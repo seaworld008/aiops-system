@@ -5,7 +5,7 @@ import (
 	"slices"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/authn"
+	"github.com/seaworld008/aiops-system/internal/authn"
 )
 
 var (

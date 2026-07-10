@@ -10,10 +10,10 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/executionlease"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/seaworld008/aiops-system/internal/executionlease"
 )
 
 const (

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/domain"
-	"github.com/aiops-system/control-plane/internal/store"
+	"github.com/seaworld008/aiops-system/internal/domain"
+	"github.com/seaworld008/aiops-system/internal/store"
 )
 
 type Starter interface {

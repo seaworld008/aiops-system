@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/connectors"
+	"github.com/seaworld008/aiops-system/internal/connectors"
 )
 
 const maxGitHubPageSize = 100

@@ -10,8 +10,8 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/aiops-system/control-plane/internal/action"
-	"github.com/aiops-system/control-plane/internal/policy"
+	"github.com/seaworld008/aiops-system/internal/action"
+	"github.com/seaworld008/aiops-system/internal/policy"
 )
 
 const MaxPolicyDecisionAge = 5 * time.Second

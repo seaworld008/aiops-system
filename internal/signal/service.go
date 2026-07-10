@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/domain"
-	"github.com/aiops-system/control-plane/internal/ids"
+	"github.com/seaworld008/aiops-system/internal/domain"
+	"github.com/seaworld008/aiops-system/internal/ids"
 )
 
 var (

@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/authn"
-	"github.com/aiops-system/control-plane/internal/httpapi"
+	"github.com/seaworld008/aiops-system/internal/authn"
+	"github.com/seaworld008/aiops-system/internal/httpapi"
 )
 
 func TestHealthEndpoints(t *testing.T) {

@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/domain"
-	"github.com/aiops-system/control-plane/internal/signal"
-	"github.com/aiops-system/control-plane/internal/store/memory"
+	"github.com/seaworld008/aiops-system/internal/domain"
+	"github.com/seaworld008/aiops-system/internal/signal"
+	"github.com/seaworld008/aiops-system/internal/store/memory"
 )
 
 var uuidV4Pattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)

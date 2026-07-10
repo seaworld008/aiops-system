@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/action"
+	"github.com/seaworld008/aiops-system/internal/action"
 )
 
 const standardExpression = `environment == "PROD" && service_id.startsWith("service-") && mapping_exact && whitelisted`

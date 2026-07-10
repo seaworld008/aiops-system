@@ -8,10 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/domain"
-	"github.com/aiops-system/control-plane/internal/ids"
-	"github.com/aiops-system/control-plane/internal/requestmeta"
-	"github.com/aiops-system/control-plane/internal/store"
+	"github.com/seaworld008/aiops-system/internal/domain"
+	"github.com/seaworld008/aiops-system/internal/ids"
+	"github.com/seaworld008/aiops-system/internal/requestmeta"
+	"github.com/seaworld008/aiops-system/internal/store"
 )
 
 type Store struct {

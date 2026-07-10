@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/connectors"
-	"github.com/aiops-system/control-plane/internal/connectors/awx"
+	"github.com/seaworld008/aiops-system/internal/connectors"
+	"github.com/seaworld008/aiops-system/internal/connectors/awx"
 )
 
 func TestListInventoryHostsUsesBoundedReadOnlyRequest(t *testing.T) {

@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/domain"
-	"github.com/aiops-system/control-plane/internal/store"
-	postgresstore "github.com/aiops-system/control-plane/internal/store/postgres"
 	"github.com/pashagolub/pgxmock/v4"
+	"github.com/seaworld008/aiops-system/internal/domain"
+	"github.com/seaworld008/aiops-system/internal/store"
+	postgresstore "github.com/seaworld008/aiops-system/internal/store/postgres"
 )
 
 const (

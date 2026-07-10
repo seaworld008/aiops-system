@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/domain"
-	"github.com/aiops-system/control-plane/internal/outbox"
-	"github.com/aiops-system/control-plane/internal/store/memory"
+	"github.com/seaworld008/aiops-system/internal/domain"
+	"github.com/seaworld008/aiops-system/internal/outbox"
+	"github.com/seaworld008/aiops-system/internal/store/memory"
 )
 
 func TestDispatcherUsesOutboxIDAsStableWorkflowIDAndAcknowledges(t *testing.T) {

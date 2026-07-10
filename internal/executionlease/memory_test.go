@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/executionlease"
+	"github.com/seaworld008/aiops-system/internal/executionlease"
 )
 
 func TestMemoryProductionWriteGlobalConcurrencyAndPoolIsolation(t *testing.T) {

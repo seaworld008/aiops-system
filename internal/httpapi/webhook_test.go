@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aiops-system/control-plane/internal/httpapi"
-	"github.com/aiops-system/control-plane/internal/signal"
-	"github.com/aiops-system/control-plane/internal/store"
+	"github.com/seaworld008/aiops-system/internal/httpapi"
+	"github.com/seaworld008/aiops-system/internal/signal"
+	"github.com/seaworld008/aiops-system/internal/store"
 )
 
 func TestWebhookAcceptsAlertmanagerWithoutIdempotencyHeader(t *testing.T) {

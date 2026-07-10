@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/model"
+	"github.com/seaworld008/aiops-system/internal/model"
 )
 
 func TestRouterKeepsRestrictedEvidenceOnPrivateEndpoint(t *testing.T) {

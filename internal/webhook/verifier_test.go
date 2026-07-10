@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/aiops-system/control-plane/internal/webhook"
+	"github.com/seaworld008/aiops-system/internal/webhook"
 )
 
 func TestHMACVerifierAcceptsValidSignatureAndRejectsTampering(t *testing.T) {

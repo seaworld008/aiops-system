@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/aiops-system/control-plane/internal/catalog"
+	"github.com/seaworld008/aiops-system/internal/catalog"
 )
 
 func TestResolveReturnsExactForOneExplicitServiceMatch(t *testing.T) {

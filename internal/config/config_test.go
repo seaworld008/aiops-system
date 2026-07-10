@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/config"
+	"github.com/seaworld008/aiops-system/internal/config"
 )
 
 func TestLoadUsesSafeDefaults(t *testing.T) {

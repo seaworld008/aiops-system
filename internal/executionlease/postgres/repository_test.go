@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/executionlease"
-	executionpostgres "github.com/aiops-system/control-plane/internal/executionlease/postgres"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/pashagolub/pgxmock/v4"
+	"github.com/seaworld008/aiops-system/internal/executionlease"
+	executionpostgres "github.com/seaworld008/aiops-system/internal/executionlease/postgres"
 )
 
 var executionColumns = []string{

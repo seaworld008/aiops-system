@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/action"
-	"github.com/aiops-system/control-plane/internal/credential"
-	"github.com/aiops-system/control-plane/internal/executionlease"
-	"github.com/aiops-system/control-plane/internal/policy"
+	"github.com/seaworld008/aiops-system/internal/action"
+	"github.com/seaworld008/aiops-system/internal/credential"
+	"github.com/seaworld008/aiops-system/internal/executionlease"
+	"github.com/seaworld008/aiops-system/internal/policy"
 )
 
 func TestSubmitDerivesWriteScopeProductionAndTargetOnlyFromVerifiedEnvelope(t *testing.T) {

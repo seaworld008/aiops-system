@@ -9,13 +9,13 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/aiops-system/control-plane/internal/authn"
-	"github.com/aiops-system/control-plane/internal/ids"
-	"github.com/aiops-system/control-plane/internal/requestmeta"
-	"github.com/aiops-system/control-plane/internal/signal"
-	"github.com/aiops-system/control-plane/internal/store"
-	"github.com/aiops-system/control-plane/internal/webhook"
 	"github.com/go-chi/chi/v5"
+	"github.com/seaworld008/aiops-system/internal/authn"
+	"github.com/seaworld008/aiops-system/internal/ids"
+	"github.com/seaworld008/aiops-system/internal/requestmeta"
+	"github.com/seaworld008/aiops-system/internal/signal"
+	"github.com/seaworld008/aiops-system/internal/store"
+	"github.com/seaworld008/aiops-system/internal/webhook"
 )
 
 var ErrInvalidWebhookSignature = webhook.ErrInvalidSignature

@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/domain"
+	"github.com/seaworld008/aiops-system/internal/domain"
 )
 
 func TestIncidentRejectsInvalidStateTransition(t *testing.T) {

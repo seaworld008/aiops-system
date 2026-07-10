@@ -3,7 +3,7 @@ package catalog
 import (
 	"sort"
 
-	"github.com/aiops-system/control-plane/internal/domain"
+	"github.com/seaworld008/aiops-system/internal/domain"
 )
 
 type MappingStatus = domain.MappingStatus

@@ -10,15 +10,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aiops-system/control-plane/internal/authn"
-	"github.com/aiops-system/control-plane/internal/buildinfo"
-	"github.com/aiops-system/control-plane/internal/config"
-	"github.com/aiops-system/control-plane/internal/httpapi"
-	signalservice "github.com/aiops-system/control-plane/internal/signal"
-	"github.com/aiops-system/control-plane/internal/store/memory"
-	postgresstore "github.com/aiops-system/control-plane/internal/store/postgres"
-	"github.com/aiops-system/control-plane/internal/webhook"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/seaworld008/aiops-system/internal/authn"
+	"github.com/seaworld008/aiops-system/internal/buildinfo"
+	"github.com/seaworld008/aiops-system/internal/config"
+	"github.com/seaworld008/aiops-system/internal/httpapi"
+	signalservice "github.com/seaworld008/aiops-system/internal/signal"
+	"github.com/seaworld008/aiops-system/internal/store/memory"
+	postgresstore "github.com/seaworld008/aiops-system/internal/store/postgres"
+	"github.com/seaworld008/aiops-system/internal/webhook"
 )
 
 func main() {
