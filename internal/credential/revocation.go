@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -13,13 +14,22 @@ import (
 )
 
 const (
-	MinRevocationClaimLease = time.Second
-	MaxRevocationClaimLease = 30 * time.Second
-	MaxRevocationClaimBatch = 100
-	MaxRevocationRetryDelay = 24 * time.Hour
-	MaxCredentialTTL        = 15 * time.Minute
-	MinPrepareFenceWindow   = time.Second
-	MinPostChildFenceWindow = time.Second
+	MinRevocationClaimLease           = time.Second
+	MaxRevocationClaimLease           = 30 * time.Second
+	MaxRevocationClaimBatch           = 100
+	MaxRevocationRetryDelay           = 24 * time.Hour
+	MaxCredentialTTL                  = 15 * time.Minute
+	MinPrepareFenceWindow             = time.Second
+	MinPostChildFenceWindow           = time.Second
+	VaultChildCreateServerMaxDuration = 10 * time.Second
+	MaxChildCreateDBCommitLatency     = time.Second
+	MaxChildCreateVaultIngressLatency = 2 * time.Second
+	MaxVaultAheadOfDatabaseClock      = time.Second
+	VaultTTLQuantum                   = time.Second
+	ChildCreateExpiryReserve          = MaxChildCreateDBCommitLatency + MaxChildCreateVaultIngressLatency +
+		VaultChildCreateServerMaxDuration + MaxVaultAheadOfDatabaseClock + VaultTTLQuantum
+	ChildCreateVaultCallBudget = MaxChildCreateVaultIngressLatency + VaultChildCreateServerMaxDuration
+	MinChildCreateTTL          = time.Second
 	// PreparedRecoveryGrace is only the bounded DB/Broker/Vault clock and
 	// expiration-propagation allowance. It is not extra credential lifetime.
 	PreparedRecoveryGrace = time.Minute
@@ -61,17 +71,21 @@ const (
 )
 
 var (
-	ErrInvalidRevocationRequest = errors.New("invalid credential revocation request")
-	ErrRevocationNotFound       = errors.New("credential revocation not found")
-	ErrIdempotencyConflict      = errors.New("credential revocation idempotency conflict")
-	ErrInvalidTransition        = errors.New("invalid credential revocation transition")
-	ErrStaleActionFence         = errors.New("stale credential revocation action fence")
-	ErrStaleClaim               = errors.New("stale credential revocation claim")
-	ErrCompletionConflict       = errors.New("credential revocation completion conflict")
-	ErrEvidenceConflict         = errors.New("credential revocation evidence conflict")
-	ErrPlatformAdminRequired    = errors.New("credential revocation requires a platform administrator confirmation")
-	ErrReferenceProtection      = errors.New("credential reference protection failed")
-	ErrRevocationPersistence    = errors.New("credential revocation persistence failed")
+	ErrInvalidRevocationRequest     = errors.New("invalid credential revocation request")
+	ErrRevocationNotFound           = errors.New("credential revocation not found")
+	ErrIdempotencyConflict          = errors.New("credential revocation idempotency conflict")
+	ErrInvalidTransition            = errors.New("invalid credential revocation transition")
+	ErrStaleActionFence             = errors.New("stale credential revocation action fence")
+	ErrStaleClaim                   = errors.New("stale credential revocation claim")
+	ErrCompletionConflict           = errors.New("credential revocation completion conflict")
+	ErrEvidenceConflict             = errors.New("credential revocation evidence conflict")
+	ErrPlatformAdminRequired        = errors.New("credential revocation requires a platform administrator confirmation")
+	ErrReferenceProtection          = errors.New("credential reference protection failed")
+	ErrRevocationPersistence        = errors.New("credential revocation persistence failed")
+	ErrAtomicActionSourceRequired   = errors.New("credential operation requires an atomic action source")
+	ErrChildCreateAlreadyAuthorized = errors.New("credential child creation already authorized")
+	ErrChildCreateWindowExpired     = errors.New("credential child creation window expired")
+	ErrStaleChildCreatePermit       = errors.New("stale credential child creation permit")
 )
 
 var (
@@ -104,8 +118,9 @@ const (
 	ActionStatusRunning ActionStatus = "RUNNING"
 )
 
-// ActionMetadata is the trusted snapshot returned only after the source has
-// validated the current action bearer token and epoch.
+// ActionMetadata is a trusted snapshot returned after the source validates the
+// action bearer and epoch. Runner registration and exact-scope fields are
+// authorizing only while delivered by AtomicActionFenceSource under its locks.
 type ActionMetadata struct {
 	ActionID               string
 	TenantID               string
@@ -118,9 +133,17 @@ type ActionMetadata struct {
 	Status                 ActionStatus
 	LeaseExpiresAt         time.Time
 	AuthorizationExpiresAt time.Time
-	ConnectorID            string
-	Permission             string
-	Resource               string
+	CancelRequestedAt      time.Time
+	RunnerEnabled          bool
+	RunnerPool             string
+	// ScopeRevision is the revision frozen on the action lease;
+	// RunnerScopeRevision is the current trusted registration revision.
+	ScopeRevision        int64
+	RunnerScopeRevision  int64
+	ExactScopeAuthorized bool
+	ConnectorID          string
+	Permission           string
+	Resource             string
 }
 
 type ActionFenceSource interface {
@@ -128,9 +151,22 @@ type ActionFenceSource interface {
 	InspectAction(context.Context, string) (ActionInspection, error)
 }
 
-// ActionInspection contains no reusable bearer. It is a non-authorizing view
-// used only to compare frozen scope and decide whether an anchored credential
-// must immediately enter revocation.
+// AtomicActionFenceSource invokes operation exactly once, synchronously, while
+// keeping its action, runner registration, and exact scope-binding locks held.
+// It must not retain the callback and must return the callback's error without
+// substituting a successful result. The callback may acquire the credential
+// repository lock, so implementations and callers must preserve the global
+// lock order: action source first, credential repository second. Code holding a
+// credential repository lock must never enter this callback API.
+type AtomicActionFenceSource interface {
+	ActionFenceSource
+	WithLockedActionInspection(context.Context, string, func(ActionInspection) error) error
+}
+
+// ActionInspection contains no reusable bearer. A value returned by the plain
+// InspectAction method is non-authorizing. Only a snapshot passed synchronously
+// by AtomicActionFenceSource while all source locks remain held may authorize
+// child creation; both forms may decide that an anchor must be revoked.
 type ActionInspection struct {
 	Metadata         ActionMetadata
 	LeaseTokenSHA256 string `json:"-"`
@@ -157,6 +193,69 @@ type PrepareRequest struct {
 type PrepareResult struct {
 	Revocation Revocation
 	Created    bool
+	Permit     *ChildCreatePermit `json:"-"`
+}
+
+// ChildCreatePermit is a single-use capability returned only to the unique
+// Prepare creator. Only its SHA-256 digest may be persisted.
+type ChildCreatePermit struct {
+	RevocationID string `json:"revocation_id"`
+	Token        string `json:"-"`
+}
+
+func (permit ChildCreatePermit) String() string {
+	return fmt.Sprintf("ChildCreatePermit{RevocationID:%q Token:[REDACTED]}", permit.RevocationID)
+}
+
+func (permit ChildCreatePermit) GoString() string { return permit.String() }
+
+func (permit ChildCreatePermit) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		RevocationID string `json:"revocation_id"`
+		Redacted     bool   `json:"redacted"`
+	}{RevocationID: permit.RevocationID, Redacted: true})
+}
+
+type AuthorizeChildCreateRequest struct {
+	Permit ChildCreatePermit
+	Fence  ActionFence
+}
+
+func (request AuthorizeChildCreateRequest) String() string {
+	return fmt.Sprintf("AuthorizeChildCreateRequest{Permit:%s Fence:%s}", request.Permit.String(), request.Fence.String())
+}
+
+func (request AuthorizeChildCreateRequest) GoString() string { return request.String() }
+
+func (request AuthorizeChildCreateRequest) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Permit ChildCreatePermit `json:"permit"`
+		Fence  struct {
+			ActionID string `json:"action_id"`
+			RunnerID string `json:"runner_id"`
+			Epoch    int64  `json:"epoch"`
+			Redacted bool   `json:"redacted"`
+		} `json:"fence"`
+	}{
+		Permit: request.Permit,
+		Fence: struct {
+			ActionID string `json:"action_id"`
+			RunnerID string `json:"runner_id"`
+			Epoch    int64  `json:"epoch"`
+			Redacted bool   `json:"redacted"`
+		}{
+			ActionID: request.Fence.ActionID, RunnerID: request.Fence.RunnerID,
+			Epoch: request.Fence.Epoch, Redacted: true,
+		},
+	})
+}
+
+type ChildCreateAuthorization struct {
+	Revocation           Revocation
+	DatabaseAuthorizedAt time.Time
+	CredentialExpiresAt  time.Time
+	TTL                  time.Duration
+	VaultCallBudget      time.Duration
 }
 
 type RecordAnchorRequest struct {
@@ -331,6 +430,7 @@ type ConfirmationResult struct {
 // broad store.Store interface and never exposes protected reference storage.
 type Repository interface {
 	Prepare(context.Context, PrepareRequest) (PrepareResult, error)
+	AuthorizeChildCreate(context.Context, AuthorizeChildCreateRequest) (ChildCreateAuthorization, error)
 	RecordAnchor(context.Context, RecordAnchorRequest) (Revocation, error)
 	Activate(context.Context, ActionTransitionRequest) (Revocation, error)
 	RecordNoCredential(context.Context, ActionTransitionRequest) (Revocation, error)

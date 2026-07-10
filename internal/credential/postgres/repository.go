@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	cryptorand "crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -22,7 +23,8 @@ import (
 const revocationProjection = `
 	revocation_id::text, tenant_id::text, workspace_id::text, environment_id::text,
 	action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-	issuer, connector_id, scope_permission, scope_resource, credential_expires_at, status,
+	issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+	child_create_permit_sha256, child_create_authorized_at, child_create_ttl_seconds, status,
 	accessor_ciphertext, accessor_hmac, encryption_key_id,
 	claim_epoch, claimed_by, claim_token_sha256, claimed_at, claim_expires_at, last_heartbeat_at,
 	completed_claim_epoch, completed_claim_token_sha256, completed_claimed_by,
@@ -38,13 +40,17 @@ type DB interface {
 }
 
 type Options struct {
-	TokenSource func() (string, error)
+	TokenSource  func() (string, error)
+	PermitSource func() (string, error)
+	MonotonicNow func() time.Time
 }
 
 type Repository struct {
-	database    DB
-	protector   credential.ReferenceProtector
-	tokenSource func() (string, error)
+	database     DB
+	protector    credential.ReferenceProtector
+	tokenSource  func() (string, error)
+	permitSource func() (string, error)
+	monotonicNow func() time.Time
 }
 
 var _ credential.Repository = (*Repository)(nil)
@@ -53,10 +59,21 @@ type storedRevocation struct {
 	revocation                credential.Revocation
 	protected                 credential.ProtectedReference
 	actionTokenSHA256         string
+	childCreatePermitSHA256   string
+	childCreateAuthorizedAt   time.Time
+	childCreateTTL            time.Duration
 	claimTokenSHA256          string
 	completedClaimEpoch       int64
 	completedClaimTokenSHA256 string
 	completedClaimedBy        string
+}
+
+type lockedRunnerRegistration struct {
+	tenantID      string
+	pool          string
+	enabled       bool
+	scopeRevision int64
+	found         bool
 }
 
 func New(database DB, protector credential.ReferenceProtector, options Options) (*Repository, error) {
@@ -66,7 +83,16 @@ func New(database DB, protector credential.ReferenceProtector, options Options) 
 	if options.TokenSource == nil {
 		options.TokenSource = randomToken
 	}
-	return &Repository{database: database, protector: protector, tokenSource: options.TokenSource}, nil
+	if options.PermitSource == nil {
+		options.PermitSource = randomToken
+	}
+	if options.MonotonicNow == nil {
+		options.MonotonicNow = time.Now
+	}
+	return &Repository{
+		database: database, protector: protector, tokenSource: options.TokenSource,
+		permitSource: options.PermitSource, monotonicNow: options.MonotonicNow,
+	}, nil
 }
 
 func (repository *Repository) Prepare(ctx context.Context, request credential.PrepareRequest) (credential.PrepareResult, error) {
@@ -94,31 +120,7 @@ func (repository *Repository) Prepare(ctx context.Context, request credential.Pr
 		return credential.PrepareResult{}, err
 	}
 	tokenDigest := credential.SHA256Hex([]byte(request.Fence.Token))
-	var status string
-	var availableAt, createdAt, updatedAt time.Time
-	var version int64
-	err = tx.QueryRow(ctx, `
-		INSERT INTO credential_revocations (
-			revocation_id, tenant_id, workspace_id, environment_id,
-			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, connector_id, scope_permission, scope_resource, credential_expires_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-		ON CONFLICT (action_id, action_lease_epoch) DO NOTHING
-		RETURNING status, available_at, created_at, updated_at, version
-	`, request.RevocationID, metadata.TenantID, metadata.WorkspaceID, metadata.EnvironmentID,
-		metadata.ActionID, metadata.TargetKey, metadata.Production, metadata.RunnerID, metadata.LeaseEpoch, tokenDigest,
-		request.Issuer, metadata.ConnectorID, metadata.Permission, metadata.Resource, request.CredentialExpiresAt,
-	).Scan(&status, &availableAt, &createdAt, &updatedAt, &version)
-	if errors.Is(err, pgx.ErrNoRows) {
-		existing, getErr := selectStored(ctx, tx, `
-			SELECT `+revocationProjection+`
-			FROM credential_revocations
-			WHERE action_id = $1 AND action_lease_epoch = $2
-			FOR SHARE
-		`, request.Fence.ActionID, request.Fence.Epoch)
-		if getErr != nil {
-			return credential.PrepareResult{}, mapReadError("read idempotent credential revocation prepare", getErr)
-		}
+	finishExisting := func(existing *storedRevocation) (credential.PrepareResult, error) {
 		if !samePrepare(existing, request, metadata, tokenDigest) {
 			return credential.PrepareResult{}, credential.ErrIdempotencyConflict
 		}
@@ -144,6 +146,53 @@ func (repository *Repository) Prepare(ctx context.Context, request credential.Pr
 		committed = true
 		return credential.PrepareResult{Revocation: publicRevocation(existing)}, nil
 	}
+
+	existing, getErr := selectStored(ctx, tx, `
+		SELECT `+revocationProjection+`
+		FROM credential_revocations
+		WHERE action_id = $1 AND action_lease_epoch = $2
+		FOR SHARE
+	`, request.Fence.ActionID, request.Fence.Epoch)
+	if getErr == nil {
+		return finishExisting(existing)
+	}
+	if !errors.Is(getErr, pgx.ErrNoRows) {
+		return credential.PrepareResult{}, mapReadError("read idempotent credential revocation prepare", getErr)
+	}
+
+	permitToken, err := repository.permitSource()
+	if err != nil || !credential.ValidOpaqueText(permitToken, 4096) {
+		return credential.PrepareResult{}, credential.ErrRevocationPersistence
+	}
+	permitDigest := credential.SHA256Hex([]byte(permitToken))
+	var status string
+	var availableAt, createdAt, updatedAt time.Time
+	var version int64
+	err = tx.QueryRow(ctx, `
+		INSERT INTO credential_revocations (
+			revocation_id, tenant_id, workspace_id, environment_id,
+			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
+			issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+			child_create_permit_sha256
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		ON CONFLICT (action_id, action_lease_epoch) DO NOTHING
+		RETURNING status, available_at, created_at, updated_at, version
+	`, request.RevocationID, metadata.TenantID, metadata.WorkspaceID, metadata.EnvironmentID,
+		metadata.ActionID, metadata.TargetKey, metadata.Production, metadata.RunnerID, metadata.LeaseEpoch, tokenDigest,
+		request.Issuer, metadata.ConnectorID, metadata.Permission, metadata.Resource, request.CredentialExpiresAt, permitDigest,
+	).Scan(&status, &availableAt, &createdAt, &updatedAt, &version)
+	if errors.Is(err, pgx.ErrNoRows) {
+		existing, getErr := selectStored(ctx, tx, `
+			SELECT `+revocationProjection+`
+			FROM credential_revocations
+			WHERE action_id = $1 AND action_lease_epoch = $2
+			FOR SHARE
+		`, request.Fence.ActionID, request.Fence.Epoch)
+		if getErr != nil {
+			return credential.PrepareResult{}, mapReadError("read idempotent credential revocation prepare", getErr)
+		}
+		return finishExisting(existing)
+	}
 	if isUniqueViolation(err) {
 		return credential.PrepareResult{}, credential.ErrIdempotencyConflict
 	}
@@ -159,7 +208,7 @@ func (repository *Repository) Prepare(ctx context.Context, request credential.Pr
 		Permission: metadata.Permission, Resource: metadata.Resource, CredentialExpiresAt: request.CredentialExpiresAt,
 		Status: credential.RevocationStatus(status), AvailableAt: availableAt.UTC(), CreatedAt: createdAt.UTC(),
 		UpdatedAt: updatedAt.UTC(), Version: version,
-	}, actionTokenSHA256: tokenDigest}
+	}, actionTokenSHA256: tokenDigest, childCreatePermitSHA256: permitDigest}
 	if err := writeStateChange(ctx, tx, record.revocation, "RUNNER", request.Fence.RunnerID,
 		"credential.revocation.prepared", "credential.revocation.prepared.v1"); err != nil {
 		return credential.PrepareResult{}, err
@@ -174,11 +223,191 @@ func (repository *Repository) Prepare(ctx context.Context, request credential.Pr
 		return credential.PrepareResult{}, databaseError("commit credential revocation prepare", err)
 	}
 	committed = true
-	return credential.PrepareResult{Revocation: publicRevocation(record), Created: true}, nil
+	return credential.PrepareResult{
+		Revocation: publicRevocation(record), Created: true,
+		Permit: &credential.ChildCreatePermit{RevocationID: request.RevocationID, Token: permitToken},
+	}, nil
+}
+
+func (repository *Repository) AuthorizeChildCreate(
+	ctx context.Context,
+	request credential.AuthorizeChildCreateRequest,
+) (credential.ChildCreateAuthorization, error) {
+	if err := validateContext(ctx); err != nil {
+		return credential.ChildCreateAuthorization{}, err
+	}
+	if !credential.ValidRevocationID(request.Permit.RevocationID) ||
+		!credential.ValidOpaqueText(request.Permit.Token, 4096) || !credential.ValidActionFence(request.Fence) {
+		return credential.ChildCreateAuthorization{}, credential.ErrInvalidRevocationRequest
+	}
+	tx, err := repository.database.Begin(ctx)
+	if err != nil {
+		return credential.ChildCreateAuthorization{}, databaseError("begin credential child creation authorization", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	// Child creation follows the execution repository's global lock prefix:
+	// runner registration, action row, then credential revocation row. runner_id
+	// is globally unique, so no action-row tenant hint is required before the
+	// registration lock.
+	metadata, err := resolveChildCreateActionFence(ctx, tx, request.Fence)
+	if err != nil {
+		return credential.ChildCreateAuthorization{}, err
+	}
+	record, err := selectStored(ctx, tx, `
+		SELECT `+revocationProjection+`
+		FROM credential_revocations
+		WHERE revocation_id = $1
+		FOR UPDATE
+	`, request.Permit.RevocationID)
+	if err != nil {
+		return credential.ChildCreateAuthorization{}, mapReadError("read credential child creation authorization", err)
+	}
+	if !storedMatchesAction(record, request.Fence, metadata) {
+		return credential.ChildCreateAuthorization{}, credential.ErrStaleActionFence
+	}
+	permitDigest := credential.SHA256Hex([]byte(request.Permit.Token))
+	if subtle.ConstantTimeCompare([]byte(record.childCreatePermitSHA256), []byte(permitDigest)) != 1 {
+		return credential.ChildCreateAuthorization{}, credential.ErrStaleChildCreatePermit
+	}
+	if record.revocation.Status != credential.StatusPrepared || len(record.protected.Ciphertext) != 0 {
+		return credential.ChildCreateAuthorization{}, credential.ErrInvalidTransition
+	}
+	if !record.childCreateAuthorizedAt.IsZero() {
+		return credential.ChildCreateAuthorization{}, credential.ErrChildCreateAlreadyAuthorized
+	}
+
+	commitWindowStarted := repository.monotonicNow()
+	databaseNow, err := databaseClockTime(ctx, tx)
+	if err != nil {
+		return credential.ChildCreateAuthorization{}, err
+	}
+	minimumFenceExpiry := databaseNow.Add(credential.ChildCreateExpiryReserve + credential.MinPostChildFenceWindow)
+	if metadata.LeaseExpiresAt.Before(minimumFenceExpiry) || metadata.AuthorizationExpiresAt.Before(minimumFenceExpiry) {
+		return credential.ChildCreateAuthorization{}, credential.ErrStaleActionFence
+	}
+	remaining := record.revocation.CredentialExpiresAt.Sub(databaseNow) - credential.ChildCreateExpiryReserve
+	ttl := remaining / credential.VaultTTLQuantum * credential.VaultTTLQuantum
+	if ttl < credential.MinChildCreateTTL {
+		return credential.ChildCreateAuthorization{}, credential.ErrChildCreateWindowExpired
+	}
+	record, err = selectStored(ctx, tx, `
+		UPDATE credential_revocations
+		SET child_create_authorized_at = $2, child_create_ttl_seconds = $3,
+			updated_at = clock_timestamp(), version = version + 1
+		WHERE revocation_id = $1 AND status = 'PREPARED'
+		  AND child_create_authorized_at IS NULL
+		  AND child_create_permit_sha256 = $4
+		RETURNING `+revocationProjection,
+		request.Permit.RevocationID, databaseNow, int32(ttl/time.Second), permitDigest)
+	if err != nil {
+		return credential.ChildCreateAuthorization{}, mapTransitionError("authorize credential child creation", err)
+	}
+	if err := writeStateChange(ctx, tx, record.revocation, "RUNNER", request.Fence.RunnerID,
+		"credential.revocation.child_create_authorized", "credential.revocation.child_create_authorized.v1"); err != nil {
+		return credential.ChildCreateAuthorization{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return credential.ChildCreateAuthorization{}, databaseError("commit credential child creation authorization", err)
+	}
+	committed = true
+	commitElapsed := repository.monotonicNow().Sub(commitWindowStarted)
+	if commitElapsed < 0 || commitElapsed > credential.MaxChildCreateDBCommitLatency {
+		return credential.ChildCreateAuthorization{}, credential.ErrChildCreateWindowExpired
+	}
+	return credential.ChildCreateAuthorization{
+		Revocation: publicRevocation(record), DatabaseAuthorizedAt: databaseNow,
+		CredentialExpiresAt: record.revocation.CredentialExpiresAt, TTL: ttl,
+		VaultCallBudget: credential.ChildCreateVaultCallBudget,
+	}, nil
 }
 
 func resolveActionFence(ctx context.Context, tx pgx.Tx, fence credential.ActionFence, credentialExpiry time.Time) (credential.ActionMetadata, error) {
 	return resolveActionFenceWithWindow(ctx, tx, fence, credentialExpiry, 0)
+}
+
+func resolveChildCreateActionFence(
+	ctx context.Context,
+	tx pgx.Tx,
+	fence credential.ActionFence,
+) (credential.ActionMetadata, error) {
+	registration, err := lockRunnerRegistration(ctx, tx, fence.RunnerID)
+	if err != nil {
+		return credential.ActionMetadata{}, err
+	}
+	metadata, err := resolveActionFence(ctx, tx, fence, time.Time{})
+	if err != nil {
+		return credential.ActionMetadata{}, err
+	}
+	if metadata.Status != credential.ActionStatusRunning || !metadata.CancelRequestedAt.IsZero() ||
+		!registration.matches(metadata) {
+		return credential.ActionMetadata{}, credential.ErrStaleActionFence
+	}
+	// Binding mutations synchronously bump this already share-locked
+	// registration row. A committed mutation therefore changes the revision;
+	// an uncommitted mutation remains invisible and linearizes after this check.
+	bound, err := exactRunnerScopeBinding(ctx, tx, metadata)
+	if err != nil {
+		return credential.ActionMetadata{}, err
+	}
+	if !bound {
+		return credential.ActionMetadata{}, credential.ErrStaleActionFence
+	}
+	return metadata, nil
+}
+
+func lockRunnerRegistration(
+	ctx context.Context,
+	tx pgx.Tx,
+	runnerID string,
+) (lockedRunnerRegistration, error) {
+	var registration lockedRunnerRegistration
+	err := tx.QueryRow(ctx, `
+		SELECT tenant_id::text, runner_pool, enabled, scope_revision
+		FROM runner_registrations
+		WHERE runner_id = $1
+		FOR SHARE
+	`, runnerID).Scan(
+		&registration.tenantID, &registration.pool, &registration.enabled, &registration.scopeRevision,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return registration, nil
+	}
+	if err != nil {
+		return lockedRunnerRegistration{}, databaseError("lock credential runner registration", err)
+	}
+	registration.found = true
+	return registration, nil
+}
+
+func (registration lockedRunnerRegistration) matches(metadata credential.ActionMetadata) bool {
+	return registration.found && registration.enabled && registration.pool == "WRITE" &&
+		metadata.RunnerPool == "WRITE" && registration.tenantID == metadata.TenantID &&
+		registration.scopeRevision > 0 && registration.scopeRevision == metadata.ScopeRevision
+}
+
+func exactRunnerScopeBinding(
+	ctx context.Context,
+	tx pgx.Tx,
+	metadata credential.ActionMetadata,
+) (bool, error) {
+	var bound bool
+	err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM runner_scope_bindings
+			WHERE runner_id = $1 AND tenant_id = $2 AND workspace_id = $3 AND environment_id = $4
+		)
+	`, metadata.RunnerID, metadata.TenantID, metadata.WorkspaceID, metadata.EnvironmentID).Scan(&bound)
+	if err != nil {
+		return false, databaseError("check credential runner scope binding", err)
+	}
+	return bound, nil
 }
 
 func resolvePrepareActionFence(ctx context.Context, tx pgx.Tx, fence credential.ActionFence, credentialExpiry time.Time) (credential.ActionMetadata, error) {
@@ -195,6 +424,7 @@ func resolveActionFenceWithWindow(
 	query := `
 		SELECT action_id, runner_tenant_id::text, runner_workspace_id::text, runner_environment_id::text,
 			target_key, production, runner_id, lease_epoch, status, lease_expires_at, authorization_expires_at,
+			runner_pool, scope_revision, cancel_requested_at,
 			envelope #>> '{credential_scope,connector_id}',
 			envelope #>> '{credential_scope,permission}',
 			envelope #>> '{credential_scope,resource}',
@@ -209,10 +439,12 @@ func resolveActionFenceWithWindow(
 	var metadata credential.ActionMetadata
 	var status string
 	var databaseNow time.Time
+	var cancelRequestedAt pgtype.Timestamptz
 	err := tx.QueryRow(ctx, query, args...).Scan(
 		&metadata.ActionID, &metadata.TenantID, &metadata.WorkspaceID, &metadata.EnvironmentID,
 		&metadata.TargetKey, &metadata.Production, &metadata.RunnerID, &metadata.LeaseEpoch, &status,
 		&metadata.LeaseExpiresAt, &metadata.AuthorizationExpiresAt,
+		&metadata.RunnerPool, &metadata.ScopeRevision, &cancelRequestedAt,
 		&metadata.ConnectorID, &metadata.Permission, &metadata.Resource, &databaseNow,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -224,6 +456,7 @@ func resolveActionFenceWithWindow(
 	metadata.Status = credential.ActionStatus(status)
 	metadata.LeaseExpiresAt = metadata.LeaseExpiresAt.UTC()
 	metadata.AuthorizationExpiresAt = metadata.AuthorizationExpiresAt.UTC()
+	metadata.CancelRequestedAt = timeValue(cancelRequestedAt)
 	credentialExpiry = credential.CanonicalCredentialExpiry(credentialExpiry)
 	if minimumWindow > 0 {
 		minimumExpiry := databaseNow.Add(minimumWindow)
@@ -330,7 +563,7 @@ func (repository *Repository) RecordAnchor(ctx context.Context, request credenti
 			_ = tx.Rollback(ctx)
 		}
 	}()
-	inspection, databaseNow, err := inspectAction(ctx, tx, request.Fence.ActionID)
+	inspection, databaseNow, registrationCurrent, err := inspectAction(ctx, tx, request.Fence.ActionID, request.Fence.RunnerID)
 	if err != nil {
 		return credential.Revocation{}, err
 	}
@@ -346,7 +579,10 @@ func (repository *Repository) RecordAnchor(ctx context.Context, request credenti
 	if !storedFrozenFenceMatches(record, request.Fence) || !storedInspectionScopeMatches(record, inspection.Metadata) {
 		return credential.Revocation{}, credential.ErrStaleActionFence
 	}
-	current := storedInspectionFenceCurrent(record, inspection, databaseNow, 0)
+	if record.childCreateAuthorizedAt.IsZero() {
+		return credential.Revocation{}, credential.ErrInvalidTransition
+	}
+	current := storedInspectionFenceCurrent(record, inspection, databaseNow, 0, registrationCurrent)
 	if record.revocation.Status != credential.StatusPrepared {
 		if record.revocation.Status == credential.StatusNoCredential || record.revocation.Status == credential.StatusRevoked ||
 			len(record.protected.Ciphertext) == 0 {
@@ -365,7 +601,7 @@ func (repository *Repository) RecordAnchor(ctx context.Context, request credenti
 				if timeErr != nil {
 					return credential.Revocation{}, timeErr
 				}
-				current = storedInspectionFenceCurrent(record, inspection, finalNow, credential.MinPostChildFenceWindow)
+				current = storedInspectionFenceCurrent(record, inspection, finalNow, credential.MinPostChildFenceWindow, registrationCurrent)
 			}
 			if !current {
 				record, err = repository.requestInvalidatedAnchor(ctx, tx, record.revocation.ID, request.Fence.RunnerID)
@@ -390,6 +626,7 @@ func (repository *Repository) RecordAnchor(ctx context.Context, request credenti
 			encryption_key_id = $4, anchored_at = statement_timestamp(),
 			updated_at = statement_timestamp(), version = version + 1
 		WHERE revocation_id = $1 AND status = 'PREPARED'
+		  AND child_create_authorized_at IS NOT NULL
 		RETURNING `+revocationProjection,
 		request.RevocationID, protected.Ciphertext, protected.AccessorHMAC, protected.KeyID)
 	if err != nil {
@@ -404,7 +641,7 @@ func (repository *Repository) RecordAnchor(ctx context.Context, request credenti
 		if timeErr != nil {
 			return credential.Revocation{}, timeErr
 		}
-		current = storedInspectionFenceCurrent(record, inspection, finalNow, credential.MinPostChildFenceWindow)
+		current = storedInspectionFenceCurrent(record, inspection, finalNow, credential.MinPostChildFenceWindow, registrationCurrent)
 	}
 	if !current {
 		record, err = repository.requestInvalidatedAnchor(ctx, tx, record.revocation.ID, request.Fence.RunnerID)
@@ -442,16 +679,27 @@ func (repository *Repository) requestInvalidatedAnchor(
 	return record, nil
 }
 
-func inspectAction(ctx context.Context, tx pgx.Tx, actionID string) (credential.ActionInspection, time.Time, error) {
+func inspectAction(
+	ctx context.Context,
+	tx pgx.Tx,
+	actionID, runnerHint string,
+) (credential.ActionInspection, time.Time, bool, error) {
+	registration, err := lockRunnerRegistration(ctx, tx, runnerHint)
+	if err != nil {
+		return credential.ActionInspection{}, time.Time{}, false, err
+	}
 	var inspection credential.ActionInspection
 	var runnerID, leaseTokenSHA256 pgtype.Text
 	var leaseExpiresAt pgtype.Timestamptz
+	var scopeRevision pgtype.Int8
+	var cancelRequestedAt pgtype.Timestamptz
 	var status string
 	var databaseNow time.Time
-	err := tx.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT action.action_id, workspace.tenant_id::text, action.workspace_id, action.environment_id,
 			action.target_key, action.production, action.runner_id, action.lease_epoch, action.status,
 			action.lease_token_sha256, action.lease_expires_at, action.authorization_expires_at,
+			action.runner_pool, action.scope_revision, action.cancel_requested_at,
 			action.envelope #>> '{credential_scope,connector_id}',
 			action.envelope #>> '{credential_scope,permission}',
 			action.envelope #>> '{credential_scope,resource}',
@@ -468,21 +716,31 @@ func inspectAction(ctx context.Context, tx pgx.Tx, actionID string) (credential.
 		&inspection.Metadata.ActionID, &inspection.Metadata.TenantID, &inspection.Metadata.WorkspaceID,
 		&inspection.Metadata.EnvironmentID, &inspection.Metadata.TargetKey, &inspection.Metadata.Production,
 		&runnerID, &inspection.Metadata.LeaseEpoch, &status, &leaseTokenSHA256, &leaseExpiresAt,
-		&inspection.Metadata.AuthorizationExpiresAt, &inspection.Metadata.ConnectorID,
+		&inspection.Metadata.AuthorizationExpiresAt, &inspection.Metadata.RunnerPool, &scopeRevision, &cancelRequestedAt,
+		&inspection.Metadata.ConnectorID,
 		&inspection.Metadata.Permission, &inspection.Metadata.Resource, &databaseNow,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return credential.ActionInspection{}, time.Time{}, credential.ErrStaleActionFence
+		return credential.ActionInspection{}, time.Time{}, false, credential.ErrStaleActionFence
 	}
 	if err != nil {
-		return credential.ActionInspection{}, time.Time{}, databaseError("inspect credential revocation action", err)
+		return credential.ActionInspection{}, time.Time{}, false, databaseError("inspect credential revocation action", err)
 	}
 	inspection.Metadata.RunnerID = textValue(runnerID)
 	inspection.Metadata.Status = credential.ActionStatus(status)
 	inspection.Metadata.LeaseExpiresAt = timeValue(leaseExpiresAt)
 	inspection.Metadata.AuthorizationExpiresAt = inspection.Metadata.AuthorizationExpiresAt.UTC()
+	inspection.Metadata.ScopeRevision = int64Value(scopeRevision)
+	inspection.Metadata.CancelRequestedAt = timeValue(cancelRequestedAt)
 	inspection.LeaseTokenSHA256 = textValue(leaseTokenSHA256)
-	return inspection, databaseNow.UTC(), nil
+	registrationCurrent := registration.matches(inspection.Metadata)
+	if registrationCurrent {
+		registrationCurrent, err = exactRunnerScopeBinding(ctx, tx, inspection.Metadata)
+		if err != nil {
+			return credential.ActionInspection{}, time.Time{}, false, err
+		}
+	}
+	return inspection, databaseNow.UTC(), registrationCurrent, nil
 }
 
 type actionTransitionKind uint8
@@ -509,7 +767,7 @@ func (repository *Repository) Activate(ctx context.Context, request credential.A
 			_ = tx.Rollback(ctx)
 		}
 	}()
-	inspection, databaseNow, err := inspectAction(ctx, tx, request.Fence.ActionID)
+	inspection, databaseNow, registrationCurrent, err := inspectAction(ctx, tx, request.Fence.ActionID, request.Fence.RunnerID)
 	if err != nil {
 		return credential.Revocation{}, err
 	}
@@ -525,7 +783,7 @@ func (repository *Repository) Activate(ctx context.Context, request credential.A
 	if !storedFrozenFenceMatches(record, request.Fence) || !storedInspectionScopeMatches(record, inspection.Metadata) {
 		return credential.Revocation{}, credential.ErrStaleActionFence
 	}
-	current := storedInspectionFenceCurrent(record, inspection, databaseNow, 0)
+	current := storedInspectionFenceCurrent(record, inspection, databaseNow, 0, registrationCurrent)
 	switch record.revocation.Status {
 	case credential.StatusAnchored:
 		if current {
@@ -568,7 +826,7 @@ func (repository *Repository) Activate(ctx context.Context, request credential.A
 		if timeErr != nil {
 			return credential.Revocation{}, timeErr
 		}
-		if !storedInspectionFenceCurrent(record, inspection, finalNow, credential.MinPostChildFenceWindow) {
+		if !storedInspectionFenceCurrent(record, inspection, finalNow, credential.MinPostChildFenceWindow, registrationCurrent) {
 			record, err = repository.requestInvalidatedAnchor(ctx, tx, record.revocation.ID, request.Fence.RunnerID)
 			if err != nil {
 				return credential.Revocation{}, err
@@ -706,10 +964,13 @@ func (repository *Repository) actionTransition(ctx context.Context, request cred
 	case transitionNoCredential:
 		switch record.revocation.Status {
 		case credential.StatusPrepared:
+			if !record.childCreateAuthorizedAt.IsZero() {
+				return credential.Revocation{}, credential.ErrInvalidTransition
+			}
 			query = `
 				UPDATE credential_revocations
 				SET status = 'NO_CREDENTIAL', updated_at = statement_timestamp(), version = version + 1
-				WHERE revocation_id = $1
+				WHERE revocation_id = $1 AND child_create_authorized_at IS NULL
 				RETURNING ` + revocationProjection
 			auditAction, eventType = "credential.revocation.no_credential", "credential.revocation.no_credential.v1"
 		case credential.StatusNoCredential:
@@ -1318,18 +1579,19 @@ func scanStored(row rowScanner) (*storedRevocation, error) {
 	var record storedRevocation
 	var status string
 	var ciphertext, accessorHMAC []byte
-	var encryptionKeyID, claimedBy, claimToken, completedToken, completedBy pgtype.Text
+	var permitSHA256, encryptionKeyID, claimedBy, claimToken, completedToken, completedBy pgtype.Text
 	var failureCode, failureDetail, evidenceHash pgtype.Text
-	var claimedAt, claimExpiresAt, heartbeatAt pgtype.Timestamptz
+	var childCreateAuthorizedAt, claimedAt, claimExpiresAt, heartbeatAt pgtype.Timestamptz
 	var anchoredAt, activatedAt, requestedAt, manualAt, revokedAt pgtype.Timestamptz
 	var completedEpoch pgtype.Int8
+	var childCreateTTLSeconds pgtype.Int4
 	var attempt, failureCount int32
 	err := row.Scan(
 		&record.revocation.ID, &record.revocation.TenantID, &record.revocation.WorkspaceID, &record.revocation.EnvironmentID,
 		&record.revocation.ActionID, &record.revocation.TargetKey, &record.revocation.Production,
 		&record.revocation.RunnerID, &record.revocation.ActionLeaseEpoch, &record.actionTokenSHA256,
 		&record.revocation.Issuer, &record.revocation.ConnectorID, &record.revocation.Permission, &record.revocation.Resource,
-		&record.revocation.CredentialExpiresAt, &status,
+		&record.revocation.CredentialExpiresAt, &permitSHA256, &childCreateAuthorizedAt, &childCreateTTLSeconds, &status,
 		&ciphertext, &accessorHMAC, &encryptionKeyID,
 		&record.revocation.ClaimEpoch, &claimedBy, &claimToken, &claimedAt, &claimExpiresAt, &heartbeatAt,
 		&completedEpoch, &completedToken, &completedBy,
@@ -1341,6 +1603,11 @@ func scanStored(row rowScanner) (*storedRevocation, error) {
 		return nil, err
 	}
 	record.revocation.Status = credential.RevocationStatus(status)
+	record.childCreatePermitSHA256 = textValue(permitSHA256)
+	record.childCreateAuthorizedAt = timeValue(childCreateAuthorizedAt)
+	if childCreateTTLSeconds.Valid {
+		record.childCreateTTL = time.Duration(childCreateTTLSeconds.Int32) * time.Second
+	}
 	record.revocation.AccessorPresent = len(ciphertext) > 0
 	if len(accessorHMAC) > 0 {
 		record.revocation.AccessorHMAC = hex.EncodeToString(accessorHMAC)
@@ -1435,10 +1702,11 @@ func storedInspectionFenceCurrent(
 	inspection credential.ActionInspection,
 	now time.Time,
 	minimumWindow time.Duration,
+	runnerRegistrationCurrent bool,
 ) bool {
 	metadata := inspection.Metadata
 	minimumExpiry := now.Add(minimumWindow)
-	return (metadata.Status == credential.ActionStatusLeased || metadata.Status == credential.ActionStatusRunning) &&
+	return runnerRegistrationCurrent && metadata.Status == credential.ActionStatusRunning && metadata.CancelRequestedAt.IsZero() &&
 		metadata.RunnerID == record.revocation.RunnerID && metadata.LeaseEpoch == record.revocation.ActionLeaseEpoch &&
 		inspection.LeaseTokenSHA256 == record.actionTokenSHA256 && metadata.LeaseExpiresAt.After(minimumExpiry) &&
 		metadata.AuthorizationExpiresAt.After(minimumExpiry) && record.revocation.CredentialExpiresAt.After(minimumExpiry)
@@ -1448,6 +1716,14 @@ func databaseTime(ctx context.Context, tx pgx.Tx) (time.Time, error) {
 	var now time.Time
 	if err := tx.QueryRow(ctx, `SELECT statement_timestamp()`).Scan(&now); err != nil {
 		return time.Time{}, databaseError("read credential revocation database time", err)
+	}
+	return now.UTC(), nil
+}
+
+func databaseClockTime(ctx context.Context, tx pgx.Tx) (time.Time, error) {
+	var now time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return time.Time{}, databaseError("read credential child creation database time", err)
 	}
 	return now.UTC(), nil
 }

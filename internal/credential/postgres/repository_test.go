@@ -32,7 +32,11 @@ func TestPrepareDerivesTrustedActionScopeAndPersistsOnlyFenceDigest(t *testing.T
 	}
 	defer database.Close()
 	protector := repositoryTestProtector(t)
-	repository, err := New(database, protector, Options{TokenSource: func() (string, error) { return "claim-token", nil }})
+	permitToken := "child-create-permit"
+	repository, err := New(database, protector, Options{
+		TokenSource:  func() (string, error) { return "claim-token", nil },
+		PermitSource: func() (string, error) { return permitToken, nil },
+	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -55,15 +59,19 @@ func TestPrepareDerivesTrustedActionScopeAndPersistsOnlyFenceDigest(t *testing.T
 		WithArgs(fence.ActionID, fence.RunnerID, fence.Epoch, tokenDigest).
 		WillReturnRows(pgxmock.NewRows([]string{
 			"action_id", "tenant_id", "workspace_id", "environment_id", "target_key", "production", "runner_id",
-			"lease_epoch", "status", "lease_expires_at", "authorization_expires_at", "connector_id", "permission", "resource", "database_now",
+			"lease_epoch", "status", "lease_expires_at", "authorization_expires_at", "runner_pool", "scope_revision",
+			"cancel_requested_at", "connector_id", "permission", "resource", "database_now",
 		}).AddRow(
 			fence.ActionID,
 			postgresTestTenantID,
 			postgresTestWorkspaceID,
 			postgresTestEnvironment,
 			"cluster-a/payments", true, fence.RunnerID, fence.Epoch, "RUNNING", now.Add(time.Minute), now.Add(10*time.Minute),
-			"kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api", now,
+			"WRITE", int64(7), nil, "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api", now,
 		))
+	database.ExpectQuery("SELECT .* FROM credential_revocations.*WHERE action_id = \\$1 AND action_lease_epoch = \\$2.*FOR SHARE").
+		WithArgs(fence.ActionID, fence.Epoch).
+		WillReturnRows(pgxmock.NewRows(storedRevocationColumns()))
 	database.ExpectQuery("INSERT INTO credential_revocations").
 		WithArgs(
 			request.RevocationID,
@@ -72,7 +80,7 @@ func TestPrepareDerivesTrustedActionScopeAndPersistsOnlyFenceDigest(t *testing.T
 			postgresTestEnvironment,
 			fence.ActionID, "cluster-a/payments", true, fence.RunnerID, fence.Epoch, tokenDigest,
 			request.Issuer, "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api",
-			canonicalExpiry,
+			canonicalExpiry, credential.SHA256Hex([]byte(permitToken)),
 		).
 		WillReturnRows(pgxmock.NewRows([]string{"status", "available_at", "created_at", "updated_at", "version"}).
 			AddRow("PREPARED", now, now, now, int64(1)))
@@ -94,7 +102,8 @@ func TestPrepareDerivesTrustedActionScopeAndPersistsOnlyFenceDigest(t *testing.T
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
-	if !prepared.Created || prepared.Revocation.Status != credential.StatusPrepared ||
+	if !prepared.Created || prepared.Permit == nil || prepared.Permit.Token != permitToken ||
+		prepared.Revocation.Status != credential.StatusPrepared ||
 		prepared.Revocation.WorkspaceID != postgresTestWorkspaceID ||
 		prepared.Revocation.EnvironmentID != postgresTestEnvironment || prepared.Revocation.TargetKey != "cluster-a/payments" ||
 		prepared.Revocation.ConnectorID != "kubernetes-prod" ||
@@ -103,6 +112,356 @@ func TestPrepareDerivesTrustedActionScopeAndPersistsOnlyFenceDigest(t *testing.T
 	}
 	if err := database.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet pgx expectations: %v", err)
+	}
+}
+
+func TestAuthorizeChildCreateUsesDatabaseTimeAndConsumesPermitOnce(t *testing.T) {
+	t.Parallel()
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	now := time.Date(2026, 7, 10, 15, 10, 0, 0, time.UTC)
+	repository, err := New(database, repositoryTestProtector(t), Options{
+		PermitSource: func() (string, error) { return "unused", nil },
+		MonotonicNow: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := credential.ActionFence{
+		ActionID: postgresTestActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 4,
+	}
+	permit := credential.ChildCreatePermit{RevocationID: postgresTestRevocationID, Token: "child-create-permit"}
+	permitDigest := credential.SHA256Hex([]byte(permit.Token))
+
+	database.ExpectBegin()
+	database.ExpectQuery("SELECT tenant_id::text, runner_pool, enabled, scope_revision.*FOR SHARE").
+		WithArgs(fence.RunnerID).
+		WillReturnRows(runnerRegistrationRows(true, "WRITE", 7))
+	database.ExpectQuery("SELECT action_id, runner_tenant_id::text.*FOR SHARE").
+		WithArgs(fence.ActionID, fence.RunnerID, fence.Epoch, credential.SHA256Hex([]byte(fence.Token))).
+		WillReturnRows(actionMetadataRowsForState(now, fence, "RUNNING", time.Time{}, 7))
+	database.ExpectQuery("SELECT EXISTS.*FROM runner_scope_bindings").
+		WithArgs(fence.RunnerID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	database.ExpectQuery("SELECT .* FROM credential_revocations.*FOR UPDATE").
+		WithArgs(postgresTestRevocationID).
+		WillReturnRows(storedRevocationRows(now, storedRowOptions{
+			Status: credential.StatusPrepared, AvailableAt: now, Version: 1, CredentialExpiresAt: now.Add(time.Minute),
+			ChildCreatePermitSHA256: permitDigest,
+		}))
+	database.ExpectQuery("SELECT clock_timestamp\\(\\)").
+		WillReturnRows(pgxmock.NewRows([]string{"database_now"}).AddRow(now))
+	database.ExpectQuery("UPDATE credential_revocations SET child_create_authorized_at").
+		WithArgs(postgresTestRevocationID, now, int32(45), permitDigest).
+		WillReturnRows(storedRevocationRows(now, storedRowOptions{
+			Status: credential.StatusPrepared, AvailableAt: now, Version: 2, CredentialExpiresAt: now.Add(time.Minute),
+			ChildCreatePermitSHA256: permitDigest, ChildCreateAuthorizedAt: now, ChildCreateTTLSeconds: 45,
+		}))
+	database.ExpectExec("INSERT INTO audit_records").
+		WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID,
+			"RUNNER", fence.RunnerID, "credential.revocation.child_create_authorized", postgresTestRevocationID,
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	database.ExpectExec("INSERT INTO outbox_events").
+		WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID,
+			postgresTestRevocationID, int64(2), "credential.revocation.child_create_authorized.v1", pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	database.ExpectCommit()
+
+	authorized, err := repository.AuthorizeChildCreate(context.Background(), credential.AuthorizeChildCreateRequest{
+		Permit: permit, Fence: fence,
+	})
+	if err != nil || authorized.TTL != 45*time.Second || authorized.VaultCallBudget != 12*time.Second ||
+		authorized.Revocation.Version != 2 || !authorized.DatabaseAuthorizedAt.Equal(now) ||
+		authorized.DatabaseAuthorizedAt.Add(authorized.TTL+credential.ChildCreateExpiryReserve).After(authorized.CredentialExpiresAt) {
+		t.Fatalf("AuthorizeChildCreate() = %#v, %v; expectations=%v", authorized, err, database.ExpectationsWereMet())
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet pgx expectations: %v", err)
+	}
+}
+
+func TestAuthorizeChildCreateRejectsLeasedActionBeforeConsumingPermit(t *testing.T) {
+	t.Parallel()
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	now := time.Date(2026, 7, 10, 15, 11, 0, 0, time.UTC)
+	repository, err := New(database, repositoryTestProtector(t), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := credential.ActionFence{
+		ActionID: postgresTestActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 4,
+	}
+	permit := credential.ChildCreatePermit{RevocationID: postgresTestRevocationID, Token: "child-create-permit"}
+	database.ExpectBegin()
+	database.ExpectQuery("SELECT tenant_id::text, runner_pool, enabled, scope_revision.*FOR SHARE").
+		WithArgs(fence.RunnerID).
+		WillReturnRows(runnerRegistrationRows(true, "WRITE", 7))
+	database.ExpectQuery("SELECT action_id, runner_tenant_id::text.*FOR SHARE").
+		WithArgs(fence.ActionID, fence.RunnerID, fence.Epoch, credential.SHA256Hex([]byte(fence.Token))).
+		WillReturnRows(actionMetadataRowsForState(now, fence, "LEASED", time.Time{}, 7))
+	database.ExpectRollback()
+
+	_, err = repository.AuthorizeChildCreate(context.Background(), credential.AuthorizeChildCreateRequest{
+		Permit: permit, Fence: fence,
+	})
+	if !errors.Is(err, credential.ErrStaleActionFence) {
+		t.Fatalf("AuthorizeChildCreate(LEASED) error = %v, want ErrStaleActionFence", err)
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet pgx expectations: %v", err)
+	}
+}
+
+func TestAuthorizeChildCreateRequiresCurrentWriteRunnerAndExactScopeBinding(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 10, 15, 11, 30, 0, time.UTC)
+	for _, test := range []struct {
+		name              string
+		enabled           bool
+		pool              string
+		registrationScope int64
+		actionScope       int64
+		cancelRequestedAt time.Time
+		bindingResult     *bool
+	}{
+		{name: "cancel requested", enabled: true, pool: "WRITE", registrationScope: 7, actionScope: 7, cancelRequestedAt: now},
+		{name: "runner disabled", enabled: false, pool: "WRITE", registrationScope: 7, actionScope: 7},
+		{name: "read runner", enabled: true, pool: "READ", registrationScope: 7, actionScope: 7},
+		{name: "scope revision changed", enabled: true, pool: "WRITE", registrationScope: 8, actionScope: 7},
+		{name: "exact binding removed", enabled: true, pool: "WRITE", registrationScope: 7, actionScope: 7, bindingResult: boolPointer(false)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			repository, err := New(database, repositoryTestProtector(t), Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fence := credential.ActionFence{
+				ActionID: postgresTestActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 4,
+			}
+			database.ExpectBegin()
+			database.ExpectQuery("SELECT tenant_id::text, runner_pool, enabled, scope_revision.*FOR SHARE").
+				WithArgs(fence.RunnerID).
+				WillReturnRows(runnerRegistrationRows(test.enabled, test.pool, test.registrationScope))
+			database.ExpectQuery("SELECT action_id, runner_tenant_id::text.*FOR SHARE").
+				WithArgs(fence.ActionID, fence.RunnerID, fence.Epoch, credential.SHA256Hex([]byte(fence.Token))).
+				WillReturnRows(actionMetadataRowsForState(now, fence, "RUNNING", test.cancelRequestedAt, test.actionScope))
+			if test.bindingResult != nil {
+				database.ExpectQuery("SELECT EXISTS.*FROM runner_scope_bindings").
+					WithArgs(fence.RunnerID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment).
+					WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(*test.bindingResult))
+			}
+			database.ExpectRollback()
+
+			_, err = repository.AuthorizeChildCreate(context.Background(), credential.AuthorizeChildCreateRequest{
+				Permit: credential.ChildCreatePermit{RevocationID: postgresTestRevocationID, Token: "child-create-permit"},
+				Fence:  fence,
+			})
+			if !errors.Is(err, credential.ErrStaleActionFence) {
+				t.Fatalf("AuthorizeChildCreate(%s) error = %v, want ErrStaleActionFence", test.name, err)
+			}
+			if err := database.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet pgx expectations: %v", err)
+			}
+		})
+	}
+}
+
+func TestAuthorizeChildCreateNeverReturnsAuthorizationAfterSlowCommit(t *testing.T) {
+	t.Parallel()
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	now := time.Date(2026, 7, 10, 15, 12, 0, 0, time.UTC)
+	monotonic := []time.Time{now, now.Add(credential.MaxChildCreateDBCommitLatency + time.Microsecond)}
+	monotonicIndex := 0
+	repository, err := New(database, repositoryTestProtector(t), Options{MonotonicNow: func() time.Time {
+		value := monotonic[monotonicIndex]
+		monotonicIndex++
+		return value
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := credential.ActionFence{ActionID: postgresTestActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 4}
+	permit := credential.ChildCreatePermit{RevocationID: postgresTestRevocationID, Token: "child-create-permit"}
+	permitDigest := credential.SHA256Hex([]byte(permit.Token))
+	database.ExpectBegin()
+	database.ExpectQuery("SELECT tenant_id::text, runner_pool, enabled, scope_revision.*FOR SHARE").
+		WithArgs(fence.RunnerID).
+		WillReturnRows(runnerRegistrationRows(true, "WRITE", 7))
+	database.ExpectQuery("SELECT action_id, runner_tenant_id::text.*FOR SHARE").
+		WithArgs(fence.ActionID, fence.RunnerID, fence.Epoch, credential.SHA256Hex([]byte(fence.Token))).
+		WillReturnRows(actionMetadataRows(now, fence, now.Add(10*time.Minute)))
+	database.ExpectQuery("SELECT EXISTS.*FROM runner_scope_bindings").
+		WithArgs(fence.RunnerID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	database.ExpectQuery("SELECT .* FROM credential_revocations.*FOR UPDATE").
+		WithArgs(postgresTestRevocationID).
+		WillReturnRows(storedRevocationRows(now, storedRowOptions{
+			Status: credential.StatusPrepared, AvailableAt: now, Version: 1, CredentialExpiresAt: now.Add(time.Minute),
+			ChildCreatePermitSHA256: permitDigest,
+		}))
+	database.ExpectQuery("SELECT clock_timestamp\\(\\)").
+		WillReturnRows(pgxmock.NewRows([]string{"database_now"}).AddRow(now))
+	database.ExpectQuery("UPDATE credential_revocations SET child_create_authorized_at").
+		WithArgs(postgresTestRevocationID, now, int32(45), permitDigest).
+		WillReturnRows(storedRevocationRows(now, storedRowOptions{
+			Status: credential.StatusPrepared, AvailableAt: now, Version: 2, CredentialExpiresAt: now.Add(time.Minute),
+			ChildCreatePermitSHA256: permitDigest, ChildCreateAuthorizedAt: now, ChildCreateTTLSeconds: 45,
+		}))
+	database.ExpectExec("INSERT INTO audit_records").
+		WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID,
+			"RUNNER", fence.RunnerID, "credential.revocation.child_create_authorized", postgresTestRevocationID,
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	database.ExpectExec("INSERT INTO outbox_events").
+		WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID,
+			postgresTestRevocationID, int64(2), "credential.revocation.child_create_authorized.v1", pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	database.ExpectCommit()
+
+	authorized, err := repository.AuthorizeChildCreate(context.Background(), credential.AuthorizeChildCreateRequest{
+		Permit: permit, Fence: fence,
+	})
+	if !errors.Is(err, credential.ErrChildCreateWindowExpired) || authorized != (credential.ChildCreateAuthorization{}) {
+		t.Fatalf("AuthorizeChildCreate(slow commit) = %#v, %v", authorized, err)
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet pgx expectations: %v", err)
+	}
+}
+
+func TestAuthorizeChildCreateChecksPermitBeforeAlreadyAuthorizedState(t *testing.T) {
+	t.Parallel()
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	now := time.Date(2026, 7, 10, 15, 13, 0, 0, time.UTC)
+	repository, err := New(database, repositoryTestProtector(t), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence := credential.ActionFence{ActionID: postgresTestActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 4}
+	database.ExpectBegin()
+	database.ExpectQuery("SELECT tenant_id::text, runner_pool, enabled, scope_revision.*FOR SHARE").
+		WithArgs(fence.RunnerID).
+		WillReturnRows(runnerRegistrationRows(true, "WRITE", 7))
+	database.ExpectQuery("SELECT action_id, runner_tenant_id::text.*FOR SHARE").
+		WithArgs(fence.ActionID, fence.RunnerID, fence.Epoch, credential.SHA256Hex([]byte(fence.Token))).
+		WillReturnRows(actionMetadataRows(now, fence, now.Add(10*time.Minute)))
+	database.ExpectQuery("SELECT EXISTS.*FROM runner_scope_bindings").
+		WithArgs(fence.RunnerID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	database.ExpectQuery("SELECT .* FROM credential_revocations.*FOR UPDATE").
+		WithArgs(postgresTestRevocationID).
+		WillReturnRows(storedRevocationRows(now, storedRowOptions{
+			Status: credential.StatusPrepared, AvailableAt: now, Version: 2,
+			ChildCreatePermitSHA256: credential.SHA256Hex([]byte("correct-permit")),
+			ChildCreateAuthorizedAt: now.Add(-time.Second), ChildCreateTTLSeconds: 585,
+		}))
+	database.ExpectRollback()
+
+	_, err = repository.AuthorizeChildCreate(context.Background(), credential.AuthorizeChildCreateRequest{
+		Permit: credential.ChildCreatePermit{RevocationID: postgresTestRevocationID, Token: "wrong-permit"}, Fence: fence,
+	})
+	if !errors.Is(err, credential.ErrStaleChildCreatePermit) {
+		t.Fatalf("AuthorizeChildCreate(wrong permit after authorization) error = %v", err)
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet pgx expectations: %v", err)
+	}
+}
+
+func TestAuthorizeChildCreateEnforcesActionFenceReserveBoundary(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 10, 15, 14, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name    string
+		window  time.Duration
+		wantErr error
+	}{
+		{name: "exact boundary", window: credential.ChildCreateExpiryReserve + credential.MinPostChildFenceWindow},
+		{name: "one microsecond short", window: credential.ChildCreateExpiryReserve + credential.MinPostChildFenceWindow - time.Microsecond, wantErr: credential.ErrStaleActionFence},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			repository, err := New(database, repositoryTestProtector(t), Options{MonotonicNow: func() time.Time { return now }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fence := credential.ActionFence{ActionID: postgresTestActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 4}
+			permit := credential.ChildCreatePermit{RevocationID: postgresTestRevocationID, Token: "boundary-permit"}
+			permitDigest := credential.SHA256Hex([]byte(permit.Token))
+			database.ExpectBegin()
+			database.ExpectQuery("SELECT tenant_id::text, runner_pool, enabled, scope_revision.*FOR SHARE").
+				WithArgs(fence.RunnerID).
+				WillReturnRows(runnerRegistrationRows(true, "WRITE", 7))
+			database.ExpectQuery("SELECT action_id, runner_tenant_id::text.*FOR SHARE").
+				WithArgs(fence.ActionID, fence.RunnerID, fence.Epoch, credential.SHA256Hex([]byte(fence.Token))).
+				WillReturnRows(actionMetadataRowsWithLease(now, fence, now.Add(test.window), now.Add(test.window)))
+			database.ExpectQuery("SELECT EXISTS.*FROM runner_scope_bindings").
+				WithArgs(fence.RunnerID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment).
+				WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+			database.ExpectQuery("SELECT .* FROM credential_revocations.*FOR UPDATE").
+				WithArgs(postgresTestRevocationID).
+				WillReturnRows(storedRevocationRows(now, storedRowOptions{
+					Status: credential.StatusPrepared, AvailableAt: now, Version: 1, CredentialExpiresAt: now.Add(time.Minute),
+					ChildCreatePermitSHA256: permitDigest,
+				}))
+			database.ExpectQuery("SELECT clock_timestamp\\(\\)").
+				WillReturnRows(pgxmock.NewRows([]string{"database_now"}).AddRow(now))
+			if test.wantErr == nil {
+				database.ExpectQuery("UPDATE credential_revocations SET child_create_authorized_at").
+					WithArgs(postgresTestRevocationID, now, int32(45), permitDigest).
+					WillReturnRows(storedRevocationRows(now, storedRowOptions{
+						Status: credential.StatusPrepared, AvailableAt: now, Version: 2, CredentialExpiresAt: now.Add(time.Minute),
+						ChildCreatePermitSHA256: permitDigest, ChildCreateAuthorizedAt: now, ChildCreateTTLSeconds: 45,
+					}))
+				database.ExpectExec("INSERT INTO audit_records").
+					WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID,
+						"RUNNER", fence.RunnerID, "credential.revocation.child_create_authorized", postgresTestRevocationID,
+						pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+					WillReturnResult(pgxmock.NewResult("INSERT", 1))
+				database.ExpectExec("INSERT INTO outbox_events").
+					WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID,
+						postgresTestRevocationID, int64(2), "credential.revocation.child_create_authorized.v1", pgxmock.AnyArg()).
+					WillReturnResult(pgxmock.NewResult("INSERT", 1))
+				database.ExpectCommit()
+			} else {
+				database.ExpectRollback()
+			}
+
+			authorized, err := repository.AuthorizeChildCreate(context.Background(), credential.AuthorizeChildCreateRequest{
+				Permit: permit, Fence: fence,
+			})
+			if !errors.Is(err, test.wantErr) || (test.wantErr == nil && authorized.TTL != 45*time.Second) {
+				t.Fatalf("AuthorizeChildCreate(action boundary) = %#v, %v, want %v", authorized, err, test.wantErr)
+			}
+			if err := database.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet pgx expectations: %v", err)
+			}
+		})
 	}
 }
 
@@ -138,13 +497,19 @@ func TestPrepareCommitResponseLossNeverAuthorizesChildCreationAndRetryIsNotCreat
 				request.RevocationID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment,
 				fence.ActionID, "cluster-a/payments", true, fence.RunnerID, fence.Epoch, tokenDigest,
 				request.Issuer, "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api",
-				request.CredentialExpiresAt,
+				request.CredentialExpiresAt, pgxmock.AnyArg(),
 			).
+			WillReturnRows(rows)
+	}
+	expectExisting := func(rows *pgxmock.Rows) {
+		database.ExpectQuery("SELECT .* FROM credential_revocations.*WHERE action_id = \\$1 AND action_lease_epoch = \\$2.*FOR SHARE").
+			WithArgs(fence.ActionID, fence.Epoch).
 			WillReturnRows(rows)
 	}
 
 	database.ExpectBegin()
 	expectResolve()
+	expectExisting(pgxmock.NewRows(storedRevocationColumns()))
 	expectInsert(pgxmock.NewRows([]string{"status", "available_at", "created_at", "updated_at", "version"}).
 		AddRow("PREPARED", now, now, now, int64(1)))
 	database.ExpectExec("INSERT INTO audit_records").
@@ -161,24 +526,73 @@ func TestPrepareCommitResponseLossNeverAuthorizesChildCreationAndRetryIsNotCreat
 	database.ExpectRollback()
 
 	first, firstErr := repository.Prepare(context.Background(), request)
-	if firstErr == nil || first.Created {
+	if firstErr == nil || first.Created || first.Permit != nil {
 		t.Fatalf("Prepare(ambiguous commit) = %#v, %v", first, firstErr)
 	}
 
 	database.ExpectBegin()
 	expectResolve()
-	expectInsert(pgxmock.NewRows([]string{"status", "available_at", "created_at", "updated_at", "version"}))
-	database.ExpectQuery("SELECT .* FROM credential_revocations").
-		WithArgs(fence.ActionID, fence.Epoch).
-		WillReturnRows(storedRevocationRows(now, storedRowOptions{
-			Status: credential.StatusPrepared, AvailableAt: now, Version: 1,
-		}))
+	expectExisting(storedRevocationRows(now, storedRowOptions{
+		Status: credential.StatusPrepared, AvailableAt: now, Version: 2,
+		ChildCreateAuthorizedAt: now.Add(-30 * time.Second), ChildCreateTTLSeconds: 600,
+	}))
 	expectResolve()
 	database.ExpectCommit()
 
 	retry, retryErr := repository.Prepare(context.Background(), request)
 	if retryErr != nil || retry.Created || retry.Revocation.ID != request.RevocationID {
 		t.Fatalf("Prepare(retry after ambiguous commit) = %#v, %v", retry, retryErr)
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet pgx expectations: %v", err)
+	}
+}
+
+func TestPrepareReplayDoesNotDependOnPermitSourceAvailability(t *testing.T) {
+	t.Parallel()
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	permitCalls := 0
+	repository, err := New(database, repositoryTestProtector(t), Options{PermitSource: func() (string, error) {
+		permitCalls++
+		return "", errors.New("random source unavailable")
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 10, 15, 17, 0, 0, time.UTC)
+	fence := credential.ActionFence{
+		ActionID: postgresTestActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 4,
+	}
+	request := credential.PrepareRequest{
+		RevocationID: postgresTestRevocationID, Fence: fence, Issuer: "vault-production",
+		CredentialExpiresAt: now.Add(10 * time.Minute),
+	}
+	tokenDigest := credential.SHA256Hex([]byte(fence.Token))
+	database.ExpectBegin()
+	database.ExpectQuery("SELECT action_id, runner_tenant_id::text").
+		WithArgs(fence.ActionID, fence.RunnerID, fence.Epoch, tokenDigest).
+		WillReturnRows(actionMetadataRows(now, fence, now.Add(15*time.Minute)))
+	database.ExpectQuery("SELECT .* FROM credential_revocations.*WHERE action_id = \\$1 AND action_lease_epoch = \\$2.*FOR SHARE").
+		WithArgs(fence.ActionID, fence.Epoch).
+		WillReturnRows(storedRevocationRows(now, storedRowOptions{
+			Status: credential.StatusPrepared, AvailableAt: now, Version: 1,
+			CredentialExpiresAt: request.CredentialExpiresAt,
+		}))
+	database.ExpectQuery("SELECT action_id, runner_tenant_id::text").
+		WithArgs(fence.ActionID, fence.RunnerID, fence.Epoch, tokenDigest).
+		WillReturnRows(actionMetadataRows(now, fence, now.Add(15*time.Minute)))
+	database.ExpectCommit()
+
+	replayed, err := repository.Prepare(context.Background(), request)
+	if err != nil || replayed.Created || replayed.Permit != nil || replayed.Revocation.ID != postgresTestRevocationID {
+		t.Fatalf("Prepare(replay with failed permit source) = %#v, %v", replayed, err)
+	}
+	if permitCalls != 0 {
+		t.Fatalf("Prepare(replay) PermitSource calls = %d, want 0", permitCalls)
 	}
 	if err := database.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet pgx expectations: %v", err)
@@ -218,15 +632,7 @@ func TestPrepareReplayReturnsCanonicalIDUnlessCandidateIsAlreadyOccupied(t *test
 			database.ExpectQuery("SELECT action_id, runner_tenant_id::text").
 				WithArgs(fence.ActionID, fence.RunnerID, fence.Epoch, credential.SHA256Hex([]byte(fence.Token))).
 				WillReturnRows(actionMetadataRows(now, fence, now.Add(15*time.Minute)))
-			database.ExpectQuery("INSERT INTO credential_revocations").
-				WithArgs(
-					request.RevocationID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment,
-					fence.ActionID, "cluster-a/payments", true, fence.RunnerID, fence.Epoch,
-					credential.SHA256Hex([]byte(fence.Token)), request.Issuer, "kubernetes-prod",
-					"PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api", request.CredentialExpiresAt,
-				).
-				WillReturnRows(pgxmock.NewRows([]string{"status", "available_at", "created_at", "updated_at", "version"}))
-			database.ExpectQuery("SELECT .* FROM credential_revocations").
+			database.ExpectQuery("SELECT .* FROM credential_revocations.*WHERE action_id = \\$1 AND action_lease_epoch = \\$2.*FOR SHARE").
 				WithArgs(fence.ActionID, fence.Epoch).
 				WillReturnRows(storedRevocationRows(now, storedRowOptions{
 					Status: credential.StatusPrepared, AvailableAt: now, Version: 1,
@@ -326,13 +732,19 @@ func TestRecordAnchorIdempotencyAuthenticatesHMACWithoutDecryptingStoredAccessor
 	defer accessor.Destroy()
 
 	database.ExpectBegin()
+	database.ExpectQuery("SELECT tenant_id::text, runner_pool, enabled, scope_revision.*FOR SHARE").
+		WithArgs(fence.RunnerID).
+		WillReturnRows(runnerRegistrationRows(true, "WRITE", 7))
 	database.ExpectQuery("SELECT action.action_id, workspace.tenant_id::text").
 		WithArgs(fence.ActionID).
 		WillReturnRows(actionInspectionRows(now, fence, true))
+	database.ExpectQuery("SELECT EXISTS.*FROM runner_scope_bindings").
+		WithArgs(fence.RunnerID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
 	database.ExpectQuery("SELECT .* FROM credential_revocations").
 		WithArgs(postgresTestRevocationID).
 		WillReturnRows(storedRevocationRows(now, storedRowOptions{
-			Status: credential.StatusAnchored, Protected: protected, AvailableAt: now, Version: 2,
+			Status: credential.StatusAnchored, Protected: protected, AvailableAt: now, Version: 3,
 		}))
 	database.ExpectQuery("SELECT statement_timestamp\\(\\)").
 		WillReturnRows(pgxmock.NewRows([]string{"database_now"}).AddRow(now))
@@ -353,7 +765,50 @@ func TestRecordAnchorIdempotencyAuthenticatesHMACWithoutDecryptingStoredAccessor
 	}
 }
 
-func TestRecordAnchorInvalidatedActionAtomicallyAnchorsAndRequestsRevocation(t *testing.T) {
+func TestRecordAnchorRejectsPreparedWithoutChildCreateAuthorization(t *testing.T) {
+	t.Parallel()
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	repository, err := New(database, repositoryTestProtector(t), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 10, 15, 37, 0, 0, time.UTC)
+	fence := credential.ActionFence{ActionID: postgresTestActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 4}
+	accessor, _ := credential.NewSensitiveReference([]byte("must-not-be-protected"))
+	defer accessor.Destroy()
+	database.ExpectBegin()
+	database.ExpectQuery("SELECT tenant_id::text, runner_pool, enabled, scope_revision.*FOR SHARE").
+		WithArgs(fence.RunnerID).
+		WillReturnRows(runnerRegistrationRows(true, "WRITE", 7))
+	database.ExpectQuery("SELECT action.action_id, workspace.tenant_id::text").
+		WithArgs(fence.ActionID).
+		WillReturnRows(actionInspectionRows(now, fence, true))
+	database.ExpectQuery("SELECT EXISTS.*FROM runner_scope_bindings").
+		WithArgs(fence.RunnerID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	database.ExpectQuery("SELECT .* FROM credential_revocations.*FOR UPDATE").
+		WithArgs(postgresTestRevocationID).
+		WillReturnRows(storedRevocationRows(now, storedRowOptions{
+			Status: credential.StatusPrepared, AvailableAt: now, Version: 1,
+		}))
+	database.ExpectRollback()
+
+	_, err = repository.RecordAnchor(context.Background(), credential.RecordAnchorRequest{
+		RevocationID: postgresTestRevocationID, Fence: fence, Accessor: accessor,
+	})
+	if !errors.Is(err, credential.ErrInvalidTransition) {
+		t.Fatalf("RecordAnchor(without child authorization) error = %v", err)
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet pgx expectations: %v", err)
+	}
+}
+
+func TestRecordAnchorCancellationAtomicallyAnchorsAndRequestsRevocation(t *testing.T) {
 	t.Parallel()
 	database, err := pgxmock.NewPool()
 	if err != nil {
@@ -374,18 +829,25 @@ func TestRecordAnchorInvalidatedActionAtomicallyAnchorsAndRequestsRevocation(t *
 	protected := protectTestReference(t, protector, []byte("nacked-action-accessor"))
 
 	database.ExpectBegin()
+	database.ExpectQuery("SELECT tenant_id::text, runner_pool, enabled, scope_revision.*FOR SHARE").
+		WithArgs(fence.RunnerID).
+		WillReturnRows(runnerRegistrationRows(true, "WRITE", 7))
 	database.ExpectQuery("SELECT action.action_id, workspace.tenant_id::text").
 		WithArgs(fence.ActionID).
-		WillReturnRows(actionInspectionRows(now, fence, false))
+		WillReturnRows(actionInspectionRowsForState(now, fence, "RUNNING", now, 7))
+	database.ExpectQuery("SELECT EXISTS.*FROM runner_scope_bindings").
+		WithArgs(fence.RunnerID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
 	database.ExpectQuery("SELECT .* FROM credential_revocations").
 		WithArgs(postgresTestRevocationID).
 		WillReturnRows(storedRevocationRows(now, storedRowOptions{
-			Status: credential.StatusPrepared, AvailableAt: now, Version: 1,
+			Status: credential.StatusPrepared, AvailableAt: now, Version: 2,
+			ChildCreateAuthorizedAt: now.Add(-30 * time.Second), ChildCreateTTLSeconds: 600,
 		}))
 	database.ExpectQuery("UPDATE credential_revocations SET status = 'ANCHORED'").
 		WithArgs(postgresTestRevocationID, pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(storedRevocationRows(now, storedRowOptions{
-			Status: credential.StatusAnchored, Protected: protected, AvailableAt: now, Version: 2,
+			Status: credential.StatusAnchored, Protected: protected, AvailableAt: now, Version: 3,
 		}))
 	database.ExpectExec("INSERT INTO audit_records").
 		WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID,
@@ -394,12 +856,12 @@ func TestRecordAnchorInvalidatedActionAtomicallyAnchorsAndRequestsRevocation(t *
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	database.ExpectExec("INSERT INTO outbox_events").
 		WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID,
-			postgresTestRevocationID, int64(2), "credential.revocation.anchored.v1", pgxmock.AnyArg()).
+			postgresTestRevocationID, int64(3), "credential.revocation.anchored.v1", pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	database.ExpectQuery("UPDATE credential_revocations SET status = 'REVOCATION_PENDING'").
 		WithArgs(postgresTestRevocationID).
 		WillReturnRows(storedRevocationRows(now, storedRowOptions{
-			Status: credential.StatusRevocationPending, Protected: protected, AvailableAt: now, Version: 3,
+			Status: credential.StatusRevocationPending, Protected: protected, AvailableAt: now, Version: 4,
 		}))
 	database.ExpectExec("INSERT INTO audit_records").
 		WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID,
@@ -408,18 +870,98 @@ func TestRecordAnchorInvalidatedActionAtomicallyAnchorsAndRequestsRevocation(t *
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	database.ExpectExec("INSERT INTO outbox_events").
 		WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID,
-			postgresTestRevocationID, int64(3), "credential.revocation.requested.v1", pgxmock.AnyArg()).
+			postgresTestRevocationID, int64(4), "credential.revocation.requested.v1", pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	database.ExpectCommit()
 
 	anchored, err := repository.RecordAnchor(context.Background(), credential.RecordAnchorRequest{
 		RevocationID: postgresTestRevocationID, Fence: fence, Accessor: accessor,
 	})
-	if err != nil || anchored.Status != credential.StatusRevocationPending || !anchored.AccessorPresent || anchored.Version != 3 {
-		t.Fatalf("RecordAnchor(invalidated action) = %#v, %v", anchored, err)
+	if err != nil || anchored.Status != credential.StatusRevocationPending || !anchored.AccessorPresent || anchored.Version != 4 {
+		t.Fatalf("RecordAnchor(cancelled action) = %#v, %v", anchored, err)
 	}
 	if err := database.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet pgx expectations: %v", err)
+	}
+}
+
+func TestRecordAnchorReplayRequestsRevocationWhenRunnerScopeIsNoLongerCurrent(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 10, 15, 41, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name              string
+		registrationScope int64
+		actionScope       int64
+		bindingResult     *bool
+	}{
+		{name: "scope revision changed", registrationScope: 8, actionScope: 7},
+		{name: "exact binding removed", registrationScope: 7, actionScope: 7, bindingResult: boolPointer(false)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			protector := repositoryTestProtector(t)
+			repository, err := New(database, protector, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fence := credential.ActionFence{
+				ActionID: postgresTestActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 4,
+			}
+			accessorValue := []byte("scope-invalidated-anchor-accessor")
+			accessor, err := credential.NewSensitiveReference(accessorValue)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer accessor.Destroy()
+			protected := protectTestReference(t, protector, accessorValue)
+
+			database.ExpectBegin()
+			database.ExpectQuery("SELECT tenant_id::text, runner_pool, enabled, scope_revision.*FOR SHARE").
+				WithArgs(fence.RunnerID).
+				WillReturnRows(runnerRegistrationRows(true, "WRITE", test.registrationScope))
+			database.ExpectQuery("SELECT action.action_id, workspace.tenant_id::text").
+				WithArgs(fence.ActionID).
+				WillReturnRows(actionInspectionRowsForState(now, fence, "RUNNING", time.Time{}, test.actionScope))
+			if test.bindingResult != nil {
+				database.ExpectQuery("SELECT EXISTS.*FROM runner_scope_bindings").
+					WithArgs(fence.RunnerID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment).
+					WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(*test.bindingResult))
+			}
+			database.ExpectQuery("SELECT .* FROM credential_revocations").
+				WithArgs(postgresTestRevocationID).
+				WillReturnRows(storedRevocationRows(now, storedRowOptions{
+					Status: credential.StatusAnchored, Protected: protected, AvailableAt: now, Version: 3,
+				}))
+			database.ExpectQuery("UPDATE credential_revocations SET status = 'REVOCATION_PENDING'").
+				WithArgs(postgresTestRevocationID).
+				WillReturnRows(storedRevocationRows(now, storedRowOptions{
+					Status: credential.StatusRevocationPending, Protected: protected, AvailableAt: now, Version: 4,
+				}))
+			database.ExpectExec("INSERT INTO audit_records").
+				WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID,
+					"RUNNER", fence.RunnerID, "credential.revocation.requested", postgresTestRevocationID,
+					pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+				WillReturnResult(pgxmock.NewResult("INSERT", 1))
+			database.ExpectExec("INSERT INTO outbox_events").
+				WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID,
+					postgresTestRevocationID, int64(4), "credential.revocation.requested.v1", pgxmock.AnyArg()).
+				WillReturnResult(pgxmock.NewResult("INSERT", 1))
+			database.ExpectCommit()
+
+			anchored, err := repository.RecordAnchor(context.Background(), credential.RecordAnchorRequest{
+				RevocationID: postgresTestRevocationID, Fence: fence, Accessor: accessor,
+			})
+			if err != nil || anchored.Status != credential.StatusRevocationPending || anchored.Version != 4 {
+				t.Fatalf("RecordAnchor(%s) = %#v, %v", test.name, anchored, err)
+			}
+			if err := database.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet pgx expectations: %v", err)
+			}
+		})
 	}
 }
 
@@ -451,24 +993,31 @@ func TestRecordAnchorRechecksDatabaseCommitWindowForNewAndIdempotentPaths(t *tes
 			protected := protectTestReference(t, protector, accessorValue)
 
 			database.ExpectBegin()
+			database.ExpectQuery("SELECT tenant_id::text, runner_pool, enabled, scope_revision.*FOR SHARE").
+				WithArgs(fence.RunnerID).
+				WillReturnRows(runnerRegistrationRows(true, "WRITE", 7))
 			database.ExpectQuery("SELECT action.action_id, workspace.tenant_id::text").
 				WithArgs(fence.ActionID).
 				WillReturnRows(actionInspectionRows(now, fence, true))
-			status, version := credential.StatusPrepared, int64(1)
+			database.ExpectQuery("SELECT EXISTS.*FROM runner_scope_bindings").
+				WithArgs(fence.RunnerID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment).
+				WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+			status, version := credential.StatusPrepared, int64(2)
 			storedProtected := credential.ProtectedReference{}
 			if idempotent {
-				status, version, storedProtected = credential.StatusAnchored, 2, protected
+				status, version, storedProtected = credential.StatusAnchored, 3, protected
 			}
 			database.ExpectQuery("SELECT .* FROM credential_revocations").
 				WithArgs(postgresTestRevocationID).
 				WillReturnRows(storedRevocationRows(now, storedRowOptions{
 					Status: status, Protected: storedProtected, AvailableAt: now, Version: version,
+					ChildCreateAuthorizedAt: now.Add(-30 * time.Second), ChildCreateTTLSeconds: 600,
 				}))
 			if !idempotent {
 				database.ExpectQuery("UPDATE credential_revocations SET status = 'ANCHORED'").
 					WithArgs(postgresTestRevocationID, pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 					WillReturnRows(storedRevocationRows(now, storedRowOptions{
-						Status: credential.StatusAnchored, Protected: protected, AvailableAt: now, Version: 2,
+						Status: credential.StatusAnchored, Protected: protected, AvailableAt: now, Version: 3,
 					}))
 				database.ExpectExec("INSERT INTO audit_records").
 					WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID,
@@ -477,7 +1026,7 @@ func TestRecordAnchorRechecksDatabaseCommitWindowForNewAndIdempotentPaths(t *tes
 					WillReturnResult(pgxmock.NewResult("INSERT", 1))
 				database.ExpectExec("INSERT INTO outbox_events").
 					WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID,
-						postgresTestRevocationID, int64(2), "credential.revocation.anchored.v1", pgxmock.AnyArg()).
+						postgresTestRevocationID, int64(3), "credential.revocation.anchored.v1", pgxmock.AnyArg()).
 					WillReturnResult(pgxmock.NewResult("INSERT", 1))
 			}
 			database.ExpectQuery("SELECT statement_timestamp\\(\\)").
@@ -485,7 +1034,7 @@ func TestRecordAnchorRechecksDatabaseCommitWindowForNewAndIdempotentPaths(t *tes
 			database.ExpectQuery("UPDATE credential_revocations SET status = 'REVOCATION_PENDING'").
 				WithArgs(postgresTestRevocationID).
 				WillReturnRows(storedRevocationRows(now, storedRowOptions{
-					Status: credential.StatusRevocationPending, Protected: protected, AvailableAt: now, Version: 3,
+					Status: credential.StatusRevocationPending, Protected: protected, AvailableAt: now, Version: 4,
 				}))
 			database.ExpectExec("INSERT INTO audit_records").
 				WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID,
@@ -494,7 +1043,7 @@ func TestRecordAnchorRechecksDatabaseCommitWindowForNewAndIdempotentPaths(t *tes
 				WillReturnResult(pgxmock.NewResult("INSERT", 1))
 			database.ExpectExec("INSERT INTO outbox_events").
 				WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID,
-					postgresTestRevocationID, int64(3), "credential.revocation.requested.v1", pgxmock.AnyArg()).
+					postgresTestRevocationID, int64(4), "credential.revocation.requested.v1", pgxmock.AnyArg()).
 				WillReturnResult(pgxmock.NewResult("INSERT", 1))
 			database.ExpectCommit()
 
@@ -530,9 +1079,15 @@ func TestActivateUsesFrozenInspectionAndRequestsRevocationWhenCommitWindowExpire
 	protected := protectTestReference(t, protector, []byte("activate-commit-window-accessor"))
 
 	database.ExpectBegin()
+	database.ExpectQuery("SELECT tenant_id::text, runner_pool, enabled, scope_revision.*FOR SHARE").
+		WithArgs(fence.RunnerID).
+		WillReturnRows(runnerRegistrationRows(true, "WRITE", 7))
 	database.ExpectQuery("SELECT action.action_id, workspace.tenant_id::text").
 		WithArgs(fence.ActionID).
 		WillReturnRows(actionInspectionRows(now, fence, true))
+	database.ExpectQuery("SELECT EXISTS.*FROM runner_scope_bindings").
+		WithArgs(fence.RunnerID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
 	database.ExpectQuery("SELECT .* FROM credential_revocations").
 		WithArgs(postgresTestRevocationID).
 		WillReturnRows(storedRevocationRows(now, storedRowOptions{
@@ -581,7 +1136,7 @@ func TestActivateUsesFrozenInspectionAndRequestsRevocationWhenCommitWindowExpire
 	}
 }
 
-func TestActivateActiveReplayImmediatelyRequestsWhenActionInspectionIsInvalid(t *testing.T) {
+func TestActivateActiveReplayImmediatelyRequestsWhenRunnerIsDisabled(t *testing.T) {
 	t.Parallel()
 	database, err := pgxmock.NewPool()
 	if err != nil {
@@ -599,9 +1154,12 @@ func TestActivateActiveReplayImmediatelyRequestsWhenActionInspectionIsInvalid(t 
 	}
 	protected := protectTestReference(t, protector, []byte("activate-invalid-inspection-accessor"))
 	database.ExpectBegin()
+	database.ExpectQuery("SELECT tenant_id::text, runner_pool, enabled, scope_revision.*FOR SHARE").
+		WithArgs(fence.RunnerID).
+		WillReturnRows(runnerRegistrationRows(false, "WRITE", 7))
 	database.ExpectQuery("SELECT action.action_id, workspace.tenant_id::text").
 		WithArgs(fence.ActionID).
-		WillReturnRows(actionInspectionRows(now, fence, false))
+		WillReturnRows(actionInspectionRows(now, fence, true))
 	database.ExpectQuery("SELECT .* FROM credential_revocations").
 		WithArgs(postgresTestRevocationID).
 		WillReturnRows(storedRevocationRows(now, storedRowOptions{
@@ -627,7 +1185,7 @@ func TestActivateActiveReplayImmediatelyRequestsWhenActionInspectionIsInvalid(t 
 		RevocationID: postgresTestRevocationID, Fence: fence,
 	})
 	if err != nil || activated.Status != credential.StatusRevocationPending {
-		t.Fatalf("Activate(invalid inspection) = %#v, %v", activated, err)
+		t.Fatalf("Activate(disabled runner) = %#v, %v", activated, err)
 	}
 	if err := database.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet pgx expectations: %v", err)
@@ -693,12 +1251,15 @@ func TestPrepareRevalidatesFenceWindowImmediatelyBeforeCommit(t *testing.T) {
 	database.ExpectQuery("SELECT action_id, runner_tenant_id::text").
 		WithArgs(fence.ActionID, fence.RunnerID, fence.Epoch, tokenDigest).
 		WillReturnRows(actionMetadataRows(base, fence, base.Add(2*time.Second)))
+	database.ExpectQuery("SELECT .* FROM credential_revocations.*WHERE action_id = \\$1 AND action_lease_epoch = \\$2.*FOR SHARE").
+		WithArgs(fence.ActionID, fence.Epoch).
+		WillReturnRows(pgxmock.NewRows(storedRevocationColumns()))
 	database.ExpectQuery("INSERT INTO credential_revocations").
 		WithArgs(
 			request.RevocationID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment,
 			fence.ActionID, "cluster-a/payments", true, fence.RunnerID, fence.Epoch, tokenDigest,
 			request.Issuer, "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api",
-			credential.CanonicalCredentialExpiry(request.CredentialExpiresAt),
+			credential.CanonicalCredentialExpiry(request.CredentialExpiresAt), pgxmock.AnyArg(),
 		).
 		WillReturnRows(pgxmock.NewRows([]string{"status", "available_at", "created_at", "updated_at", "version"}).
 			AddRow("PREPARED", base, base, base, int64(1)))
@@ -717,7 +1278,7 @@ func TestPrepareRevalidatesFenceWindowImmediatelyBeforeCommit(t *testing.T) {
 	database.ExpectRollback()
 
 	result, prepareErr := repository.Prepare(context.Background(), request)
-	if !errors.Is(prepareErr, credential.ErrStaleActionFence) || result.Created {
+	if !errors.Is(prepareErr, credential.ErrStaleActionFence) || result.Created || result.Permit != nil {
 		t.Fatalf("Prepare(commit window elapsed) = %#v, %v", result, prepareErr)
 	}
 	if err := database.ExpectationsWereMet(); err != nil {
@@ -772,6 +1333,42 @@ func TestRecoverPreparedUsesDatabaseBoundaryAndWritesAuditableTerminalState(t *t
 	replayed, err := repository.RecoverPrepared(context.Background(), credential.RecoverPreparedRequest{Limit: 10})
 	if err != nil || len(replayed) != 0 {
 		t.Fatalf("RecoverPrepared(replay) = %#v, %v", replayed, err)
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet pgx expectations: %v", err)
+	}
+}
+
+func TestRecordNoCredentialRejectsConsumedChildCreateAuthorization(t *testing.T) {
+	t.Parallel()
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	repository, err := New(database, repositoryTestProtector(t), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 10, 16, 12, 0, 0, time.UTC)
+	fence := credential.ActionFence{ActionID: postgresTestActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 4}
+	database.ExpectBegin()
+	database.ExpectQuery("SELECT action_id, runner_tenant_id::text.*FOR SHARE").
+		WithArgs(fence.ActionID, fence.RunnerID, fence.Epoch, credential.SHA256Hex([]byte(fence.Token))).
+		WillReturnRows(actionMetadataRows(now, fence, now.Add(10*time.Minute)))
+	database.ExpectQuery("SELECT .* FROM credential_revocations.*FOR UPDATE").
+		WithArgs(postgresTestRevocationID).
+		WillReturnRows(storedRevocationRows(now, storedRowOptions{
+			Status: credential.StatusPrepared, AvailableAt: now, Version: 2,
+			ChildCreateAuthorizedAt: now.Add(-time.Second), ChildCreateTTLSeconds: 585,
+		}))
+	database.ExpectRollback()
+
+	_, err = repository.RecordNoCredential(context.Background(), credential.ActionTransitionRequest{
+		RevocationID: postgresTestRevocationID, Fence: fence,
+	})
+	if !errors.Is(err, credential.ErrInvalidTransition) {
+		t.Fatalf("RecordNoCredential(after child authorization) error = %v", err)
 	}
 	if err := database.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet pgx expectations: %v", err)
@@ -1071,6 +1668,10 @@ func TestSecondExternalConfirmationAtomicallyRequiresMatchingAdminEvidenceAndRev
 
 type storedRowOptions struct {
 	Status                    credential.RevocationStatus
+	CredentialExpiresAt       time.Time
+	ChildCreatePermitSHA256   string
+	ChildCreateAuthorizedAt   time.Time
+	ChildCreateTTLSeconds     int32
 	Protected                 credential.ProtectedReference
 	AvailableAt               time.Time
 	Version                   int64
@@ -1124,11 +1725,25 @@ func (protector *spyingReferenceProtector) Calls() (matches, opens int) {
 }
 
 func storedRevocationRows(now time.Time, options storedRowOptions) *pgxmock.Rows {
+	permitDigest := options.ChildCreatePermitSHA256
+	if permitDigest == "" {
+		permitDigest = credential.SHA256Hex([]byte("child-create-permit"))
+	}
+	credentialExpiresAt := options.CredentialExpiresAt
+	if credentialExpiresAt.IsZero() {
+		credentialExpiresAt = now.Add(10 * time.Minute)
+	}
+	if options.ChildCreateAuthorizedAt.IsZero() && options.Status != credential.StatusPrepared &&
+		options.Status != credential.StatusNoCredential {
+		options.ChildCreateAuthorizedAt = now.Add(-30 * time.Second)
+		options.ChildCreateTTLSeconds = 600
+	}
 	return pgxmock.NewRows(storedRevocationColumns()).AddRow(
 		postgresTestRevocationID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment,
 		postgresTestActionID, "cluster-a/payments", true, "runner-write-1", int64(4), credential.SHA256Hex([]byte("action-token")),
 		"vault-production", "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api",
-		now.Add(10*time.Minute), string(options.Status), nullableBytes(options.Protected.Ciphertext), nullableBytes(options.Protected.AccessorHMAC),
+		credentialExpiresAt, permitDigest, nullableTime(options.ChildCreateAuthorizedAt), nullableInt32(options.ChildCreateTTLSeconds),
+		string(options.Status), nullableBytes(options.Protected.Ciphertext), nullableBytes(options.Protected.AccessorHMAC),
 		nullableString(options.Protected.KeyID), options.ClaimEpoch, nullableString(options.ClaimedBy), nullableString(options.ClaimTokenSHA256),
 		nullableTime(options.ClaimedAt), nullableTime(options.ClaimExpiresAt), nullableTime(options.HeartbeatAt),
 		nullableInt64(options.CompletedClaimEpoch), nullableString(options.CompletedClaimTokenSHA256), nullableString(options.CompletedClaimedBy),
@@ -1142,7 +1757,8 @@ func storedRevocationColumns() []string {
 	return []string{
 		"revocation_id", "tenant_id", "workspace_id", "environment_id", "action_id", "target_key", "production",
 		"runner_id", "action_lease_epoch", "action_lease_token_sha256", "issuer", "connector_id", "scope_permission",
-		"scope_resource", "credential_expires_at", "status", "accessor_ciphertext", "accessor_hmac", "encryption_key_id",
+		"scope_resource", "credential_expires_at", "child_create_permit_sha256", "child_create_authorized_at",
+		"child_create_ttl_seconds", "status", "accessor_ciphertext", "accessor_hmac", "encryption_key_id",
 		"claim_epoch", "claimed_by", "claim_token_sha256", "claimed_at", "claim_expires_at", "last_heartbeat_at",
 		"completed_claim_epoch", "completed_claim_token_sha256", "completed_claimed_by", "attempt", "failure_count",
 		"failure_code", "failure_detail_sha256", "available_at", "evidence_hash", "anchored_at", "activated_at",
@@ -1172,6 +1788,8 @@ func nullableString(value string) any {
 	return value
 }
 
+func boolPointer(value bool) *bool { return &value }
+
 func nullableBytes(value []byte) any {
 	if len(value) == 0 {
 		return nil
@@ -1193,6 +1811,13 @@ func nullableInt64(value int64) any {
 	return value
 }
 
+func nullableInt32(value int32) any {
+	if value == 0 {
+		return nil
+	}
+	return int64(value)
+}
+
 func repositoryTestProtector(t *testing.T) credential.ReferenceProtector {
 	t.Helper()
 	protector, err := credential.NewAESGCMProtector(credential.KeyRing{
@@ -1212,13 +1837,46 @@ func repositoryTestProtector(t *testing.T) credential.ReferenceProtector {
 }
 
 func actionMetadataRows(now time.Time, fence credential.ActionFence, authorizationExpiresAt time.Time) *pgxmock.Rows {
+	return actionMetadataRowsWithLease(now, fence, now.Add(time.Minute), authorizationExpiresAt)
+}
+
+func runnerRegistrationRows(enabled bool, pool string, scopeRevision int64) *pgxmock.Rows {
+	return pgxmock.NewRows([]string{"tenant_id", "runner_pool", "enabled", "scope_revision"}).
+		AddRow(postgresTestTenantID, pool, enabled, scopeRevision)
+}
+
+func actionMetadataRowsForState(
+	now time.Time,
+	fence credential.ActionFence,
+	status string,
+	cancelRequestedAt time.Time,
+	scopeRevision int64,
+) *pgxmock.Rows {
 	return pgxmock.NewRows([]string{
 		"action_id", "tenant_id", "workspace_id", "environment_id", "target_key", "production", "runner_id",
-		"lease_epoch", "status", "lease_expires_at", "authorization_expires_at", "connector_id", "permission", "resource", "database_now",
+		"lease_epoch", "status", "lease_expires_at", "authorization_expires_at", "runner_pool", "scope_revision",
+		"cancel_requested_at", "connector_id", "permission", "resource", "database_now",
 	}).AddRow(
 		fence.ActionID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment,
-		"cluster-a/payments", true, fence.RunnerID, fence.Epoch, "RUNNING", now.Add(time.Minute), authorizationExpiresAt,
-		"kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api", now,
+		"cluster-a/payments", true, fence.RunnerID, fence.Epoch, status, now.Add(time.Minute), now.Add(10*time.Minute),
+		"WRITE", scopeRevision, nullableTime(cancelRequestedAt), "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART",
+		"cluster-a/payments/deployment/api", now,
+	)
+}
+
+func actionMetadataRowsWithLease(
+	now time.Time,
+	fence credential.ActionFence,
+	leaseExpiresAt, authorizationExpiresAt time.Time,
+) *pgxmock.Rows {
+	return pgxmock.NewRows([]string{
+		"action_id", "tenant_id", "workspace_id", "environment_id", "target_key", "production", "runner_id",
+		"lease_epoch", "status", "lease_expires_at", "authorization_expires_at", "runner_pool", "scope_revision",
+		"cancel_requested_at", "connector_id", "permission", "resource", "database_now",
+	}).AddRow(
+		fence.ActionID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment,
+		"cluster-a/payments", true, fence.RunnerID, fence.Epoch, "RUNNING", leaseExpiresAt, authorizationExpiresAt,
+		"WRITE", int64(7), nil, "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api", now,
 	)
 }
 
@@ -1228,20 +1886,41 @@ func actionInspectionRows(now time.Time, fence credential.ActionFence, current b
 	status := any("RUNNING")
 	leaseTokenDigest := any(credential.SHA256Hex([]byte(fence.Token)))
 	leaseExpiresAt := any(now.Add(time.Minute))
+	scopeRevision := any(int64(7))
 	if !current {
 		runnerID = nil
 		leaseEpoch = int64(fence.Epoch)
 		status = "QUEUED"
 		leaseTokenDigest = nil
 		leaseExpiresAt = nil
+		scopeRevision = nil
 	}
 	return pgxmock.NewRows([]string{
 		"action_id", "tenant_id", "workspace_id", "environment_id", "target_key", "production",
 		"runner_id", "lease_epoch", "status", "lease_token_sha256", "lease_expires_at", "authorization_expires_at",
-		"connector_id", "permission", "resource", "database_now",
+		"runner_pool", "scope_revision", "cancel_requested_at", "connector_id", "permission", "resource", "database_now",
 	}).AddRow(
 		fence.ActionID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment,
 		"cluster-a/payments", true, runnerID, leaseEpoch, status, leaseTokenDigest, leaseExpiresAt, now.Add(15*time.Minute),
+		"WRITE", scopeRevision, nil, "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api", now,
+	)
+}
+
+func actionInspectionRowsForState(
+	now time.Time,
+	fence credential.ActionFence,
+	status string,
+	cancelRequestedAt time.Time,
+	scopeRevision int64,
+) *pgxmock.Rows {
+	return pgxmock.NewRows([]string{
+		"action_id", "tenant_id", "workspace_id", "environment_id", "target_key", "production",
+		"runner_id", "lease_epoch", "status", "lease_token_sha256", "lease_expires_at", "authorization_expires_at",
+		"runner_pool", "scope_revision", "cancel_requested_at", "connector_id", "permission", "resource", "database_now",
+	}).AddRow(
+		fence.ActionID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment,
+		"cluster-a/payments", true, fence.RunnerID, fence.Epoch, status, credential.SHA256Hex([]byte(fence.Token)),
+		now.Add(time.Minute), now.Add(15*time.Minute), "WRITE", scopeRevision, nullableTime(cancelRequestedAt),
 		"kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api", now,
 	)
 }
