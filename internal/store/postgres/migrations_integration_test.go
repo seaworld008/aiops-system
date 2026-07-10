@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -46,7 +48,11 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	}
 
 	migrationDirectory := migrationPath(t)
-	applyMigrations(t, ctx, database, migrationDirectory, ".up.sql", false)
+	applyMigrationsBefore(t, ctx, database, migrationDirectory, ".up.sql", "000007_runner_execution_hardening.up.sql")
+	seedLegacyExecutionLeaseTokens(t, ctx, database)
+	applyMigrationFile(t, ctx, database, filepath.Join(migrationDirectory, "000007_runner_execution_hardening.up.sql"))
+	verifyLegacyExecutionLeaseTokenHashes(t, ctx, database)
+	execSQL(t, ctx, database, `DELETE FROM execution_leases`)
 
 	const (
 		tenant1        = "10000000-0000-4000-8000-000000000001"
@@ -192,7 +198,14 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 		t.Fatalf("real AckOutbox(second) error = %v", err)
 	}
 
-	exerciseRealActionQueue(t, ctx, database, workspace1, environment1, service1)
+	exerciseRealActionQueue(t, ctx, database, tenant1, workspace1, environment1, service1)
+	expectSQLState(t, ctx, database, "P0001", `TRUNCATE runner_result_receipts`)
+	expectMigrationSQLState(t, ctx, database, filepath.Join(migrationDirectory, "000007_runner_execution_hardening.down.sql"), "55000")
+	execSQL(t, ctx, database, `DROP TRIGGER runner_result_receipts_no_truncate ON runner_result_receipts`)
+	execSQL(t, ctx, database, `TRUNCATE runner_result_receipts`)
+	execSQL(t, ctx, database, `DELETE FROM runner_certificates`)
+	execSQL(t, ctx, database, `DELETE FROM runner_scope_bindings`)
+	execSQL(t, ctx, database, `DELETE FROM runner_registrations`)
 
 	applyMigrations(t, ctx, database, migrationDirectory, ".down.sql", true)
 	var relationName *string
@@ -204,7 +217,7 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	}
 }
 
-func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpool.Pool, workspaceID, environmentID, serviceID string) {
+func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpool.Pool, tenantID, workspaceID, environmentID, serviceID string) {
 	t.Helper()
 	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -218,7 +231,85 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	if err != nil {
 		t.Fatalf("create real PostgreSQL ActionQueue: %v", err)
 	}
+	for _, runnerID := range []string{"runner-postgres-1", "runner-postgres-2", "runner-postgres-3", "runner-postgres-4"} {
+		execSQL(t, ctx, database, `
+			INSERT INTO runner_registrations (runner_id, tenant_id, spiffe_uri, runner_pool, enabled, scope_revision)
+			VALUES ($1, $2, 'spiffe://integration.test/runner/write/' || $1, 'WRITE', true, 1)
+		`, runnerID, tenantID)
+		execSQL(t, ctx, database, `
+			INSERT INTO runner_scope_bindings (runner_id, tenant_id, workspace_id, environment_id)
+			VALUES ($1, $2, $3, $4)
+		`, runnerID, tenantID, workspaceID, environmentID)
+	}
+	expectSQLState(t, ctx, database, "55000", `TRUNCATE runner_scope_bindings`)
+	execSQL(t, ctx, database, `
+		INSERT INTO runner_certificates (
+			certificate_sha256, runner_id, tenant_id, issuer_key_id, serial_hex, spki_sha256,
+			status, not_before, not_after
+		) VALUES ($1, 'runner-postgres-1', $2, 'integration-ca-1', '01', $3, 'ACTIVE', now() - interval '1 minute', now() + interval '1 hour')
+	`, strings.Repeat("1", 64), tenantID, strings.Repeat("2", 64))
+	expectSQLState(t, ctx, database, "23514", `
+		INSERT INTO runner_certificates (
+			certificate_sha256, runner_id, tenant_id, issuer_key_id, serial_hex, spki_sha256,
+			status, not_before, not_after, revoked_at, revocation_reason
+		) VALUES ($1, 'runner-postgres-1', $2, 'integration-ca-1', '02', $3, 'ACTIVE',
+			now() - interval '1 minute', now() + interval '1 hour', now(), 'must not accompany ACTIVE')
+	`, strings.Repeat("3", 64), tenantID, strings.Repeat("4", 64))
 	now := time.Now().UTC()
+	claimLockSubmission := realActionSubmission(t, signer, now, "90000000-0000-4000-8000-000000000097", workspaceID, environmentID,
+		serviceID, "payments-claim-lock", 'f')
+	claimLockSubmission.Production = false
+	tokenRequested := make(chan struct{})
+	releaseToken := make(chan struct{})
+	claimLockQueue, err := executionpostgres.New(database, executionpostgres.Options{TokenSource: func() (string, error) {
+		close(tokenRequested)
+		<-releaseToken
+		return strings.Repeat("9", 64), nil
+	}})
+	if err != nil {
+		t.Fatalf("create claim-lock ActionQueue: %v", err)
+	}
+	if _, err := claimLockQueue.Submit(ctx, claimLockSubmission); err != nil {
+		t.Fatalf("submit claim-lock action: %v", err)
+	}
+	type lockedClaimResult struct {
+		claim execution.ClaimedAction
+		err   error
+	}
+	lockedClaimDone := make(chan lockedClaimResult, 1)
+	lockedScope := realRunnerScope(t, ctx, database, "runner-postgres-1")
+	go func() {
+		claim, claimErr := claimLockQueue.Claim(ctx, execution.ActionClaimRequest{Scope: lockedScope, LeaseDuration: time.Minute})
+		lockedClaimDone <- lockedClaimResult{claim: claim, err: claimErr}
+	}()
+	select {
+	case <-tokenRequested:
+	case <-time.After(5 * time.Second):
+		t.Fatal("claim did not reach token source while holding registry lock")
+	}
+	deleteContext, cancelDelete := context.WithTimeout(ctx, 250*time.Millisecond)
+	_, deleteErr := database.Exec(deleteContext, `
+		DELETE FROM runner_scope_bindings
+		WHERE runner_id = 'runner-postgres-1' AND tenant_id = $1 AND workspace_id = $2 AND environment_id = $3
+	`, tenantID, workspaceID, environmentID)
+	cancelDelete()
+	close(releaseToken)
+	var lockedClaim lockedClaimResult
+	select {
+	case lockedClaim = <-lockedClaimDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("claim did not finish after token source release")
+	}
+	if lockedClaim.err != nil {
+		t.Fatalf("claim-lock Claim() error = %v", lockedClaim.err)
+	}
+	if deleteErr == nil || !errors.Is(deleteContext.Err(), context.DeadlineExceeded) {
+		t.Fatalf("scope binding delete was not blocked by Claim registration lock: error=%v context=%v", deleteErr, deleteContext.Err())
+	}
+	if _, err := claimLockQueue.Cancel(ctx, lockedClaim.claim.Execution.ExecutionID); err != nil {
+		t.Fatalf("cancel claim-lock action: %v", err)
+	}
+
 	submissions := []execution.ActionSubmission{
 		realActionSubmission(t, signer, now, "90000000-0000-4000-8000-000000000001", workspaceID, environmentID, serviceID, "payments-api", 'a'),
 		realActionSubmission(t, signer, now, "90000000-0000-4000-8000-000000000002", workspaceID, environmentID, serviceID, "payments-worker", 'b'),
@@ -227,6 +318,21 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 		if _, err := queue.Submit(ctx, submission); err != nil {
 			t.Fatalf("real ActionQueue.Submit(%s): %v", submission.Envelope.ActionID, err)
 		}
+	}
+	retried, err := queue.Submit(ctx, submissions[0])
+	if err != nil || retried.ExecutionID != submissions[0].Envelope.ActionID {
+		t.Fatalf("real ActionQueue.Submit(idempotent) = %#v, %v", retried, err)
+	}
+	semanticRetry := realActionSubmission(t, signer, now, "90000000-0000-4000-8000-000000000098", workspaceID, environmentID,
+		serviceID, "payments-api", 'a', submissions[0].Envelope.IdempotencyKey)
+	retried, err = queue.Submit(ctx, semanticRetry)
+	if err != nil || retried.ExecutionID != submissions[0].Envelope.ActionID {
+		t.Fatalf("real ActionQueue.Submit(semantic idempotency retry) = %#v, %v", retried, err)
+	}
+	conflicting := realActionSubmission(t, signer, now, "90000000-0000-4000-8000-000000000099", workspaceID, environmentID,
+		serviceID, "payments-conflict", '9', submissions[0].Envelope.IdempotencyKey)
+	if _, err := queue.Submit(ctx, conflicting); !errors.Is(err, execution.ErrIdempotencyConflict) {
+		t.Fatalf("real ActionQueue.Submit(idempotency conflict) error = %v", err)
 	}
 
 	type claimResult struct {
@@ -240,10 +346,7 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 		go func() {
 			<-start
 			claim, claimErr := queue.Claim(ctx, execution.ActionClaimRequest{
-				Scope: execution.RunnerScope{
-					RunnerID: runnerID, Pool: executionlease.PoolWrite,
-					AllowedWorkspaceIDs: []string{workspaceID}, AllowedEnvironmentIDs: []string{environmentID},
-				},
+				Scope:         realRunnerScope(t, ctx, database, runnerID),
 				LeaseDuration: time.Minute,
 			})
 			results <- claimResult{claim: claim, err: claimErr}
@@ -280,50 +383,91 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	if err != nil || started.Status != executionlease.StatusRunning || started.LeaseToken != "" {
 		t.Fatalf("real ActionQueue.Start = %#v, %v", started, err)
 	}
-	heartbeat, err := queue.Heartbeat(ctx, executionlease.HeartbeatRequest{Lease: fence, Extension: 2 * time.Minute})
-	if err != nil || heartbeat.LeaseToken != "" || !heartbeat.LeaseExpiresAt.After(started.LeaseExpiresAt) {
+	heartbeat, err := queue.Heartbeat(ctx, execution.ActionHeartbeatRequest{Lease: fence, Sequence: 1, Extension: 2 * time.Minute})
+	if err != nil || heartbeat.Execution.LeaseToken != "" || !heartbeat.Execution.LeaseExpiresAt.After(started.LeaseExpiresAt) {
 		t.Fatalf("real ActionQueue.Heartbeat = %#v, %v", heartbeat, err)
 	}
-	completion := executionlease.CompleteRequest{
-		Lease: fence, Status: executionlease.StatusSucceeded, ResultHash: strings.Repeat("c", 64),
+	heartbeatExpiry := heartbeat.Execution.LeaseExpiresAt
+	replayedHeartbeat, err := queue.Heartbeat(ctx, execution.ActionHeartbeatRequest{Lease: fence, Sequence: 1, Extension: 2 * time.Minute})
+	if err != nil || !replayedHeartbeat.Execution.LeaseExpiresAt.Equal(heartbeatExpiry) {
+		t.Fatalf("real ActionQueue.Heartbeat(replay) = %#v, %v", replayedHeartbeat, err)
 	}
-	completed, err := queue.Complete(ctx, completion)
-	if err != nil || completed.Status != executionlease.StatusSucceeded || completed.LeaseToken != "" {
-		t.Fatalf("real ActionQueue.Complete = %#v, %v", completed, err)
+	if _, err := queue.Heartbeat(ctx, execution.ActionHeartbeatRequest{Lease: fence, Sequence: 0, Extension: 2 * time.Minute}); !errors.Is(err, execution.ErrHeartbeatSequence) {
+		t.Fatalf("real ActionQueue.Heartbeat(stale sequence) error = %v", err)
+	}
+	completion := execution.ActionCompleteRequest{
+		Lease: fence, Summary: execution.ExecutorResult{
+			Outcome: execution.ExecutorSucceeded, Code: "INTEGRATION_VERIFIED", Verification: execution.VerificationPassed, Changed: true,
+		},
+	}
+	finalizing, err := queue.Complete(ctx, completion)
+	if err != nil || finalizing.Status != executionlease.StatusFinalizing || finalizing.LeaseToken != "" {
+		t.Fatalf("real ActionQueue.Complete = %#v, %v", finalizing, err)
 	}
 	if _, err := queue.Complete(ctx, completion); err != nil {
 		t.Fatalf("real ActionQueue.Complete(idempotent): %v", err)
 	}
+	completed, err := queue.Finalize(ctx, fence)
+	if err != nil || completed.Status != executionlease.StatusSucceeded {
+		t.Fatalf("real ActionQueue.Finalize = %#v, %v", completed, err)
+	}
 
 	second, err := queue.Claim(ctx, execution.ActionClaimRequest{
-		Scope: execution.RunnerScope{
-			RunnerID: "runner-postgres-3", Pool: executionlease.PoolWrite,
-			AllowedWorkspaceIDs: []string{workspaceID}, AllowedEnvironmentIDs: []string{environmentID},
-		},
+		Scope:         realRunnerScope(t, ctx, database, "runner-postgres-3"),
 		LeaseDuration: time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("real ActionQueue.Claim(after completion): %v", err)
 	}
 	secondFence := second.Execution.Fence()
+	secondStarted, err := queue.Start(ctx, secondFence)
+	if err != nil {
+		t.Fatalf("real ActionQueue.Start(second): %v", err)
+	}
 	cancelled, err := queue.Cancel(ctx, second.Execution.ExecutionID)
-	if err != nil || cancelled.Status != executionlease.StatusCancelled || cancelled.LeaseToken != "" {
+	if err != nil || cancelled.Status != executionlease.StatusRunning || cancelled.CancelRequestedAt.IsZero() || cancelled.LeaseToken != "" {
 		t.Fatalf("real ActionQueue.Cancel = %#v, %v", cancelled, err)
 	}
-	if _, err := queue.Start(ctx, secondFence); !errors.Is(err, executionlease.ErrStaleLease) {
-		t.Fatalf("real ActionQueue.Start(cancelled fence) error = %v", err)
+	terminateHeartbeat, err := queue.Heartbeat(ctx, execution.ActionHeartbeatRequest{Lease: secondFence, Sequence: 1, Extension: 2 * time.Minute})
+	if err != nil || terminateHeartbeat.Directive != execution.HeartbeatTerminate ||
+		!terminateHeartbeat.Execution.LeaseExpiresAt.Equal(secondStarted.LeaseExpiresAt) {
+		t.Fatalf("real ActionQueue.Heartbeat(cancel intent) = %#v, %v", terminateHeartbeat, err)
 	}
 
 	third := realActionSubmission(t, signer, now, "90000000-0000-4000-8000-000000000003", workspaceID, environmentID, serviceID, "payments-jobs", 'd')
 	if _, err := queue.Submit(ctx, third); err != nil {
 		t.Fatalf("real ActionQueue.Submit(third): %v", err)
 	}
-	thirdClaim, err := queue.Claim(ctx, execution.ActionClaimRequest{
-		Scope: execution.RunnerScope{
-			RunnerID: "runner-postgres-4", Pool: executionlease.PoolWrite,
-			AllowedWorkspaceIDs: []string{workspaceID}, AllowedEnvironmentIDs: []string{environmentID},
+	cancelCompletion := execution.ActionCompleteRequest{
+		Lease: secondFence, Summary: execution.ExecutorResult{
+			Outcome: execution.ExecutorUncertain, Code: "CANCELLED_OUTCOME_UNKNOWN", Verification: execution.VerificationUnknown,
 		},
-		LeaseDuration: time.Minute,
+	}
+	secondFinalizing, err := queue.Complete(ctx, cancelCompletion)
+	if err != nil || secondFinalizing.Status != executionlease.StatusFinalizing {
+		t.Fatalf("real ActionQueue.Complete(cancelled running) = %#v, %v", secondFinalizing, err)
+	}
+	blockedClaim := execution.ActionClaimRequest{
+		Scope: realRunnerScope(t, ctx, database, "runner-postgres-4"), LeaseDuration: time.Minute,
+	}
+	if _, err := queue.Claim(ctx, blockedClaim); !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
+		t.Fatalf("FINALIZING released production slot: %v", err)
+	}
+	secondUncertain, err := queue.Finalize(ctx, secondFence)
+	if err != nil || secondUncertain.Status != executionlease.StatusUncertain {
+		t.Fatalf("real ActionQueue.Finalize(cancelled running) = %#v, %v", secondUncertain, err)
+	}
+	if _, err := queue.Claim(ctx, blockedClaim); !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
+		t.Fatalf("UNCERTAIN released production slot: %v", err)
+	}
+	if _, err := queue.Reconcile(ctx, executionlease.ReconcileRequest{
+		ExecutionID: second.Execution.ExecutionID, ReconciliationID: "reconcile-postgres-cancel",
+		ActorID: "sre-postgres-1", Status: executionlease.StatusFailed, ResultHash: strings.Repeat("c", 64),
+	}); err != nil {
+		t.Fatalf("real ActionQueue.Reconcile(cancelled running): %v", err)
+	}
+	thirdClaim, err := queue.Claim(ctx, execution.ActionClaimRequest{
+		Scope: blockedClaim.Scope, LeaseDuration: time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("real ActionQueue.Claim(third): %v", err)
@@ -368,7 +512,7 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	`, second.Execution.ExecutionID, strings.Repeat("a", 64))
 }
 
-func realActionSubmission(t *testing.T, signer action.Signer, now time.Time, actionID, workspaceID, environmentID, serviceID, deployment string, digestByte byte) execution.ActionSubmission {
+func realActionSubmission(t *testing.T, signer action.Signer, now time.Time, actionID, workspaceID, environmentID, serviceID, deployment string, digestByte byte, idempotencyKeys ...string) execution.ActionSubmission {
 	t.Helper()
 	envelope := action.Envelope{
 		SchemaVersion: action.SchemaVersionV1, ActionID: actionID, WorkspaceID: workspaceID,
@@ -393,6 +537,9 @@ func realActionSubmission(t *testing.T, signer action.Signer, now time.Time, act
 		IdempotencyKey: "idem-" + actionID, NotBefore: now, ExpiresAt: now.Add(30 * time.Minute),
 		TraceID: strings.Repeat("f", 32),
 	}
+	if len(idempotencyKeys) > 0 {
+		envelope.IdempotencyKey = idempotencyKeys[0]
+	}
 	sealed, err := action.Seal(context.Background(), envelope, envelope.RequestedBy, signer)
 	if err != nil {
 		t.Fatalf("seal real PostgreSQL action %s: %v", actionID, err)
@@ -402,6 +549,23 @@ func realActionSubmission(t *testing.T, signer action.Signer, now time.Time, act
 		TargetKey:           "k8s-deployment:sha256:" + strings.Repeat(string(digestByte), 64),
 		EnvironmentRevision: "environment-postgres-1", Production: true, Pool: executionlease.PoolWrite,
 	}
+}
+
+func realRunnerScope(t *testing.T, ctx context.Context, database *pgxpool.Pool, runnerID string) execution.RunnerScope {
+	t.Helper()
+	registry, err := executionpostgres.NewRunnerRegistry(database)
+	if err != nil {
+		t.Fatalf("NewRunnerRegistry() error = %v", err)
+	}
+	registration, err := registry.Resolve(ctx, runnerID)
+	if err != nil {
+		t.Fatalf("RunnerRegistry.Resolve(%s) error = %v", runnerID, err)
+	}
+	scope, err := registration.Scope()
+	if err != nil {
+		t.Fatalf("RunnerRegistration.Scope() error = %v", err)
+	}
+	return scope
 }
 
 func policyRisk() action.RiskAssessment {
@@ -415,6 +579,117 @@ func migrationPath(t *testing.T) string {
 		t.Fatal("cannot resolve migration test path")
 	}
 	return filepath.Clean(filepath.Join(filepath.Dir(filename), "../../../migrations"))
+}
+
+func seedLegacyExecutionLeaseTokens(t *testing.T, ctx context.Context, database *pgxpool.Pool) {
+	t.Helper()
+	execSQL(t, ctx, database, `
+		INSERT INTO execution_leases (
+			execution_id, target_key, runner_pool, production, status, runner_id,
+			lease_token, lease_epoch, lease_acquired_at, lease_expires_at, last_heartbeat_at,
+			created_at, updated_at
+		) VALUES (
+			'legacy-active', 'legacy/active', 'READ', false, 'LEASED', 'legacy-runner',
+			'legacy-active-secret', 1, statement_timestamp(), statement_timestamp() + interval '5 minutes',
+			statement_timestamp(), statement_timestamp(), statement_timestamp()
+		)
+	`)
+	execSQL(t, ctx, database, `
+		INSERT INTO execution_leases (
+			execution_id, target_key, runner_pool, production, status, runner_id,
+			lease_epoch, completed_at, result_hash, completed_lease_token, completed_lease_epoch,
+			created_at, updated_at
+		) VALUES (
+			'legacy-completed', 'legacy/completed', 'READ', false, 'SUCCEEDED', 'legacy-runner',
+			1, statement_timestamp(), $1, 'legacy-completed-secret', 1,
+			statement_timestamp(), statement_timestamp()
+		)
+	`, strings.Repeat("a", 64))
+}
+
+func verifyLegacyExecutionLeaseTokenHashes(t *testing.T, ctx context.Context, database *pgxpool.Pool) {
+	t.Helper()
+	for _, test := range []struct {
+		executionID string
+		token       string
+		active      bool
+	}{
+		{executionID: "legacy-active", token: "legacy-active-secret", active: true},
+		{executionID: "legacy-completed", token: "legacy-completed-secret", active: false},
+	} {
+		var plaintext, completedPlaintext, activeHash, completedHash *string
+		if err := database.QueryRow(ctx, `
+			SELECT lease_token, completed_lease_token, lease_token_sha256, completed_lease_token_sha256
+			FROM execution_leases WHERE execution_id = $1
+		`, test.executionID).Scan(&plaintext, &completedPlaintext, &activeHash, &completedHash); err != nil {
+			t.Fatalf("read migrated execution lease %s: %v", test.executionID, err)
+		}
+		digest := sha256.Sum256([]byte(test.token))
+		wantHash := hex.EncodeToString(digest[:])
+		if plaintext != nil || completedPlaintext != nil {
+			t.Fatalf("migration retained plaintext token for %s", test.executionID)
+		}
+		if test.active {
+			if activeHash == nil || *activeHash != wantHash || completedHash != nil {
+				t.Fatalf("active token hash for %s = (%v, %v), want %s", test.executionID, activeHash, completedHash, wantHash)
+			}
+		} else if completedHash == nil || *completedHash != wantHash || activeHash != nil {
+			t.Fatalf("completed token hash for %s = (%v, %v), want %s", test.executionID, activeHash, completedHash, wantHash)
+		}
+	}
+}
+
+func applyMigrationsBefore(t *testing.T, ctx context.Context, database *pgxpool.Pool, directory, suffix, cutoff string) {
+	t.Helper()
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatalf("ReadDir(%s): %v", directory, err)
+	}
+	var files []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), suffix) && entry.Name() < cutoff {
+			files = append(files, filepath.Join(directory, entry.Name()))
+		}
+	}
+	sort.Strings(files)
+	for _, file := range files {
+		applyMigrationFile(t, ctx, database, file)
+	}
+}
+
+func applyMigrationFile(t *testing.T, ctx context.Context, database *pgxpool.Pool, filename string) {
+	t.Helper()
+	contents, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", filename, err)
+	}
+	if _, err := database.Exec(ctx, string(contents)); err != nil {
+		t.Fatalf("apply migration %s: %v", filepath.Base(filename), err)
+	}
+}
+
+func expectMigrationSQLState(t *testing.T, ctx context.Context, database *pgxpool.Pool, filename, sqlState string) {
+	t.Helper()
+	contents, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", filename, err)
+	}
+	connection, err := database.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire PostgreSQL connection: %v", err)
+	}
+	defer connection.Release()
+	_, execErr := connection.Exec(ctx, string(contents))
+	if execErr == nil {
+		t.Fatalf("migration %s unexpectedly succeeded", filepath.Base(filename))
+	}
+	var postgresError *pgconn.PgError
+	if !errors.As(execErr, &postgresError) || postgresError.Code != sqlState {
+		t.Fatalf("migration %s error = %v, want SQLSTATE %s", filepath.Base(filename), execErr, sqlState)
+	}
+	if _, err := connection.Exec(ctx, "ROLLBACK"); err != nil {
+		t.Fatalf("rollback rejected migration %s: %v", filepath.Base(filename), err)
+	}
 }
 
 func applyMigrations(t *testing.T, ctx context.Context, database *pgxpool.Pool, directory, suffix string, reverse bool) {
@@ -436,13 +711,7 @@ func applyMigrations(t *testing.T, ctx context.Context, database *pgxpool.Pool, 
 		}
 	}
 	for _, filename := range files {
-		contents, err := os.ReadFile(filename)
-		if err != nil {
-			t.Fatalf("ReadFile(%s): %v", filename, err)
-		}
-		if _, err := database.Exec(ctx, string(contents)); err != nil {
-			t.Fatalf("apply migration %s: %v", filepath.Base(filename), err)
-		}
+		applyMigrationFile(t, ctx, database, filename)
 	}
 }
 

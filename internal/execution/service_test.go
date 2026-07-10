@@ -100,7 +100,7 @@ func TestSubmitRejectsUnverifiedAndUntrustedEnvironmentState(t *testing.T) {
 				Credentials:  &fakeCredentialBroker{err: errors.New("must not be reached")},
 				Policy:       &fakePreExecutionGate{},
 				Executors:    noOpExecutors(),
-			}, Options{RunnerID: "runner-1", AllowedWorkspaceIDs: []string{"workspace-1"}, AllowedEnvironmentIDs: []string{"PROD"}, LeaseDuration: time.Minute, Clock: func() time.Time { return now }})
+			}, Options{RunnerID: "runner-1", LeaseDuration: time.Minute, Clock: func() time.Time { return now }})
 
 			if _, err := service.Submit(context.Background(), test.envelope); !errors.Is(err, test.wantError) {
 				t.Fatalf("Submit() error = %v, want %v", err, test.wantError)
@@ -172,7 +172,7 @@ func TestRunNextCallsSafetyClaimCredentialPolicyStartTypedExecutorAndCompleteInO
 	wantOrder := []string{
 		"safety:claim", "lease:claim", "environment:resolve", "credential:policy", "credential:issue",
 		"policy:pre-execution", "safety:start", "environment:resolve", "lease:start", "executor:kubernetes-rollout-restart", "lease:complete",
-		"credential:revoke",
+		"credential:revoke", "lease:finalize",
 	}
 	if got := fixture.events.snapshot(); !equalStrings(got, wantOrder) {
 		t.Fatalf("call order = %v, want %v", got, wantOrder)
@@ -199,8 +199,7 @@ func TestServicesShareAtomicActionQueueWithoutProcessLocalJobState(t *testing.T)
 		Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed, Changed: true,
 	})
 	secondService := mustService(t, fixture.service.dependencies, Options{
-		RunnerID: "runner-1", AllowedWorkspaceIDs: []string{"workspace-1"}, AllowedEnvironmentIDs: []string{"PROD"},
-		LeaseDuration: time.Minute, FinalizeTimeout: time.Second, Clock: func() time.Time { return now },
+		RunnerID: "runner-1", LeaseDuration: time.Minute, FinalizeTimeout: time.Second, Clock: func() time.Time { return now },
 	})
 	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
 		t.Fatalf("first service Submit() error = %v", err)
@@ -458,10 +457,7 @@ func TestRunNextPolicyDenialDoesNotStartOrDispatch(t *testing.T) {
 		}
 	}
 	if _, err := fixture.leases.memory.Claim(context.Background(), ActionClaimRequest{
-		Scope: RunnerScope{
-			RunnerID: "runner-2", Pool: executionlease.PoolWrite,
-			AllowedWorkspaceIDs: []string{"workspace-1"}, AllowedEnvironmentIDs: []string{"PROD"},
-		},
+		Scope:         testRunnerScope(t, "runner-2", RunnerScopeBinding{WorkspaceID: "workspace-1", EnvironmentID: "PROD"}),
 		LeaseDuration: time.Minute,
 	}); !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
 		t.Fatalf("permanently denied action was redelivered: %v", err)
@@ -484,8 +480,7 @@ func TestRunNextPermanentlyRejectsDeterministicCredentialPolicyDenial(t *testing
 		Credentials:  &fakeCredentialBroker{err: credential.ErrCredentialDenied},
 		Policy:       &fakePreExecutionGate{}, Executors: noOpExecutors(),
 	}, Options{
-		RunnerID: "runner-1", AllowedWorkspaceIDs: []string{"workspace-1"}, AllowedEnvironmentIDs: []string{"PROD"},
-		LeaseDuration: time.Minute, Clock: func() time.Time { return now },
+		RunnerID: "runner-1", LeaseDuration: time.Minute, Clock: func() time.Time { return now },
 	})
 	if _, err := service.Submit(context.Background(), envelope); err != nil {
 		t.Fatalf("Submit() error = %v", err)
@@ -565,6 +560,95 @@ func TestRunNextTreatsCompletionTransportFailureAsUncertain(t *testing.T) {
 	}
 	if fixture.issuer.revokeCalls != 1 {
 		t.Fatalf("credential revoke calls = %d, want 1", fixture.issuer.revokeCalls)
+	}
+}
+
+func TestRunNextCredentialRevokeFailureLeavesDurableFinalizingState(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	envelope, keys := signedEnvelope(t, restartEnvelope(now))
+	fixture := newRunnerFixture(t, now, envelope, keys, ExecutorResult{
+		Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed, Changed: true,
+	})
+	fixture.issuer.revokeErr = errors.New("credential backend unavailable")
+	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	result, err := fixture.service.RunNext(context.Background())
+	if !errors.Is(err, ErrCredentialRevokeFailed) || result.Status != executionlease.StatusFinalizing {
+		t.Fatalf("RunNext() = %#v, %v; want durable FINALIZING revoke failure", result, err)
+	}
+	persisted, getErr := fixture.leases.Get(context.Background(), envelope.ActionID)
+	if getErr != nil || persisted.Status != executionlease.StatusFinalizing {
+		t.Fatalf("Get() = %#v, %v; want FINALIZING", persisted, getErr)
+	}
+	for _, event := range fixture.events.snapshot() {
+		if event == "lease:finalize" {
+			t.Fatalf("revoke failure invoked Finalize: %v", fixture.events.snapshot())
+		}
+	}
+}
+
+func TestRunNextFinalizeFailureLeavesRecoverableFinalizingState(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	clock := now
+	envelope, keys := signedEnvelope(t, restartEnvelope(now))
+	fixture := newRunnerFixtureWithClock(t, func() time.Time { return clock }, envelope, keys, ExecutorResult{
+		Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed, Changed: true,
+	})
+	fixture.leases.finalizeErr = errors.New("finalize response lost")
+	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	result, err := fixture.service.RunNext(context.Background())
+	if !errors.Is(err, ErrExecutionUncertain) || result.Status != executionlease.StatusFinalizing {
+		t.Fatalf("RunNext() = %#v, %v; want recoverable FINALIZING", result, err)
+	}
+	persisted, getErr := fixture.leases.Get(context.Background(), envelope.ActionID)
+	if getErr != nil || persisted.Status != executionlease.StatusFinalizing {
+		t.Fatalf("Get() = %#v, %v; want FINALIZING", persisted, getErr)
+	}
+	clock = envelope.ExpiresAt
+	if err := fixture.leases.memory.SweepExpired(context.Background()); err != nil {
+		t.Fatalf("SweepExpired() error = %v", err)
+	}
+	recovered, getErr := fixture.leases.Get(context.Background(), envelope.ActionID)
+	if getErr != nil || recovered.Status != executionlease.StatusSucceeded {
+		t.Fatalf("Get(recovered) = %#v, %v", recovered, getErr)
+	}
+}
+
+func TestRunNextStopsExecutorWhenRunnerScopeRevisionChanges(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	envelope, keys := signedEnvelope(t, restartEnvelope(now))
+	fixture := newRunnerFixture(t, now, envelope, keys, ExecutorResult{
+		Outcome: ExecutorSucceeded, Code: "SHOULD_NOT_COMPLETE", Verification: VerificationPassed, Changed: true,
+	})
+	base := RunnerRegistration{
+		RunnerID: "runner-1", Pool: executionlease.PoolWrite, Enabled: true, ScopeRevision: 1, MaxConcurrency: 1,
+		ScopeBindings: []RunnerScopeBinding{{WorkspaceID: "workspace-1", EnvironmentID: "PROD"}},
+	}
+	changed := base
+	changed.ScopeRevision = 2
+	fixture.service.dependencies.RunnerRegistrations = &sequenceRunnerRegistrationRepository{
+		registrations: []RunnerRegistration{base, base, changed},
+	}
+	fixture.service.heartbeatInterval = 5 * time.Millisecond
+	fixture.executors.waitForCancellation = true
+	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	result, err := fixture.service.RunNext(context.Background())
+	if !errors.Is(err, ErrExecutionUncertain) || result.Status != executionlease.StatusUncertain {
+		t.Fatalf("RunNext(scope revision changed) = %#v, %v", result, err)
 	}
 }
 
@@ -828,7 +912,7 @@ func newRunnerFixtureWithClock(t *testing.T, clock func() time.Time, envelope ac
 	service := mustService(t, Dependencies{
 		Queue: leases, Keys: keys, Environments: environment, Safety: safety,
 		Credentials: broker, Policy: preExecution, Executors: executors.asDependencies(),
-	}, Options{RunnerID: "runner-1", AllowedWorkspaceIDs: []string{"workspace-1"}, AllowedEnvironmentIDs: []string{"PROD"}, LeaseDuration: time.Minute, FinalizeTimeout: time.Second, Clock: clock})
+	}, Options{RunnerID: "runner-1", LeaseDuration: time.Minute, FinalizeTimeout: time.Second, Clock: clock})
 	return &runnerFixture{
 		service: service, leases: leases, environment: environment, safety: safety,
 		preExecution: preExecution, credentialGate: credentialGate, issuer: issuer,
@@ -838,11 +922,67 @@ func newRunnerFixtureWithClock(t *testing.T, clock func() time.Time, envelope ac
 
 func mustService(t *testing.T, dependencies Dependencies, options Options) *Service {
 	t.Helper()
+	if dependencies.RunnerRegistrations == nil {
+		dependencies.RunnerRegistrations = fakeRunnerRegistrationRepository{
+			registration: RunnerRegistration{
+				RunnerID: options.RunnerID, Pool: executionlease.PoolWrite, Enabled: true, ScopeRevision: 1, MaxConcurrency: 1,
+				ScopeBindings: []RunnerScopeBinding{{WorkspaceID: "workspace-1", EnvironmentID: "PROD"}},
+			},
+		}
+	}
 	service, err := NewService(dependencies, options)
 	if err != nil {
 		t.Fatalf("NewService() error = %v", err)
 	}
 	return service
+}
+
+type fakeRunnerRegistrationRepository struct {
+	registration RunnerRegistration
+	err          error
+}
+
+type sequenceRunnerRegistrationRepository struct {
+	mu            sync.Mutex
+	registrations []RunnerRegistration
+	calls         int
+}
+
+func (repository *sequenceRunnerRegistrationRepository) Resolve(ctx context.Context, runnerID string) (RunnerRegistration, error) {
+	if err := ctx.Err(); err != nil {
+		return RunnerRegistration{}, err
+	}
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	if len(repository.registrations) == 0 {
+		return RunnerRegistration{}, executionlease.ErrNotFound
+	}
+	index := repository.calls
+	if index >= len(repository.registrations) {
+		index = len(repository.registrations) - 1
+	}
+	repository.calls++
+	registration := repository.registrations[index]
+	if registration.RunnerID != runnerID {
+		return RunnerRegistration{}, executionlease.ErrNotFound
+	}
+	registration.ScopeBindings = append([]RunnerScopeBinding(nil), registration.ScopeBindings...)
+	return registration, nil
+}
+
+func (repository fakeRunnerRegistrationRepository) Resolve(ctx context.Context, runnerID string) (RunnerRegistration, error) {
+	if err := ctx.Err(); err != nil {
+		return RunnerRegistration{}, err
+	}
+	if repository.err != nil {
+		return RunnerRegistration{}, repository.err
+	}
+	if repository.registration.RunnerID != runnerID {
+		return RunnerRegistration{}, executionlease.ErrNotFound
+	}
+	registration := repository.registration
+	registration.ScopeBindings = append([]RunnerScopeBinding(nil), registration.ScopeBindings...)
+	return registration, nil
 }
 
 type recordingActionQueue struct {
@@ -852,6 +992,7 @@ type recordingActionQueue struct {
 	startErr          error
 	heartbeatErr      error
 	completeErr       error
+	finalizeErr       error
 	heartbeatObserved chan<- struct{}
 }
 
@@ -868,7 +1009,7 @@ func (repository *recordingActionQueue) Start(ctx context.Context, lease executi
 	return repository.ActionQueue.Start(ctx, lease)
 }
 
-func (repository *recordingActionQueue) Complete(ctx context.Context, request executionlease.CompleteRequest) (executionlease.Execution, error) {
+func (repository *recordingActionQueue) Complete(ctx context.Context, request ActionCompleteRequest) (executionlease.Execution, error) {
 	repository.events.add("lease:complete")
 	if repository.completeErr != nil {
 		return executionlease.Execution{}, repository.completeErr
@@ -876,7 +1017,15 @@ func (repository *recordingActionQueue) Complete(ctx context.Context, request ex
 	return repository.ActionQueue.Complete(ctx, request)
 }
 
-func (repository *recordingActionQueue) Heartbeat(ctx context.Context, request executionlease.HeartbeatRequest) (executionlease.Execution, error) {
+func (repository *recordingActionQueue) Finalize(ctx context.Context, lease executionlease.LeaseIdentity) (executionlease.Execution, error) {
+	repository.events.add("lease:finalize")
+	if repository.finalizeErr != nil {
+		return executionlease.Execution{}, repository.finalizeErr
+	}
+	return repository.ActionQueue.Finalize(ctx, lease)
+}
+
+func (repository *recordingActionQueue) Heartbeat(ctx context.Context, request ActionHeartbeatRequest) (ActionHeartbeatResult, error) {
 	repository.events.add("lease:heartbeat")
 	if repository.heartbeatObserved != nil {
 		select {
@@ -885,7 +1034,7 @@ func (repository *recordingActionQueue) Heartbeat(ctx context.Context, request e
 		}
 	}
 	if repository.heartbeatErr != nil {
-		return executionlease.Execution{}, repository.heartbeatErr
+		return ActionHeartbeatResult{}, repository.heartbeatErr
 	}
 	return repository.ActionQueue.Heartbeat(ctx, request)
 }
@@ -958,6 +1107,7 @@ type fakeDynamicIssuer struct {
 	events         *eventLog
 	revokeCalls    int
 	revokedLeaseID string
+	revokeErr      error
 }
 
 func (issuer *fakeDynamicIssuer) Issue(context.Context, credential.IssueRequest) (credential.IssuedLease, error) {
@@ -969,7 +1119,7 @@ func (issuer *fakeDynamicIssuer) Revoke(_ context.Context, leaseID string) error
 	issuer.revokeCalls++
 	issuer.revokedLeaseID = leaseID
 	issuer.events.add("credential:revoke")
-	return nil
+	return issuer.revokeErr
 }
 
 type fakeCredentialBroker struct{ err error }

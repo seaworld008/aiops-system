@@ -28,13 +28,14 @@ const (
 type Status string
 
 const (
-	StatusQueued    Status = "QUEUED"
-	StatusLeased    Status = "LEASED"
-	StatusRunning   Status = "RUNNING"
-	StatusSucceeded Status = "SUCCEEDED"
-	StatusFailed    Status = "FAILED"
-	StatusCancelled Status = "CANCELLED"
-	StatusUncertain Status = "UNCERTAIN"
+	StatusQueued     Status = "QUEUED"
+	StatusLeased     Status = "LEASED"
+	StatusRunning    Status = "RUNNING"
+	StatusFinalizing Status = "FINALIZING"
+	StatusSucceeded  Status = "SUCCEEDED"
+	StatusFailed     Status = "FAILED"
+	StatusCancelled  Status = "CANCELLED"
+	StatusUncertain  Status = "UNCERTAIN"
 )
 
 type Execution struct {
@@ -43,12 +44,17 @@ type Execution struct {
 	Pool                     Pool
 	Production               bool
 	Status                   Status
+	CompletionStatus         Status
 	RunnerID                 string
+	ScopeRevision            int64
 	LeaseToken               string
 	LeaseEpoch               int64
 	LeaseExpiresAt           time.Time
 	LeaseAcquiredAt          time.Time
 	LastHeartbeatAt          time.Time
+	HeartbeatSeq             int64
+	CancelRequestedAt        time.Time
+	CancelReasonHash         string
 	StartedAt                time.Time
 	CompletedAt              time.Time
 	ResultHash               string

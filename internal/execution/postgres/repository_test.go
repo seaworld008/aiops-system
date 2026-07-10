@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -17,6 +19,14 @@ import (
 )
 
 var testLeaseToken = strings.Repeat("a", 64)
+
+func TestCancellationIntentHashUsesBackendIndependentDomain(t *testing.T) {
+	digest := sha256.Sum256([]byte("action-queue-cancel-intent.v1\x00REQUESTED"))
+	want := hex.EncodeToString(digest[:])
+	if got := cancellationResultHash(); got != want {
+		t.Fatalf("cancellationResultHash() = %q, want %q", got, want)
+	}
+}
 
 func TestSubmitAtomicallyPersistsImmutableEnvelopeMetadataAndQueuedLease(t *testing.T) {
 	database, repository := newActionQueueRepository(t)
@@ -36,11 +46,12 @@ func TestSubmitAtomicallyPersistsImmutableEnvelopeMetadataAndQueuedLease(t *test
 		ExecutionID: envelope.ActionID, TargetKey: submission.TargetKey, Pool: submission.Pool,
 		Production: true, Status: executionlease.StatusQueued, CreatedAt: now, UpdatedAt: now,
 	}
-	database.ExpectQuery(`(?s)INSERT INTO action_queue .*envelope.*submission_hash.*ON CONFLICT \(action_id\) DO NOTHING.*RETURNING`).
+	database.ExpectQuery(`(?s)INSERT INTO action_queue .*envelope.*submission_hash.*idempotency_key.*request_hash.*authorization_expires_at.*ON CONFLICT DO NOTHING.*RETURNING`).
 		WithArgs(
-			envelope.ActionID, string(envelopeJSON), pgxmock.AnyArg(), envelope.PlanHash,
+			envelope.ActionID, string(envelopeJSON), pgxmock.AnyArg(), envelope.IdempotencyKey,
+			pgxmock.AnyArg(), requestHashVersion, envelope.PlanHash,
 			envelope.WorkspaceID, envelope.Target.EnvironmentID, submission.TargetKey,
-			submission.EnvironmentRevision, submission.Pool, submission.Production,
+			submission.EnvironmentRevision, envelope.ExpiresAt, submission.Pool, submission.Production,
 		).
 		WillReturnRows(actionQueueRows(want, envelopeJSON, envelope.PlanHash, submission.EnvironmentRevision,
 			envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64)))
@@ -82,13 +93,14 @@ func TestSubmitIsIdempotentOnlyForTheExactImmutableSubmission(t *testing.T) {
 			defer database.Close()
 			database.ExpectQuery("INSERT INTO action_queue").
 				WithArgs(
-					envelope.ActionID, string(envelopeJSON), wantHash, envelope.PlanHash,
+					envelope.ActionID, string(envelopeJSON), wantHash, envelope.IdempotencyKey,
+					pgxmock.AnyArg(), requestHashVersion, envelope.PlanHash,
 					envelope.WorkspaceID, envelope.Target.EnvironmentID, submission.TargetKey,
-					submission.EnvironmentRevision, submission.Pool, submission.Production,
+					submission.EnvironmentRevision, envelope.ExpiresAt, submission.Pool, submission.Production,
 				).
 				WillReturnRows(actionQueueRowsEmpty())
-			database.ExpectQuery(`(?s)SELECT .*submission_hash.*FROM action_queue.*WHERE action_id = \$1`).
-				WithArgs(envelope.ActionID).
+			database.ExpectQuery(`(?s)SELECT .*submission_hash.*FROM action_queue.*WHERE action_id = \$1 OR \(workspace_id = \$2 AND idempotency_key = \$3\)`).
+				WithArgs(envelope.ActionID, envelope.WorkspaceID, envelope.IdempotencyKey).
 				WillReturnRows(actionQueueRows(want, envelopeJSON, envelope.PlanHash, submission.EnvironmentRevision,
 					envelope.WorkspaceID, envelope.Target.EnvironmentID, storedHash))
 
@@ -105,6 +117,55 @@ func TestSubmitIsIdempotentOnlyForTheExactImmutableSubmission(t *testing.T) {
 	}
 }
 
+func TestSubmitSemanticIdempotencyReturnsOriginalAcrossActionIdentity(t *testing.T) {
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	originalEnvelope := signedTestEnvelope(t, now)
+	originalSubmission := execution.ActionSubmission{
+		Envelope: originalEnvelope, PlanHash: originalEnvelope.PlanHash,
+		TargetKey: "k8s-deployment:sha256:" + strings.Repeat("a", 64), EnvironmentRevision: "environment-1",
+		Production: true, Pool: executionlease.PoolWrite,
+	}
+	originalJSON, _ := json.Marshal(originalEnvelope)
+	original := executionlease.Execution{
+		ExecutionID: originalEnvelope.ActionID, TargetKey: originalSubmission.TargetKey, Pool: originalSubmission.Pool,
+		Production: true, Status: executionlease.StatusQueued, CreatedAt: now, UpdatedAt: now,
+	}
+
+	retryEnvelope := originalEnvelope
+	retryEnvelope.ActionID = "action-semantic-retry"
+	retryEnvelope.PlanHash = strings.Repeat("c", 64)
+	retryEnvelope.TraceID = strings.Repeat("b", 32)
+	retrySubmission := originalSubmission
+	retrySubmission.Envelope = retryEnvelope
+	retrySubmission.PlanHash = retryEnvelope.PlanHash
+	retryJSON, _ := json.Marshal(retryEnvelope)
+	retrySubmissionHash, err := hashSubmission(retrySubmission, retryJSON)
+	if err != nil {
+		t.Fatalf("hashSubmission(retry) error = %v", err)
+	}
+
+	database, repository := newActionQueueRepository(t)
+	defer database.Close()
+	database.ExpectQuery("INSERT INTO action_queue").
+		WithArgs(
+			retryEnvelope.ActionID, string(retryJSON), retrySubmissionHash, retryEnvelope.IdempotencyKey,
+			pgxmock.AnyArg(), requestHashVersion, retryEnvelope.PlanHash,
+			retryEnvelope.WorkspaceID, retryEnvelope.Target.EnvironmentID, retrySubmission.TargetKey,
+			retrySubmission.EnvironmentRevision, retryEnvelope.ExpiresAt, retrySubmission.Pool, retrySubmission.Production,
+		).
+		WillReturnRows(actionQueueRowsEmpty())
+	database.ExpectQuery(`(?s)SELECT .*FROM action_queue.*WHERE action_id = \$1 OR \(workspace_id = \$2 AND idempotency_key = \$3\)`).
+		WithArgs(retryEnvelope.ActionID, retryEnvelope.WorkspaceID, retryEnvelope.IdempotencyKey).
+		WillReturnRows(actionQueueRows(original, originalJSON, originalEnvelope.PlanHash, originalSubmission.EnvironmentRevision,
+			originalEnvelope.WorkspaceID, originalEnvelope.Target.EnvironmentID, strings.Repeat("b", 64)))
+
+	got, err := repository.Submit(context.Background(), retrySubmission)
+	if err != nil || got.ExecutionID != original.ExecutionID {
+		t.Fatalf("Submit(semantic retry) = %#v, %v; want original %q", got, err, original.ExecutionID)
+	}
+	assertExpectations(t, database)
+}
+
 func TestClaimSweepsAndScopesBeforeAtomicallyLeasingWithSkipLocked(t *testing.T) {
 	database, repository := newActionQueueRepository(t)
 	defer database.Close()
@@ -118,28 +179,27 @@ func TestClaimSweepsAndScopesBeforeAtomicallyLeasingWithSkipLocked(t *testing.T)
 	wantExecution := executionlease.Execution{
 		ExecutionID: envelope.ActionID, TargetKey: targetKey, Pool: executionlease.PoolWrite,
 		Production: true, Status: executionlease.StatusLeased, RunnerID: "runner-1",
-		LeaseToken: testLeaseToken, LeaseEpoch: 1, LeaseAcquiredAt: now,
+		ScopeRevision: 1,
+		LeaseToken:    testLeaseToken, LeaseEpoch: 1, LeaseAcquiredAt: now,
 		LastHeartbeatAt: now, LeaseExpiresAt: now.Add(time.Minute), CreatedAt: now.Add(-time.Minute), UpdatedAt: now,
 	}
 	wantTokenHash := tokenHash(testLeaseToken)
 	database.ExpectBegin()
 	database.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	database.ExpectExec("UPDATE action_queue AS expired_running").WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	database.ExpectExec("UPDATE action_queue AS expired_finalizing").WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 	database.ExpectExec("UPDATE action_queue AS expired_lease").WillReturnResult(pgxmock.NewResult("UPDATE", 0))
-	database.ExpectQuery(`(?s)SELECT candidate\.action_id, candidate\.lease_epoch.*candidate\.workspace_id = ANY\(\$2::text\[\]\).*candidate\.environment_id = ANY\(\$3::text\[\]\).*FOR UPDATE OF candidate SKIP LOCKED`).
-		WithArgs(executionlease.PoolWrite, []string{"workspace-1"}, []string{"PROD"}).
-		WillReturnRows(pgxmock.NewRows([]string{"action_id", "lease_epoch"}).AddRow(envelope.ActionID, int64(0)))
+	database.ExpectQuery(`(?s)SELECT candidate\.action_id, candidate\.lease_epoch, registration\.scope_revision.*JOIN runner_scope_bindings.*binding\.workspace_id::text = candidate\.workspace_id.*binding\.environment_id::text = candidate\.environment_id.*registration\.max_concurrency.*FOR SHARE OF registration.*FOR UPDATE OF candidate SKIP LOCKED`).
+		WithArgs(executionlease.PoolWrite, "runner-1", int64(1)).
+		WillReturnRows(pgxmock.NewRows([]string{"action_id", "lease_epoch", "scope_revision"}).AddRow(envelope.ActionID, int64(0), int64(1)))
 	database.ExpectQuery(`(?s)UPDATE action_queue AS queued.*lease_token_sha256 = \$3.*lease_epoch = queued\.lease_epoch \+ 1.*WHERE queued\.action_id = \$1 AND queued\.status = 'QUEUED'.*RETURNING`).
-		WithArgs(envelope.ActionID, "runner-1", wantTokenHash, float64(60)).
+		WithArgs(envelope.ActionID, "runner-1", wantTokenHash, float64(60), int64(1)).
 		WillReturnRows(actionQueueRowsDetailed(wantExecution, envelopeJSON, envelope.PlanHash, "environment-1",
 			envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64), wantTokenHash, nil, nil, now, nil))
 	database.ExpectCommit()
 
 	got, err := repository.Claim(context.Background(), execution.ActionClaimRequest{
-		Scope: execution.RunnerScope{
-			RunnerID: "runner-1", Pool: executionlease.PoolWrite,
-			AllowedWorkspaceIDs: []string{"workspace-1"}, AllowedEnvironmentIDs: []string{"PROD"},
-		},
+		Scope:         testRunnerScope(t, "runner-1", "workspace-1", "PROD"),
 		LeaseDuration: time.Minute,
 	})
 	if err != nil {
@@ -164,17 +224,15 @@ func TestClaimRejectsTokenSourcesBelowTheEntropyContract(t *testing.T) {
 	database.ExpectBegin()
 	database.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	database.ExpectExec("UPDATE action_queue AS expired_running").WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	database.ExpectExec("UPDATE action_queue AS expired_finalizing").WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 	database.ExpectExec("UPDATE action_queue AS expired_lease").WillReturnResult(pgxmock.NewResult("UPDATE", 0))
-	database.ExpectQuery("SELECT candidate.action_id, candidate.lease_epoch").
-		WithArgs(executionlease.PoolWrite, []string{"workspace-1"}, []string{"PROD"}).
-		WillReturnRows(pgxmock.NewRows([]string{"action_id", "lease_epoch"}).AddRow("action-1", int64(0)))
+	database.ExpectQuery("SELECT candidate.action_id, candidate.lease_epoch, registration.scope_revision").
+		WithArgs(executionlease.PoolWrite, "runner-1", int64(1)).
+		WillReturnRows(pgxmock.NewRows([]string{"action_id", "lease_epoch", "scope_revision"}).AddRow("action-1", int64(0), int64(1)))
 	database.ExpectRollback()
 
 	_, err = repository.Claim(context.Background(), execution.ActionClaimRequest{
-		Scope: execution.RunnerScope{
-			RunnerID: "runner-1", Pool: executionlease.PoolWrite,
-			AllowedWorkspaceIDs: []string{"workspace-1"}, AllowedEnvironmentIDs: []string{"PROD"},
-		},
+		Scope:         testRunnerScope(t, "runner-1", "workspace-1", "PROD"),
 		LeaseDuration: time.Minute,
 	})
 	if !errors.Is(err, executionlease.ErrInvalidRequest) {
@@ -191,13 +249,13 @@ func TestLeaseMissUsesServerClockAndDistinguishesExpiredFromStarted(t *testing.T
 		database, repository := newActionQueueRepository(t)
 		defer database.Close()
 		database.ExpectQuery("UPDATE action_queue").
-			WithArgs(fence.ExecutionID, fence.RunnerID, digest, fence.Epoch, float64(60)).
+			WithArgs(fence.ExecutionID, fence.RunnerID, digest, fence.Epoch, int64(1), float64(60)).
 			WillReturnRows(actionQueueRowsEmpty())
-		database.ExpectQuery(`(?s)SELECT runner_id, lease_epoch, lease_token_sha256, status,.*statement_timestamp\(\).*FROM action_queue.*WHERE action_id = \$1`).
+		database.ExpectQuery(`(?s)SELECT runner_id, lease_epoch, lease_token_sha256, status, heartbeat_seq,.*statement_timestamp\(\).*FROM action_queue.*WHERE action_id = \$1`).
 			WithArgs(fence.ExecutionID).
-			WillReturnRows(pgxmock.NewRows([]string{"runner_id", "lease_epoch", "lease_token_sha256", "status", "lease_current"}).
-				AddRow(fence.RunnerID, fence.Epoch, digest, executionlease.StatusRunning, false))
-		_, err := repository.Heartbeat(context.Background(), executionlease.HeartbeatRequest{Lease: fence, Extension: time.Minute})
+			WillReturnRows(pgxmock.NewRows([]string{"runner_id", "lease_epoch", "lease_token_sha256", "status", "heartbeat_seq", "lease_current"}).
+				AddRow(fence.RunnerID, fence.Epoch, digest, executionlease.StatusRunning, int64(0), false))
+		_, err := repository.Heartbeat(context.Background(), execution.ActionHeartbeatRequest{Lease: fence, Sequence: 1, Extension: time.Minute})
 		if !errors.Is(err, executionlease.ErrStaleLease) {
 			t.Fatalf("Heartbeat() error = %v, want stale expired fence", err)
 		}
@@ -252,12 +310,13 @@ func TestStartAndHeartbeatFenceWithTokenHashAndNeverReturnBearer(t *testing.T) {
 
 	running.LastHeartbeatAt = now
 	running.LeaseExpiresAt = now.Add(2 * time.Minute)
-	database.ExpectQuery(`(?s)UPDATE action_queue.*make_interval\(secs => \$5::double precision\).*lease_token_sha256 = \$3.*RETURNING`).
-		WithArgs(fence.ExecutionID, fence.RunnerID, digest, fence.Epoch, float64(120)).
+	running.HeartbeatSeq = 1
+	database.ExpectQuery(`(?s)UPDATE action_queue.*heartbeat_seq = \$5.*make_interval\(secs => \$6::double precision\).*lease_token_sha256 = \$3.*RETURNING`).
+		WithArgs(fence.ExecutionID, fence.RunnerID, digest, fence.Epoch, int64(1), float64(120)).
 		WillReturnRows(actionQueueRowsDetailed(running, envelopeJSON, envelope.PlanHash, "environment-1",
 			envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64), digest, nil, nil, now, nil))
-	heartbeat, err := repository.Heartbeat(context.Background(), executionlease.HeartbeatRequest{Lease: fence, Extension: 2 * time.Minute})
-	if err != nil || !heartbeat.LeaseExpiresAt.Equal(running.LeaseExpiresAt) || heartbeat.LeaseToken != "" {
+	heartbeat, err := repository.Heartbeat(context.Background(), execution.ActionHeartbeatRequest{Lease: fence, Sequence: 1, Extension: 2 * time.Minute})
+	if err != nil || !heartbeat.Execution.LeaseExpiresAt.Equal(running.LeaseExpiresAt) || heartbeat.Execution.LeaseToken != "" {
 		t.Fatalf("Heartbeat() = %#v, %v", heartbeat, err)
 	}
 	assertExpectations(t, database)
@@ -271,26 +330,70 @@ func TestCompleteAtomicallyConsumesFenceAndKeepsOnlyTokenHashForIdempotency(t *t
 	envelopeJSON, _ := json.Marshal(envelope)
 	fence := executionlease.LeaseIdentity{ExecutionID: envelope.ActionID, RunnerID: "runner-1", Token: testLeaseToken, Epoch: 3}
 	digest := tokenHash(fence.Token)
-	resultHash := strings.Repeat("c", 64)
-	completed := executionlease.Execution{
+	running := executionlease.Execution{
 		ExecutionID: envelope.ActionID, TargetKey: "k8s-deployment:sha256:" + strings.Repeat("a", 64),
-		Pool: executionlease.PoolWrite, Production: true, Status: executionlease.StatusSucceeded,
+		Pool: executionlease.PoolWrite, Production: true, Status: executionlease.StatusRunning,
 		RunnerID: fence.RunnerID, LeaseEpoch: fence.Epoch, LeaseAcquiredAt: now.Add(-2 * time.Minute),
-		LastHeartbeatAt: now.Add(-time.Minute), StartedAt: now.Add(-time.Minute), CompletedAt: now,
-		ResultHash: resultHash, CreatedAt: now.Add(-time.Hour), UpdatedAt: now,
+		LeaseExpiresAt: now.Add(time.Minute), LastHeartbeatAt: now.Add(-time.Minute), StartedAt: now.Add(-time.Minute),
+		ScopeRevision: 1, CreatedAt: now.Add(-time.Hour), UpdatedAt: now,
 	}
+	summary := execution.ExecutorResult{Outcome: execution.ExecutorSucceeded, Code: "COMPLETED", Verification: execution.VerificationPassed}
+	receipt, err := execution.BuildRunnerResultReceipt(execution.ClaimedAction{
+		Execution: running, Envelope: envelope, PlanHash: envelope.PlanHash,
+		TargetKey: running.TargetKey, EnvironmentRevision: "environment-1", Production: true,
+	}, execution.ActionCompleteRequest{Lease: fence, Summary: summary}, executionlease.StatusSucceeded, time.Time{})
+	if err != nil {
+		t.Fatalf("BuildRunnerResultReceipt() error = %v", err)
+	}
+	finalizing := running
+	finalizing.Status = executionlease.StatusFinalizing
+	finalizing.CompletionStatus = executionlease.StatusSucceeded
+	finalizing.ResultHash = receipt.ResultHash
+	finalizing.LeaseExpiresAt = time.Time{}
+	completed := finalizing
+	completed.Status = executionlease.StatusSucceeded
+	completed.CompletedAt = now
 	database.ExpectBegin()
-	database.ExpectQuery(`(?s)UPDATE action_queue.*completed_lease_token_sha256 = lease_token_sha256.*lease_token_sha256 = NULL.*status = \$5.*result_hash = \$6.*RETURNING`).
-		WithArgs(fence.ExecutionID, fence.RunnerID, digest, fence.Epoch, executionlease.StatusSucceeded, resultHash).
-		WillReturnRows(actionQueueRowsDetailed(completed, envelopeJSON, envelope.PlanHash, "environment-1",
+	database.ExpectQuery(`(?s)SELECT .* FROM action_queue WHERE action_id = \$1 FOR UPDATE`).
+		WithArgs(fence.ExecutionID).
+		WillReturnRows(actionQueueRowsDetailed(running, envelopeJSON, envelope.PlanHash, "environment-1",
+			envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64), digest, nil, nil, now, nil))
+	database.ExpectQuery(`(?s)UPDATE action_queue.*status = 'FINALIZING'.*completion_status = \$5.*result_hash = \$6.*completed_lease_token_sha256 = lease_token_sha256.*RETURNING`).
+		WithArgs(fence.ExecutionID, fence.RunnerID, digest, fence.Epoch, executionlease.StatusSucceeded, receipt.ResultHash).
+		WillReturnRows(actionQueueRowsDetailed(finalizing, envelopeJSON, envelope.PlanHash, "environment-1",
 			envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64), nil, digest, fence.Epoch, now, nil))
+	database.ExpectExec("INSERT INTO runner_result_receipts").
+		WithArgs(fence.ExecutionID, envelope.WorkspaceID, fence.RunnerID, fence.Epoch, int64(1), receipt.ResultHash,
+			executionlease.StatusSucceeded, pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	database.ExpectCommit()
 
-	got, err := repository.Complete(context.Background(), executionlease.CompleteRequest{
-		Lease: fence, Status: executionlease.StatusSucceeded, ResultHash: resultHash,
+	got, err := repository.Complete(context.Background(), execution.ActionCompleteRequest{
+		Lease: fence, Summary: summary,
 	})
-	if err != nil || got != completed || got.LeaseToken != "" {
-		t.Fatalf("Complete() = %#v, %v; want %#v", got, err, completed)
+	if err != nil || got != finalizing || got.LeaseToken != "" {
+		t.Fatalf("Complete() = %#v, %v; want %#v", got, err, finalizing)
+	}
+	database.ExpectBegin()
+	database.ExpectQuery(`(?s)SELECT .* FROM action_queue WHERE action_id = \$1 FOR UPDATE`).
+		WithArgs(fence.ExecutionID).
+		WillReturnRows(actionQueueRowsDetailed(finalizing, envelopeJSON, envelope.PlanHash, "environment-1",
+			envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64), nil, digest, fence.Epoch, now, nil))
+	database.ExpectRollback()
+	conflictingSummary := summary
+	conflictingSummary.Code = "DIFFERENT_RESULT"
+	if _, err := repository.Complete(context.Background(), execution.ActionCompleteRequest{
+		Lease: fence, Summary: conflictingSummary,
+	}); !errors.Is(err, executionlease.ErrCompletionConflict) {
+		t.Fatalf("Complete(conflicting receipt) error = %v", err)
+	}
+	database.ExpectQuery(`(?s)UPDATE action_queue AS finalizing.*status = finalizing\.completion_status.*runner_result_receipts.*RETURNING`).
+		WithArgs(fence.ExecutionID, fence.RunnerID, digest, fence.Epoch).
+		WillReturnRows(actionQueueRowsDetailed(completed, envelopeJSON, envelope.PlanHash, "environment-1",
+			envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64), nil, digest, fence.Epoch, now, nil))
+	got, err = repository.Finalize(context.Background(), fence)
+	if err != nil || got != completed {
+		t.Fatalf("Finalize() = %#v, %v; want %#v", got, err, completed)
 	}
 	assertExpectations(t, database)
 }
@@ -364,6 +467,8 @@ func TestSweepExpiredAndGetUseServerClockAndMaterializeUncertainState(t *testing
 		database.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("SELECT", 1))
 		database.ExpectExec(`(?s)UPDATE action_queue AS expired_running.*completed_lease_token_sha256 = lease_token_sha256.*completed_lease_epoch = lease_epoch.*lease_token_sha256 = NULL`).
 			WithArgs(expiredResultHash()).WillReturnResult(pgxmock.NewResult("UPDATE", 2))
+		database.ExpectExec(`(?s)UPDATE action_queue AS expired_finalizing.*authorization_expires_at.*runner_result_receipts.*receipt_hash = expired_finalizing\.result_hash`).
+			WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 		database.ExpectExec("UPDATE action_queue AS expired_lease").WillReturnResult(pgxmock.NewResult("UPDATE", 3))
 		database.ExpectCommit()
 		if err := repository.SweepExpired(context.Background()); err != nil {
@@ -379,6 +484,9 @@ func TestSweepExpiredAndGetUseServerClockAndMaterializeUncertainState(t *testing
 		database.ExpectExec("UPDATE action_queue AS expired_running").
 			WithArgs(expiredResultHash(), envelope.ActionID).
 			WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+		database.ExpectExec("UPDATE action_queue AS expired_finalizing").
+			WithArgs(envelope.ActionID).
+			WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 		database.ExpectExec("UPDATE action_queue AS expired_lease").
 			WithArgs(envelope.ActionID).
 			WillReturnResult(pgxmock.NewResult("UPDATE", 0))
@@ -424,6 +532,8 @@ func TestReconcileAndCancelResolveUncertainOutcomesWithoutReusableToken(t *testi
 		database.ExpectBegin()
 		database.ExpectExec("UPDATE action_queue AS expired_running").
 			WithArgs(expiredResultHash(), envelope.ActionID).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+		database.ExpectExec("UPDATE action_queue AS expired_finalizing").
+			WithArgs(envelope.ActionID).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 		database.ExpectExec("UPDATE action_queue AS expired_lease").
 			WithArgs(envelope.ActionID).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 		database.ExpectQuery(`(?s)UPDATE action_queue.*reconciliation_id = \$2.*status = \$4.*status = 'UNCERTAIN'.*RETURNING`).
@@ -438,19 +548,20 @@ func TestReconcileAndCancelResolveUncertainOutcomesWithoutReusableToken(t *testi
 		assertExpectations(t, database)
 	})
 
-	t.Run("cancel running becomes uncertain", func(t *testing.T) {
+	t.Run("cancel running persists intent without clearing fence", func(t *testing.T) {
 		database, repository := newActionQueueRepository(t)
 		defer database.Close()
 		cancelled := executionlease.Execution{
 			ExecutionID: envelope.ActionID, TargetKey: targetKey, Pool: executionlease.PoolWrite,
-			Production: true, Status: executionlease.StatusUncertain, RunnerID: "runner-1", LeaseEpoch: 2,
-			StartedAt: now.Add(-time.Minute), CompletedAt: now, ResultHash: cancellationResultHash(),
+			Production: true, Status: executionlease.StatusRunning, RunnerID: "runner-1", ScopeRevision: 1, LeaseEpoch: 2,
+			LeaseAcquiredAt: now.Add(-2 * time.Minute), LastHeartbeatAt: now.Add(-time.Minute), LeaseExpiresAt: now.Add(time.Minute),
+			StartedAt: now.Add(-time.Minute), CancelRequestedAt: now, CancelReasonHash: cancellationResultHash(),
 			CreatedAt: now.Add(-time.Hour), UpdatedAt: now,
 		}
-		database.ExpectQuery(`(?s)UPDATE action_queue.*status = CASE WHEN status = 'RUNNING' THEN 'UNCERTAIN' ELSE 'CANCELLED' END.*result_hash = CASE WHEN status = 'RUNNING' THEN \$2 ELSE NULL END.*completed_lease_token_sha256 = CASE WHEN status = 'RUNNING' THEN lease_token_sha256 ELSE NULL END.*completed_lease_epoch = CASE WHEN status = 'RUNNING' THEN lease_epoch ELSE NULL END.*lease_token_sha256 = NULL.*RETURNING`).
+		database.ExpectQuery(`(?s)UPDATE action_queue.*status = CASE WHEN status = 'RUNNING' THEN status ELSE 'CANCELLED' END.*cancel_requested_at = CASE WHEN status = 'RUNNING'.*lease_token_sha256 = CASE WHEN status = 'RUNNING' THEN lease_token_sha256 ELSE NULL END.*RETURNING`).
 			WithArgs(envelope.ActionID, cancellationResultHash()).
 			WillReturnRows(actionQueueRowsDetailed(cancelled, envelopeJSON, envelope.PlanHash, "environment-1",
-				envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64), nil, tokenHash(testLeaseToken), int64(2), now, nil))
+				envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64), tokenHash(testLeaseToken), nil, nil, now, nil))
 		got, err := repository.Cancel(context.Background(), envelope.ActionID)
 		if err != nil || got != cancelled || got.LeaseToken != "" {
 			t.Fatalf("Cancel() = %#v, %v", got, err)
@@ -472,16 +583,28 @@ func newActionQueueRepository(t *testing.T) (pgxmock.PgxPoolIface, *Repository) 
 	return database, repository
 }
 
+func testRunnerScope(t *testing.T, runnerID, workspaceID, environmentID string) execution.RunnerScope {
+	t.Helper()
+	scope, err := (execution.RunnerRegistration{
+		RunnerID: runnerID, Pool: executionlease.PoolWrite, Enabled: true, ScopeRevision: 1, MaxConcurrency: 1,
+		ScopeBindings: []execution.RunnerScopeBinding{{WorkspaceID: workspaceID, EnvironmentID: environmentID}},
+	}).Scope()
+	if err != nil {
+		t.Fatalf("RunnerRegistration.Scope() error = %v", err)
+	}
+	return scope
+}
+
 func actionQueueRows(value executionlease.Execution, envelopeJSON []byte, planHash, environmentRevision, workspaceID, environmentID, submissionHash string) *pgxmock.Rows {
 	return actionQueueRowsDetailed(value, envelopeJSON, planHash, environmentRevision, workspaceID, environmentID, submissionHash, nil, nil, nil, value.CreatedAt, nil)
 }
 
 func actionQueueRowsDetailed(value executionlease.Execution, envelopeJSON []byte, planHash, environmentRevision, workspaceID, environmentID, submissionHash string, leaseTokenHash, completedLeaseTokenHash, completedLeaseEpoch, notBefore, lastNackHash any) *pgxmock.Rows {
+	var envelope action.Envelope
+	if err := json.Unmarshal(envelopeJSON, &envelope); err != nil {
+		panic(err)
+	}
 	if submissionHash == strings.Repeat("b", 64) {
-		var envelope action.Envelope
-		if err := json.Unmarshal(envelopeJSON, &envelope); err != nil {
-			panic(err)
-		}
 		computed, err := hashSubmission(execution.ActionSubmission{
 			Envelope: envelope, PlanHash: planHash, TargetKey: value.TargetKey,
 			EnvironmentRevision: environmentRevision, Production: value.Production, Pool: value.Pool,
@@ -491,13 +614,22 @@ func actionQueueRowsDetailed(value executionlease.Execution, envelopeJSON []byte
 		}
 		submissionHash = computed
 	}
+	requestHash, err := execution.RequestSemanticHash(execution.ActionSubmission{
+		Envelope: envelope, PlanHash: planHash, TargetKey: value.TargetKey,
+		EnvironmentRevision: environmentRevision, Production: value.Production, Pool: value.Pool,
+	})
+	if err != nil {
+		panic(err)
+	}
 	return actionQueueRowsEmpty().AddRow(
 		value.ExecutionID, value.TargetKey, value.Pool, value.Production, value.Status,
 		nullString(value.RunnerID), value.LeaseEpoch, nullTime(value.LeaseExpiresAt), nullTime(value.LeaseAcquiredAt), nullTime(value.LastHeartbeatAt),
 		nullTime(value.StartedAt), nullTime(value.CompletedAt), nullString(value.ResultHash), value.CreatedAt, value.UpdatedAt,
 		nullString(value.ReconciliationID), nullString(value.ReconciliationActor), nullString(value.ReconciliationResultHash), nullTime(value.ReconciledAt),
-		envelopeJSON, planHash, environmentRevision, workspaceID, environmentID,
+		envelopeJSON, planHash, environmentRevision, envelope.ExpiresAt, workspaceID, environmentID,
 		submissionHash, leaseTokenHash, completedLeaseTokenHash, completedLeaseEpoch, notBefore, lastNackHash,
+		envelope.IdempotencyKey, requestHash, requestHashVersion, nullInt64(value.ScopeRevision), value.HeartbeatSeq,
+		nullTime(value.CancelRequestedAt), nullString(value.CancelReasonHash), nullString(string(value.CompletionStatus)),
 	)
 }
 
@@ -507,10 +639,19 @@ func actionQueueRowsEmpty() *pgxmock.Rows {
 		"runner_id", "lease_epoch", "lease_expires_at", "lease_acquired_at", "last_heartbeat_at",
 		"started_at", "completed_at", "result_hash", "created_at", "updated_at",
 		"reconciliation_id", "reconciliation_actor", "reconciliation_result_hash", "reconciled_at",
-		"envelope", "plan_hash", "environment_revision", "workspace_id", "environment_id",
+		"envelope", "plan_hash", "environment_revision", "authorization_expires_at", "workspace_id", "environment_id",
 		"submission_hash", "lease_token_sha256", "completed_lease_token_sha256", "completed_lease_epoch",
 		"not_before", "last_nack_hash",
+		"idempotency_key", "request_hash", "request_hash_version", "scope_revision", "heartbeat_seq",
+		"cancel_requested_at", "cancel_reason_hash", "completion_status",
 	})
+}
+
+func nullInt64(value int64) any {
+	if value == 0 {
+		return nil
+	}
+	return value
 }
 
 func signedTestEnvelope(t *testing.T, now time.Time) action.Envelope {
