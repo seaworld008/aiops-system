@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -67,10 +68,29 @@ func NewRouter(deps Dependencies) http.Handler {
 func requestIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		requestID := ids.NewUUID()
+		traceID := traceIDFromRequest(request)
 		w.Header().Set("X-Request-ID", requestID)
-		ctx := requestmeta.With(request.Context(), requestmeta.Metadata{RequestID: requestID})
+		w.Header().Set("X-Trace-ID", traceID)
+		ctx := requestmeta.With(request.Context(), requestmeta.Metadata{RequestID: requestID, TraceID: traceID})
 		next.ServeHTTP(w, request.WithContext(ctx))
 	})
+}
+
+func traceIDFromRequest(request *http.Request) string {
+	parts := strings.Split(request.Header.Get("traceparent"), "-")
+	if len(parts) == 4 && parts[0] == "00" && validHex(parts[1], 32) &&
+		strings.Trim(parts[1], "0") != "" && validHex(parts[2], 16) && strings.Trim(parts[2], "0") != "" && validHex(parts[3], 2) {
+		return strings.ToLower(parts[1])
+	}
+	return strings.ReplaceAll(ids.NewUUID(), "-", "")
+}
+
+func validHex(value string, length int) bool {
+	if len(value) != length {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func webhookHandler(ingestor SignalIngestor, verifier WebhookVerifier) http.HandlerFunc {
