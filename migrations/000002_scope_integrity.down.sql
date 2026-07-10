@@ -2,15 +2,11 @@ BEGIN;
 
 DROP TRIGGER IF EXISTS investigations_no_reparenting ON investigations;
 DROP FUNCTION IF EXISTS reject_investigation_reparenting();
-DROP TRIGGER IF EXISTS hypotheses_confirmed_root_cause_guard ON hypotheses;
-DROP FUNCTION IF EXISTS protect_confirmed_hypothesis();
-DROP TRIGGER IF EXISTS incidents_confirmed_hypothesis_guard ON incidents;
-DROP FUNCTION IF EXISTS enforce_confirmed_hypothesis();
-DROP TRIGGER IF EXISTS hypothesis_evidence_scope_guard ON hypothesis_evidence;
-DROP FUNCTION IF EXISTS enforce_hypothesis_evidence_scope();
-DROP TRIGGER IF EXISTS incident_signals_scope_guard ON incident_signals;
-DROP FUNCTION IF EXISTS enforce_incident_signal_scope();
 
+ALTER TABLE hypothesis_evidence DROP CONSTRAINT IF EXISTS hypothesis_evidence_evidence_scope_fk;
+ALTER TABLE hypothesis_evidence DROP CONSTRAINT IF EXISTS hypothesis_evidence_hypothesis_scope_fk;
+ALTER TABLE incident_signals DROP CONSTRAINT IF EXISTS incident_signals_signal_scope_fk;
+ALTER TABLE incident_signals DROP CONSTRAINT IF EXISTS incident_signals_incident_scope_fk;
 ALTER TABLE incidents DROP CONSTRAINT IF EXISTS incidents_confirmed_hypothesis_scope_fk;
 ALTER TABLE model_calls DROP CONSTRAINT IF EXISTS model_calls_investigation_scope_fk;
 ALTER TABLE tool_invocations DROP CONSTRAINT IF EXISTS tool_invocations_execution_scope_fk;
@@ -49,8 +45,12 @@ ALTER TABLE environments DROP CONSTRAINT IF EXISTS environments_workspace_scope_
 
 ALTER TABLE executions DROP CONSTRAINT IF EXISTS executions_workspace_scope_uk;
 ALTER TABLE action_plans DROP CONSTRAINT IF EXISTS action_plans_workspace_scope_uk;
+ALTER TABLE hypotheses DROP CONSTRAINT IF EXISTS hypotheses_confirmation_scope_uk;
+ALTER TABLE hypotheses DROP CONSTRAINT IF EXISTS hypotheses_investigation_scope_uk;
 ALTER TABLE hypotheses DROP CONSTRAINT IF EXISTS hypotheses_workspace_scope_uk;
+ALTER TABLE evidence DROP CONSTRAINT IF EXISTS evidence_investigation_scope_uk;
 ALTER TABLE evidence DROP CONSTRAINT IF EXISTS evidence_workspace_scope_uk;
+ALTER TABLE investigations DROP CONSTRAINT IF EXISTS investigations_incident_scope_uk;
 ALTER TABLE investigations DROP CONSTRAINT IF EXISTS investigations_workspace_scope_uk;
 ALTER TABLE incidents DROP CONSTRAINT IF EXISTS incidents_workspace_scope_uk;
 ALTER TABLE signals DROP CONSTRAINT IF EXISTS signals_workspace_scope_uk;

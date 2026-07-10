@@ -83,12 +83,15 @@ CREATE TABLE incidents (
     severity text NOT NULL,
     title text NOT NULL,
     confirmed_hypothesis_id uuid,
+    confirmed_hypothesis_status text GENERATED ALWAYS AS ('CONFIRMED'::text) STORED,
     opened_at timestamptz NOT NULL,
     updated_at timestamptz NOT NULL,
     version bigint NOT NULL DEFAULT 1
 );
 
 CREATE TABLE incident_signals (
+    tenant_id uuid NOT NULL REFERENCES tenants(id),
+    workspace_id uuid NOT NULL REFERENCES workspaces(id),
     incident_id uuid NOT NULL REFERENCES incidents(id),
     signal_id uuid NOT NULL REFERENCES signals(id),
     PRIMARY KEY (incident_id, signal_id)
@@ -130,6 +133,7 @@ CREATE TABLE hypotheses (
     id uuid PRIMARY KEY,
     tenant_id uuid NOT NULL REFERENCES tenants(id),
     workspace_id uuid NOT NULL REFERENCES workspaces(id),
+    incident_id uuid NOT NULL REFERENCES incidents(id),
     investigation_id uuid NOT NULL REFERENCES investigations(id),
     status text NOT NULL CHECK (status IN ('PROPOSED', 'CONFIRMED', 'REJECTED')),
     rank integer NOT NULL,
@@ -143,6 +147,9 @@ ALTER TABLE incidents
     FOREIGN KEY (confirmed_hypothesis_id) REFERENCES hypotheses(id);
 
 CREATE TABLE hypothesis_evidence (
+    tenant_id uuid NOT NULL REFERENCES tenants(id),
+    workspace_id uuid NOT NULL REFERENCES workspaces(id),
+    investigation_id uuid NOT NULL REFERENCES investigations(id),
     hypothesis_id uuid NOT NULL REFERENCES hypotheses(id),
     evidence_id uuid NOT NULL REFERENCES evidence(id),
     relation text NOT NULL CHECK (relation IN ('SUPPORTS', 'CONTRADICTS')),
@@ -158,7 +165,8 @@ CREATE TABLE feedback (
     actor_id text NOT NULL,
     kind text NOT NULL CHECK (kind IN ('HELPFUL', 'NOT_HELPFUL', 'CONFIRM', 'REJECT', 'CORRECT')),
     comment text,
-    created_at timestamptz NOT NULL DEFAULT now()
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (kind NOT IN ('CONFIRM', 'REJECT', 'CORRECT') OR hypothesis_id IS NOT NULL)
 );
 
 CREATE TABLE action_plans (
@@ -292,4 +300,3 @@ CREATE INDEX outbox_pending_idx ON outbox_events (available_at, created_at)
     WHERE delivered_at IS NULL;
 
 COMMIT;
-
