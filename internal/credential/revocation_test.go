@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +21,12 @@ const (
 	testWorkspaceID  = "40000000-0000-4000-8000-000000000010"
 	testEnvironment  = "50000000-0000-4000-8000-000000000010"
 )
+
+func TestChildCreateTimingConstantsMatchDurableMigrationContract(t *testing.T) {
+	if ChildCreateExpiryReserve != 15*time.Second || ChildCreateVaultCallBudget != 12*time.Second {
+		t.Fatalf("child-create timing reserve/budget = %s/%s, want 15s/12s", ChildCreateExpiryReserve, ChildCreateVaultCallBudget)
+	}
+}
 
 func TestMemoryRevocationLifecycleIsRedactedAndCompletionIsFenced(t *testing.T) {
 	ctx := context.Background()
@@ -41,6 +49,7 @@ func TestMemoryRevocationLifecycleIsRedactedAndCompletionIsFenced(t *testing.T) 
 		prepared.Revocation.ConnectorID != "kubernetes-prod" || prepared.Revocation.Permission != "PATCH_DEPLOYMENT_RESTART" {
 		t.Fatalf("prepared derived metadata = %#v", prepared)
 	}
+	authorizePrepared(t, ctx, repository, prepared, fence)
 	accessor, err := NewSensitiveReference([]byte("vault lease/accessor 123"))
 	if err != nil {
 		t.Fatal(err)
@@ -202,6 +211,7 @@ func TestMemoryPrepareReportsExactlyOneCreatedWinner(t *testing.T) {
 	close(start)
 
 	created := 0
+	permits := 0
 	canonicalID := ""
 	for range 2 {
 		if err := <-errors; err != nil {
@@ -210,6 +220,12 @@ func TestMemoryPrepareReportsExactlyOneCreatedWinner(t *testing.T) {
 		result := <-results
 		if result.Created {
 			created++
+			if result.Permit == nil || result.Permit.Token == "" {
+				t.Fatalf("created Prepare() result has no permit: %#v", result)
+			}
+			permits++
+		} else if result.Permit != nil {
+			t.Fatalf("replayed Prepare() returned permit: %#v", result)
 		}
 		if canonicalID == "" {
 			canonicalID = result.Revocation.ID
@@ -218,11 +234,561 @@ func TestMemoryPrepareReportsExactlyOneCreatedWinner(t *testing.T) {
 			t.Fatalf("concurrent Prepare() result = %#v", result)
 		}
 	}
-	if created != 1 {
-		t.Fatalf("concurrent Prepare() Created winners = %d, want 1", created)
+	if created != 1 || permits != 1 {
+		t.Fatalf("concurrent Prepare() Created winners=%d permits=%d, want 1/1", created, permits)
 	}
 	if canonicalID != request.RevocationID && canonicalID != retryRequest.RevocationID {
 		t.Fatalf("concurrent Prepare() canonical ID = %q", canonicalID)
+	}
+}
+
+func TestMemoryChildCreateAuthorizationEnforcesExpiryReserveBoundary(t *testing.T) {
+	base := time.Date(2026, 7, 10, 11, 17, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name    string
+		expiry  time.Duration
+		wantTTL time.Duration
+		wantErr error
+	}{
+		{name: "exact one second ttl", expiry: ChildCreateExpiryReserve + time.Second, wantTTL: time.Second},
+		{name: "one microsecond short", expiry: ChildCreateExpiryReserve + time.Second - time.Microsecond, wantErr: ErrChildCreateWindowExpired},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
+			source := &fakeActionFenceSource{fence: fence, metadata: activeActionMetadata(base, fence)}
+			repository := newTestMemoryRepository(t, source, func() time.Time { return base }, sequenceTokens("unused"))
+			prepared, err := repository.Prepare(context.Background(), PrepareRequest{
+				RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production",
+				CredentialExpiresAt: base.Add(test.expiry),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			authorized, err := repository.AuthorizeChildCreate(context.Background(), AuthorizeChildCreateRequest{
+				Permit: *prepared.Permit, Fence: fence,
+			})
+			if !errors.Is(err, test.wantErr) || authorized.TTL != test.wantTTL {
+				t.Fatalf("AuthorizeChildCreate() = %#v, %v; want TTL=%s error=%v", authorized, err, test.wantTTL, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestMemoryChildCreateAuthorizationEnforcesActionFenceReserveBoundary(t *testing.T) {
+	base := time.Date(2026, 7, 10, 11, 17, 15, 0, time.UTC)
+	for _, test := range []struct {
+		name    string
+		window  time.Duration
+		wantErr error
+	}{
+		{name: "exact boundary", window: ChildCreateExpiryReserve + MinPostChildFenceWindow},
+		{name: "one microsecond short", window: ChildCreateExpiryReserve + MinPostChildFenceWindow - time.Microsecond, wantErr: ErrStaleActionFence},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
+			metadata := activeActionMetadata(base, fence)
+			source := &fakeActionFenceSource{fence: fence, metadata: metadata}
+			repository := newTestMemoryRepository(t, source, func() time.Time { return base }, sequenceTokens("unused"))
+			prepared, err := repository.Prepare(context.Background(), PrepareRequest{
+				RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production",
+				CredentialExpiresAt: base.Add(time.Minute),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			source.mu.Lock()
+			source.metadata.LeaseExpiresAt = base.Add(test.window)
+			source.metadata.AuthorizationExpiresAt = base.Add(test.window)
+			source.mu.Unlock()
+			_, err = repository.AuthorizeChildCreate(context.Background(), AuthorizeChildCreateRequest{
+				Permit: *prepared.Permit, Fence: fence,
+			})
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("AuthorizeChildCreate(action boundary) error = %v, want %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestMemoryChildCreateAuthorizationRequiresRunningActionWithoutCancellation(t *testing.T) {
+	base := time.Date(2026, 7, 10, 11, 17, 20, 0, time.UTC)
+	for _, test := range []struct {
+		name              string
+		status            ActionStatus
+		cancelRequestedAt time.Time
+	}{
+		{name: "leased before start", status: ActionStatusLeased},
+		{name: "running with cancellation intent", status: ActionStatusRunning, cancelRequestedAt: base},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
+			metadata := activeActionMetadata(base, fence)
+			metadata.Status = test.status
+			metadata.CancelRequestedAt = test.cancelRequestedAt
+			source := &fakeActionFenceSource{fence: fence, metadata: metadata}
+			repository := newTestMemoryRepository(t, source, func() time.Time { return base }, sequenceTokens("unused"))
+			prepared, err := repository.Prepare(context.Background(), PrepareRequest{
+				RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production",
+				CredentialExpiresAt: base.Add(time.Minute),
+			})
+			if err != nil || prepared.Permit == nil {
+				t.Fatalf("Prepare() = %#v, %v", prepared, err)
+			}
+
+			if _, err := repository.AuthorizeChildCreate(context.Background(), AuthorizeChildCreateRequest{
+				Permit: *prepared.Permit, Fence: fence,
+			}); !errors.Is(err, ErrStaleActionFence) {
+				t.Fatalf("AuthorizeChildCreate(%s) error = %v, want ErrStaleActionFence", test.name, err)
+			}
+
+			// A rejected pre-start/cancelled attempt must not consume the permit.
+			source.mu.Lock()
+			source.metadata.Status = ActionStatusRunning
+			source.metadata.CancelRequestedAt = time.Time{}
+			source.mu.Unlock()
+			if _, err := repository.AuthorizeChildCreate(context.Background(), AuthorizeChildCreateRequest{
+				Permit: *prepared.Permit, Fence: fence,
+			}); err != nil {
+				t.Fatalf("AuthorizeChildCreate(after valid start) error = %v", err)
+			}
+		})
+	}
+}
+
+func TestMemoryChildCreateAuthorizationRequiresAtomicActionSource(t *testing.T) {
+	base := time.Date(2026, 7, 10, 11, 17, 22, 0, time.UTC)
+	fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
+	delegate := &fakeActionFenceSource{fence: fence, metadata: activeActionMetadata(base, fence)}
+	repository := newTestMemoryRepository(t, nonAtomicActionFenceSource{delegate: delegate}, func() time.Time { return base }, sequenceTokens("unused"))
+	prepared, err := repository.Prepare(context.Background(), PrepareRequest{
+		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production",
+		CredentialExpiresAt: base.Add(time.Minute),
+	})
+	if err != nil || prepared.Permit == nil {
+		t.Fatalf("Prepare() = %#v, %v", prepared, err)
+	}
+
+	if _, err := repository.AuthorizeChildCreate(context.Background(), AuthorizeChildCreateRequest{
+		Permit: *prepared.Permit, Fence: fence,
+	}); !errors.Is(err, ErrAtomicActionSourceRequired) {
+		t.Fatalf("AuthorizeChildCreate(non-atomic source) error = %v, want ErrAtomicActionSourceRequired", err)
+	}
+	stored, err := repository.Get(context.Background(), testRevocationID)
+	if err != nil || stored.Status != StatusPrepared || stored.Version != 1 {
+		t.Fatalf("Get(after rejected non-atomic authorization) = %#v, %v", stored, err)
+	}
+}
+
+func TestMemoryChildCreateAuthorizationUsesLockedActionSnapshot(t *testing.T) {
+	base := time.Date(2026, 7, 10, 11, 17, 23, 0, time.UTC)
+	fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
+	source := &fakeActionFenceSource{fence: fence, metadata: activeActionMetadata(base, fence)}
+	repository := newTestMemoryRepository(t, source, func() time.Time { return base }, sequenceTokens("unused"))
+	prepared, err := repository.Prepare(context.Background(), PrepareRequest{
+		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production",
+		CredentialExpiresAt: base.Add(time.Minute),
+	})
+	if err != nil || prepared.Permit == nil {
+		t.Fatalf("Prepare() = %#v, %v", prepared, err)
+	}
+	source.mu.Lock()
+	source.resolveErr = errors.New("ordinary action resolution is no longer authorized")
+	source.mu.Unlock()
+
+	authorized, err := repository.AuthorizeChildCreate(context.Background(), AuthorizeChildCreateRequest{
+		Permit: *prepared.Permit, Fence: fence,
+	})
+	if err != nil || authorized.Revocation.Status != StatusPrepared || authorized.Revocation.Version != 2 {
+		t.Fatalf("AuthorizeChildCreate(locked snapshot) = %#v, %v", authorized, err)
+	}
+}
+
+func TestMemoryChildCreateAuthorizationRequiresCompleteRunnerProof(t *testing.T) {
+	base := time.Date(2026, 7, 10, 11, 17, 24, 0, time.UTC)
+	for _, test := range []struct {
+		name   string
+		mutate func(*ActionMetadata)
+	}{
+		{name: "runner disabled", mutate: func(metadata *ActionMetadata) { metadata.RunnerEnabled = false }},
+		{name: "read runner", mutate: func(metadata *ActionMetadata) { metadata.RunnerPool = "READ" }},
+		{name: "zero action revision", mutate: func(metadata *ActionMetadata) { metadata.ScopeRevision = 0 }},
+		{name: "registration revision changed", mutate: func(metadata *ActionMetadata) { metadata.RunnerScopeRevision++ }},
+		{name: "exact pair removed", mutate: func(metadata *ActionMetadata) { metadata.ExactScopeAuthorized = false }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
+			metadata := activeActionMetadata(base, fence)
+			test.mutate(&metadata)
+			source := &fakeActionFenceSource{fence: fence, metadata: metadata}
+			repository := newTestMemoryRepository(t, source, func() time.Time { return base }, sequenceTokens("unused"))
+			prepared, err := repository.Prepare(context.Background(), PrepareRequest{
+				RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production",
+				CredentialExpiresAt: base.Add(time.Minute),
+			})
+			if err != nil || prepared.Permit == nil {
+				t.Fatalf("Prepare() = %#v, %v", prepared, err)
+			}
+
+			if _, err := repository.AuthorizeChildCreate(context.Background(), AuthorizeChildCreateRequest{
+				Permit: *prepared.Permit, Fence: fence,
+			}); !errors.Is(err, ErrStaleActionFence) {
+				t.Fatalf("AuthorizeChildCreate(%s) error = %v, want ErrStaleActionFence", test.name, err)
+			}
+			stored, err := repository.Get(context.Background(), testRevocationID)
+			if err != nil || stored.Status != StatusPrepared || stored.Version != 1 {
+				t.Fatalf("Get(after rejected %s authorization) = %#v, %v", test.name, stored, err)
+			}
+		})
+	}
+}
+
+func TestMemoryAnchorAndActivateUseLockedActionSnapshot(t *testing.T) {
+	base := time.Date(2026, 7, 10, 11, 17, 25, 0, time.UTC)
+	fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
+	source := &fakeActionFenceSource{fence: fence, metadata: activeActionMetadata(base, fence)}
+	repository := newTestMemoryRepository(t, source, func() time.Time { return base }, sequenceTokens("unused"))
+	prepared, err := repository.Prepare(context.Background(), PrepareRequest{
+		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production",
+		CredentialExpiresAt: base.Add(time.Minute),
+	})
+	if err != nil || prepared.Permit == nil {
+		t.Fatalf("Prepare() = %#v, %v", prepared, err)
+	}
+	if _, err := repository.AuthorizeChildCreate(context.Background(), AuthorizeChildCreateRequest{
+		Permit: *prepared.Permit, Fence: fence,
+	}); err != nil {
+		t.Fatalf("AuthorizeChildCreate() error = %v", err)
+	}
+	source.mu.Lock()
+	source.ordinaryInspectErr = errors.New("ordinary action inspection is no longer authorized")
+	source.mu.Unlock()
+	accessor, err := NewSensitiveReference([]byte("atomic-anchor-accessor"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer accessor.Destroy()
+
+	anchored, err := repository.RecordAnchor(context.Background(), RecordAnchorRequest{
+		RevocationID: testRevocationID, Fence: fence, Accessor: accessor,
+	})
+	if err != nil || anchored.Status != StatusAnchored || !anchored.AccessorPresent {
+		t.Fatalf("RecordAnchor(locked snapshot) = %#v, %v", anchored, err)
+	}
+	activated, err := repository.Activate(context.Background(), ActionTransitionRequest{
+		RevocationID: testRevocationID, Fence: fence,
+	})
+	if err != nil || activated.Status != StatusActive {
+		t.Fatalf("Activate(locked snapshot) = %#v, %v", activated, err)
+	}
+}
+
+func TestMemoryAtomicAuthorizationSerializesCancellationAndScopeNarrowing(t *testing.T) {
+	base := time.Date(2026, 7, 10, 11, 17, 26, 0, time.UTC)
+	for _, test := range []struct {
+		name   string
+		mutate func(*ActionMetadata)
+	}{
+		{name: "cancellation", mutate: func(metadata *ActionMetadata) { metadata.CancelRequestedAt = base }},
+		{name: "scope revision narrowing", mutate: func(metadata *ActionMetadata) { metadata.RunnerScopeRevision++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
+			source := &fakeActionFenceSource{fence: fence, metadata: activeActionMetadata(base, fence)}
+			repository := newTestMemoryRepository(t, source, func() time.Time { return base }, sequenceTokens("unused"))
+			prepared, err := repository.Prepare(context.Background(), PrepareRequest{
+				RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production",
+				CredentialExpiresAt: base.Add(time.Minute),
+			})
+			if err != nil || prepared.Permit == nil {
+				t.Fatalf("Prepare() = %#v, %v", prepared, err)
+			}
+			lockedOperationEntered := make(chan struct{})
+			releaseLockedOperation := make(chan struct{})
+			source.mu.Lock()
+			source.lockedOperationEntered = lockedOperationEntered
+			source.releaseLockedOperation = releaseLockedOperation
+			source.mu.Unlock()
+			type authorizationResult struct {
+				authorization ChildCreateAuthorization
+				err           error
+			}
+			authorizationResults := make(chan authorizationResult, 1)
+			go func() {
+				authorization, authorizeErr := repository.AuthorizeChildCreate(context.Background(), AuthorizeChildCreateRequest{
+					Permit: *prepared.Permit, Fence: fence,
+				})
+				authorizationResults <- authorizationResult{authorization: authorization, err: authorizeErr}
+			}()
+			<-lockedOperationEntered
+			if source.mu.TryLock() {
+				source.mu.Unlock()
+				close(releaseLockedOperation)
+				t.Fatal("atomic action source did not hold its lock across the credential callback boundary")
+			}
+			mutationDone := make(chan struct{})
+			go func() {
+				source.mu.Lock()
+				test.mutate(&source.metadata)
+				source.mu.Unlock()
+				close(mutationDone)
+			}()
+			close(releaseLockedOperation)
+			result := <-authorizationResults
+			if result.err != nil || result.authorization.Revocation.Version != 2 {
+				t.Fatalf("AuthorizeChildCreate(before %s) = %#v, %v", test.name, result.authorization, result.err)
+			}
+			<-mutationDone
+
+			accessor, err := NewSensitiveReference([]byte("post-authorization-invalidation-accessor"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			anchored, err := repository.RecordAnchor(context.Background(), RecordAnchorRequest{
+				RevocationID: testRevocationID, Fence: fence, Accessor: accessor,
+			})
+			accessor.Destroy()
+			if err != nil || anchored.Status != StatusRevocationPending || !anchored.AccessorPresent {
+				t.Fatalf("RecordAnchor(after %s) = %#v, %v", test.name, anchored, err)
+			}
+			activated, err := repository.Activate(context.Background(), ActionTransitionRequest{
+				RevocationID: testRevocationID, Fence: fence,
+			})
+			if err != nil || activated.Status != StatusRevocationPending || !activated.ActivatedAt.IsZero() {
+				t.Fatalf("Activate(after %s) = %#v, %v", test.name, activated, err)
+			}
+		})
+	}
+}
+
+func TestMemoryAtomicActionSourceMustInvokeCallbackExactlyOnce(t *testing.T) {
+	base := time.Date(2026, 7, 10, 11, 17, 27, 0, time.UTC)
+	for _, test := range []struct {
+		name              string
+		callbackCount     int
+		wantStoredVersion int64
+	}{
+		{name: "zero callbacks", callbackCount: 0, wantStoredVersion: 1},
+		{name: "double callback with swallowed error", callbackCount: 2, wantStoredVersion: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
+			delegate := &fakeActionFenceSource{fence: fence, metadata: activeActionMetadata(base, fence)}
+			source := malformedAtomicActionFenceSource{delegate: delegate, callbackCount: test.callbackCount}
+			repository := newTestMemoryRepository(t, source, func() time.Time { return base }, sequenceTokens("unused"))
+			prepared, err := repository.Prepare(context.Background(), PrepareRequest{
+				RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production",
+				CredentialExpiresAt: base.Add(time.Minute),
+			})
+			if err != nil || prepared.Permit == nil {
+				t.Fatalf("Prepare() = %#v, %v", prepared, err)
+			}
+
+			if _, err := repository.AuthorizeChildCreate(context.Background(), AuthorizeChildCreateRequest{
+				Permit: *prepared.Permit, Fence: fence,
+			}); !errors.Is(err, ErrAtomicActionSourceRequired) {
+				t.Fatalf("AuthorizeChildCreate(%s) error = %v, want ErrAtomicActionSourceRequired", test.name, err)
+			}
+			stored, err := repository.Get(context.Background(), testRevocationID)
+			if err != nil || stored.Status != StatusPrepared || stored.Version != test.wantStoredVersion {
+				t.Fatalf("Get(after %s) = %#v, %v; want version %d", test.name, stored, err, test.wantStoredVersion)
+			}
+		})
+	}
+}
+
+func TestMemoryCancellationBeforeAnchorPersistsRevocationPendingAndNeverActivates(t *testing.T) {
+	base := time.Date(2026, 7, 10, 11, 17, 25, 0, time.UTC)
+	fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
+	source := &fakeActionFenceSource{fence: fence, metadata: activeActionMetadata(base, fence)}
+	repository := newTestMemoryRepository(t, source, func() time.Time { return base }, sequenceTokens("unused"))
+	prepared, err := repository.Prepare(context.Background(), PrepareRequest{
+		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production",
+		CredentialExpiresAt: base.Add(time.Minute),
+	})
+	if err != nil || prepared.Permit == nil {
+		t.Fatalf("Prepare() = %#v, %v", prepared, err)
+	}
+	if _, err := repository.AuthorizeChildCreate(context.Background(), AuthorizeChildCreateRequest{
+		Permit: *prepared.Permit, Fence: fence,
+	}); err != nil {
+		t.Fatalf("AuthorizeChildCreate() error = %v", err)
+	}
+	source.mu.Lock()
+	source.metadata.CancelRequestedAt = base
+	source.mu.Unlock()
+	accessor, err := NewSensitiveReference([]byte("cancelled-before-anchor-accessor"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer accessor.Destroy()
+
+	anchored, err := repository.RecordAnchor(context.Background(), RecordAnchorRequest{
+		RevocationID: testRevocationID, Fence: fence, Accessor: accessor,
+	})
+	if err != nil || anchored.Status != StatusRevocationPending || !anchored.AccessorPresent {
+		t.Fatalf("RecordAnchor(cancelled) = %#v, %v", anchored, err)
+	}
+	activated, err := repository.Activate(context.Background(), ActionTransitionRequest{
+		RevocationID: testRevocationID, Fence: fence,
+	})
+	if err != nil || activated.Status != StatusRevocationPending || activated.ActivatedAt != (time.Time{}) {
+		t.Fatalf("Activate(cancelled) = %#v, %v", activated, err)
+	}
+}
+
+func TestMemoryConcurrentChildCreateAuthorizationHasOneWinner(t *testing.T) {
+	base := time.Date(2026, 7, 10, 11, 17, 30, 0, time.UTC)
+	fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
+	source := &fakeActionFenceSource{fence: fence, metadata: activeActionMetadata(base, fence)}
+	repository := newTestMemoryRepository(t, source, func() time.Time { return base }, sequenceTokens("unused"))
+	prepared, err := repository.Prepare(context.Background(), PrepareRequest{
+		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production", CredentialExpiresAt: base.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			_, authorizeErr := repository.AuthorizeChildCreate(context.Background(), AuthorizeChildCreateRequest{
+				Permit: *prepared.Permit, Fence: fence,
+			})
+			errs <- authorizeErr
+		}()
+	}
+	close(start)
+	winners, replays := 0, 0
+	for range 2 {
+		switch authorizeErr := <-errs; {
+		case authorizeErr == nil:
+			winners++
+		case errors.Is(authorizeErr, ErrChildCreateAlreadyAuthorized):
+			replays++
+		default:
+			t.Fatalf("AuthorizeChildCreate() error = %v", authorizeErr)
+		}
+	}
+	if winners != 1 || replays != 1 {
+		t.Fatalf("AuthorizeChildCreate winners=%d replays=%d, want 1/1", winners, replays)
+	}
+}
+
+func TestMemoryChildCreateAuthorizationIsSingleUseAndRedacted(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 10, 11, 15, 0, 0, time.UTC)
+	fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
+	source := &fakeActionFenceSource{fence: fence, metadata: activeActionMetadata(now, fence)}
+	protector := testProtector(t, "memory-key", map[string]ProtectionKey{
+		"memory-key": {EncryptionKey: bytes.Repeat([]byte{0x61}, 32), HMACKey: bytes.Repeat([]byte{0x62}, 32)},
+	})
+	repository, err := NewMemoryRepository(source, protector, MemoryRepositoryOptions{
+		Clock: func() time.Time { return now }, PermitSource: sequenceTokens("child-create-permit"), TokenSource: sequenceTokens("unused"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := repository.Prepare(ctx, PrepareRequest{
+		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production",
+		CredentialExpiresAt: now.Add(time.Minute),
+	})
+	if err != nil || !prepared.Created || prepared.Permit == nil || prepared.Permit.Token != "child-create-permit" {
+		t.Fatalf("Prepare() = %#v, %v", prepared, err)
+	}
+	encoded, err := json.Marshal(prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte("child-create-permit")) || strings.Contains(fmt.Sprint(prepared.Permit), "child-create-permit") {
+		t.Fatalf("Prepare result leaked permit: json=%s string=%s", encoded, prepared.Permit)
+	}
+	permitJSON, err := json.Marshal(prepared.Permit)
+	if err != nil || bytes.Contains(permitJSON, []byte("child-create-permit")) || !bytes.Contains(permitJSON, []byte(`"redacted":true`)) {
+		t.Fatalf("ChildCreatePermit JSON = %s, %v", permitJSON, err)
+	}
+	replayed, err := repository.Prepare(ctx, PrepareRequest{
+		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production",
+		CredentialExpiresAt: now.Add(time.Minute),
+	})
+	if err != nil || replayed.Created || replayed.Permit != nil {
+		t.Fatalf("Prepare(replay) = %#v, %v", replayed, err)
+	}
+
+	authorized, err := repository.AuthorizeChildCreate(ctx, AuthorizeChildCreateRequest{
+		Permit: *prepared.Permit, Fence: fence,
+	})
+	if err != nil || authorized.TTL != 45*time.Second || authorized.VaultCallBudget != 12*time.Second ||
+		!authorized.DatabaseAuthorizedAt.Equal(now) || authorized.Revocation.Version != 2 ||
+		authorized.DatabaseAuthorizedAt.Add(authorized.TTL+ChildCreateExpiryReserve).After(authorized.CredentialExpiresAt) {
+		t.Fatalf("AuthorizeChildCreate() = %#v, %v", authorized, err)
+	}
+	if _, err := repository.AuthorizeChildCreate(ctx, AuthorizeChildCreateRequest{
+		Permit: *prepared.Permit, Fence: fence,
+	}); !errors.Is(err, ErrChildCreateAlreadyAuthorized) {
+		t.Fatalf("AuthorizeChildCreate(replay) error = %v", err)
+	}
+	wrongPermit := *prepared.Permit
+	wrongPermit.Token = "wrong-child-create-permit"
+	if _, err := repository.AuthorizeChildCreate(ctx, AuthorizeChildCreateRequest{
+		Permit: wrongPermit, Fence: fence,
+	}); !errors.Is(err, ErrStaleChildCreatePermit) {
+		t.Fatalf("AuthorizeChildCreate(wrong permit after authorization) error = %v", err)
+	}
+	if _, err := repository.RecordNoCredential(ctx, ActionTransitionRequest{
+		RevocationID: testRevocationID, Fence: fence,
+	}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("RecordNoCredential(after authorization) error = %v", err)
+	}
+}
+
+func TestMemoryPreparePermitFailureReturnsNoCapabilityOrRow(t *testing.T) {
+	now := time.Date(2026, 7, 10, 11, 15, 30, 0, time.UTC)
+	fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
+	source := &fakeActionFenceSource{fence: fence, metadata: activeActionMetadata(now, fence)}
+	protector := testProtector(t, "memory-key", map[string]ProtectionKey{
+		"memory-key": {EncryptionKey: bytes.Repeat([]byte{0x61}, 32), HMACKey: bytes.Repeat([]byte{0x62}, 32)},
+	})
+	repository, err := NewMemoryRepository(source, protector, MemoryRepositoryOptions{
+		Clock: func() time.Time { return now }, PermitSource: func() (string, error) {
+			return "secret-permit-must-not-return", errors.New("permit source unavailable")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := repository.Prepare(context.Background(), PrepareRequest{
+		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production", CredentialExpiresAt: now.Add(time.Minute),
+	})
+	if !errors.Is(err, ErrRevocationPersistence) || prepared.Permit != nil || prepared.Created {
+		t.Fatalf("Prepare(permit failure) = %#v, %v", prepared, err)
+	}
+	listed, listErr := repository.List(context.Background(), ListFilter{WorkspaceID: testWorkspaceID, Limit: 10})
+	if listErr != nil || len(listed) != 0 {
+		t.Fatalf("List(after permit failure) = %#v, %v", listed, listErr)
+	}
+}
+
+func TestAuthorizeChildCreateRequestFormattingRedactsBothBearers(t *testing.T) {
+	request := AuthorizeChildCreateRequest{
+		Permit: ChildCreatePermit{RevocationID: testRevocationID, Token: "secret-child-create-permit"},
+		Fence:  ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "secret-action-fence", Epoch: 2},
+	}
+	for _, rendered := range []string{
+		fmt.Sprintf("%v", request), fmt.Sprintf("%+v", request), fmt.Sprintf("%#v", request),
+	} {
+		if strings.Contains(rendered, request.Permit.Token) || strings.Contains(rendered, request.Fence.Token) ||
+			!strings.Contains(rendered, "[REDACTED]") {
+			t.Fatalf("AuthorizeChildCreateRequest formatting leaked bearer: %s", rendered)
+		}
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte(request.Permit.Token)) || bytes.Contains(encoded, []byte(request.Fence.Token)) ||
+		bytes.Count(encoded, []byte(`"redacted":true`)) != 2 {
+		t.Fatalf("AuthorizeChildCreateRequest JSON leaked bearer or lacks redaction markers: %s", encoded)
 	}
 }
 
@@ -323,11 +889,13 @@ func TestMemoryRecordAnchorIdempotencyNeverDecryptsStoredAccessor(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repository.Prepare(ctx, PrepareRequest{
+	prepared, err := repository.Prepare(ctx, PrepareRequest{
 		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production", CredentialExpiresAt: now.Add(time.Minute),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	authorizePrepared(t, ctx, repository, prepared, fence)
 	accessor, _ := NewSensitiveReference([]byte("idempotent-accessor"))
 	defer accessor.Destroy()
 	request := RecordAnchorRequest{RevocationID: testRevocationID, Fence: fence, Accessor: accessor}
@@ -348,11 +916,13 @@ func TestMemoryRecordAnchorPersistsFrozenFenceAfterLiveResolverExpires(t *testin
 	fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
 	source := &fakeActionFenceSource{fence: fence, metadata: activeActionMetadata(now, fence)}
 	repository := newTestMemoryRepository(t, source, func() time.Time { return now }, sequenceTokens("unused"))
-	if _, err := repository.Prepare(ctx, PrepareRequest{
+	prepared, err := repository.Prepare(ctx, PrepareRequest{
 		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production", CredentialExpiresAt: now.Add(time.Minute),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	authorizePrepared(t, ctx, repository, prepared, fence)
 	resolveCalls := source.ResolveCalls()
 	source.resolveErr = ErrStaleActionFence
 	source.metadata.LeaseExpiresAt = now.Add(-time.Second)
@@ -377,13 +947,15 @@ func TestMemoryRecordAnchorImmediatelyRequestsWhenCredentialTTLHasElapsed(t *tes
 	fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
 	source := &fakeActionFenceSource{fence: fence, metadata: activeActionMetadata(now, fence)}
 	repository := newTestMemoryRepository(t, source, func() time.Time { return now }, sequenceTokens("unused"))
-	if _, err := repository.Prepare(ctx, PrepareRequest{
+	prepared, err := repository.Prepare(ctx, PrepareRequest{
 		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production",
-		CredentialExpiresAt: now.Add(2 * time.Second),
-	}); err != nil {
+		CredentialExpiresAt: now.Add(20 * time.Second),
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	now = now.Add(3 * time.Second)
+	authorizePrepared(t, ctx, repository, prepared, fence)
+	now = now.Add(21 * time.Second)
 	accessor, _ := NewSensitiveReference([]byte("elapsed-credential-accessor"))
 	defer accessor.Destroy()
 	anchored, err := repository.RecordAnchor(ctx, RecordAnchorRequest{
@@ -408,12 +980,14 @@ func TestMemoryRecordAnchorRechecksCommitWindowForNewAndIdempotentPaths(t *testi
 			metadata.LeaseExpiresAt = base.Add(time.Minute)
 			source := &fakeActionFenceSource{fence: fence, metadata: metadata}
 			repository := newTestMemoryRepository(t, source, func() time.Time { return base }, sequenceTokens("unused"))
-			if _, err := repository.Prepare(ctx, PrepareRequest{
+			prepared, err := repository.Prepare(ctx, PrepareRequest{
 				RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production",
 				CredentialExpiresAt: base.Add(10 * time.Minute),
-			}); err != nil {
+			})
+			if err != nil {
 				t.Fatal(err)
 			}
+			authorizePrepared(t, ctx, repository, prepared, fence)
 			accessor, _ := NewSensitiveReference([]byte("commit-window-accessor"))
 			defer accessor.Destroy()
 			request := RecordAnchorRequest{RevocationID: testRevocationID, Fence: fence, Accessor: accessor}
@@ -441,12 +1015,14 @@ func TestMemoryActivateUsesFrozenInspectionAndRechecksCommitWindow(t *testing.T)
 	metadata.LeaseExpiresAt = base.Add(time.Minute)
 	source := &fakeActionFenceSource{fence: fence, metadata: metadata}
 	repository := newTestMemoryRepository(t, source, func() time.Time { return base }, sequenceTokens("unused"))
-	if _, err := repository.Prepare(ctx, PrepareRequest{
+	prepared, err := repository.Prepare(ctx, PrepareRequest{
 		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production",
 		CredentialExpiresAt: base.Add(10 * time.Minute),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	authorizePrepared(t, ctx, repository, prepared, fence)
 	accessor, _ := NewSensitiveReference([]byte("activate-commit-window-accessor"))
 	defer accessor.Destroy()
 	if _, err := repository.RecordAnchor(ctx, RecordAnchorRequest{
@@ -473,12 +1049,14 @@ func TestMemoryActivateImmediatelyRequestsWhenActionWasNacked(t *testing.T) {
 	fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
 	source := &fakeActionFenceSource{fence: fence, metadata: activeActionMetadata(now, fence)}
 	repository := newTestMemoryRepository(t, source, func() time.Time { return now }, sequenceTokens("unused"))
-	if _, err := repository.Prepare(ctx, PrepareRequest{
+	prepared, err := repository.Prepare(ctx, PrepareRequest{
 		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production",
 		CredentialExpiresAt: now.Add(10 * time.Minute),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	authorizePrepared(t, ctx, repository, prepared, fence)
 	accessor, _ := NewSensitiveReference([]byte("activate-nack-accessor"))
 	defer accessor.Destroy()
 	if _, err := repository.RecordAnchor(ctx, RecordAnchorRequest{
@@ -503,11 +1081,13 @@ func TestMemoryRevocationCanRequestAnchoredRecoveryWithoutPersistedActionBearer(
 	fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "short-lived-action-token", Epoch: 3}
 	source := &fakeActionFenceSource{fence: fence, metadata: activeActionMetadata(now, fence)}
 	repository := newTestMemoryRepository(t, source, func() time.Time { return now }, sequenceTokens("unused"))
-	if _, err := repository.Prepare(ctx, PrepareRequest{
+	prepared, err := repository.Prepare(ctx, PrepareRequest{
 		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production", CredentialExpiresAt: now.Add(5 * time.Minute),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	authorizePrepared(t, ctx, repository, prepared, fence)
 	accessor, _ := NewSensitiveReference([]byte("crash-recovery-accessor"))
 	if _, err := repository.RecordAnchor(ctx, RecordAnchorRequest{
 		RevocationID: testRevocationID, Fence: fence, Accessor: accessor,
@@ -837,11 +1417,13 @@ func TestMemoryRevocationRequiresTwoDistinctMatchingExternalConfirmations(t *tes
 
 func prepareActivePending(t *testing.T, ctx context.Context, repository Repository, now time.Time, fence ActionFence, id, accessorValue string) {
 	t.Helper()
-	if _, err := repository.Prepare(ctx, PrepareRequest{
+	prepared, err := repository.Prepare(ctx, PrepareRequest{
 		RevocationID: id, Fence: fence, Issuer: "vault-production", CredentialExpiresAt: now.Add(10 * time.Minute),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	authorizePrepared(t, ctx, repository, prepared, fence)
 	accessor, err := NewSensitiveReference([]byte(accessorValue))
 	if err != nil {
 		t.Fatal(err)
@@ -854,6 +1436,16 @@ func prepareActivePending(t *testing.T, ctx context.Context, repository Reposito
 	}
 	if _, err := repository.RequestRevocation(ctx, ActionTransitionRequest{RevocationID: id, Fence: fence}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func authorizePrepared(t *testing.T, ctx context.Context, repository Repository, prepared PrepareResult, fence ActionFence) {
+	t.Helper()
+	if prepared.Permit == nil {
+		t.Fatal("Prepare() did not return child-create permit")
+	}
+	if _, err := repository.AuthorizeChildCreate(ctx, AuthorizeChildCreateRequest{Permit: *prepared.Permit, Fence: fence}); err != nil {
+		t.Fatalf("AuthorizeChildCreate() error = %v", err)
 	}
 }
 
@@ -876,21 +1468,66 @@ func activeActionMetadata(now time.Time, fence ActionFence) ActionMetadata {
 	return ActionMetadata{
 		ActionID: fence.ActionID, TenantID: testTenantID, WorkspaceID: testWorkspaceID, EnvironmentID: testEnvironment,
 		TargetKey: "cluster-a/payments", Production: true, RunnerID: fence.RunnerID, LeaseEpoch: fence.Epoch,
-		Status: ActionStatusRunning, LeaseExpiresAt: now.Add(time.Minute), AuthorizationExpiresAt: now.Add(15 * time.Minute), ConnectorID: "kubernetes-prod",
-		Permission: "PATCH_DEPLOYMENT_RESTART", Resource: "cluster-a/payments/deployment/api",
+		Status: ActionStatusRunning, LeaseExpiresAt: now.Add(time.Minute), AuthorizationExpiresAt: now.Add(15 * time.Minute),
+		RunnerEnabled: true, RunnerPool: "WRITE", ScopeRevision: 7, RunnerScopeRevision: 7, ExactScopeAuthorized: true,
+		ConnectorID: "kubernetes-prod",
+		Permission:  "PATCH_DEPLOYMENT_RESTART", Resource: "cluster-a/payments/deployment/api",
 	}
 }
 
 type fakeActionFenceSource struct {
-	mu           sync.Mutex
-	fence        ActionFence
-	metadata     ActionMetadata
-	fences       map[ActionFence]ActionMetadata
-	resolveErr   error
-	resolveCalls int
-	inspection   *ActionInspection
-	inspectErr   error
-	inspectCalls int
+	mu                     sync.Mutex
+	fence                  ActionFence
+	metadata               ActionMetadata
+	fences                 map[ActionFence]ActionMetadata
+	resolveErr             error
+	resolveCalls           int
+	inspection             *ActionInspection
+	ordinaryInspectErr     error
+	inspectErr             error
+	inspectCalls           int
+	lockedOperationEntered chan struct{}
+	releaseLockedOperation chan struct{}
+}
+
+type nonAtomicActionFenceSource struct {
+	delegate *fakeActionFenceSource
+}
+
+func (source nonAtomicActionFenceSource) ResolveActionFence(ctx context.Context, fence ActionFence) (ActionMetadata, error) {
+	return source.delegate.ResolveActionFence(ctx, fence)
+}
+
+func (source nonAtomicActionFenceSource) InspectAction(ctx context.Context, actionID string) (ActionInspection, error) {
+	return source.delegate.InspectAction(ctx, actionID)
+}
+
+type malformedAtomicActionFenceSource struct {
+	delegate      *fakeActionFenceSource
+	callbackCount int
+}
+
+func (source malformedAtomicActionFenceSource) ResolveActionFence(ctx context.Context, fence ActionFence) (ActionMetadata, error) {
+	return source.delegate.ResolveActionFence(ctx, fence)
+}
+
+func (source malformedAtomicActionFenceSource) InspectAction(ctx context.Context, actionID string) (ActionInspection, error) {
+	return source.delegate.InspectAction(ctx, actionID)
+}
+
+func (source malformedAtomicActionFenceSource) WithLockedActionInspection(
+	ctx context.Context,
+	actionID string,
+	operation func(ActionInspection) error,
+) error {
+	inspection, err := source.delegate.InspectAction(ctx, actionID)
+	if err != nil {
+		return err
+	}
+	for range source.callbackCount {
+		_ = operation(inspection)
+	}
+	return nil
 }
 
 type countingReferenceProtector struct {
@@ -961,6 +1598,9 @@ func (source *fakeActionFenceSource) InspectAction(_ context.Context, actionID s
 	source.mu.Lock()
 	defer source.mu.Unlock()
 	source.inspectCalls++
+	if source.ordinaryInspectErr != nil {
+		return ActionInspection{}, source.ordinaryInspectErr
+	}
 	if source.inspectErr != nil {
 		return ActionInspection{}, source.inspectErr
 	}
@@ -976,6 +1616,42 @@ func (source *fakeActionFenceSource) InspectAction(_ context.Context, actionID s
 		}
 	}
 	return ActionInspection{}, ErrRevocationNotFound
+}
+
+func (source *fakeActionFenceSource) WithLockedActionInspection(
+	ctx context.Context,
+	actionID string,
+	operation func(ActionInspection) error,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	source.inspectCalls++
+	lockedOperationEntered := source.lockedOperationEntered
+	releaseLockedOperation := source.releaseLockedOperation
+	source.lockedOperationEntered = nil
+	source.releaseLockedOperation = nil
+	if lockedOperationEntered != nil {
+		close(lockedOperationEntered)
+		<-releaseLockedOperation
+	}
+	if source.inspectErr != nil {
+		return source.inspectErr
+	}
+	if source.inspection != nil {
+		return operation(*source.inspection)
+	}
+	if source.metadata.ActionID == actionID {
+		return operation(ActionInspection{Metadata: source.metadata, LeaseTokenSHA256: SHA256Hex([]byte(source.fence.Token))})
+	}
+	for fence, metadata := range source.fences {
+		if metadata.ActionID == actionID {
+			return operation(ActionInspection{Metadata: metadata, LeaseTokenSHA256: SHA256Hex([]byte(fence.Token))})
+		}
+	}
+	return ErrRevocationNotFound
 }
 
 func sequenceTokens(tokens ...string) func() (string, error) {

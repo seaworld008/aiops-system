@@ -41,6 +41,9 @@ CREATE TABLE credential_revocations (
     scope_permission text NOT NULL,
     scope_resource text NOT NULL,
     credential_expires_at timestamptz NOT NULL,
+    child_create_permit_sha256 text NOT NULL,
+    child_create_authorized_at timestamptz,
+    child_create_ttl_seconds integer,
     status text NOT NULL DEFAULT 'PREPARED',
     accessor_ciphertext bytea,
     accessor_hmac bytea,
@@ -117,6 +120,7 @@ CREATE TABLE credential_revocations (
     ),
     CONSTRAINT credential_revocations_hashes_ck CHECK (
         octet_length(action_lease_token_sha256) = 64 AND action_lease_token_sha256 COLLATE "C" !~ '[^a-f0-9]' AND
+        octet_length(child_create_permit_sha256) = 64 AND child_create_permit_sha256 COLLATE "C" !~ '[^a-f0-9]' AND
         (claim_token_sha256 IS NULL OR (
             octet_length(claim_token_sha256) = 64 AND claim_token_sha256 COLLATE "C" !~ '[^a-f0-9]'
         )) AND
@@ -129,6 +133,17 @@ CREATE TABLE credential_revocations (
         (evidence_hash IS NULL OR (
             octet_length(evidence_hash) = 64 AND evidence_hash COLLATE "C" !~ '[^a-f0-9]'
         ))
+    ),
+    CONSTRAINT credential_revocations_child_create_ck CHECK (
+        (
+            child_create_authorized_at IS NULL AND child_create_ttl_seconds IS NULL
+        ) OR (
+            child_create_authorized_at IS NOT NULL AND
+            child_create_ttl_seconds BETWEEN 1 AND 900 AND
+            child_create_authorized_at >= created_at AND
+            child_create_authorized_at + child_create_ttl_seconds * interval '1 second' + interval '15 seconds'
+                <= credential_expires_at
+        )
     ),
     CONSTRAINT credential_revocations_protected_ref_ck CHECK (
         (status = 'PREPARED' AND accessor_ciphertext IS NULL AND accessor_hmac IS NULL AND encryption_key_id IS NULL) OR
@@ -234,7 +249,9 @@ CREATE INDEX credential_revocations_prepared_recovery_idx
 CREATE OR REPLACE FUNCTION enforce_credential_revocation_transition() RETURNS trigger AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
-        IF NEW.status <> 'PREPARED' OR NEW.version <> 1 THEN
+        IF NEW.status <> 'PREPARED' OR NEW.version <> 1
+           OR NEW.child_create_authorized_at IS NOT NULL
+           OR NEW.child_create_ttl_seconds IS NOT NULL THEN
             RAISE EXCEPTION USING
                 ERRCODE = '55000',
                 MESSAGE = 'credential revocations must begin in PREPARED at version 1';
@@ -258,12 +275,34 @@ BEGIN
             MESSAGE = 'credential revocation counters and time must advance monotonically';
     END IF;
 
+    IF OLD.child_create_authorized_at IS NOT NULL AND (
+        OLD.child_create_authorized_at IS DISTINCT FROM NEW.child_create_authorized_at OR
+        OLD.child_create_ttl_seconds IS DISTINCT FROM NEW.child_create_ttl_seconds
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'credential child creation authorization is immutable';
+    END IF;
+
+    IF OLD.child_create_authorized_at IS NULL AND NEW.child_create_authorized_at IS NOT NULL AND (
+        OLD.status <> 'PREPARED' OR NEW.status <> 'PREPARED' OR
+        NEW.child_create_ttl_seconds IS NULL
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'credential child creation may only be authorized once from PREPARED';
+    END IF;
+
     IF OLD.status = NEW.status THEN
         RETURN NEW;
     END IF;
 
     IF NOT (
-        (OLD.status = 'PREPARED' AND NEW.status IN ('ANCHORED', 'NO_CREDENTIAL')) OR
+        (OLD.status = 'PREPARED' AND NEW.status = 'ANCHORED' AND OLD.child_create_authorized_at IS NOT NULL) OR
+        (OLD.status = 'PREPARED' AND NEW.status = 'NO_CREDENTIAL' AND (
+            OLD.child_create_authorized_at IS NULL OR
+            OLD.credential_expires_at <= clock_timestamp() - interval '1 minute'
+        )) OR
         (OLD.status = 'ANCHORED' AND NEW.status IN ('ACTIVE', 'REVOCATION_PENDING')) OR
         (OLD.status = 'ACTIVE' AND NEW.status = 'REVOCATION_PENDING') OR
         (OLD.status = 'REVOCATION_PENDING' AND NEW.status = 'REVOKING') OR
@@ -294,6 +333,7 @@ BEGIN
        OR OLD.runner_id IS DISTINCT FROM NEW.runner_id
        OR OLD.action_lease_epoch IS DISTINCT FROM NEW.action_lease_epoch
        OR OLD.action_lease_token_sha256 IS DISTINCT FROM NEW.action_lease_token_sha256
+       OR OLD.child_create_permit_sha256 IS DISTINCT FROM NEW.child_create_permit_sha256
        OR OLD.issuer IS DISTINCT FROM NEW.issuer
        OR OLD.connector_id IS DISTINCT FROM NEW.connector_id
        OR OLD.scope_permission IS DISTINCT FROM NEW.scope_permission

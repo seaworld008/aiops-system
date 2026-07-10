@@ -3,6 +3,7 @@ package credential
 import (
 	"context"
 	cryptorand "crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"math"
@@ -13,19 +14,23 @@ import (
 )
 
 type MemoryRepositoryOptions struct {
-	Clock       func() time.Time
-	TokenSource func() (string, error)
+	Clock        func() time.Time
+	TokenSource  func() (string, error)
+	PermitSource func() (string, error)
 }
 
 type memoryRevocationRecord struct {
-	revocation           Revocation
-	protected            ProtectedReference
-	actionTokenSHA256    string
-	claimTokenSHA256     string
-	completedClaimSHA256 string
-	completedClaimEpoch  int64
-	completedClaimWorker string
-	confirmations        map[string]ExternalConfirmation
+	revocation              Revocation
+	protected               ProtectedReference
+	actionTokenSHA256       string
+	childCreatePermitSHA256 string
+	childCreateAuthorizedAt time.Time
+	childCreateTTL          time.Duration
+	claimTokenSHA256        string
+	completedClaimSHA256    string
+	completedClaimEpoch     int64
+	completedClaimWorker    string
+	confirmations           map[string]ExternalConfirmation
 }
 
 type memoryPreparedClaim struct {
@@ -40,6 +45,7 @@ type MemoryRepository struct {
 	protector    ReferenceProtector
 	clock        func() time.Time
 	tokenSource  func() (string, error)
+	permitSource func() (string, error)
 	records      map[string]*memoryRevocationRecord
 	actionEpochs map[string]string
 }
@@ -56,12 +62,16 @@ func NewMemoryRepository(actions ActionFenceSource, protector ReferenceProtector
 	if options.TokenSource == nil {
 		options.TokenSource = randomRevocationToken
 	}
+	if options.PermitSource == nil {
+		options.PermitSource = randomRevocationToken
+	}
 	if options.Clock().IsZero() {
 		return nil, ErrInvalidRevocationRequest
 	}
 	return &MemoryRepository{
 		actions: actions, protector: protector, clock: options.Clock, tokenSource: options.TokenSource,
-		records: make(map[string]*memoryRevocationRecord), actionEpochs: make(map[string]string),
+		permitSource: options.PermitSource,
+		records:      make(map[string]*memoryRevocationRecord), actionEpochs: make(map[string]string),
 	}, nil
 }
 
@@ -83,7 +93,6 @@ func (repository *MemoryRepository) Prepare(ctx context.Context, request Prepare
 	if request.CredentialExpiresAt.After(metadata.AuthorizationExpiresAt) {
 		return PrepareResult{}, ErrInvalidRevocationRequest
 	}
-
 	revalidated, err := repository.resolvePrepareAction(ctx, request.Fence, repository.now())
 	if err != nil {
 		return PrepareResult{}, err
@@ -120,7 +129,10 @@ func (repository *MemoryRepository) Prepare(ctx context.Context, request Prepare
 		}
 		return PrepareResult{Revocation: publicMemoryRevocation(existing)}, nil
 	}
-
+	permitToken, err := repository.permitSource()
+	if err != nil || !ValidOpaqueText(permitToken, 4096) {
+		return PrepareResult{}, ErrRevocationPersistence
+	}
 	revocation := Revocation{
 		ID: request.RevocationID, TenantID: metadata.TenantID, WorkspaceID: metadata.WorkspaceID,
 		EnvironmentID: metadata.EnvironmentID, ActionID: metadata.ActionID, TargetKey: metadata.TargetKey,
@@ -131,11 +143,77 @@ func (repository *MemoryRepository) Prepare(ctx context.Context, request Prepare
 	}
 	record := &memoryRevocationRecord{
 		revocation: revocation, actionTokenSHA256: SHA256Hex([]byte(request.Fence.Token)),
-		confirmations: make(map[string]ExternalConfirmation),
+		childCreatePermitSHA256: SHA256Hex([]byte(permitToken)),
+		confirmations:           make(map[string]ExternalConfirmation),
 	}
 	repository.records[request.RevocationID] = record
 	repository.actionEpochs[key] = request.RevocationID
-	return PrepareResult{Revocation: publicMemoryRevocation(record), Created: true}, nil
+	return PrepareResult{
+		Revocation: publicMemoryRevocation(record), Created: true,
+		Permit: &ChildCreatePermit{RevocationID: request.RevocationID, Token: permitToken},
+	}, nil
+}
+
+func (repository *MemoryRepository) AuthorizeChildCreate(
+	ctx context.Context,
+	request AuthorizeChildCreateRequest,
+) (ChildCreateAuthorization, error) {
+	if err := contextError(ctx); err != nil {
+		return ChildCreateAuthorization{}, err
+	}
+	if !ValidRevocationID(request.Permit.RevocationID) || !ValidOpaqueText(request.Permit.Token, 4096) ||
+		!validActionFence(request.Fence) {
+		return ChildCreateAuthorization{}, ErrInvalidRevocationRequest
+	}
+	var authorization ChildCreateAuthorization
+	err := repository.withLockedActionInspection(ctx, request.Fence.ActionID, func(inspection ActionInspection) error {
+		now := repository.now()
+		repository.mu.Lock()
+		defer repository.mu.Unlock()
+		record := repository.records[request.Permit.RevocationID]
+		if record == nil {
+			return ErrRevocationNotFound
+		}
+		if !frozenActionFenceMatches(record, request.Fence) || !inspectionScopeMatches(record.revocation, inspection.Metadata) ||
+			!inspectionFenceCurrent(record, inspection, now, 0) {
+			return ErrStaleActionFence
+		}
+		minimumExpiry := now.Add(ChildCreateExpiryReserve + MinPostChildFenceWindow)
+		if inspection.Metadata.LeaseExpiresAt.Before(minimumExpiry) ||
+			inspection.Metadata.AuthorizationExpiresAt.Before(minimumExpiry) {
+			return ErrStaleActionFence
+		}
+		if subtle.ConstantTimeCompare(
+			[]byte(record.childCreatePermitSHA256),
+			[]byte(SHA256Hex([]byte(request.Permit.Token))),
+		) != 1 {
+			return ErrStaleChildCreatePermit
+		}
+		if record.revocation.Status != StatusPrepared || len(record.protected.Ciphertext) != 0 {
+			return ErrInvalidTransition
+		}
+		if !record.childCreateAuthorizedAt.IsZero() {
+			return ErrChildCreateAlreadyAuthorized
+		}
+		remaining := record.revocation.CredentialExpiresAt.Sub(now) - ChildCreateExpiryReserve
+		ttl := remaining / VaultTTLQuantum * VaultTTLQuantum
+		if ttl < MinChildCreateTTL {
+			return ErrChildCreateWindowExpired
+		}
+		record.childCreateAuthorizedAt = now
+		record.childCreateTTL = ttl
+		record.bump(now)
+		authorization = ChildCreateAuthorization{
+			Revocation: publicMemoryRevocation(record), DatabaseAuthorizedAt: now,
+			CredentialExpiresAt: record.revocation.CredentialExpiresAt, TTL: ttl,
+			VaultCallBudget: ChildCreateVaultCallBudget,
+		}
+		return nil
+	})
+	if err != nil {
+		return ChildCreateAuthorization{}, err
+	}
+	return authorization, nil
 }
 
 func (repository *MemoryRepository) RecordAnchor(ctx context.Context, request RecordAnchorRequest) (Revocation, error) {
@@ -145,66 +223,70 @@ func (repository *MemoryRepository) RecordAnchor(ctx context.Context, request Re
 	if !ValidRevocationID(request.RevocationID) || !validActionFence(request.Fence) || !ValidSensitiveReference(request.Accessor) {
 		return Revocation{}, ErrInvalidRevocationRequest
 	}
-	inspection, err := repository.actions.InspectAction(ctx, request.Fence.ActionID)
-	if err != nil {
-		if ctx.Err() != nil {
-			return Revocation{}, ctx.Err()
+	var anchored Revocation
+	err := repository.withLockedActionInspection(ctx, request.Fence.ActionID, func(inspection ActionInspection) error {
+		now := repository.now()
+		repository.mu.Lock()
+		defer repository.mu.Unlock()
+		record := repository.records[request.RevocationID]
+		if record == nil {
+			return ErrRevocationNotFound
 		}
-		return Revocation{}, ErrStaleActionFence
-	}
-	now := repository.now()
-
-	repository.mu.Lock()
-	defer repository.mu.Unlock()
-	record := repository.records[request.RevocationID]
-	if record == nil {
-		return Revocation{}, ErrRevocationNotFound
-	}
-	if !frozenActionFenceMatches(record, request.Fence) || !inspectionScopeMatches(record.revocation, inspection.Metadata) {
-		return Revocation{}, ErrStaleActionFence
-	}
-	current := inspectionFenceCurrent(record, inspection, now, 0)
-	if record.revocation.Status != StatusPrepared {
-		if record.revocation.Status == StatusNoCredential || record.revocation.Status == StatusRevoked || len(record.protected.Ciphertext) == 0 {
-			return Revocation{}, ErrInvalidTransition
+		if !frozenActionFenceMatches(record, request.Fence) || !inspectionScopeMatches(record.revocation, inspection.Metadata) {
+			return ErrStaleActionFence
 		}
-		matches, matchErr := repository.protector.Matches(referenceContext(record.revocation), record.protected, request.Accessor)
-		if matchErr != nil {
-			return Revocation{}, ErrReferenceProtection
+		if record.childCreateAuthorizedAt.IsZero() {
+			return ErrInvalidTransition
 		}
-		if !matches {
-			return Revocation{}, ErrIdempotencyConflict
-		}
-		if record.revocation.Status == StatusAnchored || record.revocation.Status == StatusActive {
-			finalNow := repository.now()
-			current = current && inspectionFenceCurrent(record, inspection, finalNow, MinPostChildFenceWindow)
-			if !current {
-				if err := applyRequestRevocation(record, finalNow); err != nil {
-					return Revocation{}, err
+		current := inspectionFenceCurrent(record, inspection, now, 0)
+		if record.revocation.Status != StatusPrepared {
+			if record.revocation.Status == StatusNoCredential || record.revocation.Status == StatusRevoked || len(record.protected.Ciphertext) == 0 {
+				return ErrInvalidTransition
+			}
+			matches, matchErr := repository.protector.Matches(referenceContext(record.revocation), record.protected, request.Accessor)
+			if matchErr != nil {
+				return ErrReferenceProtection
+			}
+			if !matches {
+				return ErrIdempotencyConflict
+			}
+			if record.revocation.Status == StatusAnchored || record.revocation.Status == StatusActive {
+				finalNow := repository.now()
+				current = current && inspectionFenceCurrent(record, inspection, finalNow, MinPostChildFenceWindow)
+				if !current {
+					if applyErr := applyRequestRevocation(record, finalNow); applyErr != nil {
+						return applyErr
+					}
 				}
 			}
+			anchored = publicMemoryRevocation(record)
+			return nil
 		}
-		return publicMemoryRevocation(record), nil
-	}
-	protected, err := repository.protector.Protect(referenceContext(record.revocation), request.Accessor)
+		protected, protectErr := repository.protector.Protect(referenceContext(record.revocation), request.Accessor)
+		if protectErr != nil {
+			return ErrReferenceProtection
+		}
+		finalNow := repository.now()
+		current = current && inspectionFenceCurrent(record, inspection, finalNow, MinPostChildFenceWindow)
+		record.protected = protected.clone()
+		record.revocation.Status = StatusAnchored
+		record.revocation.AccessorPresent = true
+		record.revocation.AccessorHMAC = hex.EncodeToString(protected.AccessorHMAC)
+		record.revocation.EncryptionKeyID = protected.KeyID
+		record.revocation.AnchoredAt = finalNow
+		record.bump(finalNow)
+		if !current {
+			if applyErr := applyRequestRevocation(record, finalNow); applyErr != nil {
+				return applyErr
+			}
+		}
+		anchored = publicMemoryRevocation(record)
+		return nil
+	})
 	if err != nil {
-		return Revocation{}, ErrReferenceProtection
+		return Revocation{}, err
 	}
-	finalNow := repository.now()
-	current = current && inspectionFenceCurrent(record, inspection, finalNow, MinPostChildFenceWindow)
-	record.protected = protected.clone()
-	record.revocation.Status = StatusAnchored
-	record.revocation.AccessorPresent = true
-	record.revocation.AccessorHMAC = hex.EncodeToString(protected.AccessorHMAC)
-	record.revocation.EncryptionKeyID = protected.KeyID
-	record.revocation.AnchoredAt = finalNow
-	record.bump(finalNow)
-	if !current {
-		if err := applyRequestRevocation(record, finalNow); err != nil {
-			return Revocation{}, err
-		}
-	}
-	return publicMemoryRevocation(record), nil
+	return anchored, nil
 }
 
 func (repository *MemoryRepository) Activate(ctx context.Context, request ActionTransitionRequest) (Revocation, error) {
@@ -214,54 +296,60 @@ func (repository *MemoryRepository) Activate(ctx context.Context, request Action
 	if !ValidRevocationID(request.RevocationID) || !validActionFence(request.Fence) {
 		return Revocation{}, ErrInvalidRevocationRequest
 	}
-	inspection, err := repository.actions.InspectAction(ctx, request.Fence.ActionID)
-	if err != nil {
-		if ctx.Err() != nil {
-			return Revocation{}, ctx.Err()
+	var activated Revocation
+	err := repository.withLockedActionInspection(ctx, request.Fence.ActionID, func(inspection ActionInspection) error {
+		now := repository.now()
+		repository.mu.Lock()
+		defer repository.mu.Unlock()
+		record := repository.records[request.RevocationID]
+		if record == nil {
+			return ErrRevocationNotFound
 		}
-		return Revocation{}, ErrStaleActionFence
-	}
-	now := repository.now()
-	repository.mu.Lock()
-	defer repository.mu.Unlock()
-	record := repository.records[request.RevocationID]
-	if record == nil {
-		return Revocation{}, ErrRevocationNotFound
-	}
-	if !frozenActionFenceMatches(record, request.Fence) || !inspectionScopeMatches(record.revocation, inspection.Metadata) {
-		return Revocation{}, ErrStaleActionFence
-	}
-	current := inspectionFenceCurrent(record, inspection, now, 0)
-	switch record.revocation.Status {
-	case StatusAnchored:
-		if !current {
-			if err := applyRequestRevocation(record, now); err != nil {
-				return Revocation{}, err
+		if !frozenActionFenceMatches(record, request.Fence) || !inspectionScopeMatches(record.revocation, inspection.Metadata) {
+			return ErrStaleActionFence
+		}
+		current := inspectionFenceCurrent(record, inspection, now, 0)
+		switch record.revocation.Status {
+		case StatusAnchored:
+			if !current {
+				if applyErr := applyRequestRevocation(record, now); applyErr != nil {
+					return applyErr
+				}
+				activated = publicMemoryRevocation(record)
+				return nil
 			}
-			return publicMemoryRevocation(record), nil
+			record.revocation.Status = StatusActive
+			record.revocation.ActivatedAt = now
+			record.bump(now)
+		case StatusActive:
+		case StatusRevocationPending, StatusRevoking, StatusManualRequired, StatusRevoked:
+			activated = publicMemoryRevocation(record)
+			return nil
+		default:
+			return ErrInvalidTransition
 		}
-		record.revocation.Status = StatusActive
-		record.revocation.ActivatedAt = now
-		record.bump(now)
-	case StatusActive:
-	case StatusRevocationPending, StatusRevoking, StatusManualRequired, StatusRevoked:
-		return publicMemoryRevocation(record), nil
-	default:
-		return Revocation{}, ErrInvalidTransition
-	}
-	finalNow := repository.now()
-	if !inspectionFenceCurrent(record, inspection, finalNow, MinPostChildFenceWindow) {
-		if err := applyRequestRevocation(record, finalNow); err != nil {
-			return Revocation{}, err
+		finalNow := repository.now()
+		if !inspectionFenceCurrent(record, inspection, finalNow, MinPostChildFenceWindow) {
+			if applyErr := applyRequestRevocation(record, finalNow); applyErr != nil {
+				return applyErr
+			}
 		}
+		activated = publicMemoryRevocation(record)
+		return nil
+	})
+	if err != nil {
+		return Revocation{}, err
 	}
-	return publicMemoryRevocation(record), nil
+	return activated, nil
 }
 
 func (repository *MemoryRepository) RecordNoCredential(ctx context.Context, request ActionTransitionRequest) (Revocation, error) {
 	return repository.actionTransition(ctx, request, func(record *memoryRevocationRecord, now time.Time) error {
 		switch record.revocation.Status {
 		case StatusPrepared:
+			if !record.childCreateAuthorizedAt.IsZero() {
+				return ErrInvalidTransition
+			}
 			record.revocation.Status = StatusNoCredential
 			record.bump(now)
 		case StatusNoCredential:
@@ -689,6 +777,55 @@ func (repository *MemoryRepository) resolveAction(ctx context.Context, fence Act
 	return metadata, nil
 }
 
+func (repository *MemoryRepository) withLockedActionInspection(
+	ctx context.Context,
+	actionID string,
+	operation func(ActionInspection) error,
+) error {
+	source, ok := repository.actions.(AtomicActionFenceSource)
+	if !ok {
+		return ErrAtomicActionSourceRequired
+	}
+	var callbackStateMu sync.Mutex
+	callbackCount := 0
+	var callbackErr error
+	callbackCompleted := false
+	sourceErr := source.WithLockedActionInspection(ctx, actionID, func(inspection ActionInspection) error {
+		callbackStateMu.Lock()
+		callbackCount++
+		first := callbackCount == 1
+		callbackStateMu.Unlock()
+		if !first {
+			return ErrAtomicActionSourceRequired
+		}
+		operationErr := operation(inspection)
+		callbackStateMu.Lock()
+		callbackErr = operationErr
+		callbackCompleted = true
+		callbackStateMu.Unlock()
+		return operationErr
+	})
+	callbackStateMu.Lock()
+	count, completed, operationErr := callbackCount, callbackCompleted, callbackErr
+	callbackStateMu.Unlock()
+	if count == 0 {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if sourceErr == nil {
+			return ErrAtomicActionSourceRequired
+		}
+		return ErrStaleActionFence
+	}
+	if count != 1 || !completed {
+		return ErrAtomicActionSourceRequired
+	}
+	if operationErr != nil {
+		return operationErr
+	}
+	return sourceErr
+}
+
 func (repository *MemoryRepository) resolvePrepareAction(ctx context.Context, fence ActionFence, now time.Time) (ActionMetadata, error) {
 	metadata, err := repository.resolveAction(ctx, fence, now)
 	if err != nil {
@@ -729,10 +866,15 @@ func inspectionFenceCurrent(
 ) bool {
 	metadata := inspection.Metadata
 	minimumExpiry := now.Add(minimumWindow)
-	return (metadata.Status == ActionStatusLeased || metadata.Status == ActionStatusRunning) &&
+	return runnerAuthorizationCurrent(metadata) && metadata.Status == ActionStatusRunning && metadata.CancelRequestedAt.IsZero() &&
 		metadata.RunnerID == record.revocation.RunnerID && metadata.LeaseEpoch == record.revocation.ActionLeaseEpoch &&
 		inspection.LeaseTokenSHA256 == record.actionTokenSHA256 && metadata.LeaseExpiresAt.After(minimumExpiry) &&
 		metadata.AuthorizationExpiresAt.After(minimumExpiry) && record.revocation.CredentialExpiresAt.After(minimumExpiry)
+}
+
+func runnerAuthorizationCurrent(metadata ActionMetadata) bool {
+	return metadata.RunnerEnabled && metadata.RunnerPool == "WRITE" && metadata.ScopeRevision > 0 &&
+		metadata.RunnerScopeRevision == metadata.ScopeRevision && metadata.ExactScopeAuthorized
 }
 
 func (repository *MemoryRepository) actionRecord(id string, fence ActionFence, metadata ActionMetadata) (*memoryRevocationRecord, error) {

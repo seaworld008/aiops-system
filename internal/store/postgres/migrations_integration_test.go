@@ -282,11 +282,12 @@ func exerciseRealCredentialRevocations(
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, connector_id, scope_permission, scope_resource, credential_expires_at
+			issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+			child_create_permit_sha256
 		) VALUES (
 			'92000000-0000-4000-8000-000000000099', $1, $2, $3,
 			$4, $5, false, $6, $7, $8,
-			'vault-production', $9, $10, $11, statement_timestamp() + interval '5 minutes'
+			'vault-production', $9, $10, $11, statement_timestamp() + interval '5 minutes', repeat('a', 64)
 		)
 	`, otherTenantID, otherWorkspaceID, environmentID, actionFence.ActionID, submission.TargetKey,
 		actionFence.RunnerID, actionFence.Epoch, credential.SHA256Hex([]byte(actionFence.Token)),
@@ -337,6 +338,7 @@ func exerciseRealCredentialRevocations(
 	close(prepareStart)
 	createdWinners := 0
 	revocationID := ""
+	var childCreatePermit *credential.ChildCreatePermit
 	for range 2 {
 		var call prepareCallResult
 		select {
@@ -349,6 +351,13 @@ func exerciseRealCredentialRevocations(
 		}
 		if call.result.Created {
 			createdWinners++
+			if call.result.Permit == nil {
+				t.Fatal("real concurrent credential Prepare winner returned no child-create permit")
+			}
+			permitCopy := *call.result.Permit
+			childCreatePermit = &permitCopy
+		} else if call.result.Permit != nil {
+			t.Fatal("real concurrent credential Prepare replay returned child-create permit")
 		}
 		if revocationID == "" {
 			revocationID = call.result.Revocation.ID
@@ -360,14 +369,55 @@ func exerciseRealCredentialRevocations(
 			t.Fatalf("real concurrent credential Prepare result = %#v", call.result)
 		}
 	}
-	if createdWinners != 1 {
+	if createdWinners != 1 || childCreatePermit == nil {
 		t.Fatalf("real concurrent credential Prepare Created winners = %d, want 1", createdWinners)
+	}
+	type childAuthorizationResult struct {
+		authorization credential.ChildCreateAuthorization
+		err           error
+	}
+	authorizeContext, cancelAuthorize := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelAuthorize()
+	authorizeStart := make(chan struct{})
+	authorizeResults := make(chan childAuthorizationResult, 2)
+	for range 2 {
+		go func() {
+			<-authorizeStart
+			authorization, authorizeErr := repository.AuthorizeChildCreate(authorizeContext, credential.AuthorizeChildCreateRequest{
+				Permit: *childCreatePermit, Fence: actionFence,
+			})
+			authorizeResults <- childAuthorizationResult{authorization: authorization, err: authorizeErr}
+		}()
+	}
+	close(authorizeStart)
+	authorizationWinners, authorizationReplays := 0, 0
+	var childAuthorization credential.ChildCreateAuthorization
+	for range 2 {
+		select {
+		case result := <-authorizeResults:
+			if result.err == nil {
+				authorizationWinners++
+				childAuthorization = result.authorization
+			} else if errors.Is(result.err, credential.ErrChildCreateAlreadyAuthorized) {
+				authorizationReplays++
+			} else {
+				t.Fatalf("real concurrent AuthorizeChildCreate error = %v", result.err)
+			}
+		case <-authorizeContext.Done():
+			t.Fatalf("timed out waiting for concurrent AuthorizeChildCreate: %v", authorizeContext.Err())
+		}
+	}
+	if authorizationWinners != 1 || authorizationReplays != 1 || childAuthorization.TTL < time.Second ||
+		childAuthorization.DatabaseAuthorizedAt.Add(childAuthorization.TTL+credential.ChildCreateExpiryReserve).
+			After(childAuthorization.CredentialExpiresAt) {
+		t.Fatalf("real AuthorizeChildCreate winners/replays=%d/%d authorization=%#v",
+			authorizationWinners, authorizationReplays, childAuthorization)
 	}
 	idempotent, err := repository.Prepare(ctx, credential.PrepareRequest{
 		RevocationID: revocationID, Fence: actionFence, Issuer: "vault-production",
 		CredentialExpiresAt: credentialExpiry,
 	})
-	if err != nil || idempotent.Created || idempotent.Revocation.ID != revocationID {
+	if err != nil || idempotent.Created || idempotent.Permit != nil || idempotent.Revocation.ID != revocationID {
 		t.Fatalf("real credential Prepare(idempotent) = %#v, %v", idempotent, err)
 	}
 	canonicalReplay, err := repository.Prepare(ctx, credential.PrepareRequest{
@@ -437,6 +487,7 @@ func exerciseRealCredentialRevocations(
 	close(crossStart)
 	crossWinners, crossConflicts := 0, 0
 	var crossWinnerFence, crossLoserFence credential.ActionFence
+	var crossWinnerPermit *credential.ChildCreatePermit
 	for range crossFences {
 		var call prepareCallResult
 		select {
@@ -445,9 +496,11 @@ func exerciseRealCredentialRevocations(
 			t.Fatalf("timed out waiting for credential cross-unique Prepare: %v", crossContext.Err())
 		}
 		if call.err == nil {
-			if !call.result.Created || call.result.Revocation.ID != crossCandidateID {
+			if !call.result.Created || call.result.Permit == nil || call.result.Revocation.ID != crossCandidateID {
 				t.Fatalf("credential cross-unique winner = %#v", call.result)
 			}
+			permitCopy := *call.result.Permit
+			crossWinnerPermit = &permitCopy
 			crossWinners++
 			for _, crossFence := range crossFences {
 				if crossFence.ActionID == call.result.Revocation.ActionID {
@@ -466,9 +519,14 @@ func exerciseRealCredentialRevocations(
 			crossLoserFence = crossFence
 		}
 	}
-	if crossWinners != 1 || crossConflicts != 1 || crossWinnerFence.ActionID == "" || crossLoserFence.ActionID == "" {
+	if crossWinners != 1 || crossConflicts != 1 || crossWinnerFence.ActionID == "" || crossLoserFence.ActionID == "" || crossWinnerPermit == nil {
 		t.Fatalf("credential cross-unique results winners/conflicts=%d/%d winner=%#v loser=%#v",
 			crossWinners, crossConflicts, crossWinnerFence, crossLoserFence)
+	}
+	if _, err := repository.AuthorizeChildCreate(ctx, credential.AuthorizeChildCreateRequest{
+		Permit: *crossWinnerPermit, Fence: crossWinnerFence,
+	}); err != nil {
+		t.Fatalf("authorize credential cross-unique winner: %v", err)
 	}
 	var crossCandidateRows int
 	if err := database.QueryRow(ctx, `SELECT count(*) FROM credential_revocations WHERE revocation_id = $1`, crossCandidateID).
@@ -565,6 +623,225 @@ func exerciseRealCredentialRevocations(
 		DROP TRIGGER delay_test_prepare_outbox_insert ON outbox_events;
 		DROP FUNCTION delay_test_prepare_outbox();
 	`)
+
+	// An authorized PREPARED row remains recoverable only after its durable
+	// absolute credential deadline plus grace. Race recovery against a stale
+	// authorization attempt to prove that NO_CREDENTIAL wins without reopening
+	// child creation.
+	const authorizedExpiredRecoveryID = "92000000-0000-4000-8000-000000000016"
+	authorizedExpiredPermitToken := "authorized-expired-child-create-permit"
+	authorizedExpiredPermitDigest := credential.SHA256Hex([]byte(authorizedExpiredPermitToken))
+	execSQL(t, ctx, database, `
+		UPDATE action_queue
+		SET lease_expires_at = clock_timestamp() + interval '2 minutes'
+		WHERE action_id = $1;
+		WITH clock AS (SELECT clock_timestamp() AS current_time)
+		INSERT INTO credential_revocations (
+			revocation_id, tenant_id, workspace_id, environment_id,
+			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
+			issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+			child_create_permit_sha256, available_at, created_at, updated_at
+		)
+		SELECT $2, action.runner_tenant_id, action.runner_workspace_id, action.runner_environment_id,
+			action.action_id, action.target_key, action.production, action.runner_id, action.lease_epoch,
+			action.lease_token_sha256, 'vault-production',
+			action.envelope #>> '{credential_scope,connector_id}',
+			action.envelope #>> '{credential_scope,permission}',
+			action.envelope #>> '{credential_scope,resource}',
+			clock.current_time - interval '70 seconds', $3,
+			clock.current_time - interval '2 minutes', clock.current_time - interval '2 minutes',
+			clock.current_time - interval '2 minutes'
+		FROM action_queue AS action CROSS JOIN clock
+		WHERE action.action_id = $1;
+		UPDATE credential_revocations
+		SET child_create_authorized_at = created_at + interval '5 seconds',
+			child_create_ttl_seconds = 10, updated_at = clock_timestamp(), version = version + 1
+		WHERE revocation_id = $2;
+	`, crossLoserFence.ActionID, authorizedExpiredRecoveryID, authorizedExpiredPermitDigest)
+	authorizedRecoveryContext, cancelAuthorizedRecovery := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelAuthorizedRecovery()
+	authorizedRecoveryStart := make(chan struct{})
+	type authorizedPreparedRecoveryResult struct {
+		revocations []credential.Revocation
+		err         error
+	}
+	authorizedRecoveryResult := make(chan authorizedPreparedRecoveryResult, 1)
+	authorizedRetryResult := make(chan error, 1)
+	go func() {
+		<-authorizedRecoveryStart
+		revocations, recoverErr := repository.RecoverPrepared(authorizedRecoveryContext, credential.RecoverPreparedRequest{Limit: 1})
+		authorizedRecoveryResult <- authorizedPreparedRecoveryResult{revocations: revocations, err: recoverErr}
+	}()
+	go func() {
+		<-authorizedRecoveryStart
+		_, authorizeErr := repository.AuthorizeChildCreate(authorizedRecoveryContext, credential.AuthorizeChildCreateRequest{
+			Permit: credential.ChildCreatePermit{RevocationID: authorizedExpiredRecoveryID, Token: authorizedExpiredPermitToken},
+			Fence:  crossLoserFence,
+		})
+		authorizedRetryResult <- authorizeErr
+	}()
+	close(authorizedRecoveryStart)
+	var authorizedRecovered authorizedPreparedRecoveryResult
+	select {
+	case authorizedRecovered = <-authorizedRecoveryResult:
+	case <-authorizedRecoveryContext.Done():
+		t.Fatalf("timed out waiting for authorized PREPARED recovery: %v", authorizedRecoveryContext.Err())
+	}
+	if authorizedRecovered.err != nil || len(authorizedRecovered.revocations) != 1 ||
+		authorizedRecovered.revocations[0].ID != authorizedExpiredRecoveryID ||
+		authorizedRecovered.revocations[0].Status != credential.StatusNoCredential {
+		t.Fatalf("authorized PREPARED recovery = %#v, %v", authorizedRecovered.revocations, authorizedRecovered.err)
+	}
+	select {
+	case authorizeErr := <-authorizedRetryResult:
+		if !errors.Is(authorizeErr, credential.ErrChildCreateAlreadyAuthorized) &&
+			!errors.Is(authorizeErr, credential.ErrInvalidTransition) {
+			t.Fatalf("AuthorizeChildCreate racing recovery error = %v", authorizeErr)
+		}
+	case <-authorizedRecoveryContext.Done():
+		t.Fatalf("timed out waiting for authorization racing recovery: %v", authorizedRecoveryContext.Err())
+	}
+
+	// Re-lease the same action at a new epoch and race single-use child
+	// authorization against the only safe pre-create terminal transition.
+	if _, err := queue.Nack(ctx, execution.ActionNackRequest{
+		Lease: executionlease.LeaseIdentity{
+			ExecutionID: crossLoserFence.ActionID, RunnerID: crossLoserFence.RunnerID,
+			Token: crossLoserFence.Token, Epoch: crossLoserFence.Epoch,
+		},
+		Reason:     execution.ActionQueueReason{Code: "CHILD_AUTH_RACE_REQUEUE", DetailHash: strings.Repeat("6", 64)},
+		RetryAfter: time.Second,
+	}); err != nil {
+		t.Fatalf("requeue child authorization race action: %v", err)
+	}
+	execSQL(t, ctx, database, `
+		UPDATE action_queue SET not_before = clock_timestamp() - interval '1 second' WHERE action_id = $1
+	`, crossLoserFence.ActionID)
+	raceAction, err := queue.Claim(ctx, execution.ActionClaimRequest{
+		Scope: realRunnerScope(t, ctx, database, crossLoserFence.RunnerID), LeaseDuration: time.Minute,
+	})
+	if err != nil || raceAction.Execution.ExecutionID != crossLoserFence.ActionID {
+		t.Fatalf("claim child authorization race action = %#v, %v", raceAction, err)
+	}
+	if _, err := queue.Start(ctx, raceAction.Execution.Fence()); err != nil {
+		t.Fatalf("start child authorization race action: %v", err)
+	}
+	raceFence := credential.ActionFence{
+		ActionID: raceAction.Execution.ExecutionID, RunnerID: raceAction.Execution.RunnerID,
+		Token: raceAction.Execution.LeaseToken, Epoch: raceAction.Execution.LeaseEpoch,
+	}
+	const authorizationRaceRevocationID = "92000000-0000-4000-8000-000000000017"
+	racePrepared, err := repository.Prepare(ctx, credential.PrepareRequest{
+		RevocationID: authorizationRaceRevocationID, Fence: raceFence, Issuer: "vault-production",
+		CredentialExpiresAt: time.Now().UTC().Add(5 * time.Minute),
+	})
+	if err != nil || !racePrepared.Created || racePrepared.Permit == nil {
+		t.Fatalf("prepare child authorization race = %#v, %v", racePrepared, err)
+	}
+	type authorizationRaceResult struct {
+		kind          string
+		authorization credential.ChildCreateAuthorization
+		revocation    credential.Revocation
+		err           error
+	}
+	raceContext, cancelRace := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelRace()
+	raceStart := make(chan struct{})
+	raceResults := make(chan authorizationRaceResult, 2)
+	go func() {
+		<-raceStart
+		authorization, authorizeErr := repository.AuthorizeChildCreate(raceContext, credential.AuthorizeChildCreateRequest{
+			Permit: *racePrepared.Permit, Fence: raceFence,
+		})
+		raceResults <- authorizationRaceResult{kind: "authorize", authorization: authorization, err: authorizeErr}
+	}()
+	go func() {
+		<-raceStart
+		revocation, noCredentialErr := repository.RecordNoCredential(raceContext, credential.ActionTransitionRequest{
+			RevocationID: authorizationRaceRevocationID, Fence: raceFence,
+		})
+		raceResults <- authorizationRaceResult{kind: "no_credential", revocation: revocation, err: noCredentialErr}
+	}()
+	close(raceStart)
+	raceSuccesses := 0
+	authorizationWon := false
+	for range 2 {
+		select {
+		case result := <-raceResults:
+			if result.err == nil {
+				raceSuccesses++
+				authorizationWon = result.kind == "authorize"
+				continue
+			}
+			if !errors.Is(result.err, credential.ErrInvalidTransition) {
+				t.Fatalf("child authorization/no-credential race %s error = %v", result.kind, result.err)
+			}
+		case <-raceContext.Done():
+			t.Fatalf("timed out waiting for child authorization/no-credential race: %v", raceContext.Err())
+		}
+	}
+	if raceSuccesses != 1 {
+		t.Fatalf("child authorization/no-credential race successes = %d, want 1", raceSuccesses)
+	}
+	var raceStatus string
+	var raceAuthorizedAt *time.Time
+	if err := database.QueryRow(ctx, `
+		SELECT status, child_create_authorized_at FROM credential_revocations WHERE revocation_id = $1
+	`, authorizationRaceRevocationID).Scan(&raceStatus, &raceAuthorizedAt); err != nil {
+		t.Fatalf("read child authorization race state: %v", err)
+	}
+	var raceAuditCount, raceOutboxCount int
+	if err := database.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM audit_records
+			 WHERE resource_id = $1 AND action IN (
+				'credential.revocation.child_create_authorized', 'credential.revocation.no_credential'
+			 )),
+			(SELECT count(*) FROM outbox_events
+			 WHERE aggregate_id = $1 AND event_type IN (
+				'credential.revocation.child_create_authorized.v1', 'credential.revocation.no_credential.v1'
+			 ))
+	`, authorizationRaceRevocationID).Scan(&raceAuditCount, &raceOutboxCount); err != nil ||
+		raceAuditCount != 1 || raceOutboxCount != 1 {
+		t.Fatalf("child authorization race audit/outbox = %d/%d, %v", raceAuditCount, raceOutboxCount, err)
+	}
+	if authorizationWon {
+		if raceStatus != string(credential.StatusPrepared) || raceAuthorizedAt == nil {
+			t.Fatalf("authorized race state = %s/%v", raceStatus, raceAuthorizedAt)
+		}
+		raceAccessor, _ := credential.NewSensitiveReference([]byte("authorization-race-accessor"))
+		if _, err := repository.RecordAnchor(ctx, credential.RecordAnchorRequest{
+			RevocationID: authorizationRaceRevocationID, Fence: raceFence, Accessor: raceAccessor,
+		}); err != nil {
+			raceAccessor.Destroy()
+			t.Fatalf("anchor authorization race cleanup: %v", err)
+		}
+		raceAccessor.Destroy()
+		if _, err := repository.RequestRevocation(ctx, credential.ActionTransitionRequest{
+			RevocationID: authorizationRaceRevocationID, Fence: raceFence,
+		}); err != nil {
+			t.Fatalf("request authorization race cleanup: %v", err)
+		}
+		raceClaims, err := repository.ClaimRevocations(ctx, credential.ClaimRevocationsRequest{
+			WorkerID: "credential-authorization-race-cleanup", Limit: 1, LeaseDuration: 30 * time.Second,
+		})
+		if err != nil || len(raceClaims) != 1 || raceClaims[0].Revocation.ID != authorizationRaceRevocationID {
+			t.Fatalf("claim authorization race cleanup = %#v, %v", raceClaims, err)
+		}
+		raceClaims[0].Accessor.Destroy()
+		if _, err := repository.CompleteRevocation(ctx, credential.CompleteRevocationRequest{Fence: raceClaims[0].Fence}); err != nil {
+			t.Fatalf("complete authorization race cleanup: %v", err)
+		}
+	} else if raceStatus != string(credential.StatusNoCredential) || raceAuthorizedAt != nil {
+		t.Fatalf("no-credential race state = %s/%v", raceStatus, raceAuthorizedAt)
+	}
+	if _, err := queue.Nack(ctx, execution.ActionNackRequest{
+		Lease:      raceAction.Execution.Fence(),
+		Reason:     execution.ActionQueueReason{Code: "CHILD_AUTH_RACE_COMPLETE", DetailHash: strings.Repeat("5", 64)},
+		RetryAfter: 30 * time.Minute,
+	}); err != nil {
+		t.Fatalf("drain child authorization race action: %v", err)
+	}
 	var delayedPrepareRows, delayedPrepareAudits, delayedPrepareOutbox int
 	if err := database.QueryRow(ctx, `
 		SELECT
@@ -580,12 +857,13 @@ func exerciseRealCredentialRevocations(
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, connector_id, scope_permission, scope_resource, credential_expires_at, status
+			issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+			child_create_permit_sha256, status
 		)
 		SELECT '92000000-0000-4000-8000-000000000007', tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch + 7000, action_lease_token_sha256,
 			issuer, connector_id, scope_permission, scope_resource, statement_timestamp() + interval '5 minutes',
-			'NO_CREDENTIAL'
+			repeat('7', 64), 'NO_CREDENTIAL'
 		FROM credential_revocations WHERE revocation_id = $1
 	`, revocationID)
 	expectSQLState(t, ctx, database, "55000", `
@@ -594,19 +872,33 @@ func exerciseRealCredentialRevocations(
 			updated_at = statement_timestamp(), version = version + 1
 		WHERE revocation_id = $1
 	`, revocationID)
+	expectSQLState(t, ctx, database, "55000", `
+		INSERT INTO credential_revocations (
+			revocation_id, tenant_id, workspace_id, environment_id,
+			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
+			issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+			child_create_permit_sha256, child_create_authorized_at, child_create_ttl_seconds
+		)
+		SELECT '92000000-0000-4000-8000-000000000015', tenant_id, workspace_id, environment_id,
+			action_id, target_key, production, runner_id, action_lease_epoch + 7015, action_lease_token_sha256,
+			issuer, connector_id, scope_permission, scope_resource, statement_timestamp() + interval '5 minutes',
+			repeat('f', 64), statement_timestamp(), 30
+		FROM credential_revocations WHERE revocation_id = $1
+	`, revocationID)
 	expectSQLState(t, ctx, database, "23514", `
 		WITH clock AS (SELECT statement_timestamp() AS current_time)
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
 			issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+			child_create_permit_sha256,
 			available_at, created_at, updated_at
 		)
 		SELECT '92000000-0000-4000-8000-000000000014', source.tenant_id, source.workspace_id, source.environment_id,
 			source.action_id, source.target_key, source.production, source.runner_id,
 			source.action_lease_epoch + 7004, source.action_lease_token_sha256,
 			source.issuer, source.connector_id, source.scope_permission, source.scope_resource,
-			clock.current_time + interval '15 minutes' + interval '1 microsecond',
+			clock.current_time + interval '15 minutes' + interval '1 microsecond', repeat('e', 64),
 			clock.current_time, clock.current_time, clock.current_time
 		FROM credential_revocations AS source CROSS JOIN clock
 		WHERE source.revocation_id = $1
@@ -616,18 +908,62 @@ func exerciseRealCredentialRevocations(
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, connector_id, scope_permission, scope_resource, credential_expires_at
+			issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+			child_create_permit_sha256
 		)
 		SELECT $2, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch + 7001, action_lease_token_sha256,
-			issuer, connector_id, scope_permission, scope_resource, statement_timestamp() + interval '5 minutes'
+			issuer, connector_id, scope_permission, scope_resource, statement_timestamp() + interval '5 minutes', repeat('8', 64)
 		FROM credential_revocations WHERE revocation_id = $1
 	`, revocationID, noCredentialRevocationID)
+	expectSQLState(t, ctx, database, "23514", `
+		UPDATE credential_revocations
+		SET child_create_authorized_at = clock_timestamp(), child_create_ttl_seconds = 900,
+			updated_at = clock_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, noCredentialRevocationID)
+	expectSQLState(t, ctx, database, "55000", `
+		UPDATE credential_revocations
+		SET status = 'ANCHORED', updated_at = clock_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, noCredentialRevocationID)
+	expectSQLState(t, ctx, database, "55000", `
+		UPDATE credential_revocations
+		SET child_create_permit_sha256 = repeat('a', 64),
+			updated_at = clock_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, noCredentialRevocationID)
 	execSQL(t, ctx, database, `
 		UPDATE credential_revocations
 		SET status = 'NO_CREDENTIAL', updated_at = statement_timestamp(), version = version + 1
 		WHERE revocation_id = $1
 	`, noCredentialRevocationID)
+	const authorizedNoCredentialGuardID = "92000000-0000-4000-8000-000000000018"
+	execSQL(t, ctx, database, `
+		WITH clock AS (SELECT clock_timestamp() AS current_time)
+		INSERT INTO credential_revocations (
+			revocation_id, tenant_id, workspace_id, environment_id,
+			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
+			issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+			child_create_permit_sha256, available_at, created_at, updated_at
+		)
+		SELECT $2, source.tenant_id, source.workspace_id, source.environment_id,
+			source.action_id, source.target_key, source.production, source.runner_id,
+			source.action_lease_epoch + 7018, source.action_lease_token_sha256,
+			source.issuer, source.connector_id, source.scope_permission, source.scope_resource,
+			clock.current_time + interval '60 seconds', repeat('d', 64),
+			clock.current_time, clock.current_time, clock.current_time
+		FROM credential_revocations AS source CROSS JOIN clock WHERE source.revocation_id = $1;
+		UPDATE credential_revocations
+		SET child_create_authorized_at = created_at, child_create_ttl_seconds = 45,
+			updated_at = clock_timestamp(), version = version + 1
+		WHERE revocation_id = $2;
+	`, revocationID, authorizedNoCredentialGuardID)
+	expectSQLState(t, ctx, database, "55000", `
+		UPDATE credential_revocations
+		SET status = 'NO_CREDENTIAL', updated_at = clock_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, authorizedNoCredentialGuardID)
 	for _, statement := range []string{
 		`UPDATE credential_revocations SET updated_at = statement_timestamp(), version = version + 1 WHERE revocation_id = $1`,
 		`UPDATE credential_revocations SET status = 'PREPARED', updated_at = statement_timestamp(), version = version + 1 WHERE revocation_id = $1`,
@@ -635,13 +971,14 @@ func exerciseRealCredentialRevocations(
 		expectSQLState(t, ctx, database, "55000", statement, noCredentialRevocationID)
 	}
 
-	insertPreparedRecoveryCandidate := func(id string, epochOffset int64, ageSeconds, ttlSeconds float64) {
+	insertPreparedRecoveryCandidate := func(id, permitDigest string, epochOffset int64, ageSeconds, ttlSeconds float64) {
 		execSQL(t, ctx, database, `
 			WITH clock AS (SELECT statement_timestamp() AS current_time)
 			INSERT INTO credential_revocations (
 				revocation_id, tenant_id, workspace_id, environment_id,
 				action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
 				issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+				child_create_permit_sha256,
 				available_at, created_at, updated_at
 			)
 			SELECT $2, source.tenant_id, source.workspace_id, source.environment_id,
@@ -650,12 +987,13 @@ func exerciseRealCredentialRevocations(
 				source.issuer, source.connector_id, source.scope_permission, source.scope_resource,
 				clock.current_time - make_interval(secs => $4::double precision) +
 					make_interval(secs => $5::double precision),
+				$6,
 				clock.current_time - make_interval(secs => $4::double precision),
 				clock.current_time - make_interval(secs => $4::double precision),
 				clock.current_time - make_interval(secs => $4::double precision)
 			FROM credential_revocations AS source CROSS JOIN clock
 			WHERE source.revocation_id = $1
-		`, revocationID, id, epochOffset, ageSeconds, ttlSeconds)
+		`, revocationID, id, epochOffset, ageSeconds, ttlSeconds, permitDigest)
 	}
 	const (
 		beforeRecoveryID   = "92000000-0000-4000-8000-000000000009"
@@ -664,12 +1002,13 @@ func exerciseRealCredentialRevocations(
 	)
 	// A two-minute absolute TTL proves recovery is keyed to the persisted
 	// deadline rather than waiting for the maximum created_at+15m ceiling.
-	insertPreparedRecoveryCandidate(beforeRecoveryID, 8001, 2*60+30, 2*60)
+	defaultRecoveryPermit := strings.Repeat("9", 64)
+	insertPreparedRecoveryCandidate(beforeRecoveryID, defaultRecoveryPermit, 8001, 2*60+30, 2*60)
 	beforeRecovery, err := repository.RecoverPrepared(ctx, credential.RecoverPreparedRequest{Limit: 10})
 	if err != nil || len(beforeRecovery) != 0 {
 		t.Fatalf("real RecoverPrepared(before DB boundary) = %#v, %v", beforeRecovery, err)
 	}
-	insertPreparedRecoveryCandidate(expiredRecoveryID, 8002, 3*60, 2*60)
+	insertPreparedRecoveryCandidate(expiredRecoveryID, defaultRecoveryPermit, 8002, 3*60, 2*60)
 	type preparedRecoveryResult struct {
 		revocations []credential.Revocation
 		err         error
@@ -717,7 +1056,7 @@ func exerciseRealCredentialRevocations(
 		t.Fatalf("prepared recovery audit/outbox = %d/%d, %v", recoveryAuditCount, recoveryOutboxCount, err)
 	}
 
-	insertPreparedRecoveryCandidate(rollbackRecoveryID, 8003, 3*60, 2*60)
+	insertPreparedRecoveryCandidate(rollbackRecoveryID, defaultRecoveryPermit, 8003, 3*60, 2*60)
 	execSQL(t, ctx, database, `
 		CREATE FUNCTION reject_test_prepared_recovery_outbox() RETURNS trigger AS $$
 		BEGIN
@@ -769,11 +1108,13 @@ func exerciseRealCredentialRevocations(
 	if _, err := repository.Activate(ctx, credential.ActionTransitionRequest{RevocationID: revocationID, Fence: actionFence}); err != nil {
 		t.Fatalf("real credential Activate: %v", err)
 	}
-	// Prove the stable action_id FK does not block M1 from clearing its mutable
-	// active-lease columns, then persist the frozen accessor after Nack.
+	// A durable child-create permit may be prepared while LEASED, but it cannot
+	// be consumed until Start has committed RUNNING. Race a subsequent cancel
+	// intent against anchor persistence; either interleaving must converge on a
+	// protected REVOCATION_PENDING record and never ACTIVE.
 	nackSubmission := realActionSubmission(t, signer, now,
 		"91000000-0000-4000-8000-000000000002", workspaceID, environmentID, serviceID,
-		"payments-credential-nack-recovery", '8')
+		"payments-credential-cancel-recovery", '8')
 	nackSubmission.Production = false
 	if _, err := queue.Submit(ctx, nackSubmission); err != nil {
 		t.Fatalf("submit credential Nack compatibility action: %v", err)
@@ -796,59 +1137,92 @@ func exerciseRealCredentialRevocations(
 	if err != nil || !nackPrepared.Created {
 		t.Fatalf("prepare credential Nack compatibility revocation = %#v, %v", nackPrepared, err)
 	}
+	if nackPrepared.Permit == nil {
+		t.Fatal("prepare credential Nack compatibility returned no permit")
+	}
+	if _, err := repository.AuthorizeChildCreate(ctx, credential.AuthorizeChildCreateRequest{
+		Permit: *nackPrepared.Permit, Fence: nackFence,
+	}); !errors.Is(err, credential.ErrStaleActionFence) {
+		t.Fatalf("authorize credential before Start error = %v, want ErrStaleActionFence", err)
+	}
+	if _, err := queue.Start(ctx, nackAction.Execution.Fence()); err != nil {
+		t.Fatalf("start credential cancellation race action: %v", err)
+	}
+	if _, err := repository.AuthorizeChildCreate(ctx, credential.AuthorizeChildCreateRequest{
+		Permit: *nackPrepared.Permit, Fence: nackFence,
+	}); err != nil {
+		t.Fatalf("authorize credential after Start: %v", err)
+	}
 	if _, err := repository.Prepare(ctx, credential.PrepareRequest{
 		RevocationID: nackRevocationID, Fence: actionFence, Issuer: "vault-production",
 		CredentialExpiresAt: credentialExpiry,
 	}); !errors.Is(err, credential.ErrIdempotencyConflict) {
 		t.Fatalf("replay with candidate ID occupied by another action error = %v", err)
 	}
-	nackAccessor, _ := credential.NewSensitiveReference([]byte("nack-recovery-accessor"))
-	nacked, err := queue.Nack(ctx, execution.ActionNackRequest{
-		Lease: nackAction.Execution.Fence(),
-		Reason: execution.ActionQueueReason{
-			Code: "CREDENTIAL_ANCHOR_RECOVERY_TEST", DetailHash: strings.Repeat("9", 64),
-		},
-		RetryAfter: time.Second,
-	})
-	if err != nil || nacked.Status != executionlease.StatusQueued {
-		t.Fatalf("M1 Nack with anchored credential revocation = %#v, %v", nacked, err)
+	nackAccessor, _ := credential.NewSensitiveReference([]byte("cancel-recovery-accessor"))
+	type cancelAnchorRaceResult struct {
+		kind       string
+		execution  executionlease.Execution
+		revocation credential.Revocation
+		err        error
 	}
-	var clearedRunnerID, clearedToken, clearedTenant, clearedWorkspace, clearedEnvironment *string
-	if err := database.QueryRow(ctx, `
-		SELECT runner_id, lease_token_sha256, runner_tenant_id::text,
-			runner_workspace_id::text, runner_environment_id::text
-		FROM action_queue WHERE action_id = $1
-	`, nackFence.ActionID).Scan(
-		&clearedRunnerID, &clearedToken, &clearedTenant, &clearedWorkspace, &clearedEnvironment,
-	); err != nil {
-		t.Fatalf("read Nacked action mutable fence: %v", err)
-	}
-	if clearedRunnerID != nil || clearedToken != nil || clearedTenant != nil || clearedWorkspace != nil || clearedEnvironment != nil {
-		t.Fatalf("Nack did not clear mutable action fence: runner=%v token=%v tenant=%v workspace=%v environment=%v",
-			clearedRunnerID, clearedToken, clearedTenant, clearedWorkspace, clearedEnvironment)
+	cancelAnchorContext, cancelCancelAnchor := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelCancelAnchor()
+	cancelAnchorStart := make(chan struct{})
+	cancelAnchorResults := make(chan cancelAnchorRaceResult, 2)
+	go func() {
+		<-cancelAnchorStart
+		cancelled, cancelErr := queue.Cancel(cancelAnchorContext, nackFence.ActionID)
+		cancelAnchorResults <- cancelAnchorRaceResult{kind: "cancel", execution: cancelled, err: cancelErr}
+	}()
+	go func() {
+		<-cancelAnchorStart
+		anchored, anchorErr := repository.RecordAnchor(cancelAnchorContext, credential.RecordAnchorRequest{
+			RevocationID: nackRevocationID, Fence: nackFence, Accessor: nackAccessor,
+		})
+		cancelAnchorResults <- cancelAnchorRaceResult{kind: "anchor", revocation: anchored, err: anchorErr}
+	}()
+	close(cancelAnchorStart)
+	for range 2 {
+		select {
+		case result := <-cancelAnchorResults:
+			if result.err != nil {
+				t.Fatalf("cancel/anchor race %s error = %v", result.kind, result.err)
+			}
+			if result.kind == "cancel" && result.execution.Status != executionlease.StatusRunning {
+				t.Fatalf("cancel/anchor race cancel result = %#v", result.execution)
+			}
+			if result.kind == "anchor" && result.revocation.Status != credential.StatusAnchored &&
+				result.revocation.Status != credential.StatusRevocationPending {
+				t.Fatalf("cancel/anchor race anchor result = %#v", result.revocation)
+			}
+		case <-cancelAnchorContext.Done():
+			t.Fatalf("timed out waiting for cancel/anchor race: %v", cancelAnchorContext.Err())
+		}
 	}
 	nackAnchored, err := repository.RecordAnchor(ctx, credential.RecordAnchorRequest{
 		RevocationID: nackRevocationID, Fence: nackFence, Accessor: nackAccessor,
 	})
 	nackAccessor.Destroy()
-	if err != nil || nackAnchored.Status != credential.StatusRevocationPending || !nackAnchored.AccessorPresent {
-		t.Fatalf("anchor credential after Nack = %#v, %v", nackAnchored, err)
+	if err != nil || nackAnchored.Status != credential.StatusRevocationPending || !nackAnchored.AccessorPresent ||
+		!nackAnchored.ActivatedAt.IsZero() {
+		t.Fatalf("anchor credential after cancellation = %#v, %v", nackAnchored, err)
 	}
 	if recovered, err := repository.RequestRevocation(ctx, credential.ActionTransitionRequest{RevocationID: nackRevocationID}); err != nil || recovered.Status != credential.StatusRevocationPending {
-		t.Fatalf("recover anchored revocation after action bearer was cleared: %v", err)
+		t.Fatalf("recover anchored revocation after cancellation: %v", err)
 	}
 	nackRecoveryClaims, err := repository.ClaimRevocations(ctx, credential.ClaimRevocationsRequest{
 		WorkerID: "credential-nack-recovery-revoker", Limit: 1, LeaseDuration: 30 * time.Second,
 	})
 	if err != nil || len(nackRecoveryClaims) != 1 || nackRecoveryClaims[0].Revocation.ID != nackRevocationID {
-		t.Fatalf("claim recovered Nack revocation = %#v, %v", nackRecoveryClaims, err)
+		t.Fatalf("claim recovered cancelled revocation = %#v, %v", nackRecoveryClaims, err)
 	}
 	nackRecoveryClaims[0].Accessor.Destroy()
 	if _, err := repository.CompleteRevocation(ctx, credential.CompleteRevocationRequest{Fence: nackRecoveryClaims[0].Fence}); err != nil {
-		t.Fatalf("complete recovered Nack revocation: %v", err)
+		t.Fatalf("complete recovered cancelled revocation: %v", err)
 	}
 	if _, err := repository.CompleteRevocation(ctx, credential.CompleteRevocationRequest{Fence: nackRecoveryClaims[0].Fence}); err != nil {
-		t.Fatalf("idempotent complete recovered Nack revocation: %v", err)
+		t.Fatalf("idempotent complete recovered cancelled revocation: %v", err)
 	}
 	for _, statement := range []string{
 		`UPDATE credential_revocations SET updated_at = statement_timestamp(), version = version + 1 WHERE revocation_id = $1`,
@@ -856,17 +1230,20 @@ func exerciseRealCredentialRevocations(
 	} {
 		expectSQLState(t, ctx, database, "55000", statement, nackRevocationID)
 	}
-	// Reclaim the Nacked action at a new action epoch and create a separate,
-	// legal pending revocation for the batch-decrypt rollback test.
-	execSQL(t, ctx, database, `
-		UPDATE action_queue
-		SET not_before = statement_timestamp() - interval '1 second'
-		WHERE action_id = $1
-	`, nackFence.ActionID)
+	// Use a separate started action for the batch-decrypt rollback test; the
+	// cancellation-race action intentionally remains RUNNING with termination
+	// intent until its Runner observes the directive.
+	batchSubmission := realActionSubmission(t, signer, now,
+		"91000000-0000-4000-8000-000000000005", workspaceID, environmentID, serviceID,
+		"payments-credential-batch-rollback", '9')
+	batchSubmission.Production = false
+	if _, err := queue.Submit(ctx, batchSubmission); err != nil {
+		t.Fatalf("submit credential batch rollback action: %v", err)
+	}
 	batchAction, err := queue.Claim(ctx, execution.ActionClaimRequest{
-		Scope: realRunnerScope(t, ctx, database, "runner-postgres-2"), LeaseDuration: time.Minute,
+		Scope: realRunnerScope(t, ctx, database, "runner-postgres-5"), LeaseDuration: time.Minute,
 	})
-	if err != nil || batchAction.Execution.ExecutionID != nackFence.ActionID {
+	if err != nil || batchAction.Execution.ExecutionID != batchSubmission.Envelope.ActionID {
 		t.Fatalf("claim credential batch rollback action = %#v, %v", batchAction, err)
 	}
 	batchFence := credential.ActionFence{
@@ -883,6 +1260,14 @@ func exerciseRealCredentialRevocations(
 	})
 	if err != nil || !batchPrepared.Created {
 		t.Fatalf("prepare credential batch rollback revocation = %#v, %v", batchPrepared, err)
+	}
+	if batchPrepared.Permit == nil {
+		t.Fatal("prepare credential batch rollback returned no permit")
+	}
+	if _, err := repository.AuthorizeChildCreate(ctx, credential.AuthorizeChildCreateRequest{
+		Permit: *batchPrepared.Permit, Fence: batchFence,
+	}); err != nil {
+		t.Fatalf("authorize credential batch rollback revocation: %v", err)
 	}
 	batchAccessor, _ := credential.NewSensitiveReference([]byte("batch-corrupt-accessor"))
 	if _, err := repository.RecordAnchor(ctx, credential.RecordAnchorRequest{
@@ -1233,7 +1618,7 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	if err != nil {
 		t.Fatalf("create real PostgreSQL ActionQueue: %v", err)
 	}
-	for _, runnerID := range []string{"runner-postgres-1", "runner-postgres-2", "runner-postgres-3", "runner-postgres-4", "runner-postgres-race", "runner-postgres-authorization"} {
+	for _, runnerID := range []string{"runner-postgres-1", "runner-postgres-2", "runner-postgres-3", "runner-postgres-4", "runner-postgres-5", "runner-postgres-race", "runner-postgres-authorization"} {
 		execSQL(t, ctx, database, `
 			INSERT INTO runner_registrations (runner_id, tenant_id, spiffe_uri, runner_pool, enabled, scope_revision)
 			VALUES ($1, $2, 'spiffe://integration.test/runner/write/' || $1, 'WRITE', true, 1)

@@ -26,6 +26,9 @@ func TestCredentialRevocationMigrationDefinesSecretSafeFencedLifecycle(t *testin
 		"accessor_hmac bytea",
 		"encryption_key_id text",
 		"action_lease_token_sha256 text not null",
+		"child_create_permit_sha256 text not null",
+		"child_create_authorized_at timestamptz",
+		"child_create_ttl_seconds integer",
 		"claim_token_sha256 text",
 		"completed_claim_token_sha256 text",
 		"octet_length(accessor_hmac) = 32",
@@ -119,7 +122,8 @@ func TestCredentialRevocationMigrationEnforcesInitialAndUpdatedLifecycleEdges(t 
 		"new.claim_epoch < old.claim_epoch",
 		"new.attempt < old.attempt",
 		"new.failure_count < old.failure_count",
-		"old.status = 'prepared' and new.status in ('anchored', 'no_credential')",
+		"old.status = 'prepared' and new.status = 'anchored' and old.child_create_authorized_at is not null",
+		"old.status = 'prepared' and new.status = 'no_credential'",
 		"old.status = 'anchored' and new.status in ('active', 'revocation_pending')",
 		"old.status = 'active' and new.status = 'revocation_pending'",
 		"old.status = 'revocation_pending' and new.status = 'revoking'",
@@ -134,6 +138,23 @@ func TestCredentialRevocationMigrationEnforcesInitialAndUpdatedLifecycleEdges(t 
 	}
 	if !strings.Contains(down, "drop function enforce_credential_revocation_transition()") {
 		t.Fatal("down migration does not remove credential lifecycle transition function")
+	}
+}
+
+func TestCredentialRevocationMigrationEnforcesSingleUseChildCreationAuthorization(t *testing.T) {
+	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
+	for _, fragment := range []string{
+		"octet_length(child_create_permit_sha256) = 64",
+		"child_create_authorized_at is null and child_create_ttl_seconds is null",
+		"child_create_authorized_at + child_create_ttl_seconds * interval '1 second' + interval '15 seconds' <= credential_expires_at",
+		"new.child_create_authorized_at is not null or new.child_create_ttl_seconds is not null",
+		"credential child creation authorization is immutable",
+		"old.child_create_permit_sha256 is distinct from new.child_create_permit_sha256",
+		"old.credential_expires_at <= clock_timestamp() - interval '1 minute'",
+	} {
+		if !strings.Contains(normalized, fragment) {
+			t.Errorf("up migration missing child-create invariant %q", fragment)
+		}
 	}
 }
 
