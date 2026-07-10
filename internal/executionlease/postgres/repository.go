@@ -8,9 +8,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
-	"strings"
 	"time"
-	"unicode"
 
 	"github.com/aiops-system/control-plane/internal/executionlease"
 	"github.com/jackc/pgx/v5"
@@ -19,6 +17,7 @@ import (
 )
 
 const (
+	minLeaseDuration    = time.Second
 	maxLeaseDuration    = 30 * time.Minute
 	claimAdvisoryLock   = int64(0x455845434C454153)
 	executionProjection = `
@@ -26,11 +25,14 @@ const (
 		runner_id, COALESCE(lease_token, completed_lease_token) AS lease_token,
 		lease_epoch, lease_expires_at, lease_acquired_at, last_heartbeat_at,
 		started_at, completed_at, result_hash, created_at, updated_at,
-		reconciliation_id, reconciliation_actor, reconciled_at
+		reconciliation_id, reconciliation_actor, reconciliation_result_hash, reconciled_at
 	`
 )
 
-var resultHashPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+var (
+	identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@-]*\z`)
+	resultHashPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+)
 
 type DB interface {
 	Begin(context.Context) (pgx.Tx, error)
@@ -87,10 +89,7 @@ func (repository *Repository) Claim(ctx context.Context, request executionlease.
 	if err := ctx.Err(); err != nil {
 		return executionlease.Execution{}, err
 	}
-	if !request.ClaimsEnabled {
-		return executionlease.Execution{}, executionlease.ErrClaimBlocked
-	}
-	if !validPool(request.Pool) || !validIdentifier(request.RunnerID, 256) || request.LeaseDuration <= 0 || request.LeaseDuration > maxLeaseDuration {
+	if !validPool(request.Pool) || !validIdentifier(request.RunnerID, 256) || request.LeaseDuration < minLeaseDuration || request.LeaseDuration > maxLeaseDuration {
 		return executionlease.Execution{}, executionlease.ErrInvalidRequest
 	}
 
@@ -108,25 +107,15 @@ func (repository *Repository) Claim(ctx context.Context, request executionlease.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, claimAdvisoryLock); err != nil {
 		return executionlease.Execution{}, fmt.Errorf("lock execution claim queue: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE execution_leases AS expired_running
-		SET status = 'UNCERTAIN', runner_id = NULL, lease_token = NULL,
-			lease_expires_at = NULL, completed_at = statement_timestamp(),
-			updated_at = statement_timestamp()
-		WHERE expired_running.status = 'RUNNING'
-		  AND expired_running.lease_expires_at <= statement_timestamp()
-	`); err != nil {
-		return executionlease.Execution{}, fmt.Errorf("mark expired running execution uncertain: %w", err)
+	if err := sweepExpired(ctx, tx, ""); err != nil {
+		return executionlease.Execution{}, err
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE execution_leases AS expired_lease
-		SET status = 'QUEUED', runner_id = NULL, lease_token = NULL,
-			lease_acquired_at = NULL, lease_expires_at = NULL,
-			last_heartbeat_at = NULL, updated_at = statement_timestamp()
-		WHERE expired_lease.status = 'LEASED'
-		  AND expired_lease.lease_expires_at <= statement_timestamp()
-	`); err != nil {
-		return executionlease.Execution{}, fmt.Errorf("release expired unstarted execution lease: %w", err)
+	if !request.ClaimsEnabled {
+		if err := tx.Commit(ctx); err != nil {
+			return executionlease.Execution{}, fmt.Errorf("commit disabled execution claim sweep: %w", err)
+		}
+		committed = true
+		return executionlease.Execution{}, executionlease.ErrClaimBlocked
 	}
 
 	var executionID string
@@ -188,7 +177,8 @@ func (repository *Repository) Claim(ctx context.Context, request executionlease.
 			lease_expires_at = statement_timestamp() + make_interval(secs => $4::double precision),
 			started_at = NULL, completed_at = NULL, result_hash = NULL,
 			completed_lease_token = NULL, completed_lease_epoch = NULL,
-			reconciliation_id = NULL, reconciliation_actor = NULL, reconciled_at = NULL,
+			reconciliation_id = NULL, reconciliation_actor = NULL,
+			reconciliation_result_hash = NULL, reconciled_at = NULL,
 			updated_at = statement_timestamp()
 		WHERE execution.execution_id = $1 AND execution.status = 'QUEUED'
 		RETURNING `+executionProjection,
@@ -204,6 +194,34 @@ func (repository *Repository) Claim(ctx context.Context, request executionlease.
 	return execution, nil
 }
 
+func (repository *Repository) SweepExpired(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	tx, err := repository.database.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin execution expiry sweep: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, claimAdvisoryLock); err != nil {
+		return fmt.Errorf("lock execution expiry sweep: %w", err)
+	}
+	if err := sweepExpired(ctx, tx, ""); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit execution expiry sweep: %w", err)
+	}
+	committed = true
+	return nil
+}
+
 func (repository *Repository) Start(ctx context.Context, lease executionlease.LeaseIdentity) (executionlease.Execution, error) {
 	if err := ctx.Err(); err != nil {
 		return executionlease.Execution{}, err
@@ -215,11 +233,11 @@ func (repository *Repository) Start(ctx context.Context, lease executionlease.Le
 		UPDATE execution_leases
 		SET status = 'RUNNING', started_at = COALESCE(started_at, statement_timestamp()),
 			updated_at = CASE WHEN status = 'LEASED' THEN statement_timestamp() ELSE updated_at END
-		WHERE execution_id = $1 AND lease_token = $2 AND lease_epoch = $3
+		WHERE execution_id = $1 AND runner_id = $2 AND lease_token = $3 AND lease_epoch = $4
 		  AND status IN ('LEASED', 'RUNNING')
 		  AND lease_expires_at > statement_timestamp()
 		RETURNING `+executionProjection,
-		lease.ExecutionID, lease.Token, lease.Epoch,
+		lease.ExecutionID, lease.RunnerID, lease.Token, lease.Epoch,
 	))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return repository.leaseMiss(ctx, lease)
@@ -234,19 +252,19 @@ func (repository *Repository) Heartbeat(ctx context.Context, request executionle
 	if err := ctx.Err(); err != nil {
 		return executionlease.Execution{}, err
 	}
-	if !validLease(request.Lease) || request.Extension <= 0 || request.Extension > maxLeaseDuration {
+	if !validLease(request.Lease) || request.Extension < minLeaseDuration || request.Extension > maxLeaseDuration {
 		return executionlease.Execution{}, executionlease.ErrInvalidRequest
 	}
 	execution, err := scanExecution(repository.database.QueryRow(ctx, `
 		UPDATE execution_leases
 		SET last_heartbeat_at = statement_timestamp(),
-			lease_expires_at = statement_timestamp() + make_interval(secs => $4::double precision),
+			lease_expires_at = statement_timestamp() + make_interval(secs => $5::double precision),
 			updated_at = statement_timestamp()
-		WHERE execution_id = $1 AND lease_token = $2 AND lease_epoch = $3
+		WHERE execution_id = $1 AND runner_id = $2 AND lease_token = $3 AND lease_epoch = $4
 		  AND status IN ('LEASED', 'RUNNING')
 		  AND lease_expires_at > statement_timestamp()
 		RETURNING `+executionProjection,
-		request.Lease.ExecutionID, request.Lease.Token, request.Lease.Epoch, request.Extension.Seconds(),
+		request.Lease.ExecutionID, request.Lease.RunnerID, request.Lease.Token, request.Lease.Epoch, request.Extension.Seconds(),
 	))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return repository.leaseMiss(ctx, request.Lease)
@@ -277,22 +295,23 @@ func (repository *Repository) Complete(ctx context.Context, request executionlea
 
 	execution, err := scanExecution(tx.QueryRow(ctx, `
 		UPDATE execution_leases
-		SET status = $4, result_hash = $5,
+		SET status = $5, result_hash = $6,
 			completed_lease_token = lease_token, completed_lease_epoch = lease_epoch,
 			lease_token = NULL, lease_expires_at = NULL,
 			completed_at = statement_timestamp(), updated_at = statement_timestamp()
-		WHERE execution_id = $1 AND lease_token = $2 AND lease_epoch = $3
+		WHERE execution_id = $1 AND runner_id = $2 AND lease_token = $3 AND lease_epoch = $4
 		  AND status = 'RUNNING'
 		  AND lease_expires_at > statement_timestamp()
 		RETURNING `+executionProjection,
-		request.Lease.ExecutionID, request.Lease.Token, request.Lease.Epoch, request.Status, request.ResultHash,
+		request.Lease.ExecutionID, request.Lease.RunnerID, request.Lease.Token, request.Lease.Epoch,
+		request.Status, request.ResultHash,
 	))
 	if err == nil {
 		if err := tx.Commit(ctx); err != nil {
 			return executionlease.Execution{}, fmt.Errorf("commit execution completion: %w", err)
 		}
 		committed = true
-		return execution, nil
+		return redactedExecution(execution), nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return executionlease.Execution{}, fmt.Errorf("complete execution lease: %w", err)
@@ -313,7 +332,7 @@ func (repository *Repository) Complete(ctx context.Context, request executionlea
 		return executionlease.Execution{}, executionlease.ErrStaleLease
 	}
 	if execution.Terminal() {
-		if execution.LeaseToken != request.Lease.Token || execution.LeaseEpoch != request.Lease.Epoch {
+		if execution.RunnerID != request.Lease.RunnerID || execution.LeaseToken != request.Lease.Token || execution.LeaseEpoch != request.Lease.Epoch {
 			return executionlease.Execution{}, executionlease.ErrStaleLease
 		}
 		if execution.Status != request.Status || execution.ResultHash != request.ResultHash {
@@ -323,9 +342,9 @@ func (repository *Repository) Complete(ctx context.Context, request executionlea
 			return executionlease.Execution{}, fmt.Errorf("commit idempotent execution completion: %w", err)
 		}
 		committed = true
-		return execution, nil
+		return redactedExecution(execution), nil
 	}
-	if execution.LeaseToken != request.Lease.Token || execution.LeaseEpoch != request.Lease.Epoch {
+	if execution.RunnerID != request.Lease.RunnerID || execution.LeaseToken != request.Lease.Token || execution.LeaseEpoch != request.Lease.Epoch {
 		return executionlease.Execution{}, executionlease.ErrStaleLease
 	}
 	if execution.Status != executionlease.StatusRunning {
@@ -343,6 +362,9 @@ func (repository *Repository) Reconcile(ctx context.Context, request executionle
 		!resultHashPattern.MatchString(request.ResultHash) {
 		return executionlease.Execution{}, executionlease.ErrInvalidRequest
 	}
+	if err := repository.materializeTarget(ctx, request.ExecutionID); err != nil {
+		return executionlease.Execution{}, err
+	}
 	tx, err := repository.database.Begin(ctx)
 	if err != nil {
 		return executionlease.Execution{}, fmt.Errorf("begin execution reconciliation transaction: %w", err)
@@ -357,7 +379,7 @@ func (repository *Repository) Reconcile(ctx context.Context, request executionle
 	execution, err := scanExecution(tx.QueryRow(ctx, `
 		UPDATE execution_leases
 		SET reconciliation_id = $2, reconciliation_actor = $3,
-			status = $4, result_hash = $5,
+			status = $4, reconciliation_result_hash = $5,
 			reconciled_at = statement_timestamp(), updated_at = statement_timestamp()
 		WHERE execution_id = $1 AND status = 'UNCERTAIN' AND reconciliation_id IS NULL
 		RETURNING `+executionProjection,
@@ -368,7 +390,7 @@ func (repository *Repository) Reconcile(ctx context.Context, request executionle
 			return executionlease.Execution{}, fmt.Errorf("commit execution reconciliation: %w", err)
 		}
 		committed = true
-		return execution, nil
+		return redactedExecution(execution), nil
 	}
 	if isUniqueViolation(err) {
 		return executionlease.Execution{}, executionlease.ErrReconciliationConflict
@@ -390,14 +412,14 @@ func (repository *Repository) Reconcile(ctx context.Context, request executionle
 	}
 	if execution.ReconciliationID != "" {
 		if execution.ReconciliationID != request.ReconciliationID || execution.ReconciliationActor != request.ActorID ||
-			execution.Status != request.Status || execution.ResultHash != request.ResultHash {
+			execution.Status != request.Status || execution.ReconciliationResultHash != request.ResultHash {
 			return executionlease.Execution{}, executionlease.ErrReconciliationConflict
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return executionlease.Execution{}, fmt.Errorf("commit idempotent execution reconciliation: %w", err)
 		}
 		committed = true
-		return execution, nil
+		return redactedExecution(execution), nil
 	}
 	return executionlease.Execution{}, executionlease.ErrInvalidTransition
 }
@@ -412,7 +434,8 @@ func (repository *Repository) Cancel(ctx context.Context, executionID string) (e
 	execution, err := scanExecution(repository.database.QueryRow(ctx, `
 		UPDATE execution_leases
 		SET status = CASE WHEN status = 'RUNNING' THEN 'UNCERTAIN' ELSE 'CANCELLED' END,
-			runner_id = NULL, lease_token = NULL, lease_expires_at = NULL,
+			runner_id = CASE WHEN status = 'RUNNING' THEN runner_id ELSE NULL END,
+			lease_token = NULL, lease_expires_at = NULL,
 			completed_at = statement_timestamp(), updated_at = statement_timestamp()
 		WHERE execution_id = $1
 		  AND status IN ('QUEUED', 'LEASED', 'RUNNING')
@@ -425,14 +448,14 @@ func (repository *Repository) Cancel(ctx context.Context, executionID string) (e
 			return executionlease.Execution{}, getErr
 		}
 		if existing.Terminal() {
-			return existing, nil
+			return redactedExecution(existing), nil
 		}
 		return executionlease.Execution{}, executionlease.ErrInvalidTransition
 	}
 	if err != nil {
 		return executionlease.Execution{}, fmt.Errorf("cancel execution: %w", err)
 	}
-	return execution, nil
+	return redactedExecution(execution), nil
 }
 
 func (repository *Repository) Get(ctx context.Context, executionID string) (executionlease.Execution, error) {
@@ -442,7 +465,73 @@ func (repository *Repository) Get(ctx context.Context, executionID string) (exec
 	if !validIdentifier(executionID, 256) {
 		return executionlease.Execution{}, executionlease.ErrInvalidRequest
 	}
-	return repository.get(ctx, executionID)
+	if err := repository.materializeTarget(ctx, executionID); err != nil {
+		return executionlease.Execution{}, err
+	}
+	execution, err := repository.get(ctx, executionID)
+	if err != nil {
+		return executionlease.Execution{}, err
+	}
+	return redactedExecution(execution), nil
+}
+
+func (repository *Repository) materializeTarget(ctx context.Context, executionID string) error {
+	tx, err := repository.database.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin execution target materialization: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	if err := sweepExpired(ctx, tx, executionID); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit execution target materialization: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+func sweepExpired(ctx context.Context, tx pgx.Tx, executionID string) error {
+	targetPredicate := ""
+	var args []any
+	if executionID != "" {
+		targetPredicate = " AND expired_running.execution_id = $1"
+		args = append(args, executionID)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE execution_leases AS expired_running
+		SET status = 'UNCERTAIN', lease_token = NULL,
+			lease_expires_at = NULL, completed_at = statement_timestamp(),
+			updated_at = statement_timestamp()
+		WHERE expired_running.status = 'RUNNING'
+		  AND expired_running.lease_expires_at <= statement_timestamp()
+	`+targetPredicate, args...); err != nil {
+		return fmt.Errorf("mark expired running execution uncertain: %w", err)
+	}
+
+	targetPredicate = ""
+	args = nil
+	if executionID != "" {
+		targetPredicate = " AND expired_lease.execution_id = $1"
+		args = append(args, executionID)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE execution_leases AS expired_lease
+		SET status = 'QUEUED', runner_id = NULL, lease_token = NULL,
+			lease_acquired_at = NULL, lease_expires_at = NULL,
+			last_heartbeat_at = NULL, updated_at = statement_timestamp()
+		WHERE expired_lease.status = 'LEASED'
+		  AND expired_lease.lease_expires_at <= statement_timestamp()
+	`+targetPredicate, args...); err != nil {
+		return fmt.Errorf("release expired unstarted execution lease: %w", err)
+	}
+	return nil
 }
 
 func (repository *Repository) get(ctx context.Context, executionID string) (executionlease.Execution, error) {
@@ -472,14 +561,14 @@ func scanExecution(row pgx.Row) (executionlease.Execution, error) {
 	var execution executionlease.Execution
 	var pool, status string
 	var runnerID, leaseToken, resultHash pgtype.Text
-	var reconciliationID, reconciliationActor pgtype.Text
+	var reconciliationID, reconciliationActor, reconciliationResultHash pgtype.Text
 	var leaseExpiresAt, leaseAcquiredAt, lastHeartbeatAt pgtype.Timestamptz
 	var startedAt, completedAt, reconciledAt pgtype.Timestamptz
 	err := row.Scan(
 		&execution.ExecutionID, &execution.TargetKey, &pool, &execution.Production, &status,
 		&runnerID, &leaseToken, &execution.LeaseEpoch, &leaseExpiresAt, &leaseAcquiredAt,
 		&lastHeartbeatAt, &startedAt, &completedAt, &resultHash, &execution.CreatedAt, &execution.UpdatedAt,
-		&reconciliationID, &reconciliationActor, &reconciledAt,
+		&reconciliationID, &reconciliationActor, &reconciliationResultHash, &reconciledAt,
 	)
 	if err != nil {
 		return executionlease.Execution{}, err
@@ -491,6 +580,7 @@ func scanExecution(row pgx.Row) (executionlease.Execution, error) {
 	execution.ResultHash = textValue(resultHash)
 	execution.ReconciliationID = textValue(reconciliationID)
 	execution.ReconciliationActor = textValue(reconciliationActor)
+	execution.ReconciliationResultHash = textValue(reconciliationResultHash)
 	execution.LeaseExpiresAt = timeValue(leaseExpiresAt)
 	execution.LeaseAcquiredAt = timeValue(leaseAcquiredAt)
 	execution.LastHeartbeatAt = timeValue(lastHeartbeatAt)
@@ -519,7 +609,8 @@ func validPool(pool executionlease.Pool) bool {
 }
 
 func validLease(lease executionlease.LeaseIdentity) bool {
-	return validIdentifier(lease.ExecutionID, 256) && validIdentifier(lease.Token, 256) && lease.Epoch > 0
+	return validIdentifier(lease.ExecutionID, 256) && validIdentifier(lease.RunnerID, 256) &&
+		validIdentifier(lease.Token, 256) && lease.Epoch > 0
 }
 
 func validCompletionStatus(status executionlease.Status) bool {
@@ -531,15 +622,12 @@ func validReconciliationStatus(status executionlease.Status) bool {
 }
 
 func validIdentifier(value string, maxBytes int) bool {
-	if value == "" || len(value) > maxBytes || strings.TrimSpace(value) != value {
-		return false
-	}
-	for _, character := range value {
-		if unicode.IsControl(character) {
-			return false
-		}
-	}
-	return true
+	return len(value) <= maxBytes && identifierPattern.MatchString(value)
+}
+
+func redactedExecution(execution executionlease.Execution) executionlease.Execution {
+	execution.LeaseToken = ""
+	return execution
 }
 
 func isUniqueViolation(err error) bool {

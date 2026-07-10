@@ -28,6 +28,7 @@ func TestExecutionLeaseMigrationProvidesDatabaseFencing(t *testing.T) {
 		"completed_lease_epoch bigint",
 		"reconciliation_id text",
 		"reconciliation_actor text",
+		"reconciliation_result_hash text",
 		"reconciled_at timestamptz",
 		"CHECK (runner_pool IN ('READ', 'WRITE'))",
 		"CHECK (status IN ('QUEUED', 'LEASED', 'RUNNING', 'UNCERTAIN', 'SUCCEEDED', 'FAILED', 'CANCELLED'))",
@@ -51,20 +52,37 @@ func TestExecutionLeaseMigrationProvidesDatabaseFencing(t *testing.T) {
 	if !strings.Contains(up, "lease_token IS NOT NULL") || !strings.Contains(up, "lease_expires_at IS NOT NULL") {
 		t.Error("active lease shape must require a token and expiry")
 	}
-	if !strings.Contains(up, "octet_length(execution_id) BETWEEN 1 AND 256") || !strings.Contains(up, "octet_length(runner_id) BETWEEN 1 AND 256") {
-		t.Error("database identifier limits must match the public API")
+	for _, identifierConstraint := range []string{
+		`octet_length(execution_id) BETWEEN 1 AND 256 AND left(execution_id, 1) COLLATE "C" ~ '^[A-Za-z0-9]$' AND execution_id COLLATE "C" !~ '[^A-Za-z0-9._:/@-]'`,
+		`octet_length(target_key) BETWEEN 1 AND 512 AND left(target_key, 1) COLLATE "C" ~ '^[A-Za-z0-9]$' AND target_key COLLATE "C" !~ '[^A-Za-z0-9._:/@-]'`,
+		`octet_length(runner_id) BETWEEN 1 AND 256 AND left(runner_id, 1) COLLATE "C" ~ '^[A-Za-z0-9]$' AND runner_id COLLATE "C" !~ '[^A-Za-z0-9._:/@-]'`,
+		`octet_length(lease_token) BETWEEN 1 AND 256 AND left(lease_token, 1) COLLATE "C" ~ '^[A-Za-z0-9]$' AND lease_token COLLATE "C" !~ '[^A-Za-z0-9._:/@-]'`,
+		`octet_length(completed_lease_token) BETWEEN 1 AND 256 AND left(completed_lease_token, 1) COLLATE "C" ~ '^[A-Za-z0-9]$' AND completed_lease_token COLLATE "C" !~ '[^A-Za-z0-9._:/@-]'`,
+		`octet_length(reconciliation_id) BETWEEN 1 AND 256 AND left(reconciliation_id, 1) COLLATE "C" ~ '^[A-Za-z0-9]$' AND reconciliation_id COLLATE "C" !~ '[^A-Za-z0-9._:/@-]'`,
+		`octet_length(reconciliation_actor) BETWEEN 1 AND 256 AND left(reconciliation_actor, 1) COLLATE "C" ~ '^[A-Za-z0-9]$' AND reconciliation_actor COLLATE "C" !~ '[^A-Za-z0-9._:/@-]'`,
+	} {
+		if !strings.Contains(up, identifierConstraint) {
+			t.Errorf("database identifier constraint must match Go: missing %q", identifierConstraint)
+		}
 	}
 	if !strings.Contains(up, "status IN ('SUCCEEDED', 'FAILED', 'UNCERTAIN')") {
 		t.Error("completion shape must permit a fenced UNCERTAIN result")
 	}
-	if !strings.Contains(up, "status IN ('SUCCEEDED', 'FAILED')") || !strings.Contains(up, "reconciliation_id IS NOT NULL") {
+	if !strings.Contains(up, "status IN ('SUCCEEDED', 'FAILED')") || !strings.Contains(up, "reconciliation_id IS NOT NULL") ||
+		!strings.Contains(up, "reconciliation_result_hash IS NOT NULL") {
 		t.Error("reconciliation proof must only resolve UNCERTAIN to SUCCEEDED or FAILED")
 	}
-	if strings.Count(up, "result_hash IS NOT NULL") < 3 {
-		t.Error("every completed or reconciled proof branch must reject a NULL result hash explicitly")
+	if strings.Contains(up, "reconciliation_id IS NOT NULL AND result_hash IS NOT NULL") {
+		t.Error("reconciliation must not reuse or require the runner result_hash column")
 	}
-	if !strings.Contains(up, "octet_length(completed_lease_token) BETWEEN 1 AND 256") {
-		t.Error("completed fence tokens must retain the public token bounds")
+	for _, hashColumn := range []string{"result_hash", "reconciliation_result_hash"} {
+		if !strings.Contains(up, "octet_length("+hashColumn+") = 64") ||
+			!strings.Contains(up, hashColumn+` COLLATE "C" !~ '[^a-f0-9]'`) {
+			t.Errorf("%s must be exactly 64 lowercase hexadecimal bytes", hashColumn)
+		}
+	}
+	if strings.Contains(up, "~ '^[a-f0-9]{64}$'") {
+		t.Error("PostgreSQL dollar anchors can admit a trailing newline and must not guard result hashes")
 	}
 }
 

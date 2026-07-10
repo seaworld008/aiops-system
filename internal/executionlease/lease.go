@@ -38,30 +38,32 @@ const (
 )
 
 type Execution struct {
-	ExecutionID         string
-	TargetKey           string
-	Pool                Pool
-	Production          bool
-	Status              Status
-	RunnerID            string
-	LeaseToken          string
-	LeaseEpoch          int64
-	LeaseExpiresAt      time.Time
-	LeaseAcquiredAt     time.Time
-	LastHeartbeatAt     time.Time
-	StartedAt           time.Time
-	CompletedAt         time.Time
-	ResultHash          string
-	ReconciliationID    string
-	ReconciliationActor string
-	ReconciledAt        time.Time
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	ExecutionID              string
+	TargetKey                string
+	Pool                     Pool
+	Production               bool
+	Status                   Status
+	RunnerID                 string
+	LeaseToken               string
+	LeaseEpoch               int64
+	LeaseExpiresAt           time.Time
+	LeaseAcquiredAt          time.Time
+	LastHeartbeatAt          time.Time
+	StartedAt                time.Time
+	CompletedAt              time.Time
+	ResultHash               string
+	ReconciliationResultHash string
+	ReconciliationID         string
+	ReconciliationActor      string
+	ReconciledAt             time.Time
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
 }
 
 func (execution Execution) Fence() LeaseIdentity {
 	return LeaseIdentity{
 		ExecutionID: execution.ExecutionID,
+		RunnerID:    execution.RunnerID,
 		Token:       execution.LeaseToken,
 		Epoch:       execution.LeaseEpoch,
 	}
@@ -73,6 +75,7 @@ func (execution Execution) Terminal() bool {
 
 type LeaseIdentity struct {
 	ExecutionID string
+	RunnerID    string
 	Token       string
 	Epoch       int64
 }
@@ -117,6 +120,7 @@ type Repository interface {
 	Heartbeat(context.Context, HeartbeatRequest) (Execution, error)
 	Complete(context.Context, CompleteRequest) (Execution, error)
 	Reconcile(context.Context, ReconcileRequest) (Execution, error)
+	SweepExpired(context.Context) error
 	Cancel(context.Context, string) (Execution, error)
 	Get(context.Context, string) (Execution, error)
 }

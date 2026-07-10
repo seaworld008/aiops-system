@@ -22,14 +22,63 @@ CREATE TABLE execution_leases (
     completed_lease_epoch bigint,
     reconciliation_id text,
     reconciliation_actor text,
+    reconciliation_result_hash text,
     reconciled_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT statement_timestamp(),
 
     CONSTRAINT execution_leases_execution_id_ck
-        CHECK (octet_length(execution_id) BETWEEN 1 AND 256 AND execution_id = btrim(execution_id)),
+        CHECK (
+            octet_length(execution_id) BETWEEN 1 AND 256
+            AND left(execution_id, 1) COLLATE "C" ~ '^[A-Za-z0-9]$'
+            AND execution_id COLLATE "C" !~ '[^A-Za-z0-9._:/@-]'
+        ),
     CONSTRAINT execution_leases_target_key_ck
-        CHECK (octet_length(target_key) BETWEEN 1 AND 512 AND target_key = btrim(target_key)),
+        CHECK (
+            octet_length(target_key) BETWEEN 1 AND 512
+            AND left(target_key, 1) COLLATE "C" ~ '^[A-Za-z0-9]$'
+            AND target_key COLLATE "C" !~ '[^A-Za-z0-9._:/@-]'
+        ),
+    CONSTRAINT execution_leases_runner_id_ck CHECK (
+        runner_id IS NULL
+        OR (
+            octet_length(runner_id) BETWEEN 1 AND 256
+            AND left(runner_id, 1) COLLATE "C" ~ '^[A-Za-z0-9]$'
+            AND runner_id COLLATE "C" !~ '[^A-Za-z0-9._:/@-]'
+        )
+    ),
+    CONSTRAINT execution_leases_lease_token_ck CHECK (
+        lease_token IS NULL
+        OR (
+            octet_length(lease_token) BETWEEN 1 AND 256
+            AND left(lease_token, 1) COLLATE "C" ~ '^[A-Za-z0-9]$'
+            AND lease_token COLLATE "C" !~ '[^A-Za-z0-9._:/@-]'
+        )
+    ),
+    CONSTRAINT execution_leases_completed_lease_token_ck CHECK (
+        completed_lease_token IS NULL
+        OR (
+            octet_length(completed_lease_token) BETWEEN 1 AND 256
+            AND left(completed_lease_token, 1) COLLATE "C" ~ '^[A-Za-z0-9]$'
+            AND completed_lease_token COLLATE "C" !~ '[^A-Za-z0-9._:/@-]'
+        )
+    ),
+    CONSTRAINT execution_leases_reconciliation_id_ck CHECK (
+        reconciliation_id IS NULL
+        OR (
+            octet_length(reconciliation_id) BETWEEN 1 AND 256
+            AND left(reconciliation_id, 1) COLLATE "C" ~ '^[A-Za-z0-9]$'
+            AND reconciliation_id COLLATE "C" !~ '[^A-Za-z0-9._:/@-]'
+        )
+    ),
+    CONSTRAINT execution_leases_reconciliation_actor_ck CHECK (
+        reconciliation_actor IS NULL
+        OR (
+            octet_length(reconciliation_actor) BETWEEN 1 AND 256
+            AND left(reconciliation_actor, 1) COLLATE "C" ~ '^[A-Za-z0-9]$'
+            AND reconciliation_actor COLLATE "C" !~ '[^A-Za-z0-9._:/@-]'
+        )
+    ),
     CONSTRAINT execution_leases_runner_pool_ck
         CHECK (runner_pool IN ('READ', 'WRITE')),
     CONSTRAINT execution_leases_status_ck
@@ -40,11 +89,7 @@ CREATE TABLE execution_leases (
         (
             status IN ('LEASED', 'RUNNING')
             AND runner_id IS NOT NULL
-            AND octet_length(runner_id) BETWEEN 1 AND 256
-            AND runner_id = btrim(runner_id)
             AND lease_token IS NOT NULL
-            AND octet_length(lease_token) BETWEEN 1 AND 256
-            AND lease_token = btrim(lease_token)
             AND lease_epoch > 0
             AND lease_expires_at IS NOT NULL
             AND last_heartbeat_at IS NOT NULL
@@ -61,17 +106,15 @@ CREATE TABLE execution_leases (
         (
             completed_lease_token IS NULL
             AND completed_lease_epoch IS NULL
+            AND result_hash IS NULL
             AND (
                 (
                     reconciliation_id IS NULL
-                    AND result_hash IS NULL
                     AND status NOT IN ('SUCCEEDED', 'FAILED')
                 )
                 OR
                 (
                     reconciliation_id IS NOT NULL
-                    AND result_hash IS NOT NULL
-                    AND result_hash ~ '^[a-f0-9]{64}$'
                     AND status IN ('SUCCEEDED', 'FAILED')
                 )
             )
@@ -79,13 +122,13 @@ CREATE TABLE execution_leases (
         OR
         (
             completed_lease_token IS NOT NULL
-            AND octet_length(completed_lease_token) BETWEEN 1 AND 256
-            AND completed_lease_token = btrim(completed_lease_token)
             AND completed_lease_epoch IS NOT NULL
             AND completed_lease_epoch > 0
             AND completed_lease_epoch = lease_epoch
+            AND runner_id IS NOT NULL
             AND result_hash IS NOT NULL
-            AND result_hash ~ '^[a-f0-9]{64}$'
+            AND octet_length(result_hash) = 64
+            AND result_hash COLLATE "C" !~ '[^a-f0-9]'
             AND status IN ('SUCCEEDED', 'FAILED', 'UNCERTAIN')
         )
     ),
@@ -93,19 +136,17 @@ CREATE TABLE execution_leases (
         (
             reconciliation_id IS NULL
             AND reconciliation_actor IS NULL
+            AND reconciliation_result_hash IS NULL
             AND reconciled_at IS NULL
         )
         OR
         (
             reconciliation_id IS NOT NULL
-            AND octet_length(reconciliation_id) BETWEEN 1 AND 256
-            AND reconciliation_id = btrim(reconciliation_id)
             AND reconciliation_actor IS NOT NULL
-            AND octet_length(reconciliation_actor) BETWEEN 1 AND 256
-            AND reconciliation_actor = btrim(reconciliation_actor)
+            AND reconciliation_result_hash IS NOT NULL
+            AND octet_length(reconciliation_result_hash) = 64
+            AND reconciliation_result_hash COLLATE "C" !~ '[^a-f0-9]'
             AND reconciled_at IS NOT NULL
-            AND result_hash IS NOT NULL
-            AND result_hash ~ '^[a-f0-9]{64}$'
             AND status IN ('SUCCEEDED', 'FAILED')
         )
     ),

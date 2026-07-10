@@ -7,15 +7,19 @@ import (
 	"fmt"
 	"math"
 	"regexp"
-	"strings"
 	"sync"
 	"time"
-	"unicode"
 )
 
-const maxLeaseDuration = 30 * time.Minute
+const (
+	minLeaseDuration = time.Second
+	maxLeaseDuration = 30 * time.Minute
+)
 
-var resultHashPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+var (
+	resultHashPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@-]*$`)
+)
 
 type MemoryOptions struct {
 	Clock       func() time.Time
@@ -83,10 +87,8 @@ func (repository *MemoryRepository) Claim(ctx context.Context, request ClaimRequ
 	if err := ctx.Err(); err != nil {
 		return Execution{}, err
 	}
-	if !request.ClaimsEnabled {
-		return Execution{}, ErrClaimBlocked
-	}
-	if !validPool(request.Pool) || !validIdentifier(request.RunnerID, 256) || request.LeaseDuration <= 0 || request.LeaseDuration > maxLeaseDuration {
+	if !validPool(request.Pool) || !validIdentifier(request.RunnerID, 256) ||
+		request.LeaseDuration < minLeaseDuration || request.LeaseDuration > maxLeaseDuration {
 		return Execution{}, ErrInvalidRequest
 	}
 	now, err := repository.now()
@@ -96,6 +98,9 @@ func (repository *MemoryRepository) Claim(ctx context.Context, request ClaimRequ
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
 	repository.expireLeases(now)
+	if !request.ClaimsEnabled {
+		return Execution{}, ErrClaimBlocked
+	}
 
 	for _, executionID := range repository.order {
 		execution := repository.executions[executionID]
@@ -136,6 +141,9 @@ func (repository *MemoryRepository) Start(ctx context.Context, lease LeaseIdenti
 	if err := ctx.Err(); err != nil {
 		return Execution{}, err
 	}
+	if !validLease(lease) {
+		return Execution{}, ErrInvalidRequest
+	}
 	now, err := repository.now()
 	if err != nil {
 		return Execution{}, err
@@ -166,7 +174,7 @@ func (repository *MemoryRepository) Heartbeat(ctx context.Context, request Heart
 	if err := ctx.Err(); err != nil {
 		return Execution{}, err
 	}
-	if request.Extension <= 0 || request.Extension > maxLeaseDuration {
+	if !validLease(request.Lease) || request.Extension < minLeaseDuration || request.Extension > maxLeaseDuration {
 		return Execution{}, ErrInvalidRequest
 	}
 	now, err := repository.now()
@@ -193,7 +201,8 @@ func (repository *MemoryRepository) Complete(ctx context.Context, request Comple
 	if err := ctx.Err(); err != nil {
 		return Execution{}, err
 	}
-	if (request.Status != StatusSucceeded && request.Status != StatusFailed && request.Status != StatusUncertain) ||
+	if !validLease(request.Lease) ||
+		(request.Status != StatusSucceeded && request.Status != StatusFailed && request.Status != StatusUncertain) ||
 		!resultHashPattern.MatchString(request.ResultHash) {
 		return Execution{}, ErrInvalidRequest
 	}
@@ -211,11 +220,12 @@ func (repository *MemoryRepository) Complete(ctx context.Context, request Comple
 		if execution.ReconciliationID != "" {
 			return Execution{}, ErrStaleLease
 		}
-		if execution.LeaseToken != request.Lease.Token || execution.LeaseEpoch != request.Lease.Epoch {
+		if execution.RunnerID != request.Lease.RunnerID || execution.LeaseToken != request.Lease.Token ||
+			execution.LeaseEpoch != request.Lease.Epoch {
 			return Execution{}, ErrStaleLease
 		}
 		if execution.Status == request.Status && execution.ResultHash == request.ResultHash {
-			return execution, nil
+			return redactedExecution(execution), nil
 		}
 		return Execution{}, ErrCompletionConflict
 	}
@@ -231,7 +241,7 @@ func (repository *MemoryRepository) Complete(ctx context.Context, request Comple
 	execution.LeaseExpiresAt = time.Time{}
 	execution.UpdatedAt = now
 	repository.executions[execution.ExecutionID] = execution
-	return execution, nil
+	return redactedExecution(execution), nil
 }
 
 func (repository *MemoryRepository) Reconcile(ctx context.Context, request ReconcileRequest) (Execution, error) {
@@ -251,6 +261,7 @@ func (repository *MemoryRepository) Reconcile(ctx context.Context, request Recon
 	}
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
+	repository.expireLeases(now)
 	execution, exists := repository.executions[request.ExecutionID]
 	if !exists {
 		return Execution{}, ErrNotFound
@@ -258,8 +269,8 @@ func (repository *MemoryRepository) Reconcile(ctx context.Context, request Recon
 	if execution.ReconciliationID != "" {
 		if execution.ReconciliationID == request.ReconciliationID &&
 			execution.ReconciliationActor == request.ActorID &&
-			execution.Status == request.Status && execution.ResultHash == request.ResultHash {
-			return execution, nil
+			execution.Status == request.Status && execution.ReconciliationResultHash == request.ResultHash {
+			return redactedExecution(execution), nil
 		}
 		return Execution{}, ErrReconciliationConflict
 	}
@@ -272,13 +283,27 @@ func (repository *MemoryRepository) Reconcile(ctx context.Context, request Recon
 		}
 	}
 	execution.Status = request.Status
-	execution.ResultHash = request.ResultHash
+	execution.ReconciliationResultHash = request.ResultHash
 	execution.ReconciliationID = request.ReconciliationID
 	execution.ReconciliationActor = request.ActorID
 	execution.ReconciledAt = now
 	execution.UpdatedAt = now
 	repository.executions[execution.ExecutionID] = execution
-	return execution, nil
+	return redactedExecution(execution), nil
+}
+
+func (repository *MemoryRepository) SweepExpired(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	now, err := repository.now()
+	if err != nil {
+		return err
+	}
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	repository.expireLeases(now)
+	return nil
 }
 
 func (repository *MemoryRepository) Cancel(ctx context.Context, executionID string) (Execution, error) {
@@ -299,20 +324,21 @@ func (repository *MemoryRepository) Cancel(ctx context.Context, executionID stri
 		return Execution{}, ErrNotFound
 	}
 	if terminalStatus(execution.Status) {
-		return execution, nil
+		return redactedExecution(execution), nil
 	}
-	if execution.Status == StatusRunning {
+	wasRunning := execution.Status == StatusRunning
+	if wasRunning {
 		execution.Status = StatusUncertain
 	} else {
 		execution.Status = StatusCancelled
+		execution.RunnerID = ""
 	}
-	execution.RunnerID = ""
 	execution.LeaseToken = ""
 	execution.LeaseExpiresAt = time.Time{}
 	execution.CompletedAt = now
 	execution.UpdatedAt = now
 	repository.executions[execution.ExecutionID] = execution
-	return execution, nil
+	return redactedExecution(execution), nil
 }
 
 func (repository *MemoryRepository) Get(ctx context.Context, executionID string) (Execution, error) {
@@ -322,13 +348,18 @@ func (repository *MemoryRepository) Get(ctx context.Context, executionID string)
 	if !validIdentifier(executionID, 256) {
 		return Execution{}, ErrInvalidRequest
 	}
+	now, err := repository.now()
+	if err != nil {
+		return Execution{}, err
+	}
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
+	repository.expireLeases(now)
 	execution, exists := repository.executions[executionID]
 	if !exists {
 		return Execution{}, ErrNotFound
 	}
-	return execution, nil
+	return redactedExecution(execution), nil
 }
 
 func (repository *MemoryRepository) expireLeases(now time.Time) {
@@ -347,7 +378,6 @@ func (repository *MemoryRepository) expireLeases(now time.Time) {
 			execution.UpdatedAt = now
 		case StatusRunning:
 			execution.Status = StatusUncertain
-			execution.RunnerID = ""
 			execution.LeaseToken = ""
 			execution.LeaseExpiresAt = time.Time{}
 			execution.CompletedAt = now
@@ -390,7 +420,8 @@ func (repository *MemoryRepository) now() (time.Time, error) {
 }
 
 func currentLease(execution Execution, lease LeaseIdentity, now time.Time) bool {
-	return lease.ExecutionID == execution.ExecutionID && lease.Token != "" && lease.Token == execution.LeaseToken &&
+	return lease.ExecutionID == execution.ExecutionID && lease.RunnerID == execution.RunnerID &&
+		lease.Token == execution.LeaseToken &&
 		lease.Epoch > 0 && lease.Epoch == execution.LeaseEpoch &&
 		(execution.Status == StatusLeased || execution.Status == StatusRunning) && now.Before(execution.LeaseExpiresAt)
 }
@@ -399,16 +430,18 @@ func validPool(pool Pool) bool {
 	return pool == PoolRead || pool == PoolWrite
 }
 
+func validLease(lease LeaseIdentity) bool {
+	return validIdentifier(lease.ExecutionID, 256) && validIdentifier(lease.RunnerID, 256) &&
+		validIdentifier(lease.Token, 256) && lease.Epoch > 0
+}
+
 func validIdentifier(value string, maxBytes int) bool {
-	if value == "" || len(value) > maxBytes || strings.TrimSpace(value) != value {
-		return false
-	}
-	for _, character := range value {
-		if unicode.IsControl(character) {
-			return false
-		}
-	}
-	return true
+	return len(value) <= maxBytes && identifierPattern.MatchString(value)
+}
+
+func redactedExecution(execution Execution) Execution {
+	execution.LeaseToken = ""
+	return execution
 }
 
 func randomToken() (string, error) {
