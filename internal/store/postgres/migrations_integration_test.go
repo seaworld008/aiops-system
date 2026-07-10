@@ -702,13 +702,25 @@ func exerciseRealCredentialRevocations(
 		t.Fatalf("timed out waiting for authorization racing recovery: %v", authorizedRecoveryContext.Err())
 	}
 
-	// Re-lease the same action at a new epoch and race single-use child
-	// authorization against the only safe pre-create terminal transition.
+	// Use a dedicated LEASED action to exercise the only safe pre-start retry:
+	// Nack it, re-lease it at a new epoch, then Start before racing single-use
+	// child authorization against the terminal NO_CREDENTIAL transition. The
+	// cross-unique actions above are already RUNNING and must never be Nacked.
+	raceSubmission := realActionSubmission(t, signer, now,
+		"91000000-0000-4000-8000-000000000006", workspaceID, environmentID, serviceID,
+		"payments-credential-authorization-race", '6')
+	raceSubmission.Production = false
+	if _, err := queue.Submit(ctx, raceSubmission); err != nil {
+		t.Fatalf("submit child authorization race action: %v", err)
+	}
+	initialRaceAction, err := queue.Claim(ctx, execution.ActionClaimRequest{
+		Scope: realRunnerScope(t, ctx, database, "runner-postgres-authorization"), LeaseDuration: time.Minute,
+	})
+	if err != nil || initialRaceAction.Execution.ExecutionID != raceSubmission.Envelope.ActionID {
+		t.Fatalf("claim initial child authorization race action = %#v, %v", initialRaceAction, err)
+	}
 	if _, err := queue.Nack(ctx, execution.ActionNackRequest{
-		Lease: executionlease.LeaseIdentity{
-			ExecutionID: crossLoserFence.ActionID, RunnerID: crossLoserFence.RunnerID,
-			Token: crossLoserFence.Token, Epoch: crossLoserFence.Epoch,
-		},
+		Lease:      initialRaceAction.Execution.Fence(),
 		Reason:     execution.ActionQueueReason{Code: "CHILD_AUTH_RACE_REQUEUE", DetailHash: strings.Repeat("6", 64)},
 		RetryAfter: time.Second,
 	}); err != nil {
@@ -716,11 +728,12 @@ func exerciseRealCredentialRevocations(
 	}
 	execSQL(t, ctx, database, `
 		UPDATE action_queue SET not_before = clock_timestamp() - interval '1 second' WHERE action_id = $1
-	`, crossLoserFence.ActionID)
+	`, initialRaceAction.Execution.ExecutionID)
 	raceAction, err := queue.Claim(ctx, execution.ActionClaimRequest{
-		Scope: realRunnerScope(t, ctx, database, crossLoserFence.RunnerID), LeaseDuration: time.Minute,
+		Scope: realRunnerScope(t, ctx, database, initialRaceAction.Execution.RunnerID), LeaseDuration: time.Minute,
 	})
-	if err != nil || raceAction.Execution.ExecutionID != crossLoserFence.ActionID {
+	if err != nil || raceAction.Execution.ExecutionID != initialRaceAction.Execution.ExecutionID ||
+		raceAction.Execution.LeaseEpoch != initialRaceAction.Execution.LeaseEpoch+1 {
 		t.Fatalf("claim child authorization race action = %#v, %v", raceAction, err)
 	}
 	if _, err := queue.Start(ctx, raceAction.Execution.Fence()); err != nil {
@@ -835,12 +848,10 @@ func exerciseRealCredentialRevocations(
 	} else if raceStatus != string(credential.StatusNoCredential) || raceAuthorizedAt != nil {
 		t.Fatalf("no-credential race state = %s/%v", raceStatus, raceAuthorizedAt)
 	}
-	if _, err := queue.Nack(ctx, execution.ActionNackRequest{
-		Lease:      raceAction.Execution.Fence(),
-		Reason:     execution.ActionQueueReason{Code: "CHILD_AUTH_RACE_COMPLETE", DetailHash: strings.Repeat("5", 64)},
-		RetryAfter: 30 * time.Minute,
-	}); err != nil {
-		t.Fatalf("drain child authorization race action: %v", err)
+	cancelledRaceAction, err := queue.Cancel(ctx, raceAction.Execution.ExecutionID)
+	if err != nil || cancelledRaceAction.Status != executionlease.StatusRunning ||
+		cancelledRaceAction.CancelRequestedAt.IsZero() {
+		t.Fatalf("request child authorization race termination = %#v, %v", cancelledRaceAction, err)
 	}
 	var delayedPrepareRows, delayedPrepareAudits, delayedPrepareOutbox int
 	if err := database.QueryRow(ctx, `

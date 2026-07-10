@@ -42,6 +42,10 @@ const (
 	integrationPollTimeout    = 20 * time.Second
 	integrationBodyLimit      = 64 << 10
 	integrationJSONDepth      = 32
+	// Vault 2.0.3's token store returns StatusBadRequest("invalid accessor").
+	// Core transports that route error through go-multierror v1.1.1 before the
+	// HTTP layer serializes it, so the public error string has this exact form.
+	integrationInvalidAccessorRouteError = "1 error occurred:\n\t* invalid accessor\n\n"
 )
 
 var (
@@ -1182,7 +1186,7 @@ func (fixture *vault203Fixture) lookupAccessor(t *testing.T, accessor []byte) (i
 		map[string]string{"accessor": string(accessor)})
 	defer response.destroy()
 	if response.status == http.StatusBadRequest {
-		if !decodeIntegrationError(response.body, "invalid accessor") {
+		if !decodeIntegrationError(response.body, integrationInvalidAccessorRouteError) {
 			t.Fatal("Vault accessor lookup returned unsafe 400 semantics")
 		}
 		return integrationLookup{}, false
@@ -1230,7 +1234,7 @@ func (fixture *vault203Fixture) assertAccessorMissing(t *testing.T, accessor []b
 			fixture.assertRootAvailable(t)
 			return false
 		case http.StatusBadRequest:
-			if !decodeIntegrationError(response.body, "invalid accessor") {
+			if !decodeIntegrationError(response.body, integrationInvalidAccessorRouteError) {
 				t.Fatal("Vault accessor missing response had unsafe error semantics")
 			}
 			fixture.assertRootAvailable(t)
