@@ -18,6 +18,7 @@ const MaxPolicyDecisionAge = 5 * time.Second
 
 var (
 	ErrCredentialDenied      = errors.New("credential issuance denied")
+	ErrCredentialUnavailable = errors.New("credential issuance dependency unavailable")
 	ErrInvalidCredential     = errors.New("invalid managed credential")
 	ErrUnsafeCredentialLease = errors.New("credential issuer returned an unsafe lease")
 )
@@ -118,7 +119,7 @@ func (broker *Broker) Issue(ctx context.Context, envelope action.Envelope) (Cred
 		if ctx.Err() != nil {
 			return Credential{}, ctx.Err()
 		}
-		return Credential{}, ErrCredentialDenied
+		return Credential{}, fmt.Errorf("%w: policy evaluation failed: %v", ErrCredentialUnavailable, err)
 	}
 	if !validDecision(decision, envelope, now) {
 		return Credential{}, ErrCredentialDenied
@@ -132,7 +133,10 @@ func (broker *Broker) Issue(ctx context.Context, envelope action.Envelope) (Cred
 	issued, err := broker.issuer.Issue(ctx, request)
 	if err != nil {
 		clear(issued.Secret)
-		return Credential{}, fmt.Errorf("issue dynamic credential: %w", err)
+		if ctx.Err() != nil {
+			return Credential{}, ctx.Err()
+		}
+		return Credential{}, fmt.Errorf("%w: dynamic issue failed: %v", ErrCredentialUnavailable, err)
 	}
 	if !validIssuedLease(issued, now, decision.CredentialExpiresAt) {
 		clear(issued.Secret)

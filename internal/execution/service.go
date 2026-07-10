@@ -348,8 +348,11 @@ func (service *Service) RunNext(ctx context.Context) (result executionlease.Exec
 
 	executionCredential, err = service.dependencies.Credentials.Issue(ctx, envelope)
 	if err != nil {
-		if errors.Is(err, credential.ErrCredentialDenied) || errors.Is(err, credential.ErrUnsafeCredentialLease) {
+		if errors.Is(err, credential.ErrCredentialDenied) {
 			return service.rejectClaim(ctx, claimed, "CREDENTIAL_POLICY_DENIED", ErrCredentialDenied)
+		}
+		if errors.Is(err, credential.ErrUnsafeCredentialLease) {
+			return service.rejectClaim(ctx, claimed, "CREDENTIAL_LEASE_UNSAFE", ErrCredentialDenied)
 		}
 		return service.nackClaim(ctx, claimed, "CREDENTIAL_TEMPORARILY_UNAVAILABLE", ErrCredentialDenied)
 	}

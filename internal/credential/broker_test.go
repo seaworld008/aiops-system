@@ -87,6 +87,40 @@ func TestBrokerRejectsStaleOrMismatchedPolicyDecision(t *testing.T) {
 	}
 }
 
+func TestBrokerClassifiesPolicyAndIssuerOutagesAsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	envelope := sealedEnvelope(t, now)
+	outage := errors.New("vault control plane unavailable")
+	tests := map[string]struct {
+		gate   *fakeGate
+		issuer *fakeIssuer
+	}{
+		"policy evaluator outage": {
+			gate:   &fakeGate{err: outage},
+			issuer: &fakeIssuer{},
+		},
+		"dynamic issuer outage": {
+			gate:   &fakeGate{decision: allowDecision(envelope, now)},
+			issuer: &fakeIssuer{issueErr: outage},
+		},
+	}
+	for name, test := range tests {
+		name, test := name, test
+		t.Run(name, func(t *testing.T) {
+			broker, err := NewBroker(test.gate, test.issuer, func() time.Time { return now })
+			if err != nil {
+				t.Fatalf("NewBroker() error = %v", err)
+			}
+			_, issueErr := broker.Issue(context.Background(), envelope)
+			if !errors.Is(issueErr, ErrCredentialUnavailable) || errors.Is(issueErr, ErrCredentialDenied) {
+				t.Fatalf("Issue() error = %v, want only ErrCredentialUnavailable", issueErr)
+			}
+		})
+	}
+}
+
 func TestBrokerRevokesIssuerLeaseThatOutlivesRequestedBoundary(t *testing.T) {
 	t.Parallel()
 
@@ -341,11 +375,15 @@ type fakeIssuer struct {
 	onRevoke       func()
 	respectContext bool
 	calls          int
+	issueErr       error
 }
 
 func (issuer *fakeIssuer) Issue(_ context.Context, request IssueRequest) (IssuedLease, error) {
 	issuer.calls++
 	issuer.request = request
+	if issuer.issueErr != nil {
+		return IssuedLease{}, issuer.issueErr
+	}
 	leaseID := issuer.leaseID
 	if leaseID == "" {
 		leaseID = "lease-1"
