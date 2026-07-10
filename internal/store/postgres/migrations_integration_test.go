@@ -516,7 +516,12 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	if _, err := queue.Start(ctx, thirdClaim.Execution.Fence()); err != nil {
 		t.Fatalf("real ActionQueue.Start(third): %v", err)
 	}
-	execSQL(t, ctx, database, `UPDATE action_queue SET lease_expires_at = statement_timestamp() - interval '1 second' WHERE action_id = $1`, third.Envelope.ActionID)
+	execSQL(t, ctx, database, `
+		UPDATE action_queue
+		SET lease_expires_at = statement_timestamp() - interval '1 second',
+			last_heartbeat_at = statement_timestamp() - interval '2 seconds'
+		WHERE action_id = $1
+	`, third.Envelope.ActionID)
 	uncertain, err := queue.Get(ctx, third.Envelope.ActionID)
 	if err != nil || uncertain.Status != executionlease.StatusUncertain || uncertain.LeaseToken != "" {
 		t.Fatalf("real ActionQueue.Get(expired running) = %#v, %v", uncertain, err)
@@ -662,11 +667,11 @@ func exerciseRealRegistrationRaces(
 	startDone := make(chan struct{})
 	startContext, cancelStart := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelStart()
-	go func() {
+	go func(results chan<- realExecutionCallResult, done chan<- struct{}) {
 		value, callErr := queue.Start(startContext, fence)
-		startResults <- realExecutionCallResult{execution: value, err: callErr}
-		close(startDone)
-	}()
+		results <- realExecutionCallResult{execution: value, err: callErr}
+		close(done)
+	}(startResults, startDone)
 	waitForTransactionWaiter(t, ctx, database, disableXID, startDone, "Start registration lock")
 	commitTestTransaction(t, ctx, disableTx, "commit disabled runner before Start")
 	startResult := awaitExecutionCall(t, startResults, "Start after runner disable")
@@ -682,16 +687,16 @@ func exerciseRealRegistrationRaces(
 
 	actionTx, actionXID := beginActionRowBlock(t, ctx, database, fence.ExecutionID)
 	defer rollbackTestTransaction(actionTx)
-	heartbeatResults := make(chan realHeartbeatCallResult, 1)
-	heartbeatDone := make(chan struct{})
+	operationHeartbeatResults := make(chan realHeartbeatCallResult, 1)
+	operationHeartbeatDone := make(chan struct{})
 	heartbeatContext, cancelHeartbeat := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelHeartbeat()
-	go func() {
+	go func(results chan<- realHeartbeatCallResult, done chan<- struct{}) {
 		value, callErr := queue.Heartbeat(heartbeatContext, execution.ActionHeartbeatRequest{Lease: fence, Sequence: 1, Extension: 2 * time.Minute})
-		heartbeatResults <- realHeartbeatCallResult{heartbeat: value, err: callErr}
-		close(heartbeatDone)
-	}()
-	waitForTransactionWaiter(t, ctx, database, actionXID, heartbeatDone, "Heartbeat action lock")
+		results <- realHeartbeatCallResult{heartbeat: value, err: callErr}
+		close(done)
+	}(operationHeartbeatResults, operationHeartbeatDone)
+	waitForTransactionWaiter(t, ctx, database, actionXID, operationHeartbeatDone, "Heartbeat action lock")
 	updateContext, cancelUpdate := context.WithTimeout(ctx, 250*time.Millisecond)
 	_, disableErr := database.Exec(updateContext, `
 		UPDATE runner_registrations SET enabled = false, updated_at = statement_timestamp() WHERE runner_id = $1
@@ -700,7 +705,7 @@ func exerciseRealRegistrationRaces(
 	cancelUpdate()
 	disableWasBlocked := disableErr != nil && errors.Is(updateContextErr, context.DeadlineExceeded)
 	commitTestTransaction(t, ctx, actionTx, "release Heartbeat action row")
-	heartbeatResult := awaitHeartbeatCall(t, heartbeatResults, "Heartbeat holding registration lock")
+	heartbeatResult := awaitHeartbeatCall(t, operationHeartbeatResults, "Heartbeat holding registration lock")
 	if !disableWasBlocked {
 		t.Fatalf("runner disable was not blocked by Heartbeat registration lock: error=%v context=%v", disableErr, updateContextErr)
 	}
@@ -712,18 +717,18 @@ func exerciseRealRegistrationRaces(
 	beforeExpiry := heartbeatResult.heartbeat.Execution.LeaseExpiresAt
 	disableTx, disableXID = beginRunnerDisable(t, ctx, database, runnerID)
 	defer rollbackTestTransaction(disableTx)
-	heartbeatResults = make(chan realHeartbeatCallResult, 1)
-	heartbeatDone = make(chan struct{})
+	disabledHeartbeatResults := make(chan realHeartbeatCallResult, 1)
+	disabledHeartbeatDone := make(chan struct{})
 	expiredHeartbeatContext, cancelExpiredHeartbeat := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelExpiredHeartbeat()
-	go func() {
+	go func(results chan<- realHeartbeatCallResult, done chan<- struct{}) {
 		value, callErr := queue.Heartbeat(expiredHeartbeatContext, execution.ActionHeartbeatRequest{Lease: fence, Sequence: 2, Extension: 3 * time.Minute})
-		heartbeatResults <- realHeartbeatCallResult{heartbeat: value, err: callErr}
-		close(heartbeatDone)
-	}()
-	waitForTransactionWaiter(t, ctx, database, disableXID, heartbeatDone, "Heartbeat registration lock")
+		results <- realHeartbeatCallResult{heartbeat: value, err: callErr}
+		close(done)
+	}(disabledHeartbeatResults, disabledHeartbeatDone)
+	waitForTransactionWaiter(t, ctx, database, disableXID, disabledHeartbeatDone, "Heartbeat registration lock")
 	commitTestTransaction(t, ctx, disableTx, "commit disabled runner before Heartbeat")
-	heartbeatResult = awaitHeartbeatCall(t, heartbeatResults, "Heartbeat after runner disable")
+	heartbeatResult = awaitHeartbeatCall(t, disabledHeartbeatResults, "Heartbeat after runner disable")
 	if heartbeatResult.err != nil || heartbeatResult.heartbeat.Directive != execution.HeartbeatTerminate ||
 		heartbeatResult.heartbeat.Execution.HeartbeatSeq != 1 ||
 		!heartbeatResult.heartbeat.Execution.LeaseExpiresAt.Equal(beforeExpiry) {
@@ -743,11 +748,11 @@ func exerciseRealRegistrationRaces(
 	completeDone := make(chan struct{})
 	completeContext, cancelComplete := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelComplete()
-	go func() {
+	go func(results chan<- realExecutionCallResult, done chan<- struct{}) {
 		value, callErr := queue.Complete(completeContext, completion)
-		completeResults <- realExecutionCallResult{execution: value, err: callErr}
-		close(completeDone)
-	}()
+		results <- realExecutionCallResult{execution: value, err: callErr}
+		close(done)
+	}(completeResults, completeDone)
 	waitForTransactionWaiter(t, ctx, database, disableXID, completeDone, "Complete registration lock")
 	commitTestTransaction(t, ctx, disableTx, "commit disabled runner before Complete")
 	completeResult := awaitExecutionCall(t, completeResults, "Complete after runner disable")
