@@ -46,7 +46,7 @@
 
 1. 以 `httptest` 编写路由、错误、幂等冲突和游标测试。
 2. 实现 Request ID、OIDC principal、Workspace scope 和审计中间件。
-3. 实现 SignalEnvelope 规范化、provider event ID 唯一约束和指纹去重。
+3. 实现 SignalEnvelope 规范化、provider event ID 唯一约束、payload hash冲突检测和指纹去重；Webhook不要求平台`Idempotency-Key`。
 4. 实现 Incident 创建/归并和异步 Investigation 触发。
 5. 添加重复、乱序和告警风暴测试。
 
@@ -104,10 +104,12 @@
 
 1. 先写规范化哈希、篡改、过期、申请人自批、策略变化和状态漂移测试。
 2. 实现ActionEnvelope、SHA-256 plan_hash和版本化CEL策略。
-3. 实现单/双人审批及30分钟有效期。
-4. 实现Vault凭据接口，凭据不持久化；测试用短期内存凭据实现。
-5. 实现K8s Deployment重启、无HPA扩缩容、GitOps revert MR/PR、AWX Linux/Windows服务重启类型化执行器。
-6. 实现目标锁、全局并发1、四级Kill Switch、验证和对账。
+3. 使用JCS规范化载荷和Vault Ed25519密钥完成签名；Runner实现公钥集、`key_id`、轮换窗口、吊销和验签失败测试。
+4. 实现单/双人审批及30分钟有效期。
+5. 实现Vault凭据接口，凭据不持久化；测试用短期内存凭据实现。
+6. 实现K8s Deployment重启、无HPA扩缩容、GitOps revert MR/PR、AWX Linux/Windows服务重启类型化执行器。
+7. GitOps Workflow显式等待外部分支保护审批、检查、人工合并和Argo auto-sync；平台不得绕过规则或直接参数覆盖。
+8. 实现目标锁、全局并发1、四级Kill Switch、验证和对账。
 
 **验收：** 任意命令和未知动作拒绝；计划变化后审批失效；不确定结果不盲重试；AWX不提供虚机重启。
 
@@ -136,7 +138,8 @@
 2. 提供控制面/Worker三副本、read/write Runner分离、NetworkPolicy、PDB和资源限制。
 3. 添加指标、trace和脱敏日志；内容采集默认关闭。
 4. 添加数据库备份/恢复和RPO/RTO演练脚本。
-5. CI执行测试、vet、静态分析、SBOM、镜像扫描和签名。
+5. 实现每日审计哈希清单、前序摘要链、Vault Ed25519签名、S3 Object Lock/WORM写入、离线验签和恢复演练；开发环境明确降级保证。
+6. CI执行测试、vet、静态分析、SBOM、镜像扫描和签名。
 
 **验收：** 本地一条命令启动；Helm模板验证通过；秘密不进入镜像、日志和Temporal History。
 
@@ -152,4 +155,3 @@
 6. 生成Go/No-Go报告；任一安全指标失败时保持write feature flag关闭。
 
 **最终验收：** 与V3蓝图第11章门槛逐项对照，附命令、日志摘要、指标和未完成的外部联调证据。
-

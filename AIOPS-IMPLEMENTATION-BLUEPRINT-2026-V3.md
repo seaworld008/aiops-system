@@ -186,7 +186,7 @@ POST /runner/v1/jobs/{id}:heartbeat
 POST /runner/v1/jobs/{id}:complete
 ```
 
-所有写请求要求 `Idempotency-Key`；同键不同请求哈希返回 409。PATCH要求 `If-Match`。列表使用不透明游标，默认50、最大100。错误使用 RFC 9457 `application/problem+json`。
+除外部 Webhook 外，所有写请求要求 `Idempotency-Key`；同键不同请求哈希返回 409。Webhook 使用 `(integration_id, provider_event_id)` 唯一键和 payload hash，同一事件 ID 携带不同载荷时记录安全冲突并拒绝。PATCH要求 `If-Match`。列表使用不透明游标，默认50、最大100。错误使用 RFC 9457 `application/problem+json`。
 
 ---
 
@@ -225,10 +225,11 @@ action_type, target_ref, parameters, observed_state,
 preconditions, evidence_refs, expected_outcome,
 verification, compensation, risk, policy_version,
 plan_hash, credential_scope, idempotency_key,
-not_before, expires_at, trace_id
+not_before, expires_at, trace_id,
+signature{alg,key_id,value}
 ```
 
-`plan_hash` 覆盖动作、精确目标、参数、观测版本、前置条件、验证、补偿、策略版本和有效期。任何字段变化均创建新计划并使旧审批失效。
+`plan_hash` 覆盖动作、精确目标、参数、观测版本、前置条件、验证、补偿、策略版本和有效期。任何字段变化均创建新计划并使旧审批失效。Envelope 使用 JCS 规范化 JSON，控制面以 Vault 中的 Ed25519 密钥签名；`signature` 不参与被签名载荷。Runner 使用固定信任根分发的公钥集验签，并检查 `key_id`、有效期和吊销列表。轮换期间只允许明确的当前/前一密钥，已吊销密钥立即失效。
 
 ### 7.1 确定性裁决
 
@@ -245,7 +246,7 @@ not_before, expires_at, trace_id
 | --- | --- | --- |
 | K8s滚动重启 | 白名单 Deployment；校验 UID/resourceVersion、PDB、容量和无进行中 rollout；禁止删除 Pod | 1名非申请人；验证 rollout、Ready 和 SLO 10分钟 |
 | K8s扩缩容 | 无HPA的白名单 Deployment；在策略上下限内；校验PDB、Quota和节点容量 | 1名非申请人；验证副本与SLO 10分钟 |
-| GitOps回滚 | GitLab/GitHub配置仓库创建 revert MR/PR；不绕过分支保护；Argo同步该revision | SRE+Service Owner双人审批；验证 Synced/Healthy 与SLO 15分钟 |
+| GitOps回滚 | 创建绑定 `plan_hash` 的 revert MR/PR 后进入 `WAITING_EXTERNAL_APPROVAL`；平台不绕过分支保护且不自行合并。外部审批/检查通过并合并后进入 `WAITING_SYNC`，观察 Argo auto-sync 到精确 commit | SRE+Service Owner双人审批；仅在目标commit为 Synced/Healthy 且SLO稳定15分钟后成功；超时转人工，不直接覆盖Argo参数 |
 | AWX服务重启 | 固定Job Template；Linux systemd或Windows Service；逐台摘流、重启、验证、回流 | 1名非申请人；绝不重启虚机；失败保持摘流并人工接管 |
 
 状态不确定时只允许查询原任务和对账，禁止再次发起写操作。全局、环境、连接器和动作类型均有 Kill Switch。
@@ -277,7 +278,7 @@ not_before, expires_at, trace_id
 - PostgreSQL、Temporal、Keycloak、Vault 使用企业高可用能力，平台只集成、不负责其生命周期。
 - 目标可用性99.9%，RPO不超过5分钟，RTO不超过30分钟。
 - 原始脱敏证据保留30天，结构化调查保留90天，审批和审计保留365天。
-- AuditRecord只追加；每日签名摘要写入对象存储，防止静默篡改。
+- AuditRecord只追加；每日生成包含记录ID、内容哈希和前一日摘要的规范化清单，用Vault中的独立Ed25519审计密钥签名，并写入启用Object Lock/WORM的对象存储。提供离线验签和恢复演练；开发环境若无Object Lock只能声明“可检测篡改”，不得声明不可变。
 
 ---
 
@@ -324,4 +325,3 @@ not_before, expires_at, trace_id
 ## 12. 后续路线
 
 只有内部试点达到门槛后才评估：更多日志后端、直接CI回滚、虚机应用版本回滚、相似事件向量检索、OPA适配器、跨地域Cell和多租户SaaS。新增能力不得削弱本蓝图的身份、审批、凭据、Runner隔离和审计边界。
-
