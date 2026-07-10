@@ -1,10 +1,16 @@
 .worktrees/
 .DS_Store
 .rustdesk_*
+.idea/
+.vscode/
+*.swp
 
 # Go
 bin/
 coverage.out
+coverage/
+*.prof
+*.test
 /control-plane
 /worker
 /runner
@@ -17,6 +23,7 @@ web/dist/
 .env
 .env.*
 !.env.example
+.envrc
 
 # Runtime data
 .data/

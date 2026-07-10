@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private security report
+    url: https://github.com/seaworld008/aiops-system/security/advisories/new
+    about: Report vulnerabilities and sensitive security issues privately.
+  - name: Architecture and usage discussion
+    url: https://github.com/seaworld008/aiops-system/discussions
+    about: Ask questions or discuss designs that are not yet actionable issues.

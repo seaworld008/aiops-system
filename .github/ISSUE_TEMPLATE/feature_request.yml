@@ -1,0 +1,53 @@
+name: Feature proposal
+description: Propose a scoped capability or design improvement.
+title: "[Proposal]: "
+labels: ["enhancement", "needs-design"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Large features and all new mutation types require design discussion before implementation. Explain the trust-boundary impact as carefully as the user value.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I searched existing issues, discussions, and the roadmap.
+          required: true
+        - label: This proposal does not require arbitrary shell, SSH, or model-generated mutations.
+          required: true
+        - label: I have described the security and failure-mode impact.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or operator problem should be solved?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe a narrow, testable solution and its API or workflow boundary.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence and alternatives
+      description: Operational examples, rejected alternatives, or prior art.
+  - type: textarea
+    id: safety
+    attributes:
+      label: Trust, security, and failure modes
+      description: Cover identity, scope, policy, credentials, idempotency, uncertain outcomes, audit, and rollback where relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: List measurable functional, safety, and test outcomes.
+    validations:
+      required: true

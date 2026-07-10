@@ -1,14 +1,92 @@
-# AIOps Control Plane
+# AIOps System
 
-面向中小企业内部使用的证据驱动运维调查与受控执行平台。当前实现以 `AIOPS-IMPLEMENTATION-BLUEPRINT-2026-V3.md` 为权威输入。
+[![CI](https://github.com/seaworld008/aiops-system/actions/workflows/ci.yml/badge.svg)](https://github.com/seaworld008/aiops-system/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8?logo=go)](go.mod)
 
-## 开发要求
+Evidence-first operations intelligence with policy-governed automation.
 
-- Go 1.26.5（仓库 `toolchain` 会自动选择）
-- PostgreSQL 16+（作用域完整性迁移使用生成列）
-- 完整集成测试还需要 Temporal、Keycloak、Vault 和 S3 兼容对象存储
+**English** · [简体中文](README.zh-CN.md)
 
-## 本地命令
+> [!IMPORTANT]
+> AIOps System is in active pre-alpha development. Read-only investigation foundations are usable for development and evaluation. Production write automation is disabled by design until every safety and quality gate in the pilot plan has passed.
+
+## Why this project exists
+
+Modern operations teams already have metrics, logs, Kubernetes, virtual machines, CI/CD, GitOps, and incident channels. What they often lack is a trustworthy layer that can correlate those facts, explain its evidence, and execute a very small set of changes without handing authority to an LLM.
+
+AIOps System is designed around four rules:
+
+- **Evidence before conclusions.** Every operational claim must cite bounded, traceable evidence.
+- **Models propose; deterministic systems decide.** CEL policy, identity, approvals, live state, and signed plans govern execution.
+- **Uncertain means stop and reconcile.** Side effects are fenced, verified, and never blindly retried.
+- **Least privilege is an architecture boundary.** Read and write runners have separate identities, queues, credentials, and network paths.
+
+## Current capabilities
+
+| Area | Status | What is available |
+| --- | --- | --- |
+| Signal ingestion | Implemented | Scoped and signed Alertmanager/Nightingale webhooks, idempotency, deduplication foundations |
+| Read-only evidence | Implemented | Bounded clients for Prometheus, VictoriaLogs, Kubernetes, AWX, Argo CD, GitLab, Jenkins, and GitHub Actions |
+| Investigation | Implemented foundation | Bounded parallel evidence collection, partial-result semantics, hybrid model routing, evidence-linked hypotheses |
+| Identity and policy | Implemented foundation | Keycloak OIDC, workspace/environment RBAC, signed ActionEnvelope, three-stage CEL decisions |
+| Execution safety | Implemented foundation | Typed actions, scoped runner claims, target locks, production concurrency fencing, heartbeat, cancellation, reconciliation |
+| Production automation | **Disabled** | Requires persistent credential-revocation retry, isolated executors, real integrations, non-production drills, and Go/No-Go approval |
+| Web console / ChatOps | Planned | React console and Feishu workflows are not yet shipped |
+
+“Implemented foundation” means the contracts and testable core exist; it does **not** mean a connector or mutation path is ready for unattended production use.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    UI["Web / Feishu / Alert Webhooks"] --> IN["Verified ingestion and service mapping"]
+    IN --> CP["Go modular control plane"]
+    CP --> PG[(PostgreSQL)]
+    CP --> OBJ[(S3-compatible evidence store)]
+    CP --> TW["Temporal workflows"]
+    CP --> CEL["CEL policy engine"]
+    CP --> AI["Private / cloud model adapters"]
+
+    TW --> GW["Outbound Runner Gateway"]
+    GW --> RR["Read-only runners"]
+    GW --> WR["Isolated change runners"]
+    RR --> OBS["Metrics / logs / K8s / AWX / CI / Argo"]
+    WR --> MUT["Typed K8s / GitOps / AWX actions"]
+
+    KC["Keycloak"] --> CP
+    VAULT["Vault short-lived credentials"] --> RR
+    VAULT --> WR
+```
+
+The first release targets a single self-hosted organization with multiple workspaces. PostgreSQL is the domain source of truth; Temporal is used only for durable orchestration. Runner communication is outbound-only and designed for HTTPS + mTLS.
+
+## Safety model
+
+The only accepted mutation input is a canonical, signed `ActionEnvelope`. It binds the exact target, parameters, observed resource version, preconditions, verification, compensation, risk, policy version, credential scope, idempotency key, and expiry.
+
+Before a write starts, the system must verify:
+
+1. an exact service/environment mapping;
+2. a valid signature and immutable plan hash;
+3. current policy at plan, credential, and execution stages;
+4. non-self approval bound to the exact plan and live target state;
+5. a single-target, short-lived credential;
+6. all global, environment, connector, and action kill switches;
+7. target locking and the pilot-wide production concurrency limit;
+8. post-action verification, or an `UNCERTAIN` state that retains the lock until reconciliation.
+
+See the [security model and implementation blueprint](docs/architecture/implementation-blueprint-v3.md) for the complete contract.
+
+## Quick start
+
+Requirements:
+
+- Go 1.26.5
+- PostgreSQL 16+ for persistence and migration tests
+- Temporal, Keycloak, Vault, and S3-compatible storage for the intended production architecture
+
+Run the development control plane with its in-memory repository:
 
 ```bash
 make test
@@ -17,7 +95,7 @@ make build
 make run
 ```
 
-启动后可访问：
+Then check:
 
 ```text
 GET http://localhost:8080/healthz
@@ -25,12 +103,42 @@ GET http://localhost:8080/readyz
 GET http://localhost:8080/api/v1/session
 ```
 
-Alertmanager/夜莺 Webhook 必须携带 `X-AIOPS-Signature: sha256=<hex>`，签名内容为原始请求体的 HMAC-SHA256。开发环境可用 `AIOPS_WEBHOOK_HMAC_SECRET`；生产环境必须通过 `AIOPS_WEBHOOK_HMAC_SECRETS_JSON` 按 `integration_id/provider` 隔离，并同时配置 `AIOPS_DATABASE_URL`、`AIOPS_OIDC_ISSUER` 和 `AIOPS_OIDC_CLIENT_ID`，否则控制面拒绝启动。OIDC discovery 只接受 HTTPS；Keycloak Token 还必须携带 `auth_time`、平台角色以及 `aiops_workspaces`、`aiops_environments` 作用域，服务负责人另需 `aiops_services`。数据库 Integration 记录再次校验 Workspace、Provider 和启停状态；后续 Vault 适配器会用其中的 `secret_ref` 替代环境变量密钥。
+The in-memory mode is for local development only. Production mode fails closed unless PostgreSQL, scoped webhook secrets, and Keycloak OIDC are configured. Copy [.env.example](.env.example) as a reference; never commit real credentials.
 
-本机没有 PostgreSQL 时，迁移集成测试会跳过。可设置以下变量运行真实 PostgreSQL 16 的 up/down、作用域和 pgx 仓储测试：
+To run real PostgreSQL migration and repository tests:
 
 ```bash
-AIOPS_TEST_POSTGRES_DSN='postgres://aiops:password@127.0.0.1:5432/aiops_test?sslmode=disable' go test -count=1 ./internal/store/postgres
+AIOPS_TEST_POSTGRES_DSN='postgres://aiops:password@127.0.0.1:5432/aiops_test?sslmode=disable' \
+  go test -count=1 ./internal/store/postgres ./internal/execution/postgres
 ```
 
-当前阶段已提供领域、信号接入和首批只读连接器；真实企业连接器必须使用各环境凭据配置，不随仓库分发。
+## Documentation
+
+- [Documentation index](docs/README.md)
+- [Architecture overview](docs/architecture/overview.md)
+- [2026 V3 implementation blueprint](docs/architecture/implementation-blueprint-v3.md)
+- [SME internal pilot plan](docs/plans/2026-07-10-sme-internal-aiops-pilot.md)
+- [Roadmap and release gates](docs/roadmap.md)
+- [Historical designs](docs/archive/README.md)
+
+## Repository layout
+
+```text
+cmd/                       control-plane, worker, and runner entry points
+internal/                  domain, policy, connectors, investigation, execution
+migrations/                ordered PostgreSQL schema migrations
+docs/architecture/         current architecture and trust contracts
+docs/plans/                executable delivery plans
+docs/archive/              superseded designs kept for traceability
+.github/                   CI and community templates
+```
+
+## Contributing and security
+
+We welcome design reviews, connector work, threat modeling, tests, documentation, and carefully scoped features. Start with [CONTRIBUTING.md](CONTRIBUTING.md) and open a proposal before large architectural changes.
+
+Do not report vulnerabilities in public issues. Follow [SECURITY.md](SECURITY.md) instead.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).

@@ -1,8 +1,11 @@
 # AI Native SRE / AIOps Control Plane 最终实现蓝图
 
+> [!WARNING]
+> 本文已归档，仅用于追溯早期设计决策，不再代表当前实现契约。请使用[2026 V3 实施蓝图](../architecture/implementation-blueprint-v3.md)。
+
 生成日期：2026-05-26
 
-用途：作为本仓库后续实现的最终版设计输入。本文吸收当前目录中的 `deep-research-report.md`、`deep-research-report-v2.md`、`aiops_codex_prompt_v2.md`、`ai-ops-codex-prompt-zh-v2.md`，并结合“AI Native SRE / 平台工程 / AIOps / LLMOps”成长路线，收敛成一个更适合真实落地、作品展示、面试表达和公司内部试点的版本。
+原始用途：作为本仓库早期实现的设计输入。本文吸收当时的研究材料，并结合“AI Native SRE / 平台工程 / AIOps / LLMOps”成长路线，形成早期内部试点构想。
 
 ---
 
@@ -2139,4 +2142,3 @@ Phase 0 到 Phase 3 完成后，必须满足：
 11. 优先兼容 OpenTelemetry、Prometheus、Kubernetes、Gateway API、CloudEvents、CDEvents、OpenCost、OpenFeature、OpenLineage 等标准生态。
 12. 组件升级必须支持预检、计划、审批、备份、迁移、验证、回滚和审计。
 13. 这个项目的价值不是“用了 AI”，而是“用 AI 系统性降低 MTTR、减少重复劳动、提升生产变更安全性”。
-

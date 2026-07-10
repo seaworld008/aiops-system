@@ -1,0 +1,78 @@
+name: Bug report
+description: Report a reproducible defect that is not a security vulnerability.
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve AIOps System. Do not include credentials, private logs, customer data, or vulnerability details here. Use SECURITY.md for security reports.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I searched existing issues and discussions.
+          required: true
+        - label: This is not a security vulnerability or sensitive incident.
+          required: true
+        - label: I removed all credentials and private operational data.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Commit SHA, branch, or release version.
+      placeholder: main @ abc1234
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Control plane / HTTP API
+        - Signal ingestion
+        - Read-only connector
+        - Investigation / model routing
+        - Policy / approval / ActionEnvelope
+        - Runner / execution queue
+        - PostgreSQL migration or repository
+        - Documentation / CI
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+      description: What happened? Include sanitized errors and state transitions.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest safe reproducer.
+      placeholder: |
+        1. Configure ...
+        2. Send ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, architecture, Go/PostgreSQL versions, and relevant deployment topology.
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Sanitized traces, test output, or related links.

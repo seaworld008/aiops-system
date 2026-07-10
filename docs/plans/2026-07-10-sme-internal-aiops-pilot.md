@@ -1,6 +1,6 @@
 # SME Internal AIOps Pilot Implementation Plan
 
-> 执行方式：在 `feat/sme-internal-aiops` worktree 中按任务顺序实施；每项逻辑遵循测试先行，完成后进行规格审查和代码质量审查。
+> 本文是分阶段交付计划，不是当前完成度声明；最新状态与生产开放门槛见[路线图](../roadmap.md)。每项逻辑遵循测试先行，完成后进行规格审查和代码质量审查。
 
 **Goal:** 交付一个可本地运行、可测试、可对接真实企业端点的调查与受控执行平台核心，并保留生产灰度所需的不可绕过安全边界。
 
@@ -12,11 +12,11 @@
 
 ## Task 1：文档与仓库基线
 
-**产出：** V3权威蓝图、实施计划、README、AGENTS、Makefile、版本策略、CI骨架。
+**产出：** V3 权威蓝图、实施计划、README、贡献与安全指南、Makefile、版本策略、CI 骨架。
 
 **步骤：**
 
-1. 保留旧蓝图，新建 V3 蓝图和本计划。
+1. 将旧蓝图归档，新建 V3 蓝图和本计划。
 2. 固定 Go 1.26.5，记录 `toolchain` 和 CI 版本。
 3. 创建模块化目录：`cmd/control-plane`、`cmd/worker`、`cmd/runner`、`internal`、`migrations`、`web`、`deploy`、`docs`。
 4. 添加配置加载、结构化日志、错误约定和健康端点的失败测试。

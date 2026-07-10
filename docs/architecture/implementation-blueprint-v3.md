@@ -2,8 +2,8 @@
 
 版本：2026 V3  
 更新日期：2026-07-10  
-状态：中小企业内部试点权威蓝图  
-替代关系：保留 `FINAL-AIOPS-IMPLEMENTATION-BLUEPRINT.md` 作为历史输入，本文件作为后续实现依据。
+状态：当前权威架构蓝图
+替代关系：历史输入已归档至 [`docs/archive/`](../archive/README.md)，本文件作为后续实现依据。
 
 ---
 
