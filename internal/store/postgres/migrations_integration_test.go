@@ -1,6 +1,7 @@
 package postgres_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -21,6 +22,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/seaworld008/aiops-system/internal/action"
+	"github.com/seaworld008/aiops-system/internal/credential"
+	credentialpostgres "github.com/seaworld008/aiops-system/internal/credential/postgres"
 	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/execution"
 	executionpostgres "github.com/seaworld008/aiops-system/internal/execution/postgres"
@@ -48,6 +51,13 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 		t.Fatalf("NewWithConfig() error = %v", err)
 	}
 	defer database.Close()
+	var serverVersion int
+	if err := database.QueryRow(ctx, `SELECT current_setting('server_version_num')::integer`).Scan(&serverVersion); err != nil {
+		t.Fatalf("read PostgreSQL server version: %v", err)
+	}
+	if serverVersion/10000 != 16 {
+		t.Fatalf("integration harness requires PostgreSQL 16, got server_version_num=%d", serverVersion)
+	}
 	if _, err := database.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
 		t.Fatalf("reset test schema: %v", err)
 	}
@@ -206,6 +216,9 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	}
 
 	exerciseRealActionQueue(t, ctx, database, tenant1, workspace1, environment1, service1)
+	applyMigrationFile(t, ctx, database, filepath.Join(migrationDirectory, "000008_credential_revocations.up.sql"))
+	exerciseRealCredentialRevocations(t, ctx, database, migrationDirectory,
+		tenant1, tenant2, workspace1, workspace2, environment1, service1)
 	expectSQLState(t, ctx, database, "P0001", `TRUNCATE runner_result_receipts`)
 	expectMigrationSQLState(t, ctx, database, filepath.Join(migrationDirectory, "000007_runner_execution_hardening.down.sql"), "55000")
 	execSQL(t, ctx, database, `DROP TRIGGER runner_result_receipts_no_truncate ON runner_result_receipts`)
@@ -223,6 +236,987 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	if relationName != nil {
 		t.Fatalf("tenants table remains after down migration: %s", *relationName)
 	}
+}
+
+func exerciseRealCredentialRevocations(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	migrationDirectory, tenantID, otherTenantID, workspaceID, otherWorkspaceID, environmentID, serviceID string,
+) {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate credential revocation action key: %v", err)
+	}
+	signer, err := action.NewEd25519Signer("credential-revocation-integration-key", privateKey)
+	if err != nil {
+		t.Fatalf("create credential revocation action signer: %v", err)
+	}
+	queue, err := executionpostgres.New(database, executionpostgres.Options{})
+	if err != nil {
+		t.Fatalf("create credential revocation action queue: %v", err)
+	}
+	now := time.Now().UTC()
+	submission := realActionSubmission(t, signer, now,
+		"91000000-0000-4000-8000-000000000001", workspaceID, environmentID, serviceID,
+		"payments-credential-revocation", '7')
+	submission.Production = false
+	if _, err := queue.Submit(ctx, submission); err != nil {
+		t.Fatalf("submit credential revocation action: %v", err)
+	}
+	claimedAction, err := queue.Claim(ctx, execution.ActionClaimRequest{
+		Scope: realRunnerScope(t, ctx, database, "runner-postgres-1"), LeaseDuration: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("claim credential revocation action: %v", err)
+	}
+	actionFence := credential.ActionFence{
+		ActionID: claimedAction.Execution.ExecutionID, RunnerID: claimedAction.Execution.RunnerID,
+		Token: claimedAction.Execution.LeaseToken, Epoch: claimedAction.Execution.LeaseEpoch,
+	}
+	if _, err := queue.Start(ctx, claimedAction.Execution.Fence()); err != nil {
+		t.Fatalf("start credential revocation action: %v", err)
+	}
+	expectSQLState(t, ctx, database, "23503", `
+		INSERT INTO credential_revocations (
+			revocation_id, tenant_id, workspace_id, environment_id,
+			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
+			issuer, connector_id, scope_permission, scope_resource, credential_expires_at
+		) VALUES (
+			'92000000-0000-4000-8000-000000000099', $1, $2, $3,
+			$4, $5, false, $6, $7, $8,
+			'vault-production', $9, $10, $11, statement_timestamp() + interval '5 minutes'
+		)
+	`, otherTenantID, otherWorkspaceID, environmentID, actionFence.ActionID, submission.TargetKey,
+		actionFence.RunnerID, actionFence.Epoch, credential.SHA256Hex([]byte(actionFence.Token)),
+		submission.Envelope.CredentialScope.ConnectorID, submission.Envelope.CredentialScope.Permission,
+		submission.Envelope.CredentialScope.Resource)
+	protector, err := credential.NewAESGCMProtector(credential.KeyRing{
+		ActiveKeyID: "credential-integration-key-1",
+		Keys: map[string]credential.ProtectionKey{
+			"credential-integration-key-1": {
+				EncryptionKey: bytes.Repeat([]byte{0x31}, 32),
+				HMACKey:       bytes.Repeat([]byte{0x32}, 32),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create credential reference protector: %v", err)
+	}
+	defer protector.Destroy()
+	repository, err := credentialpostgres.New(database, protector, credentialpostgres.Options{})
+	if err != nil {
+		t.Fatalf("create credential revocation repository: %v", err)
+	}
+	expectSQLState(t, ctx, database, "P0001", `TRUNCATE audit_records`)
+	credentialExpiry := now.Add(5*time.Minute + 999*time.Nanosecond)
+	canonicalCredentialExpiry := credential.CanonicalCredentialExpiry(credentialExpiry)
+	type prepareCallResult struct {
+		result credential.PrepareResult
+		err    error
+	}
+	prepareContext, cancelPrepare := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelPrepare()
+	prepareStart := make(chan struct{})
+	prepareResults := make(chan prepareCallResult, 2)
+	for _, candidateID := range []string{
+		"92000000-0000-4000-8000-000000000001",
+		"92000000-0000-4000-8000-000000000002",
+	} {
+		candidateID := candidateID
+		go func() {
+			<-prepareStart
+			result, prepareErr := repository.Prepare(prepareContext, credential.PrepareRequest{
+				RevocationID: candidateID, Fence: actionFence, Issuer: "vault-production",
+				CredentialExpiresAt: credentialExpiry,
+			})
+			prepareResults <- prepareCallResult{result: result, err: prepareErr}
+		}()
+	}
+	close(prepareStart)
+	createdWinners := 0
+	revocationID := ""
+	for range 2 {
+		var call prepareCallResult
+		select {
+		case call = <-prepareResults:
+		case <-prepareContext.Done():
+			t.Fatalf("timed out waiting for concurrent credential Prepare: %v", prepareContext.Err())
+		}
+		if call.err != nil {
+			t.Fatalf("real concurrent credential Prepare: %v", call.err)
+		}
+		if call.result.Created {
+			createdWinners++
+		}
+		if revocationID == "" {
+			revocationID = call.result.Revocation.ID
+		}
+		if call.result.Revocation.ID != revocationID || call.result.Revocation.Status != credential.StatusPrepared ||
+			call.result.Revocation.WorkspaceID != workspaceID || call.result.Revocation.EnvironmentID != environmentID ||
+			call.result.Revocation.TargetKey != submission.TargetKey ||
+			!call.result.Revocation.CredentialExpiresAt.Equal(canonicalCredentialExpiry) {
+			t.Fatalf("real concurrent credential Prepare result = %#v", call.result)
+		}
+	}
+	if createdWinners != 1 {
+		t.Fatalf("real concurrent credential Prepare Created winners = %d, want 1", createdWinners)
+	}
+	idempotent, err := repository.Prepare(ctx, credential.PrepareRequest{
+		RevocationID: revocationID, Fence: actionFence, Issuer: "vault-production",
+		CredentialExpiresAt: credentialExpiry,
+	})
+	if err != nil || idempotent.Created || idempotent.Revocation.ID != revocationID {
+		t.Fatalf("real credential Prepare(idempotent) = %#v, %v", idempotent, err)
+	}
+	canonicalReplay, err := repository.Prepare(ctx, credential.PrepareRequest{
+		RevocationID: "92000000-0000-4000-8000-000000000004", Fence: actionFence,
+		Issuer: "vault-production", CredentialExpiresAt: credentialExpiry,
+	})
+	if err != nil || canonicalReplay.Created || canonicalReplay.Revocation.ID != revocationID {
+		t.Fatalf("real credential Prepare(canonical replay) = %#v, %v", canonicalReplay, err)
+	}
+	conflicting := credential.PrepareRequest{
+		RevocationID: "92000000-0000-4000-8000-000000000005", Fence: actionFence,
+		Issuer: "different-issuer", CredentialExpiresAt: credentialExpiry,
+	}
+	if _, err := repository.Prepare(ctx, conflicting); !errors.Is(err, credential.ErrIdempotencyConflict) {
+		t.Fatalf("real credential Prepare(conflicting semantics) error = %v", err)
+	}
+
+	// Exercise the primary revocation_id key and the canonical action/epoch key
+	// in one real concurrent interleaving. Exactly one action may bind the
+	// shared candidate; the other action remains free for a later Prepare.
+	crossFences := make([]credential.ActionFence, 0, 2)
+	for index, input := range []struct {
+		actionID   string
+		runnerID   string
+		deployment string
+		digestByte byte
+	}{
+		{actionID: "91000000-0000-4000-8000-000000000003", runnerID: "runner-postgres-3", deployment: "payments-credential-unique-a", digestByte: 'a'},
+		{actionID: "91000000-0000-4000-8000-000000000004", runnerID: "runner-postgres-4", deployment: "payments-credential-unique-b", digestByte: 'b'},
+	} {
+		crossSubmission := realActionSubmission(t, signer, now, input.actionID, workspaceID, environmentID, serviceID,
+			input.deployment, input.digestByte)
+		crossSubmission.Production = false
+		if _, err := queue.Submit(ctx, crossSubmission); err != nil {
+			t.Fatalf("submit credential cross-unique action %d: %v", index, err)
+		}
+		crossAction, err := queue.Claim(ctx, execution.ActionClaimRequest{
+			Scope: realRunnerScope(t, ctx, database, input.runnerID), LeaseDuration: time.Minute,
+		})
+		if err != nil || crossAction.Execution.ExecutionID != input.actionID {
+			t.Fatalf("claim credential cross-unique action %d = %#v, %v", index, crossAction, err)
+		}
+		if _, err := queue.Start(ctx, crossAction.Execution.Fence()); err != nil {
+			t.Fatalf("start credential cross-unique action %d: %v", index, err)
+		}
+		crossFences = append(crossFences, credential.ActionFence{
+			ActionID: crossAction.Execution.ExecutionID, RunnerID: crossAction.Execution.RunnerID,
+			Token: crossAction.Execution.LeaseToken, Epoch: crossAction.Execution.LeaseEpoch,
+		})
+	}
+	const crossCandidateID = "92000000-0000-4000-8000-000000000012"
+	crossContext, cancelCross := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelCross()
+	crossStart := make(chan struct{})
+	crossResults := make(chan prepareCallResult, len(crossFences))
+	for _, crossFence := range crossFences {
+		crossFence := crossFence
+		go func() {
+			<-crossStart
+			result, prepareErr := repository.Prepare(crossContext, credential.PrepareRequest{
+				RevocationID: crossCandidateID, Fence: crossFence, Issuer: "vault-production",
+				CredentialExpiresAt: time.Now().UTC().Add(5 * time.Minute),
+			})
+			crossResults <- prepareCallResult{result: result, err: prepareErr}
+		}()
+	}
+	close(crossStart)
+	crossWinners, crossConflicts := 0, 0
+	var crossWinnerFence, crossLoserFence credential.ActionFence
+	for range crossFences {
+		var call prepareCallResult
+		select {
+		case call = <-crossResults:
+		case <-crossContext.Done():
+			t.Fatalf("timed out waiting for credential cross-unique Prepare: %v", crossContext.Err())
+		}
+		if call.err == nil {
+			if !call.result.Created || call.result.Revocation.ID != crossCandidateID {
+				t.Fatalf("credential cross-unique winner = %#v", call.result)
+			}
+			crossWinners++
+			for _, crossFence := range crossFences {
+				if crossFence.ActionID == call.result.Revocation.ActionID {
+					crossWinnerFence = crossFence
+				}
+			}
+			continue
+		}
+		if !errors.Is(call.err, credential.ErrIdempotencyConflict) {
+			t.Fatalf("credential cross-unique loser error = %v", call.err)
+		}
+		crossConflicts++
+	}
+	for _, crossFence := range crossFences {
+		if crossFence.ActionID != crossWinnerFence.ActionID {
+			crossLoserFence = crossFence
+		}
+	}
+	if crossWinners != 1 || crossConflicts != 1 || crossWinnerFence.ActionID == "" || crossLoserFence.ActionID == "" {
+		t.Fatalf("credential cross-unique results winners/conflicts=%d/%d winner=%#v loser=%#v",
+			crossWinners, crossConflicts, crossWinnerFence, crossLoserFence)
+	}
+	var crossCandidateRows int
+	if err := database.QueryRow(ctx, `SELECT count(*) FROM credential_revocations WHERE revocation_id = $1`, crossCandidateID).
+		Scan(&crossCandidateRows); err != nil || crossCandidateRows != 1 {
+		t.Fatalf("credential cross-unique candidate rows = %d, %v", crossCandidateRows, err)
+	}
+
+	// Delay the anchored outbox write until the initially-current action has
+	// less than the one-second post-child commit window. The final DB-time
+	// recheck must still persist the accessor, but atomically request revocation.
+	execSQL(t, ctx, database, `
+		CREATE FUNCTION delay_test_anchor_outbox() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.aggregate_id = '92000000-0000-4000-8000-000000000012'::uuid
+			   AND NEW.event_type = 'credential.revocation.anchored.v1' THEN
+				PERFORM pg_sleep(1.25);
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER delay_test_anchor_outbox_insert
+		BEFORE INSERT ON outbox_events
+		FOR EACH ROW EXECUTE FUNCTION delay_test_anchor_outbox();
+		UPDATE action_queue
+		SET lease_expires_at = statement_timestamp() + interval '2 seconds'
+		WHERE action_id = $1;
+	`, crossWinnerFence.ActionID)
+	anchorContext, cancelAnchor := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelAnchor()
+	crossAccessor, _ := credential.NewSensitiveReference([]byte("cross-unique-commit-window-accessor"))
+	anchorStartedAt := time.Now()
+	crossAnchored, err := repository.RecordAnchor(anchorContext, credential.RecordAnchorRequest{
+		RevocationID: crossCandidateID, Fence: crossWinnerFence, Accessor: crossAccessor,
+	})
+	anchorElapsed := time.Since(anchorStartedAt)
+	crossAccessor.Destroy()
+	if err != nil || crossAnchored.Status != credential.StatusRevocationPending || !crossAnchored.AccessorPresent {
+		t.Fatalf("real RecordAnchor(commit window elapsed) = %#v, %v", crossAnchored, err)
+	}
+	if anchorElapsed < 1200*time.Millisecond {
+		t.Fatalf("real RecordAnchor did not cross blocking outbox hook: elapsed=%s", anchorElapsed)
+	}
+	execSQL(t, ctx, database, `
+		DROP TRIGGER delay_test_anchor_outbox_insert ON outbox_events;
+		DROP FUNCTION delay_test_anchor_outbox();
+	`)
+	crossClaims, err := repository.ClaimRevocations(ctx, credential.ClaimRevocationsRequest{
+		WorkerID: "credential-cross-unique-cleanup", Limit: 1, LeaseDuration: 30 * time.Second,
+	})
+	if err != nil || len(crossClaims) != 1 || crossClaims[0].Revocation.ID != crossCandidateID {
+		t.Fatalf("claim credential cross-unique cleanup = %#v, %v", crossClaims, err)
+	}
+	crossClaims[0].Accessor.Destroy()
+	if _, err := repository.CompleteRevocation(ctx, credential.CompleteRevocationRequest{Fence: crossClaims[0].Fence}); err != nil {
+		t.Fatalf("complete credential cross-unique cleanup: %v", err)
+	}
+
+	// Delay Prepare's outbox write on the losing action. Its final live-fence
+	// query must roll the entire transaction back once less than one second
+	// remains, including both audit and outbox writes.
+	const delayedPrepareID = "92000000-0000-4000-8000-000000000013"
+	execSQL(t, ctx, database, `
+		CREATE FUNCTION delay_test_prepare_outbox() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.aggregate_id = '92000000-0000-4000-8000-000000000013'::uuid
+			   AND NEW.event_type = 'credential.revocation.prepared.v1' THEN
+				PERFORM pg_sleep(1.25);
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER delay_test_prepare_outbox_insert
+		BEFORE INSERT ON outbox_events
+		FOR EACH ROW EXECUTE FUNCTION delay_test_prepare_outbox();
+		UPDATE action_queue
+		SET lease_expires_at = statement_timestamp() + interval '2 seconds'
+		WHERE action_id = $1;
+	`, crossLoserFence.ActionID)
+	delayedPrepareContext, cancelDelayedPrepare := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelDelayedPrepare()
+	delayedPrepareStartedAt := time.Now()
+	delayedPrepare, delayedPrepareErr := repository.Prepare(delayedPrepareContext, credential.PrepareRequest{
+		RevocationID: delayedPrepareID, Fence: crossLoserFence, Issuer: "vault-production",
+		CredentialExpiresAt: time.Now().UTC().Add(5 * time.Minute),
+	})
+	delayedPrepareElapsed := time.Since(delayedPrepareStartedAt)
+	if !errors.Is(delayedPrepareErr, credential.ErrStaleActionFence) || delayedPrepare.Created {
+		t.Fatalf("real Prepare(commit window elapsed) = %#v, %v", delayedPrepare, delayedPrepareErr)
+	}
+	if delayedPrepareElapsed < 1200*time.Millisecond {
+		t.Fatalf("real Prepare did not cross blocking outbox hook: elapsed=%s", delayedPrepareElapsed)
+	}
+	execSQL(t, ctx, database, `
+		DROP TRIGGER delay_test_prepare_outbox_insert ON outbox_events;
+		DROP FUNCTION delay_test_prepare_outbox();
+	`)
+	var delayedPrepareRows, delayedPrepareAudits, delayedPrepareOutbox int
+	if err := database.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM credential_revocations WHERE revocation_id = $1),
+			(SELECT count(*) FROM audit_records WHERE action = 'credential.revocation.prepared' AND resource_id = $1),
+			(SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'credential.revocation.prepared.v1')
+	`, delayedPrepareID).Scan(&delayedPrepareRows, &delayedPrepareAudits, &delayedPrepareOutbox); err != nil ||
+		delayedPrepareRows != 0 || delayedPrepareAudits != 0 || delayedPrepareOutbox != 0 {
+		t.Fatalf("delayed Prepare rollback row/audit/outbox=%d/%d/%d, %v",
+			delayedPrepareRows, delayedPrepareAudits, delayedPrepareOutbox, err)
+	}
+	expectSQLState(t, ctx, database, "55000", `
+		INSERT INTO credential_revocations (
+			revocation_id, tenant_id, workspace_id, environment_id,
+			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
+			issuer, connector_id, scope_permission, scope_resource, credential_expires_at, status
+		)
+		SELECT '92000000-0000-4000-8000-000000000007', tenant_id, workspace_id, environment_id,
+			action_id, target_key, production, runner_id, action_lease_epoch + 7000, action_lease_token_sha256,
+			issuer, connector_id, scope_permission, scope_resource, statement_timestamp() + interval '5 minutes',
+			'NO_CREDENTIAL'
+		FROM credential_revocations WHERE revocation_id = $1
+	`, revocationID)
+	expectSQLState(t, ctx, database, "55000", `
+		UPDATE credential_revocations
+		SET status = 'ACTIVE', activated_at = statement_timestamp(),
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID)
+	expectSQLState(t, ctx, database, "23514", `
+		WITH clock AS (SELECT statement_timestamp() AS current_time)
+		INSERT INTO credential_revocations (
+			revocation_id, tenant_id, workspace_id, environment_id,
+			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
+			issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+			available_at, created_at, updated_at
+		)
+		SELECT '92000000-0000-4000-8000-000000000014', source.tenant_id, source.workspace_id, source.environment_id,
+			source.action_id, source.target_key, source.production, source.runner_id,
+			source.action_lease_epoch + 7004, source.action_lease_token_sha256,
+			source.issuer, source.connector_id, source.scope_permission, source.scope_resource,
+			clock.current_time + interval '15 minutes' + interval '1 microsecond',
+			clock.current_time, clock.current_time, clock.current_time
+		FROM credential_revocations AS source CROSS JOIN clock
+		WHERE source.revocation_id = $1
+	`, revocationID)
+	const noCredentialRevocationID = "92000000-0000-4000-8000-000000000008"
+	execSQL(t, ctx, database, `
+		INSERT INTO credential_revocations (
+			revocation_id, tenant_id, workspace_id, environment_id,
+			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
+			issuer, connector_id, scope_permission, scope_resource, credential_expires_at
+		)
+		SELECT $2, tenant_id, workspace_id, environment_id,
+			action_id, target_key, production, runner_id, action_lease_epoch + 7001, action_lease_token_sha256,
+			issuer, connector_id, scope_permission, scope_resource, statement_timestamp() + interval '5 minutes'
+		FROM credential_revocations WHERE revocation_id = $1
+	`, revocationID, noCredentialRevocationID)
+	execSQL(t, ctx, database, `
+		UPDATE credential_revocations
+		SET status = 'NO_CREDENTIAL', updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, noCredentialRevocationID)
+	for _, statement := range []string{
+		`UPDATE credential_revocations SET updated_at = statement_timestamp(), version = version + 1 WHERE revocation_id = $1`,
+		`UPDATE credential_revocations SET status = 'PREPARED', updated_at = statement_timestamp(), version = version + 1 WHERE revocation_id = $1`,
+	} {
+		expectSQLState(t, ctx, database, "55000", statement, noCredentialRevocationID)
+	}
+
+	insertPreparedRecoveryCandidate := func(id string, epochOffset int64, ageSeconds, ttlSeconds float64) {
+		execSQL(t, ctx, database, `
+			WITH clock AS (SELECT statement_timestamp() AS current_time)
+			INSERT INTO credential_revocations (
+				revocation_id, tenant_id, workspace_id, environment_id,
+				action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
+				issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+				available_at, created_at, updated_at
+			)
+			SELECT $2, source.tenant_id, source.workspace_id, source.environment_id,
+				source.action_id, source.target_key, source.production, source.runner_id,
+				source.action_lease_epoch + $3, source.action_lease_token_sha256,
+				source.issuer, source.connector_id, source.scope_permission, source.scope_resource,
+				clock.current_time - make_interval(secs => $4::double precision) +
+					make_interval(secs => $5::double precision),
+				clock.current_time - make_interval(secs => $4::double precision),
+				clock.current_time - make_interval(secs => $4::double precision),
+				clock.current_time - make_interval(secs => $4::double precision)
+			FROM credential_revocations AS source CROSS JOIN clock
+			WHERE source.revocation_id = $1
+		`, revocationID, id, epochOffset, ageSeconds, ttlSeconds)
+	}
+	const (
+		beforeRecoveryID   = "92000000-0000-4000-8000-000000000009"
+		expiredRecoveryID  = "92000000-0000-4000-8000-000000000010"
+		rollbackRecoveryID = "92000000-0000-4000-8000-000000000011"
+	)
+	// A two-minute absolute TTL proves recovery is keyed to the persisted
+	// deadline rather than waiting for the maximum created_at+15m ceiling.
+	insertPreparedRecoveryCandidate(beforeRecoveryID, 8001, 2*60+30, 2*60)
+	beforeRecovery, err := repository.RecoverPrepared(ctx, credential.RecoverPreparedRequest{Limit: 10})
+	if err != nil || len(beforeRecovery) != 0 {
+		t.Fatalf("real RecoverPrepared(before DB boundary) = %#v, %v", beforeRecovery, err)
+	}
+	insertPreparedRecoveryCandidate(expiredRecoveryID, 8002, 3*60, 2*60)
+	type preparedRecoveryResult struct {
+		revocations []credential.Revocation
+		err         error
+	}
+	recoveryContext, cancelRecovery := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelRecovery()
+	recoveryStart := make(chan struct{})
+	recoveryResults := make(chan preparedRecoveryResult, 2)
+	for range 2 {
+		go func() {
+			<-recoveryStart
+			revocations, recoverErr := repository.RecoverPrepared(recoveryContext, credential.RecoverPreparedRequest{Limit: 1})
+			recoveryResults <- preparedRecoveryResult{revocations: revocations, err: recoverErr}
+		}()
+	}
+	close(recoveryStart)
+	recoveryWinners := 0
+	for range 2 {
+		var result preparedRecoveryResult
+		select {
+		case result = <-recoveryResults:
+		case <-recoveryContext.Done():
+			t.Fatalf("timed out waiting for concurrent RecoverPrepared: %v", recoveryContext.Err())
+		}
+		if result.err != nil {
+			t.Fatalf("real concurrent RecoverPrepared: %v", result.err)
+		}
+		if len(result.revocations) == 1 {
+			if result.revocations[0].ID != expiredRecoveryID || result.revocations[0].Status != credential.StatusNoCredential {
+				t.Fatalf("real RecoverPrepared winner = %#v", result.revocations)
+			}
+			recoveryWinners++
+		}
+	}
+	if recoveryWinners != 1 {
+		t.Fatalf("real concurrent RecoverPrepared winners = %d, want 1", recoveryWinners)
+	}
+	var recoveryAuditCount, recoveryOutboxCount int
+	if err := database.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM audit_records WHERE action = 'credential.revocation.prepared_expired' AND resource_id = $1),
+			(SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'credential.revocation.prepared_expired.v1')
+	`, expiredRecoveryID).Scan(&recoveryAuditCount, &recoveryOutboxCount); err != nil ||
+		recoveryAuditCount != 1 || recoveryOutboxCount != 1 {
+		t.Fatalf("prepared recovery audit/outbox = %d/%d, %v", recoveryAuditCount, recoveryOutboxCount, err)
+	}
+
+	insertPreparedRecoveryCandidate(rollbackRecoveryID, 8003, 3*60, 2*60)
+	execSQL(t, ctx, database, `
+		CREATE FUNCTION reject_test_prepared_recovery_outbox() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.aggregate_id = '92000000-0000-4000-8000-000000000011'::uuid
+			   AND NEW.event_type = 'credential.revocation.prepared_expired.v1' THEN
+				RAISE EXCEPTION 'forced prepared recovery outbox failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER reject_test_prepared_recovery_outbox_insert
+		BEFORE INSERT ON outbox_events
+		FOR EACH ROW EXECUTE FUNCTION reject_test_prepared_recovery_outbox();
+	`)
+	if _, err := repository.RecoverPrepared(ctx, credential.RecoverPreparedRequest{Limit: 1}); !errors.Is(err, credential.ErrRevocationPersistence) {
+		t.Fatalf("real RecoverPrepared(forced outbox rollback) error = %v", err)
+	}
+	var rollbackRecoveryStatus string
+	var rollbackRecoveryVersion int64
+	var rollbackRecoveryAudits, rollbackRecoveryOutbox int
+	if err := database.QueryRow(ctx, `
+		SELECT status, version,
+			(SELECT count(*) FROM audit_records WHERE action = 'credential.revocation.prepared_expired' AND resource_id = $1),
+			(SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'credential.revocation.prepared_expired.v1')
+		FROM credential_revocations WHERE revocation_id = $1
+	`, rollbackRecoveryID).Scan(
+		&rollbackRecoveryStatus, &rollbackRecoveryVersion, &rollbackRecoveryAudits, &rollbackRecoveryOutbox,
+	); err != nil || rollbackRecoveryStatus != string(credential.StatusPrepared) || rollbackRecoveryVersion != 1 ||
+		rollbackRecoveryAudits != 0 || rollbackRecoveryOutbox != 0 {
+		t.Fatalf("prepared recovery rollback state = %s/v%d audit/outbox=%d/%d, %v",
+			rollbackRecoveryStatus, rollbackRecoveryVersion, rollbackRecoveryAudits, rollbackRecoveryOutbox, err)
+	}
+	execSQL(t, ctx, database, `
+		DROP TRIGGER reject_test_prepared_recovery_outbox_insert ON outbox_events;
+		DROP FUNCTION reject_test_prepared_recovery_outbox();
+	`)
+
+	accessorValue := []byte("vault lease/accessor with spaces 租约")
+	accessor, err := credential.NewSensitiveReference(accessorValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.RecordAnchor(ctx, credential.RecordAnchorRequest{
+		RevocationID: revocationID, Fence: actionFence, Accessor: accessor,
+	}); err != nil {
+		t.Fatalf("real credential RecordAnchor: %v", err)
+	}
+	accessor.Destroy()
+	if _, err := repository.Activate(ctx, credential.ActionTransitionRequest{RevocationID: revocationID, Fence: actionFence}); err != nil {
+		t.Fatalf("real credential Activate: %v", err)
+	}
+	// Prove the stable action_id FK does not block M1 from clearing its mutable
+	// active-lease columns, then persist the frozen accessor after Nack.
+	nackSubmission := realActionSubmission(t, signer, now,
+		"91000000-0000-4000-8000-000000000002", workspaceID, environmentID, serviceID,
+		"payments-credential-nack-recovery", '8')
+	nackSubmission.Production = false
+	if _, err := queue.Submit(ctx, nackSubmission); err != nil {
+		t.Fatalf("submit credential Nack compatibility action: %v", err)
+	}
+	nackAction, err := queue.Claim(ctx, execution.ActionClaimRequest{
+		Scope: realRunnerScope(t, ctx, database, "runner-postgres-2"), LeaseDuration: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("claim credential Nack compatibility action: %v", err)
+	}
+	nackFence := credential.ActionFence{
+		ActionID: nackAction.Execution.ExecutionID, RunnerID: nackAction.Execution.RunnerID,
+		Token: nackAction.Execution.LeaseToken, Epoch: nackAction.Execution.LeaseEpoch,
+	}
+	const nackRevocationID = "92000000-0000-4000-8000-000000000003"
+	nackPrepared, err := repository.Prepare(ctx, credential.PrepareRequest{
+		RevocationID: nackRevocationID, Fence: nackFence, Issuer: "vault-production",
+		CredentialExpiresAt: now.Add(5 * time.Minute),
+	})
+	if err != nil || !nackPrepared.Created {
+		t.Fatalf("prepare credential Nack compatibility revocation = %#v, %v", nackPrepared, err)
+	}
+	if _, err := repository.Prepare(ctx, credential.PrepareRequest{
+		RevocationID: nackRevocationID, Fence: actionFence, Issuer: "vault-production",
+		CredentialExpiresAt: credentialExpiry,
+	}); !errors.Is(err, credential.ErrIdempotencyConflict) {
+		t.Fatalf("replay with candidate ID occupied by another action error = %v", err)
+	}
+	nackAccessor, _ := credential.NewSensitiveReference([]byte("nack-recovery-accessor"))
+	nacked, err := queue.Nack(ctx, execution.ActionNackRequest{
+		Lease: nackAction.Execution.Fence(),
+		Reason: execution.ActionQueueReason{
+			Code: "CREDENTIAL_ANCHOR_RECOVERY_TEST", DetailHash: strings.Repeat("9", 64),
+		},
+		RetryAfter: time.Second,
+	})
+	if err != nil || nacked.Status != executionlease.StatusQueued {
+		t.Fatalf("M1 Nack with anchored credential revocation = %#v, %v", nacked, err)
+	}
+	var clearedRunnerID, clearedToken, clearedTenant, clearedWorkspace, clearedEnvironment *string
+	if err := database.QueryRow(ctx, `
+		SELECT runner_id, lease_token_sha256, runner_tenant_id::text,
+			runner_workspace_id::text, runner_environment_id::text
+		FROM action_queue WHERE action_id = $1
+	`, nackFence.ActionID).Scan(
+		&clearedRunnerID, &clearedToken, &clearedTenant, &clearedWorkspace, &clearedEnvironment,
+	); err != nil {
+		t.Fatalf("read Nacked action mutable fence: %v", err)
+	}
+	if clearedRunnerID != nil || clearedToken != nil || clearedTenant != nil || clearedWorkspace != nil || clearedEnvironment != nil {
+		t.Fatalf("Nack did not clear mutable action fence: runner=%v token=%v tenant=%v workspace=%v environment=%v",
+			clearedRunnerID, clearedToken, clearedTenant, clearedWorkspace, clearedEnvironment)
+	}
+	nackAnchored, err := repository.RecordAnchor(ctx, credential.RecordAnchorRequest{
+		RevocationID: nackRevocationID, Fence: nackFence, Accessor: nackAccessor,
+	})
+	nackAccessor.Destroy()
+	if err != nil || nackAnchored.Status != credential.StatusRevocationPending || !nackAnchored.AccessorPresent {
+		t.Fatalf("anchor credential after Nack = %#v, %v", nackAnchored, err)
+	}
+	if recovered, err := repository.RequestRevocation(ctx, credential.ActionTransitionRequest{RevocationID: nackRevocationID}); err != nil || recovered.Status != credential.StatusRevocationPending {
+		t.Fatalf("recover anchored revocation after action bearer was cleared: %v", err)
+	}
+	nackRecoveryClaims, err := repository.ClaimRevocations(ctx, credential.ClaimRevocationsRequest{
+		WorkerID: "credential-nack-recovery-revoker", Limit: 1, LeaseDuration: 30 * time.Second,
+	})
+	if err != nil || len(nackRecoveryClaims) != 1 || nackRecoveryClaims[0].Revocation.ID != nackRevocationID {
+		t.Fatalf("claim recovered Nack revocation = %#v, %v", nackRecoveryClaims, err)
+	}
+	nackRecoveryClaims[0].Accessor.Destroy()
+	if _, err := repository.CompleteRevocation(ctx, credential.CompleteRevocationRequest{Fence: nackRecoveryClaims[0].Fence}); err != nil {
+		t.Fatalf("complete recovered Nack revocation: %v", err)
+	}
+	if _, err := repository.CompleteRevocation(ctx, credential.CompleteRevocationRequest{Fence: nackRecoveryClaims[0].Fence}); err != nil {
+		t.Fatalf("idempotent complete recovered Nack revocation: %v", err)
+	}
+	for _, statement := range []string{
+		`UPDATE credential_revocations SET updated_at = statement_timestamp(), version = version + 1 WHERE revocation_id = $1`,
+		`UPDATE credential_revocations SET status = 'REVOCATION_PENDING', updated_at = statement_timestamp(), version = version + 1 WHERE revocation_id = $1`,
+	} {
+		expectSQLState(t, ctx, database, "55000", statement, nackRevocationID)
+	}
+	// Reclaim the Nacked action at a new action epoch and create a separate,
+	// legal pending revocation for the batch-decrypt rollback test.
+	execSQL(t, ctx, database, `
+		UPDATE action_queue
+		SET not_before = statement_timestamp() - interval '1 second'
+		WHERE action_id = $1
+	`, nackFence.ActionID)
+	batchAction, err := queue.Claim(ctx, execution.ActionClaimRequest{
+		Scope: realRunnerScope(t, ctx, database, "runner-postgres-2"), LeaseDuration: time.Minute,
+	})
+	if err != nil || batchAction.Execution.ExecutionID != nackFence.ActionID {
+		t.Fatalf("claim credential batch rollback action = %#v, %v", batchAction, err)
+	}
+	batchFence := credential.ActionFence{
+		ActionID: batchAction.Execution.ExecutionID, RunnerID: batchAction.Execution.RunnerID,
+		Token: batchAction.Execution.LeaseToken, Epoch: batchAction.Execution.LeaseEpoch,
+	}
+	if _, err := queue.Start(ctx, batchAction.Execution.Fence()); err != nil {
+		t.Fatalf("start credential batch rollback action: %v", err)
+	}
+	const batchRevocationID = "92000000-0000-4000-8000-000000000006"
+	batchPrepared, err := repository.Prepare(ctx, credential.PrepareRequest{
+		RevocationID: batchRevocationID, Fence: batchFence, Issuer: "vault-production",
+		CredentialExpiresAt: credentialExpiry,
+	})
+	if err != nil || !batchPrepared.Created {
+		t.Fatalf("prepare credential batch rollback revocation = %#v, %v", batchPrepared, err)
+	}
+	batchAccessor, _ := credential.NewSensitiveReference([]byte("batch-corrupt-accessor"))
+	if _, err := repository.RecordAnchor(ctx, credential.RecordAnchorRequest{
+		RevocationID: batchRevocationID, Fence: batchFence, Accessor: batchAccessor,
+	}); err != nil {
+		t.Fatalf("anchor credential batch rollback revocation: %v", err)
+	}
+	batchAccessor.Destroy()
+	if _, err := repository.RequestRevocation(ctx, credential.ActionTransitionRequest{
+		RevocationID: batchRevocationID, Fence: batchFence,
+	}); err != nil {
+		t.Fatalf("request credential batch rollback revocation: %v", err)
+	}
+	var batchCiphertext []byte
+	if err := database.QueryRow(ctx, `
+		SELECT accessor_ciphertext FROM credential_revocations WHERE revocation_id = $1
+	`, batchRevocationID).Scan(&batchCiphertext); err != nil {
+		t.Fatalf("read batch rollback protected accessor: %v", err)
+	}
+	if _, err := repository.RequestRevocation(ctx, credential.ActionTransitionRequest{RevocationID: revocationID, Fence: actionFence}); err != nil {
+		t.Fatalf("real credential RequestRevocation: %v", err)
+	}
+	var storedCiphertext, storedHMAC []byte
+	var storedKeyID, storedActionFenceHash string
+	if err := database.QueryRow(ctx, `
+		SELECT accessor_ciphertext, accessor_hmac, encryption_key_id, action_lease_token_sha256
+		FROM credential_revocations WHERE revocation_id = $1
+	`, revocationID).Scan(&storedCiphertext, &storedHMAC, &storedKeyID, &storedActionFenceHash); err != nil {
+		t.Fatalf("read protected credential reference: %v", err)
+	}
+	if len(storedCiphertext) < 29 || bytes.Contains(storedCiphertext, accessorValue) || len(storedHMAC) != 32 ||
+		storedKeyID != "credential-integration-key-1" || storedActionFenceHash == actionFence.Token || len(storedActionFenceHash) != 64 {
+		t.Fatalf("invalid protected credential storage shape: cipher=%d hmac=%d key=%q fence=%q",
+			len(storedCiphertext), len(storedHMAC), storedKeyID, storedActionFenceHash)
+	}
+	expectSQLState(t, ctx, database, "55000", `
+		UPDATE credential_revocations
+		SET revocation_id = '92000000-0000-4000-8000-000000000098',
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID)
+	expectSQLState(t, ctx, database, "23514", `
+		UPDATE credential_revocations
+		SET accessor_ciphertext = decode(repeat('aa', 4125), 'hex'),
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID)
+
+	rebuiltPool, err := pgxpool.NewWithConfig(ctx, database.Config().Copy())
+	if err != nil {
+		t.Fatalf("rebuild PostgreSQL connection pool: %v", err)
+	}
+	defer rebuiltPool.Close()
+	rebuilt, err := credentialpostgres.New(rebuiltPool, protector, credentialpostgres.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := rebuilt.Get(ctx, revocationID)
+	if err != nil || persisted.Status != credential.StatusRevocationPending || !persisted.AccessorPresent {
+		t.Fatalf("rebuilt repository Get = %#v, %v", persisted, err)
+	}
+
+	// Corrupt the second legal pending candidate's AEAD body without changing
+	// its schema shape. Claim must decrypt the whole batch before mutating rows.
+	execSQL(t, ctx, database, `
+		UPDATE credential_revocations
+		SET available_at = statement_timestamp() - interval '2 minutes',
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID)
+	execSQL(t, ctx, database, `
+		UPDATE credential_revocations
+		SET accessor_ciphertext = set_byte(
+			accessor_ciphertext,
+			octet_length(accessor_ciphertext) - 1,
+			(get_byte(accessor_ciphertext, octet_length(accessor_ciphertext) - 1) + 1) % 256
+		), updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, batchRevocationID)
+	claimState := func(id string) string {
+		var state string
+		if err := database.QueryRow(ctx, `
+			SELECT jsonb_build_object(
+				'status', status, 'claim_epoch', claim_epoch, 'attempt', attempt,
+				'version', version, 'updated_at', updated_at,
+				'claimed_by', claimed_by, 'claim_token_sha256', claim_token_sha256,
+				'claimed_at', claimed_at, 'claim_expires_at', claim_expires_at,
+				'last_heartbeat_at', last_heartbeat_at
+			)::text
+			FROM credential_revocations WHERE revocation_id = $1
+		`, id).Scan(&state); err != nil {
+			t.Fatalf("read credential claim state %s: %v", id, err)
+		}
+		return state
+	}
+	beforeValidClaim := claimState(revocationID)
+	beforeInvalidClaim := claimState(batchRevocationID)
+	failedBatch, err := rebuilt.ClaimRevocations(ctx, credential.ClaimRevocationsRequest{
+		WorkerID: "credential-batch-rollback-revoker", Limit: 2, LeaseDuration: 30 * time.Second,
+	})
+	if !errors.Is(err, credential.ErrReferenceProtection) || len(failedBatch) != 0 {
+		t.Fatalf("real credential ClaimRevocations(corrupt batch) = %#v, %v", failedBatch, err)
+	}
+	if after := claimState(revocationID); after != beforeValidClaim {
+		t.Fatalf("valid claim candidate mutated after batch decrypt failure: before=%s after=%s", beforeValidClaim, after)
+	}
+	if after := claimState(batchRevocationID); after != beforeInvalidClaim {
+		t.Fatalf("invalid claim candidate mutated after batch decrypt failure: before=%s after=%s", beforeInvalidClaim, after)
+	}
+	execSQL(t, ctx, database, `
+		UPDATE credential_revocations
+		SET accessor_ciphertext = $2, available_at = statement_timestamp() + interval '1 day',
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, batchRevocationID, batchCiphertext)
+
+	type claimResult struct {
+		claims []credential.ClaimedRevocation
+		err    error
+	}
+	claimContext, cancelCredentialClaims := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelCredentialClaims()
+	start := make(chan struct{})
+	results := make(chan claimResult, 2)
+	for _, worker := range []string{"credential-revoker-1", "credential-revoker-2"} {
+		worker := worker
+		go func() {
+			<-start
+			claims, claimErr := rebuilt.ClaimRevocations(claimContext, credential.ClaimRevocationsRequest{
+				WorkerID: worker, Limit: 1, LeaseDuration: 30 * time.Second,
+			})
+			results <- claimResult{claims: claims, err: claimErr}
+		}()
+	}
+	close(start)
+	var firstClaim credential.ClaimedRevocation
+	winners := 0
+	for range 2 {
+		var result claimResult
+		select {
+		case result = <-results:
+		case <-claimContext.Done():
+			t.Fatalf("timed out waiting for concurrent credential claims: %v", claimContext.Err())
+		}
+		if result.err != nil {
+			t.Fatalf("real concurrent credential claim: %v", result.err)
+		}
+		if len(result.claims) == 1 {
+			firstClaim = result.claims[0]
+			winners++
+		}
+	}
+	if winners != 1 || firstClaim.Accessor == nil || string(firstClaim.Accessor.Bytes()) != string(accessorValue) {
+		t.Fatalf("real credential claim winners=%d claim=%#v", winners, firstClaim)
+	}
+	expectSQLState(t, ctx, database, "23514", `
+		UPDATE credential_revocations
+		SET status = 'REVOKED',
+			claimed_by = NULL, claim_token_sha256 = NULL, claimed_at = NULL,
+			claim_expires_at = NULL, last_heartbeat_at = NULL,
+			accessor_ciphertext = NULL, encryption_key_id = NULL,
+			revoked_at = statement_timestamp(), updated_at = statement_timestamp(),
+			version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID)
+	firstClaim.Accessor.Destroy()
+	var storedClaimToken string
+	if err := database.QueryRow(ctx, `SELECT claim_token_sha256 FROM credential_revocations WHERE revocation_id = $1`, revocationID).Scan(&storedClaimToken); err != nil {
+		t.Fatalf("read credential claim token digest: %v", err)
+	}
+	if len(storedClaimToken) != 64 || storedClaimToken == firstClaim.Fence.Token {
+		t.Fatalf("credential claim stored reusable token %q", storedClaimToken)
+	}
+	execSQL(t, ctx, database, `
+		UPDATE credential_revocations
+		SET claimed_at = statement_timestamp() - interval '3 minutes',
+			last_heartbeat_at = statement_timestamp() - interval '2 minutes',
+			claim_expires_at = statement_timestamp() - interval '1 minute',
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID)
+	reclaimed, err := rebuilt.ClaimRevocations(ctx, credential.ClaimRevocationsRequest{
+		WorkerID: "credential-revoker-3", Limit: 1, LeaseDuration: 30 * time.Second,
+	})
+	if err != nil || len(reclaimed) != 1 || reclaimed[0].Fence.Epoch != firstClaim.Fence.Epoch+1 ||
+		reclaimed[0].Fence.Token == firstClaim.Fence.Token {
+		t.Fatalf("real expired credential reclaim = %#v, %v", reclaimed, err)
+	}
+	reclaimed[0].Accessor.Destroy()
+	if _, err := rebuilt.Heartbeat(ctx, credential.HeartbeatRequest{
+		Fence: firstClaim.Fence, Extension: 30 * time.Second,
+	}); !errors.Is(err, credential.ErrStaleClaim) {
+		t.Fatalf("real credential Heartbeat(old fence) error = %v", err)
+	}
+	failureBody := []byte("vault upstream response body must never persist")
+	execSQL(t, ctx, database, `
+		CREATE FUNCTION reject_test_credential_failure_outbox() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.event_type = 'credential.revocation.failed.v1' THEN
+				RAISE EXCEPTION 'forced credential failure outbox rollback';
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER reject_test_credential_failure_outbox_insert
+		BEFORE INSERT ON outbox_events
+		FOR EACH ROW EXECUTE FUNCTION reject_test_credential_failure_outbox();
+	`)
+	if _, err := rebuilt.RetryRevocation(ctx, credential.RetryRevocationRequest{
+		Fence: reclaimed[0].Fence, Delay: 30 * time.Second,
+		FailureCode: credential.FailureIssuerUnavailable, FailureDetail: failureBody,
+	}); !errors.Is(err, credential.ErrRevocationPersistence) {
+		t.Fatalf("real credential RetryRevocation(forced outbox rollback) error = %v", err)
+	}
+	var rollbackStatus string
+	var rollbackFailureCount, rollbackAuditCount int
+	if err := database.QueryRow(ctx, `
+		SELECT status, failure_count,
+			(SELECT count(*) FROM audit_records WHERE action = 'credential.revocation.failed' AND resource_id = $1)
+		FROM credential_revocations WHERE revocation_id = $1
+	`, revocationID).Scan(&rollbackStatus, &rollbackFailureCount, &rollbackAuditCount); err != nil {
+		t.Fatal(err)
+	}
+	if rollbackStatus != string(credential.StatusRevoking) || rollbackFailureCount != 0 || rollbackAuditCount != 0 {
+		t.Fatalf("first failure transaction was not atomic: status=%s failures=%d audits=%d",
+			rollbackStatus, rollbackFailureCount, rollbackAuditCount)
+	}
+	execSQL(t, ctx, database, `
+		DROP TRIGGER reject_test_credential_failure_outbox_insert ON outbox_events;
+		DROP FUNCTION reject_test_credential_failure_outbox();
+	`)
+	beforeRetry := time.Now().UTC()
+	retried, err := rebuilt.RetryRevocation(ctx, credential.RetryRevocationRequest{
+		Fence: reclaimed[0].Fence, Delay: 30 * time.Second,
+		FailureCode: credential.FailureIssuerUnavailable, FailureDetail: failureBody,
+	})
+	if err != nil || retried.Status != credential.StatusRevocationPending || retried.AvailableAt.Before(beforeRetry.Add(29*time.Second)) {
+		t.Fatalf("real credential RetryRevocation = %#v, %v", retried, err)
+	}
+	var failureAuditCount, failureOutboxCount int
+	if err := database.QueryRow(ctx, `SELECT count(*) FROM audit_records WHERE action = 'credential.revocation.failed' AND resource_id = $1`, revocationID).Scan(&failureAuditCount); err != nil {
+		t.Fatal(err)
+	}
+	var failurePayload string
+	if err := database.QueryRow(ctx, `
+		SELECT count(*), min(payload::text)
+		FROM outbox_events
+		WHERE aggregate_id = $1 AND event_type = 'credential.revocation.failed.v1'
+	`, revocationID).Scan(&failureOutboxCount, &failurePayload); err != nil {
+		t.Fatal(err)
+	}
+	if failureAuditCount != 1 || failureOutboxCount != 1 || strings.Contains(failurePayload, string(failureBody)) ||
+		strings.Contains(failurePayload, string(accessorValue)) || strings.Contains(failurePayload, reclaimed[0].Fence.Token) {
+		t.Fatalf("unsafe first-failure audit/outbox: audit=%d outbox=%d payload=%s", failureAuditCount, failureOutboxCount, failurePayload)
+	}
+	execSQL(t, ctx, database, `
+		UPDATE credential_revocations
+		SET available_at = statement_timestamp() - interval '1 second',
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID)
+	manualClaims, err := rebuilt.ClaimRevocations(ctx, credential.ClaimRevocationsRequest{
+		WorkerID: "credential-revoker-4", Limit: 1, LeaseDuration: 30 * time.Second,
+	})
+	if err != nil || len(manualClaims) != 1 {
+		t.Fatalf("real credential manual claim = %#v, %v", manualClaims, err)
+	}
+	manualClaims[0].Accessor.Destroy()
+	manual, err := rebuilt.RequireManual(ctx, credential.RequireManualRequest{
+		Fence: manualClaims[0].Fence, FailureCode: credential.FailurePermissionDenied, FailureDetail: []byte("permanent redacted failure"),
+	})
+	if err != nil || manual.Status != credential.StatusManualRequired {
+		t.Fatalf("real credential RequireManual = %#v, %v", manual, err)
+	}
+	if _, err := rebuilt.RequeueManual(ctx, credential.RequeueManualRequest{
+		RevocationID: revocationID, ActorSubject: "oidc:platform-admin-requeue",
+	}); err != nil {
+		t.Fatalf("real credential RequeueManual: %v", err)
+	}
+	execSQL(t, ctx, database, `
+		UPDATE credential_revocations
+		SET available_at = statement_timestamp() - interval '1 second',
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID)
+	confirmationClaims, err := rebuilt.ClaimRevocations(ctx, credential.ClaimRevocationsRequest{
+		WorkerID: "credential-revoker-5", Limit: 1, LeaseDuration: 30 * time.Second,
+	})
+	if err != nil || len(confirmationClaims) != 1 {
+		t.Fatalf("real credential confirmation claim = %#v, %v", confirmationClaims, err)
+	}
+	confirmationClaims[0].Accessor.Destroy()
+	if _, err := rebuilt.RequireManual(ctx, credential.RequireManualRequest{
+		Fence: confirmationClaims[0].Fence, FailureCode: credential.FailurePermissionDenied, FailureDetail: []byte("external evidence required"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	evidenceHash := strings.Repeat("a", 64)
+	firstConfirmation, err := rebuilt.SubmitExternalConfirmation(ctx, credential.ExternalConfirmationRequest{
+		RevocationID: revocationID, Subject: "oidc:operator-1", EvidenceHash: evidenceHash,
+	})
+	if err != nil || firstConfirmation.Revocation.Status != credential.StatusManualRequired || len(firstConfirmation.Confirmations) != 1 {
+		t.Fatalf("real first external confirmation = %#v, %v", firstConfirmation, err)
+	}
+	expectSQLState(t, ctx, database, "23514", `
+		INSERT INTO credential_revocation_confirmations (
+			revocation_id, subject, evidence_hash, platform_admin
+		) VALUES ($1, 'oidc:direct-admin-without-parent-transition', $2, true)
+	`, revocationID, evidenceHash)
+	secondConfirmation, err := rebuilt.SubmitExternalConfirmation(ctx, credential.ExternalConfirmationRequest{
+		RevocationID: revocationID, Subject: "oidc:platform-admin-1", EvidenceHash: evidenceHash, PlatformAdmin: true,
+	})
+	if err != nil || secondConfirmation.Revocation.Status != credential.StatusRevoked ||
+		secondConfirmation.Revocation.AccessorPresent || len(secondConfirmation.Confirmations) != 2 {
+		t.Fatalf("real second external confirmation = %#v, %v", secondConfirmation, err)
+	}
+	var finalCiphertext []byte
+	var finalKeyID *string
+	if err := database.QueryRow(ctx, `SELECT accessor_ciphertext, encryption_key_id FROM credential_revocations WHERE revocation_id = $1`, revocationID).
+		Scan(&finalCiphertext, &finalKeyID); err != nil || finalCiphertext != nil || finalKeyID != nil {
+		t.Fatalf("external confirmation retained decryptable accessor: cipher=%d key=%v err=%v", len(finalCiphertext), finalKeyID, err)
+	}
+	expectMigrationSQLState(t, ctx, database, filepath.Join(migrationDirectory, "000008_credential_revocations.down.sql"), "55000")
+
+	// Explicit destructive cleanup is test-only and occurs after proving the
+	// production down guard. It lets the shared harness continue through every
+	// reverse migration without weakening the shipped migration.
+	execSQL(t, ctx, database, `DROP TRIGGER credential_revocation_confirmations_no_mutation ON credential_revocation_confirmations`)
+	execSQL(t, ctx, database, `DROP TRIGGER credential_revocation_confirmations_no_truncate ON credential_revocation_confirmations`)
+	execSQL(t, ctx, database, `DELETE FROM credential_revocation_confirmations`)
+	execSQL(t, ctx, database, `DROP TRIGGER credential_revocations_no_delete ON credential_revocations`)
+	execSQL(t, ctx, database, `DROP TRIGGER credential_revocations_no_truncate ON credential_revocations`)
+	execSQL(t, ctx, database, `DELETE FROM credential_revocations`)
+	execSQL(t, ctx, database, `DELETE FROM outbox_events WHERE event_type LIKE 'credential.revocation.%'`)
 }
 
 func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpool.Pool, tenantID, workspaceID, environmentID, serviceID string) {
