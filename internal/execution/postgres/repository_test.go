@@ -208,6 +208,98 @@ func TestSubmitSemanticIdempotencyReturnsOriginalAcrossActionIdentity(t *testing
 	assertExpectations(t, database)
 }
 
+func TestSubmitLegacySemanticIdempotencyReturnsOriginalForValidResignedActionIdentity(t *testing.T) {
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	originalEnvelope := signedTestEnvelope(t, now)
+	originalSubmission := execution.ActionSubmission{
+		Envelope: originalEnvelope, PlanHash: originalEnvelope.PlanHash,
+		TargetKey: "k8s-deployment:sha256:" + strings.Repeat("a", 64), EnvironmentRevision: "environment-1",
+		Production: true, Pool: executionlease.PoolWrite,
+	}
+	originalJSON, _ := json.Marshal(originalEnvelope)
+	original := executionlease.Execution{
+		ExecutionID: originalEnvelope.ActionID, TargetKey: originalSubmission.TargetKey, Pool: originalSubmission.Pool,
+		Production: true, Status: executionlease.StatusQueued, CreatedAt: now, UpdatedAt: now,
+	}
+
+	retryEnvelope := originalEnvelope
+	retryEnvelope.ActionID = "action-legacy-semantic-retry"
+	retryEnvelope.TraceID = strings.Repeat("c", 32)
+	retryEnvelope = resealTestEnvelope(t, retryEnvelope)
+	retrySubmission := originalSubmission
+	retrySubmission.Envelope = retryEnvelope
+	retrySubmission.PlanHash = retryEnvelope.PlanHash
+	retryJSON, _ := json.Marshal(retryEnvelope)
+	retrySubmissionHash, err := hashSubmission(retrySubmission, retryJSON)
+	if err != nil {
+		t.Fatalf("hashSubmission(legacy retry) error = %v", err)
+	}
+
+	database, repository := newActionQueueRepository(t)
+	defer database.Close()
+	database.ExpectQuery("INSERT INTO action_queue").
+		WithArgs(
+			retryEnvelope.ActionID, string(retryJSON), retrySubmissionHash, retryEnvelope.IdempotencyKey,
+			pgxmock.AnyArg(), requestHashVersion, retryEnvelope.PlanHash,
+			retryEnvelope.WorkspaceID, retryEnvelope.Target.EnvironmentID, retrySubmission.TargetKey,
+			retrySubmission.EnvironmentRevision, retryEnvelope.ExpiresAt, retrySubmission.Pool, retrySubmission.Production,
+		).
+		WillReturnRows(actionQueueRowsEmpty())
+	database.ExpectQuery(`(?s)SELECT .*FROM action_queue.*WHERE action_id = \$1 OR \(workspace_id = \$2 AND idempotency_key = \$3\)`).
+		WithArgs(retryEnvelope.ActionID, retryEnvelope.WorkspaceID, retryEnvelope.IdempotencyKey).
+		WillReturnRows(actionQueueRowsDetailed(original, originalJSON, originalEnvelope.PlanHash, originalSubmission.EnvironmentRevision,
+			originalEnvelope.WorkspaceID, originalEnvelope.Target.EnvironmentID, strings.Repeat("b", 64), nil, nil, nil, now, nil,
+			"legacy-submission.v1"))
+
+	got, err := repository.Submit(context.Background(), retrySubmission)
+	if err != nil || got.ExecutionID != original.ExecutionID {
+		t.Fatalf("Submit(legacy semantic retry) = %#v, %v; want original %q", got, err, original.ExecutionID)
+	}
+	assertExpectations(t, database)
+}
+
+func TestSubmitLegacySemanticIdempotencyRejectsDifferentRequestSemantics(t *testing.T) {
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	envelope := signedTestEnvelope(t, now)
+	original := execution.ActionSubmission{
+		Envelope: envelope, PlanHash: envelope.PlanHash,
+		TargetKey: "k8s-deployment:sha256:" + strings.Repeat("a", 64), EnvironmentRevision: "environment-1",
+		Production: true, Pool: executionlease.PoolWrite,
+	}
+	changed := original
+	changed.EnvironmentRevision = "environment-2"
+	envelopeJSON, _ := json.Marshal(envelope)
+	changedHash, err := hashSubmission(changed, envelopeJSON)
+	if err != nil {
+		t.Fatalf("hashSubmission(changed legacy retry) error = %v", err)
+	}
+	storedExecution := executionlease.Execution{
+		ExecutionID: envelope.ActionID, TargetKey: original.TargetKey, Pool: original.Pool,
+		Production: true, Status: executionlease.StatusQueued, CreatedAt: now, UpdatedAt: now,
+	}
+
+	database, repository := newActionQueueRepository(t)
+	defer database.Close()
+	database.ExpectQuery("INSERT INTO action_queue").
+		WithArgs(
+			envelope.ActionID, string(envelopeJSON), changedHash, envelope.IdempotencyKey,
+			pgxmock.AnyArg(), requestHashVersion, envelope.PlanHash,
+			envelope.WorkspaceID, envelope.Target.EnvironmentID, changed.TargetKey,
+			changed.EnvironmentRevision, envelope.ExpiresAt, changed.Pool, changed.Production,
+		).
+		WillReturnRows(actionQueueRowsEmpty())
+	database.ExpectQuery(`(?s)SELECT .*FROM action_queue.*WHERE action_id = \$1 OR \(workspace_id = \$2 AND idempotency_key = \$3\)`).
+		WithArgs(envelope.ActionID, envelope.WorkspaceID, envelope.IdempotencyKey).
+		WillReturnRows(actionQueueRowsDetailed(storedExecution, envelopeJSON, envelope.PlanHash, original.EnvironmentRevision,
+			envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64), nil, nil, nil, now, nil,
+			"legacy-submission.v1"))
+
+	if _, err := repository.Submit(context.Background(), changed); !errors.Is(err, execution.ErrJobConflict) {
+		t.Fatalf("Submit(different legacy semantics) error = %v, want %v", err, execution.ErrJobConflict)
+	}
+	assertExpectations(t, database)
+}
+
 func TestSubmitSameActionIDAllowsValidResignWithSameSemantics(t *testing.T) {
 	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
 	originalEnvelope := signedTestEnvelope(t, now)
@@ -257,7 +349,7 @@ func TestClaimSweepsAndScopesBeforeAtomicallyLeasingWithSkipLocked(t *testing.T)
 	database, repository := newActionQueueRepository(t)
 	defer database.Close()
 	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
-	envelope := signedTestEnvelope(t, now)
+	envelope := signedTestEnvelopeWithExpiry(t, now, now.Add(2*time.Minute))
 	envelopeJSON, err := json.Marshal(envelope)
 	if err != nil {
 		t.Fatalf("json.Marshal() error = %v", err)
@@ -269,7 +361,7 @@ func TestClaimSweepsAndScopesBeforeAtomicallyLeasingWithSkipLocked(t *testing.T)
 		RunnerTenantID: "10000000-0000-4000-8000-000000000001", RunnerWorkspaceID: envelope.WorkspaceID,
 		RunnerEnvironmentID: envelope.Target.EnvironmentID, ScopeRevision: 1,
 		LeaseToken: testLeaseToken, LeaseEpoch: 1, LeaseAcquiredAt: now,
-		LastHeartbeatAt: now, LeaseExpiresAt: now.Add(time.Minute), CreatedAt: now.Add(-time.Minute), UpdatedAt: now,
+		LastHeartbeatAt: now, LeaseExpiresAt: envelope.ExpiresAt, CreatedAt: now.Add(-time.Minute), UpdatedAt: now,
 	}
 	wantTokenHash := tokenHash(testLeaseToken)
 	database.ExpectBegin()
@@ -281,8 +373,8 @@ func TestClaimSweepsAndScopesBeforeAtomicallyLeasingWithSkipLocked(t *testing.T)
 		WithArgs(executionlease.PoolWrite, "runner-1", int64(1), wantExecution.RunnerTenantID).
 		WillReturnRows(pgxmock.NewRows([]string{"action_id", "lease_epoch", "scope_revision", "tenant_id", "workspace_id", "environment_id"}).
 			AddRow(envelope.ActionID, int64(0), int64(1), wantExecution.RunnerTenantID, envelope.WorkspaceID, envelope.Target.EnvironmentID))
-	database.ExpectQuery(`(?s)UPDATE action_queue AS queued.*runner_tenant_id = \$6.*runner_workspace_id = \$7.*runner_environment_id = \$8.*lease_token_sha256 = \$3.*lease_epoch = queued\.lease_epoch \+ 1.*WHERE queued\.action_id = \$1 AND queued\.status = 'QUEUED'.*RETURNING`).
-		WithArgs(envelope.ActionID, "runner-1", wantTokenHash, float64(60), int64(1),
+	database.ExpectQuery(`(?s)UPDATE action_queue AS queued.*lease_expires_at = LEAST\(\s*statement_timestamp\(\) \+ make_interval\(secs => \$4::double precision\),\s*queued\.authorization_expires_at\s*\).*RETURNING`).
+		WithArgs(envelope.ActionID, "runner-1", wantTokenHash, float64(300), int64(1),
 			wantExecution.RunnerTenantID, envelope.WorkspaceID, envelope.Target.EnvironmentID).
 		WillReturnRows(actionQueueRowsDetailed(wantExecution, envelopeJSON, envelope.PlanHash, "environment-1",
 			envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64), wantTokenHash, nil, nil, now, nil))
@@ -290,13 +382,35 @@ func TestClaimSweepsAndScopesBeforeAtomicallyLeasingWithSkipLocked(t *testing.T)
 
 	got, err := repository.Claim(context.Background(), execution.ActionClaimRequest{
 		Scope:         testRunnerScope(t, "runner-1", "workspace-1", "PROD"),
-		LeaseDuration: time.Minute,
+		LeaseDuration: 5 * time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("Claim() error = %v", err)
 	}
 	if got.Execution != wantExecution || got.Envelope.PlanHash != envelope.PlanHash || got.EnvironmentRevision != "environment-1" || !got.Production {
 		t.Fatalf("Claim() = %#v, want execution %#v", got, wantExecution)
+	}
+	assertExpectations(t, database)
+}
+
+func TestClaimSkipsExpiredAuthorizationUsingDatabaseClock(t *testing.T) {
+	database, repository := newActionQueueRepository(t)
+	defer database.Close()
+	database.ExpectBegin()
+	database.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	database.ExpectExec("UPDATE action_queue AS expired_running").WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	database.ExpectExec("UPDATE action_queue AS expired_finalizing").WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	database.ExpectExec("UPDATE action_queue AS expired_lease").WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	database.ExpectQuery(`(?s)SELECT candidate\.action_id.*WHERE candidate\.runner_pool = \$1.*candidate\.status = 'QUEUED'.*candidate\.authorization_expires_at > statement_timestamp\(\).*FOR UPDATE OF candidate SKIP LOCKED`).
+		WithArgs(executionlease.PoolWrite, "runner-1", int64(1), testTenantID).
+		WillReturnRows(pgxmock.NewRows([]string{"action_id", "lease_epoch", "scope_revision", "tenant_id", "workspace_id", "environment_id"}))
+	database.ExpectCommit()
+
+	_, err := repository.Claim(context.Background(), execution.ActionClaimRequest{
+		Scope: testRunnerScope(t, "runner-1", "workspace-1", "PROD"), LeaseDuration: time.Minute,
+	})
+	if !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
+		t.Fatalf("Claim(expired authorization) error = %v, want %v", err, executionlease.ErrNoLeaseAvailable)
 	}
 	assertExpectations(t, database)
 }
@@ -923,7 +1037,7 @@ func actionQueueRows(value executionlease.Execution, envelopeJSON []byte, planHa
 	return actionQueueRowsDetailed(value, envelopeJSON, planHash, environmentRevision, workspaceID, environmentID, submissionHash, nil, nil, nil, value.CreatedAt, nil)
 }
 
-func actionQueueRowsDetailed(value executionlease.Execution, envelopeJSON []byte, planHash, environmentRevision, workspaceID, environmentID, submissionHash string, leaseTokenHash, completedLeaseTokenHash, completedLeaseEpoch, notBefore, lastNackHash any) *pgxmock.Rows {
+func actionQueueRowsDetailed(value executionlease.Execution, envelopeJSON []byte, planHash, environmentRevision, workspaceID, environmentID, submissionHash string, leaseTokenHash, completedLeaseTokenHash, completedLeaseEpoch, notBefore, lastNackHash any, storedRequestHashVersions ...string) *pgxmock.Rows {
 	var envelope action.Envelope
 	if err := json.Unmarshal(envelopeJSON, &envelope); err != nil {
 		panic(err)
@@ -945,6 +1059,16 @@ func actionQueueRowsDetailed(value executionlease.Execution, envelopeJSON []byte
 	if err != nil {
 		panic(err)
 	}
+	storedRequestHashVersion := requestHashVersion
+	if len(storedRequestHashVersions) > 0 {
+		if len(storedRequestHashVersions) != 1 {
+			panic("actionQueueRowsDetailed accepts at most one stored request hash version")
+		}
+		storedRequestHashVersion = storedRequestHashVersions[0]
+		if storedRequestHashVersion == "legacy-submission.v1" {
+			requestHash = submissionHash
+		}
+	}
 	return actionQueueRowsEmpty().AddRow(
 		value.ExecutionID, value.TargetKey, value.Pool, value.Production, value.Status,
 		nullString(value.RunnerID), nullString(value.RunnerTenantID), nullString(value.RunnerWorkspaceID), nullString(value.RunnerEnvironmentID),
@@ -953,7 +1077,7 @@ func actionQueueRowsDetailed(value executionlease.Execution, envelopeJSON []byte
 		nullString(value.ReconciliationID), nullString(value.ReconciliationActor), nullString(value.ReconciliationResultHash), nullTime(value.ReconciledAt),
 		envelopeJSON, planHash, environmentRevision, envelope.ExpiresAt, workspaceID, environmentID,
 		submissionHash, leaseTokenHash, completedLeaseTokenHash, completedLeaseEpoch, notBefore, lastNackHash,
-		envelope.IdempotencyKey, requestHash, requestHashVersion, nullInt64(value.ScopeRevision), value.HeartbeatSeq,
+		envelope.IdempotencyKey, requestHash, storedRequestHashVersion, nullInt64(value.ScopeRevision), value.HeartbeatSeq,
 		nullTime(value.CancelRequestedAt), nullString(value.CancelReasonHash), nullString(string(value.CompletionStatus)),
 	)
 }
@@ -981,15 +1105,11 @@ func nullInt64(value int64) any {
 }
 
 func signedTestEnvelope(t *testing.T, now time.Time) action.Envelope {
+	return signedTestEnvelopeWithExpiry(t, now, now.Add(30*time.Minute))
+}
+
+func signedTestEnvelopeWithExpiry(t *testing.T, now, expiresAt time.Time) action.Envelope {
 	t.Helper()
-	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("ed25519.GenerateKey() error = %v", err)
-	}
-	signer, err := action.NewEd25519Signer("queue-test-key", privateKey)
-	if err != nil {
-		t.Fatalf("action.NewEd25519Signer() error = %v", err)
-	}
 	envelope := action.Envelope{
 		SchemaVersion: action.SchemaVersionV1, ActionID: "action-1", WorkspaceID: "workspace-1",
 		IncidentID: "incident-1", RequestedBy: "requester-1", ActionType: action.ActionKubernetesRolloutRestart,
@@ -1000,13 +1120,31 @@ func signedTestEnvelope(t *testing.T, now time.Time) action.Envelope {
 		ObservedState: action.ObservedState{KubernetesDeployment: &action.KubernetesDeploymentObservedState{
 			Generation: 3, Replicas: 2, AvailableReplicas: 2, UpdatedReplicas: 2,
 		}},
-		Preconditions:   action.Preconditions{MappingResult: "EXACT", ExpectedResourceVersion: "7", RequireWhitelist: true},
-		Verification:    action.VerificationPlan{Mode: "KUBERNETES_ROLLOUT", TimeoutSeconds: 300},
-		Compensation:    action.CompensationPlan{Mode: "MANUAL_ONLY", Summary: "runbook"},
-		Risk:            action.RiskAssessment{Level: "MEDIUM", ReasonCodes: []string{"PRODUCTION_CHANGE", "RESTART"}},
-		PolicyVersion:   "policy.v1",
-		CredentialScope: action.CredentialScope{ConnectorID: "kubernetes-prod", Permission: "PATCH_DEPLOYMENT_RESTART", Resource: "cluster-1/payments/deployment/api", TTLSeconds: 600},
-		IdempotencyKey:  "idem-action-1", NotBefore: now, ExpiresAt: now.Add(30 * time.Minute), TraceID: strings.Repeat("a", 32),
+		Preconditions: action.Preconditions{MappingResult: "EXACT", ExpectedResourceVersion: "7", RequireWhitelist: true},
+		Verification: action.VerificationPlan{
+			Mode: "KUBERNETES_ROLLOUT", TimeoutSeconds: int32(min(int(expiresAt.Sub(now).Seconds()), 300)),
+		},
+		Compensation:  action.CompensationPlan{Mode: "MANUAL_ONLY", Summary: "runbook"},
+		Risk:          action.RiskAssessment{Level: "MEDIUM", ReasonCodes: []string{"PRODUCTION_CHANGE", "RESTART"}},
+		PolicyVersion: "policy.v1",
+		CredentialScope: action.CredentialScope{
+			ConnectorID: "kubernetes-prod", Permission: "PATCH_DEPLOYMENT_RESTART", Resource: "cluster-1/payments/deployment/api",
+			TTLSeconds: int32(min(int(expiresAt.Sub(now).Seconds()), 600)),
+		},
+		IdempotencyKey: "idem-action-1", NotBefore: now, ExpiresAt: expiresAt, TraceID: strings.Repeat("a", 32),
+	}
+	return resealTestEnvelope(t, envelope)
+}
+
+func resealTestEnvelope(t *testing.T, envelope action.Envelope) action.Envelope {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("ed25519.GenerateKey() error = %v", err)
+	}
+	signer, err := action.NewEd25519Signer("queue-test-key", privateKey)
+	if err != nil {
+		t.Fatalf("action.NewEd25519Signer() error = %v", err)
 	}
 	sealed, err := action.Seal(context.Background(), envelope, envelope.RequestedBy, signer)
 	if err != nil {

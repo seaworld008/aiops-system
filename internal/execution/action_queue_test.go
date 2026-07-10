@@ -497,6 +497,59 @@ func TestMemoryActionQueueHeartbeatTerminatesWithoutExtensionAtAuthorizationExpi
 	}
 }
 
+func TestMemoryActionQueueClaimSkipsExpiredQueuedCandidateWithoutReleasingItsIdentity(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	clock := now
+	expiredUnsigned := restartEnvelope(now)
+	expiredUnsigned.ExpiresAt = now.Add(2 * time.Minute)
+	expiredUnsigned.CredentialScope.TTLSeconds = 60
+	expired, _ := signedEnvelope(t, expiredUnsigned)
+	validUnsigned := restartEnvelope(now)
+	validUnsigned.ActionID = "action-valid-after-expired"
+	validUnsigned.IdempotencyKey = "idem-valid-after-expired"
+	valid, _ := signedEnvelope(t, validUnsigned)
+	queue := mustMemoryActionQueue(t, func() time.Time { return clock })
+	expiredExecution := submitAction(t, queue, expired, "environment-1", false)
+	submitAction(t, queue, valid, "environment-1", false)
+	clock = expired.ExpiresAt
+
+	claimed := claimAction(t, queue, "runner-skip-expired", []string{"workspace-1"}, []string{"PROD"})
+	if claimed.Execution.ExecutionID != valid.ActionID {
+		t.Fatalf("Claim() execution = %q, want valid candidate %q", claimed.Execution.ExecutionID, valid.ActionID)
+	}
+	storedExpired, err := queue.Get(context.Background(), expired.ActionID)
+	if err != nil || storedExpired.Status != executionlease.StatusQueued {
+		t.Fatalf("Get(expired queued) = %#v, %v; want retained QUEUED record", storedExpired, err)
+	}
+	retried := submitAction(t, queue, expired, "environment-1", false)
+	if retried.ExecutionID != expiredExecution.ExecutionID || retried.Status != executionlease.StatusQueued {
+		t.Fatalf("Submit(expired retry) = %#v, want original %#v", retried, expiredExecution)
+	}
+}
+
+func TestMemoryActionQueueClaimCapsInitialLeaseAtAuthorizationExpiry(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	clock := now
+	envelope, _ := signedEnvelope(t, restartEnvelope(now))
+	queue := mustMemoryActionQueue(t, func() time.Time { return clock })
+	submitAction(t, queue, envelope, "environment-1", false)
+	clock = envelope.ExpiresAt.Add(-time.Minute)
+	claimed, err := queue.Claim(context.Background(), ActionClaimRequest{
+		Scope:         testRunnerScope(t, "runner-short-authorization", RunnerScopeBinding{WorkspaceID: "workspace-1", EnvironmentID: "PROD"}),
+		LeaseDuration: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Claim() error = %v", err)
+	}
+	if !claimed.Execution.LeaseExpiresAt.Equal(envelope.ExpiresAt) {
+		t.Fatalf("Claim() lease expiry = %s, want authorization cap %s", claimed.Execution.LeaseExpiresAt, envelope.ExpiresAt)
+	}
+}
+
 func TestMemoryActionQueueHeartbeatCapsExtensionAtAuthorizationExpiry(t *testing.T) {
 	t.Parallel()
 
@@ -588,8 +641,8 @@ func TestMemoryActionQueueStartFailsClosedAtAuthorizationExpiry(t *testing.T) {
 		t.Fatalf("Start(at authorization expiry) error = %v, want %v", err, executionlease.ErrStaleLease)
 	}
 	persisted, err := queue.Get(context.Background(), envelope.ActionID)
-	if err != nil || persisted.Status != executionlease.StatusLeased {
-		t.Fatalf("Get(after denied Start) = %#v, %v", persisted, err)
+	if err != nil || persisted.Status != executionlease.StatusQueued || persisted.ExecutionID != envelope.ActionID {
+		t.Fatalf("Get(after denied Start) = %#v, %v; want retained QUEUED record", persisted, err)
 	}
 }
 

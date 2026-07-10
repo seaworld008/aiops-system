@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -53,9 +54,11 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	migrationDirectory := migrationPath(t)
 	applyMigrationsBefore(t, ctx, database, migrationDirectory, ".up.sql", "000007_runner_execution_hardening.up.sql")
 	seedLegacyExecutionLeaseTokens(t, ctx, database)
+	legacyAction := seedLegacyActionQueue(t, ctx, database)
 	applyMigrationFile(t, ctx, database, filepath.Join(migrationDirectory, "000007_runner_execution_hardening.up.sql"))
 	verifyLegacyExecutionLeaseTokenHashes(t, ctx, database)
 	execSQL(t, ctx, database, `DELETE FROM execution_leases`)
+	exerciseRealLegacySemanticRetry(t, ctx, database, legacyAction)
 
 	const (
 		tenant1        = "10000000-0000-4000-8000-000000000001"
@@ -235,7 +238,7 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	if err != nil {
 		t.Fatalf("create real PostgreSQL ActionQueue: %v", err)
 	}
-	for _, runnerID := range []string{"runner-postgres-1", "runner-postgres-2", "runner-postgres-3", "runner-postgres-4", "runner-postgres-race"} {
+	for _, runnerID := range []string{"runner-postgres-1", "runner-postgres-2", "runner-postgres-3", "runner-postgres-4", "runner-postgres-race", "runner-postgres-authorization"} {
 		execSQL(t, ctx, database, `
 			INSERT INTO runner_registrations (runner_id, tenant_id, spiffe_uri, runner_pool, enabled, scope_revision)
 			VALUES ($1, $2, 'spiffe://integration.test/runner/write/' || $1, 'WRITE', true, 1)
@@ -245,6 +248,7 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 			VALUES ($1, $2, $3, $4)
 		`, runnerID, tenantID, workspaceID, environmentID)
 	}
+	exerciseRealClaimAuthorization(t, ctx, database, queue, signer, workspaceID, environmentID, serviceID)
 	exerciseRealRegistrationRaces(t, ctx, database, queue, signer, tenantID, workspaceID, environmentID, serviceID)
 	expectSQLState(t, ctx, database, "55000", `TRUNCATE runner_scope_bindings`)
 	execSQL(t, ctx, database, `
@@ -547,6 +551,52 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 			runner_workspace_id = $3, runner_environment_id = $4
 		WHERE action_id = $1
 	`, shapeSubmission.Envelope.ActionID, tenantID, workspaceID, environmentID)
+}
+
+func exerciseRealClaimAuthorization(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	queue execution.ActionQueue,
+	signer action.Signer,
+	workspaceID, environmentID, serviceID string,
+) {
+	t.Helper()
+	databaseNow := time.Now().UTC()
+	expired := realActionSubmission(t, signer, databaseNow.Add(-31*time.Minute),
+		"90000000-0000-4000-8000-000000000094", workspaceID, environmentID, serviceID, "payments-expired-authorization", '4')
+	expired.Production = false
+	shortWindow := realActionSubmission(t, signer, databaseNow.Add(-28*time.Minute),
+		"90000000-0000-4000-8000-000000000093", workspaceID, environmentID, serviceID, "payments-short-authorization", '3')
+	shortWindow.Production = false
+	for _, submission := range []execution.ActionSubmission{expired, shortWindow} {
+		if _, err := queue.Submit(ctx, submission); err != nil {
+			t.Fatalf("submit authorization-boundary action %s: %v", submission.Envelope.ActionID, err)
+		}
+	}
+	claimed, err := queue.Claim(ctx, execution.ActionClaimRequest{
+		Scope: realRunnerScope(t, ctx, database, "runner-postgres-authorization"), LeaseDuration: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Claim(short authorization window): %v", err)
+	}
+	if claimed.Execution.ExecutionID != shortWindow.Envelope.ActionID {
+		t.Fatalf("Claim(short authorization window) action = %q, want %q", claimed.Execution.ExecutionID, shortWindow.Envelope.ActionID)
+	}
+	if delta := claimed.Execution.LeaseExpiresAt.Sub(shortWindow.Envelope.ExpiresAt); delta > time.Microsecond || delta < -time.Microsecond {
+		t.Fatalf("Claim(short authorization window) lease expiry = %s, want cap %s", claimed.Execution.LeaseExpiresAt, shortWindow.Envelope.ExpiresAt)
+	}
+	storedExpired, err := queue.Get(ctx, expired.Envelope.ActionID)
+	if err != nil || storedExpired.Status != executionlease.StatusQueued {
+		t.Fatalf("Get(expired queued action) = %#v, %v", storedExpired, err)
+	}
+	retriedExpired, err := queue.Submit(ctx, expired)
+	if err != nil || retriedExpired.ExecutionID != expired.Envelope.ActionID || retriedExpired.Status != executionlease.StatusQueued {
+		t.Fatalf("Submit(expired queued retry) = %#v, %v", retriedExpired, err)
+	}
+	if _, err := queue.Cancel(ctx, shortWindow.Envelope.ActionID); err != nil {
+		t.Fatalf("Cancel(short authorization window action): %v", err)
+	}
 }
 
 type realExecutionCallResult struct {
@@ -882,6 +932,100 @@ func migrationPath(t *testing.T) string {
 		t.Fatal("cannot resolve migration test path")
 	}
 	return filepath.Clean(filepath.Join(filepath.Dir(filename), "../../../migrations"))
+}
+
+type legacyActionQueueFixture struct {
+	signer   action.Signer
+	original execution.ActionSubmission
+}
+
+func seedLegacyActionQueue(t *testing.T, ctx context.Context, database *pgxpool.Pool) legacyActionQueueFixture {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate legacy action signing key: %v", err)
+	}
+	signer, err := action.NewEd25519Signer("legacy-action-key", privateKey)
+	if err != nil {
+		t.Fatalf("create legacy action signer: %v", err)
+	}
+	original := realActionSubmission(t, signer, time.Now().UTC(), "legacy-action-1", "legacy-workspace-1", "PROD",
+		"legacy-service-1", "legacy-api", '7')
+	original.Production = false
+	envelopeJSON, err := json.Marshal(original.Envelope)
+	if err != nil {
+		t.Fatalf("marshal legacy action envelope: %v", err)
+	}
+	submissionHash := legacyActionSubmissionHash(t, original, envelopeJSON)
+	execSQL(t, ctx, database, `
+		INSERT INTO action_queue (
+			action_id, envelope, submission_hash, plan_hash, workspace_id, environment_id,
+			target_key, environment_revision, runner_pool, production, status, not_before, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'QUEUED', $11, statement_timestamp(), statement_timestamp())
+	`, original.Envelope.ActionID, string(envelopeJSON), submissionHash, original.PlanHash,
+		original.Envelope.WorkspaceID, original.Envelope.Target.EnvironmentID, original.TargetKey,
+		original.EnvironmentRevision, original.Pool, original.Production, original.Envelope.NotBefore)
+	return legacyActionQueueFixture{signer: signer, original: original}
+}
+
+func legacyActionSubmissionHash(t *testing.T, submission execution.ActionSubmission, envelopeJSON []byte) string {
+	t.Helper()
+	encoded, err := json.Marshal(struct {
+		SchemaVersion       string              `json:"schema_version"`
+		Envelope            json.RawMessage     `json:"envelope"`
+		PlanHash            string              `json:"plan_hash"`
+		TargetKey           string              `json:"target_key"`
+		EnvironmentRevision string              `json:"environment_revision"`
+		Production          bool                `json:"production"`
+		Pool                executionlease.Pool `json:"pool"`
+	}{
+		SchemaVersion: "action-queue-submission.v1", Envelope: envelopeJSON,
+		PlanHash: submission.PlanHash, TargetKey: submission.TargetKey,
+		EnvironmentRevision: submission.EnvironmentRevision, Production: submission.Production, Pool: submission.Pool,
+	})
+	if err != nil {
+		t.Fatalf("marshal legacy action submission hash input: %v", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
+func exerciseRealLegacySemanticRetry(t *testing.T, ctx context.Context, database *pgxpool.Pool, fixture legacyActionQueueFixture) {
+	t.Helper()
+	var requestHashVersion string
+	if err := database.QueryRow(ctx, `SELECT request_hash_version FROM action_queue WHERE action_id = $1`,
+		fixture.original.Envelope.ActionID).Scan(&requestHashVersion); err != nil {
+		t.Fatalf("read migrated legacy action request hash version: %v", err)
+	}
+	if requestHashVersion != "legacy-submission.v1" {
+		t.Fatalf("migrated legacy action request hash version = %q", requestHashVersion)
+	}
+	retryEnvelope := fixture.original.Envelope
+	retryEnvelope.ActionID = "legacy-action-2"
+	retryEnvelope.TraceID = strings.Repeat("e", 32)
+	retryEnvelope, err := action.Seal(ctx, retryEnvelope, retryEnvelope.RequestedBy, fixture.signer)
+	if err != nil {
+		t.Fatalf("seal valid legacy semantic retry: %v", err)
+	}
+	if retryEnvelope.Signature.Value == fixture.original.Envelope.Signature.Value {
+		t.Fatal("legacy semantic retry did not produce a second signature")
+	}
+	retry := fixture.original
+	retry.Envelope = retryEnvelope
+	retry.PlanHash = retryEnvelope.PlanHash
+	queue, err := executionpostgres.New(database, executionpostgres.Options{})
+	if err != nil {
+		t.Fatalf("create action queue for legacy semantic retry: %v", err)
+	}
+	got, err := queue.Submit(ctx, retry)
+	if err != nil || got.ExecutionID != fixture.original.Envelope.ActionID {
+		t.Fatalf("Submit(real migrated legacy semantic retry) = %#v, %v", got, err)
+	}
+	var identityCount int
+	if err := database.QueryRow(ctx, `SELECT count(*) FROM action_queue WHERE action_id IN ($1, $2)`,
+		fixture.original.Envelope.ActionID, retryEnvelope.ActionID).Scan(&identityCount); err != nil || identityCount != 1 {
+		t.Fatalf("legacy semantic retry action identity count = %d, %v", identityCount, err)
+	}
 }
 
 func seedLegacyExecutionLeaseTokens(t *testing.T, ctx context.Context, database *pgxpool.Pool) {
