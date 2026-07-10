@@ -37,9 +37,14 @@ func ValidFailureCode(value string) bool {
 }
 
 type SecurityConflict struct {
-	IntegrationID   string
-	ProviderEventID string
-	ExistingHash    string
-	IncomingHash    string
-	DetectedAt      time.Time
+	WorkspaceID      string
+	Provider         string
+	IntegrationID    string
+	ProviderEventID  string
+	ExistingSignalID string
+	ExistingHash     string
+	IncomingHash     string
+	RequestID        string
+	TraceID          string
+	DetectedAt       time.Time
 }

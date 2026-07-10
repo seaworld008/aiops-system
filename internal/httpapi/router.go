@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/aiops-system/control-plane/internal/ids"
+	"github.com/aiops-system/control-plane/internal/requestmeta"
 	"github.com/aiops-system/control-plane/internal/signal"
 	"github.com/aiops-system/control-plane/internal/store"
 	"github.com/aiops-system/control-plane/internal/webhook"
@@ -37,6 +39,7 @@ func NewRouter(deps Dependencies) http.Handler {
 	}
 
 	router := chi.NewRouter()
+	router.Use(requestIDMiddleware)
 	router.NotFound(func(w http.ResponseWriter, _ *http.Request) {
 		writeProblem(w, http.StatusNotFound, "route_not_found", "The requested route does not exist")
 	})
@@ -59,6 +62,15 @@ func NewRouter(deps Dependencies) http.Handler {
 	router.Post("/api/v1/integrations/{integrationID}/webhooks/{provider}", webhookHandler(deps.SignalIngestor, deps.WebhookVerifier))
 
 	return router
+}
+
+func requestIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requestID := ids.NewUUID()
+		w.Header().Set("X-Request-ID", requestID)
+		ctx := requestmeta.With(request.Context(), requestmeta.Metadata{RequestID: requestID})
+		next.ServeHTTP(w, request.WithContext(ctx))
+	})
 }
 
 func webhookHandler(ingestor SignalIngestor, verifier WebhookVerifier) http.HandlerFunc {

@@ -32,14 +32,14 @@ func TestCreateSignalCommitsConflictAuditBeforeReturningDomainError(t *testing.T
 		WithArgs(integrationID).
 		WillReturnRows(pgxmock.NewRows([]string{"tenant_id", "workspace_id", "provider"}).AddRow(tenantID, workspaceID, "alertmanager"))
 	database.ExpectExec("INSERT INTO signals").
-		WithArgs(signalID, tenantID, workspaceID, integrationID, "alertmanager", "event-1", "incoming-hash", "fingerprint-1", pgxmock.AnyArg()).
+		WithArgs(signalID, tenantID, workspaceID, integrationID, "alertmanager", "event-1", "incoming-hash", "fingerprint-1", "firing", pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("INSERT", 0))
 	database.ExpectQuery("SELECT id::text, tenant_id::text, workspace_id::text, provider, payload_hash").
 		WithArgs(integrationID, "event-1").
 		WillReturnRows(pgxmock.NewRows([]string{"id", "tenant_id", "workspace_id", "provider", "payload_hash"}).
 			AddRow(signalID, tenantID, workspaceID, "alertmanager", "existing-hash"))
 	database.ExpectExec("INSERT INTO audit_records").
-		WithArgs(pgxmock.AnyArg(), tenantID, workspaceID, integrationID, signalID, pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), tenantID, workspaceID, integrationID, signalID, pgxmock.AnyArg(), nil, pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	database.ExpectCommit()
 
@@ -47,7 +47,7 @@ func TestCreateSignalCommitsConflictAuditBeforeReturningDomainError(t *testing.T
 	created, err := repository.CreateSignal(context.Background(), domain.Signal{
 		ID: signalID, WorkspaceID: workspaceID, IntegrationID: integrationID,
 		Provider: "alertmanager", ProviderEventID: "event-1", PayloadHash: "incoming-hash",
-		Fingerprint: "fingerprint-1", ObservedAt: time.Now().UTC(),
+		Fingerprint: "fingerprint-1", Status: "firing", ObservedAt: time.Now().UTC(),
 	})
 	if created || !errors.Is(err, store.ErrIdempotencyConflict) {
 		t.Fatalf("CreateSignal() = (%v, %v), want conflict", created, err)
@@ -68,7 +68,7 @@ func TestCreateSignalReturnsDuplicateWithoutAuditForSamePayload(t *testing.T) {
 		WithArgs(integrationID).
 		WillReturnRows(pgxmock.NewRows([]string{"tenant_id", "workspace_id", "provider"}).AddRow(tenantID, workspaceID, "alertmanager"))
 	database.ExpectExec("INSERT INTO signals").
-		WithArgs(signalID, tenantID, workspaceID, integrationID, "alertmanager", "event-1", "same-hash", "fingerprint-1", pgxmock.AnyArg()).
+		WithArgs(signalID, tenantID, workspaceID, integrationID, "alertmanager", "event-1", "same-hash", "fingerprint-1", "firing", pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("INSERT", 0))
 	database.ExpectQuery("SELECT id::text, tenant_id::text, workspace_id::text, provider, payload_hash").
 		WithArgs(integrationID, "event-1").
@@ -79,10 +79,72 @@ func TestCreateSignalReturnsDuplicateWithoutAuditForSamePayload(t *testing.T) {
 	created, err := postgresstore.New(database).CreateSignal(context.Background(), domain.Signal{
 		ID: signalID, WorkspaceID: workspaceID, IntegrationID: integrationID,
 		Provider: "alertmanager", ProviderEventID: "event-1", PayloadHash: "same-hash",
-		Fingerprint: "fingerprint-1", ObservedAt: time.Now().UTC(),
+		Fingerprint: "fingerprint-1", Status: "firing", ObservedAt: time.Now().UTC(),
 	})
 	if err != nil || created {
 		t.Fatalf("CreateSignal() = (%v, %v), want duplicate", created, err)
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("database expectations: %v", err)
+	}
+}
+
+func TestCreateSignalAndOutboxAreCommittedAtomically(t *testing.T) {
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer database.Close()
+	database.ExpectBegin()
+	database.ExpectQuery("SELECT tenant_id::text, workspace_id::text, provider").
+		WithArgs(integrationID).
+		WillReturnRows(pgxmock.NewRows([]string{"tenant_id", "workspace_id", "provider"}).AddRow(tenantID, workspaceID, "alertmanager"))
+	database.ExpectExec("INSERT INTO signals").
+		WithArgs(signalID, tenantID, workspaceID, integrationID, "alertmanager", "event-new", "hash", "fingerprint-1", "firing", pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	database.ExpectExec("INSERT INTO outbox_events").
+		WithArgs(pgxmock.AnyArg(), tenantID, workspaceID, signalID, pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	database.ExpectCommit()
+
+	created, err := postgresstore.New(database).CreateSignal(context.Background(), domain.Signal{
+		ID: signalID, WorkspaceID: workspaceID, IntegrationID: integrationID,
+		Provider: "alertmanager", ProviderEventID: "event-new", PayloadHash: "hash",
+		Fingerprint: "fingerprint-1", Status: "firing", ObservedAt: time.Now().UTC(),
+	})
+	if err != nil || !created {
+		t.Fatalf("CreateSignal() = (%v, %v), want created", created, err)
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("database expectations: %v", err)
+	}
+}
+
+func TestCreateSignalRollsBackWhenOutboxInsertFails(t *testing.T) {
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer database.Close()
+	database.ExpectBegin()
+	database.ExpectQuery("SELECT tenant_id::text, workspace_id::text, provider").
+		WithArgs(integrationID).
+		WillReturnRows(pgxmock.NewRows([]string{"tenant_id", "workspace_id", "provider"}).AddRow(tenantID, workspaceID, "alertmanager"))
+	database.ExpectExec("INSERT INTO signals").
+		WithArgs(signalID, tenantID, workspaceID, integrationID, "alertmanager", "event-new", "hash", "fingerprint-1", "firing", pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	database.ExpectExec("INSERT INTO outbox_events").
+		WithArgs(pgxmock.AnyArg(), tenantID, workspaceID, signalID, pgxmock.AnyArg()).
+		WillReturnError(errors.New("outbox unavailable"))
+	database.ExpectRollback()
+
+	created, err := postgresstore.New(database).CreateSignal(context.Background(), domain.Signal{
+		ID: signalID, WorkspaceID: workspaceID, IntegrationID: integrationID,
+		Provider: "alertmanager", ProviderEventID: "event-new", PayloadHash: "hash",
+		Fingerprint: "fingerprint-1", Status: "firing", ObservedAt: time.Now().UTC(),
+	})
+	if err == nil || created {
+		t.Fatalf("CreateSignal() = (%v, %v), want rollback error", created, err)
 	}
 	if err := database.ExpectationsWereMet(); err != nil {
 		t.Fatalf("database expectations: %v", err)
@@ -104,7 +166,7 @@ func TestCreateSignalRejectsIntegrationWorkspaceMismatch(t *testing.T) {
 	created, err := postgresstore.New(database).CreateSignal(context.Background(), domain.Signal{
 		ID: signalID, WorkspaceID: "99999999-9999-4999-8999-999999999999", IntegrationID: integrationID,
 		Provider: "alertmanager", ProviderEventID: "event-1", PayloadHash: "hash",
-		Fingerprint: "fingerprint-1", ObservedAt: time.Now().UTC(),
+		Fingerprint: "fingerprint-1", Status: "firing", ObservedAt: time.Now().UTC(),
 	})
 	if created || !errors.Is(err, store.ErrScopeViolation) {
 		t.Fatalf("CreateSignal() = (%v, %v), want scope violation", created, err)
@@ -243,8 +305,8 @@ func TestOutboxAckIsIdempotentAfterUncertainResponse(t *testing.T) {
 	id := "66666666-6666-4666-8666-666666666666"
 	token := "77777777-7777-4777-8777-777777777777"
 	database.ExpectExec("UPDATE outbox_events").WithArgs(id, token).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
-	database.ExpectQuery("SELECT delivered_at IS NOT NULL FROM outbox_events").
-		WithArgs(id).
+	database.ExpectQuery("SELECT delivered_at IS NOT NULL AND delivered_claim_token").
+		WithArgs(id, token).
 		WillReturnRows(pgxmock.NewRows([]string{"delivered"}).AddRow(true))
 
 	if err := postgresstore.New(database).AckOutbox(context.Background(), id, token); err != nil {

@@ -10,12 +10,14 @@ import (
 
 	"github.com/aiops-system/control-plane/internal/domain"
 	"github.com/aiops-system/control-plane/internal/ids"
+	"github.com/aiops-system/control-plane/internal/requestmeta"
 	"github.com/aiops-system/control-plane/internal/store"
 )
 
 type Store struct {
 	mu                sync.RWMutex
 	signals           map[string]domain.Signal
+	integrations      map[string]domain.Integration
 	incidents         map[string]domain.Incident
 	outbox            []domain.OutboxEvent
 	securityConflicts []store.SecurityConflict
@@ -31,35 +33,79 @@ func NewWithClock(now func() time.Time) *Store {
 		now = time.Now
 	}
 	return &Store{
-		signals:   make(map[string]domain.Signal),
-		incidents: make(map[string]domain.Incident),
-		now:       now,
+		signals:      make(map[string]domain.Signal),
+		integrations: make(map[string]domain.Integration),
+		incidents:    make(map[string]domain.Incident),
+		now:          now,
 	}
 }
 
-func (repository *Store) CreateSignal(_ context.Context, signal domain.Signal) (bool, error) {
+func (repository *Store) RegisterIntegration(integration domain.Integration) error {
+	if err := integration.Validate(); err != nil {
+		return err
+	}
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	if _, exists := repository.integrations[integration.ID]; exists {
+		return fmt.Errorf("integration %s already exists", integration.ID)
+	}
+	repository.integrations[integration.ID] = integration
+	return nil
+}
+
+func (repository *Store) CreateSignal(ctx context.Context, signal domain.Signal) (bool, error) {
 	if err := signal.Validate(); err != nil {
 		return false, err
 	}
 
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
+	integration, exists := repository.integrations[signal.IntegrationID]
+	if !exists || !integration.Enabled {
+		return false, store.ErrNotFound
+	}
+	if integration.WorkspaceID != signal.WorkspaceID || integration.Provider != signal.Provider {
+		return false, store.ErrScopeViolation
+	}
 
 	key := signal.IntegrationID + "\x00" + signal.ProviderEventID
 	if existing, ok := repository.signals[key]; ok {
 		if existing.PayloadHash != signal.PayloadHash {
+			metadata := requestmeta.From(ctx)
+			if metadata.RequestID == "" {
+				metadata.RequestID = ids.NewUUID()
+			}
 			repository.securityConflicts = append(repository.securityConflicts, store.SecurityConflict{
-				IntegrationID:   signal.IntegrationID,
-				ProviderEventID: signal.ProviderEventID,
-				ExistingHash:    existing.PayloadHash,
-				IncomingHash:    signal.PayloadHash,
-				DetectedAt:      repository.now().UTC(),
+				WorkspaceID:      existing.WorkspaceID,
+				Provider:         existing.Provider,
+				IntegrationID:    signal.IntegrationID,
+				ProviderEventID:  signal.ProviderEventID,
+				ExistingSignalID: existing.ID,
+				ExistingHash:     existing.PayloadHash,
+				IncomingHash:     signal.PayloadHash,
+				RequestID:        metadata.RequestID,
+				TraceID:          metadata.TraceID,
+				DetectedAt:       repository.now().UTC(),
 			})
 			return false, store.ErrIdempotencyConflict
 		}
 		return false, nil
 	}
+	signal.Labels = cloneStringMap(signal.Labels)
 	repository.signals[key] = signal
+	now := repository.now().UTC()
+	payload, _ := json.Marshal(map[string]string{"signal_id": signal.ID})
+	repository.outbox = append(repository.outbox, domain.OutboxEvent{
+		ID:               ids.NewUUID(),
+		WorkspaceID:      signal.WorkspaceID,
+		AggregateType:    "SIGNAL",
+		AggregateID:      signal.ID,
+		AggregateVersion: 1,
+		Type:             "signal.ingested.v1",
+		Payload:          payload,
+		CreatedAt:        now,
+		AvailableAt:      now,
+	})
 	return true, nil
 }
 
@@ -144,12 +190,17 @@ func (repository *Store) AckOutbox(_ context.Context, id, claimToken string) err
 			continue
 		}
 		if !event.DeliveredAt.IsZero() {
-			return nil
-		}
-		if event.ClaimToken == "" || event.ClaimToken != claimToken {
+			if event.DeliveredClaimToken == claimToken {
+				return nil
+			}
 			return store.ErrStaleClaim
 		}
-		event.DeliveredAt = repository.now().UTC()
+		now := repository.now().UTC()
+		if event.ClaimToken == "" || event.ClaimToken != claimToken || !event.ClaimExpiresAt.After(now) {
+			return store.ErrStaleClaim
+		}
+		event.DeliveredAt = now
+		event.DeliveredClaimToken = claimToken
 		event.ClaimedAt = time.Time{}
 		event.ClaimedBy = ""
 		event.ClaimToken = ""
@@ -173,7 +224,8 @@ func (repository *Store) RetryOutbox(_ context.Context, id, claimToken string, a
 		if event.ID != id {
 			continue
 		}
-		if event.ClaimToken == "" || event.ClaimToken != claimToken || !event.DeliveredAt.IsZero() {
+		if event.ClaimToken == "" || event.ClaimToken != claimToken || !event.DeliveredAt.IsZero() ||
+			!event.ClaimExpiresAt.After(repository.now().UTC()) {
 			return store.ErrStaleClaim
 		}
 		event.AvailableAt = availableAt.UTC()
@@ -190,4 +242,15 @@ func (repository *Store) RetryOutbox(_ context.Context, id, claimToken string, a
 func cloneOutboxEvent(event domain.OutboxEvent) domain.OutboxEvent {
 	event.Payload = bytes.Clone(event.Payload)
 	return event
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	if source == nil {
+		return nil
+	}
+	clone := make(map[string]string, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
 }

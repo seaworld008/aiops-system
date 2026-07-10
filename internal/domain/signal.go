@@ -13,6 +13,8 @@ type Signal struct {
 	ProviderEventID string
 	PayloadHash     string
 	Fingerprint     string
+	Status          string
+	Labels          map[string]string
 	ObservedAt      time.Time
 }
 
@@ -24,6 +26,8 @@ func (signal Signal) Validate() error {
 		"provider":          signal.Provider,
 		"provider_event_id": signal.ProviderEventID,
 		"payload_hash":      signal.PayloadHash,
+		"fingerprint":       signal.Fingerprint,
+		"status":            signal.Status,
 	}
 	for name, value := range fields {
 		if value == "" {
@@ -32,6 +36,12 @@ func (signal Signal) Validate() error {
 	}
 	if signal.ObservedAt.IsZero() {
 		return fmt.Errorf("observed_at is required")
+	}
+	if len(signal.Provider) > 64 || len(signal.ProviderEventID) > 512 || len(signal.Fingerprint) > 512 || len(signal.PayloadHash) > 128 {
+		return fmt.Errorf("signal indexed fields exceed byte limits")
+	}
+	if signal.Status != "firing" && signal.Status != "resolved" {
+		return fmt.Errorf("signal status must be firing or resolved")
 	}
 	return nil
 }

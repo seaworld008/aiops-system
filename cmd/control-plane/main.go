@@ -56,11 +56,14 @@ func main() {
 		}
 	}
 	signalIngestor := signalservice.NewService(repository, time.Now)
-	webhookVerifier := webhook.NewHMACVerifier(func(_, _ string) ([]byte, error) {
-		if cfg.WebhookHMACSecret == "" {
-			return nil, webhook.ErrSecretUnavailable
+	webhookVerifier := webhook.NewHMACVerifier(func(integrationID, provider string) ([]byte, error) {
+		if secret := cfg.WebhookHMACSecrets[integrationID+"/"+provider]; secret != "" {
+			return []byte(secret), nil
 		}
-		return []byte(cfg.WebhookHMACSecret), nil
+		if cfg.Environment != "production" && cfg.WebhookHMACSecret != "" {
+			return []byte(cfg.WebhookHMACSecret), nil
+		}
+		return nil, webhook.ErrSecretUnavailable
 	})
 	server := &http.Server{
 		Addr: cfg.HTTPAddr,

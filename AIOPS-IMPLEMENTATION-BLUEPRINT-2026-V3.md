@@ -188,6 +188,8 @@ POST /runner/v1/jobs/{id}:complete
 
 除外部 Webhook 外，所有写请求要求 `Idempotency-Key`；同键不同请求哈希返回 409。Webhook 使用 `(integration_id, provider_event_id)` 唯一键和 payload hash，同一事件 ID 携带不同载荷时记录安全冲突并拒绝。PATCH要求 `If-Match`。列表使用不透明游标，默认50、最大100。错误使用 RFC 9457 `application/problem+json`。
 
+`Integration` 是 Workspace/Provider/启停状态与 Vault `secret_ref` 的权威绑定。Webhook 的 Workspace 声明不是信任来源；控制面必须同时验证按 `integration_id/provider` 隔离的签名密钥和数据库作用域绑定。一个 Integration 的密钥不得用于签署另一个 Integration 的事件。
+
 ---
 
 ## 6. 模型与调查编排

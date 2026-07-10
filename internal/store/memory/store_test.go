@@ -12,7 +12,7 @@ import (
 )
 
 func TestCreateSignalIsIdempotentForSameProviderEventAndPayload(t *testing.T) {
-	repository := memory.New()
+	repository := newSignalRepository(t)
 	signal := validSignal()
 
 	created, err := repository.CreateSignal(context.Background(), signal)
@@ -23,10 +23,14 @@ func TestCreateSignalIsIdempotentForSameProviderEventAndPayload(t *testing.T) {
 	if err != nil || created {
 		t.Fatalf("duplicate CreateSignal() = (%v, %v), want (false, nil)", created, err)
 	}
+	events := repository.PendingOutbox()
+	if len(events) != 1 || events[0].AggregateID != signal.ID || events[0].Type != "signal.ingested.v1" {
+		t.Fatalf("PendingOutbox() = %#v, want one signal.ingested.v1", events)
+	}
 }
 
 func TestCreateSignalRejectsSameProviderEventWithDifferentPayload(t *testing.T) {
-	repository := memory.New()
+	repository := newSignalRepository(t)
 	signal := validSignal()
 	if _, err := repository.CreateSignal(context.Background(), signal); err != nil {
 		t.Fatalf("first CreateSignal() error = %v", err)
@@ -39,6 +43,15 @@ func TestCreateSignalRejectsSameProviderEventWithDifferentPayload(t *testing.T) 
 	}
 	if got := len(repository.SecurityConflicts()); got != 1 {
 		t.Fatalf("len(SecurityConflicts()) = %d, want 1", got)
+	}
+}
+
+func TestCreateSignalRejectsIntegrationScopeMismatch(t *testing.T) {
+	repository := newSignalRepository(t)
+	item := validSignal()
+	item.WorkspaceID = "workspace-2"
+	if _, err := repository.CreateSignal(context.Background(), item); !errors.Is(err, store.ErrScopeViolation) {
+		t.Fatalf("CreateSignal() error = %v, want ErrScopeViolation", err)
 	}
 }
 
@@ -85,8 +98,27 @@ func TestOutboxClaimUsesFencingTokenAndRecoversExpiredLease(t *testing.T) {
 	if err := repository.AckOutbox(context.Background(), second[0].ID, second[0].ClaimToken); err != nil {
 		t.Fatalf("AckOutbox(retry after uncertain response) error = %v", err)
 	}
+	if err := repository.AckOutbox(context.Background(), second[0].ID, "wrong-token"); !errors.Is(err, store.ErrStaleClaim) {
+		t.Fatalf("AckOutbox(delivered with wrong token) error = %v, want ErrStaleClaim", err)
+	}
 	if claimed, err := repository.ClaimOutbox(context.Background(), "dispatcher-1", 1, time.Minute); err != nil || len(claimed) != 0 {
 		t.Fatalf("ClaimOutbox(delivered) = (%#v, %v), want empty", claimed, err)
+	}
+}
+
+func TestOutboxExpiredLeaseCannotAckBeforeReclaim(t *testing.T) {
+	now := time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)
+	repository := memory.NewWithClock(func() time.Time { return now })
+	if err := repository.CreateIncident(context.Background(), domain.NewIncident("incident-1", "workspace-1", now)); err != nil {
+		t.Fatalf("CreateIncident() error = %v", err)
+	}
+	claimed, err := repository.ClaimOutbox(context.Background(), "dispatcher-1", 1, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("ClaimOutbox() = (%#v, %v)", claimed, err)
+	}
+	now = now.Add(time.Minute)
+	if err := repository.AckOutbox(context.Background(), claimed[0].ID, claimed[0].ClaimToken); !errors.Is(err, store.ErrStaleClaim) {
+		t.Fatalf("AckOutbox(expired) error = %v, want ErrStaleClaim", err)
 	}
 }
 
@@ -125,6 +157,19 @@ func validSignal() domain.Signal {
 		Provider:        "alertmanager",
 		ProviderEventID: "event-1",
 		PayloadHash:     "payload-hash",
+		Fingerprint:     "fingerprint-1",
+		Status:          "firing",
 		ObservedAt:      time.Now(),
 	}
+}
+
+func newSignalRepository(t *testing.T) *memory.Store {
+	t.Helper()
+	repository := memory.New()
+	if err := repository.RegisterIntegration(domain.Integration{
+		ID: "integration-1", WorkspaceID: "workspace-1", Provider: "alertmanager", Enabled: true,
+	}); err != nil {
+		t.Fatalf("RegisterIntegration() error = %v", err)
+	}
+	return repository
 }

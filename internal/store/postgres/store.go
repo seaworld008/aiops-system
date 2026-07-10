@@ -11,6 +11,7 @@ import (
 
 	"github.com/aiops-system/control-plane/internal/domain"
 	"github.com/aiops-system/control-plane/internal/ids"
+	"github.com/aiops-system/control-plane/internal/requestmeta"
 	"github.com/aiops-system/control-plane/internal/store"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -40,6 +41,10 @@ func (repository *Store) CreateSignal(ctx context.Context, item domain.Signal) (
 	if item.Fingerprint == "" {
 		return false, fmt.Errorf("signal fingerprint is required")
 	}
+	payloadSummary, err := json.Marshal(map[string]any{"status": item.Status, "labels": item.Labels})
+	if err != nil {
+		return false, fmt.Errorf("encode signal payload summary: %w", err)
+	}
 	tx, err := repository.database.Begin(ctx)
 	if err != nil {
 		return false, fmt.Errorf("begin signal transaction: %w", err)
@@ -56,6 +61,7 @@ func (repository *Store) CreateSignal(ctx context.Context, item domain.Signal) (
 		SELECT tenant_id::text, workspace_id::text, provider
 		FROM integrations
 		WHERE id = $1 AND enabled = true
+		FOR SHARE
 	`, item.IntegrationID).Scan(&tenantID, &integrationWorkspaceID, &provider)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, store.ErrNotFound
@@ -70,15 +76,29 @@ func (repository *Store) CreateSignal(ctx context.Context, item domain.Signal) (
 	result, err := tx.Exec(ctx, `
 		INSERT INTO signals (
 			id, tenant_id, workspace_id, integration_id, provider,
-			provider_event_id, payload_hash, fingerprint, observed_at, payload_summary
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '{}'::jsonb)
+			provider_event_id, payload_hash, fingerprint, status, observed_at, payload_summary
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT (integration_id, provider_event_id) DO NOTHING
 	`, item.ID, tenantID, item.WorkspaceID, item.IntegrationID, item.Provider,
-		item.ProviderEventID, item.PayloadHash, item.Fingerprint, item.ObservedAt.UTC())
+		item.ProviderEventID, item.PayloadHash, item.Fingerprint, item.Status, item.ObservedAt.UTC(), payloadSummary)
 	if err != nil {
 		return false, fmt.Errorf("insert signal: %w", err)
 	}
 	if result.RowsAffected() == 1 {
+		payload, marshalErr := json.Marshal(map[string]string{"signal_id": item.ID})
+		if marshalErr != nil {
+			return false, fmt.Errorf("encode signal outbox payload: %w", marshalErr)
+		}
+		_, err = tx.Exec(ctx, `
+			INSERT INTO outbox_events (
+				id, tenant_id, workspace_id, aggregate_type, aggregate_id, aggregate_version,
+				event_type, payload, created_at, available_at
+			) VALUES ($1, $2, $3, 'SIGNAL', $4, 1, 'signal.ingested.v1', $5,
+				statement_timestamp(), statement_timestamp())
+		`, ids.NewUUID(), tenantID, item.WorkspaceID, item.ID, payload)
+		if err != nil {
+			return false, fmt.Errorf("insert signal outbox event: %w", err)
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return false, fmt.Errorf("commit signal: %w", err)
 		}
@@ -145,14 +165,18 @@ func insertSignalConflictAudit(ctx context.Context, tx pgx.Tx, conflict signalCo
 		return fmt.Errorf("encode signal conflict audit: %w", err)
 	}
 	sum := sha256.Sum256(details)
+	metadata := requestmeta.From(ctx)
+	if metadata.RequestID == "" {
+		metadata.RequestID = ids.NewUUID()
+	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO audit_records (
 			id, tenant_id, workspace_id, actor_type, actor_id, action,
-			resource_type, resource_id, request_id, payload_hash, details
+			resource_type, resource_id, request_id, trace_id, payload_hash, details
 		) VALUES ($1, $2, $3, 'INTEGRATION', $4, 'signal.idempotency_conflict',
-			'SIGNAL', $5, $6, $7, $8)
+			'SIGNAL', $5, $6, $7, $8, $9)
 	`, ids.NewUUID(), conflict.TenantID, conflict.WorkspaceID, conflict.IntegrationID,
-		conflict.SignalID, ids.NewUUID(), hex.EncodeToString(sum[:]), details)
+		conflict.SignalID, metadata.RequestID, nullableText(metadata.TraceID), hex.EncodeToString(sum[:]), details)
 	if err != nil {
 		return fmt.Errorf("insert signal conflict audit: %w", err)
 	}
@@ -268,9 +292,11 @@ func (repository *Store) ClaimOutbox(ctx context.Context, consumerID string, lim
 func (repository *Store) AckOutbox(ctx context.Context, id, claimToken string) error {
 	result, err := repository.database.Exec(ctx, `
 		UPDATE outbox_events
-		SET delivered_at = statement_timestamp(), claimed_at = NULL, claimed_by = NULL,
+		SET delivered_at = statement_timestamp(), delivered_claim_token = claim_token,
+			claimed_at = NULL, claimed_by = NULL,
 			claim_token = NULL, claim_expires_at = NULL, last_error_code = NULL
 		WHERE id = $1 AND claim_token = $2 AND delivered_at IS NULL
+		  AND claim_expires_at > statement_timestamp()
 	`, id, claimToken)
 	if err != nil {
 		return fmt.Errorf("ack outbox event: %w", err)
@@ -280,8 +306,9 @@ func (repository *Store) AckOutbox(ctx context.Context, id, claimToken string) e
 	}
 	var delivered bool
 	err = repository.database.QueryRow(ctx, `
-		SELECT delivered_at IS NOT NULL FROM outbox_events WHERE id = $1
-	`, id).Scan(&delivered)
+		SELECT delivered_at IS NOT NULL AND delivered_claim_token = $2
+		FROM outbox_events WHERE id = $1
+	`, id, claimToken).Scan(&delivered)
 	if err == nil && delivered {
 		return nil
 	}
@@ -300,6 +327,7 @@ func (repository *Store) RetryOutbox(ctx context.Context, id, claimToken string,
 		SET available_at = $3, claimed_at = NULL, claimed_by = NULL,
 			claim_token = NULL, claim_expires_at = NULL, last_error_code = $4
 		WHERE id = $1 AND claim_token = $2 AND delivered_at IS NULL
+		  AND claim_expires_at > statement_timestamp()
 	`, id, claimToken, availableAt.UTC(), failureCode)
 	if err != nil {
 		return fmt.Errorf("retry outbox event: %w", err)
@@ -311,6 +339,13 @@ func (repository *Store) RetryOutbox(ctx context.Context, id, claimToken string,
 }
 
 func nullableUUID(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func nullableText(value string) any {
 	if value == "" {
 		return nil
 	}

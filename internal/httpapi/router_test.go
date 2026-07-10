@@ -23,6 +23,9 @@ func TestHealthEndpoints(t *testing.T) {
 		if res.Code != http.StatusOK {
 			t.Fatalf("GET %s status = %d, want 200", path, res.Code)
 		}
+		if requestID := res.Header().Get("X-Request-ID"); requestID == "" {
+			t.Fatalf("GET %s missing X-Request-ID", path)
+		}
 
 		var body map[string]string
 		if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil {
