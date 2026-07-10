@@ -13,6 +13,8 @@ import (
 	"github.com/aiops-system/control-plane/internal/buildinfo"
 	"github.com/aiops-system/control-plane/internal/config"
 	"github.com/aiops-system/control-plane/internal/httpapi"
+	signalservice "github.com/aiops-system/control-plane/internal/signal"
+	"github.com/aiops-system/control-plane/internal/store/memory"
 )
 
 func main() {
@@ -22,9 +24,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	repository := memory.New()
+	signalIngestor := signalservice.NewService(repository, time.Now)
 	server := &http.Server{
-		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewRouter(httpapi.Dependencies{Version: buildinfo.Version}),
+		Addr: cfg.HTTPAddr,
+		Handler: httpapi.NewRouter(httpapi.Dependencies{
+			Version:        buildinfo.Version,
+			SignalIngestor: signalIngestor,
+		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
