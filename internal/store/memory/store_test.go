@@ -37,6 +37,9 @@ func TestCreateSignalRejectsSameProviderEventWithDifferentPayload(t *testing.T) 
 	if !errors.Is(err, store.ErrIdempotencyConflict) {
 		t.Fatalf("error = %v, want ErrIdempotencyConflict", err)
 	}
+	if got := len(repository.SecurityConflicts()); got != 1 {
+		t.Fatalf("len(SecurityConflicts()) = %d, want 1", got)
+	}
 }
 
 func TestCreateIncidentAlsoAppendsOutboxEvent(t *testing.T) {

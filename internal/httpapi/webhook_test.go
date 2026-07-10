@@ -14,7 +14,7 @@ import (
 
 func TestWebhookAcceptsAlertmanagerWithoutIdempotencyHeader(t *testing.T) {
 	ingestor := &fakeSignalIngestor{result: signal.IngestResult{Accepted: 1}}
-	router := httpapi.NewRouter(httpapi.Dependencies{SignalIngestor: ingestor})
+	router := httpapi.NewRouter(httpapi.Dependencies{SignalIngestor: ingestor, WebhookVerifier: allowWebhookVerifier{}})
 	req := httptest.NewRequest(
 		http.MethodPost,
 		"/api/v1/integrations/integration-1/webhooks/alertmanager",
@@ -36,7 +36,7 @@ func TestWebhookAcceptsAlertmanagerWithoutIdempotencyHeader(t *testing.T) {
 
 func TestWebhookReturnsProblemJSONForInvalidPayload(t *testing.T) {
 	ingestor := &fakeSignalIngestor{err: signal.ErrInvalidPayload}
-	router := httpapi.NewRouter(httpapi.Dependencies{SignalIngestor: ingestor})
+	router := httpapi.NewRouter(httpapi.Dependencies{SignalIngestor: ingestor, WebhookVerifier: allowWebhookVerifier{}})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/integrations/i/webhooks/nightingale", strings.NewReader(`{`))
 	req.Header.Set("X-Workspace-ID", "workspace-1")
 	req.Header.Set("Content-Type", "application/json")
@@ -59,6 +59,44 @@ func TestWebhookReturnsProblemJSONForInvalidPayload(t *testing.T) {
 	}
 }
 
+func TestWebhookRejectsInvalidSignature(t *testing.T) {
+	router := httpapi.NewRouter(httpapi.Dependencies{
+		SignalIngestor:  &fakeSignalIngestor{},
+		WebhookVerifier: rejectWebhookVerifier{},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/integrations/i/webhooks/alertmanager", strings.NewReader(`{"alerts":[]}`))
+	req.Header.Set("X-Workspace-ID", "workspace-1")
+	req.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+
+	router.ServeHTTP(res, req)
+
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", res.Code)
+	}
+}
+
+func TestRouterUsesProblemJSONForNotFoundAndMethodNotAllowed(t *testing.T) {
+	router := httpapi.NewRouter(httpapi.Dependencies{})
+	for _, tc := range []struct {
+		method string
+		path   string
+		want   int
+	}{
+		{method: http.MethodGet, path: "/missing", want: http.StatusNotFound},
+		{method: http.MethodPost, path: "/healthz", want: http.StatusMethodNotAllowed},
+	} {
+		res := httptest.NewRecorder()
+		router.ServeHTTP(res, httptest.NewRequest(tc.method, tc.path, nil))
+		if res.Code != tc.want {
+			t.Fatalf("%s %s status = %d, want %d", tc.method, tc.path, res.Code, tc.want)
+		}
+		if got := res.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/problem+json") {
+			t.Fatalf("%s %s Content-Type = %q", tc.method, tc.path, got)
+		}
+	}
+}
+
 type fakeSignalIngestor struct {
 	result        signal.IngestResult
 	err           error
@@ -70,4 +108,14 @@ func (fake *fakeSignalIngestor) Ingest(_ context.Context, _, integrationID, prov
 	fake.provider = provider
 	fake.integrationID = integrationID
 	return fake.result, fake.err
+}
+
+type allowWebhookVerifier struct{}
+
+func (allowWebhookVerifier) Verify(string, string, http.Header, []byte) error { return nil }
+
+type rejectWebhookVerifier struct{}
+
+func (rejectWebhookVerifier) Verify(string, string, http.Header, []byte) error {
+	return httpapi.ErrInvalidWebhookSignature
 }

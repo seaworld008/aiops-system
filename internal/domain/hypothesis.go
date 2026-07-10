@@ -10,6 +10,8 @@ const (
 
 type Hypothesis struct {
 	ID              string
+	WorkspaceID     string
+	IncidentID      string
 	InvestigationID string
 	Status          HypothesisStatus
 	Summary         string

@@ -42,6 +42,7 @@ func New(rawURL string, httpClient *http.Client, budget connectors.Budget) (*Cli
 	if err != nil || baseURL.Scheme == "" || baseURL.Host == "" {
 		return nil, fmt.Errorf("invalid VictoriaLogs URL")
 	}
+	budget = budget.WithDefaults()
 	if err := budget.Validate(); err != nil {
 		return nil, err
 	}
@@ -111,6 +112,9 @@ func (client *Client) validateSearch(search SearchRequest) error {
 	}
 	if search.Start.IsZero() || search.End.IsZero() || !search.Start.Before(search.End) {
 		return fmt.Errorf("bounded start and end times are required")
+	}
+	if window := search.End.Sub(search.Start); window > client.budget.MaxTimeRange {
+		return fmt.Errorf("query range %s exceeds budget %s", window, client.budget.MaxTimeRange)
 	}
 	if len(search.Fields) == 0 {
 		return fmt.Errorf("at least one projected field is required")

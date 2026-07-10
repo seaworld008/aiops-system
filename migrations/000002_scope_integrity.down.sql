@@ -1,0 +1,61 @@
+BEGIN;
+
+DROP TRIGGER IF EXISTS investigations_no_reparenting ON investigations;
+DROP FUNCTION IF EXISTS reject_investigation_reparenting();
+DROP TRIGGER IF EXISTS hypotheses_confirmed_root_cause_guard ON hypotheses;
+DROP FUNCTION IF EXISTS protect_confirmed_hypothesis();
+DROP TRIGGER IF EXISTS incidents_confirmed_hypothesis_guard ON incidents;
+DROP FUNCTION IF EXISTS enforce_confirmed_hypothesis();
+DROP TRIGGER IF EXISTS hypothesis_evidence_scope_guard ON hypothesis_evidence;
+DROP FUNCTION IF EXISTS enforce_hypothesis_evidence_scope();
+DROP TRIGGER IF EXISTS incident_signals_scope_guard ON incident_signals;
+DROP FUNCTION IF EXISTS enforce_incident_signal_scope();
+
+ALTER TABLE incidents DROP CONSTRAINT IF EXISTS incidents_confirmed_hypothesis_scope_fk;
+ALTER TABLE model_calls DROP CONSTRAINT IF EXISTS model_calls_investigation_scope_fk;
+ALTER TABLE tool_invocations DROP CONSTRAINT IF EXISTS tool_invocations_execution_scope_fk;
+ALTER TABLE tool_invocations DROP CONSTRAINT IF EXISTS tool_invocations_investigation_scope_fk;
+ALTER TABLE executions DROP CONSTRAINT IF EXISTS executions_action_plan_scope_fk;
+ALTER TABLE approvals DROP CONSTRAINT IF EXISTS approvals_action_plan_scope_fk;
+ALTER TABLE policy_decisions DROP CONSTRAINT IF EXISTS policy_decisions_action_plan_scope_fk;
+ALTER TABLE action_plans DROP CONSTRAINT IF EXISTS action_plans_incident_scope_fk;
+ALTER TABLE feedback DROP CONSTRAINT IF EXISTS feedback_hypothesis_scope_fk;
+ALTER TABLE feedback DROP CONSTRAINT IF EXISTS feedback_investigation_scope_fk;
+ALTER TABLE hypotheses DROP CONSTRAINT IF EXISTS hypotheses_investigation_scope_fk;
+ALTER TABLE evidence DROP CONSTRAINT IF EXISTS evidence_investigation_scope_fk;
+ALTER TABLE investigations DROP CONSTRAINT IF EXISTS investigations_incident_scope_fk;
+ALTER TABLE incidents DROP CONSTRAINT IF EXISTS incidents_environment_scope_fk;
+ALTER TABLE incidents DROP CONSTRAINT IF EXISTS incidents_service_scope_fk;
+ALTER TABLE service_bindings DROP CONSTRAINT IF EXISTS service_bindings_environment_scope_fk;
+ALTER TABLE service_bindings DROP CONSTRAINT IF EXISTS service_bindings_service_scope_fk;
+
+ALTER TABLE outbox_events DROP CONSTRAINT IF EXISTS outbox_events_workspace_scope_fk;
+ALTER TABLE audit_records DROP CONSTRAINT IF EXISTS audit_records_workspace_scope_fk;
+ALTER TABLE model_calls DROP CONSTRAINT IF EXISTS model_calls_workspace_scope_fk;
+ALTER TABLE tool_invocations DROP CONSTRAINT IF EXISTS tool_invocations_workspace_scope_fk;
+ALTER TABLE executions DROP CONSTRAINT IF EXISTS executions_workspace_scope_fk;
+ALTER TABLE approvals DROP CONSTRAINT IF EXISTS approvals_workspace_scope_fk;
+ALTER TABLE policy_decisions DROP CONSTRAINT IF EXISTS policy_decisions_workspace_scope_fk;
+ALTER TABLE action_plans DROP CONSTRAINT IF EXISTS action_plans_workspace_scope_fk;
+ALTER TABLE feedback DROP CONSTRAINT IF EXISTS feedback_workspace_scope_fk;
+ALTER TABLE hypotheses DROP CONSTRAINT IF EXISTS hypotheses_workspace_scope_fk;
+ALTER TABLE evidence DROP CONSTRAINT IF EXISTS evidence_workspace_scope_fk;
+ALTER TABLE investigations DROP CONSTRAINT IF EXISTS investigations_workspace_scope_fk;
+ALTER TABLE incidents DROP CONSTRAINT IF EXISTS incidents_workspace_scope_fk;
+ALTER TABLE signals DROP CONSTRAINT IF EXISTS signals_workspace_scope_fk;
+ALTER TABLE service_bindings DROP CONSTRAINT IF EXISTS service_bindings_workspace_scope_fk;
+ALTER TABLE services DROP CONSTRAINT IF EXISTS services_workspace_scope_fk;
+ALTER TABLE environments DROP CONSTRAINT IF EXISTS environments_workspace_scope_fk;
+
+ALTER TABLE executions DROP CONSTRAINT IF EXISTS executions_workspace_scope_uk;
+ALTER TABLE action_plans DROP CONSTRAINT IF EXISTS action_plans_workspace_scope_uk;
+ALTER TABLE hypotheses DROP CONSTRAINT IF EXISTS hypotheses_workspace_scope_uk;
+ALTER TABLE evidence DROP CONSTRAINT IF EXISTS evidence_workspace_scope_uk;
+ALTER TABLE investigations DROP CONSTRAINT IF EXISTS investigations_workspace_scope_uk;
+ALTER TABLE incidents DROP CONSTRAINT IF EXISTS incidents_workspace_scope_uk;
+ALTER TABLE signals DROP CONSTRAINT IF EXISTS signals_workspace_scope_uk;
+ALTER TABLE services DROP CONSTRAINT IF EXISTS services_workspace_scope_uk;
+ALTER TABLE environments DROP CONSTRAINT IF EXISTS environments_workspace_scope_uk;
+ALTER TABLE workspaces DROP CONSTRAINT IF EXISTS workspaces_tenant_scope_uk;
+
+COMMIT;

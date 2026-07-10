@@ -10,6 +10,7 @@ import (
 func TestLoadUsesSafeDefaults(t *testing.T) {
 	t.Setenv("AIOPS_HTTP_ADDR", "")
 	t.Setenv("AIOPS_SHUTDOWN_TIMEOUT", "")
+	t.Setenv("AIOPS_ENVIRONMENT", "")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -33,5 +34,14 @@ func TestLoadRejectsInvalidShutdownTimeout(t *testing.T) {
 	_, err := config.Load()
 	if err == nil {
 		t.Fatal("Load() error = nil, want validation error")
+	}
+}
+
+func TestLoadRejectsProductionWithoutWebhookSecret(t *testing.T) {
+	t.Setenv("AIOPS_ENVIRONMENT", "production")
+	t.Setenv("AIOPS_WEBHOOK_HMAC_SECRET", "")
+
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load() error = nil, want fail-closed production configuration")
 	}
 }

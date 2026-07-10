@@ -51,13 +51,17 @@ func (incident *Incident) Transition(next IncidentStatus) error {
 	return nil
 }
 
-func (incident *Incident) ConfirmRootCause(hypothesis Hypothesis, actor Actor) error {
+func (incident *Incident) ConfirmRootCause(hypothesis *Hypothesis, actor Actor) error {
 	if actor.Type != ActorHuman || actor.ID == "" {
 		return fmt.Errorf("root cause confirmation requires an authenticated human")
 	}
-	if hypothesis.ID == "" || hypothesis.Status != HypothesisProposed {
+	if hypothesis == nil || hypothesis.ID == "" || hypothesis.Status != HypothesisProposed {
 		return fmt.Errorf("only a proposed hypothesis can be confirmed")
 	}
+	if hypothesis.WorkspaceID != incident.WorkspaceID || hypothesis.IncidentID != incident.ID {
+		return fmt.Errorf("hypothesis does not belong to this incident")
+	}
+	hypothesis.Status = HypothesisConfirmed
 	incident.ConfirmedHypothesisID = hypothesis.ID
 	incident.UpdatedAt = time.Now().UTC()
 	return nil

@@ -13,16 +13,18 @@ const (
 )
 
 type Config struct {
-	HTTPAddr        string
-	Environment     string
-	ShutdownTimeout time.Duration
+	HTTPAddr          string
+	Environment       string
+	ShutdownTimeout   time.Duration
+	WebhookHMACSecret string
 }
 
 func Load() (Config, error) {
 	cfg := Config{
-		HTTPAddr:        valueOrDefault("AIOPS_HTTP_ADDR", defaultHTTPAddr),
-		Environment:     valueOrDefault("AIOPS_ENVIRONMENT", defaultEnvironment),
-		ShutdownTimeout: defaultShutdownTimeout,
+		HTTPAddr:          valueOrDefault("AIOPS_HTTP_ADDR", defaultHTTPAddr),
+		Environment:       valueOrDefault("AIOPS_ENVIRONMENT", defaultEnvironment),
+		ShutdownTimeout:   defaultShutdownTimeout,
+		WebhookHMACSecret: os.Getenv("AIOPS_WEBHOOK_HMAC_SECRET"),
 	}
 
 	if raw := os.Getenv("AIOPS_SHUTDOWN_TIMEOUT"); raw != "" {
@@ -34,6 +36,9 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("AIOPS_SHUTDOWN_TIMEOUT must be positive")
 		}
 		cfg.ShutdownTimeout = duration
+	}
+	if cfg.Environment == "production" && cfg.WebhookHMACSecret == "" {
+		return Config{}, fmt.Errorf("AIOPS_WEBHOOK_HMAC_SECRET is required in production")
 	}
 
 	return cfg, nil

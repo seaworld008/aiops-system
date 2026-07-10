@@ -59,7 +59,9 @@ func TestSearchEnforcesTimeFieldsLimitAndTimeout(t *testing.T) {
 }
 
 func TestSearchRejectsUnboundedOrInvalidRequests(t *testing.T) {
-	client, err := victorialogs.New("http://victorialogs.invalid", nil, connectors.DefaultBudget())
+	budget := connectors.DefaultBudget()
+	budget.MaxTimeRange = 15 * time.Minute
+	client, err := victorialogs.New("http://victorialogs.invalid", nil, budget)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -68,6 +70,7 @@ func TestSearchRejectsUnboundedOrInvalidRequests(t *testing.T) {
 		{Query: "error", Start: time.Now(), End: time.Time{}, Fields: []string{"_msg"}, Limit: 1},
 		{Query: "error", Start: time.Now(), End: time.Now().Add(time.Minute), Fields: nil, Limit: 1},
 		{Query: "error", Start: time.Now(), End: time.Now().Add(time.Minute), Fields: []string{"_msg"}, Limit: connectors.DefaultBudget().MaxItems + 1},
+		{Query: "error", Start: time.Now(), End: time.Now().Add(16 * time.Minute), Fields: []string{"_msg"}, Limit: 1},
 	}
 	for _, request := range requests {
 		if _, err := client.Search(context.Background(), request); err == nil {

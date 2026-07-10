@@ -23,5 +23,6 @@ GET http://localhost:8080/healthz
 GET http://localhost:8080/readyz
 ```
 
-当前阶段只提供平台骨架和健康端点；真实企业连接器必须使用各环境凭据配置，不随仓库分发。
+Alertmanager/夜莺 Webhook 必须携带 `X-AIOPS-Signature: sha256=<hex>`，签名内容为原始请求体的 HMAC-SHA256。开发环境通过 `AIOPS_WEBHOOK_HMAC_SECRET` 注入测试密钥；生产环境缺少该配置时控制面拒绝启动。后续生产适配器会把密钥解析切换到按 Integration 隔离的 Vault 引用。
 
+当前阶段已提供领域、信号接入和首批只读连接器；真实企业连接器必须使用各环境凭据配置，不随仓库分发。

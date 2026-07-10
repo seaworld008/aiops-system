@@ -11,10 +11,11 @@ import (
 )
 
 type Store struct {
-	mu        sync.RWMutex
-	signals   map[string]domain.Signal
-	incidents map[string]domain.Incident
-	outbox    []domain.OutboxEvent
+	mu                sync.RWMutex
+	signals           map[string]domain.Signal
+	incidents         map[string]domain.Incident
+	outbox            []domain.OutboxEvent
+	securityConflicts []store.SecurityConflict
 }
 
 func New() *Store {
@@ -35,12 +36,27 @@ func (repository *Store) CreateSignal(_ context.Context, signal domain.Signal) (
 	key := signal.IntegrationID + "\x00" + signal.ProviderEventID
 	if existing, ok := repository.signals[key]; ok {
 		if existing.PayloadHash != signal.PayloadHash {
+			repository.securityConflicts = append(repository.securityConflicts, store.SecurityConflict{
+				IntegrationID:   signal.IntegrationID,
+				ProviderEventID: signal.ProviderEventID,
+				ExistingHash:    existing.PayloadHash,
+				IncomingHash:    signal.PayloadHash,
+				DetectedAt:      time.Now().UTC(),
+			})
 			return false, store.ErrIdempotencyConflict
 		}
 		return false, nil
 	}
 	repository.signals[key] = signal
 	return true, nil
+}
+
+func (repository *Store) SecurityConflicts() []store.SecurityConflict {
+	repository.mu.RLock()
+	defer repository.mu.RUnlock()
+	conflicts := make([]store.SecurityConflict, len(repository.securityConflicts))
+	copy(conflicts, repository.securityConflicts)
+	return conflicts
 }
 
 func (repository *Store) CreateIncident(_ context.Context, incident domain.Incident) error {

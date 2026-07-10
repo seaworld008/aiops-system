@@ -10,17 +10,25 @@ import (
 
 	"github.com/aiops-system/control-plane/internal/signal"
 	"github.com/aiops-system/control-plane/internal/store"
+	"github.com/aiops-system/control-plane/internal/webhook"
 	"github.com/go-chi/chi/v5"
 )
+
+var ErrInvalidWebhookSignature = webhook.ErrInvalidSignature
 
 type SignalIngestor interface {
 	Ingest(context.Context, string, string, string, []byte) (signal.IngestResult, error)
 }
 
+type WebhookVerifier interface {
+	Verify(integrationID, provider string, headers http.Header, body []byte) error
+}
+
 type Dependencies struct {
-	Version        string
-	Ready          func() error
-	SignalIngestor SignalIngestor
+	Version         string
+	Ready           func() error
+	SignalIngestor  SignalIngestor
+	WebhookVerifier WebhookVerifier
 }
 
 func NewRouter(deps Dependencies) http.Handler {
@@ -29,6 +37,12 @@ func NewRouter(deps Dependencies) http.Handler {
 	}
 
 	router := chi.NewRouter()
+	router.NotFound(func(w http.ResponseWriter, _ *http.Request) {
+		writeProblem(w, http.StatusNotFound, "route_not_found", "The requested route does not exist")
+	})
+	router.MethodNotAllowed(func(w http.ResponseWriter, _ *http.Request) {
+		writeProblem(w, http.StatusMethodNotAllowed, "method_not_allowed", "The HTTP method is not allowed for this route")
+	})
 	router.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status":  "ok",
@@ -37,17 +51,17 @@ func NewRouter(deps Dependencies) http.Handler {
 	})
 	router.Get("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 		if err := deps.Ready(); err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable"})
+			writeProblem(w, http.StatusServiceUnavailable, "not_ready", "The service is not ready")
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	router.Post("/api/v1/integrations/{integrationID}/webhooks/{provider}", webhookHandler(deps.SignalIngestor))
+	router.Post("/api/v1/integrations/{integrationID}/webhooks/{provider}", webhookHandler(deps.SignalIngestor, deps.WebhookVerifier))
 
 	return router
 }
 
-func webhookHandler(ingestor SignalIngestor) http.HandlerFunc {
+func webhookHandler(ingestor SignalIngestor, verifier WebhookVerifier) http.HandlerFunc {
 	return func(w http.ResponseWriter, request *http.Request) {
 		if ingestor == nil {
 			writeProblem(w, http.StatusServiceUnavailable, "signal_ingestor_unavailable", "Signal ingestion is unavailable")
@@ -67,11 +81,25 @@ func webhookHandler(ingestor SignalIngestor) http.HandlerFunc {
 			writeProblem(w, http.StatusRequestEntityTooLarge, "payload_too_large", "Webhook payload exceeds 1 MiB")
 			return
 		}
+		if verifier == nil {
+			writeProblem(w, http.StatusServiceUnavailable, "webhook_verifier_unavailable", "Webhook verification is unavailable")
+			return
+		}
+		integrationID := chi.URLParam(request, "integrationID")
+		provider := chi.URLParam(request, "provider")
+		if err := verifier.Verify(integrationID, provider, request.Header, body); err != nil {
+			if errors.Is(err, webhook.ErrInvalidSignature) {
+				writeProblem(w, http.StatusUnauthorized, "invalid_webhook_signature", "Webhook signature is invalid")
+			} else {
+				writeProblem(w, http.StatusServiceUnavailable, "webhook_verification_failed", "Webhook verification could not be completed")
+			}
+			return
+		}
 		result, err := ingestor.Ingest(
 			request.Context(),
 			workspaceID,
-			chi.URLParam(request, "integrationID"),
-			chi.URLParam(request, "provider"),
+			integrationID,
+			provider,
 			body,
 		)
 		if err != nil {

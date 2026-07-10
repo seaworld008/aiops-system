@@ -15,6 +15,7 @@ import (
 	"github.com/aiops-system/control-plane/internal/httpapi"
 	signalservice "github.com/aiops-system/control-plane/internal/signal"
 	"github.com/aiops-system/control-plane/internal/store/memory"
+	"github.com/aiops-system/control-plane/internal/webhook"
 )
 
 func main() {
@@ -26,11 +27,18 @@ func main() {
 
 	repository := memory.New()
 	signalIngestor := signalservice.NewService(repository, time.Now)
+	webhookVerifier := webhook.NewHMACVerifier(func(_, _ string) ([]byte, error) {
+		if cfg.WebhookHMACSecret == "" {
+			return nil, webhook.ErrSecretUnavailable
+		}
+		return []byte(cfg.WebhookHMACSecret), nil
+	})
 	server := &http.Server{
 		Addr: cfg.HTTPAddr,
 		Handler: httpapi.NewRouter(httpapi.Dependencies{
-			Version:        buildinfo.Version,
-			SignalIngestor: signalIngestor,
+			Version:         buildinfo.Version,
+			SignalIngestor:  signalIngestor,
+			WebhookVerifier: webhookVerifier,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}

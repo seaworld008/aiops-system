@@ -36,17 +36,34 @@ func TestOnlyExplicitHumanFeedbackConfirmsRootCause(t *testing.T) {
 	incident := domain.NewIncident("incident-1", "workspace-1", time.Now())
 	hypothesis := domain.Hypothesis{
 		ID:              "hypothesis-1",
+		WorkspaceID:     "workspace-1",
+		IncidentID:      "incident-1",
 		InvestigationID: "investigation-1",
 		Status:          domain.HypothesisProposed,
 	}
 
-	if err := incident.ConfirmRootCause(hypothesis, domain.Actor{Type: domain.ActorModel, ID: "model"}); err == nil {
+	if err := incident.ConfirmRootCause(&hypothesis, domain.Actor{Type: domain.ActorModel, ID: "model"}); err == nil {
 		t.Fatal("model confirmation error = nil, want rejection")
 	}
-	if err := incident.ConfirmRootCause(hypothesis, domain.Actor{Type: domain.ActorHuman, ID: "user-1"}); err != nil {
+	if err := incident.ConfirmRootCause(&hypothesis, domain.Actor{Type: domain.ActorHuman, ID: "user-1"}); err != nil {
 		t.Fatalf("human confirmation error = %v", err)
 	}
 	if incident.ConfirmedHypothesisID != hypothesis.ID {
 		t.Fatalf("ConfirmedHypothesisID = %q, want %q", incident.ConfirmedHypothesisID, hypothesis.ID)
+	}
+	if hypothesis.Status != domain.HypothesisConfirmed {
+		t.Fatalf("hypothesis status = %s, want CONFIRMED", hypothesis.Status)
+	}
+}
+
+func TestIncidentRejectsHypothesisFromAnotherIncidentOrWorkspace(t *testing.T) {
+	incident := domain.NewIncident("incident-1", "workspace-1", time.Now())
+	for _, hypothesis := range []domain.Hypothesis{
+		{ID: "h1", WorkspaceID: "workspace-2", IncidentID: "incident-1", Status: domain.HypothesisProposed},
+		{ID: "h2", WorkspaceID: "workspace-1", IncidentID: "incident-2", Status: domain.HypothesisProposed},
+	} {
+		if err := incident.ConfirmRootCause(&hypothesis, domain.Actor{Type: domain.ActorHuman, ID: "user-1"}); err == nil {
+			t.Fatalf("ConfirmRootCause(%#v) error = nil, want ownership rejection", hypothesis)
+		}
 	}
 }
