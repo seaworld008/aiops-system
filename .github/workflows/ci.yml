@@ -30,8 +30,25 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
+      vault:
+        image: hashicorp/vault:2.0.3
+        env:
+          VAULT_ADDR: http://127.0.0.1:8200
+          VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+          VAULT_DEV_ROOT_TOKEN_ID: aiops-vault-test-only
+        ports:
+          - 8200:8200
+        options: >-
+          --cap-add=IPC_LOCK
+          --health-cmd "vault status"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       AIOPS_TEST_POSTGRES_DSN: postgres://aiops:aiops-test-only@127.0.0.1:5432/aiops_test?sslmode=disable
+      AIOPS_TEST_VAULT_ADDR: http://127.0.0.1:8200
+      AIOPS_TEST_VAULT_POSTGRES_HOST: postgres:5432
+      AIOPS_TEST_VAULT_ROOT_TOKEN: aiops-vault-test-only
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
