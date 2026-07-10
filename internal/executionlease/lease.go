@@ -46,6 +46,9 @@ type Execution struct {
 	Status                   Status
 	CompletionStatus         Status
 	RunnerID                 string
+	RunnerTenantID           string
+	RunnerWorkspaceID        string
+	RunnerEnvironmentID      string
 	ScopeRevision            int64
 	LeaseToken               string
 	LeaseEpoch               int64

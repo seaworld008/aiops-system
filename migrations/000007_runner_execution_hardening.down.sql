@@ -62,6 +62,7 @@ DROP TRIGGER IF EXISTS runner_result_receipts_immutable ON runner_result_receipt
 DROP FUNCTION reject_runner_result_receipt_mutation();
 DROP TABLE runner_result_receipts;
 DROP TABLE runner_certificates;
+ALTER TABLE action_queue DROP CONSTRAINT action_queue_runner_registration_fk;
 DROP TRIGGER IF EXISTS runner_scope_bindings_revision ON runner_scope_bindings;
 DROP TRIGGER IF EXISTS runner_scope_bindings_no_truncate ON runner_scope_bindings;
 DROP TRIGGER IF EXISTS runner_scope_bindings_immutable ON runner_scope_bindings;
@@ -90,6 +91,7 @@ ALTER TABLE action_queue
     DROP CONSTRAINT action_queue_idempotency_key_ck,
     DROP CONSTRAINT action_queue_request_hash_ck,
     DROP CONSTRAINT action_queue_authorization_expiry_ck,
+    DROP CONSTRAINT action_queue_runner_scope_identity_ck,
     DROP CONSTRAINT action_queue_scope_revision_ck,
     DROP CONSTRAINT action_queue_heartbeat_seq_ck,
     DROP CONSTRAINT action_queue_cancel_intent_ck,
@@ -156,6 +158,9 @@ ALTER TABLE action_queue
     DROP COLUMN request_hash_version,
     DROP COLUMN request_hash,
     DROP COLUMN authorization_expires_at,
+    DROP COLUMN runner_environment_id,
+    DROP COLUMN runner_workspace_id,
+    DROP COLUMN runner_tenant_id,
     DROP COLUMN idempotency_key;
 
 ALTER TABLE execution_leases

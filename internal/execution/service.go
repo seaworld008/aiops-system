@@ -671,8 +671,13 @@ func (service *Service) heartbeatLoop(ctx context.Context, cancelExecutor contex
 			return
 		case <-ticker.C:
 			currentScope, scopeErr := service.resolveRunnerScope(ctx)
+			if scopeErr != nil && ctx.Err() != nil {
+				done <- nil
+				return
+			}
 			if scopeErr != nil || currentScope.runnerID != claimedScope.runnerID ||
-				currentScope.pool != claimedScope.pool || currentScope.scopeRevision != claimedScope.scopeRevision {
+				currentScope.tenantID != claimedScope.tenantID || currentScope.pool != claimedScope.pool ||
+				currentScope.scopeRevision != claimedScope.scopeRevision {
 				cancelExecutor()
 				done <- ErrExecutionUncertain
 				return

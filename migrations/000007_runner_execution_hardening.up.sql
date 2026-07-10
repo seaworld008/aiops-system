@@ -90,6 +90,9 @@ ALTER TABLE action_queue
     ADD COLUMN request_hash text,
     ADD COLUMN request_hash_version text,
     ADD COLUMN authorization_expires_at timestamptz,
+    ADD COLUMN runner_tenant_id uuid,
+    ADD COLUMN runner_workspace_id uuid,
+    ADD COLUMN runner_environment_id uuid,
     ADD COLUMN scope_revision bigint,
     ADD COLUMN heartbeat_seq bigint NOT NULL DEFAULT 0,
     ADD COLUMN cancel_requested_at timestamptz,
@@ -158,6 +161,25 @@ ALTER TABLE action_queue
         authorization_expires_at > '-infinity'::timestamptz AND
         authorization_expires_at < 'infinity'::timestamptz
     ),
+    ADD CONSTRAINT action_queue_runner_scope_identity_ck CHECK (
+        (
+            status IN ('QUEUED', 'CANCELLED') AND
+            runner_tenant_id IS NULL AND runner_workspace_id IS NULL AND runner_environment_id IS NULL
+        ) OR (
+            status IN ('LEASED', 'RUNNING') AND
+            runner_tenant_id IS NOT NULL AND runner_workspace_id IS NOT NULL AND runner_environment_id IS NOT NULL AND
+            runner_workspace_id::text = workspace_id AND runner_environment_id::text = environment_id
+        ) OR (
+            status IN ('FINALIZING', 'UNCERTAIN', 'SUCCEEDED', 'FAILED') AND (
+                (
+                    runner_tenant_id IS NULL AND runner_workspace_id IS NULL AND runner_environment_id IS NULL
+                ) OR (
+                    runner_tenant_id IS NOT NULL AND runner_workspace_id IS NOT NULL AND runner_environment_id IS NOT NULL AND
+                    runner_workspace_id::text = workspace_id AND runner_environment_id::text = environment_id
+                )
+            )
+        )
+    ),
     ADD CONSTRAINT action_queue_scope_revision_ck CHECK (
         scope_revision IS NULL OR scope_revision > 0
     ),
@@ -176,6 +198,7 @@ ALTER TABLE action_queue
     ADD CONSTRAINT action_queue_active_lease_shape_ck CHECK (
         (
             status IN ('LEASED', 'RUNNING') AND lease_epoch > 0 AND runner_id IS NOT NULL AND
+            runner_tenant_id IS NOT NULL AND runner_workspace_id IS NOT NULL AND runner_environment_id IS NOT NULL AND
             scope_revision IS NOT NULL AND lease_token_sha256 IS NOT NULL AND
             lease_acquired_at IS NOT NULL AND lease_expires_at IS NOT NULL AND last_heartbeat_at IS NOT NULL AND
             completed_at IS NULL AND result_hash IS NULL AND completion_status IS NULL
@@ -234,7 +257,8 @@ CREATE UNIQUE INDEX action_queue_workspace_idempotency_uk
 
 ALTER TABLE action_queue
     ADD CONSTRAINT action_queue_receipt_fence_uk UNIQUE (
-        workspace_id, action_id, runner_id, lease_epoch, scope_revision, result_hash, completion_status
+        runner_tenant_id, runner_workspace_id, runner_environment_id,
+        action_id, runner_id, lease_epoch, scope_revision, result_hash, completion_status
     );
 
 -- Align the durable domain projection with the runner queue state machine.
@@ -275,6 +299,11 @@ CREATE TABLE runner_registrations (
     ),
     CONSTRAINT runner_registrations_updated_ck CHECK (updated_at >= created_at)
 );
+
+ALTER TABLE action_queue
+    ADD CONSTRAINT action_queue_runner_registration_fk
+        FOREIGN KEY (runner_tenant_id, runner_id)
+        REFERENCES runner_registrations (tenant_id, runner_id) ON DELETE RESTRICT;
 
 CREATE TABLE runner_scope_bindings (
     runner_id text NOT NULL,
@@ -369,8 +398,10 @@ CREATE TABLE runner_certificates (
 
 CREATE TABLE runner_result_receipts (
     action_id text NOT NULL,
-    workspace_id text NOT NULL,
-    runner_id text NOT NULL REFERENCES runner_registrations(runner_id) ON DELETE RESTRICT,
+    tenant_id uuid NOT NULL,
+    workspace_id uuid NOT NULL,
+    environment_id uuid NOT NULL,
+    runner_id text NOT NULL,
     lease_epoch bigint NOT NULL,
     scope_revision bigint NOT NULL,
     certificate_sha256 text,
@@ -381,9 +412,21 @@ CREATE TABLE runner_result_receipts (
     received_at timestamptz NOT NULL DEFAULT statement_timestamp(),
 
     PRIMARY KEY (action_id, lease_epoch),
+    CONSTRAINT runner_result_receipts_registration_fk
+        FOREIGN KEY (tenant_id, runner_id)
+        REFERENCES runner_registrations (tenant_id, runner_id) ON DELETE RESTRICT,
+    CONSTRAINT runner_result_receipts_environment_scope_fk
+        FOREIGN KEY (tenant_id, workspace_id, environment_id)
+        REFERENCES environments (tenant_id, workspace_id, id) ON DELETE RESTRICT,
     CONSTRAINT runner_result_receipts_action_fence_fk
-        FOREIGN KEY (workspace_id, action_id, runner_id, lease_epoch, scope_revision, receipt_hash, completion_status)
-        REFERENCES action_queue (workspace_id, action_id, runner_id, lease_epoch, scope_revision, result_hash, completion_status)
+        FOREIGN KEY (
+            tenant_id, workspace_id, environment_id,
+            action_id, runner_id, lease_epoch, scope_revision, receipt_hash, completion_status
+        )
+        REFERENCES action_queue (
+            runner_tenant_id, runner_workspace_id, runner_environment_id,
+            action_id, runner_id, lease_epoch, scope_revision, result_hash, completion_status
+        )
         ON DELETE RESTRICT,
     CONSTRAINT runner_result_receipts_certificate_fk
         FOREIGN KEY (runner_id, certificate_sha256)

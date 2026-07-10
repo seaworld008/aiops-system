@@ -34,7 +34,8 @@ func TestRunnerRegistryResolvesRevisionedExactScopeBindings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve() error = %v", err)
 	}
-	if registration.RunnerID != "runner-1" || registration.ScopeRevision != 7 || registration.MaxConcurrency != 3 || len(registration.ScopeBindings) != 2 {
+	if registration.RunnerID != "runner-1" || registration.TenantID != "10000000-0000-4000-8000-000000000001" ||
+		registration.ScopeRevision != 7 || registration.MaxConcurrency != 3 || len(registration.ScopeBindings) != 2 {
 		t.Fatalf("Resolve() = %#v", registration)
 	}
 	scope, err := registration.Scope()
