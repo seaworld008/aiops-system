@@ -5,6 +5,7 @@
 ## 开发要求
 
 - Go 1.26.5（仓库 `toolchain` 会自动选择）
+- PostgreSQL 16+（作用域完整性迁移使用生成列）
 - 后续集成测试需要 PostgreSQL、Temporal、Keycloak、Vault 和 S3 兼容对象存储
 
 ## 本地命令

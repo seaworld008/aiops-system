@@ -60,7 +60,7 @@ func (client *Client) Query(ctx context.Context, expression string, at time.Time
 	query.Set("time", at.UTC().Format(time.RFC3339Nano))
 	endpoint.RawQuery = query.Encode()
 
-	return client.execute(ctx, endpoint, expression, false)
+	return client.execute(ctx, endpoint, expression)
 }
 
 func (client *Client) QueryRange(ctx context.Context, queryRequest RangeRequest) (connectors.Result, error) {
@@ -91,10 +91,10 @@ func (client *Client) QueryRange(ctx context.Context, queryRequest RangeRequest)
 	query.Set("step", strconv.FormatFloat(queryRequest.Step.Seconds(), 'f', -1, 64))
 	endpoint.RawQuery = query.Encode()
 
-	return client.execute(ctx, endpoint, queryRequest.Expression, true)
+	return client.execute(ctx, endpoint, queryRequest.Expression)
 }
 
-func (client *Client) execute(ctx context.Context, endpoint url.URL, expression string, enforceSampleBudget bool) (connectors.Result, error) {
+func (client *Client) execute(ctx context.Context, endpoint url.URL, expression string) (connectors.Result, error) {
 	requestCtx, cancel := context.WithTimeout(ctx, client.budget.Timeout)
 	defer cancel()
 	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint.String(), nil)
@@ -116,7 +116,8 @@ func (client *Client) execute(ctx context.Context, endpoint url.URL, expression 
 	var envelope struct {
 		Status string `json:"status"`
 		Data   struct {
-			Result []json.RawMessage `json:"result"`
+			ResultType string          `json:"resultType"`
+			Result     json.RawMessage `json:"result"`
 		} `json:"data"`
 		Error string `json:"error"`
 	}
@@ -126,41 +127,73 @@ func (client *Client) execute(ctx context.Context, endpoint url.URL, expression 
 	if envelope.Status != "success" {
 		return connectors.Result{}, fmt.Errorf("Prometheus query failed: %s", envelope.Error)
 	}
-	if enforceSampleBudget {
-		samples, err := countRangeSamples(envelope.Data.Result)
-		if err != nil {
-			return connectors.Result{}, err
-		}
-		if samples > client.budget.MaxSamples {
-			return connectors.Result{}, fmt.Errorf("Prometheus returned %d samples, exceeding budget %d", samples, client.budget.MaxSamples)
-		}
+	items, err := decodeResultItems(envelope.Data.ResultType, envelope.Data.Result)
+	if err != nil {
+		return connectors.Result{}, err
 	}
-	truncated := len(envelope.Data.Result) > client.budget.MaxItems
+	samples, err := countSamples(envelope.Data.ResultType, items)
+	if err != nil {
+		return connectors.Result{}, err
+	}
+	if samples > client.budget.MaxSamples {
+		return connectors.Result{}, fmt.Errorf("Prometheus returned %d samples, exceeding budget %d", samples, client.budget.MaxSamples)
+	}
+	truncated := len(items) > client.budget.MaxItems
 	if truncated {
-		envelope.Data.Result = envelope.Data.Result[:client.budget.MaxItems]
+		items = items[:client.budget.MaxItems]
 	}
 	sum := sha256.Sum256(body)
 	return connectors.Result{
 		Source:      "prometheus",
 		Query:       expression,
 		CollectedAt: client.clock().UTC(),
-		ItemCount:   len(envelope.Data.Result),
+		ItemCount:   len(items),
 		ContentHash: hex.EncodeToString(sum[:]),
 		Truncated:   truncated,
-		Items:       envelope.Data.Result,
+		Items:       items,
 	}, nil
 }
 
-func countRangeSamples(items []json.RawMessage) (int, error) {
+func decodeResultItems(resultType string, raw json.RawMessage) ([]json.RawMessage, error) {
+	switch resultType {
+	case "vector", "matrix":
+		var items []json.RawMessage
+		if err := json.Unmarshal(raw, &items); err != nil {
+			return nil, fmt.Errorf("decode Prometheus %s result: %w", resultType, err)
+		}
+		return items, nil
+	case "scalar", "string":
+		if len(raw) == 0 || string(raw) == "null" {
+			return nil, nil
+		}
+		return []json.RawMessage{raw}, nil
+	default:
+		return nil, fmt.Errorf("unsupported Prometheus result type %q", resultType)
+	}
+}
+
+func countSamples(resultType string, items []json.RawMessage) (int, error) {
+	if resultType == "scalar" || resultType == "string" {
+		return len(items), nil
+	}
 	total := 0
 	for _, item := range items {
 		var series struct {
-			Values []json.RawMessage `json:"values"`
+			Value      json.RawMessage   `json:"value"`
+			Histogram  json.RawMessage   `json:"histogram"`
+			Values     []json.RawMessage `json:"values"`
+			Histograms []json.RawMessage `json:"histograms"`
 		}
 		if err := json.Unmarshal(item, &series); err != nil {
-			return 0, fmt.Errorf("decode Prometheus range series: %w", err)
+			return 0, fmt.Errorf("decode Prometheus series: %w", err)
 		}
-		total += len(series.Values)
+		if len(series.Value) > 0 && string(series.Value) != "null" {
+			total++
+		}
+		if len(series.Histogram) > 0 && string(series.Histogram) != "null" {
+			total++
+		}
+		total += len(series.Values) + len(series.Histograms)
 	}
 	return total, nil
 }

@@ -2,12 +2,16 @@ package signal_test
 
 import (
 	"context"
+	"regexp"
 	"testing"
 	"time"
 
+	"github.com/aiops-system/control-plane/internal/domain"
 	"github.com/aiops-system/control-plane/internal/signal"
 	"github.com/aiops-system/control-plane/internal/store/memory"
 )
+
+var uuidV4Pattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 func TestIngestAlertmanagerCreatesOneSignalPerAlert(t *testing.T) {
 	repository := memory.New()
@@ -56,4 +60,26 @@ func TestIngestRejectsUnsupportedProvider(t *testing.T) {
 	if err == nil {
 		t.Fatal("Ingest() error = nil, want unsupported provider")
 	}
+}
+
+func TestIngestGeneratesPostgresCompatibleUUID(t *testing.T) {
+	repository := &capturingRepository{}
+	service := signal.NewService(repository, time.Now)
+	payload := []byte(`{"event_id":"evt-1","hash":"host-1/cpu","trigger_time":1783650000}`)
+
+	if _, err := service.Ingest(context.Background(), "workspace-1", "integration-1", "nightingale", payload); err != nil {
+		t.Fatalf("Ingest() error = %v", err)
+	}
+	if len(repository.signals) != 1 || !uuidV4Pattern.MatchString(repository.signals[0].ID) {
+		t.Fatalf("generated signal ID = %q, want UUIDv4", repository.signals[0].ID)
+	}
+}
+
+type capturingRepository struct {
+	signals []domain.Signal
+}
+
+func (repository *capturingRepository) CreateSignal(_ context.Context, item domain.Signal) (bool, error) {
+	repository.signals = append(repository.signals, item)
+	return true, nil
 }

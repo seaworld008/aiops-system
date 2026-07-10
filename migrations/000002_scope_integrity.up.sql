@@ -117,6 +117,11 @@ ALTER TABLE hypothesis_evidence ADD CONSTRAINT hypothesis_evidence_evidence_scop
     FOREIGN KEY (tenant_id, workspace_id, investigation_id, evidence_id)
     REFERENCES evidence (tenant_id, workspace_id, investigation_id, id);
 
+CREATE INDEX incident_signals_signal_scope_idx
+    ON incident_signals (tenant_id, workspace_id, signal_id);
+CREATE INDEX hypothesis_evidence_evidence_scope_idx
+    ON hypothesis_evidence (tenant_id, workspace_id, investigation_id, evidence_id);
+
 CREATE OR REPLACE FUNCTION reject_investigation_reparenting() RETURNS trigger AS $$
 BEGIN
     IF OLD.tenant_id IS DISTINCT FROM NEW.tenant_id

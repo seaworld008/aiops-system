@@ -3,6 +3,9 @@ BEGIN;
 DROP TRIGGER IF EXISTS investigations_no_reparenting ON investigations;
 DROP FUNCTION IF EXISTS reject_investigation_reparenting();
 
+DROP INDEX IF EXISTS hypothesis_evidence_evidence_scope_idx;
+DROP INDEX IF EXISTS incident_signals_signal_scope_idx;
+
 ALTER TABLE hypothesis_evidence DROP CONSTRAINT IF EXISTS hypothesis_evidence_evidence_scope_fk;
 ALTER TABLE hypothesis_evidence DROP CONSTRAINT IF EXISTS hypothesis_evidence_hypothesis_scope_fk;
 ALTER TABLE incident_signals DROP CONSTRAINT IF EXISTS incident_signals_signal_scope_fk;

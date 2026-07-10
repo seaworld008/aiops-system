@@ -71,9 +71,9 @@ func TestQueryRangeSendsBoundsAndStep(t *testing.T) {
 	start := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
 	if _, err := client.QueryRange(context.Background(), prometheus.RangeRequest{
 		Expression: "rate(http_requests_total[5m])",
-		Start: start,
-		End: start.Add(10 * time.Minute),
-		Step: 30 * time.Second,
+		Start:      start,
+		End:        start.Add(10 * time.Minute),
+		Step:       30 * time.Second,
 	}); err != nil {
 		t.Fatalf("QueryRange() error = %v", err)
 	}
@@ -95,5 +95,45 @@ func TestQueryRangeRejectsWindowOrSampleBudgetOverflow(t *testing.T) {
 		if _, err := client.QueryRange(context.Background(), request); err == nil {
 			t.Fatalf("QueryRange(%#v) error = nil, want budget rejection", request)
 		}
+	}
+}
+
+func TestQueryRejectsActualInstantSampleOverflow(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[1,"1"]},{"histogram":[1,{"count":"1"}]}]}}`))
+	}))
+	defer server.Close()
+
+	budget := connectors.DefaultBudget()
+	budget.MaxSamples = 1
+	client, err := prometheus.New(server.URL, nil, budget)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if _, err := client.Query(context.Background(), "up", time.Now()); err == nil {
+		t.Fatal("Query() error = nil, want actual sample budget rejection")
+	}
+}
+
+func TestQueryRangeCountsNativeHistogramSamples(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[{"histograms":[[1,{"count":"1"}],[2,{"count":"1"}]]},{"values":[[1,"1"],[2,"1"]]}]}}`))
+	}))
+	defer server.Close()
+
+	budget := connectors.DefaultBudget()
+	budget.MaxSamples = 2
+	client, err := prometheus.New(server.URL, nil, budget)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	start := time.Now().UTC()
+	if _, err := client.QueryRange(context.Background(), prometheus.RangeRequest{
+		Expression: "up",
+		Start:      start,
+		End:        start.Add(time.Minute),
+		Step:       time.Minute,
+	}); err == nil {
+		t.Fatal("QueryRange() error = nil, want native histogram sample budget rejection")
 	}
 }
