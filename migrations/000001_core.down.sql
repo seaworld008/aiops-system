@@ -21,9 +21,9 @@ DROP TABLE IF EXISTS incidents;
 DROP TABLE IF EXISTS signals;
 DROP TABLE IF EXISTS service_bindings;
 DROP TABLE IF EXISTS services;
+DROP TABLE IF EXISTS integrations;
 DROP TABLE IF EXISTS environments;
 DROP TABLE IF EXISTS workspaces;
 DROP TABLE IF EXISTS tenants;
 
 COMMIT;
-

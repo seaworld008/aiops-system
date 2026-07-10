@@ -20,6 +20,7 @@ func TestIncidentRejectsInvalidStateTransition(t *testing.T) {
 
 func TestIncidentAllowsOrderedLifecycle(t *testing.T) {
 	incident := domain.NewIncident("incident-1", "workspace-1", time.Now())
+	initialVersion := incident.Version
 	for _, next := range []domain.IncidentStatus{
 		domain.IncidentInvestigating,
 		domain.IncidentMitigating,
@@ -29,6 +30,9 @@ func TestIncidentAllowsOrderedLifecycle(t *testing.T) {
 		if err := incident.Transition(next); err != nil {
 			t.Fatalf("Transition(%s) error = %v", next, err)
 		}
+	}
+	if incident.Version != initialVersion+4 {
+		t.Fatalf("Version = %d, want %d", incident.Version, initialVersion+4)
 	}
 }
 
@@ -65,5 +69,31 @@ func TestIncidentRejectsHypothesisFromAnotherIncidentOrWorkspace(t *testing.T) {
 		if err := incident.ConfirmRootCause(&hypothesis, domain.Actor{Type: domain.ActorHuman, ID: "user-1"}); err == nil {
 			t.Fatalf("ConfirmRootCause(%#v) error = nil, want ownership rejection", hypothesis)
 		}
+	}
+}
+
+func TestNewIncidentHasPersistableRequiredFields(t *testing.T) {
+	incident := domain.NewIncident("incident-1", "workspace-1", time.Now())
+	if incident.Title == "" || incident.Severity == "" {
+		t.Fatalf("NewIncident() title/severity = %q/%q, want non-empty defaults", incident.Title, incident.Severity)
+	}
+	if err := incident.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestIncidentCreateContractRejectsPreTransitionedState(t *testing.T) {
+	incident := domain.NewIncident("incident-1", "workspace-1", time.Now())
+	incident.Status = domain.IncidentInvestigating
+	if err := incident.ValidateForCreate(); err == nil {
+		t.Fatal("ValidateForCreate() error = nil, want initial-state rejection")
+	}
+}
+
+func TestIncidentRejectsBackwardTransitionTime(t *testing.T) {
+	now := time.Now().UTC()
+	incident := domain.NewIncident("incident-1", "workspace-1", now)
+	if err := incident.TransitionAt(domain.IncidentInvestigating, now.Add(-time.Second)); err == nil {
+		t.Fatal("TransitionAt() error = nil, want backward-time rejection")
 	}
 }

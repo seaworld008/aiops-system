@@ -23,6 +23,7 @@ ALTER TABLE feedback DROP CONSTRAINT IF EXISTS feedback_investigation_scope_fk;
 ALTER TABLE hypotheses DROP CONSTRAINT IF EXISTS hypotheses_investigation_scope_fk;
 ALTER TABLE evidence DROP CONSTRAINT IF EXISTS evidence_investigation_scope_fk;
 ALTER TABLE investigations DROP CONSTRAINT IF EXISTS investigations_incident_scope_fk;
+ALTER TABLE signals DROP CONSTRAINT IF EXISTS signals_integration_scope_fk;
 ALTER TABLE incidents DROP CONSTRAINT IF EXISTS incidents_environment_scope_fk;
 ALTER TABLE incidents DROP CONSTRAINT IF EXISTS incidents_service_scope_fk;
 ALTER TABLE service_bindings DROP CONSTRAINT IF EXISTS service_bindings_environment_scope_fk;
@@ -44,6 +45,7 @@ ALTER TABLE incidents DROP CONSTRAINT IF EXISTS incidents_workspace_scope_fk;
 ALTER TABLE signals DROP CONSTRAINT IF EXISTS signals_workspace_scope_fk;
 ALTER TABLE service_bindings DROP CONSTRAINT IF EXISTS service_bindings_workspace_scope_fk;
 ALTER TABLE services DROP CONSTRAINT IF EXISTS services_workspace_scope_fk;
+ALTER TABLE integrations DROP CONSTRAINT IF EXISTS integrations_workspace_scope_fk;
 ALTER TABLE environments DROP CONSTRAINT IF EXISTS environments_workspace_scope_fk;
 
 ALTER TABLE executions DROP CONSTRAINT IF EXISTS executions_workspace_scope_uk;
@@ -58,6 +60,8 @@ ALTER TABLE investigations DROP CONSTRAINT IF EXISTS investigations_workspace_sc
 ALTER TABLE incidents DROP CONSTRAINT IF EXISTS incidents_workspace_scope_uk;
 ALTER TABLE signals DROP CONSTRAINT IF EXISTS signals_workspace_scope_uk;
 ALTER TABLE services DROP CONSTRAINT IF EXISTS services_workspace_scope_uk;
+ALTER TABLE integrations DROP CONSTRAINT IF EXISTS integrations_provider_scope_uk;
+ALTER TABLE integrations DROP CONSTRAINT IF EXISTS integrations_workspace_scope_uk;
 ALTER TABLE environments DROP CONSTRAINT IF EXISTS environments_workspace_scope_uk;
 ALTER TABLE workspaces DROP CONSTRAINT IF EXISTS workspaces_tenant_scope_uk;
 

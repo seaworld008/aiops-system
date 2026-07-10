@@ -10,6 +10,7 @@ import (
 
 	"github.com/aiops-system/control-plane/internal/httpapi"
 	"github.com/aiops-system/control-plane/internal/signal"
+	"github.com/aiops-system/control-plane/internal/store"
 )
 
 func TestWebhookAcceptsAlertmanagerWithoutIdempotencyHeader(t *testing.T) {
@@ -73,6 +74,29 @@ func TestWebhookRejectsInvalidSignature(t *testing.T) {
 
 	if res.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", res.Code)
+	}
+}
+
+func TestWebhookDoesNotExposeIntegrationScopeAsServerError(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want int
+	}{
+		{err: store.ErrScopeViolation, want: http.StatusForbidden},
+		{err: store.ErrNotFound, want: http.StatusNotFound},
+	} {
+		router := httpapi.NewRouter(httpapi.Dependencies{
+			SignalIngestor:  &fakeSignalIngestor{err: tc.err},
+			WebhookVerifier: allowWebhookVerifier{},
+		})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/integrations/i/webhooks/alertmanager", strings.NewReader(`{"alerts":[]}`))
+		req.Header.Set("X-Workspace-ID", "workspace-1")
+		req.Header.Set("Content-Type", "application/json")
+		res := httptest.NewRecorder()
+		router.ServeHTTP(res, req)
+		if res.Code != tc.want {
+			t.Fatalf("ingestor error %v returned %d, want %d", tc.err, res.Code, tc.want)
+		}
 	}
 }
 

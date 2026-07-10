@@ -15,7 +15,9 @@ import (
 	"github.com/aiops-system/control-plane/internal/httpapi"
 	signalservice "github.com/aiops-system/control-plane/internal/signal"
 	"github.com/aiops-system/control-plane/internal/store/memory"
+	postgresstore "github.com/aiops-system/control-plane/internal/store/postgres"
 	"github.com/aiops-system/control-plane/internal/webhook"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {
@@ -25,7 +27,34 @@ func main() {
 		os.Exit(1)
 	}
 
-	repository := memory.New()
+	var repository signalservice.Repository
+	ready := func() error { return nil }
+	var databasePool *pgxpool.Pool
+	if cfg.DatabaseURL == "" {
+		repository = memory.New()
+		slog.Warn("using in-memory repository; data will not survive restart")
+	} else {
+		connectCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		databasePool, err = pgxpool.New(connectCtx, cfg.DatabaseURL)
+		if err == nil {
+			err = databasePool.Ping(connectCtx)
+		}
+		cancel()
+		if err != nil {
+			slog.Error("connect PostgreSQL", "error", err)
+			if databasePool != nil {
+				databasePool.Close()
+			}
+			os.Exit(1)
+		}
+		defer databasePool.Close()
+		repository = postgresstore.New(databasePool)
+		ready = func() error {
+			pingCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			return databasePool.Ping(pingCtx)
+		}
+	}
 	signalIngestor := signalservice.NewService(repository, time.Now)
 	webhookVerifier := webhook.NewHMACVerifier(func(_, _ string) ([]byte, error) {
 		if cfg.WebhookHMACSecret == "" {
@@ -37,6 +66,7 @@ func main() {
 		Addr: cfg.HTTPAddr,
 		Handler: httpapi.NewRouter(httpapi.Dependencies{
 			Version:         buildinfo.Version,
+			Ready:           ready,
 			SignalIngestor:  signalIngestor,
 			WebhookVerifier: webhookVerifier,
 		}),

@@ -40,8 +40,19 @@ func TestLoadRejectsInvalidShutdownTimeout(t *testing.T) {
 func TestLoadRejectsProductionWithoutWebhookSecret(t *testing.T) {
 	t.Setenv("AIOPS_ENVIRONMENT", "production")
 	t.Setenv("AIOPS_WEBHOOK_HMAC_SECRET", "")
+	t.Setenv("AIOPS_DATABASE_URL", "postgres://configured")
 
 	if _, err := config.Load(); err == nil {
 		t.Fatal("Load() error = nil, want fail-closed production configuration")
+	}
+}
+
+func TestLoadRejectsProductionWithoutDatabaseURL(t *testing.T) {
+	t.Setenv("AIOPS_ENVIRONMENT", "production")
+	t.Setenv("AIOPS_WEBHOOK_HMAC_SECRET", "configured")
+	t.Setenv("AIOPS_DATABASE_URL", "")
+
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load() error = nil, want database fail-closed production configuration")
 	}
 }

@@ -110,6 +110,10 @@ func webhookHandler(ingestor SignalIngestor, verifier WebhookVerifier) http.Hand
 				writeProblem(w, http.StatusNotFound, "unsupported_signal_provider", "Signal provider is not supported")
 			case errors.Is(err, store.ErrIdempotencyConflict):
 				writeProblem(w, http.StatusConflict, "provider_event_conflict", "Provider event ID was reused with a different payload")
+			case errors.Is(err, store.ErrScopeViolation):
+				writeProblem(w, http.StatusForbidden, "integration_scope_violation", "Integration is not authorized for this workspace or provider")
+			case errors.Is(err, store.ErrNotFound):
+				writeProblem(w, http.StatusNotFound, "integration_not_found", "Integration was not found")
 			default:
 				writeProblem(w, http.StatusInternalServerError, "signal_ingestion_failed", "Signal ingestion failed")
 			}

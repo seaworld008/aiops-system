@@ -25,6 +25,20 @@ CREATE TABLE environments (
     UNIQUE (workspace_id, name)
 );
 
+CREATE TABLE integrations (
+    id uuid PRIMARY KEY,
+    tenant_id uuid NOT NULL REFERENCES tenants(id),
+    workspace_id uuid NOT NULL REFERENCES workspaces(id),
+    provider text NOT NULL,
+    name text NOT NULL,
+    secret_ref text NOT NULL,
+    config jsonb NOT NULL DEFAULT '{}'::jsonb,
+    enabled boolean NOT NULL DEFAULT true,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, provider, name)
+);
+
 CREATE TABLE services (
     id uuid PRIMARY KEY,
     tenant_id uuid NOT NULL REFERENCES tenants(id),
@@ -60,7 +74,7 @@ CREATE TABLE signals (
     id uuid PRIMARY KEY,
     tenant_id uuid NOT NULL REFERENCES tenants(id),
     workspace_id uuid NOT NULL REFERENCES workspaces(id),
-    integration_id uuid NOT NULL,
+    integration_id uuid NOT NULL REFERENCES integrations(id),
     provider text NOT NULL,
     provider_event_id text NOT NULL,
     payload_hash text NOT NULL,
@@ -68,7 +82,7 @@ CREATE TABLE signals (
     observed_at timestamptz NOT NULL,
     payload_summary jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (workspace_id, integration_id, provider_event_id)
+    UNIQUE (integration_id, provider_event_id)
 );
 
 CREATE INDEX signals_fingerprint_idx ON signals (workspace_id, fingerprint, observed_at DESC);

@@ -4,6 +4,8 @@ BEGIN;
 -- reference instead of trusting globally unique UUIDs alone.
 ALTER TABLE workspaces ADD CONSTRAINT workspaces_tenant_scope_uk UNIQUE (tenant_id, id);
 ALTER TABLE environments ADD CONSTRAINT environments_workspace_scope_uk UNIQUE (tenant_id, workspace_id, id);
+ALTER TABLE integrations ADD CONSTRAINT integrations_workspace_scope_uk UNIQUE (tenant_id, workspace_id, id);
+ALTER TABLE integrations ADD CONSTRAINT integrations_provider_scope_uk UNIQUE (tenant_id, workspace_id, id, provider);
 ALTER TABLE services ADD CONSTRAINT services_workspace_scope_uk UNIQUE (tenant_id, workspace_id, id);
 ALTER TABLE signals ADD CONSTRAINT signals_workspace_scope_uk UNIQUE (tenant_id, workspace_id, id);
 ALTER TABLE incidents ADD CONSTRAINT incidents_workspace_scope_uk UNIQUE (tenant_id, workspace_id, id);
@@ -20,6 +22,8 @@ ALTER TABLE executions ADD CONSTRAINT executions_workspace_scope_uk UNIQUE (tena
 ALTER TABLE environments ADD CONSTRAINT environments_workspace_scope_fk
     FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspaces (tenant_id, id);
 ALTER TABLE services ADD CONSTRAINT services_workspace_scope_fk
+    FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspaces (tenant_id, id);
+ALTER TABLE integrations ADD CONSTRAINT integrations_workspace_scope_fk
     FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspaces (tenant_id, id);
 ALTER TABLE service_bindings ADD CONSTRAINT service_bindings_workspace_scope_fk
     FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspaces (tenant_id, id);
@@ -64,6 +68,9 @@ ALTER TABLE incidents ADD CONSTRAINT incidents_service_scope_fk
 ALTER TABLE incidents ADD CONSTRAINT incidents_environment_scope_fk
     FOREIGN KEY (tenant_id, workspace_id, environment_id)
     REFERENCES environments (tenant_id, workspace_id, id);
+ALTER TABLE signals ADD CONSTRAINT signals_integration_scope_fk
+    FOREIGN KEY (tenant_id, workspace_id, integration_id, provider)
+    REFERENCES integrations (tenant_id, workspace_id, id, provider);
 ALTER TABLE investigations ADD CONSTRAINT investigations_incident_scope_fk
     FOREIGN KEY (tenant_id, workspace_id, incident_id)
     REFERENCES incidents (tenant_id, workspace_id, id);

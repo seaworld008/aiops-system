@@ -2,7 +2,6 @@ package signal
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aiops-system/control-plane/internal/domain"
+	"github.com/aiops-system/control-plane/internal/ids"
 )
 
 var (
@@ -118,7 +118,7 @@ func (service *Service) normalizeAlertmanager(workspaceID, integrationID string,
 			status = incoming.Status
 		}
 		result = append(result, domain.Signal{
-			ID:              newID(),
+			ID:              ids.NewUUID(),
 			WorkspaceID:     workspaceID,
 			IntegrationID:   integrationID,
 			Provider:        "alertmanager",
@@ -151,7 +151,7 @@ func (service *Service) normalizeNightingale(workspaceID, integrationID string, 
 		fingerprint = incoming.EventID
 	}
 	return []domain.Signal{{
-		ID:              newID(),
+		ID:              ids.NewUUID(),
 		WorkspaceID:     workspaceID,
 		IntegrationID:   integrationID,
 		Provider:        "nightingale",
@@ -165,14 +165,4 @@ func (service *Service) normalizeNightingale(workspaceID, integrationID string, 
 func hashBytes(value []byte) string {
 	sum := sha256.Sum256(value)
 	return hex.EncodeToString(sum[:])
-}
-
-func newID() string {
-	var value [16]byte
-	if _, err := rand.Read(value[:]); err != nil {
-		panic("crypto/rand unavailable: " + err.Error())
-	}
-	value[6] = (value[6] & 0x0f) | 0x40
-	value[8] = (value[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", value[0:4], value[4:6], value[6:8], value[8:10], value[10:16])
 }

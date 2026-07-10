@@ -17,6 +17,7 @@ type Config struct {
 	Environment       string
 	ShutdownTimeout   time.Duration
 	WebhookHMACSecret string
+	DatabaseURL       string
 }
 
 func Load() (Config, error) {
@@ -25,6 +26,7 @@ func Load() (Config, error) {
 		Environment:       valueOrDefault("AIOPS_ENVIRONMENT", defaultEnvironment),
 		ShutdownTimeout:   defaultShutdownTimeout,
 		WebhookHMACSecret: os.Getenv("AIOPS_WEBHOOK_HMAC_SECRET"),
+		DatabaseURL:       os.Getenv("AIOPS_DATABASE_URL"),
 	}
 
 	if raw := os.Getenv("AIOPS_SHUTDOWN_TIMEOUT"); raw != "" {
@@ -39,6 +41,9 @@ func Load() (Config, error) {
 	}
 	if cfg.Environment == "production" && cfg.WebhookHMACSecret == "" {
 		return Config{}, fmt.Errorf("AIOPS_WEBHOOK_HMAC_SECRET is required in production")
+	}
+	if cfg.Environment == "production" && cfg.DatabaseURL == "" {
+		return Config{}, fmt.Errorf("AIOPS_DATABASE_URL is required in production")
 	}
 
 	return cfg, nil
