@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -307,6 +308,51 @@ func TestMemoryActionQueuePermanentlyRejectsPoisonedPreStartAction(t *testing.T)
 	}
 }
 
+func TestMemoryActionQueueRejectConsumesFenceAndKeepsOnlyTokenHashForIdempotency(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	envelope, _ := signedEnvelope(t, restartEnvelope(now))
+	queue := mustMemoryActionQueue(t, func() time.Time { return now })
+	submitted := submitAction(t, queue, envelope, "environment-1", true)
+	claimed := claimAction(t, queue, "runner-1", []string{"workspace-1"}, []string{"PROD"})
+	fence := claimed.Execution.Fence()
+	reason := ActionQueueReason{Code: "INVALID_VERIFIED_ACTION", DetailHash: strings.Repeat("a", 64)}
+
+	rejected, err := queue.Reject(context.Background(), ActionRejectRequest{Lease: fence, Reason: reason})
+	if err != nil {
+		t.Fatalf("Reject() error = %v", err)
+	}
+	if rejected.Status != executionlease.StatusFailed || rejected.LeaseToken != "" {
+		t.Fatalf("Reject() = %#v", rejected)
+	}
+
+	queue.mu.Lock()
+	record := queue.records[submitted.ExecutionID]
+	queue.mu.Unlock()
+	if record.execution.LeaseToken != "" {
+		t.Fatalf("stored plaintext lease token = %q, want empty", record.execution.LeaseToken)
+	}
+	if record.completedTokenHash != hashLeaseToken(fence.Token) || record.completedEpoch != fence.Epoch {
+		t.Fatalf("stored completion fence = (%q, %d), want (%q, %d)",
+			record.completedTokenHash, record.completedEpoch, hashLeaseToken(fence.Token), fence.Epoch)
+	}
+
+	if _, err := queue.Reject(context.Background(), ActionRejectRequest{Lease: fence, Reason: reason}); err != nil {
+		t.Fatalf("Reject(idempotent replay) error = %v", err)
+	}
+	differentReason := reason
+	differentReason.DetailHash = strings.Repeat("b", 64)
+	if _, err := queue.Reject(context.Background(), ActionRejectRequest{Lease: fence, Reason: differentReason}); !errors.Is(err, executionlease.ErrCompletionConflict) {
+		t.Fatalf("Reject(conflicting replay) error = %v, want %v", err, executionlease.ErrCompletionConflict)
+	}
+	wrongToken := fence
+	wrongToken.Token = "wrong-token"
+	if _, err := queue.Reject(context.Background(), ActionRejectRequest{Lease: wrongToken, Reason: reason}); !errors.Is(err, executionlease.ErrStaleLease) {
+		t.Fatalf("Reject(stale replay) error = %v, want %v", err, executionlease.ErrStaleLease)
+	}
+}
+
 func TestMemoryActionQueueNackUsesFencedBackoffBeforeRedelivery(t *testing.T) {
 	t.Parallel()
 
@@ -547,6 +593,52 @@ func TestMemoryActionQueueClaimCapsInitialLeaseAtAuthorizationExpiry(t *testing.
 	}
 	if !claimed.Execution.LeaseExpiresAt.Equal(envelope.ExpiresAt) {
 		t.Fatalf("Claim() lease expiry = %s, want authorization cap %s", claimed.Execution.LeaseExpiresAt, envelope.ExpiresAt)
+	}
+}
+
+func TestMemoryActionQueueClaimRechecksAuthorizationAfterSlowTokenSource(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	clock := now
+	tokenCalls := 0
+	queue, err := NewMemoryActionQueue(MemoryActionQueueOptions{
+		Clock: func() time.Time { return clock },
+		TokenSource: func() (string, error) {
+			tokenCalls++
+			if tokenCalls == 1 {
+				clock = now.Add(3 * time.Minute)
+			}
+			return fmt.Sprintf("queue-lease-token-%d", tokenCalls), nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewMemoryActionQueue() error = %v", err)
+	}
+	expiringUnsigned := restartEnvelope(now)
+	expiringUnsigned.ExpiresAt = now.Add(2 * time.Minute)
+	expiringUnsigned.CredentialScope.TTLSeconds = 60
+	expiring, _ := signedEnvelope(t, expiringUnsigned)
+	validUnsigned := restartEnvelope(now)
+	validUnsigned.ActionID = "action-valid-after-slow-token"
+	validUnsigned.IdempotencyKey = "idem-valid-after-slow-token"
+	valid, _ := signedEnvelope(t, validUnsigned)
+	submitAction(t, queue, expiring, "environment-1", false)
+	submitAction(t, queue, valid, "environment-1", false)
+
+	claimed, err := queue.Claim(context.Background(), ActionClaimRequest{
+		Scope:         testRunnerScope(t, "runner-slow-token", RunnerScopeBinding{WorkspaceID: "workspace-1", EnvironmentID: "PROD"}),
+		LeaseDuration: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Claim() error = %v", err)
+	}
+	if claimed.Execution.ExecutionID != valid.ActionID || tokenCalls != 2 || !claimed.Execution.LeaseAcquiredAt.Equal(clock) {
+		t.Fatalf("Claim(slow token) = %#v, token calls=%d, want valid action acquired at %s", claimed.Execution, tokenCalls, clock)
+	}
+	storedExpiring, err := queue.Get(context.Background(), expiring.ActionID)
+	if err != nil || storedExpiring.Status != executionlease.StatusQueued {
+		t.Fatalf("Get(expired during token generation) = %#v, %v", storedExpiring, err)
 	}
 }
 

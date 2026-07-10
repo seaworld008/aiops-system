@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -270,8 +271,14 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	claimLockSubmission.Production = false
 	tokenRequested := make(chan struct{})
 	releaseToken := make(chan struct{})
+	var tokenRequestedOnce sync.Once
+	var releaseTokenOnce sync.Once
+	releaseTokenGate := func() {
+		releaseTokenOnce.Do(func() { close(releaseToken) })
+	}
+	defer releaseTokenGate()
 	claimLockQueue, err := executionpostgres.New(database, executionpostgres.Options{TokenSource: func() (string, error) {
-		close(tokenRequested)
+		tokenRequestedOnce.Do(func() { close(tokenRequested) })
 		<-releaseToken
 		return strings.Repeat("9", 64), nil
 	}})
@@ -287,33 +294,36 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	}
 	lockedClaimDone := make(chan lockedClaimResult, 1)
 	lockedScope := realRunnerScope(t, ctx, database, "runner-postgres-1")
+	lockedClaimContext, cancelLockedClaim := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelLockedClaim()
 	go func() {
-		claim, claimErr := claimLockQueue.Claim(ctx, execution.ActionClaimRequest{Scope: lockedScope, LeaseDuration: time.Minute})
+		claim, claimErr := claimLockQueue.Claim(lockedClaimContext, execution.ActionClaimRequest{Scope: lockedScope, LeaseDuration: time.Minute})
 		lockedClaimDone <- lockedClaimResult{claim: claim, err: claimErr}
 	}()
 	select {
 	case <-tokenRequested:
-	case <-time.After(5 * time.Second):
-		t.Fatal("claim did not reach token source while holding registry lock")
+	case <-lockedClaimContext.Done():
+		t.Fatalf("claim did not reach token source while holding registry lock: %v", lockedClaimContext.Err())
 	}
 	deleteContext, cancelDelete := context.WithTimeout(ctx, 250*time.Millisecond)
 	_, deleteErr := database.Exec(deleteContext, `
 		DELETE FROM runner_scope_bindings
 		WHERE runner_id = 'runner-postgres-1' AND tenant_id = $1 AND workspace_id = $2 AND environment_id = $3
 	`, tenantID, workspaceID, environmentID)
+	deleteContextErr := deleteContext.Err()
 	cancelDelete()
-	close(releaseToken)
+	releaseTokenGate()
 	var lockedClaim lockedClaimResult
 	select {
 	case lockedClaim = <-lockedClaimDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("claim did not finish after token source release")
+	case <-lockedClaimContext.Done():
+		t.Fatalf("claim did not finish after token source release: %v", lockedClaimContext.Err())
 	}
 	if lockedClaim.err != nil {
 		t.Fatalf("claim-lock Claim() error = %v", lockedClaim.err)
 	}
-	if deleteErr == nil || !errors.Is(deleteContext.Err(), context.DeadlineExceeded) {
-		t.Fatalf("scope binding delete was not blocked by Claim registration lock: error=%v context=%v", deleteErr, deleteContext.Err())
+	if deleteErr == nil || !errors.Is(deleteContextErr, context.DeadlineExceeded) {
+		t.Fatalf("scope binding delete was not blocked by Claim registration lock: error=%v context=%v", deleteErr, deleteContextErr)
 	}
 	if _, err := claimLockQueue.Cancel(ctx, lockedClaim.claim.Execution.ExecutionID); err != nil {
 		t.Fatalf("cancel claim-lock action: %v", err)
@@ -350,12 +360,19 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	}
 	start := make(chan struct{})
 	results := make(chan claimResult, 2)
-	for _, runnerID := range []string{"runner-postgres-1", "runner-postgres-2"} {
-		runnerID := runnerID
+	runnerIDs := []string{"runner-postgres-1", "runner-postgres-2"}
+	runnerScopes := make([]execution.RunnerScope, len(runnerIDs))
+	for index, runnerID := range runnerIDs {
+		runnerScopes[index] = realRunnerScope(t, ctx, database, runnerID)
+	}
+	claimContext, cancelClaims := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelClaims()
+	for _, runnerScope := range runnerScopes {
+		runnerScope := runnerScope
 		go func() {
 			<-start
-			claim, claimErr := queue.Claim(ctx, execution.ActionClaimRequest{
-				Scope:         realRunnerScope(t, ctx, database, runnerID),
+			claim, claimErr := queue.Claim(claimContext, execution.ActionClaimRequest{
+				Scope:         runnerScope,
 				LeaseDuration: time.Minute,
 			})
 			results <- claimResult{claim: claim, err: claimErr}
@@ -365,7 +382,12 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	var claimed execution.ClaimedAction
 	var winners, blocked int
 	for range 2 {
-		result := <-results
+		var result claimResult
+		select {
+		case result = <-results:
+		case <-claimContext.Done():
+			t.Fatalf("timed out waiting for concurrent ActionQueue.Claim results: %v", claimContext.Err())
+		}
 		switch {
 		case result.err == nil:
 			claimed = result.claim
@@ -635,6 +657,7 @@ func exerciseRealRegistrationRaces(
 	fence := claimed.Execution.Fence()
 
 	disableTx, disableXID := beginRunnerDisable(t, ctx, database, runnerID)
+	defer rollbackTestTransaction(disableTx)
 	startResults := make(chan realExecutionCallResult, 1)
 	startDone := make(chan struct{})
 	startContext, cancelStart := context.WithTimeout(ctx, 5*time.Second)
@@ -658,6 +681,7 @@ func exerciseRealRegistrationRaces(
 	}
 
 	actionTx, actionXID := beginActionRowBlock(t, ctx, database, fence.ExecutionID)
+	defer rollbackTestTransaction(actionTx)
 	heartbeatResults := make(chan realHeartbeatCallResult, 1)
 	heartbeatDone := make(chan struct{})
 	heartbeatContext, cancelHeartbeat := context.WithTimeout(ctx, 5*time.Second)
@@ -674,11 +698,12 @@ func exerciseRealRegistrationRaces(
 	`, runnerID)
 	updateContextErr := updateContext.Err()
 	cancelUpdate()
-	if disableErr == nil || !errors.Is(updateContextErr, context.DeadlineExceeded) {
-		t.Fatalf("runner disable was not blocked by Heartbeat registration lock: error=%v context=%v", disableErr, updateContextErr)
-	}
+	disableWasBlocked := disableErr != nil && errors.Is(updateContextErr, context.DeadlineExceeded)
 	commitTestTransaction(t, ctx, actionTx, "release Heartbeat action row")
 	heartbeatResult := awaitHeartbeatCall(t, heartbeatResults, "Heartbeat holding registration lock")
+	if !disableWasBlocked {
+		t.Fatalf("runner disable was not blocked by Heartbeat registration lock: error=%v context=%v", disableErr, updateContextErr)
+	}
 	if heartbeatResult.err != nil || heartbeatResult.heartbeat.Directive != execution.HeartbeatContinue ||
 		heartbeatResult.heartbeat.Execution.HeartbeatSeq != 1 {
 		t.Fatalf("Heartbeat(operation wins) = %#v, %v", heartbeatResult.heartbeat, heartbeatResult.err)
@@ -686,6 +711,7 @@ func exerciseRealRegistrationRaces(
 
 	beforeExpiry := heartbeatResult.heartbeat.Execution.LeaseExpiresAt
 	disableTx, disableXID = beginRunnerDisable(t, ctx, database, runnerID)
+	defer rollbackTestTransaction(disableTx)
 	heartbeatResults = make(chan realHeartbeatCallResult, 1)
 	heartbeatDone = make(chan struct{})
 	expiredHeartbeatContext, cancelExpiredHeartbeat := context.WithTimeout(ctx, 5*time.Second)
@@ -712,6 +738,7 @@ func exerciseRealRegistrationRaces(
 		},
 	}
 	disableTx, disableXID = beginRunnerDisable(t, ctx, database, runnerID)
+	defer rollbackTestTransaction(disableTx)
 	completeResults := make(chan realExecutionCallResult, 1)
 	completeDone := make(chan struct{})
 	completeContext, cancelComplete := context.WithTimeout(ctx, 5*time.Second)
@@ -745,38 +772,54 @@ func exerciseRealRegistrationRaces(
 
 func beginRunnerDisable(t *testing.T, ctx context.Context, database *pgxpool.Pool, runnerID string) (pgx.Tx, string) {
 	t.Helper()
-	tx, err := database.Begin(ctx)
+	operationContext, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	tx, err := database.Begin(operationContext)
 	if err != nil {
 		t.Fatalf("begin runner disable transaction: %v", err)
 	}
-	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
-	if _, err := tx.Exec(ctx, `
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			rollbackTestTransaction(tx)
+		}
+	}()
+	if _, err := tx.Exec(operationContext, `
 		UPDATE runner_registrations SET enabled = false, updated_at = statement_timestamp() WHERE runner_id = $1
 	`, runnerID); err != nil {
 		t.Fatalf("disable runner in transaction: %v", err)
 	}
 	var xid string
-	if err := tx.QueryRow(ctx, `SELECT txid_current()::text`).Scan(&xid); err != nil {
+	if err := tx.QueryRow(operationContext, `SELECT txid_current()::text`).Scan(&xid); err != nil {
 		t.Fatalf("read runner disable transaction ID: %v", err)
 	}
+	handedOff = true
 	return tx, xid
 }
 
 func beginActionRowBlock(t *testing.T, ctx context.Context, database *pgxpool.Pool, actionID string) (pgx.Tx, string) {
 	t.Helper()
-	tx, err := database.Begin(ctx)
+	operationContext, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	tx, err := database.Begin(operationContext)
 	if err != nil {
 		t.Fatalf("begin action row blocker: %v", err)
 	}
-	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			rollbackTestTransaction(tx)
+		}
+	}()
 	var lockedActionID string
-	if err := tx.QueryRow(ctx, `SELECT action_id FROM action_queue WHERE action_id = $1 FOR UPDATE`, actionID).Scan(&lockedActionID); err != nil {
+	if err := tx.QueryRow(operationContext, `SELECT action_id FROM action_queue WHERE action_id = $1 FOR UPDATE`, actionID).Scan(&lockedActionID); err != nil {
 		t.Fatalf("lock action row: %v", err)
 	}
 	var xid string
-	if err := tx.QueryRow(ctx, `SELECT txid_current()::text`).Scan(&xid); err != nil {
+	if err := tx.QueryRow(operationContext, `SELECT txid_current()::text`).Scan(&xid); err != nil {
 		t.Fatalf("read action blocker transaction ID: %v", err)
 	}
+	handedOff = true
 	return tx, xid
 }
 
@@ -818,9 +861,17 @@ func waitForTransactionWaiter(
 
 func commitTestTransaction(t *testing.T, ctx context.Context, tx pgx.Tx, operation string) {
 	t.Helper()
-	if err := tx.Commit(ctx); err != nil {
+	commitContext, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := tx.Commit(commitContext); err != nil {
 		t.Fatalf("%s: %v", operation, err)
 	}
+}
+
+func rollbackTestTransaction(tx pgx.Tx) {
+	rollbackContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = tx.Rollback(rollbackContext)
 }
 
 func setRunnerEnabled(t *testing.T, ctx context.Context, database *pgxpool.Pool, runnerID string, enabled bool) {

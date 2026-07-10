@@ -346,6 +346,13 @@ func (queue *MemoryActionQueue) Claim(ctx context.Context, request ActionClaimRe
 		if !validIdentifier(token, 256) {
 			return ClaimedAction{}, fmt.Errorf("%w: invalid lease token", executionlease.ErrInvalidRequest)
 		}
+		now, err = queue.now()
+		if err != nil {
+			return ClaimedAction{}, err
+		}
+		if !record.submission.Envelope.ExpiresAt.After(now) {
+			continue
+		}
 		record.execution.Status = executionlease.StatusLeased
 		record.execution.RunnerID = request.Scope.runnerID
 		record.execution.RunnerTenantID = request.Scope.tenantID
@@ -574,11 +581,16 @@ func (queue *MemoryActionQueue) Reject(ctx context.Context, request ActionReject
 	if !exists {
 		return executionlease.Execution{}, executionlease.ErrNotFound
 	}
+	requestTokenHash := hashLeaseToken(request.Lease.Token)
 	if record.execution.Status == executionlease.StatusFailed {
-		if sameActionFence(record.execution, request.Lease) && record.execution.ResultHash == reasonHash {
-			return redactActionExecution(record.execution), nil
+		if record.execution.ReconciliationID != "" || record.execution.RunnerID != request.Lease.RunnerID ||
+			record.completedEpoch != request.Lease.Epoch || record.completedTokenHash != requestTokenHash {
+			return executionlease.Execution{}, executionlease.ErrStaleLease
 		}
-		return executionlease.Execution{}, executionlease.ErrCompletionConflict
+		if record.execution.ResultHash != reasonHash {
+			return executionlease.Execution{}, executionlease.ErrCompletionConflict
+		}
+		return redactActionExecution(record.execution), nil
 	}
 	if !currentActionFence(record.execution, request.Lease, now) {
 		return executionlease.Execution{}, executionlease.ErrStaleLease
@@ -591,7 +603,10 @@ func (queue *MemoryActionQueue) Reject(ctx context.Context, request ActionReject
 	record.execution.ResultHash = reasonHash
 	record.execution.CompletedAt = now
 	record.execution.LeaseExpiresAt = time.Time{}
+	record.execution.LeaseToken = ""
 	record.execution.UpdatedAt = now
+	record.completedTokenHash = requestTokenHash
+	record.completedEpoch = request.Lease.Epoch
 	queue.records[request.Lease.ExecutionID] = record
 	return redactActionExecution(record.execution), nil
 }
@@ -915,8 +930,7 @@ func RequestSemanticHash(submission ActionSubmission) (string, error) {
 }
 
 func ResultSummaryStatus(summary ExecutorResult) (executionlease.Status, error) {
-	if !validExecutorResult(summary) ||
-		(summary.ExternalOperationRefHash != "" && !actionQueueSHA256Pattern.MatchString(summary.ExternalOperationRefHash)) {
+	if !validExecutorResult(summary) {
 		return "", executionlease.ErrInvalidRequest
 	}
 	switch summary.Outcome {

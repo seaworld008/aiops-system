@@ -818,6 +818,7 @@ func TestRunNextMapsVerifiedFailedAndUnknownExecutorOutcomesAndStoresOnlySummary
 		executorErr error
 		wantStatus  executionlease.Status
 		wantError   error
+		wantCode    string
 	}{
 		"success": {
 			result:     ExecutorResult{Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed, Changed: true},
@@ -830,6 +831,13 @@ func TestRunNextMapsVerifiedFailedAndUnknownExecutorOutcomesAndStoresOnlySummary
 		"unknown provider result": {
 			executorErr: errors.New("provider connection dropped after write"),
 			wantStatus:  executionlease.StatusUncertain, wantError: ErrExecutionUncertain,
+		},
+		"malformed external operation reference hash": {
+			result: ExecutorResult{
+				Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed,
+				Changed: true, ExternalOperationRefHash: "not-a-sha256",
+			},
+			wantStatus: executionlease.StatusUncertain, wantError: ErrExecutionUncertain, wantCode: "INVALID_EXECUTOR_RESULT",
 		},
 	}
 	for name, test := range tests {
@@ -852,6 +860,38 @@ func TestRunNextMapsVerifiedFailedAndUnknownExecutorOutcomesAndStoresOnlySummary
 			}
 			if strings.Contains(execution.ResultHash, "provider") || strings.Contains(execution.ResultHash, "HEALTH") {
 				t.Fatalf("ResultHash leaked raw result: %q", execution.ResultHash)
+			}
+			if test.wantCode != "" {
+				fixture.leases.memory.mu.Lock()
+				receipt := fixture.leases.memory.records[envelope.ActionID].receipt
+				fixture.leases.memory.mu.Unlock()
+				if receipt == nil || receipt.CompletionStatus != executionlease.StatusUncertain || receipt.Summary.Code != test.wantCode {
+					t.Fatalf("persisted receipt = %#v, want UNCERTAIN code %q", receipt, test.wantCode)
+				}
+			}
+		})
+	}
+}
+
+func TestValidExecutorResultRequiresEmptyOrLowercaseSHA256ExternalOperationReference(t *testing.T) {
+	t.Parallel()
+
+	base := ExecutorResult{Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed}
+	tests := map[string]struct {
+		hash string
+		want bool
+	}{
+		"empty":            {want: true},
+		"lowercase SHA256": {hash: strings.Repeat("a", 64), want: true},
+		"uppercase SHA256": {hash: strings.Repeat("A", 64), want: false},
+		"malformed":        {hash: "not-a-sha256", want: false},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			result := base
+			result.ExternalOperationRefHash = test.hash
+			if got := validExecutorResult(result); got != test.want {
+				t.Fatalf("validExecutorResult(hash=%q) = %t, want %t", test.hash, got, test.want)
 			}
 		})
 	}

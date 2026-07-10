@@ -108,6 +108,7 @@ func TestRunnerExecutionHardeningMigrationExpandsQueueAndRegistrySafely(t *testi
 		"ADD COLUMN runner_environment_id uuid",
 		"status IN ('QUEUED', 'CANCELLED') AND runner_tenant_id IS NULL AND runner_workspace_id IS NULL AND runner_environment_id IS NULL",
 		"status IN ('LEASED', 'RUNNING') AND runner_tenant_id IS NOT NULL AND runner_workspace_id IS NOT NULL AND runner_environment_id IS NOT NULL",
+		"lease_expires_at > last_heartbeat_at",
 		"status IN ('FINALIZING', 'UNCERTAIN', 'SUCCEEDED', 'FAILED')",
 		"ADD COLUMN heartbeat_seq bigint NOT NULL DEFAULT 0",
 		"ADD COLUMN cancel_requested_at timestamptz",
@@ -154,6 +155,9 @@ func TestRunnerExecutionHardeningMigrationExpandsQueueAndRegistrySafely(t *testi
 	}
 	if strings.Contains(up, "DROP COLUMN lease_token") || strings.Contains(up, "DROP COLUMN completed_lease_token") {
 		t.Error("coordinated migration must retain legacy token columns as an empty compatibility shell")
+	}
+	if !strings.Contains(up, "lease_acquired_at IS NOT NULL AND lease_expires_at IS NOT NULL AND last_heartbeat_at IS NOT NULL AND lease_expires_at > last_heartbeat_at AND completed_at IS NULL") {
+		t.Error("action_queue active leases must expire strictly after their last heartbeat")
 	}
 }
 

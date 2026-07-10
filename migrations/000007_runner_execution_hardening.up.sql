@@ -201,6 +201,7 @@ ALTER TABLE action_queue
             runner_tenant_id IS NOT NULL AND runner_workspace_id IS NOT NULL AND runner_environment_id IS NOT NULL AND
             scope_revision IS NOT NULL AND lease_token_sha256 IS NOT NULL AND
             lease_acquired_at IS NOT NULL AND lease_expires_at IS NOT NULL AND last_heartbeat_at IS NOT NULL AND
+            lease_expires_at > last_heartbeat_at AND
             completed_at IS NULL AND result_hash IS NULL AND completion_status IS NULL
         ) OR (
             status NOT IN ('LEASED', 'RUNNING') AND lease_token_sha256 IS NULL AND lease_expires_at IS NULL
