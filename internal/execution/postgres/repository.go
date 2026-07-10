@@ -134,8 +134,12 @@ func (repository *Repository) Submit(ctx context.Context, submission execution.A
 		if getErr != nil {
 			return executionlease.Execution{}, fmt.Errorf("read conflicting action submission: %w", getErr)
 		}
+		existingRequestHash, hashErr := storedRequestSemanticHash(existing)
+		if hashErr != nil {
+			return executionlease.Execution{}, hashErr
+		}
 		if existing.claimed.Execution.ExecutionID == submission.Envelope.ActionID {
-			if existing.requestHashVersion == requestHashVersion && existing.requestHash == requestHash {
+			if existingRequestHash == requestHash {
 				return redact(existing.claimed.Execution), nil
 			}
 			if existing.submissionHash == submissionHash {
@@ -145,7 +149,7 @@ func (repository *Repository) Submit(ctx context.Context, submission execution.A
 		}
 		if existing.idempotencyKey != submission.Envelope.IdempotencyKey ||
 			existing.claimed.Envelope.WorkspaceID != submission.Envelope.WorkspaceID ||
-			existing.requestHashVersion != requestHashVersion || existing.requestHash != requestHash {
+			existingRequestHash != requestHash {
 			return executionlease.Execution{}, execution.ErrIdempotencyConflict
 		}
 		if existing.submissionHash == "" {
@@ -201,6 +205,7 @@ func (repository *Repository) Claim(ctx context.Context, request execution.Actio
 		WHERE candidate.runner_pool = $1
 		  AND candidate.status = 'QUEUED'
 		  AND candidate.not_before <= statement_timestamp()
+		  AND candidate.authorization_expires_at > statement_timestamp()
 		  AND (
 			SELECT count(*) FROM action_queue AS runner_active
 			WHERE runner_active.runner_id = registration.runner_id
@@ -256,7 +261,10 @@ func (repository *Repository) Claim(ctx context.Context, request execution.Actio
 			lease_epoch = queued.lease_epoch + 1,
 			scope_revision = $5, heartbeat_seq = 0,
 			lease_acquired_at = statement_timestamp(), last_heartbeat_at = statement_timestamp(),
-			lease_expires_at = statement_timestamp() + make_interval(secs => $4::double precision),
+			lease_expires_at = LEAST(
+				statement_timestamp() + make_interval(secs => $4::double precision),
+				queued.authorization_expires_at
+			),
 			started_at = NULL, completed_at = NULL, completed_lease_token_sha256 = NULL,
 			completed_lease_epoch = NULL, result_hash = NULL, completion_status = NULL,
 			cancel_requested_at = NULL, cancel_reason_hash = NULL,
@@ -1216,6 +1224,25 @@ func hashSubmission(submission execution.ActionSubmission, envelopeJSON []byte) 
 	}
 	digest := sha256.Sum256(encoded)
 	return hex.EncodeToString(digest[:]), nil
+}
+
+func storedRequestSemanticHash(record storedAction) (string, error) {
+	switch record.requestHashVersion {
+	case requestHashVersion:
+		return record.requestHash, nil
+	case "legacy-submission.v1":
+		requestHash, err := execution.RequestSemanticHash(execution.ActionSubmission{
+			Envelope: record.claimed.Envelope, PlanHash: record.claimed.PlanHash,
+			TargetKey: record.claimed.TargetKey, EnvironmentRevision: record.claimed.EnvironmentRevision,
+			Production: record.claimed.Production, Pool: record.claimed.Execution.Pool,
+		})
+		if err != nil {
+			return "", fmt.Errorf("rebuild legacy action request semantics: %w", err)
+		}
+		return requestHash, nil
+	default:
+		return "", execution.ErrJobConflict
+	}
 }
 
 func scanStoredAction(row pgx.Row) (storedAction, error) {

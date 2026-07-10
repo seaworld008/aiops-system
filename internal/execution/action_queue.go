@@ -324,6 +324,9 @@ func (queue *MemoryActionQueue) Claim(ctx context.Context, request ActionClaimRe
 		if record.notBefore.After(now) {
 			continue
 		}
+		if !record.submission.Envelope.ExpiresAt.After(now) {
+			continue
+		}
 		if !request.Scope.allows(record.submission.Envelope.WorkspaceID, record.submission.Envelope.Target.EnvironmentID) {
 			continue
 		}
@@ -357,6 +360,9 @@ func (queue *MemoryActionQueue) Claim(ctx context.Context, request ActionClaimRe
 		record.execution.LeaseAcquiredAt = now
 		record.execution.LastHeartbeatAt = now
 		record.execution.LeaseExpiresAt = now.Add(request.LeaseDuration)
+		if record.submission.Envelope.ExpiresAt.Before(record.execution.LeaseExpiresAt) {
+			record.execution.LeaseExpiresAt = record.submission.Envelope.ExpiresAt
+		}
 		record.execution.UpdatedAt = now
 		queue.records[executionID] = record
 		return claimedAction(record), nil
