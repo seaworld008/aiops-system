@@ -6,7 +6,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/aiops-system/control-plane/internal/authn"
 	"github.com/aiops-system/control-plane/internal/httpapi"
 )
 
@@ -69,6 +71,41 @@ func TestRequestMetadataRejectsInvalidW3CTraceParents(t *testing.T) {
 			t.Fatalf("traceparent %q produced trace id %q", traceparent, got)
 		}
 	}
+}
+
+func TestSessionEndpointRequiresVerifiedOIDCPrincipal(t *testing.T) {
+	t.Parallel()
+
+	principal := authn.Principal{
+		Subject: "subject-1", Username: "alice", Roles: []authn.Role{authn.RoleSRE},
+		WorkspaceIDs: []string{"workspace-1"}, EnvironmentIDs: []string{"PROD"}, ServiceIDs: []string{"service-1"},
+		AuthenticatedAt: time.Now().Add(-time.Minute), ExpiresAt: time.Now().Add(time.Hour),
+	}
+	router := httpapi.NewRouter(httpapi.Dependencies{Authenticator: fakeAuthenticator{principal: principal}})
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/session", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "subject-1") {
+		t.Fatalf("session response = %d %s", response.Code, response.Body.String())
+	}
+
+	router = httpapi.NewRouter(httpapi.Dependencies{Authenticator: fakeAuthenticator{err: authn.ErrUnauthenticated}})
+	request = httptest.NewRequest(http.MethodGet, "/api/v1/session", nil)
+	request.Header.Set("X-User-ID", "forged")
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), "authentication_required") {
+		t.Fatalf("unauthorized session response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+type fakeAuthenticator struct {
+	principal authn.Principal
+	err       error
+}
+
+func (authenticator fakeAuthenticator) Authenticate(*http.Request) (authn.Principal, error) {
+	return authenticator.principal, authenticator.err
 }
 
 func TestReadinessReturnsServiceUnavailable(t *testing.T) {

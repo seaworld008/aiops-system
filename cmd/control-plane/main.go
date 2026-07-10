@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aiops-system/control-plane/internal/authn"
 	"github.com/aiops-system/control-plane/internal/buildinfo"
 	"github.com/aiops-system/control-plane/internal/config"
 	"github.com/aiops-system/control-plane/internal/httpapi"
@@ -65,6 +66,21 @@ func main() {
 		}
 		return nil, webhook.ErrSecretUnavailable
 	})
+	var authenticator *authn.Authenticator
+	if cfg.OIDCIssuer != "" {
+		discoveryCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		keycloakVerifier, verifierErr := authn.NewKeycloakVerifier(discoveryCtx, cfg.OIDCIssuer, cfg.OIDCClientID)
+		cancel()
+		if verifierErr != nil {
+			slog.Error("configure Keycloak OIDC", "error", verifierErr)
+			os.Exit(1)
+		}
+		authenticator, err = authn.NewAuthenticator(keycloakVerifier, authn.Options{MaxSessionAge: cfg.OIDCMaxSessionAge}, time.Now)
+		if err != nil {
+			slog.Error("configure OIDC authentication", "error", err)
+			os.Exit(1)
+		}
+	}
 	server := &http.Server{
 		Addr: cfg.HTTPAddr,
 		Handler: httpapi.NewRouter(httpapi.Dependencies{
@@ -72,6 +88,7 @@ func main() {
 			Ready:           ready,
 			SignalIngestor:  signalIngestor,
 			WebhookVerifier: webhookVerifier,
+			Authenticator:   authenticator,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}

@@ -22,9 +22,10 @@ make run
 ```text
 GET http://localhost:8080/healthz
 GET http://localhost:8080/readyz
+GET http://localhost:8080/api/v1/session
 ```
 
-Alertmanager/夜莺 Webhook 必须携带 `X-AIOPS-Signature: sha256=<hex>`，签名内容为原始请求体的 HMAC-SHA256。开发环境可用 `AIOPS_WEBHOOK_HMAC_SECRET`；生产环境必须通过 `AIOPS_WEBHOOK_HMAC_SECRETS_JSON` 按 `integration_id/provider` 隔离，并配置 `AIOPS_DATABASE_URL`，否则控制面拒绝启动。数据库 Integration 记录再次校验 Workspace、Provider 和启停状态；后续 Vault 适配器会用其中的 `secret_ref` 替代环境变量密钥。
+Alertmanager/夜莺 Webhook 必须携带 `X-AIOPS-Signature: sha256=<hex>`，签名内容为原始请求体的 HMAC-SHA256。开发环境可用 `AIOPS_WEBHOOK_HMAC_SECRET`；生产环境必须通过 `AIOPS_WEBHOOK_HMAC_SECRETS_JSON` 按 `integration_id/provider` 隔离，并同时配置 `AIOPS_DATABASE_URL`、`AIOPS_OIDC_ISSUER` 和 `AIOPS_OIDC_CLIENT_ID`，否则控制面拒绝启动。OIDC discovery 只接受 HTTPS；Keycloak Token 还必须携带 `auth_time`、平台角色以及 `aiops_workspaces`、`aiops_environments` 作用域，服务负责人另需 `aiops_services`。数据库 Integration 记录再次校验 Workspace、Provider 和启停状态；后续 Vault 适配器会用其中的 `secret_ref` 替代环境变量密钥。
 
 本机没有 PostgreSQL 时，迁移集成测试会跳过。可设置以下变量运行真实 PostgreSQL 16 的 up/down、作用域和 pgx 仓储测试：
 

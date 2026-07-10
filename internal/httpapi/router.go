@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/aiops-system/control-plane/internal/authn"
 	"github.com/aiops-system/control-plane/internal/ids"
 	"github.com/aiops-system/control-plane/internal/requestmeta"
 	"github.com/aiops-system/control-plane/internal/signal"
@@ -27,11 +28,16 @@ type WebhookVerifier interface {
 	Verify(integrationID, provider string, headers http.Header, body []byte) error
 }
 
+type Authenticator interface {
+	Authenticate(*http.Request) (authn.Principal, error)
+}
+
 type Dependencies struct {
 	Version         string
 	Ready           func() error
 	SignalIngestor  SignalIngestor
 	WebhookVerifier WebhookVerifier
+	Authenticator   Authenticator
 }
 
 func NewRouter(deps Dependencies) http.Handler {
@@ -61,8 +67,39 @@ func NewRouter(deps Dependencies) http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	router.Post("/api/v1/integrations/{integrationID}/webhooks/{provider}", webhookHandler(deps.SignalIngestor, deps.WebhookVerifier))
+	router.With(authenticationMiddleware(deps.Authenticator)).Get("/api/v1/session", sessionHandler)
 
 	return router
+}
+
+func authenticationMiddleware(authenticator Authenticator) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			if authenticator == nil {
+				writeProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "OIDC authentication is unavailable")
+				return
+			}
+			principal, err := authenticator.Authenticate(request)
+			if err != nil {
+				writeProblem(w, http.StatusUnauthorized, "authentication_required", "A valid OIDC bearer token is required")
+				return
+			}
+			next.ServeHTTP(w, request.WithContext(authn.WithPrincipal(request.Context(), principal)))
+		})
+	}
+}
+
+func sessionHandler(w http.ResponseWriter, request *http.Request) {
+	principal, ok := authn.PrincipalFromContext(request.Context())
+	if !ok {
+		writeProblem(w, http.StatusUnauthorized, "authentication_required", "A valid OIDC bearer token is required")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"subject": principal.Subject, "username": principal.Username, "roles": principal.Roles,
+		"workspace_ids": principal.WorkspaceIDs, "environment_ids": principal.EnvironmentIDs,
+		"service_ids": principal.ServiceIDs, "authenticated_at": principal.AuthenticatedAt, "expires_at": principal.ExpiresAt,
+	})
 }
 
 func requestIDMiddleware(next http.Handler) http.Handler {

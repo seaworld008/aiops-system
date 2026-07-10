@@ -43,6 +43,7 @@ func TestLoadRejectsProductionWithoutWebhookSecret(t *testing.T) {
 	t.Setenv("AIOPS_WEBHOOK_HMAC_SECRET", "")
 	t.Setenv("AIOPS_WEBHOOK_HMAC_SECRETS_JSON", "")
 	t.Setenv("AIOPS_DATABASE_URL", "postgres://configured")
+	setOIDCEnvironment(t)
 
 	if _, err := config.Load(); err == nil {
 		t.Fatal("Load() error = nil, want fail-closed production configuration")
@@ -54,6 +55,7 @@ func TestLoadRejectsProductionWithoutDatabaseURL(t *testing.T) {
 	t.Setenv("AIOPS_WEBHOOK_HMAC_SECRET", "")
 	t.Setenv("AIOPS_WEBHOOK_HMAC_SECRETS_JSON", `{"33333333-3333-4333-8333-333333333333/alertmanager":"configured"}`)
 	t.Setenv("AIOPS_DATABASE_URL", "")
+	setOIDCEnvironment(t)
 
 	if _, err := config.Load(); err == nil {
 		t.Fatal("Load() error = nil, want database fail-closed production configuration")
@@ -65,6 +67,7 @@ func TestLoadParsesIntegrationScopedWebhookSecrets(t *testing.T) {
 	t.Setenv("AIOPS_DATABASE_URL", "postgres://configured")
 	t.Setenv("AIOPS_WEBHOOK_HMAC_SECRET", "")
 	t.Setenv("AIOPS_WEBHOOK_HMAC_SECRETS_JSON", `{"33333333-3333-4333-8333-333333333333/alertmanager":"secret"}`)
+	setOIDCEnvironment(t)
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -72,6 +75,17 @@ func TestLoadParsesIntegrationScopedWebhookSecrets(t *testing.T) {
 	}
 	if cfg.WebhookHMACSecrets["33333333-3333-4333-8333-333333333333/alertmanager"] != "secret" {
 		t.Fatalf("WebhookHMACSecrets = %#v", cfg.WebhookHMACSecrets)
+	}
+}
+
+func TestLoadRejectsProductionWithoutOIDCConfiguration(t *testing.T) {
+	t.Setenv("AIOPS_ENVIRONMENT", "production")
+	t.Setenv("AIOPS_DATABASE_URL", "postgres://configured")
+	t.Setenv("AIOPS_WEBHOOK_HMAC_SECRETS_JSON", `{"33333333-3333-4333-8333-333333333333/alertmanager":"secret"}`)
+	t.Setenv("AIOPS_OIDC_ISSUER", "")
+	t.Setenv("AIOPS_OIDC_CLIENT_ID", "")
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load() error = nil, want OIDC fail-closed production configuration")
 	}
 }
 
@@ -93,6 +107,12 @@ func TestLoadNormalizesProductionAliasesBeforeFailClosedChecks(t *testing.T) {
 			}
 		})
 	}
+}
+
+func setOIDCEnvironment(t *testing.T) {
+	t.Helper()
+	t.Setenv("AIOPS_OIDC_ISSUER", "https://keycloak.example.com/realms/aiops")
+	t.Setenv("AIOPS_OIDC_CLIENT_ID", "aiops-control-plane")
 }
 
 func TestLoadRejectsUnknownEnvironment(t *testing.T) {

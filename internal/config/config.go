@@ -21,6 +21,9 @@ type Config struct {
 	WebhookHMACSecret  string
 	WebhookHMACSecrets map[string]string
 	DatabaseURL        string
+	OIDCIssuer         string
+	OIDCClientID       string
+	OIDCMaxSessionAge  time.Duration
 }
 
 func Load() (Config, error) {
@@ -40,6 +43,9 @@ func Load() (Config, error) {
 		WebhookHMACSecret:  os.Getenv("AIOPS_WEBHOOK_HMAC_SECRET"),
 		WebhookHMACSecrets: make(map[string]string),
 		DatabaseURL:        os.Getenv("AIOPS_DATABASE_URL"),
+		OIDCIssuer:         strings.TrimSpace(os.Getenv("AIOPS_OIDC_ISSUER")),
+		OIDCClientID:       strings.TrimSpace(os.Getenv("AIOPS_OIDC_CLIENT_ID")),
+		OIDCMaxSessionAge:  12 * time.Hour,
 	}
 	if raw := os.Getenv("AIOPS_WEBHOOK_HMAC_SECRETS_JSON"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.WebhookHMACSecrets); err != nil {
@@ -66,11 +72,24 @@ func Load() (Config, error) {
 		}
 		cfg.ShutdownTimeout = duration
 	}
+	if raw := os.Getenv("AIOPS_OIDC_MAX_SESSION_AGE"); raw != "" {
+		duration, err := time.ParseDuration(raw)
+		if err != nil || duration < time.Minute || duration > 24*time.Hour {
+			return Config{}, fmt.Errorf("AIOPS_OIDC_MAX_SESSION_AGE must be between 1m and 24h")
+		}
+		cfg.OIDCMaxSessionAge = duration
+	}
+	if (cfg.OIDCIssuer == "") != (cfg.OIDCClientID == "") {
+		return Config{}, fmt.Errorf("AIOPS_OIDC_ISSUER and AIOPS_OIDC_CLIENT_ID must be configured together")
+	}
 	if cfg.Environment == "production" && len(cfg.WebhookHMACSecrets) == 0 {
 		return Config{}, fmt.Errorf("AIOPS_WEBHOOK_HMAC_SECRETS_JSON is required in production")
 	}
 	if cfg.Environment == "production" && cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("AIOPS_DATABASE_URL is required in production")
+	}
+	if cfg.Environment == "production" && (cfg.OIDCIssuer == "" || cfg.OIDCClientID == "") {
+		return Config{}, fmt.Errorf("AIOPS_OIDC_ISSUER and AIOPS_OIDC_CLIENT_ID are required in production")
 	}
 
 	return cfg, nil
