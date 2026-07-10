@@ -108,7 +108,7 @@
 4. 实现单/双人审批及30分钟有效期。
 5. 实现Vault凭据接口，凭据不持久化；测试用短期内存凭据实现。
 6. 实现K8s Deployment重启、无HPA扩缩容、GitOps revert MR/PR、AWX Linux/Windows服务重启类型化执行器。
-7. GitOps Workflow显式等待外部分支保护审批、检查、人工合并和Argo auto-sync；平台不得绕过规则或直接参数覆盖。
+7. GitOps Workflow显式等待外部分支保护审批、检查、人工合并和Argo auto-sync；计划绑定base/head commit及diff/tree hash，MR head变化使审批失效，合并后验证结果tree再等待Argo；添加追加提交、force-push、merge结果漂移测试。平台不得绕过规则或直接参数覆盖。
 8. 实现目标锁、全局并发1、四级Kill Switch、验证和对账。
 
 **验收：** 任意命令和未知动作拒绝；计划变化后审批失效；不确定结果不盲重试；AWX不提供虚机重启。

@@ -144,7 +144,7 @@ SignalEnvelope
 - Investigation：`QUEUED / RUNNING / PARTIAL / COMPLETED / FAILED / CANCELLED`。
 - Hypothesis：`PROPOSED / CONFIRMED / REJECTED`。
 - Approval：`PENDING / APPROVED / REJECTED / EXPIRED / REVOKED`。
-- Execution：`QUEUED / LEASED / RUNNING / VERIFYING / SUCCEEDED / FAILED / ROLLED_BACK / CANCELLED`。
+- Execution：`QUEUED / LEASED / RUNNING / WAITING_EXTERNAL_APPROVAL / WAITING_SYNC / VERIFYING / SUCCEEDED / FAILED / ROLLED_BACK / CANCELLED`。两个 `WAITING_*` 状态只用于GitOps外部控制点，不持有Runner租约或生产凭据。
 
 不存在由模型直接填写的最终 `root_cause`。只有人工显式确认的 Hypothesis 才能成为 Incident 的 `confirmed_hypothesis_id`。
 
@@ -246,7 +246,7 @@ signature{alg,key_id,value}
 | --- | --- | --- |
 | K8s滚动重启 | 白名单 Deployment；校验 UID/resourceVersion、PDB、容量和无进行中 rollout；禁止删除 Pod | 1名非申请人；验证 rollout、Ready 和 SLO 10分钟 |
 | K8s扩缩容 | 无HPA的白名单 Deployment；在策略上下限内；校验PDB、Quota和节点容量 | 1名非申请人；验证副本与SLO 10分钟 |
-| GitOps回滚 | 创建绑定 `plan_hash` 的 revert MR/PR 后进入 `WAITING_EXTERNAL_APPROVAL`；平台不绕过分支保护且不自行合并。外部审批/检查通过并合并后进入 `WAITING_SYNC`，观察 Argo auto-sync 到精确 commit | SRE+Service Owner双人审批；仅在目标commit为 Synced/Healthy 且SLO稳定15分钟后成功；超时转人工，不直接覆盖Argo参数 |
+| GitOps回滚 | 计划绑定 source base commit、revert head commit、diff/tree hash和目标路径；创建MR/PR后进入 `WAITING_EXTERNAL_APPROVAL`。MR head或diff变化立即使平台审批失效。平台不绕过分支保护且不自行合并；合并后验证结果commit包含获批tree，再进入 `WAITING_SYNC` 并观察Argo auto-sync到该commit | SRE+Service Owner双人审批；仅在获批内容对应的commit为 Synced/Healthy 且SLO稳定15分钟后成功；超时转人工，不直接覆盖Argo参数 |
 | AWX服务重启 | 固定Job Template；Linux systemd或Windows Service；逐台摘流、重启、验证、回流 | 1名非申请人；绝不重启虚机；失败保持摘流并人工接管 |
 
 状态不确定时只允许查询原任务和对账，禁止再次发起写操作。全局、环境、连接器和动作类型均有 Kill Switch。
