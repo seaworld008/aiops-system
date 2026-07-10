@@ -415,6 +415,71 @@ func TestClaimSkipsExpiredAuthorizationUsingDatabaseClock(t *testing.T) {
 	assertExpectations(t, database)
 }
 
+func TestClaimRetriesCandidateWhenAuthorizationExpiresBeforeFinalUpdate(t *testing.T) {
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock.NewPool() error = %v", err)
+	}
+	defer database.Close()
+	secondToken := strings.Repeat("b", 64)
+	tokenCalls := 0
+	repository, err := New(database, Options{TokenSource: func() (string, error) {
+		tokenCalls++
+		if tokenCalls == 1 {
+			return testLeaseToken, nil
+		}
+		return secondToken, nil
+	}})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	secondEnvelope := signedTestEnvelope(t, now)
+	secondEnvelope.ActionID = "action-2"
+	secondEnvelope.IdempotencyKey = "idem-action-2"
+	secondEnvelope = resealTestEnvelope(t, secondEnvelope)
+	secondEnvelopeJSON, _ := json.Marshal(secondEnvelope)
+	want := executionlease.Execution{
+		ExecutionID: secondEnvelope.ActionID, TargetKey: "k8s-deployment:sha256:" + strings.Repeat("b", 64),
+		Pool: executionlease.PoolWrite, Production: false, Status: executionlease.StatusLeased,
+		RunnerID: "runner-1", RunnerTenantID: testTenantID, RunnerWorkspaceID: secondEnvelope.WorkspaceID,
+		RunnerEnvironmentID: secondEnvelope.Target.EnvironmentID, ScopeRevision: 1, LeaseToken: secondToken,
+		LeaseEpoch: 1, LeaseAcquiredAt: now, LastHeartbeatAt: now, LeaseExpiresAt: now.Add(time.Minute),
+		CreatedAt: now.Add(-time.Minute), UpdatedAt: now,
+	}
+	database.ExpectBegin()
+	database.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	database.ExpectExec("UPDATE action_queue AS expired_running").WithArgs(pgxmock.AnyArg()).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	database.ExpectExec("UPDATE action_queue AS expired_finalizing").WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	database.ExpectExec("UPDATE action_queue AS expired_lease").WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	candidateQuery := `(?s)SELECT candidate\.action_id.*candidate\.authorization_expires_at > statement_timestamp\(\).*FOR UPDATE OF candidate SKIP LOCKED`
+	database.ExpectQuery(candidateQuery).
+		WithArgs(executionlease.PoolWrite, "runner-1", int64(1), testTenantID).
+		WillReturnRows(pgxmock.NewRows([]string{"action_id", "lease_epoch", "scope_revision", "tenant_id", "workspace_id", "environment_id"}).
+			AddRow("action-1", int64(0), int64(1), testTenantID, "workspace-1", "PROD"))
+	finalUpdate := `(?s)UPDATE action_queue AS queued.*lease_expires_at = LEAST\(.*queued\.authorization_expires_at.*\).*WHERE queued\.action_id = \$1 AND queued\.status = 'QUEUED' AND queued\.authorization_expires_at > statement_timestamp\(\).*RETURNING`
+	database.ExpectQuery(finalUpdate).
+		WithArgs("action-1", "runner-1", tokenHash(testLeaseToken), float64(60), int64(1), testTenantID, "workspace-1", "PROD").
+		WillReturnRows(actionQueueRowsEmpty())
+	database.ExpectQuery(candidateQuery).
+		WithArgs(executionlease.PoolWrite, "runner-1", int64(1), testTenantID).
+		WillReturnRows(pgxmock.NewRows([]string{"action_id", "lease_epoch", "scope_revision", "tenant_id", "workspace_id", "environment_id"}).
+			AddRow(secondEnvelope.ActionID, int64(0), int64(1), testTenantID, secondEnvelope.WorkspaceID, secondEnvelope.Target.EnvironmentID))
+	database.ExpectQuery(finalUpdate).
+		WithArgs(secondEnvelope.ActionID, "runner-1", tokenHash(secondToken), float64(60), int64(1), testTenantID, secondEnvelope.WorkspaceID, secondEnvelope.Target.EnvironmentID).
+		WillReturnRows(actionQueueRowsDetailed(want, secondEnvelopeJSON, secondEnvelope.PlanHash, "environment-1",
+			secondEnvelope.WorkspaceID, secondEnvelope.Target.EnvironmentID, strings.Repeat("b", 64), tokenHash(secondToken), nil, nil, now, nil))
+	database.ExpectCommit()
+
+	claimed, err := repository.Claim(context.Background(), execution.ActionClaimRequest{
+		Scope: testRunnerScope(t, "runner-1", "workspace-1", "PROD"), LeaseDuration: time.Minute,
+	})
+	if err != nil || claimed.Execution != want || tokenCalls != 2 {
+		t.Fatalf("Claim(retry after authorization expiry) = %#v, %v; token calls=%d", claimed.Execution, err, tokenCalls)
+	}
+	assertExpectations(t, database)
+}
+
 func TestClaimRejectsTokenSourcesBelowTheEntropyContract(t *testing.T) {
 	database, err := pgxmock.NewPool()
 	if err != nil {
@@ -826,6 +891,76 @@ func TestCompleteRejectsReceiptWhenRunnerRegistrationRevisionChanged(t *testing.
 		t.Fatalf("Complete(scope revision changed) error = %v, want %v", err, executionlease.ErrStaleLease)
 	}
 	assertExpectations(t, database)
+}
+
+func TestCompleteIdempotentReceiptReadClassifiesConflictsAndPreservesDatabaseErrors(t *testing.T) {
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	envelope := signedTestEnvelope(t, now)
+	envelopeJSON, _ := json.Marshal(envelope)
+	fence := executionlease.LeaseIdentity{ExecutionID: envelope.ActionID, RunnerID: "runner-1", Token: testLeaseToken, Epoch: 3}
+	digest := tokenHash(fence.Token)
+	summary := execution.ExecutorResult{Outcome: execution.ExecutorSucceeded, Code: "COMPLETED", Verification: execution.VerificationPassed}
+	finalizing := executionlease.Execution{
+		ExecutionID: envelope.ActionID, TargetKey: "k8s-deployment:sha256:" + strings.Repeat("a", 64),
+		Pool: executionlease.PoolWrite, Production: true, Status: executionlease.StatusFinalizing,
+		CompletionStatus: executionlease.StatusSucceeded, RunnerID: fence.RunnerID, RunnerTenantID: testTenantID,
+		RunnerWorkspaceID: envelope.WorkspaceID, RunnerEnvironmentID: envelope.Target.EnvironmentID,
+		ScopeRevision: 1, LeaseEpoch: fence.Epoch, LeaseAcquiredAt: now.Add(-2 * time.Minute),
+		LastHeartbeatAt: now.Add(-time.Minute), StartedAt: now.Add(-time.Minute), CreatedAt: now.Add(-time.Hour), UpdatedAt: now,
+	}
+	receipt, err := execution.BuildRunnerResultReceipt(execution.ClaimedAction{
+		Execution: finalizing, Envelope: envelope, PlanHash: envelope.PlanHash,
+		TargetKey: finalizing.TargetKey, EnvironmentRevision: "environment-1", Production: true,
+	}, execution.ActionCompleteRequest{Lease: fence, Summary: summary}, executionlease.StatusSucceeded, time.Time{})
+	if err != nil {
+		t.Fatalf("BuildRunnerResultReceipt() error = %v", err)
+	}
+	finalizing.ResultHash = receipt.ResultHash
+	readErr := errors.New("receipt connection lost")
+	tests := []struct {
+		name          string
+		storedHash    string
+		readErr       error
+		wantConflict  bool
+		wantPreserved error
+	}{
+		{name: "missing receipt", wantConflict: true},
+		{name: "mismatched receipt hash", storedHash: strings.Repeat("f", 64), wantConflict: true},
+		{name: "database error", readErr: readErr, wantPreserved: readErr},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			database, repository := newActionQueueRepository(t)
+			defer database.Close()
+			database.ExpectBegin()
+			expectRunnerRegistrationLock(database, fence.RunnerID, testTenantID, executionlease.PoolWrite, true, 1)
+			database.ExpectQuery(`(?s)SELECT .*FROM action_queue.*WHERE action_id = \$1 FOR UPDATE`).
+				WithArgs(fence.ExecutionID).
+				WillReturnRows(actionQueueRowsDetailed(finalizing, envelopeJSON, envelope.PlanHash, "environment-1",
+					envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64), nil, digest, fence.Epoch, now, nil))
+			receiptExpectation := database.ExpectQuery(`SELECT receipt_hash FROM runner_result_receipts`).
+				WithArgs(fence.ExecutionID, fence.Epoch)
+			if test.readErr != nil {
+				receiptExpectation.WillReturnError(test.readErr)
+			} else {
+				rows := pgxmock.NewRows([]string{"receipt_hash"})
+				if test.storedHash != "" {
+					rows.AddRow(test.storedHash)
+				}
+				receiptExpectation.WillReturnRows(rows)
+			}
+			database.ExpectRollback()
+
+			_, completeErr := repository.Complete(context.Background(), execution.ActionCompleteRequest{Lease: fence, Summary: summary})
+			if test.wantConflict && !errors.Is(completeErr, executionlease.ErrCompletionConflict) {
+				t.Fatalf("Complete(idempotent receipt conflict) error = %v, want %v", completeErr, executionlease.ErrCompletionConflict)
+			}
+			if test.wantPreserved != nil && (!errors.Is(completeErr, test.wantPreserved) || errors.Is(completeErr, executionlease.ErrCompletionConflict)) {
+				t.Fatalf("Complete(idempotent receipt read failure) error = %v, want wrapped database error", completeErr)
+			}
+			assertExpectations(t, database)
+		})
+	}
 }
 
 func TestRejectAndNackUseFencedStructuredReasonHashes(t *testing.T) {

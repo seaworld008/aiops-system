@@ -733,7 +733,8 @@ var (
 )
 
 func validExecutorResult(result ExecutorResult) bool {
-	if !resultCodePattern.MatchString(result.Code) {
+	if !resultCodePattern.MatchString(result.Code) ||
+		(result.ExternalOperationRefHash != "" && !actionQueueSHA256Pattern.MatchString(result.ExternalOperationRefHash)) {
 		return false
 	}
 	switch result.Outcome {

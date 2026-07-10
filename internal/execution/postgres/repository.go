@@ -187,9 +187,10 @@ func (repository *Repository) Claim(ctx context.Context, request execution.Actio
 		return execution.ClaimedAction{}, err
 	}
 
-	var actionID, runnerTenantID, runnerWorkspaceID, runnerEnvironmentID string
-	var epoch, scopeRevision int64
-	err = tx.QueryRow(ctx, `
+	for {
+		var actionID, runnerTenantID, runnerWorkspaceID, runnerEnvironmentID string
+		var epoch, scopeRevision int64
+		err = tx.QueryRow(ctx, `
 		SELECT candidate.action_id, candidate.lease_epoch, registration.scope_revision,
 			registration.tenant_id::text, binding.workspace_id::text, binding.environment_id::text
 		FROM action_queue AS candidate
@@ -230,30 +231,30 @@ func (repository *Repository) Claim(ctx context.Context, request execution.Actio
 		FOR UPDATE OF candidate SKIP LOCKED
 		LIMIT 1
 	`, request.Scope.Pool(), request.Scope.RunnerID(), request.Scope.ScopeRevision(), request.Scope.TenantID()).Scan(
-		&actionID, &epoch, &scopeRevision, &runnerTenantID, &runnerWorkspaceID, &runnerEnvironmentID,
-	)
-	if errors.Is(err, pgx.ErrNoRows) {
-		if err := tx.Commit(ctx); err != nil {
-			return execution.ClaimedAction{}, fmt.Errorf("commit empty action claim: %w", err)
+			&actionID, &epoch, &scopeRevision, &runnerTenantID, &runnerWorkspaceID, &runnerEnvironmentID,
+		)
+		if errors.Is(err, pgx.ErrNoRows) {
+			if err := tx.Commit(ctx); err != nil {
+				return execution.ClaimedAction{}, fmt.Errorf("commit empty action claim: %w", err)
+			}
+			committed = true
+			return execution.ClaimedAction{}, executionlease.ErrNoLeaseAvailable
 		}
-		committed = true
-		return execution.ClaimedAction{}, executionlease.ErrNoLeaseAvailable
-	}
-	if err != nil {
-		return execution.ClaimedAction{}, fmt.Errorf("select scoped action claim: %w", err)
-	}
-	if epoch == math.MaxInt64 {
-		return execution.ClaimedAction{}, fmt.Errorf("%w: lease epoch exhausted", executionlease.ErrInvalidTransition)
-	}
-	token, err := repository.tokenSource()
-	if err != nil {
-		return execution.ClaimedAction{}, fmt.Errorf("generate action lease token: %w", err)
-	}
-	if !hashPattern.MatchString(token) {
-		return execution.ClaimedAction{}, fmt.Errorf("%w: lease token must contain 256 bits encoded as 64 lowercase hexadecimal characters", executionlease.ErrInvalidRequest)
-	}
-	digest := tokenHash(token)
-	record, err := scanStoredAction(tx.QueryRow(ctx, `
+		if err != nil {
+			return execution.ClaimedAction{}, fmt.Errorf("select scoped action claim: %w", err)
+		}
+		if epoch == math.MaxInt64 {
+			return execution.ClaimedAction{}, fmt.Errorf("%w: lease epoch exhausted", executionlease.ErrInvalidTransition)
+		}
+		token, err := repository.tokenSource()
+		if err != nil {
+			return execution.ClaimedAction{}, fmt.Errorf("generate action lease token: %w", err)
+		}
+		if !hashPattern.MatchString(token) {
+			return execution.ClaimedAction{}, fmt.Errorf("%w: lease token must contain 256 bits encoded as 64 lowercase hexadecimal characters", executionlease.ErrInvalidRequest)
+		}
+		digest := tokenHash(token)
+		record, err := scanStoredAction(tx.QueryRow(ctx, `
 		UPDATE action_queue AS queued
 		SET status = 'LEASED', runner_id = $2,
 			runner_tenant_id = $6, runner_workspace_id = $7, runner_environment_id = $8,
@@ -272,25 +273,30 @@ func (repository *Repository) Claim(ctx context.Context, request execution.Actio
 			reconciliation_result_hash = NULL, reconciled_at = NULL,
 			updated_at = statement_timestamp()
 		WHERE queued.action_id = $1 AND queued.status = 'QUEUED'
+		  AND queued.authorization_expires_at > statement_timestamp()
 		RETURNING `+actionQueueProjection,
-		actionID, request.Scope.RunnerID(), digest, request.LeaseDuration.Seconds(), scopeRevision,
-		runnerTenantID, runnerWorkspaceID, runnerEnvironmentID,
-	))
-	if err != nil {
-		return execution.ClaimedAction{}, fmt.Errorf("lease scoped action: %w", err)
+			actionID, request.Scope.RunnerID(), digest, request.LeaseDuration.Seconds(), scopeRevision,
+			runnerTenantID, runnerWorkspaceID, runnerEnvironmentID,
+		))
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return execution.ClaimedAction{}, fmt.Errorf("lease scoped action: %w", err)
+		}
+		if record.leaseTokenHash != digest || record.claimed.Execution.RunnerID != request.Scope.RunnerID() ||
+			record.claimed.Execution.RunnerTenantID != runnerTenantID ||
+			record.claimed.Execution.RunnerWorkspaceID != runnerWorkspaceID ||
+			record.claimed.Execution.RunnerEnvironmentID != runnerEnvironmentID {
+			return execution.ClaimedAction{}, execution.ErrJobConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return execution.ClaimedAction{}, fmt.Errorf("commit action claim: %w", err)
+		}
+		committed = true
+		record.claimed.Execution.LeaseToken = token
+		return record.claimed, nil
 	}
-	if record.leaseTokenHash != digest || record.claimed.Execution.RunnerID != request.Scope.RunnerID() ||
-		record.claimed.Execution.RunnerTenantID != runnerTenantID ||
-		record.claimed.Execution.RunnerWorkspaceID != runnerWorkspaceID ||
-		record.claimed.Execution.RunnerEnvironmentID != runnerEnvironmentID {
-		return execution.ClaimedAction{}, execution.ErrJobConflict
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return execution.ClaimedAction{}, fmt.Errorf("commit action claim: %w", err)
-	}
-	committed = true
-	record.claimed.Execution.LeaseToken = token
-	return record.claimed, nil
 }
 
 func (repository *Repository) Start(ctx context.Context, fence executionlease.LeaseIdentity) (executionlease.Execution, error) {
@@ -615,9 +621,16 @@ func (repository *Repository) Complete(ctx context.Context, request execution.Ac
 			return executionlease.Execution{}, executionlease.ErrCompletionConflict
 		}
 		var storedReceiptHash string
-		if err := tx.QueryRow(ctx, `
+		receiptErr := tx.QueryRow(ctx, `
 			SELECT receipt_hash FROM runner_result_receipts WHERE action_id = $1 AND lease_epoch = $2
-		`, request.Lease.ExecutionID, request.Lease.Epoch).Scan(&storedReceiptHash); err != nil || storedReceiptHash != receipt.ResultHash {
+		`, request.Lease.ExecutionID, request.Lease.Epoch).Scan(&storedReceiptHash)
+		if errors.Is(receiptErr, pgx.ErrNoRows) {
+			return executionlease.Execution{}, executionlease.ErrCompletionConflict
+		}
+		if receiptErr != nil {
+			return executionlease.Execution{}, fmt.Errorf("read idempotent action completion receipt: %w", receiptErr)
+		}
+		if storedReceiptHash != receipt.ResultHash {
 			return executionlease.Execution{}, executionlease.ErrCompletionConflict
 		}
 		if err := tx.Commit(ctx); err != nil {
