@@ -105,6 +105,29 @@ func TestBrokerRevokesIssuerLeaseThatOutlivesRequestedBoundary(t *testing.T) {
 	}
 }
 
+func TestBrokerRejectsIssuerLeaseIDContainingControlCharacters(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	envelope := sealedEnvelope(t, now)
+	decision := allowDecision(envelope, now)
+	issuer := &fakeIssuer{
+		leaseID:   "lease-1\nforged-audit-line",
+		secret:    []byte("secret"),
+		expiresAt: decision.CredentialExpiresAt,
+	}
+	broker, err := NewBroker(&fakeGate{decision: decision}, issuer, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewBroker() error = %v", err)
+	}
+	if _, err := broker.Issue(context.Background(), envelope); !errors.Is(err, ErrUnsafeCredentialLease) {
+		t.Fatalf("Issue() error = %v, want ErrUnsafeCredentialLease", err)
+	}
+	if issuer.revokedLeaseID != issuer.leaseID {
+		t.Fatalf("revoked lease = %q, want %q", issuer.revokedLeaseID, issuer.leaseID)
+	}
+}
+
 type fakeGate struct {
 	decision policy.Decision
 	err      error
@@ -118,6 +141,7 @@ func (gate *fakeGate) EvaluateCredentialIssue(context.Context, action.Envelope) 
 
 type fakeIssuer struct {
 	request        IssueRequest
+	leaseID        string
 	secret         []byte
 	expiresAt      time.Time
 	revokedLeaseID string
@@ -127,7 +151,11 @@ type fakeIssuer struct {
 func (issuer *fakeIssuer) Issue(_ context.Context, request IssueRequest) (IssuedLease, error) {
 	issuer.calls++
 	issuer.request = request
-	return IssuedLease{LeaseID: "lease-1", Secret: append([]byte(nil), issuer.secret...), ExpiresAt: issuer.expiresAt}, nil
+	leaseID := issuer.leaseID
+	if leaseID == "" {
+		leaseID = "lease-1"
+	}
+	return IssuedLease{LeaseID: leaseID, Secret: append([]byte(nil), issuer.secret...), ExpiresAt: issuer.expiresAt}, nil
 }
 
 func (issuer *fakeIssuer) Revoke(_ context.Context, leaseID string) error {

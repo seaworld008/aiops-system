@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/aiops-system/control-plane/internal/action"
 	"github.com/aiops-system/control-plane/internal/policy"
@@ -134,5 +135,6 @@ func validDecision(decision policy.Decision, envelope action.Envelope, now time.
 
 func validIssuedLease(lease IssuedLease, now, requestedExpiry time.Time) bool {
 	return lease.LeaseID != "" && len(lease.LeaseID) <= 256 && strings.TrimSpace(lease.LeaseID) == lease.LeaseID &&
+		!strings.ContainsFunc(lease.LeaseID, unicode.IsControl) &&
 		len(lease.Secret) > 0 && len(lease.Secret) <= 64<<10 && lease.ExpiresAt.After(now) && !lease.ExpiresAt.After(requestedExpiry)
 }
