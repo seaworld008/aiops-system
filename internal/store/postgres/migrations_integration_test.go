@@ -390,7 +390,7 @@ func realActionSubmission(t *testing.T, signer action.Signer, now time.Time, act
 			ConnectorID: "kubernetes-postgres", Permission: "PATCH_DEPLOYMENT_RESTART",
 			Resource: "cluster-postgres-1/payments/deployment/" + deployment, TTLSeconds: 600,
 		},
-		IdempotencyKey: "idem-" + actionID, NotBefore: now.Add(-time.Minute), ExpiresAt: now.Add(30 * time.Minute),
+		IdempotencyKey: "idem-" + actionID, NotBefore: now, ExpiresAt: now.Add(30 * time.Minute),
 		TraceID: strings.Repeat("f", 32),
 	}
 	sealed, err := action.Seal(context.Background(), envelope, envelope.RequestedBy, signer)
