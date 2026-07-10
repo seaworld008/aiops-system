@@ -1,0 +1,21 @@
+.worktrees/
+.DS_Store
+.rustdesk_*
+
+# Go
+bin/
+coverage.out
+
+# Node
+node_modules/
+web/dist/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data
+.data/
+tmp/
+
