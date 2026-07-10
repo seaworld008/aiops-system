@@ -2,7 +2,9 @@ package authn
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -23,7 +25,13 @@ func NewKeycloakVerifier(ctx context.Context, issuer, clientID string) (*Keycloa
 	if !scopePattern.MatchString(clientID) {
 		return nil, fmt.Errorf("valid Keycloak client id is required")
 	}
-	provider, err := oidc.NewProvider(ctx, issuer)
+	strictClient := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return errors.New("OIDC discovery redirects are disabled")
+		},
+	}
+	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, strictClient), issuer)
 	if err != nil {
 		return nil, fmt.Errorf("discover Keycloak issuer: %w", err)
 	}
