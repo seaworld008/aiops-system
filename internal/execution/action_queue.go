@@ -8,8 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"reflect"
 	"regexp"
+	"strconv"
 	"sync"
 	"time"
 
@@ -48,6 +48,7 @@ type RunnerScopeBinding struct {
 // constructing RunnerScope directly from request data.
 type RunnerRegistration struct {
 	RunnerID       string
+	TenantID       string
 	Pool           executionlease.Pool
 	Enabled        bool
 	ScopeRevision  int64
@@ -63,6 +64,7 @@ type RunnerRegistrationRepository interface {
 // Its fields remain private so a job request cannot smuggle its own scope.
 type RunnerScope struct {
 	runnerID       string
+	tenantID       string
 	pool           executionlease.Pool
 	scopeRevision  int64
 	maxConcurrency int
@@ -70,7 +72,7 @@ type RunnerScope struct {
 }
 
 func (registration RunnerRegistration) Scope() (RunnerScope, error) {
-	if !registration.Enabled || !validIdentifier(registration.RunnerID, 256) ||
+	if !registration.Enabled || !validIdentifier(registration.RunnerID, 256) || !validIdentifier(registration.TenantID, 256) ||
 		(registration.Pool != executionlease.PoolRead && registration.Pool != executionlease.PoolWrite) ||
 		registration.ScopeRevision <= 0 || registration.MaxConcurrency < 1 || registration.MaxConcurrency > 1024 ||
 		len(registration.ScopeBindings) == 0 {
@@ -90,12 +92,13 @@ func (registration RunnerRegistration) Scope() (RunnerScope, error) {
 		bindings[index] = binding
 	}
 	return RunnerScope{
-		runnerID: registration.RunnerID, pool: registration.Pool,
+		runnerID: registration.RunnerID, tenantID: registration.TenantID, pool: registration.Pool,
 		scopeRevision: registration.ScopeRevision, maxConcurrency: registration.MaxConcurrency, bindings: bindings,
 	}, nil
 }
 
 func (scope RunnerScope) RunnerID() string          { return scope.runnerID }
+func (scope RunnerScope) TenantID() string          { return scope.tenantID }
 func (scope RunnerScope) Pool() executionlease.Pool { return scope.pool }
 func (scope RunnerScope) ScopeRevision() int64      { return scope.scopeRevision }
 func (scope RunnerScope) MaxConcurrency() int       { return scope.maxConcurrency }
@@ -171,6 +174,7 @@ type ActionCompleteRequest struct {
 
 type RunnerResultReceipt struct {
 	ActionID         string
+	TenantID         string
 	WorkspaceID      string
 	EnvironmentID    string
 	PlanHash         string
@@ -266,7 +270,7 @@ func (queue *MemoryActionQueue) Submit(ctx context.Context, submission ActionSub
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
 	if existing, exists := queue.records[submission.Envelope.ActionID]; exists {
-		if sameActionSubmission(existing.submission, submission) {
+		if existing.requestHash == requestHash {
 			return redactActionExecution(existing.execution), nil
 		}
 		return executionlease.Execution{}, ErrJobConflict
@@ -341,6 +345,9 @@ func (queue *MemoryActionQueue) Claim(ctx context.Context, request ActionClaimRe
 		}
 		record.execution.Status = executionlease.StatusLeased
 		record.execution.RunnerID = request.Scope.runnerID
+		record.execution.RunnerTenantID = request.Scope.tenantID
+		record.execution.RunnerWorkspaceID = record.submission.Envelope.WorkspaceID
+		record.execution.RunnerEnvironmentID = record.submission.Envelope.Target.EnvironmentID
 		record.execution.ScopeRevision = request.Scope.scopeRevision
 		record.execution.LeaseToken = token
 		record.execution.LeaseEpoch++
@@ -373,6 +380,9 @@ func (queue *MemoryActionQueue) Start(ctx context.Context, fence executionlease.
 	record, exists := queue.records[fence.ExecutionID]
 	if !exists {
 		return executionlease.Execution{}, executionlease.ErrNotFound
+	}
+	if !record.submission.Envelope.ExpiresAt.After(now) {
+		return executionlease.Execution{}, executionlease.ErrStaleLease
 	}
 	if !currentActionFence(record.execution, fence, now) {
 		return executionlease.Execution{}, executionlease.ErrStaleLease
@@ -410,11 +420,17 @@ func (queue *MemoryActionQueue) Heartbeat(ctx context.Context, request ActionHea
 	if !exists {
 		return ActionHeartbeatResult{}, executionlease.ErrNotFound
 	}
-	if !currentActionFence(record.execution, request.Lease, now) {
+	if !sameActionFence(record.execution, request.Lease) {
 		return ActionHeartbeatResult{}, executionlease.ErrStaleLease
 	}
 	if record.execution.Status != executionlease.StatusLeased && record.execution.Status != executionlease.StatusRunning {
 		return ActionHeartbeatResult{}, executionlease.ErrInvalidTransition
+	}
+	if !record.submission.Envelope.ExpiresAt.After(now) {
+		return ActionHeartbeatResult{Execution: redactActionExecution(record.execution), Directive: HeartbeatTerminate}, nil
+	}
+	if !record.execution.LeaseExpiresAt.After(now) {
+		return ActionHeartbeatResult{}, executionlease.ErrStaleLease
 	}
 	if request.Sequence == record.execution.HeartbeatSeq {
 		return actionHeartbeatResult(record.execution), nil
@@ -424,7 +440,11 @@ func (queue *MemoryActionQueue) Heartbeat(ctx context.Context, request ActionHea
 	}
 	record.execution.HeartbeatSeq = request.Sequence
 	if record.execution.CancelRequestedAt.IsZero() {
-		record.execution.LeaseExpiresAt = now.Add(request.Extension)
+		leaseExpiresAt := now.Add(request.Extension)
+		if record.submission.Envelope.ExpiresAt.Before(leaseExpiresAt) {
+			leaseExpiresAt = record.submission.Envelope.ExpiresAt
+		}
+		record.execution.LeaseExpiresAt = leaseExpiresAt
 		record.execution.LastHeartbeatAt = now
 	}
 	record.execution.UpdatedAt = now
@@ -600,6 +620,9 @@ func (queue *MemoryActionQueue) Nack(ctx context.Context, request ActionNackRequ
 	}
 	record.execution.Status = executionlease.StatusQueued
 	record.execution.RunnerID = ""
+	record.execution.RunnerTenantID = ""
+	record.execution.RunnerWorkspaceID = ""
+	record.execution.RunnerEnvironmentID = ""
 	record.execution.LeaseToken = ""
 	record.execution.LeaseExpiresAt = time.Time{}
 	record.execution.LeaseAcquiredAt = time.Time{}
@@ -697,6 +720,9 @@ func (queue *MemoryActionQueue) Cancel(ctx context.Context, executionID string) 
 	}
 	record.execution.Status = executionlease.StatusCancelled
 	record.execution.RunnerID = ""
+	record.execution.RunnerTenantID = ""
+	record.execution.RunnerWorkspaceID = ""
+	record.execution.RunnerEnvironmentID = ""
 	record.execution.LeaseToken = ""
 	record.execution.LeaseExpiresAt = time.Time{}
 	record.execution.CompletedAt = now
@@ -760,6 +786,9 @@ func (queue *MemoryActionQueue) expireLocked(now time.Time) {
 		case executionlease.StatusLeased:
 			record.execution.Status = executionlease.StatusQueued
 			record.execution.RunnerID = ""
+			record.execution.RunnerTenantID = ""
+			record.execution.RunnerWorkspaceID = ""
+			record.execution.RunnerEnvironmentID = ""
 			record.execution.ScopeRevision = 0
 			record.execution.LeaseToken = ""
 			record.execution.HeartbeatSeq = 0
@@ -812,7 +841,7 @@ func validateActionSubmission(submission ActionSubmission) error {
 }
 
 func validateRunnerScope(request ActionClaimRequest) error {
-	if !validIdentifier(request.Scope.runnerID, 256) ||
+	if !validIdentifier(request.Scope.runnerID, 256) || !validIdentifier(request.Scope.tenantID, 256) ||
 		(request.Scope.pool != executionlease.PoolRead && request.Scope.pool != executionlease.PoolWrite) ||
 		request.Scope.scopeRevision <= 0 || len(request.Scope.bindings) == 0 ||
 		request.LeaseDuration < minimumActionLease || request.LeaseDuration > maximumActionLease {
@@ -849,12 +878,6 @@ func hashActionQueueReason(reason ActionQueueReason) (string, error) {
 	}
 	digest := sha256.Sum256(encoded)
 	return hex.EncodeToString(digest[:]), nil
-}
-
-func sameActionSubmission(first, second ActionSubmission) bool {
-	return first.PlanHash == second.PlanHash && first.TargetKey == second.TargetKey &&
-		first.EnvironmentRevision == second.EnvironmentRevision && first.Production == second.Production &&
-		first.Pool == second.Pool && reflect.DeepEqual(first.Envelope, second.Envelope)
 }
 
 func RequestSemanticHash(submission ActionSubmission) (string, error) {
@@ -904,8 +927,9 @@ func ResultSummaryStatus(summary ExecutorResult) (executionlease.Status, error) 
 
 func BuildRunnerResultReceipt(claimed ClaimedAction, request ActionCompleteRequest, completionStatus executionlease.Status, receivedAt time.Time) (RunnerResultReceipt, error) {
 	receipt := RunnerResultReceipt{
-		ActionID: claimed.Execution.ExecutionID, WorkspaceID: claimed.Envelope.WorkspaceID,
-		EnvironmentID: claimed.Envelope.Target.EnvironmentID, PlanHash: claimed.PlanHash,
+		ActionID: claimed.Execution.ExecutionID, TenantID: claimed.Execution.RunnerTenantID,
+		WorkspaceID: claimed.Execution.RunnerWorkspaceID, EnvironmentID: claimed.Execution.RunnerEnvironmentID,
+		PlanHash: claimed.PlanHash,
 		RunnerID: request.Lease.RunnerID, LeaseEpoch: request.Lease.Epoch,
 		ScopeRevision: claimed.Execution.ScopeRevision, CompletionStatus: completionStatus,
 		Summary: request.Summary, ReceivedAt: receivedAt,
@@ -913,12 +937,13 @@ func BuildRunnerResultReceipt(claimed ClaimedAction, request ActionCompleteReque
 	encoded, err := json.Marshal(struct {
 		SchemaVersion    string                `json:"schema_version"`
 		ActionID         string                `json:"action_id"`
+		TenantID         string                `json:"tenant_id"`
 		WorkspaceID      string                `json:"workspace_id"`
 		EnvironmentID    string                `json:"environment_id"`
 		PlanHash         string                `json:"plan_hash"`
 		RunnerID         string                `json:"runner_id"`
-		LeaseEpoch       int64                 `json:"lease_epoch"`
-		ScopeRevision    int64                 `json:"scope_revision"`
+		LeaseEpoch       string                `json:"lease_epoch"`
+		ScopeRevision    string                `json:"scope_revision"`
 		CompletionStatus executionlease.Status `json:"completion_status"`
 		Outcome          ExecutorOutcome       `json:"outcome"`
 		Code             string                `json:"code"`
@@ -926,9 +951,9 @@ func BuildRunnerResultReceipt(claimed ClaimedAction, request ActionCompleteReque
 		Changed          bool                  `json:"changed"`
 		ExternalRefHash  string                `json:"external_operation_ref_hash,omitempty"`
 	}{
-		SchemaVersion: "runner-result.v1", ActionID: receipt.ActionID, WorkspaceID: receipt.WorkspaceID,
+		SchemaVersion: "runner-result.v1", ActionID: receipt.ActionID, TenantID: receipt.TenantID, WorkspaceID: receipt.WorkspaceID,
 		EnvironmentID: receipt.EnvironmentID, PlanHash: receipt.PlanHash, RunnerID: receipt.RunnerID,
-		LeaseEpoch: receipt.LeaseEpoch, ScopeRevision: receipt.ScopeRevision, CompletionStatus: receipt.CompletionStatus,
+		LeaseEpoch: strconv.FormatInt(receipt.LeaseEpoch, 10), ScopeRevision: strconv.FormatInt(receipt.ScopeRevision, 10), CompletionStatus: receipt.CompletionStatus,
 		Outcome: receipt.Summary.Outcome, Code: receipt.Summary.Code, Verification: receipt.Summary.Verification,
 		Changed: receipt.Summary.Changed, ExternalRefHash: receipt.Summary.ExternalOperationRefHash,
 	})

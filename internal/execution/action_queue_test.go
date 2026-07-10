@@ -2,11 +2,16 @@ package execution
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
 	"github.com/seaworld008/aiops-system/internal/action"
 	"github.com/seaworld008/aiops-system/internal/executionlease"
 )
@@ -128,6 +133,27 @@ func TestMemoryActionQueueIdempotencyKeyReturnsOriginalOrConflictsByRequestSeman
 	}
 }
 
+func TestMemoryActionQueueSameActionIDAllowsValidResignWithSameSemantics(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	unsigned := restartEnvelope(now)
+	first, _ := signedEnvelope(t, unsigned)
+	resigned, _ := signedEnvelope(t, unsigned)
+	if first.Signature.Value == resigned.Signature.Value {
+		t.Fatal("test setup produced identical signatures")
+	}
+	queue := mustMemoryActionQueue(t, func() time.Time { return now })
+	original := submitAction(t, queue, first, "environment-1", false)
+	retried, err := queue.Submit(context.Background(), ActionSubmission{
+		Envelope: resigned, PlanHash: resigned.PlanHash, TargetKey: original.TargetKey,
+		EnvironmentRevision: "environment-1", Production: false, Pool: executionlease.PoolWrite,
+	})
+	if err != nil || retried.ExecutionID != original.ExecutionID {
+		t.Fatalf("Submit(valid resign) = %#v, %v; want original execution", retried, err)
+	}
+}
+
 func TestMemoryActionQueueFiltersRunnerScopeBeforeTakingProductionSlot(t *testing.T) {
 	t.Parallel()
 
@@ -190,7 +216,7 @@ func TestMemoryActionQueueRunnerScopeAuthorizesExactWorkspaceEnvironmentPairs(t 
 	}
 
 	registration := RunnerRegistration{
-		RunnerID: "runner-exact-pairs", Pool: executionlease.PoolWrite, Enabled: true, ScopeRevision: 7, MaxConcurrency: 1,
+		RunnerID: "runner-exact-pairs", TenantID: "tenant-1", Pool: executionlease.PoolWrite, Enabled: true, ScopeRevision: 7, MaxConcurrency: 1,
 		ScopeBindings: []RunnerScopeBinding{
 			{WorkspaceID: "workspace-1", EnvironmentID: "PROD"},
 			{WorkspaceID: "workspace-2", EnvironmentID: "STAGING"},
@@ -210,6 +236,10 @@ func TestMemoryActionQueueRunnerScopeAuthorizesExactWorkspaceEnvironmentPairs(t 
 	if claimed.Execution.ScopeRevision != registration.ScopeRevision {
 		t.Fatalf("Claim() scope revision = %d, want %d", claimed.Execution.ScopeRevision, registration.ScopeRevision)
 	}
+	if claimed.Execution.RunnerTenantID != registration.TenantID || claimed.Execution.RunnerWorkspaceID != "workspace-1" ||
+		claimed.Execution.RunnerEnvironmentID != "PROD" {
+		t.Fatalf("Claim() runner scope identity = %#v", claimed.Execution)
+	}
 }
 
 func TestMemoryActionQueueRunnerMaxConcurrencyBlocksSecondLease(t *testing.T) {
@@ -228,7 +258,7 @@ func TestMemoryActionQueueRunnerMaxConcurrencyBlocksSecondLease(t *testing.T) {
 	submitAction(t, queue, firstEnvelope, "environment-1", false)
 	submitAction(t, queue, secondEnvelope, "environment-1", false)
 	scope, err := (RunnerRegistration{
-		RunnerID: "runner-concurrency", Pool: executionlease.PoolWrite, Enabled: true,
+		RunnerID: "runner-concurrency", TenantID: "tenant-test", Pool: executionlease.PoolWrite, Enabled: true,
 		ScopeRevision: 1, MaxConcurrency: 1,
 		ScopeBindings: []RunnerScopeBinding{{WorkspaceID: "workspace-1", EnvironmentID: "PROD"}},
 	}).Scope()
@@ -440,6 +470,67 @@ func TestMemoryActionQueueReclaimResetsHeartbeatSequenceForNewEpoch(t *testing.T
 	}
 }
 
+func TestMemoryActionQueueHeartbeatTerminatesWithoutExtensionAtAuthorizationExpiry(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	clock := now
+	envelope, _ := signedEnvelope(t, restartEnvelope(now))
+	queue := mustMemoryActionQueue(t, func() time.Time { return clock })
+	submitAction(t, queue, envelope, "environment-1", false)
+	clock = clock.Add(10 * time.Minute)
+	scope := testRunnerScope(t, "runner-expired-authorization", RunnerScopeBinding{WorkspaceID: "workspace-1", EnvironmentID: "PROD"})
+	claimed, err := queue.Claim(context.Background(), ActionClaimRequest{Scope: scope, LeaseDuration: 30 * time.Minute})
+	if err != nil {
+		t.Fatalf("Claim() error = %v", err)
+	}
+	if _, err := queue.Start(context.Background(), claimed.Execution.Fence()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	originalExpiry := claimed.Execution.LeaseExpiresAt
+	clock = envelope.ExpiresAt
+	heartbeat, err := queue.Heartbeat(context.Background(), ActionHeartbeatRequest{
+		Lease: claimed.Execution.Fence(), Sequence: 1, Extension: 5 * time.Minute,
+	})
+	if err != nil || heartbeat.Directive != HeartbeatTerminate || !heartbeat.Execution.LeaseExpiresAt.Equal(originalExpiry) {
+		t.Fatalf("Heartbeat(at authorization expiry) = %#v, %v; want TERMINATE and expiry %s", heartbeat, err, originalExpiry)
+	}
+}
+
+func TestMemoryActionQueueHeartbeatCapsExtensionAtAuthorizationExpiry(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	clock := now
+	envelope, _ := signedEnvelope(t, restartEnvelope(now))
+	queue := mustMemoryActionQueue(t, func() time.Time { return clock })
+	submitAction(t, queue, envelope, "environment-1", false)
+	clock = clock.Add(10 * time.Minute)
+	scope := testRunnerScope(t, "runner-capped-authorization", RunnerScopeBinding{WorkspaceID: "workspace-1", EnvironmentID: "PROD"})
+	claimed, err := queue.Claim(context.Background(), ActionClaimRequest{Scope: scope, LeaseDuration: 30 * time.Minute})
+	if err != nil {
+		t.Fatalf("Claim() error = %v", err)
+	}
+	if _, err := queue.Start(context.Background(), claimed.Execution.Fence()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	clock = envelope.ExpiresAt.Add(-time.Minute)
+	heartbeat, err := queue.Heartbeat(context.Background(), ActionHeartbeatRequest{
+		Lease: claimed.Execution.Fence(), Sequence: 1, Extension: 5 * time.Minute,
+	})
+	if err != nil || heartbeat.Directive != HeartbeatContinue || !heartbeat.Execution.LeaseExpiresAt.Equal(envelope.ExpiresAt) {
+		t.Fatalf("Heartbeat(before authorization expiry) = %#v, %v; want capped expiry %s", heartbeat, err, envelope.ExpiresAt)
+	}
+	clock = envelope.ExpiresAt
+	heartbeat, err = queue.Heartbeat(context.Background(), ActionHeartbeatRequest{
+		Lease: claimed.Execution.Fence(), Sequence: 2, Extension: 5 * time.Minute,
+	})
+	if err != nil || heartbeat.Directive != HeartbeatTerminate || heartbeat.Execution.HeartbeatSeq != 1 ||
+		!heartbeat.Execution.LeaseExpiresAt.Equal(envelope.ExpiresAt) {
+		t.Fatalf("Heartbeat(at capped authorization expiry) = %#v, %v; want unchanged TERMINATE", heartbeat, err)
+	}
+}
+
 func TestMemoryActionQueueClaimSweepsExpiredLeasesAndFencesExpiredRunner(t *testing.T) {
 	t.Parallel()
 
@@ -475,6 +566,30 @@ func TestMemoryActionQueueClaimSweepsExpiredLeasesAndFencesExpiredRunner(t *test
 		Lease: secondFence, Summary: ExecutorResult{Outcome: ExecutorSucceeded, Code: "COMPLETED", Verification: VerificationPassed},
 	}); !errors.Is(err, executionlease.ErrStaleLease) {
 		t.Fatalf("Complete(expired runner) error = %v, want ErrStaleLease", err)
+	}
+}
+
+func TestMemoryActionQueueStartFailsClosedAtAuthorizationExpiry(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	clock := now
+	envelope, _ := signedEnvelope(t, restartEnvelope(now))
+	queue := mustMemoryActionQueue(t, func() time.Time { return clock })
+	submitAction(t, queue, envelope, "environment-1", false)
+	clock = clock.Add(10 * time.Minute)
+	scope := testRunnerScope(t, "runner-authorization-boundary", RunnerScopeBinding{WorkspaceID: "workspace-1", EnvironmentID: "PROD"})
+	claimed, err := queue.Claim(context.Background(), ActionClaimRequest{Scope: scope, LeaseDuration: 30 * time.Minute})
+	if err != nil {
+		t.Fatalf("Claim() error = %v", err)
+	}
+	clock = envelope.ExpiresAt
+	if _, err := queue.Start(context.Background(), claimed.Execution.Fence()); !errors.Is(err, executionlease.ErrStaleLease) {
+		t.Fatalf("Start(at authorization expiry) error = %v, want %v", err, executionlease.ErrStaleLease)
+	}
+	persisted, err := queue.Get(context.Background(), envelope.ActionID)
+	if err != nil || persisted.Status != executionlease.StatusLeased {
+		t.Fatalf("Get(after denied Start) = %#v, %v", persisted, err)
 	}
 }
 
@@ -571,6 +686,73 @@ func TestMemoryActionQueueCompletePersistsStructuredReceiptAndFinalizingRetainsL
 	second := claimAction(t, queue, "runner-after-finalize", []string{"workspace-1"}, []string{"PROD"})
 	if second.Execution.ExecutionID != secondEnvelope.ActionID {
 		t.Fatalf("post-Finalize claim = %q, want %q", second.Execution.ExecutionID, secondEnvelope.ActionID)
+	}
+}
+
+func TestRunnerResultReceiptHashesBigintFencesBeyondIJSONSafeIntegerAsStrings(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	envelope, _ := signedEnvelope(t, restartEnvelope(now))
+	const firstEpoch = int64(1<<53 + 1)
+	claimed := ClaimedAction{
+		Execution: executionlease.Execution{
+			ExecutionID: envelope.ActionID, RunnerID: "runner-bigint", RunnerTenantID: "tenant-test",
+			RunnerWorkspaceID: envelope.WorkspaceID, RunnerEnvironmentID: envelope.Target.EnvironmentID, LeaseEpoch: firstEpoch,
+			ScopeRevision: firstEpoch + 2,
+		},
+		Envelope: envelope, PlanHash: envelope.PlanHash,
+	}
+	summary := ExecutorResult{Outcome: ExecutorSucceeded, Code: "BIGINT_FENCE_VERIFIED", Verification: VerificationPassed}
+	first, err := BuildRunnerResultReceipt(claimed, ActionCompleteRequest{
+		Lease:   executionlease.LeaseIdentity{ExecutionID: envelope.ActionID, RunnerID: "runner-bigint", Epoch: firstEpoch},
+		Summary: summary,
+	}, executionlease.StatusSucceeded, now)
+	if err != nil {
+		t.Fatalf("BuildRunnerResultReceipt(bigint) error = %v", err)
+	}
+	expectedJSON, err := json.Marshal(struct {
+		SchemaVersion    string                `json:"schema_version"`
+		ActionID         string                `json:"action_id"`
+		TenantID         string                `json:"tenant_id"`
+		WorkspaceID      string                `json:"workspace_id"`
+		EnvironmentID    string                `json:"environment_id"`
+		PlanHash         string                `json:"plan_hash"`
+		RunnerID         string                `json:"runner_id"`
+		LeaseEpoch       string                `json:"lease_epoch"`
+		ScopeRevision    string                `json:"scope_revision"`
+		CompletionStatus executionlease.Status `json:"completion_status"`
+		Outcome          ExecutorOutcome       `json:"outcome"`
+		Code             string                `json:"code"`
+		Verification     Verification          `json:"verification"`
+		Changed          bool                  `json:"changed"`
+	}{
+		SchemaVersion: "runner-result.v1", ActionID: envelope.ActionID, TenantID: "tenant-test", WorkspaceID: envelope.WorkspaceID,
+		EnvironmentID: envelope.Target.EnvironmentID, PlanHash: envelope.PlanHash, RunnerID: "runner-bigint",
+		LeaseEpoch: strconv.FormatInt(firstEpoch, 10), ScopeRevision: strconv.FormatInt(firstEpoch+2, 10),
+		CompletionStatus: executionlease.StatusSucceeded, Outcome: summary.Outcome, Code: summary.Code,
+		Verification: summary.Verification, Changed: summary.Changed,
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(expected receipt) error = %v", err)
+	}
+	expectedCanonical, err := jsoncanonicalizer.Transform(expectedJSON)
+	if err != nil {
+		t.Fatalf("canonicalize expected receipt error = %v", err)
+	}
+	expectedDigest := sha256.Sum256(append([]byte("runner-result.v1\x00"), expectedCanonical...))
+	if want := hex.EncodeToString(expectedDigest[:]); first.ResultHash != want {
+		t.Fatalf("bigint receipt hash = %s, want string-fence JCS hash %s", first.ResultHash, want)
+	}
+	second, err := BuildRunnerResultReceipt(claimed, ActionCompleteRequest{
+		Lease:   executionlease.LeaseIdentity{ExecutionID: envelope.ActionID, RunnerID: "runner-bigint", Epoch: firstEpoch + 1},
+		Summary: summary,
+	}, executionlease.StatusSucceeded, now)
+	if err != nil {
+		t.Fatalf("BuildRunnerResultReceipt(adjacent bigint) error = %v", err)
+	}
+	if first.ResultHash == second.ResultHash {
+		t.Fatalf("adjacent bigint fences collided: %s", first.ResultHash)
 	}
 }
 
@@ -796,7 +978,7 @@ func claimAction(t *testing.T, queue *MemoryActionQueue, runnerID string, worksp
 func testRunnerScope(t *testing.T, runnerID string, bindings ...RunnerScopeBinding) RunnerScope {
 	t.Helper()
 	scope, err := (RunnerRegistration{
-		RunnerID: runnerID, Pool: executionlease.PoolWrite, Enabled: true,
+		RunnerID: runnerID, TenantID: "tenant-test", Pool: executionlease.PoolWrite, Enabled: true,
 		ScopeRevision: 1, MaxConcurrency: 1, ScopeBindings: bindings,
 	}).Scope()
 	if err != nil {

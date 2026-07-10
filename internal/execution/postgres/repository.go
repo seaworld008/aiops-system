@@ -21,7 +21,8 @@ import (
 
 const actionQueueProjection = `
 	action_id, target_key, runner_pool, production, status,
-	runner_id, lease_epoch, lease_expires_at, lease_acquired_at, last_heartbeat_at,
+	runner_id, runner_tenant_id::text, runner_workspace_id::text, runner_environment_id::text,
+	lease_epoch, lease_expires_at, lease_acquired_at, last_heartbeat_at,
 	started_at, completed_at, result_hash, created_at, updated_at,
 	reconciliation_id, reconciliation_actor, reconciliation_result_hash, reconciled_at,
 	envelope, plan_hash, environment_revision, authorization_expires_at, workspace_id, environment_id,
@@ -134,10 +135,13 @@ func (repository *Repository) Submit(ctx context.Context, submission execution.A
 			return executionlease.Execution{}, fmt.Errorf("read conflicting action submission: %w", getErr)
 		}
 		if existing.claimed.Execution.ExecutionID == submission.Envelope.ActionID {
-			if existing.submissionHash != submissionHash {
-				return executionlease.Execution{}, execution.ErrJobConflict
+			if existing.requestHashVersion == requestHashVersion && existing.requestHash == requestHash {
+				return redact(existing.claimed.Execution), nil
 			}
-			return redact(existing.claimed.Execution), nil
+			if existing.submissionHash == submissionHash {
+				return redact(existing.claimed.Execution), nil
+			}
+			return executionlease.Execution{}, execution.ErrJobConflict
 		}
 		if existing.idempotencyKey != submission.Envelope.IdempotencyKey ||
 			existing.claimed.Envelope.WorkspaceID != submission.Envelope.WorkspaceID ||
@@ -179,14 +183,16 @@ func (repository *Repository) Claim(ctx context.Context, request execution.Actio
 		return execution.ClaimedAction{}, err
 	}
 
-	var actionID string
+	var actionID, runnerTenantID, runnerWorkspaceID, runnerEnvironmentID string
 	var epoch, scopeRevision int64
 	err = tx.QueryRow(ctx, `
-		SELECT candidate.action_id, candidate.lease_epoch, registration.scope_revision
+		SELECT candidate.action_id, candidate.lease_epoch, registration.scope_revision,
+			registration.tenant_id::text, binding.workspace_id::text, binding.environment_id::text
 		FROM action_queue AS candidate
 		JOIN runner_registrations AS registration
 		  ON registration.runner_id = $2 AND registration.enabled = true
 		 AND registration.runner_pool = $1 AND registration.scope_revision = $3
+		 AND registration.tenant_id::text = $4
 		JOIN runner_scope_bindings AS binding
 		  ON binding.runner_id = registration.runner_id
 		 AND binding.tenant_id = registration.tenant_id
@@ -218,7 +224,9 @@ func (repository *Repository) Claim(ctx context.Context, request execution.Actio
 		FOR SHARE OF registration
 		FOR UPDATE OF candidate SKIP LOCKED
 		LIMIT 1
-	`, request.Scope.Pool(), request.Scope.RunnerID(), request.Scope.ScopeRevision()).Scan(&actionID, &epoch, &scopeRevision)
+	`, request.Scope.Pool(), request.Scope.RunnerID(), request.Scope.ScopeRevision(), request.Scope.TenantID()).Scan(
+		&actionID, &epoch, &scopeRevision, &runnerTenantID, &runnerWorkspaceID, &runnerEnvironmentID,
+	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if err := tx.Commit(ctx); err != nil {
 			return execution.ClaimedAction{}, fmt.Errorf("commit empty action claim: %w", err)
@@ -242,7 +250,9 @@ func (repository *Repository) Claim(ctx context.Context, request execution.Actio
 	digest := tokenHash(token)
 	record, err := scanStoredAction(tx.QueryRow(ctx, `
 		UPDATE action_queue AS queued
-		SET status = 'LEASED', runner_id = $2, lease_token_sha256 = $3,
+		SET status = 'LEASED', runner_id = $2,
+			runner_tenant_id = $6, runner_workspace_id = $7, runner_environment_id = $8,
+			lease_token_sha256 = $3,
 			lease_epoch = queued.lease_epoch + 1,
 			scope_revision = $5, heartbeat_seq = 0,
 			lease_acquired_at = statement_timestamp(), last_heartbeat_at = statement_timestamp(),
@@ -256,11 +266,15 @@ func (repository *Repository) Claim(ctx context.Context, request execution.Actio
 		WHERE queued.action_id = $1 AND queued.status = 'QUEUED'
 		RETURNING `+actionQueueProjection,
 		actionID, request.Scope.RunnerID(), digest, request.LeaseDuration.Seconds(), scopeRevision,
+		runnerTenantID, runnerWorkspaceID, runnerEnvironmentID,
 	))
 	if err != nil {
 		return execution.ClaimedAction{}, fmt.Errorf("lease scoped action: %w", err)
 	}
-	if record.leaseTokenHash != digest || record.claimed.Execution.RunnerID != request.Scope.RunnerID() {
+	if record.leaseTokenHash != digest || record.claimed.Execution.RunnerID != request.Scope.RunnerID() ||
+		record.claimed.Execution.RunnerTenantID != runnerTenantID ||
+		record.claimed.Execution.RunnerWorkspaceID != runnerWorkspaceID ||
+		record.claimed.Execution.RunnerEnvironmentID != runnerEnvironmentID {
 		return execution.ClaimedAction{}, execution.ErrJobConflict
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -279,17 +293,54 @@ func (repository *Repository) Start(ctx context.Context, fence executionlease.Le
 		return executionlease.Execution{}, executionlease.ErrInvalidRequest
 	}
 	digest := tokenHash(fence.Token)
-	record, err := scanStoredAction(repository.database.QueryRow(ctx, `
+	tx, err := repository.database.Begin(ctx)
+	if err != nil {
+		return executionlease.Execution{}, fmt.Errorf("begin action start: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	registration, err := lockRunnerRegistration(ctx, tx, fence.RunnerID)
+	if err != nil {
+		return executionlease.Execution{}, err
+	}
+	record, err := scanStoredAction(tx.QueryRow(ctx, `
+		SELECT `+actionQueueProjection+`
+		FROM action_queue
+		WHERE action_id = $1
+		FOR UPDATE
+	`, fence.ExecutionID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return executionlease.Execution{}, executionlease.ErrNotFound
+	}
+	if err != nil {
+		return executionlease.Execution{}, fmt.Errorf("lock action start state: %w", err)
+	}
+	if record.claimed.Execution.RunnerID != fence.RunnerID || record.claimed.Execution.LeaseEpoch != fence.Epoch ||
+		record.leaseTokenHash != digest {
+		return executionlease.Execution{}, executionlease.ErrStaleLease
+	}
+	if record.claimed.Execution.Status != executionlease.StatusLeased && record.claimed.Execution.Status != executionlease.StatusRunning {
+		return executionlease.Execution{}, executionlease.ErrInvalidTransition
+	}
+	if !registration.matches(record.claimed.Execution) {
+		return executionlease.Execution{}, executionlease.ErrStaleLease
+	}
+	record, err = scanStoredAction(tx.QueryRow(ctx, `
 		UPDATE action_queue
 		SET status = 'RUNNING', started_at = COALESCE(started_at, statement_timestamp()),
 			updated_at = CASE WHEN status = 'LEASED' THEN statement_timestamp() ELSE updated_at END
 		WHERE action_id = $1 AND runner_id = $2 AND lease_token_sha256 = $3 AND lease_epoch = $4
 		  AND status IN ('LEASED', 'RUNNING') AND lease_expires_at > statement_timestamp()
+		  AND authorization_expires_at > statement_timestamp()
 		RETURNING `+actionQueueProjection,
 		fence.ExecutionID, fence.RunnerID, digest, fence.Epoch,
 	))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return repository.leaseMiss(ctx, fence, executionlease.StatusLeased, executionlease.StatusRunning)
+		return executionlease.Execution{}, executionlease.ErrStaleLease
 	}
 	if err != nil {
 		return executionlease.Execution{}, fmt.Errorf("start action execution: %w", err)
@@ -297,6 +348,10 @@ func (repository *Repository) Start(ctx context.Context, fence executionlease.Le
 	if record.leaseTokenHash != digest {
 		return executionlease.Execution{}, executionlease.ErrStaleLease
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return executionlease.Execution{}, fmt.Errorf("commit action start: %w", err)
+	}
+	committed = true
 	return redact(record.claimed.Execution), nil
 }
 
@@ -311,30 +366,156 @@ func (repository *Repository) Heartbeat(ctx context.Context, request execution.A
 		return execution.ActionHeartbeatResult{}, execution.ErrHeartbeatSequence
 	}
 	digest := tokenHash(request.Lease.Token)
-	record, err := scanStoredAction(repository.database.QueryRow(ctx, `
+	tx, err := repository.database.Begin(ctx)
+	if err != nil {
+		return execution.ActionHeartbeatResult{}, fmt.Errorf("begin action heartbeat: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	registration, err := lockRunnerRegistration(ctx, tx, request.Lease.RunnerID)
+	if err != nil {
+		return execution.ActionHeartbeatResult{}, err
+	}
+	record, err := scanStoredAction(tx.QueryRow(ctx, `
+		SELECT `+actionQueueProjection+`
+		FROM action_queue
+		WHERE action_id = $1
+		FOR UPDATE
+	`, request.Lease.ExecutionID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return execution.ActionHeartbeatResult{}, executionlease.ErrNotFound
+	}
+	if err != nil {
+		return execution.ActionHeartbeatResult{}, fmt.Errorf("lock action heartbeat state: %w", err)
+	}
+	if record.claimed.Execution.RunnerID != request.Lease.RunnerID || record.claimed.Execution.LeaseEpoch != request.Lease.Epoch ||
+		record.leaseTokenHash != digest {
+		return execution.ActionHeartbeatResult{}, executionlease.ErrStaleLease
+	}
+	if record.claimed.Execution.Status != executionlease.StatusLeased && record.claimed.Execution.Status != executionlease.StatusRunning {
+		return execution.ActionHeartbeatResult{}, executionlease.ErrInvalidTransition
+	}
+	if !registration.matches(record.claimed.Execution) {
+		if err := tx.Commit(ctx); err != nil {
+			return execution.ActionHeartbeatResult{}, fmt.Errorf("commit terminated action heartbeat: %w", err)
+		}
+		committed = true
+		return execution.ActionHeartbeatResult{Execution: redact(record.claimed.Execution), Directive: execution.HeartbeatTerminate}, nil
+	}
+	var leaseCurrent, authorizationCurrent bool
+	leaseCurrent, authorizationCurrent, err = heartbeatTimeBoundaries(ctx, tx, request.Lease.ExecutionID)
+	if err != nil {
+		return execution.ActionHeartbeatResult{}, fmt.Errorf("read action heartbeat time boundaries: %w", err)
+	}
+	if !authorizationCurrent {
+		if err := tx.Commit(ctx); err != nil {
+			return execution.ActionHeartbeatResult{}, fmt.Errorf("commit expired-authorization heartbeat: %w", err)
+		}
+		committed = true
+		return execution.ActionHeartbeatResult{Execution: redact(record.claimed.Execution), Directive: execution.HeartbeatTerminate}, nil
+	}
+	if !leaseCurrent {
+		return execution.ActionHeartbeatResult{}, executionlease.ErrStaleLease
+	}
+	if request.Sequence == record.claimed.Execution.HeartbeatSeq {
+		if err := tx.Commit(ctx); err != nil {
+			return execution.ActionHeartbeatResult{}, fmt.Errorf("commit replayed action heartbeat: %w", err)
+		}
+		committed = true
+		return heartbeatResult(record.claimed.Execution), nil
+	}
+	if request.Sequence != record.claimed.Execution.HeartbeatSeq+1 {
+		return execution.ActionHeartbeatResult{}, execution.ErrHeartbeatSequence
+	}
+	updatedRecord, err := scanStoredAction(tx.QueryRow(ctx, `
 		UPDATE action_queue
 		SET heartbeat_seq = $5,
 			last_heartbeat_at = CASE WHEN cancel_requested_at IS NULL THEN statement_timestamp() ELSE last_heartbeat_at END,
 			lease_expires_at = CASE WHEN cancel_requested_at IS NULL
-				THEN statement_timestamp() + make_interval(secs => $6::double precision)
+				THEN LEAST(statement_timestamp() + make_interval(secs => $6::double precision), authorization_expires_at)
 				ELSE lease_expires_at END,
 			updated_at = statement_timestamp()
 		WHERE action_id = $1 AND runner_id = $2 AND lease_token_sha256 = $3 AND lease_epoch = $4
 		  AND status IN ('LEASED', 'RUNNING') AND lease_expires_at > statement_timestamp()
+		  AND authorization_expires_at > statement_timestamp()
 		  AND heartbeat_seq + 1 = $5
 		RETURNING `+actionQueueProjection,
 		request.Lease.ExecutionID, request.Lease.RunnerID, digest, request.Lease.Epoch, request.Sequence, request.Extension.Seconds(),
 	))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return repository.heartbeatMiss(ctx, request, digest)
+		_, authorizationCurrent, boundaryErr := heartbeatTimeBoundaries(ctx, tx, request.Lease.ExecutionID)
+		if boundaryErr != nil {
+			return execution.ActionHeartbeatResult{}, fmt.Errorf("recheck action heartbeat time boundaries: %w", boundaryErr)
+		}
+		if !authorizationCurrent {
+			if err := tx.Commit(ctx); err != nil {
+				return execution.ActionHeartbeatResult{}, fmt.Errorf("commit expired-authorization heartbeat: %w", err)
+			}
+			committed = true
+			return execution.ActionHeartbeatResult{Execution: redact(record.claimed.Execution), Directive: execution.HeartbeatTerminate}, nil
+		}
+		return execution.ActionHeartbeatResult{}, executionlease.ErrStaleLease
 	}
 	if err != nil {
 		return execution.ActionHeartbeatResult{}, fmt.Errorf("heartbeat action execution: %w", err)
 	}
+	record = updatedRecord
 	if record.leaseTokenHash != digest {
 		return execution.ActionHeartbeatResult{}, executionlease.ErrStaleLease
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return execution.ActionHeartbeatResult{}, fmt.Errorf("commit action heartbeat: %w", err)
+	}
+	committed = true
 	return heartbeatResult(record.claimed.Execution), nil
+}
+
+func heartbeatTimeBoundaries(ctx context.Context, tx pgx.Tx, actionID string) (bool, bool, error) {
+	var leaseCurrent, authorizationCurrent bool
+	err := tx.QueryRow(ctx, `
+		SELECT COALESCE(lease_expires_at > statement_timestamp(), false),
+			authorization_expires_at > statement_timestamp()
+		FROM action_queue
+		WHERE action_id = $1
+	`, actionID).Scan(&leaseCurrent, &authorizationCurrent)
+	return leaseCurrent, authorizationCurrent, err
+}
+
+type lockedRunnerRegistration struct {
+	tenantID      string
+	pool          executionlease.Pool
+	enabled       bool
+	scopeRevision int64
+	found         bool
+}
+
+func (registration lockedRunnerRegistration) matches(value executionlease.Execution) bool {
+	return registration.found && registration.enabled && registration.tenantID == value.RunnerTenantID &&
+		registration.pool == value.Pool && registration.scopeRevision == value.ScopeRevision
+}
+
+func lockRunnerRegistration(ctx context.Context, tx pgx.Tx, runnerID string) (lockedRunnerRegistration, error) {
+	var registration lockedRunnerRegistration
+	var pool string
+	err := tx.QueryRow(ctx, `
+		SELECT tenant_id::text, runner_pool, enabled, scope_revision
+		FROM runner_registrations
+		WHERE runner_id = $1
+		FOR SHARE
+	`, runnerID).Scan(&registration.tenantID, &pool, &registration.enabled, &registration.scopeRevision)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return registration, nil
+	}
+	if err != nil {
+		return lockedRunnerRegistration{}, fmt.Errorf("lock runner registration: %w", err)
+	}
+	registration.pool = executionlease.Pool(pool)
+	registration.found = true
+	return registration, nil
 }
 
 func (repository *Repository) heartbeatMiss(ctx context.Context, request execution.ActionHeartbeatRequest, digest string) (execution.ActionHeartbeatResult, error) {
@@ -396,6 +577,10 @@ func (repository *Repository) Complete(ctx context.Context, request execution.Ac
 			_ = tx.Rollback(ctx)
 		}
 	}()
+	registration, err := lockRunnerRegistration(ctx, tx, request.Lease.RunnerID)
+	if err != nil {
+		return executionlease.Execution{}, err
+	}
 	record, err := scanStoredAction(tx.QueryRow(ctx, `
 		SELECT `+actionQueueProjection+` FROM action_queue WHERE action_id = $1 FOR UPDATE
 	`, request.Lease.ExecutionID))
@@ -404,6 +589,9 @@ func (repository *Repository) Complete(ctx context.Context, request execution.Ac
 	}
 	if err != nil {
 		return executionlease.Execution{}, fmt.Errorf("lock action completion state: %w", err)
+	}
+	if record.claimed.Execution.Status == executionlease.StatusRunning && !registration.matches(record.claimed.Execution) {
+		return executionlease.Execution{}, executionlease.ErrStaleLease
 	}
 	receipt, err := execution.BuildRunnerResultReceipt(record.claimed, request, completionStatus, time.Time{})
 	if err != nil {
@@ -459,11 +647,11 @@ func (repository *Repository) Complete(ctx context.Context, request execution.Ac
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO runner_result_receipts (
-			action_id, workspace_id, runner_id, lease_epoch, scope_revision,
+			action_id, tenant_id, workspace_id, environment_id, runner_id, lease_epoch, scope_revision,
 			receipt_hash, completion_status, schema_version, summary, received_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'runner-result.v1', $8, statement_timestamp())
-	`, receipt.ActionID, receipt.WorkspaceID, receipt.RunnerID, receipt.LeaseEpoch, receipt.ScopeRevision,
-		receipt.ResultHash, receipt.CompletionStatus, string(summaryJSON)); err != nil {
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'runner-result.v1', $10, statement_timestamp())
+	`, receipt.ActionID, receipt.TenantID, receipt.WorkspaceID, receipt.EnvironmentID, receipt.RunnerID,
+		receipt.LeaseEpoch, receipt.ScopeRevision, receipt.ResultHash, receipt.CompletionStatus, string(summaryJSON)); err != nil {
 		if isUniqueViolation(err) {
 			return executionlease.Execution{}, executionlease.ErrCompletionConflict
 		}
@@ -607,7 +795,8 @@ func (repository *Repository) Nack(ctx context.Context, request execution.Action
 		UPDATE action_queue
 		SET status = 'QUEUED', last_nack_hash = $5,
 			not_before = statement_timestamp() + make_interval(secs => $6::double precision),
-			runner_id = NULL, lease_token_sha256 = NULL, lease_acquired_at = NULL,
+			runner_id = NULL, runner_tenant_id = NULL, runner_workspace_id = NULL, runner_environment_id = NULL,
+			lease_token_sha256 = NULL, lease_acquired_at = NULL,
 			lease_expires_at = NULL, last_heartbeat_at = NULL, scope_revision = NULL,
 			heartbeat_seq = 0, cancel_requested_at = NULL, cancel_reason_hash = NULL,
 			updated_at = statement_timestamp()
@@ -710,6 +899,9 @@ func (repository *Repository) Cancel(ctx context.Context, actionID string) (exec
 			cancel_requested_at = CASE WHEN status = 'RUNNING' THEN COALESCE(cancel_requested_at, statement_timestamp()) ELSE NULL END,
 			cancel_reason_hash = CASE WHEN status = 'RUNNING' THEN COALESCE(cancel_reason_hash, $2) ELSE NULL END,
 			runner_id = CASE WHEN status = 'RUNNING' THEN runner_id ELSE NULL END,
+			runner_tenant_id = CASE WHEN status = 'RUNNING' THEN runner_tenant_id ELSE NULL END,
+			runner_workspace_id = CASE WHEN status = 'RUNNING' THEN runner_workspace_id ELSE NULL END,
+			runner_environment_id = CASE WHEN status = 'RUNNING' THEN runner_environment_id ELSE NULL END,
 			scope_revision = CASE WHEN status = 'RUNNING' THEN scope_revision ELSE NULL END,
 			lease_token_sha256 = CASE WHEN status = 'RUNNING' THEN lease_token_sha256 ELSE NULL END,
 			lease_expires_at = CASE WHEN status = 'RUNNING' THEN lease_expires_at ELSE NULL END,
@@ -757,7 +949,8 @@ func validCompletionStatus(status executionlease.Status) bool {
 }
 
 func validateClaim(request execution.ActionClaimRequest) error {
-	if !validIdentifier(request.Scope.RunnerID(), 256) || !validPool(request.Scope.Pool()) || request.Scope.ScopeRevision() <= 0 ||
+	if !validIdentifier(request.Scope.RunnerID(), 256) || !validIdentifier(request.Scope.TenantID(), 256) ||
+		!validPool(request.Scope.Pool()) || request.Scope.ScopeRevision() <= 0 ||
 		request.Scope.MaxConcurrency() < 1 || request.Scope.MaxConcurrency() > 1024 ||
 		request.LeaseDuration < minimumLeaseDuration || request.LeaseDuration > maximumLeaseDuration {
 		return executionlease.ErrInvalidRequest
@@ -894,7 +1087,9 @@ func sweepExpired(ctx context.Context, tx pgx.Tx, actionID string) error {
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE action_queue AS expired_lease
-		SET status = 'QUEUED', runner_id = NULL, lease_token_sha256 = NULL,
+		SET status = 'QUEUED', runner_id = NULL,
+			runner_tenant_id = NULL, runner_workspace_id = NULL, runner_environment_id = NULL,
+			lease_token_sha256 = NULL,
 			lease_acquired_at = NULL, lease_expires_at = NULL, last_heartbeat_at = NULL,
 			scope_revision = NULL, heartbeat_seq = 0, cancel_requested_at = NULL, cancel_reason_hash = NULL,
 			not_before = statement_timestamp(), updated_at = statement_timestamp()
@@ -1026,7 +1221,7 @@ func hashSubmission(submission execution.ActionSubmission, envelopeJSON []byte) 
 func scanStoredAction(row pgx.Row) (storedAction, error) {
 	var record storedAction
 	var pool, status string
-	var runnerID, resultHash pgtype.Text
+	var runnerID, runnerTenantID, runnerWorkspaceID, runnerEnvironmentID, resultHash pgtype.Text
 	var reconciliationID, reconciliationActor, reconciliationResultHash pgtype.Text
 	var leaseTokenHash, completedLeaseTokenHash, lastNackHash pgtype.Text
 	var cancelReasonHash, completionStatus pgtype.Text
@@ -1037,7 +1232,8 @@ func scanStoredAction(row pgx.Row) (storedAction, error) {
 	var workspaceID, environmentID string
 	err := row.Scan(
 		&record.claimed.Execution.ExecutionID, &record.claimed.Execution.TargetKey, &pool,
-		&record.claimed.Execution.Production, &status, &runnerID, &record.claimed.Execution.LeaseEpoch,
+		&record.claimed.Execution.Production, &status, &runnerID,
+		&runnerTenantID, &runnerWorkspaceID, &runnerEnvironmentID, &record.claimed.Execution.LeaseEpoch,
 		&leaseExpiresAt, &leaseAcquiredAt, &lastHeartbeatAt, &startedAt, &completedAt, &resultHash,
 		&record.claimed.Execution.CreatedAt, &record.claimed.Execution.UpdatedAt,
 		&reconciliationID, &reconciliationActor, &reconciliationResultHash, &reconciledAt,
@@ -1056,6 +1252,9 @@ func scanStoredAction(row pgx.Row) (storedAction, error) {
 	record.claimed.Execution.Pool = executionlease.Pool(pool)
 	record.claimed.Execution.Status = executionlease.Status(status)
 	record.claimed.Execution.RunnerID = textValue(runnerID)
+	record.claimed.Execution.RunnerTenantID = textValue(runnerTenantID)
+	record.claimed.Execution.RunnerWorkspaceID = textValue(runnerWorkspaceID)
+	record.claimed.Execution.RunnerEnvironmentID = textValue(runnerEnvironmentID)
 	record.claimed.Execution.ResultHash = textValue(resultHash)
 	record.claimed.Execution.ReconciliationID = textValue(reconciliationID)
 	record.claimed.Execution.ReconciliationActor = textValue(reconciliationActor)
@@ -1080,6 +1279,14 @@ func scanStoredAction(row pgx.Row) (storedAction, error) {
 	}
 	if scopeRevision.Valid {
 		record.claimed.Execution.ScopeRevision = scopeRevision.Int64
+	}
+	runnerIdentityPresent := record.claimed.Execution.RunnerTenantID != "" ||
+		record.claimed.Execution.RunnerWorkspaceID != "" || record.claimed.Execution.RunnerEnvironmentID != ""
+	if runnerIdentityPresent && (record.claimed.Execution.RunnerID == "" || record.claimed.Execution.RunnerTenantID == "" ||
+		record.claimed.Execution.RunnerWorkspaceID == "" || record.claimed.Execution.RunnerEnvironmentID == "" ||
+		record.claimed.Execution.RunnerWorkspaceID != record.claimed.Envelope.WorkspaceID ||
+		record.claimed.Execution.RunnerEnvironmentID != record.claimed.Envelope.Target.EnvironmentID) {
+		return storedAction{}, execution.ErrJobConflict
 	}
 	if record.claimed.Envelope.WorkspaceID != workspaceID || record.claimed.Envelope.Target.EnvironmentID != environmentID ||
 		record.claimed.Envelope.PlanHash != record.claimed.PlanHash || record.claimed.Envelope.ActionID != record.claimed.Execution.ExecutionID ||

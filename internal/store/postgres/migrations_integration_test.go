@@ -38,6 +38,9 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 		t.Fatalf("ParseConfig() error = %v", err)
 	}
 	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	if config.MaxConns < 6 {
+		config.MaxConns = 6
+	}
 	database, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		t.Fatalf("NewWithConfig() error = %v", err)
@@ -203,6 +206,7 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	expectMigrationSQLState(t, ctx, database, filepath.Join(migrationDirectory, "000007_runner_execution_hardening.down.sql"), "55000")
 	execSQL(t, ctx, database, `DROP TRIGGER runner_result_receipts_no_truncate ON runner_result_receipts`)
 	execSQL(t, ctx, database, `TRUNCATE runner_result_receipts`)
+	execSQL(t, ctx, database, `DELETE FROM action_queue`)
 	execSQL(t, ctx, database, `DELETE FROM runner_certificates`)
 	execSQL(t, ctx, database, `DELETE FROM runner_scope_bindings`)
 	execSQL(t, ctx, database, `DELETE FROM runner_registrations`)
@@ -231,7 +235,7 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	if err != nil {
 		t.Fatalf("create real PostgreSQL ActionQueue: %v", err)
 	}
-	for _, runnerID := range []string{"runner-postgres-1", "runner-postgres-2", "runner-postgres-3", "runner-postgres-4"} {
+	for _, runnerID := range []string{"runner-postgres-1", "runner-postgres-2", "runner-postgres-3", "runner-postgres-4", "runner-postgres-race"} {
 		execSQL(t, ctx, database, `
 			INSERT INTO runner_registrations (runner_id, tenant_id, spiffe_uri, runner_pool, enabled, scope_revision)
 			VALUES ($1, $2, 'spiffe://integration.test/runner/write/' || $1, 'WRITE', true, 1)
@@ -241,6 +245,7 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 			VALUES ($1, $2, $3, $4)
 		`, runnerID, tenantID, workspaceID, environmentID)
 	}
+	exerciseRealRegistrationRaces(t, ctx, database, queue, signer, tenantID, workspaceID, environmentID, serviceID)
 	expectSQLState(t, ctx, database, "55000", `TRUNCATE runner_scope_bindings`)
 	execSQL(t, ctx, database, `
 		INSERT INTO runner_certificates (
@@ -411,6 +416,16 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	if err != nil || completed.Status != executionlease.StatusSucceeded {
 		t.Fatalf("real ActionQueue.Finalize = %#v, %v", completed, err)
 	}
+	var receiptTenantID, receiptWorkspaceID, receiptEnvironmentID string
+	if err := database.QueryRow(ctx, `
+		SELECT runner_tenant_id::text, runner_workspace_id::text, runner_environment_id::text
+		FROM action_queue WHERE action_id = $1
+	`, completed.ExecutionID).Scan(&receiptTenantID, &receiptWorkspaceID, &receiptEnvironmentID); err != nil {
+		t.Fatalf("read terminal action runner identity: %v", err)
+	}
+	if receiptTenantID != tenantID || receiptWorkspaceID != workspaceID || receiptEnvironmentID != environmentID {
+		t.Fatalf("terminal action runner identity = (%q, %q, %q)", receiptTenantID, receiptWorkspaceID, receiptEnvironmentID)
+	}
 
 	second, err := queue.Claim(ctx, execution.ActionClaimRequest{
 		Scope:         realRunnerScope(t, ctx, database, "runner-postgres-3"),
@@ -503,13 +518,301 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	`, claimed.Execution.ExecutionID)
 	expectSQLState(t, ctx, database, "23514", `
 		UPDATE action_queue
-		SET status = 'LEASED', runner_id = 'runner-invalid-epoch', lease_epoch = 0,
+		SET status = 'LEASED', lease_epoch = 0,
 			lease_token_sha256 = $2, lease_acquired_at = statement_timestamp(),
 			lease_expires_at = statement_timestamp() + interval '1 minute',
 			last_heartbeat_at = statement_timestamp(), completed_at = NULL,
 			result_hash = NULL, updated_at = statement_timestamp()
 		WHERE action_id = $1
 	`, second.Execution.ExecutionID, strings.Repeat("a", 64))
+
+	shapeSubmission := realActionSubmission(t, signer, now, "90000000-0000-4000-8000-000000000096", workspaceID, environmentID,
+		serviceID, "payments-runner-identity-shape", '6')
+	shapeSubmission.Production = false
+	if _, err := queue.Submit(ctx, shapeSubmission); err != nil {
+		t.Fatalf("submit runner identity shape action: %v", err)
+	}
+	expectSQLState(t, ctx, database, "23514", `
+		UPDATE action_queue
+		SET runner_id = 'runner-postgres-1', runner_tenant_id = $2,
+			runner_workspace_id = $3, runner_environment_id = $4
+		WHERE action_id = $1
+	`, shapeSubmission.Envelope.ActionID, tenantID, workspaceID, environmentID)
+	if _, err := queue.Cancel(ctx, shapeSubmission.Envelope.ActionID); err != nil {
+		t.Fatalf("cancel runner identity shape action: %v", err)
+	}
+	expectSQLState(t, ctx, database, "23514", `
+		UPDATE action_queue
+		SET runner_id = 'runner-postgres-1', runner_tenant_id = $2,
+			runner_workspace_id = $3, runner_environment_id = $4
+		WHERE action_id = $1
+	`, shapeSubmission.Envelope.ActionID, tenantID, workspaceID, environmentID)
+}
+
+type realExecutionCallResult struct {
+	execution executionlease.Execution
+	err       error
+}
+
+type realHeartbeatCallResult struct {
+	heartbeat execution.ActionHeartbeatResult
+	err       error
+}
+
+func exerciseRealRegistrationRaces(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	queue execution.ActionQueue,
+	signer action.Signer,
+	tenantID, workspaceID, environmentID, serviceID string,
+) {
+	t.Helper()
+	const runnerID = "runner-postgres-race"
+	now := time.Now().UTC()
+	submission := realActionSubmission(t, signer, now, "90000000-0000-4000-8000-000000000095", workspaceID, environmentID,
+		serviceID, "payments-registration-race", '5')
+	submission.Production = false
+	if _, err := queue.Submit(ctx, submission); err != nil {
+		t.Fatalf("submit registration race action: %v", err)
+	}
+	claimed, err := queue.Claim(ctx, execution.ActionClaimRequest{
+		Scope: realRunnerScope(t, ctx, database, runnerID), LeaseDuration: time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("claim registration race action: %v", err)
+	}
+	fence := claimed.Execution.Fence()
+
+	disableTx, disableXID := beginRunnerDisable(t, ctx, database, runnerID)
+	startResults := make(chan realExecutionCallResult, 1)
+	startDone := make(chan struct{})
+	startContext, cancelStart := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelStart()
+	go func() {
+		value, callErr := queue.Start(startContext, fence)
+		startResults <- realExecutionCallResult{execution: value, err: callErr}
+		close(startDone)
+	}()
+	waitForTransactionWaiter(t, ctx, database, disableXID, startDone, "Start registration lock")
+	commitTestTransaction(t, ctx, disableTx, "commit disabled runner before Start")
+	startResult := awaitExecutionCall(t, startResults, "Start after runner disable")
+	if !errors.Is(startResult.err, executionlease.ErrStaleLease) {
+		t.Fatalf("Start(disable wins) = %#v, %v; want stale lease", startResult.execution, startResult.err)
+	}
+	assertActionStatus(t, ctx, database, fence.ExecutionID, executionlease.StatusLeased)
+	setRunnerEnabled(t, ctx, database, runnerID, true)
+	started, err := queue.Start(ctx, fence)
+	if err != nil || started.Status != executionlease.StatusRunning {
+		t.Fatalf("Start(after re-enable) = %#v, %v", started, err)
+	}
+
+	actionTx, actionXID := beginActionRowBlock(t, ctx, database, fence.ExecutionID)
+	heartbeatResults := make(chan realHeartbeatCallResult, 1)
+	heartbeatDone := make(chan struct{})
+	heartbeatContext, cancelHeartbeat := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelHeartbeat()
+	go func() {
+		value, callErr := queue.Heartbeat(heartbeatContext, execution.ActionHeartbeatRequest{Lease: fence, Sequence: 1, Extension: 2 * time.Minute})
+		heartbeatResults <- realHeartbeatCallResult{heartbeat: value, err: callErr}
+		close(heartbeatDone)
+	}()
+	waitForTransactionWaiter(t, ctx, database, actionXID, heartbeatDone, "Heartbeat action lock")
+	updateContext, cancelUpdate := context.WithTimeout(ctx, 250*time.Millisecond)
+	_, disableErr := database.Exec(updateContext, `
+		UPDATE runner_registrations SET enabled = false, updated_at = statement_timestamp() WHERE runner_id = $1
+	`, runnerID)
+	updateContextErr := updateContext.Err()
+	cancelUpdate()
+	if disableErr == nil || !errors.Is(updateContextErr, context.DeadlineExceeded) {
+		t.Fatalf("runner disable was not blocked by Heartbeat registration lock: error=%v context=%v", disableErr, updateContextErr)
+	}
+	commitTestTransaction(t, ctx, actionTx, "release Heartbeat action row")
+	heartbeatResult := awaitHeartbeatCall(t, heartbeatResults, "Heartbeat holding registration lock")
+	if heartbeatResult.err != nil || heartbeatResult.heartbeat.Directive != execution.HeartbeatContinue ||
+		heartbeatResult.heartbeat.Execution.HeartbeatSeq != 1 {
+		t.Fatalf("Heartbeat(operation wins) = %#v, %v", heartbeatResult.heartbeat, heartbeatResult.err)
+	}
+
+	beforeExpiry := heartbeatResult.heartbeat.Execution.LeaseExpiresAt
+	disableTx, disableXID = beginRunnerDisable(t, ctx, database, runnerID)
+	heartbeatResults = make(chan realHeartbeatCallResult, 1)
+	heartbeatDone = make(chan struct{})
+	expiredHeartbeatContext, cancelExpiredHeartbeat := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelExpiredHeartbeat()
+	go func() {
+		value, callErr := queue.Heartbeat(expiredHeartbeatContext, execution.ActionHeartbeatRequest{Lease: fence, Sequence: 2, Extension: 3 * time.Minute})
+		heartbeatResults <- realHeartbeatCallResult{heartbeat: value, err: callErr}
+		close(heartbeatDone)
+	}()
+	waitForTransactionWaiter(t, ctx, database, disableXID, heartbeatDone, "Heartbeat registration lock")
+	commitTestTransaction(t, ctx, disableTx, "commit disabled runner before Heartbeat")
+	heartbeatResult = awaitHeartbeatCall(t, heartbeatResults, "Heartbeat after runner disable")
+	if heartbeatResult.err != nil || heartbeatResult.heartbeat.Directive != execution.HeartbeatTerminate ||
+		heartbeatResult.heartbeat.Execution.HeartbeatSeq != 1 ||
+		!heartbeatResult.heartbeat.Execution.LeaseExpiresAt.Equal(beforeExpiry) {
+		t.Fatalf("Heartbeat(disable wins) = %#v, %v", heartbeatResult.heartbeat, heartbeatResult.err)
+	}
+	setRunnerEnabled(t, ctx, database, runnerID, true)
+
+	completion := execution.ActionCompleteRequest{
+		Lease: fence,
+		Summary: execution.ExecutorResult{
+			Outcome: execution.ExecutorSucceeded, Code: "REGISTRATION_RACE_VERIFIED", Verification: execution.VerificationPassed,
+		},
+	}
+	disableTx, disableXID = beginRunnerDisable(t, ctx, database, runnerID)
+	completeResults := make(chan realExecutionCallResult, 1)
+	completeDone := make(chan struct{})
+	completeContext, cancelComplete := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelComplete()
+	go func() {
+		value, callErr := queue.Complete(completeContext, completion)
+		completeResults <- realExecutionCallResult{execution: value, err: callErr}
+		close(completeDone)
+	}()
+	waitForTransactionWaiter(t, ctx, database, disableXID, completeDone, "Complete registration lock")
+	commitTestTransaction(t, ctx, disableTx, "commit disabled runner before Complete")
+	completeResult := awaitExecutionCall(t, completeResults, "Complete after runner disable")
+	if !errors.Is(completeResult.err, executionlease.ErrStaleLease) {
+		t.Fatalf("Complete(disable wins) = %#v, %v; want stale lease", completeResult.execution, completeResult.err)
+	}
+	assertActionStatus(t, ctx, database, fence.ExecutionID, executionlease.StatusRunning)
+	var receiptCount int
+	if err := database.QueryRow(ctx, `SELECT count(*) FROM runner_result_receipts WHERE action_id = $1`, fence.ExecutionID).Scan(&receiptCount); err != nil || receiptCount != 0 {
+		t.Fatalf("receipt count after rejected Complete = %d, %v", receiptCount, err)
+	}
+	setRunnerEnabled(t, ctx, database, runnerID, true)
+	finalizing, err := queue.Complete(ctx, completion)
+	if err != nil || finalizing.Status != executionlease.StatusFinalizing {
+		t.Fatalf("Complete(after re-enable) = %#v, %v", finalizing, err)
+	}
+	completed, err := queue.Finalize(ctx, fence)
+	if err != nil || completed.Status != executionlease.StatusSucceeded {
+		t.Fatalf("Finalize(registration race action) = %#v, %v", completed, err)
+	}
+}
+
+func beginRunnerDisable(t *testing.T, ctx context.Context, database *pgxpool.Pool, runnerID string) (pgx.Tx, string) {
+	t.Helper()
+	tx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin runner disable transaction: %v", err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
+	if _, err := tx.Exec(ctx, `
+		UPDATE runner_registrations SET enabled = false, updated_at = statement_timestamp() WHERE runner_id = $1
+	`, runnerID); err != nil {
+		t.Fatalf("disable runner in transaction: %v", err)
+	}
+	var xid string
+	if err := tx.QueryRow(ctx, `SELECT txid_current()::text`).Scan(&xid); err != nil {
+		t.Fatalf("read runner disable transaction ID: %v", err)
+	}
+	return tx, xid
+}
+
+func beginActionRowBlock(t *testing.T, ctx context.Context, database *pgxpool.Pool, actionID string) (pgx.Tx, string) {
+	t.Helper()
+	tx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin action row blocker: %v", err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
+	var lockedActionID string
+	if err := tx.QueryRow(ctx, `SELECT action_id FROM action_queue WHERE action_id = $1 FOR UPDATE`, actionID).Scan(&lockedActionID); err != nil {
+		t.Fatalf("lock action row: %v", err)
+	}
+	var xid string
+	if err := tx.QueryRow(ctx, `SELECT txid_current()::text`).Scan(&xid); err != nil {
+		t.Fatalf("read action blocker transaction ID: %v", err)
+	}
+	return tx, xid
+}
+
+func waitForTransactionWaiter(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	xid string,
+	operationDone <-chan struct{},
+	operation string,
+) {
+	t.Helper()
+	waitContext, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting bool
+		if err := database.QueryRow(waitContext, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_locks
+				WHERE locktype = 'transactionid' AND transactionid::text = $1 AND NOT granted
+			)
+		`, xid).Scan(&waiting); err != nil {
+			t.Fatalf("observe %s waiter: %v", operation, err)
+		}
+		if waiting {
+			return
+		}
+		select {
+		case <-operationDone:
+			t.Fatalf("%s completed before waiting on transaction %s", operation, xid)
+		case <-ticker.C:
+		case <-waitContext.Done():
+			t.Fatalf("timed out observing %s wait on transaction %s", operation, xid)
+		}
+	}
+}
+
+func commitTestTransaction(t *testing.T, ctx context.Context, tx pgx.Tx, operation string) {
+	t.Helper()
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("%s: %v", operation, err)
+	}
+}
+
+func setRunnerEnabled(t *testing.T, ctx context.Context, database *pgxpool.Pool, runnerID string, enabled bool) {
+	t.Helper()
+	if _, err := database.Exec(ctx, `
+		UPDATE runner_registrations SET enabled = $2, updated_at = statement_timestamp() WHERE runner_id = $1
+	`, runnerID, enabled); err != nil {
+		t.Fatalf("set runner %s enabled=%t: %v", runnerID, enabled, err)
+	}
+}
+
+func assertActionStatus(t *testing.T, ctx context.Context, database *pgxpool.Pool, actionID string, want executionlease.Status) {
+	t.Helper()
+	var status executionlease.Status
+	if err := database.QueryRow(ctx, `SELECT status FROM action_queue WHERE action_id = $1`, actionID).Scan(&status); err != nil {
+		t.Fatalf("read action %s status: %v", actionID, err)
+	}
+	if status != want {
+		t.Fatalf("action %s status = %s, want %s", actionID, status, want)
+	}
+}
+
+func awaitExecutionCall(t *testing.T, results <-chan realExecutionCallResult, operation string) realExecutionCallResult {
+	t.Helper()
+	select {
+	case result := <-results:
+		return result
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", operation)
+		return realExecutionCallResult{}
+	}
+}
+
+func awaitHeartbeatCall(t *testing.T, results <-chan realHeartbeatCallResult, operation string) realHeartbeatCallResult {
+	t.Helper()
+	select {
+	case result := <-results:
+		return result
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", operation)
+		return realHeartbeatCallResult{}
+	}
 }
 
 func realActionSubmission(t *testing.T, signer action.Signer, now time.Time, actionID, workspaceID, environmentID, serviceID, deployment string, digestByte byte, idempotencyKeys ...string) execution.ActionSubmission {

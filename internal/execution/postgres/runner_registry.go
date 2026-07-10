@@ -58,6 +58,7 @@ func (registry *RunnerRegistry) Resolve(ctx context.Context, runnerID string) (e
 	if err != nil {
 		return execution.RunnerRegistration{}, fmt.Errorf("read runner registration: %w", err)
 	}
+	registration.TenantID = tenantID
 	registration.Pool = executionlease.Pool(pool)
 
 	rows, err := tx.Query(ctx, `

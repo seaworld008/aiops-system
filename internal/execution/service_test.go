@@ -632,7 +632,7 @@ func TestRunNextStopsExecutorWhenRunnerScopeRevisionChanges(t *testing.T) {
 		Outcome: ExecutorSucceeded, Code: "SHOULD_NOT_COMPLETE", Verification: VerificationPassed, Changed: true,
 	})
 	base := RunnerRegistration{
-		RunnerID: "runner-1", Pool: executionlease.PoolWrite, Enabled: true, ScopeRevision: 1, MaxConcurrency: 1,
+		RunnerID: "runner-1", TenantID: "tenant-test", Pool: executionlease.PoolWrite, Enabled: true, ScopeRevision: 1, MaxConcurrency: 1,
 		ScopeBindings: []RunnerScopeBinding{{WorkspaceID: "workspace-1", EnvironmentID: "PROD"}},
 	}
 	changed := base
@@ -649,6 +649,58 @@ func TestRunNextStopsExecutorWhenRunnerScopeRevisionChanges(t *testing.T) {
 	result, err := fixture.service.RunNext(context.Background())
 	if !errors.Is(err, ErrExecutionUncertain) || result.Status != executionlease.StatusUncertain {
 		t.Fatalf("RunNext(scope revision changed) = %#v, %v", result, err)
+	}
+}
+
+func TestRunNextTreatsCanceledHeartbeatResolveAsNormalStopAfterExecutorSuccess(t *testing.T) {
+	now := time.Now().UTC()
+	envelope, keys := signedEnvelope(t, restartEnvelope(now))
+	fixture := newRunnerFixture(t, now, envelope, keys, ExecutorResult{
+		Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed, Changed: true,
+	})
+	registration := RunnerRegistration{
+		RunnerID: "runner-1", TenantID: "tenant-test", Pool: executionlease.PoolWrite, Enabled: true, ScopeRevision: 1, MaxConcurrency: 1,
+		ScopeBindings: []RunnerScopeBinding{{WorkspaceID: "workspace-1", EnvironmentID: "PROD"}},
+	}
+	heartbeatResolveEntered := make(chan struct{}, 1)
+	fixture.service.dependencies.RunnerRegistrations = &blockingHeartbeatRunnerRegistrationRepository{
+		registration: registration, heartbeatResolveEntered: heartbeatResolveEntered,
+	}
+	fixture.service.heartbeatInterval = 5 * time.Millisecond
+	executorRelease := make(chan struct{})
+	defer func() {
+		select {
+		case <-executorRelease:
+		default:
+			close(executorRelease)
+		}
+	}()
+	fixture.executors.release = executorRelease
+	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	type runResult struct {
+		execution executionlease.Execution
+		err       error
+	}
+	runDone := make(chan runResult, 1)
+	go func() {
+		execution, err := fixture.service.RunNext(context.Background())
+		runDone <- runResult{execution: execution, err: err}
+	}()
+	select {
+	case <-heartbeatResolveEntered:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat registry resolve did not block")
+	}
+	close(executorRelease)
+	select {
+	case result := <-runDone:
+		if result.err != nil || result.execution.Status != executionlease.StatusSucceeded {
+			t.Fatalf("RunNext() = %#v, %v; canceled heartbeat resolve must be a normal stop", result.execution, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RunNext() did not finish after executor success")
 	}
 }
 
@@ -925,7 +977,7 @@ func mustService(t *testing.T, dependencies Dependencies, options Options) *Serv
 	if dependencies.RunnerRegistrations == nil {
 		dependencies.RunnerRegistrations = fakeRunnerRegistrationRepository{
 			registration: RunnerRegistration{
-				RunnerID: options.RunnerID, Pool: executionlease.PoolWrite, Enabled: true, ScopeRevision: 1, MaxConcurrency: 1,
+				RunnerID: options.RunnerID, TenantID: "tenant-test", Pool: executionlease.PoolWrite, Enabled: true, ScopeRevision: 1, MaxConcurrency: 1,
 				ScopeBindings: []RunnerScopeBinding{{WorkspaceID: "workspace-1", EnvironmentID: "PROD"}},
 			},
 		}
@@ -946,6 +998,30 @@ type sequenceRunnerRegistrationRepository struct {
 	mu            sync.Mutex
 	registrations []RunnerRegistration
 	calls         int
+}
+
+type blockingHeartbeatRunnerRegistrationRepository struct {
+	mu                      sync.Mutex
+	registration            RunnerRegistration
+	calls                   int
+	heartbeatResolveEntered chan<- struct{}
+}
+
+func (repository *blockingHeartbeatRunnerRegistrationRepository) Resolve(ctx context.Context, runnerID string) (RunnerRegistration, error) {
+	repository.mu.Lock()
+	repository.calls++
+	call := repository.calls
+	registration := repository.registration
+	repository.mu.Unlock()
+	if call <= 2 {
+		return registration, nil
+	}
+	select {
+	case repository.heartbeatResolveEntered <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return RunnerRegistration{}, ctx.Err()
 }
 
 func (repository *sequenceRunnerRegistrationRepository) Resolve(ctx context.Context, runnerID string) (RunnerRegistration, error) {
