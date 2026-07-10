@@ -2,6 +2,9 @@ package prometheus_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -39,6 +42,43 @@ func TestQuerySendsBoundedPrometheusRequest(t *testing.T) {
 	}
 	if result.Source != "prometheus" || result.ItemCount != 1 || result.ContentHash == "" {
 		t.Fatalf("result = %#v", result)
+	}
+	projected, err := json.Marshal(result.Items)
+	if err != nil {
+		t.Fatalf("marshal result items: %v", err)
+	}
+	wantHash := sha256.Sum256(projected)
+	if result.ContentHash != hex.EncodeToString(wantHash[:]) {
+		t.Fatalf("ContentHash = %q, want final Items hash", result.ContentHash)
+	}
+}
+
+func TestNewRejectsUnsafeURLAndQueryRejectsRedirect(t *testing.T) {
+	t.Parallel()
+
+	for _, rawURL := range []string{"file:///tmp/prometheus", "https://user@example.com", "https://example.com?token=x", "https://example.com#fragment"} {
+		if _, err := prometheus.New(rawURL, nil, connectors.DefaultBudget()); err == nil {
+			t.Fatalf("New(%q) error = nil, want URL rejection", rawURL)
+		}
+	}
+
+	targetCalled := false
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { targetCalled = true }))
+	defer target.Close()
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", target.URL)
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer redirect.Close()
+	client, err := prometheus.New(redirect.URL, nil, connectors.DefaultBudget())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if _, err := client.Query(context.Background(), "up", time.Now()); err == nil {
+		t.Fatal("Query() followed redirect")
+	}
+	if targetCalled {
+		t.Fatal("redirect target was called")
 	}
 }
 

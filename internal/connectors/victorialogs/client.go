@@ -4,9 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -39,7 +38,7 @@ type Client struct {
 
 func New(rawURL string, httpClient *http.Client, budget connectors.Budget) (*Client, error) {
 	baseURL, err := url.Parse(rawURL)
-	if err != nil || baseURL.Scheme == "" || baseURL.Host == "" {
+	if err != nil || rawURL != strings.TrimSpace(rawURL) || (baseURL.Scheme != "http" && baseURL.Scheme != "https") || baseURL.Host == "" || baseURL.User != nil || baseURL.ForceQuery || baseURL.RawQuery != "" || baseURL.Fragment != "" {
 		return nil, fmt.Errorf("invalid VictoriaLogs URL")
 	}
 	budget = budget.WithDefaults()
@@ -49,7 +48,11 @@ func New(rawURL string, httpClient *http.Client, budget connectors.Budget) (*Cli
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	return &Client{baseURL: baseURL, httpClient: httpClient, budget: budget, clock: time.Now}, nil
+	boundedClient := *httpClient
+	boundedClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return errors.New("VictoriaLogs redirects are disabled")
+	}
+	return &Client{baseURL: baseURL, httpClient: &boundedClient, budget: budget, clock: time.Now}, nil
 }
 
 func (client *Client) Search(ctx context.Context, search SearchRequest) (connectors.Result, error) {
@@ -61,7 +64,7 @@ func (client *Client) Search(ctx context.Context, search SearchRequest) (connect
 		"query":   []string{queryWithProjection},
 		"start":   []string{search.Start.UTC().Format(time.RFC3339Nano)},
 		"end":     []string{search.End.UTC().Format(time.RFC3339Nano)},
-		"limit":   []string{strconv.Itoa(search.Limit)},
+		"limit":   []string{strconv.Itoa(search.Limit + 1)},
 		"timeout": []string{client.budget.Timeout.String()},
 	}
 
@@ -94,21 +97,28 @@ func (client *Client) Search(ctx context.Context, search SearchRequest) (connect
 	if err != nil {
 		return connectors.Result{}, err
 	}
-	sum := sha256.Sum256(body)
+	items, err = projectFields(items, search.Fields)
+	if err != nil {
+		return connectors.Result{}, err
+	}
+	contentHash, err := connectors.HashItems(items)
+	if err != nil {
+		return connectors.Result{}, err
+	}
 	return connectors.Result{
 		Source:      "victorialogs",
 		Query:       queryWithProjection,
 		CollectedAt: client.clock().UTC(),
 		ItemCount:   len(items),
-		ContentHash: hex.EncodeToString(sum[:]),
+		ContentHash: contentHash,
 		Truncated:   truncated,
 		Items:       items,
 	}, nil
 }
 
 func (client *Client) validateSearch(search SearchRequest) error {
-	if search.Query == "" {
-		return fmt.Errorf("LogsQL query is required")
+	if strings.TrimSpace(search.Query) == "" || len(search.Query) > 4096 || strings.ContainsAny(search.Query, "\r\n\x00") {
+		return fmt.Errorf("LogsQL query is required and limited to 4096 single-line bytes")
 	}
 	if search.Start.IsZero() || search.End.IsZero() || !search.Start.Before(search.End) {
 		return fmt.Errorf("bounded start and end times are required")
@@ -119,15 +129,45 @@ func (client *Client) validateSearch(search SearchRequest) error {
 	if len(search.Fields) == 0 {
 		return fmt.Errorf("at least one projected field is required")
 	}
+	seenFields := make(map[string]struct{}, len(search.Fields))
 	for _, field := range search.Fields {
 		if !fieldNamePattern.MatchString(field) {
 			return fmt.Errorf("invalid projected field %q", field)
 		}
+		if _, duplicate := seenFields[field]; duplicate {
+			return fmt.Errorf("duplicate projected field %q", field)
+		}
+		seenFields[field] = struct{}{}
 	}
 	if search.Limit <= 0 || search.Limit > client.budget.MaxItems {
 		return fmt.Errorf("limit must be between 1 and %d", client.budget.MaxItems)
 	}
 	return nil
+}
+
+func projectFields(items []json.RawMessage, fields []string) ([]json.RawMessage, error) {
+	projected := make([]json.RawMessage, 0, len(items))
+	for _, item := range items {
+		var source map[string]json.RawMessage
+		if err := json.Unmarshal(item, &source); err != nil || source == nil {
+			return nil, fmt.Errorf("VictoriaLogs result must be a JSON object")
+		}
+		projection := make(map[string]json.RawMessage, len(fields))
+		for _, field := range fields {
+			if value, exists := source[field]; exists {
+				projection[field] = value
+			}
+		}
+		if len(projection) == 0 {
+			return nil, fmt.Errorf("VictoriaLogs result contains none of the projected fields")
+		}
+		encoded, err := json.Marshal(projection)
+		if err != nil {
+			return nil, fmt.Errorf("project VictoriaLogs result: %w", err)
+		}
+		projected = append(projected, json.RawMessage(encoded))
+	}
+	return projected, nil
 }
 
 func decodeJSONLines(body []byte, limit int) ([]json.RawMessage, bool, error) {

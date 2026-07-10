@@ -2,15 +2,15 @@ package prometheus
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aiops-system/control-plane/internal/connectors"
@@ -32,7 +32,7 @@ type RangeRequest struct {
 
 func New(rawURL string, httpClient *http.Client, budget connectors.Budget) (*Client, error) {
 	baseURL, err := url.Parse(rawURL)
-	if err != nil || baseURL.Scheme == "" || baseURL.Host == "" {
+	if err != nil || rawURL != strings.TrimSpace(rawURL) || (baseURL.Scheme != "http" && baseURL.Scheme != "https") || baseURL.Host == "" || baseURL.User != nil || baseURL.ForceQuery || baseURL.RawQuery != "" || baseURL.Fragment != "" {
 		return nil, fmt.Errorf("invalid Prometheus URL")
 	}
 	budget = budget.WithDefaults()
@@ -42,12 +42,16 @@ func New(rawURL string, httpClient *http.Client, budget connectors.Budget) (*Cli
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	return &Client{baseURL: baseURL, httpClient: httpClient, budget: budget, clock: time.Now}, nil
+	boundedClient := *httpClient
+	boundedClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return errors.New("Prometheus redirects are disabled")
+	}
+	return &Client{baseURL: baseURL, httpClient: &boundedClient, budget: budget, clock: time.Now}, nil
 }
 
 func (client *Client) Query(ctx context.Context, expression string, at time.Time) (connectors.Result, error) {
-	if expression == "" {
-		return connectors.Result{}, fmt.Errorf("PromQL expression is required")
+	if err := validateExpression(expression); err != nil {
+		return connectors.Result{}, err
 	}
 	if at.IsZero() {
 		at = client.clock().UTC()
@@ -64,8 +68,8 @@ func (client *Client) Query(ctx context.Context, expression string, at time.Time
 }
 
 func (client *Client) QueryRange(ctx context.Context, queryRequest RangeRequest) (connectors.Result, error) {
-	if queryRequest.Expression == "" {
-		return connectors.Result{}, fmt.Errorf("PromQL expression is required")
+	if err := validateExpression(queryRequest.Expression); err != nil {
+		return connectors.Result{}, err
 	}
 	if queryRequest.Start.IsZero() || queryRequest.End.IsZero() || !queryRequest.Start.Before(queryRequest.End) {
 		return connectors.Result{}, fmt.Errorf("bounded start and end times are required")
@@ -125,7 +129,7 @@ func (client *Client) execute(ctx context.Context, endpoint url.URL, expression 
 		return connectors.Result{}, fmt.Errorf("decode Prometheus response: %w", err)
 	}
 	if envelope.Status != "success" {
-		return connectors.Result{}, fmt.Errorf("Prometheus query failed: %s", envelope.Error)
+		return connectors.Result{}, fmt.Errorf("Prometheus query failed")
 	}
 	items, err := decodeResultItems(envelope.Data.ResultType, envelope.Data.Result)
 	if err != nil {
@@ -142,16 +146,26 @@ func (client *Client) execute(ctx context.Context, endpoint url.URL, expression 
 	if truncated {
 		items = items[:client.budget.MaxItems]
 	}
-	sum := sha256.Sum256(body)
+	contentHash, err := connectors.HashItems(items)
+	if err != nil {
+		return connectors.Result{}, err
+	}
 	return connectors.Result{
 		Source:      "prometheus",
 		Query:       expression,
 		CollectedAt: client.clock().UTC(),
 		ItemCount:   len(items),
-		ContentHash: hex.EncodeToString(sum[:]),
+		ContentHash: contentHash,
 		Truncated:   truncated,
 		Items:       items,
 	}, nil
+}
+
+func validateExpression(expression string) error {
+	if strings.TrimSpace(expression) == "" || len(expression) > 4096 || strings.ContainsAny(expression, "\r\n\x00") {
+		return fmt.Errorf("PromQL expression is required and limited to 4096 single-line bytes")
+	}
+	return nil
 }
 
 func decodeResultItems(resultType string, raw json.RawMessage) ([]json.RawMessage, error) {
