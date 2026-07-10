@@ -38,7 +38,7 @@ func TestSubmitAtomicallyPersistsImmutableEnvelopeMetadataAndQueuedLease(t *test
 	}
 	database.ExpectQuery(`(?s)INSERT INTO action_queue .*envelope.*submission_hash.*ON CONFLICT \(action_id\) DO NOTHING.*RETURNING`).
 		WithArgs(
-			envelope.ActionID, envelopeJSON, pgxmock.AnyArg(), envelope.PlanHash,
+			envelope.ActionID, string(envelopeJSON), pgxmock.AnyArg(), envelope.PlanHash,
 			envelope.WorkspaceID, envelope.Target.EnvironmentID, submission.TargetKey,
 			submission.EnvironmentRevision, submission.Pool, submission.Production,
 		).
@@ -82,7 +82,7 @@ func TestSubmitIsIdempotentOnlyForTheExactImmutableSubmission(t *testing.T) {
 			defer database.Close()
 			database.ExpectQuery("INSERT INTO action_queue").
 				WithArgs(
-					envelope.ActionID, envelopeJSON, wantHash, envelope.PlanHash,
+					envelope.ActionID, string(envelopeJSON), wantHash, envelope.PlanHash,
 					envelope.WorkspaceID, envelope.Target.EnvironmentID, submission.TargetKey,
 					submission.EnvironmentRevision, submission.Pool, submission.Production,
 				).

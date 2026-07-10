@@ -80,7 +80,7 @@ func (repository *Store) CreateSignal(ctx context.Context, item domain.Signal) (
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT (integration_id, provider_event_id) DO NOTHING
 	`, item.ID, tenantID, item.WorkspaceID, item.IntegrationID, item.Provider,
-		item.ProviderEventID, item.PayloadHash, item.Fingerprint, item.Status, item.ObservedAt.UTC(), payloadSummary)
+		item.ProviderEventID, item.PayloadHash, item.Fingerprint, item.Status, item.ObservedAt.UTC(), string(payloadSummary))
 	if err != nil {
 		return false, fmt.Errorf("insert signal: %w", err)
 	}
@@ -95,7 +95,7 @@ func (repository *Store) CreateSignal(ctx context.Context, item domain.Signal) (
 				event_type, payload, created_at, available_at
 			) VALUES ($1, $2, $3, 'SIGNAL', $4, 1, 'signal.ingested.v1', $5,
 				statement_timestamp(), statement_timestamp())
-		`, ids.NewUUID(), tenantID, item.WorkspaceID, item.ID, payload)
+		`, ids.NewUUID(), tenantID, item.WorkspaceID, item.ID, string(payload))
 		if err != nil {
 			return false, fmt.Errorf("insert signal outbox event: %w", err)
 		}
@@ -176,7 +176,7 @@ func insertSignalConflictAudit(ctx context.Context, tx pgx.Tx, conflict signalCo
 		) VALUES ($1, $2, $3, 'INTEGRATION', $4, 'signal.idempotency_conflict',
 			'SIGNAL', $5, $6, $7, $8, $9)
 	`, ids.NewUUID(), conflict.TenantID, conflict.WorkspaceID, conflict.IntegrationID,
-		conflict.SignalID, metadata.RequestID, nullableText(metadata.TraceID), hex.EncodeToString(sum[:]), details)
+		conflict.SignalID, metadata.RequestID, nullableText(metadata.TraceID), hex.EncodeToString(sum[:]), string(details))
 	if err != nil {
 		return fmt.Errorf("insert signal conflict audit: %w", err)
 	}
@@ -226,7 +226,7 @@ func (repository *Store) CreateIncident(ctx context.Context, incident domain.Inc
 			event_type, payload, created_at, available_at
 		) VALUES ($1, $2, $3, 'INCIDENT', $4, $5, 'incident.created.v1', $6,
 			statement_timestamp(), statement_timestamp())
-	`, ids.NewUUID(), tenantID, incident.WorkspaceID, incident.ID, incident.Version, payload)
+	`, ids.NewUUID(), tenantID, incident.WorkspaceID, incident.ID, incident.Version, string(payload))
 	if err != nil {
 		return fmt.Errorf("insert incident outbox event: %w", err)
 	}

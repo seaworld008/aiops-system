@@ -100,10 +100,10 @@ func TestCreateSignalAndOutboxAreCommittedAtomically(t *testing.T) {
 		WithArgs(integrationID).
 		WillReturnRows(pgxmock.NewRows([]string{"tenant_id", "workspace_id", "provider"}).AddRow(tenantID, workspaceID, "alertmanager"))
 	database.ExpectExec("INSERT INTO signals").
-		WithArgs(signalID, tenantID, workspaceID, integrationID, "alertmanager", "event-new", "hash", "fingerprint-1", "firing", pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(signalID, tenantID, workspaceID, integrationID, "alertmanager", "event-new", "hash", "fingerprint-1", "firing", pgxmock.AnyArg(), `{"labels":null,"status":"firing"}`).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	database.ExpectExec("INSERT INTO outbox_events").
-		WithArgs(pgxmock.AnyArg(), tenantID, workspaceID, signalID, pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), tenantID, workspaceID, signalID, `{"signal_id":"44444444-4444-4444-8444-444444444444"}`).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	database.ExpectCommit()
 

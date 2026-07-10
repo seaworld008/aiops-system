@@ -101,7 +101,7 @@ func (repository *Repository) Submit(ctx context.Context, submission execution.A
 			statement_timestamp(), statement_timestamp(), statement_timestamp())
 		ON CONFLICT (action_id) DO NOTHING
 		RETURNING `+actionQueueProjection,
-		submission.Envelope.ActionID, envelopeJSON, submissionHash, submission.PlanHash,
+		submission.Envelope.ActionID, string(envelopeJSON), submissionHash, submission.PlanHash,
 		submission.Envelope.WorkspaceID, submission.Envelope.Target.EnvironmentID,
 		submission.TargetKey, submission.EnvironmentRevision, submission.Pool, submission.Production,
 	))
