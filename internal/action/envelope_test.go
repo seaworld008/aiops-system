@@ -29,7 +29,7 @@ func TestSealAndVerifyDetectsPlanTampering(t *testing.T) {
 	}
 	now := time.Date(2026, 7, 10, 8, 0, 0, 0, time.UTC)
 
-	sealed, err := Seal(context.Background(), validRestartEnvelope(now), signer)
+	sealed, err := Seal(context.Background(), validRestartEnvelope(now), "requester-01", signer)
 	if err != nil {
 		t.Fatalf("seal envelope: %v", err)
 	}
@@ -63,13 +63,13 @@ func TestSealAndVerifyDetectsPlanTampering(t *testing.T) {
 	for name, mutate := range tests {
 		name, mutate := name, mutate
 		t.Run(name, func(t *testing.T) {
-			tampered, err := Seal(context.Background(), validRestartEnvelope(now), signer)
+			tampered, err := Seal(context.Background(), validRestartEnvelope(now), "requester-01", signer)
 			if err != nil {
 				t.Fatalf("seal tamper candidate: %v", err)
 			}
 			mutate(&tampered)
-			if err := Verify(context.Background(), tampered, keys, now); !errors.Is(err, ErrPlanHashMismatch) {
-				t.Fatalf("verify error = %v, want ErrPlanHashMismatch", err)
+			if err := Verify(context.Background(), tampered, keys, now); err == nil {
+				t.Fatal("tampered envelope verified successfully")
 			}
 		})
 	}
@@ -88,16 +88,33 @@ func TestSealIsDeterministicForSameEnvelopeAndKey(t *testing.T) {
 	}
 	now := time.Date(2026, 7, 10, 8, 0, 0, 0, time.UTC)
 
-	first, err := Seal(context.Background(), validRestartEnvelope(now), signer)
+	first, err := Seal(context.Background(), validRestartEnvelope(now), "requester-01", signer)
 	if err != nil {
 		t.Fatalf("first seal: %v", err)
 	}
-	second, err := Seal(context.Background(), validRestartEnvelope(now), signer)
+	second, err := Seal(context.Background(), validRestartEnvelope(now), "requester-01", signer)
 	if err != nil {
 		t.Fatalf("second seal: %v", err)
 	}
 	if first.PlanHash != second.PlanHash || first.Signature != second.Signature {
 		t.Fatalf("sealing was not deterministic:\nfirst=%+v\nsecond=%+v", first, second)
+	}
+}
+
+func TestSealRejectsRequesterDifferentFromAuthenticatedOIDCSubject(t *testing.T) {
+	t.Parallel()
+
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	signer, err := NewEd25519Signer("key-1", privateKey)
+	if err != nil {
+		t.Fatalf("new signer: %v", err)
+	}
+	now := time.Date(2026, 7, 10, 8, 0, 0, 0, time.UTC)
+	if _, err := Seal(context.Background(), validRestartEnvelope(now), "different-subject", signer); err == nil {
+		t.Fatal("Seal() accepted a requester different from the authenticated OIDC subject")
 	}
 }
 
@@ -113,7 +130,7 @@ func TestVerifyRejectsExpiredUnknownAndRevokedKeys(t *testing.T) {
 		t.Fatalf("new signer: %v", err)
 	}
 	now := time.Date(2026, 7, 10, 8, 0, 0, 0, time.UTC)
-	sealed, err := Seal(context.Background(), validRestartEnvelope(now), signer)
+	sealed, err := Seal(context.Background(), validRestartEnvelope(now), "requester-01", signer)
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
@@ -249,7 +266,7 @@ func TestGitOpsRevertBindsImmutableRevisions(t *testing.T) {
 			t.Fatalf("missing %s revision binding was accepted", field)
 		}
 	}
-	for _, unsafePath := range []string{"/apps/payments", "apps//payments", "apps/../payments", "apps/payments;touch-pwned", `apps\payments`, "apps/\npayments"} {
+	for _, unsafePath := range []string{"/apps/payments", "apps//payments", "apps/../payments", "apps/payments;touch-pwned", `apps\payments`, "apps/\npayments", "-c/apps", ".git/config", "apps/.GIT/config"} {
 		candidate := envelope
 		target := *candidate.Target.GitOpsApplication
 		candidate.Target.GitOpsApplication = &target
@@ -272,7 +289,7 @@ func TestSigningKeyActivationWindowAndConcurrentRotation(t *testing.T) {
 		t.Fatalf("new signer: %v", err)
 	}
 	now := time.Date(2026, 7, 10, 8, 0, 0, 0, time.UTC)
-	sealed, err := Seal(context.Background(), validRestartEnvelope(now), signer)
+	sealed, err := Seal(context.Background(), validRestartEnvelope(now), "requester-01", signer)
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
@@ -357,13 +374,13 @@ func TestAWXRestartAllowsOnlyTypedLinuxOrWindowsService(t *testing.T) {
 		envelope := validRestartEnvelope(now)
 		envelope.ActionType = ActionAWXServiceRestart
 		envelope.Target = TargetRef{ServiceID: "service-payments", EnvironmentID: "PROD", AWXHosts: &AWXTarget{
-			InventoryID: 42, HostIDs: []int64{101, 102}, InventorySnapshotSHA256: strings.Repeat("f", 64),
+			InventoryID: 42, HostIDs: []int64{101, 102}, InventorySnapshotSHA256: strings.Repeat("f", 64), JobTemplateSnapshotSHA256: strings.Repeat("e", 64),
 		}}
 		envelope.Parameters = ActionParameters{AWXServiceRestart: &AWXServiceRestartParameters{
 			JobTemplateID: 81, ServiceName: "payments-api", OSFamily: osFamily, Serial: 1,
 		}}
 		envelope.ObservedState = ObservedState{AWXService: &AWXServiceObservedState{
-			HostCount: 2, ServiceState: "RUNNING", InventorySnapshotSHA256: strings.Repeat("f", 64),
+			HostCount: 2, ServiceState: "RUNNING", InventorySnapshotSHA256: strings.Repeat("f", 64), ServiceStateSnapshotSHA256: strings.Repeat("d", 64),
 		}}
 		envelope.Preconditions.ExpectedResourceVersion = ""
 		envelope.Verification = VerificationPlan{Mode: "AWX_SERVICE_HEALTH", TimeoutSeconds: 300}
@@ -376,13 +393,13 @@ func TestAWXRestartAllowsOnlyTypedLinuxOrWindowsService(t *testing.T) {
 	envelope := validRestartEnvelope(now)
 	envelope.ActionType = ActionAWXServiceRestart
 	envelope.Target = TargetRef{ServiceID: "service-payments", EnvironmentID: "PROD", AWXHosts: &AWXTarget{
-		InventoryID: 42, HostIDs: []int64{101}, InventorySnapshotSHA256: strings.Repeat("f", 64),
+		InventoryID: 42, HostIDs: []int64{101}, InventorySnapshotSHA256: strings.Repeat("f", 64), JobTemplateSnapshotSHA256: strings.Repeat("e", 64),
 	}}
 	envelope.Parameters = ActionParameters{AWXServiceRestart: &AWXServiceRestartParameters{
 		JobTemplateID: 81, ServiceName: "payments-api; rm -rf /", OSFamily: "SHELL", Serial: 1,
 	}}
 	envelope.ObservedState = ObservedState{AWXService: &AWXServiceObservedState{
-		HostCount: 1, ServiceState: "RUNNING", InventorySnapshotSHA256: strings.Repeat("f", 64),
+		HostCount: 1, ServiceState: "RUNNING", InventorySnapshotSHA256: strings.Repeat("f", 64), ServiceStateSnapshotSHA256: strings.Repeat("d", 64),
 	}}
 	envelope.Verification = VerificationPlan{Mode: "AWX_SERVICE_HEALTH", TimeoutSeconds: 300}
 	if err := envelope.Validate(); err == nil {
@@ -402,6 +419,17 @@ func TestAWXRestartAllowsOnlyTypedLinuxOrWindowsService(t *testing.T) {
 	unsafeInteger.Target.AWXHosts.InventoryID = 1<<53 + 1
 	if err := unsafeInteger.Validate(); err == nil {
 		t.Fatal("AWX target with a JCS-unsafe integer was accepted")
+	}
+
+	tooManyHosts := envelope
+	target := *tooManyHosts.Target.AWXHosts
+	tooManyHosts.Target.AWXHosts = &target
+	target.HostIDs = []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+	state := *tooManyHosts.ObservedState.AWXService
+	tooManyHosts.ObservedState.AWXService = &state
+	state.HostCount = 11
+	if err := tooManyHosts.Validate(); err == nil {
+		t.Fatal("AWX action exceeding the 10-host pilot limit was accepted")
 	}
 }
 

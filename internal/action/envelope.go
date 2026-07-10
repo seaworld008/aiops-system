@@ -25,6 +25,7 @@ const (
 
 	MaxEnvelopeValidity = 30 * time.Minute
 	MaxCredentialTTL    = 15 * time.Minute
+	MaxAWXHosts         = 10
 )
 
 type ActionType string
@@ -107,9 +108,10 @@ type GitOpsTarget struct {
 }
 
 type AWXTarget struct {
-	InventoryID             int64   `json:"inventory_id"`
-	HostIDs                 []int64 `json:"host_ids"`
-	InventorySnapshotSHA256 string  `json:"inventory_snapshot_sha256"`
+	InventoryID               int64   `json:"inventory_id"`
+	HostIDs                   []int64 `json:"host_ids"`
+	InventorySnapshotSHA256   string  `json:"inventory_snapshot_sha256"`
+	JobTemplateSnapshotSHA256 string  `json:"job_template_snapshot_sha256"`
 }
 
 type ActionParameters struct {
@@ -170,9 +172,10 @@ type GitOpsObservedState struct {
 }
 
 type AWXServiceObservedState struct {
-	HostCount               int32  `json:"host_count"`
-	ServiceState            string `json:"service_state"`
-	InventorySnapshotSHA256 string `json:"inventory_snapshot_sha256"`
+	HostCount                  int32  `json:"host_count"`
+	ServiceState               string `json:"service_state"`
+	InventorySnapshotSHA256    string `json:"inventory_snapshot_sha256"`
+	ServiceStateSnapshotSHA256 string `json:"service_state_snapshot_sha256"`
 }
 
 type Preconditions struct {
@@ -396,7 +399,7 @@ func (envelope Envelope) validateGitOpsRevert() error {
 
 func (envelope Envelope) validateAWXRestart() error {
 	target := envelope.Target.AWXHosts
-	if !safePositiveInteger(target.InventoryID) || len(target.HostIDs) == 0 || len(target.HostIDs) > 500 || !strictlyIncreasingPositive(target.HostIDs) || !hex64Pattern.MatchString(target.InventorySnapshotSHA256) {
+	if !safePositiveInteger(target.InventoryID) || len(target.HostIDs) == 0 || len(target.HostIDs) > MaxAWXHosts || !strictlyIncreasingPositive(target.HostIDs) || !hex64Pattern.MatchString(target.InventorySnapshotSHA256) || !hex64Pattern.MatchString(target.JobTemplateSnapshotSHA256) {
 		return fmt.Errorf("AWX target requires sorted unique positive host ids")
 	}
 	parameters := envelope.Parameters.AWXServiceRestart
@@ -404,7 +407,7 @@ func (envelope Envelope) validateAWXRestart() error {
 		return fmt.Errorf("AWX restart requires a fixed template, typed service, supported OS family, and serial execution")
 	}
 	state := envelope.ObservedState.AWXService
-	if state.HostCount != int32(len(target.HostIDs)) || !oneOf(state.ServiceState, "RUNNING", "STOPPED", "DEGRADED", "UNKNOWN") || state.InventorySnapshotSHA256 != target.InventorySnapshotSHA256 {
+	if state.HostCount != int32(len(target.HostIDs)) || !oneOf(state.ServiceState, "RUNNING", "STOPPED", "DEGRADED", "UNKNOWN") || state.InventorySnapshotSHA256 != target.InventorySnapshotSHA256 || !hex64Pattern.MatchString(state.ServiceStateSnapshotSHA256) {
 		return fmt.Errorf("invalid AWX service observed state")
 	}
 	if envelope.Preconditions.ExpectedResourceVersion != "" || envelope.Preconditions.ExpectedGitHeadCommit != "" || envelope.Verification.Mode != "AWX_SERVICE_HEALTH" {
@@ -542,8 +545,12 @@ func validRepositoryPath(value string) bool {
 	if value == "" || len(value) > 512 || !repoPathPattern.MatchString(value) || strings.HasPrefix(value, "/") || path.Clean(value) != value || value == "." {
 		return false
 	}
-	for _, segment := range strings.Split(value, "/") {
-		if segment == "" || segment == "." || segment == ".." {
+	segments := strings.Split(value, "/")
+	if strings.HasPrefix(segments[0], "-") {
+		return false
+	}
+	for _, segment := range segments {
+		if segment == "" || segment == "." || segment == ".." || strings.EqualFold(segment, ".git") {
 			return false
 		}
 	}
@@ -675,10 +682,14 @@ func cloneKeyRecords(records map[string]KeyRecord) (map[string]KeyRecord, error)
 	return cloned, nil
 }
 
-func Seal(ctx context.Context, envelope Envelope, signer Signer) (Envelope, error) {
-	if signer == nil || !validToken(signer.KeyID()) {
+func Seal(ctx context.Context, envelope Envelope, authenticatedRequester string, signer Signer) (Envelope, error) {
+	if signer == nil || !validToken(signer.KeyID()) || !validToken(authenticatedRequester) {
 		return Envelope{}, fmt.Errorf("valid action envelope signer is required")
 	}
+	if envelope.RequestedBy != "" && envelope.RequestedBy != authenticatedRequester {
+		return Envelope{}, fmt.Errorf("action requester does not match the authenticated OIDC subject")
+	}
+	envelope.RequestedBy = authenticatedRequester
 	envelope.PlanHash = ""
 	envelope.Signature = Signature{}
 	if err := envelope.Validate(); err != nil {
@@ -709,7 +720,9 @@ func Verify(ctx context.Context, envelope Envelope, resolver KeyResolver, now ti
 	if resolver == nil {
 		return fmt.Errorf("action envelope key resolver is required")
 	}
-	if err := validateTimes(envelope.NotBefore, envelope.ExpiresAt); err != nil {
+	// Validate bounded structure before JCS transformation so an oversized
+	// unauthenticated payload cannot force unbounded canonicalization work.
+	if err := envelope.Validate(); err != nil {
 		return err
 	}
 	if !now.Before(envelope.ExpiresAt) {
@@ -752,7 +765,7 @@ func Verify(ctx context.Context, envelope Envelope, resolver KeyResolver, now ti
 	if err != nil || !ed25519.Verify(record.PublicKey, message, signature) {
 		return ErrInvalidSignature
 	}
-	return envelope.Validate()
+	return nil
 }
 
 func calculatePlanHash(envelope Envelope) (string, error) {

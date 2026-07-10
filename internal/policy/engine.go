@@ -49,6 +49,8 @@ const (
 	ReasonCELPolicyDenied         = "CEL_POLICY_DENIED"
 	ReasonInvalidEnvelope         = "INVALID_ACTION_ENVELOPE"
 	ReasonIdentityUnavailable     = "IDENTITY_UNAVAILABLE"
+	ReasonRiskAssessmentDrift     = "RISK_ASSESSMENT_DRIFT"
+	ReasonActionLimitsDrift       = "ACTION_LIMITS_DRIFT"
 )
 
 const (
@@ -115,6 +117,7 @@ type ScopedSwitchSnapshot struct {
 }
 
 type GitOpsFacts struct {
+	Provider         string
 	RepositoryID     string
 	Application      string
 	Path             string
@@ -124,6 +127,37 @@ type GitOpsFacts struct {
 	DiffSHA256       string
 	ResultTreeSHA256 string
 	HeadTreeSHA256   string
+	LiveRevision     string
+	DesiredRevision  string
+	SyncStatus       string
+	HealthStatus     string
+}
+
+type KubernetesFacts struct {
+	ClusterID         string
+	Namespace         string
+	Name              string
+	UID               string
+	ResourceVersion   string
+	Generation        int64
+	Replicas          int32
+	AvailableReplicas int32
+	UpdatedReplicas   int32
+	HPAAbsent         bool
+	PDBChecked        bool
+	QuotaChecked      bool
+}
+
+type AWXFacts struct {
+	InventoryID                int64
+	HostIDs                    []int64
+	InventorySnapshotSHA256    string
+	JobTemplateID              int64
+	JobTemplateSnapshotSHA256  string
+	ServiceName                string
+	OSFamily                   string
+	ServiceState               string
+	ServiceStateSnapshotSHA256 string
 }
 
 type TargetSnapshot struct {
@@ -135,9 +169,35 @@ type TargetSnapshot struct {
 	MappingResult string
 	Whitelisted   bool
 	TargetVersion string
+	Kubernetes    *KubernetesFacts
 	GitOps        *GitOpsFacts
+	AWX           *AWXFacts
 	Revision      string
 	ObservedAt    time.Time
+}
+
+type RiskSnapshot struct {
+	WorkspaceID   string
+	ActionID      string
+	PlanHash      string
+	TargetDigest  string
+	PolicyVersion string
+	Level         string
+	ReasonCodes   []string
+	Revision      string
+	ObservedAt    time.Time
+}
+
+type ActionLimitsSnapshot struct {
+	WorkspaceID     string
+	ServiceID       string
+	EnvironmentID   string
+	ActionType      action.ActionType
+	MinimumReplicas int32
+	MaximumReplicas int32
+	MaxAWXHosts     int
+	Revision        string
+	ObservedAt      time.Time
 }
 
 type ApprovalReader interface {
@@ -157,6 +217,14 @@ type TargetStateReader interface {
 	Resolve(context.Context, action.Envelope) (TargetSnapshot, error)
 }
 
+type RiskStateReader interface {
+	Resolve(context.Context, action.Envelope) (RiskSnapshot, error)
+}
+
+type ActionLimitsReader interface {
+	Resolve(context.Context, action.Envelope) (ActionLimitsSnapshot, error)
+}
+
 type Clock interface {
 	Now() time.Time
 }
@@ -167,6 +235,8 @@ type Dependencies struct {
 	Principals PrincipalResolver
 	Safety     SafetyStateReader
 	Targets    TargetStateReader
+	Risk       RiskStateReader
+	Limits     ActionLimitsReader
 	Clock      Clock
 }
 
@@ -178,6 +248,8 @@ type Decision struct {
 	ReasonCodes         []string
 	SafetyRevision      string
 	TargetRevision      string
+	RiskRevision        string
+	LimitsRevision      string
 	EvaluatedAt         time.Time
 	CredentialExpiresAt time.Time
 }
@@ -218,7 +290,7 @@ func NewEngine(definition Definition, dependencies Dependencies) (*Engine, error
 	if definition.Version != expected.Version {
 		return nil, fmt.Errorf("policy version does not match its immutable CEL source")
 	}
-	if dependencies.Keys == nil || dependencies.Approvals == nil || dependencies.Principals == nil || dependencies.Safety == nil || dependencies.Targets == nil {
+	if dependencies.Keys == nil || dependencies.Approvals == nil || dependencies.Principals == nil || dependencies.Safety == nil || dependencies.Targets == nil || dependencies.Risk == nil || dependencies.Limits == nil {
 		return nil, fmt.Errorf("all trusted policy dependencies are required")
 	}
 	if dependencies.Clock == nil {
@@ -306,6 +378,23 @@ func (engine *Engine) evaluate(ctx context.Context, stage Stage, envelope action
 	if !targetMatchesEnvelope(target, envelope) {
 		return withReasons(decision, OutcomeDeny, ReasonTargetStateDrift), nil
 	}
+	targetDigest, digestErr := TargetDigest(envelope)
+	risk, err := engine.deps.Risk.Resolve(ctx, envelope)
+	if err != nil || risk.Revision == "" || !fresh(now, risk.ObservedAt, MaxTargetSnapshotAge) ||
+		digestErr != nil || risk.WorkspaceID != envelope.WorkspaceID || risk.ActionID != envelope.ActionID ||
+		risk.PlanHash != envelope.PlanHash || risk.TargetDigest != targetDigest || risk.PolicyVersion != envelope.PolicyVersion ||
+		risk.Level != envelope.Risk.Level || !slices.Equal(risk.ReasonCodes, envelope.Risk.ReasonCodes) {
+		return withReasons(decision, OutcomeDeny, ReasonRiskAssessmentDrift), nil
+	}
+	decision.RiskRevision = risk.Revision
+	limits, err := engine.deps.Limits.Resolve(ctx, envelope)
+	if err != nil || limits.Revision == "" || !fresh(now, limits.ObservedAt, MaxTargetSnapshotAge) ||
+		limits.WorkspaceID != envelope.WorkspaceID || limits.ServiceID != envelope.Target.ServiceID ||
+		limits.EnvironmentID != envelope.Target.EnvironmentID || limits.ActionType != envelope.ActionType ||
+		!limitsMatchEnvelope(limits, envelope) {
+		return withReasons(decision, OutcomeDeny, ReasonActionLimitsDrift), nil
+	}
+	decision.LimitsRevision = limits.Revision
 
 	result, _, err := engine.program.ContextEval(ctx, map[string]any{
 		"action_type":           string(envelope.ActionType),
@@ -313,7 +402,7 @@ func (engine *Engine) evaluate(ctx context.Context, stage Stage, envelope action
 		"environment":           target.EnvironmentID,
 		"service_id":            target.ServiceID,
 		"workspace_id":          target.WorkspaceID,
-		"risk_level":            envelope.Risk.Level,
+		"risk_level":            risk.Level,
 		"connector_id":          target.ConnectorID,
 		"credential_permission": envelope.CredentialScope.Permission,
 		"mapping_exact":         target.MappingResult == "EXACT",
@@ -457,14 +546,44 @@ func TargetDigest(envelope action.Envelope) (string, error) {
 func targetMatchesEnvelope(snapshot TargetSnapshot, envelope action.Envelope) bool {
 	switch envelope.ActionType {
 	case action.ActionKubernetesRolloutRestart, action.ActionKubernetesScale:
-		return snapshot.GitOps == nil && envelope.Target.KubernetesDeployment != nil && snapshot.TargetVersion == envelope.Target.KubernetesDeployment.ResourceVersion
+		if snapshot.Kubernetes == nil || snapshot.GitOps != nil || snapshot.AWX != nil || envelope.Target.KubernetesDeployment == nil || envelope.ObservedState.KubernetesDeployment == nil {
+			return false
+		}
+		target := envelope.Target.KubernetesDeployment
+		state := envelope.ObservedState.KubernetesDeployment
+		expected := KubernetesFacts{
+			ClusterID: target.ClusterID, Namespace: target.Namespace, Name: target.Name, UID: target.UID,
+			ResourceVersion: target.ResourceVersion, Generation: state.Generation, Replicas: state.Replicas,
+			AvailableReplicas: state.AvailableReplicas, UpdatedReplicas: state.UpdatedReplicas,
+		}
+		if envelope.ActionType == action.ActionKubernetesScale {
+			if envelope.Parameters.KubernetesScale == nil {
+				return false
+			}
+			expected.HPAAbsent = envelope.Parameters.KubernetesScale.HPAAbsent
+			expected.PDBChecked = envelope.Parameters.KubernetesScale.PDBChecked
+			expected.QuotaChecked = envelope.Parameters.KubernetesScale.QuotaChecked
+		}
+		return snapshot.TargetVersion == target.ResourceVersion && *snapshot.Kubernetes == expected
 	case action.ActionAWXServiceRestart:
-		return snapshot.GitOps == nil && envelope.Target.AWXHosts != nil && snapshot.TargetVersion == envelope.Target.AWXHosts.InventorySnapshotSHA256
+		if snapshot.AWX == nil || snapshot.GitOps != nil || snapshot.Kubernetes != nil || envelope.Target.AWXHosts == nil || envelope.Parameters.AWXServiceRestart == nil || envelope.ObservedState.AWXService == nil {
+			return false
+		}
+		target := envelope.Target.AWXHosts
+		parameters := envelope.Parameters.AWXServiceRestart
+		state := envelope.ObservedState.AWXService
+		facts := snapshot.AWX
+		return snapshot.TargetVersion == target.InventorySnapshotSHA256 && facts.InventoryID == target.InventoryID &&
+			slices.Equal(facts.HostIDs, target.HostIDs) && facts.InventorySnapshotSHA256 == target.InventorySnapshotSHA256 &&
+			facts.JobTemplateID == parameters.JobTemplateID && facts.JobTemplateSnapshotSHA256 == target.JobTemplateSnapshotSHA256 &&
+			facts.ServiceName == parameters.ServiceName && facts.OSFamily == parameters.OSFamily && facts.ServiceState == state.ServiceState &&
+			facts.ServiceStateSnapshotSHA256 == state.ServiceStateSnapshotSHA256
 	case action.ActionGitOpsRevert:
-		if snapshot.GitOps == nil || envelope.Target.GitOpsApplication == nil || envelope.Parameters.GitOpsRevert == nil || envelope.ObservedState.GitOpsApplication == nil {
+		if snapshot.GitOps == nil || snapshot.Kubernetes != nil || snapshot.AWX != nil || envelope.Target.GitOpsApplication == nil || envelope.Parameters.GitOpsRevert == nil || envelope.ObservedState.GitOpsApplication == nil {
 			return false
 		}
 		expected := GitOpsFacts{
+			Provider:         envelope.Parameters.GitOpsRevert.Provider,
 			RepositoryID:     envelope.Target.GitOpsApplication.RepositoryID,
 			Application:      envelope.Target.GitOpsApplication.Application,
 			Path:             envelope.Target.GitOpsApplication.Path,
@@ -474,10 +593,28 @@ func targetMatchesEnvelope(snapshot TargetSnapshot, envelope action.Envelope) bo
 			DiffSHA256:       envelope.Parameters.GitOpsRevert.DiffSHA256,
 			ResultTreeSHA256: envelope.Parameters.GitOpsRevert.TreeSHA256,
 			HeadTreeSHA256:   envelope.ObservedState.GitOpsApplication.HeadTreeSHA256,
+			LiveRevision:     envelope.ObservedState.GitOpsApplication.LiveRevision,
+			DesiredRevision:  envelope.ObservedState.GitOpsApplication.DesiredRevision,
+			SyncStatus:       envelope.ObservedState.GitOpsApplication.SyncStatus,
+			HealthStatus:     envelope.ObservedState.GitOpsApplication.HealthStatus,
 		}
 		return *snapshot.GitOps == expected
 	default:
 		return false
+	}
+}
+
+func limitsMatchEnvelope(limits ActionLimitsSnapshot, envelope action.Envelope) bool {
+	switch envelope.ActionType {
+	case action.ActionKubernetesScale:
+		parameters := envelope.Parameters.KubernetesScale
+		return parameters != nil && limits.MinimumReplicas >= 0 && limits.MaximumReplicas >= limits.MinimumReplicas &&
+			parameters.Minimum == limits.MinimumReplicas && parameters.Maximum == limits.MaximumReplicas
+	case action.ActionAWXServiceRestart:
+		return envelope.Target.AWXHosts != nil && limits.MaxAWXHosts > 0 && limits.MaxAWXHosts <= action.MaxAWXHosts &&
+			len(envelope.Target.AWXHosts.HostIDs) <= limits.MaxAWXHosts
+	default:
+		return limits.MinimumReplicas == 0 && limits.MaximumReplicas == 0 && limits.MaxAWXHosts == 0
 	}
 }
 
