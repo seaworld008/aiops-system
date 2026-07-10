@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -128,6 +129,195 @@ func TestBrokerRejectsIssuerLeaseIDContainingControlCharacters(t *testing.T) {
 	}
 }
 
+func TestBrokerRevokeClearsSecretBeforeRemoteCallAndIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	envelope := sealedEnvelope(t, now)
+	issuer := &fakeIssuer{secret: []byte("ephemeral-secret"), expiresAt: allowDecision(envelope, now).CredentialExpiresAt}
+	broker, err := NewBroker(&fakeGate{decision: allowDecision(envelope, now)}, issuer, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewBroker() error = %v", err)
+	}
+	credential, err := broker.Issue(context.Background(), envelope)
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+	issuer.onRevoke = func() {
+		if got := credential.Secret(); len(got) != 0 {
+			t.Errorf("secret was still available during remote revoke: %q", got)
+		}
+	}
+
+	if err := broker.Revoke(context.Background(), &credential); err != nil {
+		t.Fatalf("Revoke() error = %v", err)
+	}
+	if err := broker.Revoke(context.Background(), &credential); err != nil {
+		t.Fatalf("second Revoke() error = %v", err)
+	}
+	if got := issuer.revokeCallCount(); got != 1 {
+		t.Fatalf("remote revoke calls = %d, want 1", got)
+	}
+	if got := credential.Secret(); len(got) != 0 {
+		t.Fatalf("Revoke() retained local secret: %q", got)
+	}
+}
+
+func TestBrokerRevokeFailureClearsSecretAndCanBeRetriedSafely(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	envelope := sealedEnvelope(t, now)
+	issuer := &fakeIssuer{
+		secret:    []byte("ephemeral-secret"),
+		expiresAt: allowDecision(envelope, now).CredentialExpiresAt,
+		revokeErr: errors.New("vault unavailable"),
+	}
+	broker, err := NewBroker(&fakeGate{decision: allowDecision(envelope, now)}, issuer, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewBroker() error = %v", err)
+	}
+	credential, err := broker.Issue(context.Background(), envelope)
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+
+	if err := broker.Revoke(context.Background(), &credential); err == nil || !strings.Contains(err.Error(), "vault unavailable") {
+		t.Fatalf("Revoke() error = %v, want issuer failure", err)
+	}
+	if got := credential.Secret(); len(got) != 0 {
+		t.Fatalf("failed Revoke() retained local secret: %q", got)
+	}
+	if got := issuer.revokeCallCount(); got != 1 {
+		t.Fatalf("remote revoke calls = %d, want 1", got)
+	}
+
+	issuer.setRevokeError(nil)
+	if err := broker.Revoke(context.Background(), &credential); err != nil {
+		t.Fatalf("retry Revoke() error = %v", err)
+	}
+	if err := broker.Revoke(context.Background(), &credential); err != nil {
+		t.Fatalf("post-success Revoke() error = %v", err)
+	}
+	if got := issuer.revokeCallCount(); got != 2 {
+		t.Fatalf("remote revoke calls after retry = %d, want 2", got)
+	}
+}
+
+func TestBrokerRevokeCanRetryWithIndependentFinalizeContext(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	envelope := sealedEnvelope(t, now)
+	issuer := &fakeIssuer{
+		secret:         []byte("ephemeral-secret"),
+		expiresAt:      allowDecision(envelope, now).CredentialExpiresAt,
+		respectContext: true,
+	}
+	broker, err := NewBroker(&fakeGate{decision: allowDecision(envelope, now)}, issuer, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewBroker() error = %v", err)
+	}
+	credential, err := broker.Issue(context.Background(), envelope)
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := broker.Revoke(cancelled, &credential); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Revoke(cancelled) error = %v, want context.Canceled", err)
+	}
+	if err := broker.Revoke(context.Background(), &credential); err != nil {
+		t.Fatalf("Revoke(finalize context) error = %v", err)
+	}
+	if got := issuer.revokeCallCount(); got != 2 {
+		t.Fatalf("remote revoke calls = %d, want cancelled attempt plus retry", got)
+	}
+}
+
+func TestBrokerRevokeRejectsUnmanagedAndTamperedCredentialsFailClosed(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	envelope := sealedEnvelope(t, now)
+	issuer := &fakeIssuer{secret: []byte("ephemeral-secret"), expiresAt: allowDecision(envelope, now).CredentialExpiresAt}
+	broker, err := NewBroker(&fakeGate{decision: allowDecision(envelope, now)}, issuer, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewBroker() error = %v", err)
+	}
+
+	invalid := []*Credential{
+		nil,
+		{},
+		{LeaseID: "forged-lease", ExpiresAt: now.Add(time.Minute)},
+	}
+	for index, credential := range invalid {
+		if err := broker.Revoke(context.Background(), credential); !errors.Is(err, ErrInvalidCredential) {
+			t.Errorf("Revoke(invalid[%d]) error = %v, want ErrInvalidCredential", index, err)
+		}
+	}
+	if got := issuer.revokeCallCount(); got != 0 {
+		t.Fatalf("issuer called for unmanaged credential %d times", got)
+	}
+
+	credential, err := broker.Issue(context.Background(), envelope)
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+	credential.LeaseID = "tampered-lease"
+	if err := broker.Revoke(context.Background(), &credential); !errors.Is(err, ErrInvalidCredential) {
+		t.Fatalf("Revoke(tampered) error = %v, want ErrInvalidCredential", err)
+	}
+	if got := credential.Secret(); len(got) != 0 {
+		t.Fatalf("tampered credential retained local secret: %q", got)
+	}
+	if got := issuer.revokeCallCount(); got != 0 {
+		t.Fatalf("issuer called for tampered credential %d times", got)
+	}
+}
+
+func TestBrokerConcurrentRevokeUsesOneRemoteCallAcrossCredentialCopies(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	envelope := sealedEnvelope(t, now)
+	issuer := &fakeIssuer{secret: []byte("ephemeral-secret"), expiresAt: allowDecision(envelope, now).CredentialExpiresAt}
+	broker, err := NewBroker(&fakeGate{decision: allowDecision(envelope, now)}, issuer, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewBroker() error = %v", err)
+	}
+	credential, err := broker.Issue(context.Background(), envelope)
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+
+	const callers = 16
+	start := make(chan struct{})
+	errorsByCaller := make(chan error, callers)
+	var waitGroup sync.WaitGroup
+	for range callers {
+		waitGroup.Add(1)
+		credentialCopy := credential
+		go func() {
+			defer waitGroup.Done()
+			<-start
+			errorsByCaller <- broker.Revoke(context.Background(), &credentialCopy)
+		}()
+	}
+	close(start)
+	waitGroup.Wait()
+	close(errorsByCaller)
+	for err := range errorsByCaller {
+		if err != nil {
+			t.Errorf("concurrent Revoke() error = %v", err)
+		}
+	}
+	if got := issuer.revokeCallCount(); got != 1 {
+		t.Fatalf("remote revoke calls = %d, want 1", got)
+	}
+}
+
 type fakeGate struct {
 	decision policy.Decision
 	err      error
@@ -140,11 +330,16 @@ func (gate *fakeGate) EvaluateCredentialIssue(context.Context, action.Envelope) 
 }
 
 type fakeIssuer struct {
+	mu             sync.Mutex
 	request        IssueRequest
 	leaseID        string
 	secret         []byte
 	expiresAt      time.Time
 	revokedLeaseID string
+	revokeCalls    int
+	revokeErr      error
+	onRevoke       func()
+	respectContext bool
 	calls          int
 }
 
@@ -158,9 +353,33 @@ func (issuer *fakeIssuer) Issue(_ context.Context, request IssueRequest) (Issued
 	return IssuedLease{LeaseID: leaseID, Secret: append([]byte(nil), issuer.secret...), ExpiresAt: issuer.expiresAt}, nil
 }
 
-func (issuer *fakeIssuer) Revoke(_ context.Context, leaseID string) error {
+func (issuer *fakeIssuer) Revoke(ctx context.Context, leaseID string) error {
+	issuer.mu.Lock()
 	issuer.revokedLeaseID = leaseID
-	return nil
+	issuer.revokeCalls++
+	onRevoke := issuer.onRevoke
+	revokeErr := issuer.revokeErr
+	respectContext := issuer.respectContext
+	issuer.mu.Unlock()
+	if onRevoke != nil {
+		onRevoke()
+	}
+	if respectContext && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return revokeErr
+}
+
+func (issuer *fakeIssuer) revokeCallCount() int {
+	issuer.mu.Lock()
+	defer issuer.mu.Unlock()
+	return issuer.revokeCalls
+}
+
+func (issuer *fakeIssuer) setRevokeError(err error) {
+	issuer.mu.Lock()
+	defer issuer.mu.Unlock()
+	issuer.revokeErr = err
 }
 
 func allowDecision(envelope action.Envelope, now time.Time) policy.Decision {
