@@ -163,7 +163,12 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	if err != nil || len(secondClaim) != 1 || secondClaim[0].ID == firstClaim[0].ID {
 		t.Fatalf("real ClaimOutbox(second) = (%#v, %v)", secondClaim, err)
 	}
-	execSQL(t, ctx, database, `UPDATE outbox_events SET claim_expires_at = statement_timestamp() - interval '1 second' WHERE id = $1`, firstClaim[0].ID)
+	execSQL(t, ctx, database, `
+		UPDATE outbox_events
+		SET claimed_at = statement_timestamp() - interval '2 minutes',
+			claim_expires_at = statement_timestamp() - interval '1 minute'
+		WHERE id = $1
+	`, firstClaim[0].ID)
 	if err := repository.AckOutbox(ctx, firstClaim[0].ID, firstClaim[0].ClaimToken); !errors.Is(err, store.ErrStaleClaim) {
 		t.Fatalf("real AckOutbox(expired) error = %v", err)
 	}
