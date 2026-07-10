@@ -2,6 +2,8 @@ package postgres_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -15,7 +17,7 @@ import (
 
 var executionColumns = []string{
 	"execution_id", "target_key", "runner_pool", "production", "status",
-	"runner_id", "lease_token", "lease_epoch", "lease_expires_at", "lease_acquired_at",
+	"runner_id", "lease_token_hash", "lease_epoch", "lease_expires_at", "lease_acquired_at",
 	"last_heartbeat_at", "started_at", "completed_at", "result_hash", "created_at", "updated_at",
 	"reconciliation_id", "reconciliation_actor", "reconciliation_result_hash", "reconciled_at",
 }
@@ -81,7 +83,7 @@ func TestClaimSerializesExpiryAndEnforcesPoolTargetAndGlobalWriteGuards(t *testi
 		CreatedAt: now.Add(-time.Minute), UpdatedAt: now,
 	}
 	database.ExpectQuery(`(?s)UPDATE execution_leases AS execution.*lease_epoch = execution\.lease_epoch \+ 1.*WHERE execution\.execution_id = \$1 AND execution\.status = 'QUEUED'`).
-		WithArgs(want.ExecutionID, want.RunnerID, want.LeaseToken, float64(60)).
+		WithArgs(want.ExecutionID, want.RunnerID, leaseTokenHash(want.LeaseToken), float64(60)).
 		WillReturnRows(executionRows(want))
 	database.ExpectCommit()
 
@@ -113,7 +115,7 @@ func TestClaimReclaimsExpiredLeaseWithMonotonicallyHigherEpoch(t *testing.T) {
 		CreatedAt: now.Add(-2 * time.Minute), UpdatedAt: now,
 	}
 	database.ExpectQuery("UPDATE execution_leases AS execution").
-		WithArgs(want.ExecutionID, want.RunnerID, want.LeaseToken, float64(60)).
+		WithArgs(want.ExecutionID, want.RunnerID, leaseTokenHash(want.LeaseToken), float64(60)).
 		WillReturnRows(executionRows(want))
 	database.ExpectCommit()
 
@@ -201,8 +203,8 @@ func TestStartAndHeartbeatRequireTheCurrentTokenEpochAndUnexpiredLease(t *testin
 		LeaseAcquiredAt: now.Add(-time.Minute), LastHeartbeatAt: now.Add(-time.Minute),
 		LeaseExpiresAt: now.Add(time.Minute), StartedAt: now, CreatedAt: now.Add(-time.Hour), UpdatedAt: now,
 	}
-	database.ExpectQuery(`(?s)UPDATE execution_leases.*runner_id = \$2.*lease_token = \$3.*lease_epoch = \$4.*lease_expires_at > statement_timestamp\(\)`).
-		WithArgs(fence.ExecutionID, fence.RunnerID, fence.Token, fence.Epoch).
+	database.ExpectQuery(`(?s)UPDATE execution_leases.*runner_id = \$2.*lease_token_sha256 = \$3.*lease_epoch = \$4.*lease_expires_at > statement_timestamp\(\)`).
+		WithArgs(fence.ExecutionID, fence.RunnerID, leaseTokenHash(fence.Token), fence.Epoch).
 		WillReturnRows(executionRows(running))
 
 	started, err := repository.Start(context.Background(), fence)
@@ -214,8 +216,8 @@ func TestStartAndHeartbeatRequireTheCurrentTokenEpochAndUnexpiredLease(t *testin
 	heartbeatExpiry := now.Add(2 * time.Minute)
 	running.LastHeartbeatAt = heartbeatAt
 	running.LeaseExpiresAt = heartbeatExpiry
-	database.ExpectQuery(`(?s)UPDATE execution_leases.*runner_id = \$2.*lease_token = \$3.*lease_epoch = \$4.*lease_expires_at > statement_timestamp\(\)`).
-		WithArgs(fence.ExecutionID, fence.RunnerID, fence.Token, fence.Epoch, float64(120)).
+	database.ExpectQuery(`(?s)UPDATE execution_leases.*runner_id = \$2.*lease_token_sha256 = \$3.*lease_epoch = \$4.*lease_expires_at > statement_timestamp\(\)`).
+		WithArgs(fence.ExecutionID, fence.RunnerID, leaseTokenHash(fence.Token), fence.Epoch, float64(120)).
 		WillReturnRows(executionRows(running))
 
 	heartbeat, err := repository.Heartbeat(context.Background(), executionlease.HeartbeatRequest{Lease: fence, Extension: 2 * time.Minute})
@@ -230,7 +232,7 @@ func TestHeartbeatZeroRowUpdateChecksStateAndReturnsStaleLease(t *testing.T) {
 	defer database.Close()
 	stale := executionlease.LeaseIdentity{ExecutionID: "execution-01", RunnerID: "runner-old", Token: "lease-token-old", Epoch: 2}
 	database.ExpectQuery("UPDATE execution_leases").
-		WithArgs(stale.ExecutionID, stale.RunnerID, stale.Token, stale.Epoch, float64(60)).
+		WithArgs(stale.ExecutionID, stale.RunnerID, leaseTokenHash(stale.Token), stale.Epoch, float64(60)).
 		WillReturnRows(executionRows())
 	current := executionlease.Execution{
 		ExecutionID: stale.ExecutionID, TargetKey: "prod/cluster/deployment/api",
@@ -544,7 +546,7 @@ func TestCancelRunningExecutionBecomesUncertainAndFencesTheOldRunner(t *testing.
 		StartedAt: now.Add(-time.Minute), CompletedAt: now,
 		CreatedAt: now.Add(-time.Hour), UpdatedAt: now,
 	}
-	database.ExpectQuery(`(?s)UPDATE execution_leases.*WHEN status = 'RUNNING' THEN 'UNCERTAIN'.*runner_id = CASE WHEN status = 'RUNNING' THEN runner_id ELSE NULL END.*lease_token = NULL`).
+	database.ExpectQuery(`(?s)UPDATE execution_leases.*WHEN status = 'RUNNING' THEN 'UNCERTAIN'.*runner_id = CASE WHEN status = 'RUNNING' THEN runner_id ELSE NULL END.*lease_token_sha256 = NULL`).
 		WithArgs(want.ExecutionID).
 		WillReturnRows(executionRows(want))
 
@@ -601,8 +603,8 @@ func TestClaimAndHeartbeatRejectSubsecondDurationsBeforeSQL(t *testing.T) {
 
 func expectCompleteUpdate(database pgxmock.PgxPoolIface, fence executionlease.LeaseIdentity, status executionlease.Status, hash string, rows *pgxmock.Rows) {
 	database.ExpectBegin()
-	database.ExpectQuery(`(?s)UPDATE execution_leases.*completed_lease_token = lease_token.*runner_id = \$2.*lease_token = \$3.*lease_epoch = \$4.*status = 'RUNNING'.*lease_expires_at > statement_timestamp\(\)`).
-		WithArgs(fence.ExecutionID, fence.RunnerID, fence.Token, fence.Epoch, status, hash).
+	database.ExpectQuery(`(?s)UPDATE execution_leases.*completed_lease_token_sha256 = lease_token_sha256.*runner_id = \$2.*lease_token_sha256 = \$3.*lease_epoch = \$4.*status = 'RUNNING'.*lease_expires_at > statement_timestamp\(\)`).
+		WithArgs(fence.ExecutionID, fence.RunnerID, leaseTokenHash(fence.Token), fence.Epoch, status, hash).
 		WillReturnRows(rows)
 }
 
@@ -620,14 +622,14 @@ func expectGlobalSweep(database pgxmock.PgxPoolIface, expiredRunning, expiredLea
 	database.ExpectExec("SELECT pg_advisory_xact_lock").
 		WithArgs(pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
-	database.ExpectExec(`(?s)UPDATE execution_leases AS expired_running.*SET status = 'UNCERTAIN', lease_token = NULL`).
+	database.ExpectExec(`(?s)UPDATE execution_leases AS expired_running.*SET status = 'UNCERTAIN', lease_token_sha256 = NULL`).
 		WillReturnResult(pgxmock.NewResult("UPDATE", expiredRunning))
 	database.ExpectExec("UPDATE execution_leases AS expired_lease").
 		WillReturnResult(pgxmock.NewResult("UPDATE", expiredLeased))
 }
 
 func expectTargetSweep(database pgxmock.PgxPoolIface, executionID string, expiredRunning, expiredLeased int64) {
-	database.ExpectExec(`(?s)UPDATE execution_leases AS expired_running.*SET status = 'UNCERTAIN', lease_token = NULL.*execution_id = \$1`).
+	database.ExpectExec(`(?s)UPDATE execution_leases AS expired_running.*SET status = 'UNCERTAIN', lease_token_sha256 = NULL.*execution_id = \$1`).
 		WithArgs(executionID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", expiredRunning))
 	database.ExpectExec(`(?s)UPDATE execution_leases AS expired_lease.*execution_id = \$1`).
@@ -659,7 +661,7 @@ func executionRows(executions ...executionlease.Execution) *pgxmock.Rows {
 	for _, execution := range executions {
 		rows.AddRow(
 			execution.ExecutionID, execution.TargetKey, string(execution.Pool), execution.Production, string(execution.Status),
-			nullableString(execution.RunnerID), nullableString(execution.LeaseToken), execution.LeaseEpoch,
+			nullableString(execution.RunnerID), nullableString(leaseTokenHash(execution.LeaseToken)), execution.LeaseEpoch,
 			nullableTime(execution.LeaseExpiresAt), nullableTime(execution.LeaseAcquiredAt), nullableTime(execution.LastHeartbeatAt),
 			nullableTime(execution.StartedAt), nullableTime(execution.CompletedAt), nullableString(execution.ResultHash),
 			execution.CreatedAt, execution.UpdatedAt,
@@ -668,6 +670,14 @@ func executionRows(executions ...executionlease.Execution) *pgxmock.Rows {
 		)
 	}
 	return rows
+}
+
+func leaseTokenHash(token string) string {
+	if token == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(digest[:])
 }
 
 func nullableString(value string) any {

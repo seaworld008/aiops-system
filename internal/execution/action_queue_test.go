@@ -32,10 +32,7 @@ func TestMemoryActionQueueSubmitAndClaimReturnsImmutableActionWithinRunnerScope(
 	envelope.Target.KubernetesDeployment.Name = "mutated-after-submit"
 	envelope.Risk.ReasonCodes[0] = "MUTATED"
 	claimed, err := queue.Claim(context.Background(), ActionClaimRequest{
-		Scope: RunnerScope{
-			RunnerID: "runner-1", Pool: executionlease.PoolWrite,
-			AllowedWorkspaceIDs: []string{"workspace-1"}, AllowedEnvironmentIDs: []string{"PROD"},
-		},
+		Scope:         testRunnerScope(t, "runner-1", RunnerScopeBinding{WorkspaceID: "workspace-1", EnvironmentID: "PROD"}),
 		LeaseDuration: time.Minute,
 	})
 	if err != nil {
@@ -96,6 +93,41 @@ func TestMemoryActionQueueRejectsAnActionIDBoundToADifferentPlan(t *testing.T) {
 	}
 }
 
+func TestMemoryActionQueueIdempotencyKeyReturnsOriginalOrConflictsByRequestSemantics(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	first, _ := signedEnvelope(t, restartEnvelope(now))
+	queue := mustMemoryActionQueue(t, func() time.Time { return now })
+	firstExecution := submitAction(t, queue, first, "environment-1", false)
+
+	retryUnsigned := restartEnvelope(now)
+	retryUnsigned.ActionID = "action-semantic-idempotency-retry"
+	retryUnsigned.TraceID = strings.Repeat("b", 32)
+	retry, _ := signedEnvelope(t, retryUnsigned)
+	retried, err := queue.Submit(context.Background(), ActionSubmission{
+		Envelope: retry, PlanHash: retry.PlanHash,
+		TargetKey: firstExecution.TargetKey, EnvironmentRevision: "environment-1",
+		Production: false, Pool: executionlease.PoolWrite,
+	})
+	if err != nil || retried.ExecutionID != firstExecution.ExecutionID {
+		t.Fatalf("Submit(same semantics with new action identity) = %#v, %v", retried, err)
+	}
+
+	conflictingUnsigned := restartEnvelope(now)
+	conflictingUnsigned.ActionID = "action-conflicting-idempotency"
+	conflictingUnsigned.Parameters.KubernetesRolloutRestart.Reason = "different request semantics"
+	conflicting, _ := signedEnvelope(t, conflictingUnsigned)
+	_, err = queue.Submit(context.Background(), ActionSubmission{
+		Envelope: conflicting, PlanHash: conflicting.PlanHash,
+		TargetKey: firstExecution.TargetKey, EnvironmentRevision: "environment-1",
+		Production: false, Pool: executionlease.PoolWrite,
+	})
+	if !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("Submit(same idempotency key, different request) error = %v, want %v", err, ErrIdempotencyConflict)
+	}
+}
+
 func TestMemoryActionQueueFiltersRunnerScopeBeforeTakingProductionSlot(t *testing.T) {
 	t.Parallel()
 
@@ -125,10 +157,7 @@ func TestMemoryActionQueueFiltersRunnerScopeBeforeTakingProductionSlot(t *testin
 	}
 
 	claimed, err := queue.Claim(context.Background(), ActionClaimRequest{
-		Scope: RunnerScope{
-			RunnerID: "runner-prod", Pool: executionlease.PoolWrite,
-			AllowedWorkspaceIDs: []string{"workspace-1"}, AllowedEnvironmentIDs: []string{"PROD"},
-		},
+		Scope:         testRunnerScope(t, "runner-prod", RunnerScopeBinding{WorkspaceID: "workspace-1", EnvironmentID: "PROD"}),
 		LeaseDuration: time.Minute,
 	})
 	if err != nil {
@@ -136,6 +165,88 @@ func TestMemoryActionQueueFiltersRunnerScopeBeforeTakingProductionSlot(t *testin
 	}
 	if claimed.Envelope.ActionID != "action-production" {
 		t.Fatalf("Claim() action id = %q, want action-production", claimed.Envelope.ActionID)
+	}
+}
+
+func TestMemoryActionQueueRunnerScopeAuthorizesExactWorkspaceEnvironmentPairs(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	unauthorizedUnsigned := restartEnvelope(now)
+	unauthorizedUnsigned.ActionID = "action-cross-product"
+	unauthorizedUnsigned.IdempotencyKey = "idem-action-cross-product"
+	unauthorizedUnsigned.Target.EnvironmentID = "STAGING"
+	unauthorized, _ := signedEnvelope(t, unauthorizedUnsigned)
+	authorizedUnsigned := restartEnvelope(now)
+	authorizedUnsigned.ActionID = "action-authorized-pair"
+	authorizedUnsigned.IdempotencyKey = "idem-action-authorized-pair"
+	authorizedUnsigned.Target.KubernetesDeployment.Name = "payments-worker"
+	authorizedUnsigned.Target.KubernetesDeployment.UID = "uid-authorized"
+	authorizedUnsigned.CredentialScope.Resource = "cluster-a/payments/deployment/payments-worker"
+	authorized, _ := signedEnvelope(t, authorizedUnsigned)
+	queue := mustMemoryActionQueue(t, func() time.Time { return now })
+	for _, envelope := range []action.Envelope{unauthorized, authorized} {
+		submitAction(t, queue, envelope, "environment-1", false)
+	}
+
+	registration := RunnerRegistration{
+		RunnerID: "runner-exact-pairs", Pool: executionlease.PoolWrite, Enabled: true, ScopeRevision: 7, MaxConcurrency: 1,
+		ScopeBindings: []RunnerScopeBinding{
+			{WorkspaceID: "workspace-1", EnvironmentID: "PROD"},
+			{WorkspaceID: "workspace-2", EnvironmentID: "STAGING"},
+		},
+	}
+	scope, err := registration.Scope()
+	if err != nil {
+		t.Fatalf("RunnerRegistration.Scope() error = %v", err)
+	}
+	claimed, err := queue.Claim(context.Background(), ActionClaimRequest{Scope: scope, LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatalf("Claim() error = %v", err)
+	}
+	if claimed.Execution.ExecutionID != authorized.ActionID {
+		t.Fatalf("Claim() execution = %q, want exact authorized pair %q", claimed.Execution.ExecutionID, authorized.ActionID)
+	}
+	if claimed.Execution.ScopeRevision != registration.ScopeRevision {
+		t.Fatalf("Claim() scope revision = %d, want %d", claimed.Execution.ScopeRevision, registration.ScopeRevision)
+	}
+}
+
+func TestMemoryActionQueueRunnerMaxConcurrencyBlocksSecondLease(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	firstEnvelope, _ := signedEnvelope(t, restartEnvelope(now))
+	secondUnsigned := restartEnvelope(now)
+	secondUnsigned.ActionID = "action-runner-concurrency-2"
+	secondUnsigned.IdempotencyKey = "idem-runner-concurrency-2"
+	secondUnsigned.Target.KubernetesDeployment.Name = "payments-worker"
+	secondUnsigned.Target.KubernetesDeployment.UID = "uid-runner-concurrency-2"
+	secondUnsigned.CredentialScope.Resource = "cluster-a/payments/deployment/payments-worker"
+	secondEnvelope, _ := signedEnvelope(t, secondUnsigned)
+	queue := mustMemoryActionQueue(t, func() time.Time { return now })
+	submitAction(t, queue, firstEnvelope, "environment-1", false)
+	submitAction(t, queue, secondEnvelope, "environment-1", false)
+	scope, err := (RunnerRegistration{
+		RunnerID: "runner-concurrency", Pool: executionlease.PoolWrite, Enabled: true,
+		ScopeRevision: 1, MaxConcurrency: 1,
+		ScopeBindings: []RunnerScopeBinding{{WorkspaceID: "workspace-1", EnvironmentID: "PROD"}},
+	}).Scope()
+	if err != nil {
+		t.Fatalf("RunnerRegistration.Scope() error = %v", err)
+	}
+	first, err := queue.Claim(context.Background(), ActionClaimRequest{Scope: scope, LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatalf("Claim(first) error = %v", err)
+	}
+	if _, err := queue.Claim(context.Background(), ActionClaimRequest{Scope: scope, LeaseDuration: time.Minute}); !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
+		t.Fatalf("Claim(over max concurrency) error = %v, want %v", err, executionlease.ErrNoLeaseAvailable)
+	}
+	if _, err := queue.Cancel(context.Background(), first.Execution.ExecutionID); err != nil {
+		t.Fatalf("Cancel(first) error = %v", err)
+	}
+	if _, err := queue.Claim(context.Background(), ActionClaimRequest{Scope: scope, LeaseDuration: time.Minute}); err != nil {
+		t.Fatalf("Claim(after slot release) error = %v", err)
 	}
 }
 
@@ -159,10 +270,7 @@ func TestMemoryActionQueuePermanentlyRejectsPoisonedPreStartAction(t *testing.T)
 		t.Fatalf("Reject() = %#v", rejected)
 	}
 	if _, err := queue.Claim(context.Background(), ActionClaimRequest{
-		Scope: RunnerScope{
-			RunnerID: "runner-2", Pool: executionlease.PoolWrite,
-			AllowedWorkspaceIDs: []string{"workspace-1"}, AllowedEnvironmentIDs: []string{"PROD"},
-		},
+		Scope:         testRunnerScope(t, "runner-2", RunnerScopeBinding{WorkspaceID: "workspace-1", EnvironmentID: "PROD"}),
 		LeaseDuration: time.Minute,
 	}); !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
 		t.Fatalf("poisoned action was redelivered: %v", err)
@@ -191,10 +299,7 @@ func TestMemoryActionQueueNackUsesFencedBackoffBeforeRedelivery(t *testing.T) {
 		t.Fatalf("Nack() = %#v", released)
 	}
 	claim := ActionClaimRequest{
-		Scope: RunnerScope{
-			RunnerID: "runner-2", Pool: executionlease.PoolWrite,
-			AllowedWorkspaceIDs: []string{"workspace-1"}, AllowedEnvironmentIDs: []string{"PROD"},
-		},
+		Scope:         testRunnerScope(t, "runner-2", RunnerScopeBinding{WorkspaceID: "workspace-1", EnvironmentID: "PROD"}),
 		LeaseDuration: time.Minute,
 	}
 	if _, err := queue.Claim(context.Background(), claim); !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
@@ -233,29 +338,105 @@ func TestMemoryActionQueueStartHeartbeatAndCompleteRequireCurrentFence(t *testin
 
 	stale := claimed.Execution.Fence()
 	stale.Epoch++
-	if _, err := queue.Heartbeat(context.Background(), executionlease.HeartbeatRequest{
-		Lease: stale, Extension: time.Minute,
+	if _, err := queue.Heartbeat(context.Background(), ActionHeartbeatRequest{
+		Lease: stale, Sequence: 1, Extension: time.Minute,
 	}); !errors.Is(err, executionlease.ErrStaleLease) {
 		t.Fatalf("stale Heartbeat() error = %v, want stale lease", err)
 	}
 	clock = clock.Add(10 * time.Second)
-	heartbeated, err := queue.Heartbeat(context.Background(), executionlease.HeartbeatRequest{
-		Lease: fence, Extension: time.Minute,
+	heartbeated, err := queue.Heartbeat(context.Background(), ActionHeartbeatRequest{
+		Lease: fence, Sequence: 1, Extension: time.Minute,
 	})
-	if err != nil || !heartbeated.LeaseExpiresAt.Equal(clock.Add(time.Minute)) {
+	if err != nil || !heartbeated.Execution.LeaseExpiresAt.Equal(clock.Add(time.Minute)) {
 		t.Fatalf("Heartbeat() = %#v, %v", heartbeated, err)
 	}
-	if heartbeated.LeaseToken != "" {
-		t.Fatalf("Heartbeat() leaked lease token %q", heartbeated.LeaseToken)
+	if heartbeated.Execution.LeaseToken != "" {
+		t.Fatalf("Heartbeat() leaked lease token %q", heartbeated.Execution.LeaseToken)
 	}
-	completed, err := queue.Complete(context.Background(), executionlease.CompleteRequest{
-		Lease: fence, Status: executionlease.StatusSucceeded, ResultHash: strings.Repeat("c", 64),
+	finalizing, err := queue.Complete(context.Background(), ActionCompleteRequest{
+		Lease: fence, Summary: ExecutorResult{Outcome: ExecutorSucceeded, Code: "COMPLETED", Verification: VerificationPassed},
 	})
 	if err != nil {
 		t.Fatalf("Complete() error = %v", err)
 	}
+	completed, err := queue.Finalize(context.Background(), fence)
+	if err != nil {
+		t.Fatalf("Finalize() error = %v", err)
+	}
 	if completed.Status != executionlease.StatusSucceeded || completed.LeaseToken != "" {
-		t.Fatalf("Complete() = %#v", completed)
+		t.Fatalf("Complete()/Finalize() = %#v then %#v", finalizing, completed)
+	}
+}
+
+func TestMemoryActionQueueHeartbeatSequenceRejectsReplayWithoutExtendingLease(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	clock := now
+	envelope, _ := signedEnvelope(t, restartEnvelope(now))
+	queue := mustMemoryActionQueue(t, func() time.Time { return clock })
+	submitAction(t, queue, envelope, "environment-1", false)
+	claimed := claimAction(t, queue, "runner-sequenced", []string{"workspace-1"}, []string{"PROD"})
+	if _, err := queue.Start(context.Background(), claimed.Execution.Fence()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if _, err := queue.Heartbeat(context.Background(), ActionHeartbeatRequest{
+		Lease: claimed.Execution.Fence(), Sequence: 0, Extension: time.Minute,
+	}); !errors.Is(err, ErrHeartbeatSequence) {
+		t.Fatalf("Heartbeat(initial seq=0) error = %v, want %v", err, ErrHeartbeatSequence)
+	}
+
+	clock = clock.Add(10 * time.Second)
+	first, err := queue.Heartbeat(context.Background(), ActionHeartbeatRequest{
+		Lease: claimed.Execution.Fence(), Sequence: 1, Extension: time.Minute,
+	})
+	if err != nil || first.Directive != HeartbeatContinue || first.Execution.HeartbeatSeq != 1 {
+		t.Fatalf("Heartbeat(seq=1) = %#v, %v", first, err)
+	}
+	firstExpiry := first.Execution.LeaseExpiresAt
+	clock = clock.Add(10 * time.Second)
+	replayed, err := queue.Heartbeat(context.Background(), ActionHeartbeatRequest{
+		Lease: claimed.Execution.Fence(), Sequence: 1, Extension: time.Minute,
+	})
+	if err != nil || !replayed.Execution.LeaseExpiresAt.Equal(firstExpiry) {
+		t.Fatalf("Heartbeat(replay seq=1) = %#v, %v; expiry changed from %s", replayed, err, firstExpiry)
+	}
+	for _, sequence := range []int64{0, 3} {
+		if _, err := queue.Heartbeat(context.Background(), ActionHeartbeatRequest{
+			Lease: claimed.Execution.Fence(), Sequence: sequence, Extension: time.Minute,
+		}); !errors.Is(err, ErrHeartbeatSequence) {
+			t.Fatalf("Heartbeat(seq=%d) error = %v, want %v", sequence, err, ErrHeartbeatSequence)
+		}
+	}
+}
+
+func TestMemoryActionQueueReclaimResetsHeartbeatSequenceForNewEpoch(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	clock := now
+	envelope, _ := signedEnvelope(t, restartEnvelope(now))
+	queue := mustMemoryActionQueue(t, func() time.Time { return clock })
+	submitAction(t, queue, envelope, "environment-1", false)
+	first := claimAction(t, queue, "runner-first-epoch", []string{"workspace-1"}, []string{"PROD"})
+	if _, err := queue.Heartbeat(context.Background(), ActionHeartbeatRequest{
+		Lease: first.Execution.Fence(), Sequence: 1, Extension: time.Minute,
+	}); err != nil {
+		t.Fatalf("Heartbeat(first epoch) error = %v", err)
+	}
+
+	clock = clock.Add(2 * time.Minute)
+	second := claimAction(t, queue, "runner-second-epoch", []string{"workspace-1"}, []string{"PROD"})
+	if second.Execution.LeaseEpoch != first.Execution.LeaseEpoch+1 || second.Execution.HeartbeatSeq != 0 {
+		t.Fatalf("reclaimed execution = %#v", second.Execution)
+	}
+	secondExpiry := second.Execution.LeaseExpiresAt
+	clock = clock.Add(10 * time.Second)
+	heartbeat, err := queue.Heartbeat(context.Background(), ActionHeartbeatRequest{
+		Lease: second.Execution.Fence(), Sequence: 1, Extension: time.Minute,
+	})
+	if err != nil || !heartbeat.Execution.LeaseExpiresAt.After(secondExpiry) {
+		t.Fatalf("Heartbeat(new epoch seq=1) = %#v, %v; old expiry %s", heartbeat, err, secondExpiry)
 	}
 }
 
@@ -290,8 +471,8 @@ func TestMemoryActionQueueClaimSweepsExpiredLeasesAndFencesExpiredRunner(t *test
 	if uncertain.Status != executionlease.StatusUncertain || uncertain.RunnerID != "runner-new" || uncertain.LeaseToken != "" {
 		t.Fatalf("expired RUNNING execution = %#v", uncertain)
 	}
-	if _, err := queue.Complete(context.Background(), executionlease.CompleteRequest{
-		Lease: secondFence, Status: executionlease.StatusSucceeded, ResultHash: strings.Repeat("d", 64),
+	if _, err := queue.Complete(context.Background(), ActionCompleteRequest{
+		Lease: secondFence, Summary: ExecutorResult{Outcome: ExecutorSucceeded, Code: "COMPLETED", Verification: VerificationPassed},
 	}); !errors.Is(err, executionlease.ErrStaleLease) {
 		t.Fatalf("Complete(expired runner) error = %v, want ErrStaleLease", err)
 	}
@@ -322,8 +503,7 @@ func TestMemoryActionQueueReconcileReleasesUncertainProductionSlotAndPreservesBo
 		t.Fatalf("SweepExpired() error = %v", err)
 	}
 	if _, err := queue.Claim(context.Background(), ActionClaimRequest{
-		Scope: RunnerScope{RunnerID: "runner-blocked", Pool: executionlease.PoolWrite,
-			AllowedWorkspaceIDs: []string{"workspace-1"}, AllowedEnvironmentIDs: []string{"PROD"}},
+		Scope:         testRunnerScope(t, "runner-blocked", RunnerScopeBinding{WorkspaceID: "workspace-1", EnvironmentID: "PROD"}),
 		LeaseDuration: time.Minute,
 	}); !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
 		t.Fatalf("UNCERTAIN did not retain production slot: %v", err)
@@ -345,6 +525,97 @@ func TestMemoryActionQueueReconcileReleasesUncertainProductionSlotAndPreservesBo
 	}
 }
 
+func TestMemoryActionQueueCompletePersistsStructuredReceiptAndFinalizingRetainsLocks(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	firstEnvelope, _ := signedEnvelope(t, restartEnvelope(now))
+	secondUnsigned := restartEnvelope(now)
+	secondUnsigned.ActionID = "action-after-finalizing"
+	secondUnsigned.IdempotencyKey = "idem-after-finalizing"
+	secondUnsigned.Target.KubernetesDeployment.Name = "payments-worker"
+	secondUnsigned.Target.KubernetesDeployment.UID = "uid-finalizing-worker"
+	secondUnsigned.CredentialScope.Resource = "cluster-a/payments/deployment/payments-worker"
+	secondEnvelope, _ := signedEnvelope(t, secondUnsigned)
+	queue := mustMemoryActionQueue(t, func() time.Time { return now })
+	submitAction(t, queue, firstEnvelope, "environment-1", true)
+	submitAction(t, queue, secondEnvelope, "environment-1", true)
+	first := claimAction(t, queue, "runner-finalizing", []string{"workspace-1"}, []string{"PROD"})
+	fence := first.Execution.Fence()
+	if _, err := queue.Start(context.Background(), fence); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	summary := ExecutorResult{Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed, Changed: true}
+	finalizing, err := queue.Complete(context.Background(), ActionCompleteRequest{Lease: fence, Summary: summary})
+	if err != nil || finalizing.Status != executionlease.StatusFinalizing || len(finalizing.ResultHash) != 64 {
+		t.Fatalf("Complete() = %#v, %v", finalizing, err)
+	}
+	if _, err := queue.Complete(context.Background(), ActionCompleteRequest{Lease: fence, Summary: summary}); err != nil {
+		t.Fatalf("Complete(idempotent receipt) error = %v", err)
+	}
+	conflicting := summary
+	conflicting.Code = "DIFFERENT_RESULT"
+	if _, err := queue.Complete(context.Background(), ActionCompleteRequest{Lease: fence, Summary: conflicting}); !errors.Is(err, executionlease.ErrCompletionConflict) {
+		t.Fatalf("Complete(conflicting receipt) error = %v, want %v", err, executionlease.ErrCompletionConflict)
+	}
+	if _, err := queue.Claim(context.Background(), ActionClaimRequest{
+		Scope:         testRunnerScope(t, "runner-blocked-finalizing", RunnerScopeBinding{WorkspaceID: "workspace-1", EnvironmentID: "PROD"}),
+		LeaseDuration: time.Minute,
+	}); !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
+		t.Fatalf("FINALIZING released production lock: %v", err)
+	}
+	completed, err := queue.Finalize(context.Background(), fence)
+	if err != nil || completed.Status != executionlease.StatusSucceeded || completed.ResultHash != finalizing.ResultHash {
+		t.Fatalf("Finalize() = %#v, %v", completed, err)
+	}
+	second := claimAction(t, queue, "runner-after-finalize", []string{"workspace-1"}, []string{"PROD"})
+	if second.Execution.ExecutionID != secondEnvelope.ActionID {
+		t.Fatalf("post-Finalize claim = %q, want %q", second.Execution.ExecutionID, secondEnvelope.ActionID)
+	}
+}
+
+func TestMemoryActionQueueSweepRecoversFinalizingAfterSignedCredentialBoundary(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	clock := now
+	envelope, _ := signedEnvelope(t, restartEnvelope(now))
+	queue := mustMemoryActionQueue(t, func() time.Time { return clock })
+	submitAction(t, queue, envelope, "environment-1", true)
+	claimed := claimAction(t, queue, "runner-finalizing-recovery", []string{"workspace-1"}, []string{"PROD"})
+	fence := claimed.Execution.Fence()
+	if _, err := queue.Start(context.Background(), fence); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	finalizing, err := queue.Complete(context.Background(), ActionCompleteRequest{
+		Lease: fence,
+		Summary: ExecutorResult{
+			Outcome: ExecutorSucceeded, Code: "RECOVERY_RECEIPT_VERIFIED", Verification: VerificationPassed, Changed: true,
+		},
+	})
+	if err != nil || finalizing.Status != executionlease.StatusFinalizing {
+		t.Fatalf("Complete() = %#v, %v", finalizing, err)
+	}
+
+	clock = envelope.ExpiresAt.Add(-time.Nanosecond)
+	if err := queue.SweepExpired(context.Background()); err != nil {
+		t.Fatalf("SweepExpired(before signed boundary) error = %v", err)
+	}
+	beforeBoundary, err := queue.Get(context.Background(), envelope.ActionID)
+	if err != nil || beforeBoundary.Status != executionlease.StatusFinalizing {
+		t.Fatalf("Get(before signed boundary) = %#v, %v", beforeBoundary, err)
+	}
+
+	clock = envelope.ExpiresAt
+	if err := queue.SweepExpired(context.Background()); err != nil {
+		t.Fatalf("SweepExpired(at signed boundary) error = %v", err)
+	}
+	recovered, err := queue.Get(context.Background(), envelope.ActionID)
+	if err != nil || recovered.Status != executionlease.StatusSucceeded || recovered.CompletedAt.IsZero() {
+		t.Fatalf("Get(recovered FINALIZING) = %#v, %v", recovered, err)
+	}
+}
+
 func TestMemoryActionQueueCancelIsIdempotentAndFencesActiveRunner(t *testing.T) {
 	t.Parallel()
 
@@ -363,6 +634,37 @@ func TestMemoryActionQueueCancelIsIdempotentAndFencesActiveRunner(t *testing.T) 
 	}
 	if _, err := queue.Start(context.Background(), claimed.Execution.Fence()); !errors.Is(err, executionlease.ErrStaleLease) {
 		t.Fatalf("Start(cancelled fence) error = %v, want ErrStaleLease", err)
+	}
+}
+
+func TestMemoryActionQueueRunningCancelPersistsIntentAndHeartbeatTerminatesWithoutClearingFence(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	clock := now
+	envelope, _ := signedEnvelope(t, restartEnvelope(now))
+	queue := mustMemoryActionQueue(t, func() time.Time { return clock })
+	submitAction(t, queue, envelope, "environment-1", true)
+	claimed := claimAction(t, queue, "runner-cancel-intent", []string{"workspace-1"}, []string{"PROD"})
+	fence := claimed.Execution.Fence()
+	if _, err := queue.Start(context.Background(), fence); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	originalExpiry := claimed.Execution.LeaseExpiresAt
+
+	cancelled, err := queue.Cancel(context.Background(), claimed.Execution.ExecutionID)
+	if err != nil || cancelled.Status != executionlease.StatusRunning || cancelled.CancelRequestedAt.IsZero() {
+		t.Fatalf("Cancel(RUNNING) = %#v, %v; want running cancel intent", cancelled, err)
+	}
+	clock = clock.Add(10 * time.Second)
+	heartbeat, err := queue.Heartbeat(context.Background(), ActionHeartbeatRequest{
+		Lease: fence, Sequence: 1, Extension: 2 * time.Minute,
+	})
+	if err != nil || heartbeat.Directive != HeartbeatTerminate {
+		t.Fatalf("Heartbeat(after cancel) = %#v, %v", heartbeat, err)
+	}
+	if !heartbeat.Execution.LeaseExpiresAt.Equal(originalExpiry) {
+		t.Fatalf("terminate heartbeat extended lease from %s to %s", originalExpiry, heartbeat.Execution.LeaseExpiresAt)
 	}
 }
 
@@ -431,10 +733,7 @@ func TestMemoryActionQueueSubmitAndProductionClaimAreAtomicUnderConcurrency(t *t
 			go func() {
 				<-start
 				_, err := queue.Claim(context.Background(), ActionClaimRequest{
-					Scope: RunnerScope{
-						RunnerID: runnerID, Pool: executionlease.PoolWrite,
-						AllowedWorkspaceIDs: []string{"workspace-1"}, AllowedEnvironmentIDs: []string{"PROD"},
-					},
+					Scope:         testRunnerScope(t, runnerID, RunnerScopeBinding{WorkspaceID: "workspace-1", EnvironmentID: "PROD"}),
 					LeaseDuration: time.Minute,
 				})
 				results <- err
@@ -477,17 +776,33 @@ func submitAction(t *testing.T, queue *MemoryActionQueue, envelope action.Envelo
 
 func claimAction(t *testing.T, queue *MemoryActionQueue, runnerID string, workspaces, environments []string) ClaimedAction {
 	t.Helper()
+	if len(workspaces) != len(environments) {
+		t.Fatal("claimAction requires exact workspace/environment pairs")
+	}
+	bindings := make([]RunnerScopeBinding, len(workspaces))
+	for index := range workspaces {
+		bindings[index] = RunnerScopeBinding{WorkspaceID: workspaces[index], EnvironmentID: environments[index]}
+	}
 	claimed, err := queue.Claim(context.Background(), ActionClaimRequest{
-		Scope: RunnerScope{
-			RunnerID: runnerID, Pool: executionlease.PoolWrite,
-			AllowedWorkspaceIDs: workspaces, AllowedEnvironmentIDs: environments,
-		},
+		Scope:         testRunnerScope(t, runnerID, bindings...),
 		LeaseDuration: time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("Claim() error = %v", err)
 	}
 	return claimed
+}
+
+func testRunnerScope(t *testing.T, runnerID string, bindings ...RunnerScopeBinding) RunnerScope {
+	t.Helper()
+	scope, err := (RunnerRegistration{
+		RunnerID: runnerID, Pool: executionlease.PoolWrite, Enabled: true,
+		ScopeRevision: 1, MaxConcurrency: 1, ScopeBindings: bindings,
+	}).Scope()
+	if err != nil {
+		t.Fatalf("RunnerRegistration.Scope() error = %v", err)
+	}
+	return scope
 }
 
 func mustMemoryActionQueue(t *testing.T, clock func() time.Time) *MemoryActionQueue {

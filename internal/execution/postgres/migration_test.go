@@ -95,6 +95,79 @@ func TestActionQueueDownMigrationRemovesAllArtifacts(t *testing.T) {
 	}
 }
 
+func TestRunnerExecutionHardeningMigrationExpandsQueueAndRegistrySafely(t *testing.T) {
+	up := normalizedMigration(t, "000007_runner_execution_hardening.up.sql")
+	for _, required := range []string{
+		"COORDINATED CUTOVER PREREQUISITE",
+		"ADD COLUMN idempotency_key text",
+		"ADD COLUMN request_hash text",
+		"ADD COLUMN scope_revision bigint",
+		"ADD COLUMN authorization_expires_at timestamptz",
+		"ADD COLUMN heartbeat_seq bigint NOT NULL DEFAULT 0",
+		"ADD COLUMN cancel_requested_at timestamptz",
+		"ADD COLUMN completion_status text",
+		"CREATE UNIQUE INDEX action_queue_workspace_idempotency_uk",
+		"ALTER COLUMN authorization_expires_at SET NOT NULL",
+		"status IN ('LEASED', 'RUNNING', 'FINALIZING', 'UNCERTAIN')",
+		"CREATE TABLE runner_registrations",
+		"CREATE TABLE runner_scope_bindings",
+		"FOREIGN KEY (tenant_id, workspace_id, environment_id) REFERENCES environments (tenant_id, workspace_id, id)",
+		"CREATE TRIGGER runner_scope_bindings_immutable",
+		"CREATE TRIGGER runner_scope_bindings_revision",
+		"CREATE TRIGGER runner_scope_bindings_no_truncate",
+		"CREATE TABLE runner_certificates",
+		"CONSTRAINT runner_certificates_revocation_shape_ck",
+		"CREATE TABLE runner_result_receipts",
+		"CONSTRAINT runner_result_receipts_action_fence_fk",
+		"workspace_id, action_id, runner_id, lease_epoch, scope_revision, result_hash, completion_status",
+		"CREATE TRIGGER runner_result_receipts_no_truncate",
+		"pg_column_size(summary) BETWEEN 2 AND 16384",
+		"ADD COLUMN lease_token_sha256 text",
+		"ADD COLUMN completed_lease_token_sha256 text",
+		"SET lease_token = NULL, completed_lease_token = NULL",
+		"CHECK (lease_token IS NULL AND completed_lease_token IS NULL)",
+		"'FINALIZING', 'UNCERTAIN'",
+		"unsafe runner hardening upgrade: active action queue must be drained",
+	} {
+		if !strings.Contains(up, required) {
+			t.Errorf("000007 up migration missing %q", required)
+		}
+	}
+	if !strings.Contains(up, "encode(sha256(convert_to(lease_token, 'UTF8')), 'hex')") ||
+		!strings.Contains(up, "encode(sha256(convert_to(completed_lease_token, 'UTF8')), 'hex')") {
+		t.Error("000007 must backfill both legacy bearer-token columns with SHA-256")
+	}
+	if strings.Contains(up, "candidate.workspace_id::uuid") || strings.Contains(up, "candidate.environment_id::uuid") {
+		t.Error("claim-side text identifiers must not be cast to UUID because legacy dirty data must fail closed per row")
+	}
+	if strings.Contains(up, "DROP COLUMN lease_token") || strings.Contains(up, "DROP COLUMN completed_lease_token") {
+		t.Error("coordinated migration must retain legacy token columns as an empty compatibility shell")
+	}
+}
+
+func TestRunnerExecutionHardeningDownMigrationRefusesUnsafeRollback(t *testing.T) {
+	down := normalizedMigration(t, "000007_runner_execution_hardening.down.sql")
+	for _, required := range []string{
+		"LOCK TABLE action_queue, execution_leases, executions, runner_result_receipts, runner_certificates, runner_scope_bindings, runner_registrations IN ACCESS EXCLUSIVE MODE",
+		"ERRCODE = '55000'",
+		"status IN ('LEASED', 'RUNNING', 'FINALIZING', 'UNCERTAIN')",
+		"WHERE status = 'QUEUED'",
+		"runner_result_receipts",
+		"runner_scope_bindings",
+		"runner_registrations",
+		"completed_lease_token_sha256 IS NOT NULL",
+		"DROP TABLE runner_certificates",
+		"DROP FUNCTION bump_runner_scope_revision()",
+		"DROP FUNCTION reject_runner_scope_binding_update()",
+		"DROP TABLE runner_scope_bindings",
+		"DROP TABLE runner_registrations",
+	} {
+		if !strings.Contains(down, required) {
+			t.Errorf("000007 down migration missing %q", required)
+		}
+	}
+}
+
 func normalizedMigration(t *testing.T, name string) string {
 	t.Helper()
 	_, filename, _, ok := runtime.Caller(0)
