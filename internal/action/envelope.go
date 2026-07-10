@@ -9,9 +9,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
@@ -35,12 +37,13 @@ const (
 )
 
 var (
-	ErrPlanHashMismatch  = errors.New("action envelope plan hash mismatch")
-	ErrInvalidSignature  = errors.New("action envelope signature is invalid")
-	ErrEnvelopeExpired   = errors.New("action envelope is expired")
-	ErrEnvelopeNotActive = errors.New("action envelope is not active")
-	ErrUnknownSigningKey = errors.New("unknown action envelope signing key")
-	ErrSigningKeyRevoked = errors.New("action envelope signing key is revoked")
+	ErrPlanHashMismatch   = errors.New("action envelope plan hash mismatch")
+	ErrInvalidSignature   = errors.New("action envelope signature is invalid")
+	ErrEnvelopeExpired    = errors.New("action envelope is expired")
+	ErrEnvelopeNotActive  = errors.New("action envelope is not active")
+	ErrUnknownSigningKey  = errors.New("unknown action envelope signing key")
+	ErrSigningKeyRevoked  = errors.New("action envelope signing key is revoked")
+	ErrSigningKeyInactive = errors.New("action envelope signing key is outside its activation window")
 )
 
 var (
@@ -50,7 +53,10 @@ var (
 	hex32Pattern       = regexp.MustCompile(`^[a-f0-9]{32}$`)
 	hex64Pattern       = regexp.MustCompile(`^[a-f0-9]{64}$`)
 	gitOIDPattern      = regexp.MustCompile(`^(?:[a-f0-9]{40}|[a-f0-9]{64})$`)
+	repoPathPattern    = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
 )
+
+const maxJCSSafeInteger int64 = 1<<53 - 1
 
 // Envelope is the sole write-side execution input. It deliberately contains
 // typed unions rather than arbitrary command, environment, or parameter maps.
@@ -59,6 +65,7 @@ type Envelope struct {
 	ActionID        string           `json:"action_id"`
 	WorkspaceID     string           `json:"workspace_id"`
 	IncidentID      string           `json:"incident_id"`
+	RequestedBy     string           `json:"requested_by"`
 	ActionType      ActionType       `json:"action_type"`
 	Target          TargetRef        `json:"target_ref"`
 	Parameters      ActionParameters `json:"parameters"`
@@ -157,6 +164,7 @@ type KubernetesDeploymentObservedState struct {
 type GitOpsObservedState struct {
 	LiveRevision    string `json:"live_revision"`
 	DesiredRevision string `json:"desired_revision"`
+	HeadTreeSHA256  string `json:"head_tree_sha256"`
 	SyncStatus      string `json:"sync_status"`
 	HealthStatus    string `json:"health_status"`
 }
@@ -208,7 +216,8 @@ func (envelope Envelope) Validate() error {
 	}
 	for name, value := range map[string]string{
 		"action id": envelope.ActionID, "workspace id": envelope.WorkspaceID,
-		"incident id": envelope.IncidentID, "policy version": envelope.PolicyVersion,
+		"incident id": envelope.IncidentID, "requester id": envelope.RequestedBy,
+		"policy version":  envelope.PolicyVersion,
 		"idempotency key": envelope.IdempotencyKey,
 	} {
 		if !validToken(value) {
@@ -328,6 +337,9 @@ func (envelope Envelope) validateKubernetesRestart() error {
 	if envelope.Preconditions.ExpectedGitHeadCommit != "" || envelope.Verification.Mode != "KUBERNETES_ROLLOUT" {
 		return fmt.Errorf("invalid Kubernetes restart precondition or verification mode")
 	}
+	if err := envelope.validateCredentialBinding("PATCH_DEPLOYMENT_RESTART", kubernetesCredentialResource(*envelope.Target.KubernetesDeployment)); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -348,12 +360,15 @@ func (envelope Envelope) validateKubernetesScale() error {
 	if envelope.Preconditions.ExpectedResourceVersion != envelope.Target.KubernetesDeployment.ResourceVersion || envelope.Verification.Mode != "KUBERNETES_ROLLOUT" {
 		return fmt.Errorf("invalid Kubernetes scale precondition or verification mode")
 	}
+	if err := envelope.validateCredentialBinding("PATCH_DEPLOYMENT_SCALE", kubernetesCredentialResource(*envelope.Target.KubernetesDeployment)); err != nil {
+		return err
+	}
 	return nil
 }
 
 func (envelope Envelope) validateGitOpsRevert() error {
 	target := envelope.Target.GitOpsApplication
-	if !validToken(target.RepositoryID) || !validToken(target.Application) || strings.TrimSpace(target.Path) == "" || len(target.Path) > 512 || strings.HasPrefix(target.Path, "/") || strings.Contains(target.Path, "..") {
+	if !validToken(target.RepositoryID) || !validToken(target.Application) || !validRepositoryPath(target.Path) {
 		return fmt.Errorf("invalid GitOps target")
 	}
 	parameters := envelope.Parameters.GitOpsRevert
@@ -364,7 +379,7 @@ func (envelope Envelope) validateGitOpsRevert() error {
 		return fmt.Errorf("GitOps revert requires immutable base, head, revert, diff, and tree bindings")
 	}
 	state := envelope.ObservedState.GitOpsApplication
-	if !gitOIDPattern.MatchString(state.LiveRevision) || !gitOIDPattern.MatchString(state.DesiredRevision) || !oneOf(state.SyncStatus, "SYNCED", "OUT_OF_SYNC") || !oneOf(state.HealthStatus, "HEALTHY", "DEGRADED", "PROGRESSING", "MISSING", "UNKNOWN") {
+	if !gitOIDPattern.MatchString(state.LiveRevision) || !gitOIDPattern.MatchString(state.DesiredRevision) || !hex64Pattern.MatchString(state.HeadTreeSHA256) || !oneOf(state.SyncStatus, "SYNCED", "OUT_OF_SYNC") || !oneOf(state.HealthStatus, "HEALTHY", "DEGRADED", "PROGRESSING", "MISSING", "UNKNOWN") {
 		return fmt.Errorf("invalid GitOps observed state")
 	}
 	if parameters.HeadCommit != state.DesiredRevision || parameters.HeadCommit != envelope.Preconditions.ExpectedGitHeadCommit || envelope.Preconditions.ExpectedResourceVersion != "" {
@@ -373,16 +388,19 @@ func (envelope Envelope) validateGitOpsRevert() error {
 	if envelope.Verification.Mode != "ARGO_CD_HEALTH" {
 		return fmt.Errorf("GitOps revert requires Argo CD health verification")
 	}
+	if err := envelope.validateCredentialBinding("CREATE_REVERT_MR", target.RepositoryID); err != nil {
+		return err
+	}
 	return nil
 }
 
 func (envelope Envelope) validateAWXRestart() error {
 	target := envelope.Target.AWXHosts
-	if target.InventoryID <= 0 || len(target.HostIDs) == 0 || len(target.HostIDs) > 500 || !strictlyIncreasingPositive(target.HostIDs) || !hex64Pattern.MatchString(target.InventorySnapshotSHA256) {
+	if !safePositiveInteger(target.InventoryID) || len(target.HostIDs) == 0 || len(target.HostIDs) > 500 || !strictlyIncreasingPositive(target.HostIDs) || !hex64Pattern.MatchString(target.InventorySnapshotSHA256) {
 		return fmt.Errorf("AWX target requires sorted unique positive host ids")
 	}
 	parameters := envelope.Parameters.AWXServiceRestart
-	if parameters.JobTemplateID <= 0 || !serviceNamePattern.MatchString(parameters.ServiceName) || !oneOf(parameters.OSFamily, "LINUX_SYSTEMD", "WINDOWS_SERVICE") || parameters.Serial != 1 {
+	if !safePositiveInteger(parameters.JobTemplateID) || !serviceNamePattern.MatchString(parameters.ServiceName) || !oneOf(parameters.OSFamily, "LINUX_SYSTEMD", "WINDOWS_SERVICE") || parameters.Serial != 1 {
 		return fmt.Errorf("AWX restart requires a fixed template, typed service, supported OS family, and serial execution")
 	}
 	state := envelope.ObservedState.AWXService
@@ -391,6 +409,10 @@ func (envelope Envelope) validateAWXRestart() error {
 	}
 	if envelope.Preconditions.ExpectedResourceVersion != "" || envelope.Preconditions.ExpectedGitHeadCommit != "" || envelope.Verification.Mode != "AWX_SERVICE_HEALTH" {
 		return fmt.Errorf("invalid AWX restart precondition or verification mode")
+	}
+	resource := fmt.Sprintf("inventory/%d/job-template/%d", target.InventoryID, parameters.JobTemplateID)
+	if err := envelope.validateCredentialBinding("LAUNCH_SERVICE_RESTART_TEMPLATE", resource); err != nil {
+		return err
 	}
 	return nil
 }
@@ -406,7 +428,10 @@ func (target KubernetesDeploymentTarget) validate() error {
 }
 
 func (state KubernetesDeploymentObservedState) validate() error {
-	if state.Generation <= 0 || state.Replicas < 0 || state.AvailableReplicas < 0 || state.UpdatedReplicas < 0 || state.AvailableReplicas > state.Replicas || state.UpdatedReplicas > state.Replicas {
+	if !safePositiveInteger(state.Generation) {
+		return fmt.Errorf("Kubernetes generation must be a positive RFC 8785 safe integer")
+	}
+	if state.Replicas < 0 || state.AvailableReplicas < 0 || state.UpdatedReplicas < 0 || state.AvailableReplicas > state.Replicas || state.UpdatedReplicas > state.Replicas {
 		return fmt.Errorf("invalid Kubernetes deployment observed state")
 	}
 	return nil
@@ -502,11 +527,38 @@ func countNonNil(values ...bool) int {
 
 func strictlyIncreasingPositive(values []int64) bool {
 	for index, value := range values {
-		if value <= 0 || (index > 0 && value <= values[index-1]) {
+		if !safePositiveInteger(value) || (index > 0 && value <= values[index-1]) {
 			return false
 		}
 	}
 	return true
+}
+
+func safePositiveInteger(value int64) bool {
+	return value > 0 && value <= maxJCSSafeInteger
+}
+
+func validRepositoryPath(value string) bool {
+	if value == "" || len(value) > 512 || !repoPathPattern.MatchString(value) || strings.HasPrefix(value, "/") || path.Clean(value) != value || value == "." {
+		return false
+	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+func kubernetesCredentialResource(target KubernetesDeploymentTarget) string {
+	return target.ClusterID + "/" + target.Namespace + "/deployment/" + target.Name
+}
+
+func (envelope Envelope) validateCredentialBinding(permission, resource string) error {
+	if envelope.CredentialScope.Permission != permission || envelope.CredentialScope.Resource != resource {
+		return fmt.Errorf("credential scope does not match action and exact target")
+	}
+	return nil
 }
 
 type Signer interface {
@@ -538,23 +590,89 @@ func (signer *Ed25519Signer) Sign(ctx context.Context, message []byte) ([]byte, 
 type KeyRecord struct {
 	PublicKey ed25519.PublicKey
 	Revoked   bool
+	ActiveAt  time.Time
+	RetireAt  time.Time
 }
 
 type KeyResolver interface {
 	Resolve(context.Context, string) (KeyRecord, error)
 }
 
-type StaticKeySet map[string]KeyRecord
+type StaticKeySet struct {
+	records map[string]KeyRecord
+}
 
-func (keys StaticKeySet) Resolve(ctx context.Context, keyID string) (KeyRecord, error) {
+func NewStaticKeySet(records map[string]KeyRecord) (*StaticKeySet, error) {
+	cloned, err := cloneKeyRecords(records)
+	if err != nil {
+		return nil, err
+	}
+	return &StaticKeySet{records: cloned}, nil
+}
+
+func (keys *StaticKeySet) Resolve(ctx context.Context, keyID string) (KeyRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return KeyRecord{}, err
 	}
-	record, exists := keys[keyID]
+	if keys == nil {
+		return KeyRecord{}, ErrUnknownSigningKey
+	}
+	record, exists := keys.records[keyID]
 	if !exists {
 		return KeyRecord{}, ErrUnknownSigningKey
 	}
+	record.PublicKey = slices.Clone(record.PublicKey)
 	return record, nil
+}
+
+type RotatingKeySet struct {
+	mu      sync.RWMutex
+	records map[string]KeyRecord
+}
+
+func NewRotatingKeySet(records map[string]KeyRecord) (*RotatingKeySet, error) {
+	cloned, err := cloneKeyRecords(records)
+	if err != nil {
+		return nil, err
+	}
+	return &RotatingKeySet{records: cloned}, nil
+}
+
+func (keys *RotatingKeySet) Replace(records map[string]KeyRecord) error {
+	cloned, err := cloneKeyRecords(records)
+	if err != nil {
+		return err
+	}
+	keys.mu.Lock()
+	keys.records = cloned
+	keys.mu.Unlock()
+	return nil
+}
+
+func (keys *RotatingKeySet) Resolve(ctx context.Context, keyID string) (KeyRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return KeyRecord{}, err
+	}
+	keys.mu.RLock()
+	record, exists := keys.records[keyID]
+	keys.mu.RUnlock()
+	if !exists {
+		return KeyRecord{}, ErrUnknownSigningKey
+	}
+	record.PublicKey = slices.Clone(record.PublicKey)
+	return record, nil
+}
+
+func cloneKeyRecords(records map[string]KeyRecord) (map[string]KeyRecord, error) {
+	cloned := make(map[string]KeyRecord, len(records))
+	for keyID, record := range records {
+		if !validToken(keyID) || len(record.PublicKey) != ed25519.PublicKeySize || (!record.RetireAt.IsZero() && !record.ActiveAt.IsZero() && !record.ActiveAt.Before(record.RetireAt)) {
+			return nil, fmt.Errorf("invalid signing key record")
+		}
+		record.PublicKey = slices.Clone(record.PublicKey)
+		cloned[keyID] = record
+	}
+	return cloned, nil
 }
 
 func Seal(ctx context.Context, envelope Envelope, signer Signer) (Envelope, error) {
@@ -571,6 +689,7 @@ func Seal(ctx context.Context, envelope Envelope, signer Signer) (Envelope, erro
 		return Envelope{}, err
 	}
 	envelope.PlanHash = planHash
+	envelope.Signature = Signature{Algorithm: SignatureEd25519, KeyID: signer.KeyID()}
 	message, err := canonicalSigningMessage(envelope)
 	if err != nil {
 		return Envelope{}, err
@@ -582,11 +701,7 @@ func Seal(ctx context.Context, envelope Envelope, signer Signer) (Envelope, erro
 	if len(signature) != ed25519.SignatureSize {
 		return Envelope{}, fmt.Errorf("signer returned invalid Ed25519 signature length")
 	}
-	envelope.Signature = Signature{
-		Algorithm: SignatureEd25519,
-		KeyID:     signer.KeyID(),
-		Value:     base64.RawURLEncoding.EncodeToString(signature),
-	}
+	envelope.Signature.Value = base64.RawURLEncoding.EncodeToString(signature)
 	return envelope, nil
 }
 
@@ -623,6 +738,9 @@ func Verify(ctx context.Context, envelope Envelope, resolver KeyResolver, now ti
 	if record.Revoked {
 		return ErrSigningKeyRevoked
 	}
+	if (!record.ActiveAt.IsZero() && now.Before(record.ActiveAt)) || (!record.RetireAt.IsZero() && !now.Before(record.RetireAt)) {
+		return ErrSigningKeyInactive
+	}
 	if len(record.PublicKey) != ed25519.PublicKeySize {
 		return ErrUnknownSigningKey
 	}
@@ -649,7 +767,7 @@ func calculatePlanHash(envelope Envelope) (string, error) {
 }
 
 func canonicalSigningMessage(envelope Envelope) ([]byte, error) {
-	envelope.Signature = Signature{}
+	envelope.Signature.Value = ""
 	canonical, err := canonicalJSON(envelope)
 	if err != nil {
 		return nil, fmt.Errorf("canonicalize action envelope: %w", err)

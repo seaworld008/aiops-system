@@ -21,8 +21,11 @@ func TestSealAndVerifyDetectsPlanTampering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new signer: %v", err)
 	}
-	keys := StaticKeySet{
+	keys, err := NewStaticKeySet(map[string]KeyRecord{
 		"control-plane-2026-07": {PublicKey: publicKey},
+	})
+	if err != nil {
+		t.Fatalf("new key set: %v", err)
 	}
 	now := time.Date(2026, 7, 10, 8, 0, 0, 0, time.UTC)
 
@@ -52,6 +55,9 @@ func TestSealAndVerifyDetectsPlanTampering(t *testing.T) {
 		},
 		"policy version": func(envelope *Envelope) {
 			envelope.PolicyVersion = "policy.v2"
+		},
+		"requester": func(envelope *Envelope) {
+			envelope.RequestedBy = "another-requester"
 		},
 	}
 	for name, mutate := range tests {
@@ -112,14 +118,35 @@ func TestVerifyRejectsExpiredUnknownAndRevokedKeys(t *testing.T) {
 		t.Fatalf("seal: %v", err)
 	}
 
-	if err := Verify(context.Background(), sealed, StaticKeySet{"key-1": {PublicKey: publicKey}}, sealed.ExpiresAt); !errors.Is(err, ErrEnvelopeExpired) {
+	activeKeys, err := NewStaticKeySet(map[string]KeyRecord{"key-1": {PublicKey: publicKey}})
+	if err != nil {
+		t.Fatalf("new active key set: %v", err)
+	}
+	unknownKeys, err := NewStaticKeySet(map[string]KeyRecord{})
+	if err != nil {
+		t.Fatalf("new empty key set: %v", err)
+	}
+	revokedKeys, err := NewStaticKeySet(map[string]KeyRecord{"key-1": {PublicKey: publicKey, Revoked: true}})
+	if err != nil {
+		t.Fatalf("new revoked key set: %v", err)
+	}
+	aliasKeys, err := NewStaticKeySet(map[string]KeyRecord{"unrevoked-alias": {PublicKey: publicKey}})
+	if err != nil {
+		t.Fatalf("new alias key set: %v", err)
+	}
+	if err := Verify(context.Background(), sealed, activeKeys, sealed.ExpiresAt); !errors.Is(err, ErrEnvelopeExpired) {
 		t.Fatalf("expired verify error = %v, want ErrEnvelopeExpired", err)
 	}
-	if err := Verify(context.Background(), sealed, StaticKeySet{}, now); !errors.Is(err, ErrUnknownSigningKey) {
+	if err := Verify(context.Background(), sealed, unknownKeys, now); !errors.Is(err, ErrUnknownSigningKey) {
 		t.Fatalf("unknown key error = %v, want ErrUnknownSigningKey", err)
 	}
-	if err := Verify(context.Background(), sealed, StaticKeySet{"key-1": {PublicKey: publicKey, Revoked: true}}, now); !errors.Is(err, ErrSigningKeyRevoked) {
+	if err := Verify(context.Background(), sealed, revokedKeys, now); !errors.Is(err, ErrSigningKeyRevoked) {
 		t.Fatalf("revoked key error = %v, want ErrSigningKeyRevoked", err)
+	}
+	aliased := sealed
+	aliased.Signature.KeyID = "unrevoked-alias"
+	if err := Verify(context.Background(), aliased, aliasKeys, now); !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("key alias error = %v, want ErrInvalidSignature", err)
 	}
 }
 
@@ -156,6 +183,14 @@ func TestValidateRejectsUnsafeOrMismatchedActions(t *testing.T) {
 			mutate: func(envelope *Envelope) { envelope.CredentialScope.TTLSeconds = 901 },
 			want:   "credential ttl",
 		},
+		"credential permission mismatch": {
+			mutate: func(envelope *Envelope) { envelope.CredentialScope.Permission = "CREATE_REVERT_MR" },
+			want:   "credential scope",
+		},
+		"JCS unsafe integer": {
+			mutate: func(envelope *Envelope) { envelope.ObservedState.KubernetesDeployment.Generation = 1<<53 + 1 },
+			want:   "safe integer",
+		},
 	}
 
 	for name, test := range tests {
@@ -184,7 +219,7 @@ func TestGitOpsRevertBindsImmutableRevisions(t *testing.T) {
 		RevertCommit: strings.Repeat("c", 40), DiffSHA256: strings.Repeat("d", 64), TreeSHA256: strings.Repeat("e", 64),
 	}}
 	envelope.ObservedState = ObservedState{GitOpsApplication: &GitOpsObservedState{
-		LiveRevision: strings.Repeat("b", 40), DesiredRevision: strings.Repeat("b", 40), SyncStatus: "SYNCED", HealthStatus: "HEALTHY",
+		LiveRevision: strings.Repeat("b", 40), DesiredRevision: strings.Repeat("b", 40), HeadTreeSHA256: strings.Repeat("f", 64), SyncStatus: "SYNCED", HealthStatus: "HEALTHY",
 	}}
 	envelope.Preconditions.ExpectedResourceVersion = ""
 	envelope.Preconditions.ExpectedGitHeadCommit = strings.Repeat("b", 40)
@@ -214,6 +249,69 @@ func TestGitOpsRevertBindsImmutableRevisions(t *testing.T) {
 			t.Fatalf("missing %s revision binding was accepted", field)
 		}
 	}
+	for _, unsafePath := range []string{"/apps/payments", "apps//payments", "apps/../payments", "apps/payments;touch-pwned", `apps\payments`, "apps/\npayments"} {
+		candidate := envelope
+		target := *candidate.Target.GitOpsApplication
+		candidate.Target.GitOpsApplication = &target
+		target.Path = unsafePath
+		if err := candidate.Validate(); err == nil {
+			t.Fatalf("unsafe GitOps path %q was accepted", unsafePath)
+		}
+	}
+}
+
+func TestSigningKeyActivationWindowAndConcurrentRotation(t *testing.T) {
+	t.Parallel()
+
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	signer, err := NewEd25519Signer("rotating-key", privateKey)
+	if err != nil {
+		t.Fatalf("new signer: %v", err)
+	}
+	now := time.Date(2026, 7, 10, 8, 0, 0, 0, time.UTC)
+	sealed, err := Seal(context.Background(), validRestartEnvelope(now), signer)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	inactive, err := NewStaticKeySet(map[string]KeyRecord{"rotating-key": {PublicKey: publicKey, ActiveAt: now.Add(time.Second)}})
+	if err != nil {
+		t.Fatalf("new inactive key set: %v", err)
+	}
+	if err := Verify(context.Background(), sealed, inactive, now); !errors.Is(err, ErrSigningKeyInactive) {
+		t.Fatalf("inactive key error = %v", err)
+	}
+
+	rotating, err := NewRotatingKeySet(map[string]KeyRecord{"rotating-key": {PublicKey: publicKey}})
+	if err != nil {
+		t.Fatalf("new rotating key set: %v", err)
+	}
+	done := make(chan error, 2)
+	go func() {
+		for range 100 {
+			if err := rotating.Replace(map[string]KeyRecord{"rotating-key": {PublicKey: publicKey}}); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	go func() {
+		for range 100 {
+			if err := Verify(context.Background(), sealed, rotating, now); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatalf("concurrent key rotation: %v", err)
+		}
+	}
 }
 
 func TestKubernetesScaleRequiresNoHPAAndBoundedSafetyChecks(t *testing.T) {
@@ -225,6 +323,7 @@ func TestKubernetesScaleRequiresNoHPAAndBoundedSafetyChecks(t *testing.T) {
 	envelope.Parameters = ActionParameters{KubernetesScale: &KubernetesScaleParameters{
 		Replicas: 5, Minimum: 2, Maximum: 8, HPAAbsent: true, PDBChecked: true, QuotaChecked: true,
 	}}
+	envelope.CredentialScope.Permission = "PATCH_DEPLOYMENT_SCALE"
 	if err := envelope.Validate(); err != nil {
 		t.Fatalf("valid Kubernetes scale envelope: %v", err)
 	}
@@ -268,7 +367,7 @@ func TestAWXRestartAllowsOnlyTypedLinuxOrWindowsService(t *testing.T) {
 		}}
 		envelope.Preconditions.ExpectedResourceVersion = ""
 		envelope.Verification = VerificationPlan{Mode: "AWX_SERVICE_HEALTH", TimeoutSeconds: 300}
-		envelope.CredentialScope = CredentialScope{ConnectorID: "awx-prod", Permission: "LAUNCH_SERVICE_RESTART_TEMPLATE", Resource: "inventory/42", TTLSeconds: 600}
+		envelope.CredentialScope = CredentialScope{ConnectorID: "awx-prod", Permission: "LAUNCH_SERVICE_RESTART_TEMPLATE", Resource: "inventory/42/job-template/81", TTLSeconds: 600}
 		if err := envelope.Validate(); err != nil {
 			t.Fatalf("valid %s AWX envelope: %v", osFamily, err)
 		}
@@ -298,6 +397,12 @@ func TestAWXRestartAllowsOnlyTypedLinuxOrWindowsService(t *testing.T) {
 	if err := missingSnapshot.Validate(); err == nil {
 		t.Fatal("AWX action without an immutable inventory snapshot was accepted")
 	}
+
+	unsafeInteger := envelope
+	unsafeInteger.Target.AWXHosts.InventoryID = 1<<53 + 1
+	if err := unsafeInteger.Validate(); err == nil {
+		t.Fatal("AWX target with a JCS-unsafe integer was accepted")
+	}
 }
 
 func validRestartEnvelope(now time.Time) Envelope {
@@ -306,6 +411,7 @@ func validRestartEnvelope(now time.Time) Envelope {
 		ActionID:      "action-01",
 		WorkspaceID:   "workspace-01",
 		IncidentID:    "incident-01",
+		RequestedBy:   "requester-01",
 		ActionType:    ActionKubernetesRolloutRestart,
 		Target: TargetRef{ServiceID: "service-payments", EnvironmentID: "PROD", KubernetesDeployment: &KubernetesDeploymentTarget{
 			ClusterID: "cluster-a",

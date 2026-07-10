@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -11,267 +12,416 @@ import (
 	"github.com/aiops-system/control-plane/internal/action"
 )
 
-func TestEvaluateRechecksPolicyApprovalAndTargetAtEveryGate(t *testing.T) {
-	t.Parallel()
+const standardExpression = `environment == "PROD" && service_id.startsWith("service-") && mapping_exact && whitelisted`
 
-	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
-	envelope, keys := sealedRestartEnvelope(t, now)
-	engine := newTestEngine(t, "policy.v1", `environment == "PROD" && service_id.startsWith("service-")`, keys)
-	input := validInput(envelope, now)
+func TestEveryGateRechecksTrustedApprovalAndTargetState(t *testing.T) {
+	fixture := newKubernetesFixture(t, standardExpression)
 
-	decision, err := engine.Evaluate(context.Background(), input)
+	decision, err := fixture.engine.EvaluatePlanSubmission(context.Background(), fixture.envelope)
 	if err != nil {
-		t.Fatalf("evaluate plan submission: %v", err)
+		t.Fatalf("evaluate plan: %v", err)
 	}
 	if decision.Outcome != OutcomeRequireApproval || !contains(decision.ReasonCodes, ReasonApprovalRequired) {
-		t.Fatalf("plan decision = %+v, want approval required", decision)
+		t.Fatalf("plan decision = %+v", decision)
 	}
 
-	input.Approvals = []Approval{validApproval(envelope, "approver-1", []Role{RoleSRE}, "83", now.Add(20*time.Minute))}
-	for _, stage := range []Stage{StagePlanSubmission, StageCredentialIssue, StagePreExecution} {
-		candidate := input
-		candidate.Stage = stage
-		decision, err := engine.Evaluate(context.Background(), candidate)
+	fixture.approvals.records = []Approval{fixture.approval("approver-1", ApprovalApproved, fixture.envelope.ExpiresAt)}
+	for name, evaluate := range map[string]func(context.Context, action.Envelope) (Decision, error){
+		"plan":       fixture.engine.EvaluatePlanSubmission,
+		"credential": fixture.engine.EvaluateCredentialIssue,
+		"execution":  fixture.engine.EvaluatePreExecution,
+	} {
+		decision, err := evaluate(context.Background(), fixture.envelope)
 		if err != nil {
-			t.Fatalf("evaluate %s: %v", stage, err)
+			t.Fatalf("evaluate %s: %v", name, err)
 		}
 		if decision.Outcome != OutcomeAllow {
-			t.Fatalf("%s outcome = %s, reasons = %v", stage, decision.Outcome, decision.ReasonCodes)
+			t.Fatalf("%s decision = %+v", name, decision)
 		}
 	}
 
-	drifted := input
-	drifted.Stage = StagePreExecution
-	drifted.CurrentTargetVersion = "84"
-	decision, err = engine.Evaluate(context.Background(), drifted)
+	fixture.targets.snapshot.TargetVersion = "84"
+	decision, err = fixture.engine.EvaluatePreExecution(context.Background(), fixture.envelope)
 	if err != nil {
-		t.Fatalf("evaluate drifted target: %v", err)
+		t.Fatalf("evaluate drift: %v", err)
 	}
 	if decision.Outcome != OutcomeDeny || !contains(decision.ReasonCodes, ReasonTargetStateDrift) {
 		t.Fatalf("drift decision = %+v", decision)
 	}
 
-	expired := input
-	expired.Stage = StageCredentialIssue
-	expired.Now = now.Add(21 * time.Minute)
-	decision, err = engine.Evaluate(context.Background(), expired)
+	fixture.targets.snapshot.TargetVersion = "83"
+	fixture.targets.snapshot.Whitelisted = false
+	decision, err = fixture.engine.EvaluatePreExecution(context.Background(), fixture.envelope)
 	if err != nil {
-		t.Fatalf("evaluate expired approval: %v", err)
+		t.Fatalf("evaluate removed whitelist: %v", err)
 	}
-	if decision.Outcome != OutcomeDeny || !contains(decision.ReasonCodes, ReasonApprovalExpired) {
-		t.Fatalf("expired approval decision = %+v", decision)
-	}
-
-	upgraded := newTestEngine(t, "policy.v2", `true`, keys)
-	decision, err = upgraded.Evaluate(context.Background(), input)
-	if err != nil {
-		t.Fatalf("evaluate upgraded policy: %v", err)
-	}
-	if decision.Outcome != OutcomeDeny || !contains(decision.ReasonCodes, ReasonPolicyVersionMismatch) {
-		t.Fatalf("upgraded policy decision = %+v", decision)
+	if decision.Outcome != OutcomeDeny || !contains(decision.ReasonCodes, ReasonTargetNotWhitelisted) {
+		t.Fatalf("whitelist decision = %+v", decision)
 	}
 }
 
-func TestEvaluateFailsClosedForEveryKillSwitch(t *testing.T) {
-	t.Parallel()
+func TestKillSwitchesAreScopedFreshAndGlobalCheckPrecedesKeyResolution(t *testing.T) {
+	fixture := newKubernetesFixture(t, `true`)
+	fixture.approvals.records = []Approval{fixture.approval("approver-1", ApprovalApproved, fixture.envelope.ExpiresAt)}
 
-	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
-	envelope, keys := sealedRestartEnvelope(t, now)
-	engine := newTestEngine(t, "policy.v1", `true`, keys)
-	base := validInput(envelope, now)
-	base.Approvals = []Approval{validApproval(envelope, "approver-1", []Role{RoleApprover}, "83", now.Add(20*time.Minute))}
-
-	tests := map[string]func(*SwitchState){
-		"global":      func(state *SwitchState) { state.GlobalEnabled = false },
-		"environment": func(state *SwitchState) { state.EnvironmentEnabled = false },
-		"connector":   func(state *SwitchState) { state.ConnectorEnabled = false },
-		"action":      func(state *SwitchState) { state.ActionEnabled = false },
+	fixture.safety.global.Enabled = false
+	decision, err := fixture.engine.EvaluatePreExecution(context.Background(), fixture.envelope)
+	if err != nil {
+		t.Fatalf("evaluate global switch: %v", err)
 	}
-	for name, disable := range tests {
-		name, disable := name, disable
+	if decision.Outcome != OutcomeDeny || !contains(decision.ReasonCodes, ReasonKillSwitchDisabled) || fixture.keys.calls != 0 {
+		t.Fatalf("global switch decision/key calls = %+v/%d", decision, fixture.keys.calls)
+	}
+
+	fixture.safety.global.Enabled = true
+	tests := map[string]func(*ScopedSwitchSnapshot){
+		"environment": func(snapshot *ScopedSwitchSnapshot) { snapshot.EnvironmentEnabled = false },
+		"connector":   func(snapshot *ScopedSwitchSnapshot) { snapshot.ConnectorEnabled = false },
+		"action":      func(snapshot *ScopedSwitchSnapshot) { snapshot.ActionEnabled = false },
+		"wrong scope": func(snapshot *ScopedSwitchSnapshot) { snapshot.EnvironmentID = "STAGING" },
+	}
+	for name, mutate := range tests {
+		name, mutate := name, mutate
 		t.Run(name, func(t *testing.T) {
-			input := base
-			disable(&input.Switches)
-			decision, err := engine.Evaluate(context.Background(), input)
+			original := fixture.safety.scoped
+			mutate(&fixture.safety.scoped)
+			decision, err := fixture.engine.EvaluatePreExecution(context.Background(), fixture.envelope)
+			fixture.safety.scoped = original
 			if err != nil {
 				t.Fatalf("evaluate: %v", err)
 			}
 			if decision.Outcome != OutcomeDeny || !contains(decision.ReasonCodes, ReasonKillSwitchDisabled) {
-				t.Fatalf("decision = %+v, want kill-switch deny", decision)
+				t.Fatalf("decision = %+v", decision)
 			}
+		})
+	}
+
+	fixture.safety.global.ObservedAt = fixture.clock.now.Add(-MaxSafetySnapshotAge - time.Nanosecond)
+	decision, err = fixture.engine.EvaluatePreExecution(context.Background(), fixture.envelope)
+	if err != nil {
+		t.Fatalf("evaluate stale global switch: %v", err)
+	}
+	if decision.Outcome != OutcomeDeny || !contains(decision.ReasonCodes, ReasonSafetyStateStale) {
+		t.Fatalf("stale decision = %+v", decision)
+	}
+}
+
+func TestRejectedApprovalVetoesAndIdentityComesFromTrustedResolver(t *testing.T) {
+	fixture := newKubernetesFixture(t, `true`)
+	approved := fixture.approval("approver-1", ApprovalApproved, fixture.envelope.ExpiresAt)
+	rejected := fixture.approval("owner-1", ApprovalRejected, fixture.envelope.ExpiresAt)
+	fixture.approvals.records = []Approval{approved, rejected}
+
+	decision, err := fixture.engine.EvaluatePlanSubmission(context.Background(), fixture.envelope)
+	if err != nil {
+		t.Fatalf("evaluate rejected approval: %v", err)
+	}
+	if decision.Outcome != OutcomeDeny || !contains(decision.ReasonCodes, ReasonApprovalRejected) {
+		t.Fatalf("rejected approval decision = %+v", decision)
+	}
+
+	fixture.approvals.records = []Approval{fixture.approval("requester-alias", ApprovalApproved, fixture.envelope.ExpiresAt)}
+	fixture.principals.values["requester-alias"] = Principal{CanonicalID: "requester-1", Active: true, Roles: []Role{RoleSRE}}
+	decision, err = fixture.engine.EvaluatePlanSubmission(context.Background(), fixture.envelope)
+	if err != nil {
+		t.Fatalf("evaluate requester alias: %v", err)
+	}
+	if decision.Outcome != OutcomeRequireApproval || !contains(decision.ReasonCodes, ReasonSeparationOfDuties) {
+		t.Fatalf("requester alias decision = %+v", decision)
+	}
+
+	fixture.approvals.records = []Approval{approved}
+	fixture.principals.values["approver-1"] = Principal{CanonicalID: "approver-1", Active: true, Roles: []Role{"UNTRUSTED_ROLE"}}
+	decision, err = fixture.engine.EvaluateCredentialIssue(context.Background(), fixture.envelope)
+	if err != nil {
+		t.Fatalf("evaluate unauthorized role: %v", err)
+	}
+	if decision.Outcome != OutcomeDeny || !contains(decision.ReasonCodes, ReasonApprovalRoleInvalid) {
+		t.Fatalf("role decision = %+v", decision)
+	}
+}
+
+func TestGitOpsRequiresDistinctSREAndOwnerAndFullFactBinding(t *testing.T) {
+	fixture := newGitOpsFixture(t, `true`)
+	fixture.principals.values["dual-role"] = Principal{CanonicalID: "dual-role", Active: true, Roles: []Role{RoleSRE, RoleServiceOwner}}
+	fixture.principals.values["ordinary"] = Principal{CanonicalID: "ordinary", Active: true, Roles: []Role{RoleApprover}}
+	fixture.approvals.records = []Approval{
+		fixture.approval("dual-role", ApprovalApproved, fixture.envelope.ExpiresAt),
+		fixture.approval("ordinary", ApprovalApproved, fixture.envelope.ExpiresAt),
+	}
+
+	decision, err := fixture.engine.EvaluatePlanSubmission(context.Background(), fixture.envelope)
+	if err != nil {
+		t.Fatalf("evaluate dual role: %v", err)
+	}
+	if decision.Outcome != OutcomeRequireApproval {
+		t.Fatalf("one person supplied both mandatory roles: %+v", decision)
+	}
+
+	fixture.principals.values["dual-role"] = Principal{CanonicalID: "dual-role", Active: true, Roles: []Role{RoleSRE}}
+	fixture.principals.values["ordinary"] = Principal{CanonicalID: "ordinary", Active: true, Roles: []Role{RoleServiceOwner}}
+	decision, err = fixture.engine.EvaluatePlanSubmission(context.Background(), fixture.envelope)
+	if err != nil {
+		t.Fatalf("evaluate distinct roles: %v", err)
+	}
+	if decision.Outcome != OutcomeAllow {
+		t.Fatalf("distinct role decision = %+v", decision)
+	}
+
+	for name, mutate := range map[string]func(*GitOpsFacts){
+		"base": func(facts *GitOpsFacts) { facts.BaseCommit = strings.Repeat("9", 40) },
+		"diff": func(facts *GitOpsFacts) { facts.DiffSHA256 = strings.Repeat("9", 64) },
+		"tree": func(facts *GitOpsFacts) { facts.ResultTreeSHA256 = strings.Repeat("9", 64) },
+		"path": func(facts *GitOpsFacts) { facts.Path = "apps/other" },
+	} {
+		name, mutate := name, mutate
+		t.Run(name, func(t *testing.T) {
+			facts := *fixture.targets.snapshot.GitOps
+			mutate(&facts)
+			fixture.targets.snapshot.GitOps = &facts
+			decision, err := fixture.engine.EvaluatePreExecution(context.Background(), fixture.envelope)
+			if err != nil {
+				t.Fatalf("evaluate: %v", err)
+			}
+			if decision.Outcome != OutcomeDeny || !contains(decision.ReasonCodes, ReasonTargetStateDrift) {
+				t.Fatalf("decision = %+v", decision)
+			}
+			fixture.targets.snapshot.GitOps = fixture.gitOpsFacts()
 		})
 	}
 }
 
-func TestGitOpsRevertRequiresTwoDistinctRoleBoundApprovers(t *testing.T) {
-	t.Parallel()
+func TestPolicyVersionIsContentAddressedAndCELCanOnlyNarrow(t *testing.T) {
+	fixture := newKubernetesFixture(t, standardExpression)
+	fixture.approvals.records = []Approval{fixture.approval("approver-1", ApprovalApproved, fixture.envelope.ExpiresAt)}
 
-	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
-	envelope, keys := sealedGitOpsEnvelope(t, now)
-	engine := newTestEngine(t, "policy.v1", `true`, keys)
-	input := validInput(envelope, now)
-	input.CurrentTargetVersion = strings.Repeat("b", 40)
-
-	sre := validApproval(envelope, "sre-1", []Role{RoleSRE}, input.CurrentTargetVersion, now.Add(20*time.Minute))
-	owner := validApproval(envelope, "owner-1", []Role{RoleServiceOwner}, input.CurrentTargetVersion, now.Add(20*time.Minute))
-	input.Approvals = []Approval{sre}
-	decision, err := engine.Evaluate(context.Background(), input)
-	if err != nil {
-		t.Fatalf("evaluate one approver: %v", err)
+	tampered := fixture.definition
+	tampered.Expression = `true`
+	if _, err := NewEngine(tampered, fixture.dependencies()); err == nil {
+		t.Fatal("same policy version accepted different CEL source")
 	}
-	if decision.Outcome != OutcomeRequireApproval {
-		t.Fatalf("one approver outcome = %s, want REQUIRE_APPROVAL", decision.Outcome)
+	if _, err := NewDefinition("policy.prod", `"ALLOW"`); err == nil {
+		t.Fatal("non-boolean policy definition was accepted")
 	}
 
-	input.Approvals = []Approval{sre, owner}
-	decision, err = engine.Evaluate(context.Background(), input)
-	if err != nil {
-		t.Fatalf("evaluate two approvers: %v", err)
-	}
-	if decision.Outcome != OutcomeAllow {
-		t.Fatalf("two approvers decision = %+v", decision)
-	}
-
-	owner.SubjectID = input.RequesterID
-	input.Approvals = []Approval{sre, owner}
-	decision, err = engine.Evaluate(context.Background(), input)
-	if err != nil {
-		t.Fatalf("evaluate requester approval: %v", err)
-	}
-	if decision.Outcome != OutcomeRequireApproval || !contains(decision.ReasonCodes, ReasonSeparationOfDuties) {
-		t.Fatalf("requester approval decision = %+v", decision)
-	}
-
-	bothRoles := validApproval(envelope, "one-person", []Role{RoleSRE, RoleServiceOwner}, input.CurrentTargetVersion, now.Add(20*time.Minute))
-	input.Approvals = []Approval{bothRoles}
-	decision, err = engine.Evaluate(context.Background(), input)
-	if err != nil {
-		t.Fatalf("evaluate one dual-role approver: %v", err)
-	}
-	if decision.Outcome != OutcomeRequireApproval {
-		t.Fatalf("one person satisfied dual approval: %+v", decision)
-	}
-}
-
-func TestCELCanOnlyNarrowHardSafetyGates(t *testing.T) {
-	t.Parallel()
-
-	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
-	envelope, keys := sealedRestartEnvelope(t, now)
-	input := validInput(envelope, now)
-	input.Approvals = []Approval{validApproval(envelope, "approver-1", []Role{RoleSRE}, "83", now.Add(20*time.Minute))}
-
-	denyEngine := newTestEngine(t, "policy.v1", `service_id == "a-service-that-is-not-allowed"`, keys)
-	decision, err := denyEngine.Evaluate(context.Background(), input)
+	denyFixture := newKubernetesFixture(t, `service_id == "not-allowed"`)
+	denyFixture.approvals.records = []Approval{denyFixture.approval("approver-1", ApprovalApproved, denyFixture.envelope.ExpiresAt)}
+	decision, err := denyFixture.engine.EvaluatePreExecution(context.Background(), denyFixture.envelope)
 	if err != nil {
 		t.Fatalf("evaluate CEL deny: %v", err)
 	}
 	if decision.Outcome != OutcomeDeny || !contains(decision.ReasonCodes, ReasonCELPolicyDenied) {
 		t.Fatalf("CEL deny decision = %+v", decision)
 	}
+}
 
-	allowEngine := newTestEngine(t, "policy.v1", `true`, keys)
-	input.Switches.GlobalEnabled = false
-	decision, err = allowEngine.Evaluate(context.Background(), input)
+func TestTrustedClockControlsExpiryAndCredentialExpiryIsCapped(t *testing.T) {
+	fixture := newKubernetesFixture(t, `true`)
+	fixture.approvals.records = []Approval{fixture.approval("approver-1", ApprovalApproved, fixture.envelope.ExpiresAt)}
+	fixture.clock.now = fixture.envelope.ExpiresAt.Add(-time.Minute)
+	fixture.refreshSnapshots()
+
+	decision, err := fixture.engine.EvaluateCredentialIssue(context.Background(), fixture.envelope)
 	if err != nil {
-		t.Fatalf("evaluate hard gate: %v", err)
+		t.Fatalf("evaluate credential: %v", err)
 	}
-	if decision.Outcome != OutcomeDeny || !contains(decision.ReasonCodes, ReasonKillSwitchDisabled) {
-		t.Fatalf("CEL bypassed hard gate: %+v", decision)
+	if decision.Outcome != OutcomeAllow || !decision.CredentialExpiresAt.Equal(fixture.envelope.ExpiresAt) {
+		t.Fatalf("credential decision = %+v", decision)
 	}
-}
 
-func TestCompileRejectsUnsafeOrNonBooleanPolicy(t *testing.T) {
-	t.Parallel()
-
-	_, _, keys := testSigningKey(t)
-	for name, expression := range map[string]string{
-		"non boolean": `"ALLOW"`,
-		"undeclared":  `llm_risk == "LOW"`,
-		"oversized":   strings.Repeat("true || ", 600) + "true",
-	} {
-		name, expression := name, expression
-		t.Run(name, func(t *testing.T) {
-			if _, err := NewEngine(Definition{Version: "policy.v1", Expression: expression}, keys); err == nil {
-				t.Fatal("unsafe policy compiled successfully")
-			}
-		})
+	fixture.clock.now = fixture.envelope.ExpiresAt
+	fixture.refreshSnapshots()
+	decision, err = fixture.engine.EvaluatePreExecution(context.Background(), fixture.envelope)
+	if err != nil {
+		t.Fatalf("evaluate expired envelope: %v", err)
+	}
+	if decision.Outcome != OutcomeDeny || !contains(decision.ReasonCodes, ReasonInvalidEnvelope) {
+		t.Fatalf("expired decision = %+v", decision)
 	}
 }
 
-func validInput(envelope action.Envelope, now time.Time) Input {
-	return Input{
-		Stage: StagePlanSubmission, Envelope: envelope, RequesterID: "requester-1",
-		Environment: "PROD", ServiceID: "service-payments", CurrentTargetVersion: "83",
-		Switches: SwitchState{GlobalEnabled: true, EnvironmentEnabled: true, ConnectorEnabled: true, ActionEnabled: true},
-		Now:      now,
+type testFixture struct {
+	t                *testing.T
+	definition       Definition
+	envelope         action.Envelope
+	engine           *Engine
+	clock            *fixedClock
+	keys             *countingKeyResolver
+	approvals        *fakeApprovalReader
+	principals       *fakePrincipalResolver
+	safety           *fakeSafetyReader
+	targets          *fakeTargetReader
+	underlyingKeySet action.KeyResolver
+}
+
+func newKubernetesFixture(t *testing.T, expression string) *testFixture {
+	t.Helper()
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	definition := mustDefinition(t, expression)
+	envelope, keySet := sealEnvelope(t, kubernetesEnvelope(now, definition.Version))
+	fixture := baseFixture(t, now, definition, envelope, keySet)
+	fixture.targets.snapshot.TargetVersion = "83"
+	fixture.principals.values["approver-1"] = Principal{CanonicalID: "approver-1", Active: true, Roles: []Role{RoleSRE}}
+	fixture.principals.values["owner-1"] = Principal{CanonicalID: "owner-1", Active: true, Roles: []Role{RoleServiceOwner}}
+	fixture.installEngine()
+	return fixture
+}
+
+func newGitOpsFixture(t *testing.T, expression string) *testFixture {
+	t.Helper()
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	definition := mustDefinition(t, expression)
+	envelope, keySet := sealEnvelope(t, gitOpsEnvelope(now, definition.Version))
+	fixture := baseFixture(t, now, definition, envelope, keySet)
+	fixture.targets.snapshot.TargetVersion = ""
+	fixture.targets.snapshot.GitOps = fixture.gitOpsFacts()
+	fixture.installEngine()
+	return fixture
+}
+
+func baseFixture(t *testing.T, now time.Time, definition Definition, envelope action.Envelope, keySet action.KeyResolver) *testFixture {
+	clock := &fixedClock{now: now}
+	return &testFixture{
+		t: t, definition: definition, envelope: envelope, clock: clock, underlyingKeySet: keySet,
+		keys:       &countingKeyResolver{delegate: keySet},
+		approvals:  &fakeApprovalReader{},
+		principals: &fakePrincipalResolver{values: map[string]Principal{"requester-1": {CanonicalID: "requester-1", Active: true}}},
+		safety: &fakeSafetyReader{
+			global: GlobalSwitchSnapshot{Enabled: true, Revision: "global-1", ObservedAt: now},
+			scoped: ScopedSwitchSnapshot{
+				WorkspaceID: envelope.WorkspaceID, EnvironmentID: envelope.Target.EnvironmentID,
+				ConnectorID: envelope.CredentialScope.ConnectorID, ActionType: envelope.ActionType,
+				EnvironmentEnabled: true, ConnectorEnabled: true, ActionEnabled: true,
+				Revision: "scoped-1", ObservedAt: now,
+			},
+		},
+		targets: &fakeTargetReader{snapshot: TargetSnapshot{
+			WorkspaceID: envelope.WorkspaceID, ServiceID: envelope.Target.ServiceID,
+			EnvironmentID: envelope.Target.EnvironmentID, ConnectorID: envelope.CredentialScope.ConnectorID,
+			ActionType: envelope.ActionType, MappingResult: "EXACT", Whitelisted: true,
+			Revision: "target-1", ObservedAt: now,
+		}},
 	}
 }
 
-func validApproval(envelope action.Envelope, subject string, roles []Role, targetVersion string, expiresAt time.Time) Approval {
+func (fixture *testFixture) installEngine() {
+	fixture.t.Helper()
+	engine, err := NewEngine(fixture.definition, fixture.dependencies())
+	if err != nil {
+		fixture.t.Fatalf("NewEngine() error = %v", err)
+	}
+	fixture.engine = engine
+}
+
+func (fixture *testFixture) dependencies() Dependencies {
+	return Dependencies{
+		Keys: fixture.keys, Approvals: fixture.approvals, Principals: fixture.principals,
+		Safety: fixture.safety, Targets: fixture.targets, Clock: fixture.clock,
+	}
+}
+
+func (fixture *testFixture) approval(subject string, decision ApprovalDecision, expiresAt time.Time) Approval {
+	fixture.t.Helper()
+	digest, err := TargetDigest(fixture.envelope)
+	if err != nil {
+		fixture.t.Fatalf("TargetDigest() error = %v", err)
+	}
 	return Approval{
-		SubjectID: subject, Roles: roles, Decision: ApprovalApproved,
-		ActionID: envelope.ActionID, PlanHash: envelope.PlanHash, PolicyVersion: envelope.PolicyVersion,
-		TargetVersion: targetVersion, ExpiresAt: expiresAt,
+		SubjectID: subject, Decision: decision, WorkspaceID: fixture.envelope.WorkspaceID, ActionID: fixture.envelope.ActionID,
+		PlanHash: fixture.envelope.PlanHash, PolicyVersion: fixture.envelope.PolicyVersion,
+		TargetDigest: digest, DecidedAt: fixture.clock.now, ExpiresAt: expiresAt,
 	}
 }
 
-func sealedRestartEnvelope(t *testing.T, now time.Time) (action.Envelope, action.StaticKeySet) {
+func (fixture *testFixture) gitOpsFacts() *GitOpsFacts {
+	parameters := fixture.envelope.Parameters.GitOpsRevert
+	target := fixture.envelope.Target.GitOpsApplication
+	return &GitOpsFacts{
+		RepositoryID: target.RepositoryID, Application: target.Application, Path: target.Path,
+		BaseCommit: parameters.BaseCommit, HeadCommit: parameters.HeadCommit, RevertCommit: parameters.RevertCommit,
+		DiffSHA256: parameters.DiffSHA256, ResultTreeSHA256: parameters.TreeSHA256,
+		HeadTreeSHA256: fixture.envelope.ObservedState.GitOpsApplication.HeadTreeSHA256,
+	}
+}
+
+func (fixture *testFixture) refreshSnapshots() {
+	fixture.safety.global.ObservedAt = fixture.clock.now
+	fixture.safety.scoped.ObservedAt = fixture.clock.now
+	fixture.targets.snapshot.ObservedAt = fixture.clock.now
+}
+
+type fixedClock struct{ now time.Time }
+
+func (clock *fixedClock) Now() time.Time { return clock.now }
+
+type countingKeyResolver struct {
+	delegate action.KeyResolver
+	calls    int
+}
+
+func (resolver *countingKeyResolver) Resolve(ctx context.Context, keyID string) (action.KeyRecord, error) {
+	resolver.calls++
+	return resolver.delegate.Resolve(ctx, keyID)
+}
+
+type fakeApprovalReader struct {
+	records []Approval
+	err     error
+}
+
+func (reader *fakeApprovalReader) List(context.Context, string, string, string) ([]Approval, error) {
+	return append([]Approval(nil), reader.records...), reader.err
+}
+
+type fakePrincipalResolver struct {
+	values map[string]Principal
+	err    error
+}
+
+func (resolver *fakePrincipalResolver) Resolve(_ context.Context, subjectID, _, _, _ string) (Principal, error) {
+	if resolver.err != nil {
+		return Principal{}, resolver.err
+	}
+	principal, exists := resolver.values[subjectID]
+	if !exists {
+		return Principal{}, errors.New("principal not found")
+	}
+	return principal, nil
+}
+
+type fakeSafetyReader struct {
+	global GlobalSwitchSnapshot
+	scoped ScopedSwitchSnapshot
+	err    error
+}
+
+func (reader *fakeSafetyReader) Global(context.Context) (GlobalSwitchSnapshot, error) {
+	return reader.global, reader.err
+}
+
+func (reader *fakeSafetyReader) Scoped(context.Context, action.Envelope) (ScopedSwitchSnapshot, error) {
+	return reader.scoped, reader.err
+}
+
+type fakeTargetReader struct {
+	snapshot TargetSnapshot
+	err      error
+}
+
+func (reader *fakeTargetReader) Resolve(context.Context, action.Envelope) (TargetSnapshot, error) {
+	return reader.snapshot, reader.err
+}
+
+func mustDefinition(t *testing.T, expression string) Definition {
 	t.Helper()
-	_, signer, keys := testSigningKey(t)
-	envelope := action.Envelope{
-		SchemaVersion: action.SchemaVersionV1, ActionID: "action-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
-		ActionType: action.ActionKubernetesRolloutRestart,
-		Target: action.TargetRef{ServiceID: "service-payments", EnvironmentID: "PROD", KubernetesDeployment: &action.KubernetesDeploymentTarget{
-			ClusterID: "cluster-a", Namespace: "payments",
-			Name: "payments-api", UID: "uid-1", ResourceVersion: "83",
-		}},
-		Parameters:      action.ActionParameters{KubernetesRolloutRestart: &action.KubernetesRolloutRestartParameters{Reason: "confirmed deadlock"}},
-		ObservedState:   action.ObservedState{KubernetesDeployment: &action.KubernetesDeploymentObservedState{Generation: 4, Replicas: 3, AvailableReplicas: 3, UpdatedReplicas: 3}},
-		Preconditions:   action.Preconditions{MappingResult: "EXACT", ExpectedResourceVersion: "83", RequireWhitelist: true},
-		Verification:    action.VerificationPlan{Mode: "KUBERNETES_ROLLOUT", TimeoutSeconds: 300},
-		Compensation:    action.CompensationPlan{Mode: "MANUAL_ONLY", Summary: "follow runbook"},
-		Risk:            action.RiskAssessment{Level: "MEDIUM", ReasonCodes: []string{"PRODUCTION_CHANGE", "RESTART"}},
-		PolicyVersion:   "policy.v1",
-		CredentialScope: action.CredentialScope{ConnectorID: "kubernetes-prod", Permission: "PATCH_DEPLOYMENT_RESTART", Resource: "cluster-a/payments/deployment/payments-api", TTLSeconds: 600},
-		IdempotencyKey:  "idem-action-1", NotBefore: now, ExpiresAt: now.Add(30 * time.Minute), TraceID: strings.Repeat("a", 32),
-	}
-	sealed, err := action.Seal(context.Background(), envelope, signer)
+	definition, err := NewDefinition("policy.prod.v1", expression)
 	if err != nil {
-		t.Fatalf("seal restart envelope: %v", err)
+		t.Fatalf("NewDefinition() error = %v", err)
 	}
-	return sealed, keys
+	return definition
 }
 
-func sealedGitOpsEnvelope(t *testing.T, now time.Time) (action.Envelope, action.StaticKeySet) {
-	t.Helper()
-	_, signer, keys := testSigningKey(t)
-	head := strings.Repeat("b", 40)
-	envelope := action.Envelope{
-		SchemaVersion: action.SchemaVersionV1, ActionID: "action-gitops", WorkspaceID: "workspace-1", IncidentID: "incident-1",
-		ActionType: action.ActionGitOpsRevert,
-		Target:     action.TargetRef{ServiceID: "service-payments", EnvironmentID: "PROD", GitOpsApplication: &action.GitOpsTarget{RepositoryID: "gitops-prod", Application: "payments", Path: "apps/payments"}},
-		Parameters: action.ActionParameters{GitOpsRevert: &action.GitOpsRevertParameters{
-			Provider: "GITLAB", BaseCommit: strings.Repeat("a", 40), HeadCommit: head, RevertCommit: strings.Repeat("c", 40),
-			DiffSHA256: strings.Repeat("d", 64), TreeSHA256: strings.Repeat("e", 64),
-		}},
-		ObservedState:   action.ObservedState{GitOpsApplication: &action.GitOpsObservedState{LiveRevision: head, DesiredRevision: head, SyncStatus: "SYNCED", HealthStatus: "HEALTHY"}},
-		Preconditions:   action.Preconditions{MappingResult: "EXACT", ExpectedGitHeadCommit: head, RequireWhitelist: true},
-		Verification:    action.VerificationPlan{Mode: "ARGO_CD_HEALTH", TimeoutSeconds: 300},
-		Compensation:    action.CompensationPlan{Mode: "MANUAL_ONLY", Summary: "stop sync and follow runbook"},
-		Risk:            action.RiskAssessment{Level: "HIGH", ReasonCodes: []string{"GITOPS_REVERT", "PRODUCTION_CHANGE"}},
-		PolicyVersion:   "policy.v1",
-		CredentialScope: action.CredentialScope{ConnectorID: "gitlab-prod", Permission: "CREATE_REVERT_MR", Resource: "gitops-prod", TTLSeconds: 600},
-		IdempotencyKey:  "idem-action-gitops", NotBefore: now, ExpiresAt: now.Add(30 * time.Minute), TraceID: strings.Repeat("b", 32),
-	}
-	sealed, err := action.Seal(context.Background(), envelope, signer)
-	if err != nil {
-		t.Fatalf("seal GitOps envelope: %v", err)
-	}
-	return sealed, keys
-}
-
-func testSigningKey(t *testing.T) (ed25519.PublicKey, *action.Ed25519Signer, action.StaticKeySet) {
+func sealEnvelope(t *testing.T, envelope action.Envelope) (action.Envelope, action.KeyResolver) {
 	t.Helper()
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -281,16 +431,59 @@ func testSigningKey(t *testing.T) (ed25519.PublicKey, *action.Ed25519Signer, act
 	if err != nil {
 		t.Fatalf("new signer: %v", err)
 	}
-	return publicKey, signer, action.StaticKeySet{"policy-test-key": {PublicKey: publicKey}}
+	sealed, err := action.Seal(context.Background(), envelope, signer)
+	if err != nil {
+		t.Fatalf("seal envelope: %v", err)
+	}
+	keys, err := action.NewStaticKeySet(map[string]action.KeyRecord{"policy-test-key": {PublicKey: publicKey}})
+	if err != nil {
+		t.Fatalf("new key set: %v", err)
+	}
+	return sealed, keys
 }
 
-func newTestEngine(t *testing.T, version, expression string, keys action.StaticKeySet) *Engine {
-	t.Helper()
-	engine, err := NewEngine(Definition{Version: version, Expression: expression}, keys)
-	if err != nil {
-		t.Fatalf("new engine: %v", err)
+func kubernetesEnvelope(now time.Time, policyVersion string) action.Envelope {
+	return action.Envelope{
+		SchemaVersion: action.SchemaVersionV1, ActionID: "action-1", WorkspaceID: "workspace-1", IncidentID: "incident-1", RequestedBy: "requester-1",
+		ActionType: action.ActionKubernetesRolloutRestart,
+		Target: action.TargetRef{ServiceID: "service-payments", EnvironmentID: "PROD", KubernetesDeployment: &action.KubernetesDeploymentTarget{
+			ClusterID: "cluster-a", Namespace: "payments", Name: "payments-api", UID: "uid-1", ResourceVersion: "83",
+		}},
+		Parameters:    action.ActionParameters{KubernetesRolloutRestart: &action.KubernetesRolloutRestartParameters{Reason: "confirmed deadlock"}},
+		ObservedState: action.ObservedState{KubernetesDeployment: &action.KubernetesDeploymentObservedState{Generation: 4, Replicas: 3, AvailableReplicas: 3, UpdatedReplicas: 3}},
+		Preconditions: action.Preconditions{MappingResult: "EXACT", ExpectedResourceVersion: "83", RequireWhitelist: true},
+		Verification:  action.VerificationPlan{Mode: "KUBERNETES_ROLLOUT", TimeoutSeconds: 300},
+		Compensation:  action.CompensationPlan{Mode: "MANUAL_ONLY", Summary: "follow runbook"},
+		Risk:          action.RiskAssessment{Level: "MEDIUM", ReasonCodes: []string{"PRODUCTION_CHANGE", "RESTART"}},
+		PolicyVersion: policyVersion,
+		CredentialScope: action.CredentialScope{ConnectorID: "kubernetes-prod", Permission: "PATCH_DEPLOYMENT_RESTART",
+			Resource: "cluster-a/payments/deployment/payments-api", TTLSeconds: 600},
+		IdempotencyKey: "idem-action-1", NotBefore: now, ExpiresAt: now.Add(30 * time.Minute), TraceID: strings.Repeat("a", 32),
 	}
-	return engine
+}
+
+func gitOpsEnvelope(now time.Time, policyVersion string) action.Envelope {
+	head := strings.Repeat("b", 40)
+	return action.Envelope{
+		SchemaVersion: action.SchemaVersionV1, ActionID: "action-gitops", WorkspaceID: "workspace-1", IncidentID: "incident-1", RequestedBy: "requester-1",
+		ActionType: action.ActionGitOpsRevert,
+		Target:     action.TargetRef{ServiceID: "service-payments", EnvironmentID: "PROD", GitOpsApplication: &action.GitOpsTarget{RepositoryID: "gitops-prod", Application: "payments", Path: "apps/payments"}},
+		Parameters: action.ActionParameters{GitOpsRevert: &action.GitOpsRevertParameters{
+			Provider: "GITLAB", BaseCommit: strings.Repeat("a", 40), HeadCommit: head, RevertCommit: strings.Repeat("c", 40),
+			DiffSHA256: strings.Repeat("d", 64), TreeSHA256: strings.Repeat("e", 64),
+		}},
+		ObservedState: action.ObservedState{GitOpsApplication: &action.GitOpsObservedState{
+			LiveRevision: head, DesiredRevision: head, HeadTreeSHA256: strings.Repeat("f", 64), SyncStatus: "SYNCED", HealthStatus: "HEALTHY",
+		}},
+		Preconditions: action.Preconditions{MappingResult: "EXACT", ExpectedGitHeadCommit: head, RequireWhitelist: true},
+		Verification:  action.VerificationPlan{Mode: "ARGO_CD_HEALTH", TimeoutSeconds: 300},
+		Compensation:  action.CompensationPlan{Mode: "MANUAL_ONLY", Summary: "stop sync and follow runbook"},
+		Risk:          action.RiskAssessment{Level: "HIGH", ReasonCodes: []string{"GITOPS_REVERT", "PRODUCTION_CHANGE"}},
+		PolicyVersion: policyVersion,
+		CredentialScope: action.CredentialScope{ConnectorID: "gitlab-prod", Permission: "CREATE_REVERT_MR",
+			Resource: "gitops-prod", TTLSeconds: 600},
+		IdempotencyKey: "idem-action-gitops", NotBefore: now, ExpiresAt: now.Add(30 * time.Minute), TraceID: strings.Repeat("b", 32),
+	}
 }
 
 func contains(values []string, target string) bool {
