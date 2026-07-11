@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -19,8 +20,16 @@ import (
 
 func main() {
 	if len(os.Args) == 2 && os.Args[1] == "descendant" {
+		ready := os.NewFile(3, "descendant-ready")
+		if ready == nil {
+			os.Exit(94)
+		}
+		if _, err := ready.Write([]byte{1}); err != nil {
+			os.Exit(95)
+		}
+		_ = ready.Close()
 		signal.Ignore(syscall.SIGTERM)
-		select {}
+		blockForever()
 	}
 	if len(os.Args) != 1 {
 		os.Exit(90)
@@ -41,7 +50,7 @@ func main() {
 	}
 	if handler.mode == "post-result-hang" {
 		signal.Ignore(syscall.SIGTERM)
-		select {}
+		blockForever()
 	}
 	if handler.mode == "result-then-delay-exit" {
 		time.Sleep(500 * time.Millisecond)
@@ -79,10 +88,7 @@ func (handler *fixtureHandler) Execute(
 	case "success", "post-result-hang", "result-then-delay-exit":
 		return succeeded(), nil
 	case "leader-exit-with-descendant":
-		child := exec.Command(os.Args[0], "descendant")
-		child.Stdout = os.Stdout
-		child.Stderr = os.Stderr
-		if err := child.Start(); err != nil {
+		if err := startDescendant(); err != nil {
 			return failed("DESCENDANT_START_FAILED"), nil
 		}
 		return succeeded(), nil
@@ -95,7 +101,7 @@ func (handler *fixtureHandler) Execute(
 		return execution.ExecutorResult{}, errors.New("unreachable")
 	case "ignore-term":
 		signal.Ignore(syscall.SIGTERM)
-		select {}
+		blockForever()
 	case "flood-output":
 		block := bytes.Repeat([]byte{'x'}, 8<<10)
 		for range 16 {
@@ -104,16 +110,49 @@ func (handler *fixtureHandler) Execute(
 		}
 		select {}
 	case "fork-descendant":
-		child := exec.Command(os.Args[0], "descendant")
-		child.Stdout = os.Stdout
-		child.Stderr = os.Stderr
-		if err := child.Start(); err != nil {
+		if err := startDescendant(); err != nil {
 			return failed("DESCENDANT_START_FAILED"), nil
 		}
 		signal.Ignore(syscall.SIGTERM)
-		select {}
+		blockForever()
 	default:
 		return failed("UNKNOWN_FIXTURE_MODE"), nil
+	}
+}
+
+func startDescendant() error {
+	readyReader, readyWriter, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer readyReader.Close()
+	child := exec.Command(os.Args[0], "descendant")
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	child.ExtraFiles = []*os.File{readyWriter}
+	if err := child.Start(); err != nil {
+		_ = readyWriter.Close()
+		return err
+	}
+	_ = readyWriter.Close()
+	if err := readyReader.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		_ = child.Process.Kill()
+		return err
+	}
+	var ready [1]byte
+	if _, err := io.ReadFull(readyReader, ready[:]); err != nil || ready[0] != 1 {
+		_ = child.Process.Kill()
+		if err != nil {
+			return err
+		}
+		return errors.New("invalid descendant readiness")
+	}
+	return nil
+}
+
+func blockForever() {
+	for {
+		time.Sleep(time.Hour)
 	}
 }
 
