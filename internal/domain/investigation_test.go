@@ -237,19 +237,20 @@ func TestEvidenceAttributesRejectSensitiveNamesAndValues(t *testing.T) {
 	}
 	const canary = "attribute-sensitive-canary"
 	unsafe := map[string]map[string]string{
-		"authorization name":     {"authorization": canary},
-		"credential name":        {"credential_ref": canary},
-		"raw error name":         {"raw_error_body": canary},
-		"secret name":            {"secret": canary},
-		"token name":             {"access_token": canary},
-		"password name":          {"password": canary},
-		"semantic name":          {"name": "Authorization", "value": canary},
-		"bearer value":           {"message": "Bearer " + canary},
-		"credential assignment":  {"message": "password : " + canary},
-		"invalid UTF-8 value":    {"message": canary + string([]byte{0xff})},
-		"NUL value":              {"message": canary + "\x00text"},
-		"Unicode control value":  {"message": canary + "\u0085text"},
-		"replacement rune value": {"message": canary + "�"},
+		"authorization name":             {"authorization": canary},
+		"credential name":                {"credential_ref": canary},
+		"raw error name":                 {"raw_error_body": canary},
+		"secret name":                    {"secret": canary},
+		"token name":                     {"access_token": canary},
+		"password name":                  {"password": canary},
+		"semantic name":                  {"name": "Authorization", "value": canary},
+		"bearer value":                   {"message": "Bearer " + canary},
+		"credential assignment":          {"message": "password : " + canary},
+		"prefixed credential assignment": {"message": "client_secret: " + canary},
+		"invalid UTF-8 value":            {"message": canary + string([]byte{0xff})},
+		"NUL value":                      {"message": canary + "\x00text"},
+		"Unicode control value":          {"message": canary + "\u0085text"},
+		"replacement rune value":         {"message": canary + "�"},
 	}
 	for name, attributes := range unsafe {
 		t.Run(name, func(t *testing.T) {
@@ -300,23 +301,42 @@ func TestSafeTextAndMetadataEnforceUnicodeSafety(t *testing.T) {
 	}
 }
 
-func TestValidSafeTextRejectsCredentialAssignmentVariants(t *testing.T) {
+func TestSafeTextAndMetadataRejectCredentialAssignmentVariants(t *testing.T) {
 	for name, value := range map[string]string{
-		"password":      "password=canary",
-		"token":         "TOKEN : canary",
-		"secret":        "secret = canary",
-		"credential":    "credential:canary",
-		"authorization": "authorization = canary",
-		"cookie":        "cookie: canary",
-		"api key":       "api-key = canary",
-		"accessor":      "accessor=canary",
-		"private key":   "private.key: canary",
+		"password":               "password=canary",
+		"prefixed password":      "dbPassword=canary",
+		"token":                  "TOKEN : canary",
+		"prefixed token":         "accessToken=canary",
+		"secret":                 "secret = canary",
+		"prefixed secret":        "client_secret: canary",
+		"credential":             "credential:canary",
+		"prefixed credential":    "dbCredential=canary",
+		"authorization":          "authorization = canary",
+		"prefixed authorization": "httpAuthorization=canary",
+		"cookie":                 "cookie: canary",
+		"prefixed cookie":        "sessionCookie=canary",
+		"api key":                "api-key = canary",
+		"prefixed API key":       "clientApiKey=canary",
+		"accessor":               "accessor=canary",
+		"prefixed accessor":      "dbAccessor=canary",
+		"private key":            "private.key: canary",
+		"prefixed private key":   "clientPrivateKey=canary",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if domain.ValidSafeText(value) {
 				t.Fatalf("ValidSafeText(%q) = true, want credential assignment rejection", value)
 			}
+			if domain.ValidSafeMetadata("message", value) {
+				t.Fatalf("ValidSafeMetadata(%q) = true, want credential assignment rejection", value)
+			}
 		})
+	}
+
+	if !domain.ValidSafeText("tokenization completed") {
+		t.Fatal("ValidSafeText() rejected ordinary non-assignment text")
+	}
+	if !domain.ValidSafeMetadata("message", "tokenization completed") {
+		t.Fatal("ValidSafeMetadata() rejected ordinary non-assignment text")
 	}
 }
 
