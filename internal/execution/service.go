@@ -436,6 +436,7 @@ func (service *Service) RunNext(ctx context.Context) (executionlease.Execution, 
 	// context, whose timer is based on the process clock. This keeps injected
 	// clocks deterministic and avoids treating a valid simulated deadline as
 	// already expired in real wall time.
+	localExecutorObservedAt := time.Now()
 	now, err = service.now()
 	if err != nil || !executorDeadline.After(now) {
 		noCredentialErr := service.recordNoCredential(ctx, prepared)
@@ -444,7 +445,14 @@ func (service *Service) RunNext(ctx context.Context) (executionlease.Execution, 
 		}
 		return redactActionExecution(started), errors.Join(ErrExecutionUncertain, err, noCredentialErr)
 	}
-	executorContext, cancelExecutor := context.WithTimeout(ctx, executorDeadline.Sub(now))
+	localExecutorDeadline, validExecutorDeadline := mappedExecutionDeadline(
+		executorDeadline, now, localExecutorObservedAt,
+	)
+	if !validExecutorDeadline {
+		noCredentialErr := service.recordNoCredential(ctx, prepared)
+		return redactActionExecution(started), errors.Join(ErrExecutionUncertain, ErrPreExecutionDenied, noCredentialErr)
+	}
+	executorContext, cancelExecutor := context.WithDeadline(ctx, localExecutorDeadline)
 	defer cancelExecutor()
 	heartbeats := service.startHeartbeatSession(executorContext, cancelExecutor, runnerScope, leaseFence, 2)
 
@@ -479,14 +487,19 @@ func (service *Service) RunNext(ctx context.Context) (executionlease.Execution, 
 	if err != nil {
 		executorErr = ErrCredentialDenied
 	} else {
+		localIssueObservedAt := time.Now()
 		issueNow, clockErr := service.now()
 		if clockErr != nil || !validDurableCredential(
 			executionCredential, envelope, credentialDecision.CredentialExpiresAt, issueNow,
 		) {
 			executorErr = ErrCredentialDenied
+		} else if localCredentialDeadline, validCredentialDeadline := mappedExecutionDeadline(
+			executionCredential.ExpiresAt(), issueNow, localIssueObservedAt,
+		); !validCredentialDeadline {
+			executorErr = ErrCredentialDenied
 		} else {
-			credentialExecutionContext, cancelCredentialDeadline := context.WithTimeout(
-				executorContext, executionCredential.ExpiresAt().Sub(issueNow),
+			credentialExecutionContext, cancelCredentialDeadline := context.WithDeadline(
+				executorContext, localCredentialDeadline,
 			)
 			executionContext = credentialExecutionContext
 			defer cancelCredentialDeadline()
@@ -1002,6 +1015,24 @@ func boundedExecutionDeadline(ctx context.Context, envelope action.Envelope, cre
 		return time.Time{}, ErrPreExecutionDenied
 	}
 	return deadline, nil
+}
+
+// mappedExecutionDeadline maps a trusted logical deadline onto an already
+// observed local monotonic instant. Capturing localObservedAt before reading the
+// logical clock makes clock-read latency conservative, and WithDeadline cannot
+// move the resulting boundary later after a scheduler or GC pause. Production
+// uses time.Now for both clocks; tests may supply a coherent simulated logical
+// clock without turning a valid simulated deadline into an already-expired wall
+// timestamp.
+func mappedExecutionDeadline(deadline, logicalObservedAt, localObservedAt time.Time) (time.Time, bool) {
+	if deadline.IsZero() || logicalObservedAt.IsZero() || localObservedAt.IsZero() {
+		return time.Time{}, false
+	}
+	remaining := deadline.Sub(logicalObservedAt)
+	if remaining <= 0 {
+		return time.Time{}, false
+	}
+	return localObservedAt.Add(remaining), true
 }
 
 func validDurableCredential(

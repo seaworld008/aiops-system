@@ -514,11 +514,18 @@ func TestRunNextHeartbeatLossDuringIssuanceNeverStartsExecutor(t *testing.T) {
 	fixture := newRunnerFixture(t, now, envelope, keys, ExecutorResult{
 		Outcome: ExecutorSucceeded, Code: "MUST_NOT_RUN", Verification: VerificationPassed, Changed: true,
 	})
-	fixture.service.heartbeatInterval = 5 * time.Millisecond
+	// The heartbeat cadence is part of the behavior under test, but reaching the
+	// blocked issuer is synchronized by a channel rather than racing a tiny
+	// timer. A two-second interval also keeps the heartbeat RPC deadline valid on
+	// a loaded race-enabled CI runner.
+	fixture.service.heartbeatInterval = 2 * time.Second
+	fixture.service.finalizeTimeout = 5 * time.Second
 	fixture.leases.heartbeatErr = errors.New("heartbeat lease lost")
 	fixture.leases.heartbeatErrAfter = 2
-	heartbeats := make(chan struct{}, 4)
-	fixture.leases.heartbeatObserved = heartbeats
+	heartbeatFailureEnabled := make(chan struct{})
+	heartbeatFailed := make(chan struct{}, 1)
+	fixture.leases.heartbeatErrGate = heartbeatFailureEnabled
+	fixture.leases.heartbeatFailed = heartbeatFailed
 	issueEntered := make(chan struct{}, 1)
 	issueRelease := make(chan struct{})
 	fixture.issuer.issueEntered = issueEntered
@@ -532,31 +539,24 @@ func TestRunNextHeartbeatLossDuringIssuanceNeverStartsExecutor(t *testing.T) {
 		execution executionlease.Execution
 		err       error
 	}
+	runContext, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+	var releaseIssue sync.Once
+	release := func() { releaseIssue.Do(func() { close(issueRelease) }) }
+	t.Cleanup(release)
 	runDone := make(chan runResult, 1)
 	go func() {
-		execution, err := fixture.service.RunNext(context.Background())
+		execution, err := fixture.service.RunNext(runContext)
 		runDone <- runResult{execution: execution, err: err}
 	}()
-	select {
-	case <-issueEntered:
-	case <-time.After(time.Second):
-		t.Fatal("durable issuance did not reach the blocked dynamic issuer")
-	}
-	for observed := 0; observed < 2; observed++ {
-		select {
-		case <-heartbeats:
-		case <-time.After(time.Second):
-			t.Fatal("heartbeat loss was not observed during issuance")
-		}
-	}
-	close(issueRelease)
-	select {
-	case result := <-runDone:
-		if !errors.Is(result.err, ErrExecutionUncertain) || result.execution.Status != executionlease.StatusUncertain {
-			t.Fatalf("RunNext() = %#v, %v; want UNCERTAIN after issuance heartbeat loss", result.execution, result.err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("RunNext() did not converge after the late issuer returned")
+	awaitTestSignal(t, issueEntered, "durable issuance to enter the blocked dynamic issuer")
+	close(heartbeatFailureEnabled)
+	awaitTestSignal(t, heartbeatFailed, "a heartbeat loss while dynamic issuance is blocked")
+	release()
+	result := awaitTestValue(t, runDone, "RunNext to converge after the late issuer returned")
+	if !errors.Is(result.err, ErrExecutionUncertain) || result.execution.Status != executionlease.StatusUncertain {
+		t.Fatalf("RunNext() = %#v, %v; want UNCERTAIN after issuance heartbeat loss; events=%v",
+			result.execution, result.err, fixture.events.snapshot())
 	}
 	if len(fixture.executors.calls) != 0 || fixture.credentials.issueCalls != 1 {
 		t.Fatalf("late issuance crossed executor gate: issue=%d executors=%v", fixture.credentials.issueCalls, fixture.executors.calls)
@@ -742,11 +742,20 @@ func TestRunNextRevalidatesPolicyCredentialAndSafetyFreshnessImmediatelyBeforeSt
 func TestRunNextBoundsExecutorContextBySignedVerificationTimeout(t *testing.T) {
 	t.Parallel()
 
-	now := time.Now().UTC()
+	now := credential.CanonicalCredentialExpiry(time.Now().UTC())
 	unsigned := restartEnvelope(now)
 	unsigned.Verification.TimeoutSeconds = 1
+	calculated, err := boundedExecutionDeadline(context.Background(), unsigned, now.Add(5*time.Minute), now)
+	if err != nil || !calculated.Equal(now.Add(time.Second)) {
+		t.Fatalf("boundedExecutionDeadline(1s signed timeout) = %s, %v", calculated, err)
+	}
+
+	// The end-to-end assertion uses a comfortable signed timeout and the real
+	// clock. The exact one-second arithmetic is proven above without requiring
+	// the entire durable issuance path to beat a one-second CI scheduling race.
+	unsigned.Verification.TimeoutSeconds = 30
 	envelope, keys := signedEnvelope(t, unsigned)
-	fixture := newRunnerFixtureWithClock(t, func() time.Time { return now }, envelope, keys, ExecutorResult{
+	fixture := newRunnerFixtureWithClock(t, time.Now, envelope, keys, ExecutorResult{
 		Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed, Changed: true,
 	})
 	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
@@ -755,39 +764,117 @@ func TestRunNextBoundsExecutorContextBySignedVerificationTimeout(t *testing.T) {
 	if _, err := fixture.service.RunNext(context.Background()); err != nil {
 		t.Fatalf("RunNext() error = %v", err)
 	}
-	deadline := fixture.executors.capturedDeadline
-	if deadline.IsZero() || deadline.After(now.Add(time.Second+100*time.Millisecond)) || !deadline.After(now) {
-		t.Fatalf("executor deadline = %s, want within signed 1s verification timeout", deadline)
+	deadline, enteredAt := fixture.executors.capturedDeadline, fixture.executors.enteredAt
+	remaining := deadline.Sub(enteredAt)
+	if deadline.IsZero() || enteredAt.IsZero() || remaining <= 0 || remaining > 30*time.Second {
+		t.Fatalf("executor entered/deadline = %s/%s (remaining %s), want within signed 30s timeout; events=%v",
+			enteredAt, deadline, remaining, fixture.events.snapshot())
 	}
 }
 
-func TestRunNextCancelsExecutionAtTheActualDurableCredentialExpiry(t *testing.T) {
+func TestMappedExecutionDeadlinePreservesShortLogicalWindowWithoutMovingLater(t *testing.T) {
+	t.Parallel()
+
+	logicalNow := time.Date(2026, 7, 11, 6, 40, 0, 0, time.UTC)
+	localNow := time.Now()
+	for _, test := range []struct {
+		name            string
+		logicalDeadline time.Time
+		wantRemaining   time.Duration
+		valid           bool
+	}{
+		{name: "zero deadline"},
+		{name: "expired", logicalDeadline: logicalNow},
+		{name: "one second remains", logicalDeadline: logicalNow.Add(time.Second), wantRemaining: time.Second, valid: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			deadline, valid := mappedExecutionDeadline(test.logicalDeadline, logicalNow, localNow)
+			remaining := time.Duration(0)
+			if !deadline.IsZero() {
+				remaining = deadline.Sub(localNow)
+			}
+			if remaining != test.wantRemaining || valid != test.valid {
+				t.Fatalf("mappedExecutionDeadline() = %s (%s), %v; want remaining %s, %v",
+					deadline, remaining, valid, test.wantRemaining, test.valid)
+			}
+		})
+	}
+}
+
+func TestRunNextBoundsExecutorContextByTheActualDurableCredentialExpiry(t *testing.T) {
+	now := credential.CanonicalCredentialExpiry(time.Now().UTC())
+	envelope, keys := signedEnvelope(t, restartEnvelope(now))
+	fixture := newRunnerFixtureWithClock(t, time.Now, envelope, keys, ExecutorResult{
+		Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed, Changed: true,
+	})
+	// This remains materially shorter than the five-minute policy deadline, but
+	// does not require a loaded CI runner to finish activation and dispatch in a
+	// 250ms scheduling window. The executor returns immediately after capturing
+	// the context deadline; cancellation behavior is covered by the explicit
+	// entered-then-cancel test below.
+	fixture.issuer.dynamicTTL = 30 * time.Second
+	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	completed, err := fixture.service.RunNext(context.Background())
+	if err != nil || completed.Status != executionlease.StatusSucceeded {
+		t.Fatalf("RunNext(short credential TTL) = %#v, %v; events=%v", completed, err, fixture.events.snapshot())
+	}
+	credentialExpiry := fixture.executors.capturedCredential.ExpiresAt()
+	deadline, enteredAt := fixture.executors.capturedDeadline, fixture.executors.enteredAt
+	remaining := deadline.Sub(enteredAt)
+	if deadline.IsZero() || enteredAt.IsZero() || credentialExpiry.IsZero() || deadline.After(credentialExpiry) ||
+		remaining <= 0 || remaining > 30*time.Second {
+		t.Fatalf("executor entered/deadline/credential expiry = %s/%s/%s (remaining %s)",
+			enteredAt, deadline, credentialExpiry, remaining)
+	}
+	if fixture.credentials.requestRevocationCalls != 1 || fixture.executors.capturedCredential.Secret() != nil {
+		t.Fatalf("credential cleanup = requests %d secret %v",
+			fixture.credentials.requestRevocationCalls, fixture.executors.capturedCredential.Secret())
+	}
+}
+
+func TestRunNextActualCredentialExpiryCancelsExecutionAndRequestsCleanup(t *testing.T) {
 	now := credential.CanonicalCredentialExpiry(time.Now().UTC())
 	envelope, keys := signedEnvelope(t, restartEnvelope(now))
 	fixture := newRunnerFixtureWithClock(t, time.Now, envelope, keys, ExecutorResult{
 		Outcome: ExecutorSucceeded, Code: "MUST_NOT_SURVIVE_CREDENTIAL_EXPIRY", Verification: VerificationPassed, Changed: true,
 	})
-	fixture.issuer.dynamicTTL = 250 * time.Millisecond
+	// This test intentionally exercises real timer behavior. First synchronize on
+	// executor entry, then let the materially-shorter dynamic credential deadline
+	// fire. Five seconds is long enough for race-enabled CI dispatch while still
+	// keeping the test bounded by the shared watchdog.
+	fixture.issuer.dynamicTTL = 5 * time.Second
 	fixture.executors.waitForCancellation = true
+	executorEntered := make(chan struct{}, 1)
+	fixture.executors.entered = executorEntered
 	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
 		t.Fatalf("Submit() error = %v", err)
 	}
 
-	startedAt := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	completed, err := fixture.service.RunNext(ctx)
-	elapsed := time.Since(startedAt)
-	if !errors.Is(err, ErrExecutionUncertain) || completed.Status != executionlease.StatusUncertain {
-		t.Fatalf("RunNext(short credential TTL) = %#v, %v; want UNCERTAIN", completed, err)
+	type runResult struct {
+		execution executionlease.Execution
+		err       error
 	}
-	if elapsed >= time.Second {
-		t.Fatalf("executor survived its 250ms credential TTL for %s", elapsed)
+	runContext, cancelRun := context.WithTimeout(context.Background(), asynchronousTestWatchdog)
+	defer cancelRun()
+	runDone := make(chan runResult, 1)
+	go func() {
+		execution, err := fixture.service.RunNext(runContext)
+		runDone <- runResult{execution: execution, err: err}
+	}()
+	awaitTestSignal(t, executorEntered, "executor entry before dynamic credential expiry")
+	result := awaitTestValue(t, runDone, "dynamic credential expiry to stop execution")
+	if !errors.Is(result.err, ErrExecutionUncertain) || result.execution.Status != executionlease.StatusUncertain {
+		t.Fatalf("RunNext(actual credential expiry) = %#v, %v; events=%v",
+			result.execution, result.err, fixture.events.snapshot())
 	}
 	credentialExpiry := fixture.executors.capturedCredential.ExpiresAt()
 	if fixture.executors.capturedDeadline.IsZero() || credentialExpiry.IsZero() ||
-		fixture.executors.capturedDeadline.After(credentialExpiry.Add(100*time.Millisecond)) {
-		t.Fatalf("executor deadline = %s, credential expiry = %s", fixture.executors.capturedDeadline, credentialExpiry)
+		fixture.executors.capturedDeadline.After(credentialExpiry) {
+		t.Fatalf("executor deadline = %s, credential expiry = %s",
+			fixture.executors.capturedDeadline, credentialExpiry)
 	}
 	if fixture.credentials.requestRevocationCalls != 1 || fixture.executors.capturedCredential.Secret() != nil {
 		t.Fatalf("credential expiry cleanup = requests %d secret %v",
@@ -1025,14 +1112,19 @@ func TestRunNextStopsHeartbeatAndReturnsUncertainWhenExecutorIgnoresDeadline(t *
 	})
 	release := make(chan struct{})
 	finished := make(chan struct{})
+	entered := make(chan struct{}, 1)
 	fixture.executors.ignoreCancellation = true
 	fixture.executors.release = release
 	fixture.executors.finished = finished
+	fixture.executors.entered = entered
 	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
 		t.Fatalf("Submit() error = %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	var releaseExecutor sync.Once
+	releaseLateExecutor := func() { releaseExecutor.Do(func() { close(release) }) }
+	t.Cleanup(releaseLateExecutor)
 	type runResult struct {
 		execution executionlease.Execution
 		err       error
@@ -1042,22 +1134,20 @@ func TestRunNextStopsHeartbeatAndReturnsUncertainWhenExecutorIgnoresDeadline(t *
 		execution, err := fixture.service.RunNext(ctx)
 		completed <- runResult{execution: execution, err: err}
 	}()
-	select {
-	case result := <-completed:
-		if !errors.Is(result.err, ErrExecutionUncertain) || result.execution.LeaseToken != "" {
-			t.Fatalf("RunNext(deadline) = %#v, %v", result.execution, result.err)
-		}
-	case <-time.After(500 * time.Millisecond):
-		close(release)
-		<-finished
-		t.Fatal("RunNext waited indefinitely for an executor that ignored context")
+	awaitTestSignal(t, entered, "the context-ignoring executor to enter")
+	cancel()
+	result := awaitTestValue(t, completed, "RunNext to stop after cancellation")
+	if !errors.Is(result.err, ErrExecutionUncertain) || result.execution.LeaseToken != "" {
+		t.Fatalf("RunNext(cancelled executor) = %#v, %v; events=%v",
+			result.execution, result.err, fixture.events.snapshot())
 	}
-	close(release)
 	select {
 	case <-finished:
-	case <-time.After(time.Second):
-		t.Fatal("late executor did not exit after test release")
+		t.Fatal("context-ignoring executor exited before its explicit release")
+	default:
 	}
+	releaseLateExecutor()
+	awaitTestSignal(t, finished, "the late executor to exit after explicit release")
 }
 
 func TestRunNextDispatchesOnlyTheFourTypedActionExecutors(t *testing.T) {
@@ -1496,7 +1586,9 @@ type recordingActionQueue struct {
 	startErr          error
 	heartbeatErr      error
 	heartbeatErrAfter int
+	heartbeatErrGate  <-chan struct{}
 	heartbeatCalls    int
+	heartbeatFailed   chan<- struct{}
 	completeErr       error
 	finalizeErr       error
 	heartbeatObserved chan<- struct{}
@@ -1575,8 +1667,22 @@ func (repository *recordingActionQueue) Heartbeat(ctx context.Context, request A
 		default:
 		}
 	}
-	if repository.heartbeatErr != nil &&
-		(repository.heartbeatErrAfter == 0 || repository.heartbeatCalls >= repository.heartbeatErrAfter) {
+	shouldFail := repository.heartbeatErr != nil &&
+		(repository.heartbeatErrAfter == 0 || repository.heartbeatCalls >= repository.heartbeatErrAfter)
+	if shouldFail && repository.heartbeatErrGate != nil {
+		select {
+		case <-repository.heartbeatErrGate:
+		default:
+			shouldFail = false
+		}
+	}
+	if shouldFail {
+		if repository.heartbeatFailed != nil {
+			select {
+			case repository.heartbeatFailed <- struct{}{}:
+			default:
+			}
+		}
 		return ActionHeartbeatResult{}, repository.heartbeatErr
 	}
 	result, err := repository.ActionQueue.Heartbeat(ctx, request)
@@ -2006,6 +2112,8 @@ type recordingExecutors struct {
 	release             <-chan struct{}
 	waitForCancellation bool
 	capturedDeadline    time.Time
+	enteredAt           time.Time
+	entered             chan<- struct{}
 	destroyCredential   bool
 	ignoreCancellation  bool
 	finished            chan<- struct{}
@@ -2024,6 +2132,13 @@ func (executors *recordingExecutors) record(ctx context.Context, name string, ex
 	executors.calls = append(executors.calls, name)
 	executors.capturedCredential = executionCredential
 	executors.credentialCaptured = true
+	executors.enteredAt = time.Now()
+	if executors.entered != nil {
+		select {
+		case executors.entered <- struct{}{}:
+		default:
+		}
+	}
 	if executors.destroyCredential {
 		executionCredential.Destroy()
 	}
@@ -2052,6 +2167,27 @@ func (executors *recordingExecutors) record(ctx context.Context, name string, ex
 		}
 	}
 	return executors.result, executors.err
+}
+
+const asynchronousTestWatchdog = 10 * time.Second
+
+func awaitTestSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	awaitTestValue(t, signal, description)
+}
+
+func awaitTestValue[T any](t *testing.T, values <-chan T, description string) T {
+	t.Helper()
+	timer := time.NewTimer(asynchronousTestWatchdog)
+	defer timer.Stop()
+	select {
+	case value := <-values:
+		return value
+	case <-timer.C:
+		t.Fatalf("timed out after %s waiting for %s", asynchronousTestWatchdog, description)
+		var zero T
+		return zero
+	}
 }
 
 func (executors *recordingExecutors) ExecuteRolloutRestart(ctx context.Context, command KubernetesRolloutRestartCommand, executionCredential credential.DurableCredential) (ExecutorResult, error) {
