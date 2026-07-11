@@ -12,8 +12,11 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/seaworld008/aiops-system/internal/authn"
+	"github.com/seaworld008/aiops-system/internal/authz"
 	"github.com/seaworld008/aiops-system/internal/buildinfo"
 	"github.com/seaworld008/aiops-system/internal/config"
+	credentialpostgres "github.com/seaworld008/aiops-system/internal/credential/postgres"
+	"github.com/seaworld008/aiops-system/internal/credentialadmin"
 	"github.com/seaworld008/aiops-system/internal/httpapi"
 	signalservice "github.com/seaworld008/aiops-system/internal/signal"
 	"github.com/seaworld008/aiops-system/internal/store/memory"
@@ -81,14 +84,33 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	var credentialRevocations httpapi.CredentialRevocationManager
+	if databasePool != nil {
+		authorizer, authorizerErr := authz.NewAuthorizer(cfg.OIDCRecentAuthWindow, time.Now)
+		if authorizerErr != nil {
+			slog.Error("configure credential revocation authorization", "error", authorizerErr)
+			os.Exit(1)
+		}
+		managementStore, managementErr := credentialpostgres.NewManagement(databasePool)
+		if managementErr != nil {
+			slog.Error("configure credential revocation management store", "error", managementErr)
+			os.Exit(1)
+		}
+		credentialRevocations, err = credentialadmin.New(managementStore, authorizer)
+		if err != nil {
+			slog.Error("configure credential revocation management", "error", err)
+			os.Exit(1)
+		}
+	}
 	server := &http.Server{
 		Addr: cfg.HTTPAddr,
 		Handler: httpapi.NewRouter(httpapi.Dependencies{
-			Version:         buildinfo.Version,
-			Ready:           ready,
-			SignalIngestor:  signalIngestor,
-			WebhookVerifier: webhookVerifier,
-			Authenticator:   authenticator,
+			Version:               buildinfo.Version,
+			Ready:                 ready,
+			SignalIngestor:        signalIngestor,
+			WebhookVerifier:       webhookVerifier,
+			Authenticator:         authenticator,
+			CredentialRevocations: credentialRevocations,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}

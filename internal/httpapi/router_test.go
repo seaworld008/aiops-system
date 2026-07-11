@@ -97,6 +97,14 @@ func TestSessionEndpointRequiresVerifiedOIDCPrincipal(t *testing.T) {
 	if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), "authentication_required") {
 		t.Fatalf("unauthorized session response = %d %s", response.Code, response.Body.String())
 	}
+
+	var typedNil *fakeAuthenticator
+	router = httpapi.NewRouter(httpapi.Dependencies{Authenticator: typedNil})
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/session", nil))
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "authentication_unavailable") {
+		t.Fatalf("typed-nil authenticator response = %d %s", response.Code, response.Body.String())
+	}
 }
 
 type fakeAuthenticator struct {

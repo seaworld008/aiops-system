@@ -16,15 +16,18 @@ var (
 type Permission string
 
 const (
-	PermissionIncidentRead     Permission = "INCIDENT_READ"
-	PermissionInvestigationRun Permission = "INVESTIGATION_RUN"
-	PermissionFeedbackWrite    Permission = "FEEDBACK_WRITE"
-	PermissionActionPropose    Permission = "ACTION_PROPOSE"
-	PermissionActionApprove    Permission = "ACTION_APPROVE"
-	PermissionExecutionRequest Permission = "EXECUTION_REQUEST"
-	PermissionAuditRead        Permission = "AUDIT_READ"
-	PermissionAuditExport      Permission = "AUDIT_EXPORT"
-	PermissionCatalogManage    Permission = "CATALOG_MANAGE"
+	PermissionIncidentRead                Permission = "INCIDENT_READ"
+	PermissionInvestigationRun            Permission = "INVESTIGATION_RUN"
+	PermissionFeedbackWrite               Permission = "FEEDBACK_WRITE"
+	PermissionActionPropose               Permission = "ACTION_PROPOSE"
+	PermissionActionApprove               Permission = "ACTION_APPROVE"
+	PermissionExecutionRequest            Permission = "EXECUTION_REQUEST"
+	PermissionAuditRead                   Permission = "AUDIT_READ"
+	PermissionAuditExport                 Permission = "AUDIT_EXPORT"
+	PermissionCatalogManage               Permission = "CATALOG_MANAGE"
+	PermissionCredentialRevocationRead    Permission = "CREDENTIAL_REVOCATION_READ"
+	PermissionCredentialRevocationRequeue Permission = "CREDENTIAL_REVOCATION_REQUEUE"
+	PermissionCredentialRevocationConfirm Permission = "CREDENTIAL_REVOCATION_CONFIRM"
 )
 
 type Request struct {
@@ -49,6 +52,12 @@ func NewAuthorizer(recentAuthentication time.Duration, clock func() time.Time) (
 	return &Authorizer{recentAuthentication: recentAuthentication, clock: clock}, nil
 }
 
+// IsPlatformAdmin derives the credential-management Platform Admin bit only
+// from roles on the authenticated OIDC principal.
+func IsPlatformAdmin(principal authn.Principal) bool {
+	return slices.Contains(principal.Roles, authn.RoleAdmin)
+}
+
 func (authorizer *Authorizer) Authorize(principal authn.Principal, request Request) error {
 	now := authorizer.clock().UTC()
 	if principal.Subject == "" || principal.ExpiresAt.IsZero() || !now.Before(principal.ExpiresAt) ||
@@ -59,20 +68,34 @@ func (authorizer *Authorizer) Authorize(principal authn.Principal, request Reque
 	if requiresService(request.Permission) && request.ServiceID == "" {
 		return ErrForbidden
 	}
-	if (request.Permission == PermissionActionApprove || request.Permission == PermissionExecutionRequest) &&
-		(principal.AuthenticatedAt.IsZero() || principal.AuthenticatedAt.After(now.Add(30*time.Second)) || now.Sub(principal.AuthenticatedAt) > authorizer.recentAuthentication) {
-		return ErrReauthenticationRequired
-	}
-
+	allowed := false
 	for _, role := range principal.Roles {
 		if role == authn.RoleServiceOwner && request.ServiceID != "" && !slices.Contains(principal.ServiceIDs, request.ServiceID) {
 			continue
 		}
 		if roleAllows(role, request.Permission) {
-			return nil
+			allowed = true
+			break
 		}
 	}
-	return ErrForbidden
+	if !allowed {
+		return ErrForbidden
+	}
+	if requiresRecentAuthentication(request.Permission) &&
+		(principal.AuthenticatedAt.IsZero() || principal.AuthenticatedAt.After(now.Add(30*time.Second)) || now.Sub(principal.AuthenticatedAt) > authorizer.recentAuthentication) {
+		return ErrReauthenticationRequired
+	}
+	return nil
+}
+
+func requiresRecentAuthentication(permission Permission) bool {
+	switch permission {
+	case PermissionActionApprove, PermissionExecutionRequest,
+		PermissionCredentialRevocationRequeue, PermissionCredentialRevocationConfirm:
+		return true
+	default:
+		return false
+	}
 }
 
 func requiresService(permission Permission) bool {
@@ -90,6 +113,7 @@ func roleAllows(role authn.Role, permission Permission) bool {
 		return slices.Contains([]Permission{
 			PermissionIncidentRead, PermissionInvestigationRun, PermissionFeedbackWrite,
 			PermissionActionPropose, PermissionActionApprove, PermissionExecutionRequest, PermissionAuditRead,
+			PermissionCredentialRevocationRead, PermissionCredentialRevocationConfirm,
 		}, permission)
 	case authn.RoleServiceOwner:
 		return slices.Contains([]Permission{
@@ -98,9 +122,13 @@ func roleAllows(role authn.Role, permission Permission) bool {
 	case authn.RoleApprover:
 		return permission == PermissionIncidentRead || permission == PermissionActionApprove
 	case authn.RoleAuditor:
-		return permission == PermissionIncidentRead || permission == PermissionAuditRead || permission == PermissionAuditExport
+		return permission == PermissionIncidentRead || permission == PermissionAuditRead || permission == PermissionAuditExport ||
+			permission == PermissionCredentialRevocationRead
 	case authn.RoleAdmin:
-		return permission == PermissionIncidentRead || permission == PermissionAuditRead || permission == PermissionAuditExport || permission == PermissionCatalogManage
+		return slices.Contains([]Permission{
+			PermissionIncidentRead, PermissionAuditRead, PermissionAuditExport, PermissionCatalogManage,
+			PermissionCredentialRevocationRead, PermissionCredentialRevocationRequeue, PermissionCredentialRevocationConfirm,
+		}, permission)
 	default:
 		return false
 	}
