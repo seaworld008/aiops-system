@@ -51,10 +51,11 @@ func (ring KeyRing) MarshalJSON() ([]byte, error) {
 }
 
 type ReferenceContext struct {
-	RevocationID string
-	ActionID     string
-	ActionEpoch  int64
-	Issuer       string
+	RevocationID   string
+	ActionID       string
+	ActionEpoch    int64
+	Issuer         string
+	IssuerRevision string
 }
 
 type ProtectedReference struct {
@@ -323,18 +324,21 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 
 func validReferenceContext(context ReferenceContext) bool {
 	return ValidRevocationID(context.RevocationID) && ValidIdentifier(context.ActionID, 256) &&
-		context.ActionEpoch > 0 && ValidOpaqueText(context.Issuer, 256)
+		context.ActionEpoch > 0 && ValidOpaqueText(context.Issuer, 256) &&
+		ValidIdentifier(context.IssuerRevision, 256)
 }
 
 func referenceAAD(context ReferenceContext) []byte {
-	buffer := bytes.NewBuffer(make([]byte, 0, len(context.RevocationID)+len(context.ActionID)+len(context.Issuer)+32))
-	writeAADField(buffer, "credential-reference.v1")
+	buffer := bytes.NewBuffer(make([]byte, 0,
+		len(context.RevocationID)+len(context.ActionID)+len(context.Issuer)+len(context.IssuerRevision)+36))
+	writeAADField(buffer, "credential-reference.v2")
 	writeAADField(buffer, context.RevocationID)
 	writeAADField(buffer, context.ActionID)
 	var epoch [8]byte
 	binary.BigEndian.PutUint64(epoch[:], uint64(context.ActionEpoch))
 	buffer.Write(epoch[:])
 	writeAADField(buffer, context.Issuer)
+	writeAADField(buffer, context.IssuerRevision)
 	return buffer.Bytes()
 }
 

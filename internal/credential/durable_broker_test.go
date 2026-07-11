@@ -83,7 +83,8 @@ func TestDurableBrokerIssuesOnlyAfterAnchoredInspectionAndActiveACK(t *testing.T
 		prepare: func(_ context.Context, request PrepareRequest) (PrepareResult, error) {
 			record("prepare")
 			if request.RevocationID != durableTestRevocationID || request.Fence != fence ||
-				request.Issuer != profile.IssuerID || request.CredentialExpiresAt != now.Add(profile.CredentialTTL) {
+				request.Issuer != profile.IssuerID || request.IssuerRevision != profile.Revision ||
+				request.CredentialExpiresAt != now.Add(profile.CredentialTTL) {
 				t.Fatalf("Prepare request = %#v", request)
 			}
 			return PrepareResult{
@@ -357,6 +358,14 @@ func TestDurableBrokerRejectsUnsafeProfileAndStaleIssuerResponses(t *testing.T) 
 			name: "anchor cannot change frozen issuer",
 			mutate: func(harness *durableBrokerHarness) {
 				harness.anchored.Issuer = "vault-attacker"
+			},
+			wantPrepareCalls: 1,
+			wantRevokeCalls:  1,
+		},
+		{
+			name: "anchor cannot change frozen issuer revision",
+			mutate: func(harness *durableBrokerHarness) {
+				harness.anchored.IssuerRevision = "rev-attacker"
 			},
 			wantPrepareCalls: 1,
 			wantRevokeCalls:  1,
@@ -1283,7 +1292,8 @@ func durablePreparedRevocation(now time.Time, selection DurableIssuerResolveRequ
 		ID: durableTestRevocationID, TenantID: "tenant-1", WorkspaceID: selection.WorkspaceID,
 		EnvironmentID: selection.EnvironmentID, ActionID: durableTestActionID, TargetKey: "database/inventory/orders",
 		RunnerID: durableTestFence().RunnerID, ActionLeaseEpoch: durableTestFence().Epoch,
-		Issuer: profile.IssuerID, ConnectorID: selection.ConnectorID, Permission: selection.Permission,
+		Issuer: profile.IssuerID, IssuerRevision: profile.Revision,
+		ConnectorID: selection.ConnectorID, Permission: selection.Permission,
 		Resource: selection.Resource, CredentialExpiresAt: now.Add(profile.CredentialTTL), Status: StatusPrepared,
 		CreatedAt: now, UpdatedAt: now, AvailableAt: now, Version: 1,
 	}

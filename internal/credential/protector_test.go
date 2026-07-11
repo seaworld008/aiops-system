@@ -22,10 +22,11 @@ func TestAESGCMProtectorRoundTripBindsContextAndUsesKeyedHMAC(t *testing.T) {
 		},
 	})
 	context := ReferenceContext{
-		RevocationID: "10000000-0000-4000-8000-000000000001",
-		ActionID:     "20000000-0000-4000-8000-000000000001",
-		ActionEpoch:  7,
-		Issuer:       "vault-production",
+		RevocationID:   "10000000-0000-4000-8000-000000000001",
+		ActionID:       "20000000-0000-4000-8000-000000000001",
+		ActionEpoch:    7,
+		Issuer:         "vault-production",
+		IssuerRevision: "rev-17",
 	}
 	plaintext := []byte("lease/accessor with spaces and unicode-租约")
 	reference, err := NewSensitiveReference(plaintext)
@@ -56,6 +57,11 @@ func TestAESGCMProtectorRoundTripBindsContextAndUsesKeyedHMAC(t *testing.T) {
 	if _, err := protector.Unprotect(wrongContext, protected); !errors.Is(err, ErrReferenceProtection) {
 		t.Fatalf("Unprotect(wrong AAD) error = %v, want ErrReferenceProtection", err)
 	}
+	wrongRevision := context
+	wrongRevision.IssuerRevision = "rev-18"
+	if _, err := protector.Unprotect(wrongRevision, protected); !errors.Is(err, ErrReferenceProtection) {
+		t.Fatalf("Unprotect(wrong issuer revision AAD) error = %v, want ErrReferenceProtection", err)
+	}
 
 	otherProtector := testProtector(t, "key-2026-07", map[string]ProtectionKey{
 		"key-2026-07": {
@@ -80,7 +86,7 @@ func TestAESGCMProtectorSupportsKeyRotationWithoutMutatingCallerKeys(t *testing.
 		RevocationID: "10000000-0000-4000-8000-000000000002",
 		ActionID:     "20000000-0000-4000-8000-000000000002",
 		ActionEpoch:  3,
-		Issuer:       "vault-production",
+		Issuer:       "vault-production", IssuerRevision: "rev-1",
 	}
 	secret, err := NewSensitiveReference([]byte("old-accessor"))
 	if err != nil {
@@ -254,10 +260,11 @@ func TestAESGCMProtectorRejectsMalformedKeysAndProtectedShape(t *testing.T) {
 		"key": {EncryptionKey: bytes.Repeat([]byte{1}, 32), HMACKey: bytes.Repeat([]byte{2}, 32)},
 	})
 	context := ReferenceContext{
-		RevocationID: "10000000-0000-4000-8000-000000000003",
-		ActionID:     "20000000-0000-4000-8000-000000000003",
-		ActionEpoch:  1,
-		Issuer:       "vault",
+		RevocationID:   "10000000-0000-4000-8000-000000000003",
+		ActionID:       "20000000-0000-4000-8000-000000000003",
+		ActionEpoch:    1,
+		Issuer:         "vault",
+		IssuerRevision: "rev-1",
 	}
 	if _, err := protector.Unprotect(context, ProtectedReference{KeyID: "key"}); !errors.Is(err, ErrReferenceProtection) {
 		t.Fatalf("Unprotect(malformed) error = %v", err)
@@ -276,7 +283,7 @@ func TestAESGCMProtectorDestroyIsConcurrentIdempotentAndFailsClosed(t *testing.T
 		RevocationID: "10000000-0000-4000-8000-000000000097",
 		ActionID:     "20000000-0000-4000-8000-000000000097",
 		ActionEpoch:  2,
-		Issuer:       "vault-production",
+		Issuer:       "vault-production", IssuerRevision: "rev-1",
 	}
 	reference, _ := NewSensitiveReference([]byte("destroy-race-accessor"))
 	protected, err := protector.Protect(context, reference)

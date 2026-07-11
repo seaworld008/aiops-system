@@ -12,6 +12,7 @@ func TestLoadUsesSafeDefaults(t *testing.T) {
 	t.Setenv("AIOPS_SHUTDOWN_TIMEOUT", "")
 	t.Setenv("AIOPS_ENVIRONMENT", "")
 	t.Setenv("AIOPS_WEBHOOK_HMAC_SECRETS_JSON", "")
+	t.Setenv("AIOPS_WRITE_EXECUTION_MODE", "")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -27,6 +28,9 @@ func TestLoadUsesSafeDefaults(t *testing.T) {
 	if cfg.Environment != "development" {
 		t.Fatalf("Environment = %q, want development", cfg.Environment)
 	}
+	if cfg.WriteExecutionMode != config.WriteExecutionModeDisabled {
+		t.Fatalf("WriteExecutionMode = %q, want %q", cfg.WriteExecutionMode, config.WriteExecutionModeDisabled)
+	}
 }
 
 func TestLoadRejectsInvalidShutdownTimeout(t *testing.T) {
@@ -35,6 +39,54 @@ func TestLoadRejectsInvalidShutdownTimeout(t *testing.T) {
 	_, err := config.Load()
 	if err == nil {
 		t.Fatal("Load() error = nil, want validation error")
+	}
+}
+
+func TestLoadAcceptsOnlySupportedWriteExecutionModes(t *testing.T) {
+	for _, testCase := range []struct {
+		input string
+		want  config.WriteExecutionMode
+	}{
+		{input: "disabled", want: config.WriteExecutionModeDisabled},
+		{input: "non-production", want: config.WriteExecutionModeNonProduction},
+	} {
+		t.Run(testCase.input, func(t *testing.T) {
+			t.Setenv("AIOPS_WRITE_EXECUTION_MODE", testCase.input)
+
+			cfg, err := config.Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.WriteExecutionMode != testCase.want {
+				t.Fatalf("WriteExecutionMode = %q, want %q", cfg.WriteExecutionMode, testCase.want)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsUnsupportedWriteExecutionModesWithoutNormalization(t *testing.T) {
+	for _, mode := range []string{
+		"production",
+		"prod",
+		"enabled",
+		"true",
+		"1",
+		"DISABLED",
+		"NON-PRODUCTION",
+		"Disabled",
+		"Non-Production",
+		" disabled",
+		"disabled ",
+		"\tdisabled",
+		"non-production\n",
+	} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("AIOPS_WRITE_EXECUTION_MODE", mode)
+
+			if _, err := config.Load(); err == nil {
+				t.Fatalf("Load() error = nil for AIOPS_WRITE_EXECUTION_MODE=%q, want fail-closed rejection", mode)
+			}
+		})
 	}
 }
 

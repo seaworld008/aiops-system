@@ -37,6 +37,7 @@ CREATE TABLE credential_revocations (
     action_lease_epoch bigint NOT NULL,
     action_lease_token_sha256 text NOT NULL,
     issuer text NOT NULL,
+    issuer_revision text NOT NULL,
     connector_id text NOT NULL,
     scope_permission text NOT NULL,
     scope_resource text NOT NULL,
@@ -58,6 +59,8 @@ CREATE TABLE credential_revocations (
     completed_claim_token_sha256 text,
     completed_claimed_by text,
     attempt integer NOT NULL DEFAULT 0,
+    retry_cycle_attempt_base integer NOT NULL DEFAULT 0,
+    retry_cycle_started_at timestamptz,
     failure_count integer NOT NULL DEFAULT 0,
     failure_code text,
     failure_detail_sha256 text,
@@ -88,7 +91,9 @@ CREATE TABLE credential_revocations (
         status IN ('PREPARED', 'ANCHORED', 'ACTIVE', 'REVOCATION_PENDING', 'REVOKING', 'REVOKED', 'MANUAL_REQUIRED', 'NO_CREDENTIAL')
     ),
     CONSTRAINT credential_revocations_epoch_counters_ck CHECK (
-        action_lease_epoch > 0 AND claim_epoch >= 0 AND attempt >= 0 AND failure_count >= 0 AND version > 0
+        action_lease_epoch > 0 AND claim_epoch >= 0 AND attempt >= 0 AND
+        retry_cycle_attempt_base >= 0 AND retry_cycle_attempt_base <= attempt AND
+        failure_count >= 0 AND version > 0
     ),
     CONSTRAINT credential_revocations_identifier_ck CHECK (
         octet_length(action_id) BETWEEN 1 AND 256 AND
@@ -103,6 +108,9 @@ CREATE TABLE credential_revocations (
     ),
     CONSTRAINT credential_revocations_metadata_ck CHECK (
         octet_length(issuer) BETWEEN 1 AND 256 AND
+        octet_length(issuer_revision) BETWEEN 1 AND 256 AND
+        left(issuer_revision, 1) COLLATE "C" ~ '^[A-Za-z0-9]$' AND
+        issuer_revision COLLATE "C" !~ '[^A-Za-z0-9._:/@-]' AND
         octet_length(connector_id) BETWEEN 1 AND 256 AND
         octet_length(scope_permission) BETWEEN 1 AND 256 AND
         octet_length(scope_resource) BETWEEN 1 AND 2048 AND
@@ -116,6 +124,9 @@ CREATE TABLE credential_revocations (
         credential_expires_at > created_at AND
         credential_expires_at <= created_at + interval '15 minutes' AND
         available_at > '-infinity'::timestamptz AND available_at < 'infinity'::timestamptz AND
+        (retry_cycle_started_at IS NULL OR (
+            retry_cycle_started_at > '-infinity'::timestamptz AND retry_cycle_started_at < 'infinity'::timestamptz
+        )) AND
         updated_at >= created_at
     ),
     CONSTRAINT credential_revocations_hashes_ck CHECK (
@@ -209,24 +220,29 @@ CREATE TABLE credential_revocations (
     CONSTRAINT credential_revocations_status_time_ck CHECK (
         (
             status = 'PREPARED' AND anchored_at IS NULL AND activated_at IS NULL AND
-            revocation_requested_at IS NULL AND manual_required_at IS NULL AND revoked_at IS NULL
+            revocation_requested_at IS NULL AND retry_cycle_started_at IS NULL AND
+            retry_cycle_attempt_base = 0 AND manual_required_at IS NULL AND revoked_at IS NULL
         ) OR (
             status = 'NO_CREDENTIAL' AND anchored_at IS NULL AND activated_at IS NULL AND
-            revocation_requested_at IS NULL AND manual_required_at IS NULL AND revoked_at IS NULL
+            revocation_requested_at IS NULL AND retry_cycle_started_at IS NULL AND
+            retry_cycle_attempt_base = 0 AND manual_required_at IS NULL AND revoked_at IS NULL
         ) OR (
             status = 'ANCHORED' AND anchored_at IS NOT NULL AND activated_at IS NULL AND
-            revocation_requested_at IS NULL AND manual_required_at IS NULL AND revoked_at IS NULL
+            revocation_requested_at IS NULL AND retry_cycle_started_at IS NULL AND
+            retry_cycle_attempt_base = 0 AND manual_required_at IS NULL AND revoked_at IS NULL
         ) OR (
             status = 'ACTIVE' AND anchored_at IS NOT NULL AND activated_at IS NOT NULL AND
-            revocation_requested_at IS NULL AND manual_required_at IS NULL AND revoked_at IS NULL
+            revocation_requested_at IS NULL AND retry_cycle_started_at IS NULL AND
+            retry_cycle_attempt_base = 0 AND manual_required_at IS NULL AND revoked_at IS NULL
         ) OR (
             status IN ('REVOCATION_PENDING', 'REVOKING') AND anchored_at IS NOT NULL AND
-            revocation_requested_at IS NOT NULL AND revoked_at IS NULL
+            revocation_requested_at IS NOT NULL AND retry_cycle_started_at IS NOT NULL AND revoked_at IS NULL
         ) OR (
             status = 'MANUAL_REQUIRED' AND anchored_at IS NOT NULL AND revocation_requested_at IS NOT NULL AND
-            manual_required_at IS NOT NULL AND revoked_at IS NULL
+            retry_cycle_started_at IS NOT NULL AND manual_required_at IS NOT NULL AND failure_count > 0 AND revoked_at IS NULL
         ) OR (
-            status = 'REVOKED' AND anchored_at IS NOT NULL AND revocation_requested_at IS NOT NULL AND revoked_at IS NOT NULL
+            status = 'REVOKED' AND anchored_at IS NOT NULL AND revocation_requested_at IS NOT NULL AND
+            retry_cycle_started_at IS NOT NULL AND revoked_at IS NOT NULL
         )
     ),
     CONSTRAINT credential_revocations_evidence_ck CHECK (
@@ -245,6 +261,15 @@ CREATE INDEX credential_revocations_expired_claim_idx
 CREATE INDEX credential_revocations_prepared_recovery_idx
     ON credential_revocations (credential_expires_at, revocation_id)
     WHERE status = 'PREPARED';
+
+CREATE INDEX credential_revocations_managed_recovery_idx
+    ON credential_revocations ((COALESCE(activated_at, anchored_at)), revocation_id)
+    WHERE status IN ('ANCHORED', 'ACTIVE');
+
+CREATE INDEX credential_revocations_exhausted_recovery_idx
+    ON credential_revocations (retry_cycle_started_at, revocation_id)
+    INCLUDE (attempt, retry_cycle_attempt_base, claim_expires_at)
+    WHERE status IN ('REVOCATION_PENDING', 'REVOKING');
 
 CREATE OR REPLACE FUNCTION enforce_credential_revocation_transition() RETURNS trigger AS $$
 BEGIN
@@ -269,10 +294,27 @@ BEGIN
        OR NEW.updated_at < OLD.updated_at
        OR NEW.claim_epoch < OLD.claim_epoch
        OR NEW.attempt < OLD.attempt
+       OR NEW.retry_cycle_attempt_base < OLD.retry_cycle_attempt_base
        OR NEW.failure_count < OLD.failure_count THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000',
             MESSAGE = 'credential revocation counters and time must advance monotonically';
+    END IF;
+
+    IF (
+        OLD.retry_cycle_attempt_base IS DISTINCT FROM NEW.retry_cycle_attempt_base OR
+        OLD.retry_cycle_started_at IS DISTINCT FROM NEW.retry_cycle_started_at
+    ) AND NOT (
+        OLD.status IN ('ANCHORED', 'ACTIVE', 'MANUAL_REQUIRED') AND
+        NEW.status = 'REVOCATION_PENDING' AND
+        NEW.retry_cycle_attempt_base = OLD.attempt AND
+        NEW.retry_cycle_started_at IS NOT NULL AND
+        NEW.retry_cycle_started_at >= OLD.updated_at AND
+        NEW.retry_cycle_started_at <= clock_timestamp()
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'credential revocation retry cycle may only reset after authorization loss or manual repair';
     END IF;
 
     IF OLD.child_create_authorized_at IS NOT NULL AND (
@@ -293,7 +335,31 @@ BEGIN
             MESSAGE = 'credential child creation may only be authorized once from PREPARED';
     END IF;
 
+    IF OLD.status = 'REVOKING' AND NEW.status = 'REVOCATION_PENDING' AND (
+        OLD.attempt - OLD.retry_cycle_attempt_base >= 12 OR
+        OLD.retry_cycle_started_at <= clock_timestamp() - interval '2 hours'
+    ) THEN
+        NEW.status := 'MANUAL_REQUIRED';
+        NEW.available_at := OLD.available_at;
+        NEW.manual_required_at := clock_timestamp();
+    END IF;
+
     IF OLD.status = NEW.status THEN
+        IF (
+            NEW.claim_epoch IS DISTINCT FROM OLD.claim_epoch OR
+            NEW.attempt IS DISTINCT FROM OLD.attempt
+        ) AND NOT (
+            OLD.status = 'REVOKING' AND
+            OLD.claim_expires_at <= clock_timestamp() AND
+            OLD.attempt - OLD.retry_cycle_attempt_base < 12 AND
+            OLD.retry_cycle_started_at > clock_timestamp() - interval '2 hours' AND
+            NEW.claim_epoch = OLD.claim_epoch + 1 AND
+            NEW.attempt = OLD.attempt + 1
+        ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'credential revocation may only reclaim an expired non-exhausted claim';
+        END IF;
         RETURN NEW;
     END IF;
 
@@ -305,8 +371,18 @@ BEGIN
         )) OR
         (OLD.status = 'ANCHORED' AND NEW.status IN ('ACTIVE', 'REVOCATION_PENDING')) OR
         (OLD.status = 'ACTIVE' AND NEW.status = 'REVOCATION_PENDING') OR
-        (OLD.status = 'REVOCATION_PENDING' AND NEW.status = 'REVOKING') OR
-        (OLD.status = 'REVOKING' AND NEW.status IN ('REVOCATION_PENDING', 'MANUAL_REQUIRED', 'REVOKED')) OR
+        (OLD.status = 'REVOCATION_PENDING' AND NEW.status = 'REVOKING' AND
+            OLD.attempt - OLD.retry_cycle_attempt_base < 12 AND
+            OLD.retry_cycle_started_at > clock_timestamp() - interval '2 hours' AND
+            NEW.claim_epoch = OLD.claim_epoch + 1 AND NEW.attempt = OLD.attempt + 1) OR
+        (OLD.status = 'REVOCATION_PENDING' AND NEW.status = 'MANUAL_REQUIRED' AND (
+            OLD.attempt - OLD.retry_cycle_attempt_base >= 12 OR
+            OLD.retry_cycle_started_at <= clock_timestamp() - interval '2 hours'
+        )) OR
+        (OLD.status = 'REVOKING' AND NEW.status = 'REVOCATION_PENDING' AND
+            OLD.attempt - OLD.retry_cycle_attempt_base < 12 AND
+            OLD.retry_cycle_started_at > clock_timestamp() - interval '2 hours') OR
+        (OLD.status = 'REVOKING' AND NEW.status IN ('MANUAL_REQUIRED', 'REVOKED')) OR
         (OLD.status = 'MANUAL_REQUIRED' AND NEW.status IN ('REVOCATION_PENDING', 'REVOKED'))
     ) THEN
         RAISE EXCEPTION USING
@@ -335,6 +411,7 @@ BEGIN
        OR OLD.action_lease_token_sha256 IS DISTINCT FROM NEW.action_lease_token_sha256
        OR OLD.child_create_permit_sha256 IS DISTINCT FROM NEW.child_create_permit_sha256
        OR OLD.issuer IS DISTINCT FROM NEW.issuer
+       OR OLD.issuer_revision IS DISTINCT FROM NEW.issuer_revision
        OR OLD.connector_id IS DISTINCT FROM NEW.connector_id
        OR OLD.scope_permission IS DISTINCT FROM NEW.scope_permission
        OR OLD.scope_resource IS DISTINCT FROM NEW.scope_resource

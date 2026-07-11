@@ -23,12 +23,13 @@ import (
 const revocationProjection = `
 	revocation_id::text, tenant_id::text, workspace_id::text, environment_id::text,
 	action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-	issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+	issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
 	child_create_permit_sha256, child_create_authorized_at, child_create_ttl_seconds, status,
 	accessor_ciphertext, accessor_hmac, encryption_key_id,
 	claim_epoch, claimed_by, claim_token_sha256, claimed_at, claim_expires_at, last_heartbeat_at,
 	completed_claim_epoch, completed_claim_token_sha256, completed_claimed_by,
-	attempt, failure_count, failure_code, failure_detail_sha256, available_at, evidence_hash,
+	attempt, retry_cycle_attempt_base, retry_cycle_started_at,
+	failure_count, failure_code, failure_detail_sha256, available_at, evidence_hash,
 	anchored_at, activated_at, revocation_requested_at, manual_required_at, revoked_at,
 	version, created_at, updated_at
 `
@@ -62,6 +63,8 @@ type storedRevocation struct {
 	childCreatePermitSHA256   string
 	childCreateAuthorizedAt   time.Time
 	childCreateTTL            time.Duration
+	retryCycleAttemptBase     int
+	retryCycleStartedAt       time.Time
 	claimTokenSHA256          string
 	completedClaimEpoch       int64
 	completedClaimTokenSHA256 string
@@ -101,7 +104,8 @@ func (repository *Repository) Prepare(ctx context.Context, request credential.Pr
 	}
 	request.CredentialExpiresAt = credential.CanonicalCredentialExpiry(request.CredentialExpiresAt)
 	if !credential.ValidRevocationID(request.RevocationID) || !credential.ValidActionFence(request.Fence) ||
-		!credential.ValidOpaqueText(request.Issuer, 256) || request.CredentialExpiresAt.IsZero() {
+		!credential.ValidOpaqueText(request.Issuer, 256) || !credential.ValidIdentifier(request.IssuerRevision, 256) ||
+		request.CredentialExpiresAt.IsZero() {
 		return credential.PrepareResult{}, credential.ErrInvalidRevocationRequest
 	}
 	tx, err := repository.database.Begin(ctx)
@@ -172,14 +176,15 @@ func (repository *Repository) Prepare(ctx context.Context, request credential.Pr
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
 			child_create_permit_sha256
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		ON CONFLICT (action_id, action_lease_epoch) DO NOTHING
 		RETURNING status, available_at, created_at, updated_at, version
 	`, request.RevocationID, metadata.TenantID, metadata.WorkspaceID, metadata.EnvironmentID,
 		metadata.ActionID, metadata.TargetKey, metadata.Production, metadata.RunnerID, metadata.LeaseEpoch, tokenDigest,
-		request.Issuer, metadata.ConnectorID, metadata.Permission, metadata.Resource, request.CredentialExpiresAt, permitDigest,
+		request.Issuer, request.IssuerRevision, metadata.ConnectorID, metadata.Permission, metadata.Resource,
+		request.CredentialExpiresAt, permitDigest,
 	).Scan(&status, &availableAt, &createdAt, &updatedAt, &version)
 	if errors.Is(err, pgx.ErrNoRows) {
 		existing, getErr := selectStored(ctx, tx, `
@@ -204,7 +209,7 @@ func (repository *Repository) Prepare(ctx context.Context, request credential.Pr
 		ID: request.RevocationID, TenantID: metadata.TenantID, WorkspaceID: metadata.WorkspaceID,
 		EnvironmentID: metadata.EnvironmentID, ActionID: metadata.ActionID, TargetKey: metadata.TargetKey,
 		Production: metadata.Production, RunnerID: metadata.RunnerID, ActionLeaseEpoch: metadata.LeaseEpoch,
-		Issuer: request.Issuer, ConnectorID: metadata.ConnectorID,
+		Issuer: request.Issuer, IssuerRevision: request.IssuerRevision, ConnectorID: metadata.ConnectorID,
 		Permission: metadata.Permission, Resource: metadata.Resource, CredentialExpiresAt: request.CredentialExpiresAt,
 		Status: credential.RevocationStatus(status), AvailableAt: availableAt.UTC(), CreatedAt: createdAt.UTC(),
 		UpdatedAt: updatedAt.UTC(), Version: version,
@@ -499,11 +504,13 @@ func sameResolvedActionScope(left, right credential.ActionMetadata) bool {
 
 func writeStateChange(ctx context.Context, tx pgx.Tx, revocation credential.Revocation, actorType, actorID, auditAction, eventType string) error {
 	payload := map[string]any{
-		"revocation_id": revocation.ID,
-		"action_id":     revocation.ActionID,
-		"workspace_id":  revocation.WorkspaceID,
-		"issuer":        revocation.Issuer,
-		"attempt":       revocation.Attempt,
+		"revocation_id":   revocation.ID,
+		"action_id":       revocation.ActionID,
+		"workspace_id":    revocation.WorkspaceID,
+		"issuer":          revocation.Issuer,
+		"issuer_revision": revocation.IssuerRevision,
+		"attempt":         revocation.Attempt,
+		"failure_count":   revocation.FailureCount,
 	}
 	if revocation.FailureCode != "" {
 		payload["failure_code"] = revocation.FailureCode
@@ -604,7 +611,7 @@ func (repository *Repository) RecordAnchor(ctx context.Context, request credenti
 				current = storedInspectionFenceCurrent(record, inspection, finalNow, credential.MinPostChildFenceWindow, registrationCurrent)
 			}
 			if !current {
-				record, err = repository.requestInvalidatedAnchor(ctx, tx, record.revocation.ID, request.Fence.RunnerID)
+				record, err = repository.requestInvalidatedAnchor(ctx, tx, record.revocation.ID, "RUNNER", request.Fence.RunnerID)
 				if err != nil {
 					return credential.Revocation{}, err
 				}
@@ -644,7 +651,7 @@ func (repository *Repository) RecordAnchor(ctx context.Context, request credenti
 		current = storedInspectionFenceCurrent(record, inspection, finalNow, credential.MinPostChildFenceWindow, registrationCurrent)
 	}
 	if !current {
-		record, err = repository.requestInvalidatedAnchor(ctx, tx, record.revocation.ID, request.Fence.RunnerID)
+		record, err = repository.requestInvalidatedAnchor(ctx, tx, record.revocation.ID, "RUNNER", request.Fence.RunnerID)
 		if err != nil {
 			return credential.Revocation{}, err
 		}
@@ -659,12 +666,13 @@ func (repository *Repository) RecordAnchor(ctx context.Context, request credenti
 func (repository *Repository) requestInvalidatedAnchor(
 	ctx context.Context,
 	tx pgx.Tx,
-	revocationID, actorID string,
+	revocationID, actorType, actorID string,
 ) (*storedRevocation, error) {
 	record, err := selectStored(ctx, tx, `
 		UPDATE credential_revocations
 		SET status = 'REVOCATION_PENDING', available_at = statement_timestamp(),
 			revocation_requested_at = statement_timestamp(), updated_at = statement_timestamp(),
+			retry_cycle_attempt_base = attempt, retry_cycle_started_at = statement_timestamp(),
 			version = version + 1
 		WHERE revocation_id = $1 AND status IN ('ANCHORED', 'ACTIVE')
 		RETURNING `+revocationProjection,
@@ -672,7 +680,7 @@ func (repository *Repository) requestInvalidatedAnchor(
 	if err != nil {
 		return nil, mapTransitionError("request invalidated anchored credential revocation", err)
 	}
-	if err := writeStateChange(ctx, tx, record.revocation, "RUNNER", actorID,
+	if err := writeStateChange(ctx, tx, record.revocation, actorType, actorID,
 		"credential.revocation.requested", "credential.revocation.requested.v1"); err != nil {
 		return nil, err
 	}
@@ -802,14 +810,14 @@ func (repository *Repository) Activate(ctx context.Context, request credential.A
 				return credential.Revocation{}, err
 			}
 		} else {
-			record, err = repository.requestInvalidatedAnchor(ctx, tx, record.revocation.ID, request.Fence.RunnerID)
+			record, err = repository.requestInvalidatedAnchor(ctx, tx, record.revocation.ID, "RUNNER", request.Fence.RunnerID)
 			if err != nil {
 				return credential.Revocation{}, err
 			}
 		}
 	case credential.StatusActive:
 		if !current {
-			record, err = repository.requestInvalidatedAnchor(ctx, tx, record.revocation.ID, request.Fence.RunnerID)
+			record, err = repository.requestInvalidatedAnchor(ctx, tx, record.revocation.ID, "RUNNER", request.Fence.RunnerID)
 			if err != nil {
 				return credential.Revocation{}, err
 			}
@@ -827,7 +835,7 @@ func (repository *Repository) Activate(ctx context.Context, request credential.A
 			return credential.Revocation{}, timeErr
 		}
 		if !storedInspectionFenceCurrent(record, inspection, finalNow, credential.MinPostChildFenceWindow, registrationCurrent) {
-			record, err = repository.requestInvalidatedAnchor(ctx, tx, record.revocation.ID, request.Fence.RunnerID)
+			record, err = repository.requestInvalidatedAnchor(ctx, tx, record.revocation.ID, "RUNNER", request.Fence.RunnerID)
 			if err != nil {
 				return credential.Revocation{}, err
 			}
@@ -917,6 +925,259 @@ func (repository *Repository) RecoverPrepared(
 	return recovered, nil
 }
 
+type managedRecoveryCandidate struct {
+	revocationID string
+	actionID     string
+	runnerID     string
+	managedAt    time.Time
+}
+
+// RecoverManaged deliberately scans candidates without taking credential row
+// locks. Each candidate is then rechecked under the global authorization lock
+// order: runner registration -> action -> exact scope -> credential.
+func (repository *Repository) RecoverManaged(
+	ctx context.Context,
+	request credential.RecoverManagedRequest,
+) ([]credential.Revocation, error) {
+	if err := validateContext(ctx); err != nil {
+		return nil, err
+	}
+	if request.Limit < 1 || request.Limit > credential.MaxRevocationClaimBatch {
+		return nil, credential.ErrInvalidRevocationRequest
+	}
+	rows, err := repository.database.Query(ctx, `
+		SELECT credential.revocation_id::text, credential.action_id, credential.runner_id,
+			COALESCE(credential.activated_at, credential.anchored_at) AS managed_at
+		FROM credential_revocations AS credential
+		WHERE credential.status IN ('ANCHORED', 'ACTIVE')
+		  AND (
+			(
+				credential.status = 'ANCHORED' AND
+				credential.anchored_at <= clock_timestamp() - make_interval(secs => $2::double precision)
+			) OR NOT EXISTS (
+				SELECT 1
+				FROM action_queue AS action
+				JOIN runner_registrations AS registration
+				  ON registration.runner_id = credential.runner_id
+				 AND registration.tenant_id = credential.tenant_id
+				WHERE action.action_id = credential.action_id
+				  AND action.status = 'RUNNING' AND action.cancel_requested_at IS NULL
+				  AND action.runner_id = credential.runner_id
+				  AND action.lease_epoch = credential.action_lease_epoch
+				  AND action.lease_token_sha256 = credential.action_lease_token_sha256
+				  AND action.runner_tenant_id = credential.tenant_id
+				  AND action.runner_workspace_id = credential.workspace_id
+				  AND action.runner_environment_id = credential.environment_id
+				  AND action.target_key = credential.target_key
+				  AND action.production = credential.production
+				  AND action.runner_pool = 'WRITE'
+				  AND action.scope_revision > 0
+				  AND action.envelope #>> '{credential_scope,connector_id}' = credential.connector_id
+				  AND action.envelope #>> '{credential_scope,permission}' = credential.scope_permission
+				  AND action.envelope #>> '{credential_scope,resource}' = credential.scope_resource
+				  AND action.lease_expires_at > clock_timestamp() + make_interval(secs => $3::double precision)
+				  AND action.authorization_expires_at > clock_timestamp() + make_interval(secs => $3::double precision)
+				  AND credential.credential_expires_at > clock_timestamp() + make_interval(secs => $3::double precision)
+				  AND registration.enabled AND registration.runner_pool = 'WRITE'
+				  AND registration.scope_revision = action.scope_revision
+				  AND EXISTS (
+					SELECT 1 FROM runner_scope_bindings AS binding
+					WHERE binding.runner_id = credential.runner_id
+					  AND binding.tenant_id = credential.tenant_id
+					  AND binding.workspace_id = credential.workspace_id
+					  AND binding.environment_id = credential.environment_id
+				  )
+			)
+		  )
+		ORDER BY managed_at, revocation_id
+		LIMIT $1
+	`, request.Limit, credential.ManagedAnchorRecoveryGrace.Seconds(), credential.MinPostChildFenceWindow.Seconds())
+	if err != nil {
+		return nil, databaseError("select managed credential recovery candidates", err)
+	}
+	candidates := make([]managedRecoveryCandidate, 0, request.Limit)
+	for rows.Next() {
+		var candidate managedRecoveryCandidate
+		if scanErr := rows.Scan(&candidate.revocationID, &candidate.actionID, &candidate.runnerID, &candidate.managedAt); scanErr != nil {
+			rows.Close()
+			return nil, databaseError("scan managed credential recovery candidate", scanErr)
+		}
+		candidate.managedAt = candidate.managedAt.UTC()
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, databaseError("read managed credential recovery candidates", err)
+	}
+	rows.Close()
+
+	recovered := make([]credential.Revocation, 0, len(candidates))
+	for _, candidate := range candidates {
+		revocation, transitioned, recoverErr := repository.recoverManagedCandidate(ctx, candidate)
+		if recoverErr != nil {
+			return recovered, recoverErr
+		}
+		if transitioned {
+			recovered = append(recovered, revocation)
+		}
+	}
+	return recovered, nil
+}
+
+func (repository *Repository) recoverManagedCandidate(
+	ctx context.Context,
+	candidate managedRecoveryCandidate,
+) (credential.Revocation, bool, error) {
+	tx, err := repository.database.Begin(ctx)
+	if err != nil {
+		return credential.Revocation{}, false, databaseError("begin managed credential recovery", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	inspection, _, registrationCurrent, err := inspectAction(ctx, tx, candidate.actionID, candidate.runnerID)
+	if err != nil {
+		return credential.Revocation{}, false, err
+	}
+	record, err := selectStored(ctx, tx, `
+		SELECT `+revocationProjection+`
+		FROM credential_revocations
+		WHERE revocation_id = $1
+		FOR UPDATE
+	`, candidate.revocationID)
+	if err != nil {
+		return credential.Revocation{}, false, mapReadError("lock managed credential recovery candidate", err)
+	}
+	if record.revocation.Status != credential.StatusAnchored && record.revocation.Status != credential.StatusActive {
+		if err := tx.Commit(ctx); err != nil {
+			return credential.Revocation{}, false, databaseError("commit idempotent managed credential recovery", err)
+		}
+		committed = true
+		return credential.Revocation{}, false, nil
+	}
+	currentTime, err := databaseClockTime(ctx, tx)
+	if err != nil {
+		return credential.Revocation{}, false, err
+	}
+	current := storedInspectionScopeMatches(record, inspection.Metadata) &&
+		storedInspectionFenceCurrent(record, inspection, currentTime, credential.MinPostChildFenceWindow, registrationCurrent)
+	if record.revocation.Status == credential.StatusAnchored && current &&
+		!record.revocation.AnchoredAt.Add(credential.ManagedAnchorRecoveryGrace).After(currentTime) {
+		current = false
+	}
+	if current {
+		if err := tx.Commit(ctx); err != nil {
+			return credential.Revocation{}, false, databaseError("commit current managed credential recovery", err)
+		}
+		committed = true
+		return credential.Revocation{}, false, nil
+	}
+	record, err = repository.requestInvalidatedAnchor(
+		ctx, tx, record.revocation.ID, "SYSTEM", "credential-managed-recovery",
+	)
+	if err != nil {
+		return credential.Revocation{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return credential.Revocation{}, false, databaseError("commit managed credential recovery", err)
+	}
+	committed = true
+	return publicRevocation(record), true, nil
+}
+
+func (repository *Repository) RecoverExhausted(
+	ctx context.Context,
+	request credential.RecoverExhaustedRequest,
+) ([]credential.Revocation, error) {
+	if err := validateContext(ctx); err != nil {
+		return nil, err
+	}
+	if request.Limit < 1 || request.Limit > credential.MaxRevocationClaimBatch {
+		return nil, credential.ErrInvalidRevocationRequest
+	}
+	tx, err := repository.database.Begin(ctx)
+	if err != nil {
+		return nil, databaseError("begin exhausted credential recovery", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	rows, err := tx.Query(ctx, `
+		SELECT `+revocationProjection+`
+		FROM credential_revocations
+		WHERE (
+			status = 'REVOCATION_PENDING'
+			OR (status = 'REVOKING' AND claim_expires_at <= clock_timestamp())
+		)
+		  AND (
+			attempt - retry_cycle_attempt_base >= $2
+			OR retry_cycle_started_at <= clock_timestamp() - make_interval(secs => $3::double precision)
+		  )
+		ORDER BY retry_cycle_started_at, revocation_id
+		FOR UPDATE SKIP LOCKED
+		LIMIT $1
+	`, request.Limit, credential.MaxRevocationAttempts, credential.MaxRevocationElapsed.Seconds())
+	if err != nil {
+		return nil, databaseError("select exhausted credential revocations", err)
+	}
+	candidates := make([]*storedRevocation, 0, request.Limit)
+	for rows.Next() {
+		record, scanErr := scanStored(rows)
+		if scanErr != nil {
+			rows.Close()
+			return nil, databaseError("scan exhausted credential revocation", scanErr)
+		}
+		candidates = append(candidates, record)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, databaseError("read exhausted credential revocations", err)
+	}
+	rows.Close()
+	detailHash := credential.SHA256Hex([]byte(credential.FailureDetailExhaustedWithoutAck))
+	recovered := make([]credential.Revocation, 0, len(candidates))
+	for _, candidate := range candidates {
+		record, updateErr := selectStored(ctx, tx, `
+			UPDATE credential_revocations
+			SET status = 'MANUAL_REQUIRED',
+				claimed_by = NULL, claim_token_sha256 = NULL, claimed_at = NULL,
+				claim_expires_at = NULL, last_heartbeat_at = NULL,
+				failure_count = failure_count + 1, failure_code = $2, failure_detail_sha256 = $3,
+				manual_required_at = clock_timestamp(), updated_at = clock_timestamp(), version = version + 1
+			WHERE revocation_id = $1
+			  AND (
+				status = 'REVOCATION_PENDING'
+				OR (status = 'REVOKING' AND claim_expires_at <= clock_timestamp())
+			  )
+			  AND (
+				attempt - retry_cycle_attempt_base >= $4
+				OR retry_cycle_started_at <= clock_timestamp() - make_interval(secs => $5::double precision)
+			  )
+			RETURNING `+revocationProjection,
+			candidate.revocation.ID, string(credential.FailureUnknown), detailHash,
+			credential.MaxRevocationAttempts, credential.MaxRevocationElapsed.Seconds())
+		if updateErr != nil {
+			return nil, mapTransitionError("recover exhausted credential revocation", updateErr)
+		}
+		if err := writeStateChange(ctx, tx, record.revocation, "SYSTEM", "credential-revocation-recovery",
+			"credential.revocation.manual_required", "credential.revocation.manual_required.v1"); err != nil {
+			return nil, err
+		}
+		recovered = append(recovered, publicRevocation(record))
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, databaseError("commit exhausted credential recovery", err)
+	}
+	committed = true
+	return recovered, nil
+}
+
 func (repository *Repository) RequestRevocation(ctx context.Context, request credential.ActionTransitionRequest) (credential.Revocation, error) {
 	return repository.actionTransition(ctx, request, transitionRequestRevocation)
 }
@@ -985,6 +1246,7 @@ func (repository *Repository) actionTransition(ctx context.Context, request cred
 				UPDATE credential_revocations
 				SET status = 'REVOCATION_PENDING', available_at = statement_timestamp(),
 					revocation_requested_at = statement_timestamp(), updated_at = statement_timestamp(),
+					retry_cycle_attempt_base = attempt, retry_cycle_started_at = statement_timestamp(),
 					version = version + 1
 				WHERE revocation_id = $1
 				RETURNING ` + revocationProjection
@@ -1048,12 +1310,16 @@ func (repository *Repository) ClaimRevocations(ctx context.Context, request cred
 	rows, err := tx.Query(ctx, `
 		SELECT `+revocationProjection+`
 		FROM credential_revocations
-		WHERE (status = 'REVOCATION_PENDING' AND available_at <= statement_timestamp())
-		   OR (status = 'REVOKING' AND claim_expires_at <= statement_timestamp())
+		WHERE (
+			(status = 'REVOCATION_PENDING' AND available_at <= clock_timestamp())
+			OR (status = 'REVOKING' AND claim_expires_at <= clock_timestamp())
+		)
+		  AND attempt - retry_cycle_attempt_base < $2
+		  AND retry_cycle_started_at > clock_timestamp() - make_interval(secs => $3::double precision)
 		ORDER BY available_at, created_at, revocation_id
 		FOR UPDATE SKIP LOCKED
 		LIMIT $1
-	`, request.Limit)
+	`, request.Limit, credential.MaxRevocationAttempts, credential.MaxRevocationElapsed.Seconds())
 	if err != nil {
 		return nil, databaseError("select credential revocation claims", err)
 	}
@@ -1079,40 +1345,70 @@ func (repository *Repository) ClaimRevocations(ctx context.Context, request cred
 		if tokenErr != nil || !credential.ValidOpaqueText(token, 4096) {
 			return nil, fmt.Errorf("generate credential revocation claim token: %w", credential.ErrInvalidRevocationRequest)
 		}
-		accessor, openErr := repository.protector.Unprotect(referenceContext(record.revocation), record.protected)
-		if openErr != nil {
-			return nil, credential.ErrReferenceProtection
+		digest := credential.SHA256Hex([]byte(token))
+		updated, updateErr := selectStored(ctx, tx, `
+			UPDATE credential_revocations
+			SET status = 'REVOKING', claim_epoch = claim_epoch + 1,
+				claimed_by = $2, claim_token_sha256 = $3,
+				claimed_at = clock_timestamp(), last_heartbeat_at = clock_timestamp(),
+				claim_expires_at = clock_timestamp() + make_interval(secs => $4::double precision),
+				attempt = attempt + 1, updated_at = clock_timestamp(), version = version + 1
+			WHERE revocation_id = $1 AND claim_epoch < 9223372036854775807
+			  AND (
+				(status = 'REVOCATION_PENDING' AND available_at <= clock_timestamp())
+				OR (status = 'REVOKING' AND claim_expires_at <= clock_timestamp())
+			  )
+			  AND attempt - retry_cycle_attempt_base < $5
+			  AND retry_cycle_started_at > clock_timestamp() - make_interval(secs => $6::double precision)
+			RETURNING `+revocationProjection,
+			record.revocation.ID, request.WorkerID, digest, request.LeaseDuration.Seconds(),
+			credential.MaxRevocationAttempts, credential.MaxRevocationElapsed.Seconds())
+		if updateErr != nil {
+			return nil, mapTransitionError("claim credential revocation", updateErr)
 		}
-		prepared = append(prepared, preparedClaim{record: record, token: token, accessor: accessor})
+		if err := writeStateChange(ctx, tx, updated.revocation, "SYSTEM", request.WorkerID,
+			"credential.revocation.claimed", "credential.revocation.claimed.v1"); err != nil {
+			return nil, err
+		}
+		accessor, openErr := repository.protector.Unprotect(referenceContext(updated.revocation), updated.protected)
+		poison := openErr != nil || !credential.ValidSensitiveReference(accessor)
+		if poison {
+			if accessor != nil {
+				accessor.Destroy()
+			}
+			detailHash := credential.SHA256Hex([]byte(credential.FailureDetailProtectedRefInvalid))
+			quarantined, quarantineErr := selectStored(ctx, tx, `
+				UPDATE credential_revocations
+				SET status = 'MANUAL_REQUIRED',
+					claimed_by = NULL, claim_token_sha256 = NULL, claimed_at = NULL,
+					claim_expires_at = NULL, last_heartbeat_at = NULL,
+					failure_count = failure_count + 1, failure_code = $5, failure_detail_sha256 = $6,
+					manual_required_at = clock_timestamp(), updated_at = clock_timestamp(), version = version + 1
+				WHERE revocation_id = $1 AND claimed_by = $2 AND claim_token_sha256 = $3
+				  AND claim_epoch = $4 AND status = 'REVOKING'
+				RETURNING `+revocationProjection,
+				updated.revocation.ID, request.WorkerID, digest, updated.revocation.ClaimEpoch,
+				string(credential.FailureInvalidReference), detailHash)
+			if quarantineErr != nil {
+				return nil, mapTransitionError("quarantine invalid credential reference", quarantineErr)
+			}
+			if err := writeStateChange(ctx, tx, quarantined.revocation, "SYSTEM", request.WorkerID,
+				"credential.revocation.manual_required", "credential.revocation.manual_required.v1"); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		prepared = append(prepared, preparedClaim{record: updated, token: token, accessor: accessor})
 	}
 
 	claims := make([]credential.ClaimedRevocation, 0, len(prepared))
 	for index := range prepared {
 		item := &prepared[index]
-		digest := credential.SHA256Hex([]byte(item.token))
-		updated, updateErr := selectStored(ctx, tx, `
-			UPDATE credential_revocations
-			SET status = 'REVOKING', claim_epoch = claim_epoch + 1,
-				claimed_by = $2, claim_token_sha256 = $3,
-				claimed_at = statement_timestamp(), last_heartbeat_at = statement_timestamp(),
-				claim_expires_at = statement_timestamp() + make_interval(secs => $4::double precision),
-				attempt = attempt + 1, updated_at = statement_timestamp(), version = version + 1
-			WHERE revocation_id = $1 AND claim_epoch < 9223372036854775807
-			RETURNING `+revocationProjection,
-			item.record.revocation.ID, request.WorkerID, digest, request.LeaseDuration.Seconds())
-		if updateErr != nil {
-			return nil, mapTransitionError("claim credential revocation", updateErr)
-		}
-		item.record = updated
-		if err := writeStateChange(ctx, tx, updated.revocation, "SYSTEM", request.WorkerID,
-			"credential.revocation.claimed", "credential.revocation.claimed.v1"); err != nil {
-			return nil, err
-		}
 		claims = append(claims, credential.ClaimedRevocation{
-			Revocation: publicRevocation(updated),
+			Revocation: publicRevocation(item.record),
 			Fence: credential.ClaimFence{
-				RevocationID: updated.revocation.ID, WorkerID: request.WorkerID,
-				Token: item.token, Epoch: updated.revocation.ClaimEpoch,
+				RevocationID: item.record.revocation.ID, WorkerID: request.WorkerID,
+				Token: item.token, Epoch: item.record.revocation.ClaimEpoch,
 			},
 			Accessor: item.accessor,
 		})
@@ -1220,7 +1516,8 @@ func (repository *Repository) CompleteRevocation(ctx context.Context, request cr
 }
 
 func (repository *Repository) RetryRevocation(ctx context.Context, request credential.RetryRevocationRequest) (credential.Revocation, error) {
-	if request.Delay < 0 || request.Delay > credential.MaxRevocationRetryDelay || !credential.ValidFailure(request.FailureCode, request.FailureDetail) {
+	if request.Delay < credential.MinRevocationRetryDelay || request.Delay > credential.MaxRevocationRetryDelay ||
+		!credential.ValidFailure(request.FailureCode, request.FailureDetail) {
 		return credential.Revocation{}, credential.ErrInvalidRevocationRequest
 	}
 	return repository.failClaim(ctx, request.Fence, request.FailureCode, request.FailureDetail, request.Delay, false)
@@ -1260,28 +1557,44 @@ func (repository *Repository) failClaim(ctx context.Context, fence credential.Cl
 				claimed_by = NULL, claim_token_sha256 = NULL, claimed_at = NULL,
 				claim_expires_at = NULL, last_heartbeat_at = NULL,
 				failure_count = failure_count + 1, failure_code = $5, failure_detail_sha256 = $6,
-				manual_required_at = statement_timestamp(), updated_at = statement_timestamp(), version = version + 1
+				manual_required_at = clock_timestamp(), updated_at = clock_timestamp(), version = version + 1
 			WHERE revocation_id = $1 AND claimed_by = $2 AND claim_token_sha256 = $3 AND claim_epoch = $4
-			  AND status = 'REVOKING' AND claim_expires_at > statement_timestamp()
+			  AND status = 'REVOKING' AND claim_expires_at > clock_timestamp()
 			RETURNING ` + revocationProjection
 		auditAction, eventType = "credential.revocation.manual_required", "credential.revocation.manual_required.v1"
 	} else {
 		query = `
 			UPDATE credential_revocations
-			SET status = 'REVOCATION_PENDING',
+			SET status = CASE
+					WHEN attempt - retry_cycle_attempt_base >= $8
+					  OR retry_cycle_started_at <= clock_timestamp() - make_interval(secs => $9::double precision)
+					THEN 'MANUAL_REQUIRED'
+					ELSE 'REVOCATION_PENDING'
+				END,
 				claimed_by = NULL, claim_token_sha256 = NULL, claimed_at = NULL,
 				claim_expires_at = NULL, last_heartbeat_at = NULL,
 				failure_count = failure_count + 1, failure_code = $5, failure_detail_sha256 = $6,
-				available_at = statement_timestamp() + make_interval(secs => $7::double precision),
-				updated_at = statement_timestamp(), version = version + 1
+				available_at = CASE
+					WHEN attempt - retry_cycle_attempt_base >= $8
+					  OR retry_cycle_started_at <= clock_timestamp() - make_interval(secs => $9::double precision)
+					THEN available_at
+					ELSE clock_timestamp() + make_interval(secs => $7::double precision)
+				END,
+				manual_required_at = CASE
+					WHEN attempt - retry_cycle_attempt_base >= $8
+					  OR retry_cycle_started_at <= clock_timestamp() - make_interval(secs => $9::double precision)
+					THEN clock_timestamp()
+					ELSE manual_required_at
+				END,
+				updated_at = clock_timestamp(), version = version + 1
 			WHERE revocation_id = $1 AND claimed_by = $2 AND claim_token_sha256 = $3 AND claim_epoch = $4
-			  AND status = 'REVOKING' AND claim_expires_at > statement_timestamp()
+			  AND status = 'REVOKING' AND claim_expires_at > clock_timestamp()
 			RETURNING ` + revocationProjection
 		auditAction, eventType = "credential.revocation.failed", "credential.revocation.failed.v1"
 	}
 	args := []any{fence.RevocationID, fence.WorkerID, digest, fence.Epoch, string(code), detailHash}
 	if !manual {
-		args = append(args, delay.Seconds())
+		args = append(args, delay.Seconds(), credential.MaxRevocationAttempts, credential.MaxRevocationElapsed.Seconds())
 	}
 	record, err := selectStored(ctx, tx, query, args...)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1289,6 +1602,9 @@ func (repository *Repository) failClaim(ctx context.Context, fence credential.Cl
 	}
 	if err != nil {
 		return credential.Revocation{}, databaseError("record failed credential revocation", err)
+	}
+	if !manual && record.revocation.Status == credential.StatusManualRequired {
+		auditAction, eventType = "credential.revocation.manual_required", "credential.revocation.manual_required.v1"
 	}
 	if err := writeStateChange(ctx, tx, record.revocation, "SYSTEM", fence.WorkerID, auditAction, eventType); err != nil {
 		return credential.Revocation{}, err
@@ -1320,6 +1636,7 @@ func (repository *Repository) RequeueManual(ctx context.Context, request credent
 	record, err := selectStored(ctx, tx, `
 		UPDATE credential_revocations AS revocation
 		SET status = 'REVOCATION_PENDING', available_at = statement_timestamp(),
+			retry_cycle_attempt_base = attempt, retry_cycle_started_at = statement_timestamp(),
 			updated_at = statement_timestamp(), version = version + 1
 		WHERE revocation_id = $1 AND status = 'MANUAL_REQUIRED' AND evidence_hash IS NULL
 		  AND NOT EXISTS (
@@ -1581,21 +1898,23 @@ func scanStored(row rowScanner) (*storedRevocation, error) {
 	var ciphertext, accessorHMAC []byte
 	var permitSHA256, encryptionKeyID, claimedBy, claimToken, completedToken, completedBy pgtype.Text
 	var failureCode, failureDetail, evidenceHash pgtype.Text
-	var childCreateAuthorizedAt, claimedAt, claimExpiresAt, heartbeatAt pgtype.Timestamptz
+	var childCreateAuthorizedAt, claimedAt, claimExpiresAt, heartbeatAt, retryCycleStartedAt pgtype.Timestamptz
 	var anchoredAt, activatedAt, requestedAt, manualAt, revokedAt pgtype.Timestamptz
 	var completedEpoch pgtype.Int8
 	var childCreateTTLSeconds pgtype.Int4
-	var attempt, failureCount int32
+	var attempt, retryCycleAttemptBase, failureCount int32
 	err := row.Scan(
 		&record.revocation.ID, &record.revocation.TenantID, &record.revocation.WorkspaceID, &record.revocation.EnvironmentID,
 		&record.revocation.ActionID, &record.revocation.TargetKey, &record.revocation.Production,
 		&record.revocation.RunnerID, &record.revocation.ActionLeaseEpoch, &record.actionTokenSHA256,
-		&record.revocation.Issuer, &record.revocation.ConnectorID, &record.revocation.Permission, &record.revocation.Resource,
+		&record.revocation.Issuer, &record.revocation.IssuerRevision, &record.revocation.ConnectorID,
+		&record.revocation.Permission, &record.revocation.Resource,
 		&record.revocation.CredentialExpiresAt, &permitSHA256, &childCreateAuthorizedAt, &childCreateTTLSeconds, &status,
 		&ciphertext, &accessorHMAC, &encryptionKeyID,
 		&record.revocation.ClaimEpoch, &claimedBy, &claimToken, &claimedAt, &claimExpiresAt, &heartbeatAt,
 		&completedEpoch, &completedToken, &completedBy,
-		&attempt, &failureCount, &failureCode, &failureDetail, &record.revocation.AvailableAt, &evidenceHash,
+		&attempt, &retryCycleAttemptBase, &retryCycleStartedAt,
+		&failureCount, &failureCode, &failureDetail, &record.revocation.AvailableAt, &evidenceHash,
 		&anchoredAt, &activatedAt, &requestedAt, &manualAt, &revokedAt,
 		&record.revocation.Version, &record.revocation.CreatedAt, &record.revocation.UpdatedAt,
 	)
@@ -1622,6 +1941,8 @@ func scanStored(row rowScanner) (*storedRevocation, error) {
 	record.revocation.ClaimExpiresAt = timeValue(claimExpiresAt)
 	record.revocation.LastHeartbeatAt = timeValue(heartbeatAt)
 	record.revocation.Attempt = int(attempt)
+	record.retryCycleAttemptBase = int(retryCycleAttemptBase)
+	record.retryCycleStartedAt = timeValue(retryCycleStartedAt)
 	record.revocation.FailureCount = int(failureCount)
 	record.revocation.FailureCode = credential.FailureCode(textValue(failureCode))
 	record.revocation.FailureDetailSHA256 = textValue(failureDetail)
@@ -1667,7 +1988,8 @@ func samePrepare(record *storedRevocation, request credential.PrepareRequest, me
 		revocation.EnvironmentID == metadata.EnvironmentID && revocation.TargetKey == metadata.TargetKey &&
 		revocation.Production == metadata.Production && revocation.RunnerID == metadata.RunnerID &&
 		revocation.ActionLeaseEpoch == metadata.LeaseEpoch && record.actionTokenSHA256 == tokenDigest &&
-		revocation.Issuer == request.Issuer && revocation.ConnectorID == metadata.ConnectorID &&
+		revocation.Issuer == request.Issuer && revocation.IssuerRevision == request.IssuerRevision &&
+		revocation.ConnectorID == metadata.ConnectorID &&
 		revocation.Permission == metadata.Permission && revocation.Resource == metadata.Resource &&
 		revocation.CredentialExpiresAt.Equal(credential.CanonicalCredentialExpiry(request.CredentialExpiresAt))
 }
@@ -1732,6 +2054,7 @@ func referenceContext(revocation credential.Revocation) credential.ReferenceCont
 	return credential.ReferenceContext{
 		RevocationID: revocation.ID, ActionID: revocation.ActionID,
 		ActionEpoch: revocation.ActionLeaseEpoch, Issuer: revocation.Issuer,
+		IssuerRevision: revocation.IssuerRevision,
 	}
 }
 

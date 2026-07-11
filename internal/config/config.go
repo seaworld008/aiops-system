@@ -14,6 +14,13 @@ const (
 	defaultShutdownTimeout = 10 * time.Second
 )
 
+type WriteExecutionMode string
+
+const (
+	WriteExecutionModeDisabled      WriteExecutionMode = "disabled"
+	WriteExecutionModeNonProduction WriteExecutionMode = "non-production"
+)
+
 type Config struct {
 	HTTPAddr           string
 	Environment        string
@@ -24,9 +31,20 @@ type Config struct {
 	OIDCIssuer         string
 	OIDCClientID       string
 	OIDCMaxSessionAge  time.Duration
+	WriteExecutionMode WriteExecutionMode
 }
 
 func Load() (Config, error) {
+	var writeExecutionMode WriteExecutionMode
+	switch os.Getenv("AIOPS_WRITE_EXECUTION_MODE") {
+	case "", string(WriteExecutionModeDisabled):
+		writeExecutionMode = WriteExecutionModeDisabled
+	case string(WriteExecutionModeNonProduction):
+		writeExecutionMode = WriteExecutionModeNonProduction
+	default:
+		return Config{}, fmt.Errorf("AIOPS_WRITE_EXECUTION_MODE must be disabled or non-production")
+	}
+
 	environment := strings.ToLower(strings.TrimSpace(valueOrDefault("AIOPS_ENVIRONMENT", defaultEnvironment)))
 	if environment == "prod" {
 		environment = "production"
@@ -46,6 +64,7 @@ func Load() (Config, error) {
 		OIDCIssuer:         strings.TrimSpace(os.Getenv("AIOPS_OIDC_ISSUER")),
 		OIDCClientID:       strings.TrimSpace(os.Getenv("AIOPS_OIDC_CLIENT_ID")),
 		OIDCMaxSessionAge:  12 * time.Hour,
+		WriteExecutionMode: writeExecutionMode,
 	}
 	if raw := os.Getenv("AIOPS_WEBHOOK_HMAC_SECRETS_JSON"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.WebhookHMACSecrets); err != nil {
