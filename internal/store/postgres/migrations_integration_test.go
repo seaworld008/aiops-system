@@ -2120,8 +2120,8 @@ func exerciseRealRunnerGatewayMigration(
 	execSQL(t, ctx, database, `
 		UPDATE runner_registrations
 		SET max_concurrency = 4, updated_at = statement_timestamp()
-		WHERE runner_id = $1
-	`, transactionRunnerID)
+		WHERE runner_id IN ($1, $2)
+	`, runnerID, transactionRunnerID)
 
 	var certificateSHA256 string
 	if err := database.QueryRow(ctx, `
