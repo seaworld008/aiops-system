@@ -12,7 +12,7 @@ test-race:
 
 test-integration:
 	@test -n "$$AIOPS_TEST_POSTGRES_DSN" || (echo "AIOPS_TEST_POSTGRES_DSN is required" >&2; exit 1)
-	go test -race -count=1 ./internal/store/postgres ./internal/execution/postgres
+	go test -race -count=1 ./internal/store/postgres ./internal/execution/postgres ./internal/investigation/postgres
 
 vet:
 	go vet ./...

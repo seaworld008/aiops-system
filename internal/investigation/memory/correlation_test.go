@@ -46,6 +46,32 @@ func TestCorrelateFiringSignalCreatesOneIncidentAndReplayDoesNotRecount(t *testi
 	}
 }
 
+func TestGetSignalIsWorkspaceScopedAndReturnsDetachedLabels(t *testing.T) {
+	now := time.Date(2026, 7, 13, 9, 0, 0, 0, time.UTC)
+	repository := newRepository(t, now)
+	signal := testSignal("workspace-1", "signal-get", "firing", now)
+	signal.Labels = map[string]string{"service": "payments"}
+	if created, err := repository.RegisterSignal(context.Background(), signal); err != nil || !created {
+		t.Fatalf("RegisterSignal() = %v, %v; want true, nil", created, err)
+	}
+
+	first, err := repository.GetSignal(context.Background(), signal.WorkspaceID, signal.ID)
+	if err != nil {
+		t.Fatalf("GetSignal() error = %v", err)
+	}
+	first.Labels["service"] = "mutated"
+	second, err := repository.GetSignal(context.Background(), signal.WorkspaceID, signal.ID)
+	if err != nil || second.Labels["service"] != "payments" {
+		t.Fatalf("GetSignal(after caller mutation) = %#v, %v; want detached labels", second, err)
+	}
+	if _, err := repository.GetSignal(context.Background(), "workspace-2", signal.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("GetSignal(cross workspace) error = %v, want ErrNotFound", err)
+	}
+	if _, err := repository.GetSignal(context.Background(), "bad\x00workspace", signal.ID); !errors.Is(err, investigation.ErrInvalidRequest) {
+		t.Fatalf("GetSignal(invalid scope) error = %v, want ErrInvalidRequest", err)
+	}
+}
+
 func TestCorrelateSignalKeepsExistingIncidentUpdatedAtMonotonic(t *testing.T) {
 	base := time.Date(2026, 7, 13, 2, 0, 0, 0, time.UTC)
 	clockNow := base.Add(10 * time.Minute)

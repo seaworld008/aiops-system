@@ -171,6 +171,7 @@ type RecordFeedbackResult struct {
 
 type Repository interface {
 	RegisterSignal(context.Context, domain.Signal) (bool, error)
+	GetSignal(context.Context, string, string) (domain.Signal, error)
 	CorrelateSignal(context.Context, CorrelateSignalRequest) (CorrelateSignalResult, error)
 	CreateOrGetInvestigation(context.Context, CreateOrGetInvestigationRequest) (CreateOrGetInvestigationResult, error)
 

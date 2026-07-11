@@ -36,6 +36,22 @@ func (repository *Repository) RegisterSignal(ctx context.Context, signal domain.
 	return true, nil
 }
 
+func (repository *Repository) GetSignal(ctx context.Context, workspaceID, signalID string) (domain.Signal, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.Signal{}, err
+	}
+	if !validResourceScope(workspaceID, signalID) {
+		return domain.Signal{}, fmt.Errorf("%w: workspace and signal IDs are required", investigation.ErrInvalidRequest)
+	}
+	repository.mu.RLock()
+	defer repository.mu.RUnlock()
+	signal, exists := repository.signals[scoped(workspaceID, signalID)]
+	if !exists {
+		return domain.Signal{}, store.ErrNotFound
+	}
+	return cloneSignal(signal), nil
+}
+
 func (repository *Repository) CorrelateSignal(ctx context.Context, request investigation.CorrelateSignalRequest) (investigation.CorrelateSignalResult, error) {
 	if err := ctx.Err(); err != nil {
 		return investigation.CorrelateSignalResult{}, err
