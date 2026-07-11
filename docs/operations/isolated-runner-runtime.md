@@ -101,8 +101,11 @@ docker run --rm --read-only \
   16 MiB 的挂载；
 - 探针先以 `mkdirat/fstatat/unlinkat` 验证可写；验证后的目录 FD 与 mount ID 保留在
   Supervisor 生命周期内。所有作业目录经该 FD 创建，在 `Start` 前重新核对路径的
-  mount ID 与 inode，清理经 `/proc/self/fd/<retained-fd>` 锚定；任一复核或清理失败
-  都保持不确定态；
+  mount ID 与 inode；每个作业另保留原目录 FD/dev/inode，清理经
+  `/proc/self/fd/<retained-root-fd>` 锚定，并且只有原目录 FD 最终读到 `nlink=0` 才算
+  成功。rename+decoy、`/tmp` chmod、mount/statfs 漂移或任一清理失败都保持不确定态；
+- Supervisor 为每个作业持有 active reservation；`Close()` 在 active 非零时失败，不能
+  越过校验/Start 边界关闭根 FD。只有确认终止并成功清理原 inode 后才释放 reservation；
 - Runner 设置并读回 `PR_SET_CHILD_SUBREAPER`。强杀后只回收同一 PGID、`ppid=self`、
   `state=Z` 且不是 direct leader 的已收养后代；direct leader 仍只由对应
   `exec.Cmd.Wait()` 回收，禁止全局 `wait4(-1)`；

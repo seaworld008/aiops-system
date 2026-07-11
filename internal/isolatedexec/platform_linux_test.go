@@ -250,6 +250,36 @@ func TestLinuxSecureTempRootMetadataRequiresPrivateOwnedDirectory(t *testing.T) 
 	}
 }
 
+func TestLinuxRuntimeRootRevalidationRejectsMetadataAndFilesystemDrift(t *testing.T) {
+	metadata := unix.Stat_t{
+		Dev: 17, Ino: 23, Mode: unix.S_IFDIR | 0o700,
+		Uid: isolatedRuntimeUID, Gid: isolatedRuntimeGID,
+	}
+	filesystem := unix.Statfs_t{
+		Type: unix.TMPFS_MAGIC, Bsize: 4096, Frsize: 4096,
+		Blocks: (16 << 20) / 4096, Flags: unix.ST_NOSUID | unix.ST_NODEV | unix.ST_NOEXEC,
+	}
+	if !runtimeRootDescriptorsSecure(
+		metadata, metadata, filesystem, filesystem, isolatedRuntimeUID, isolatedRuntimeGID,
+	) {
+		t.Fatal("runtimeRootDescriptorsSecure(valid) = false")
+	}
+	permissive := metadata
+	permissive.Mode = unix.S_IFDIR | 0o777
+	if runtimeRootDescriptorsSecure(
+		metadata, permissive, filesystem, filesystem, isolatedRuntimeUID, isolatedRuntimeGID,
+	) {
+		t.Fatal("runtimeRootDescriptorsSecure(chmod drift) = true")
+	}
+	unsafeFilesystem := filesystem
+	unsafeFilesystem.Flags &^= unix.ST_NOEXEC
+	if runtimeRootDescriptorsSecure(
+		metadata, metadata, filesystem, unsafeFilesystem, isolatedRuntimeUID, isolatedRuntimeGID,
+	) {
+		t.Fatal("runtimeRootDescriptorsSecure(mount drift) = true")
+	}
+}
+
 func TestLinuxPrivateJobDirectoryStaysBoundToRetainedDescriptor(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "root")
@@ -281,30 +311,41 @@ func TestLinuxPrivateJobDirectoryStaysBoundToRetainedDescriptor(t *testing.T) {
 }
 
 func TestLinuxRuntimeJobPathIsRecheckedAndCleanupIsDescriptorAnchored(t *testing.T) {
-	root, err := os.Open("/tmp")
+	rootPath := t.TempDir()
+	if err := os.Chmod(rootPath, 0o700); err != nil {
+		t.Fatalf("chmod root: %v", err)
+	}
+	root, err := os.Open(rootPath)
 	if err != nil {
-		t.Fatalf("open /tmp: %v", err)
+		t.Fatalf("open root: %v", err)
 	}
 	t.Cleanup(func() { _ = root.Close() })
 	mountID, ok := descriptorMountID(int(root.Fd()))
 	if !ok {
-		t.Fatal("descriptorMountID(/tmp) failed")
+		t.Fatal("descriptorMountID(root) failed")
 	}
 	name, err := createPrivateDirectoryAt(int(root.Fd()), "aiops-executor-test-", uint32(os.Geteuid()), uint32(os.Getegid()))
 	if err != nil {
 		t.Fatalf("create private runtime directory: %v", err)
 	}
-	jobDirectory := filepath.Join("/tmp", name)
-	t.Cleanup(func() { _ = removeRuntimeJobDirectory(root, jobDirectory) })
-	if !validateRuntimeJobDirectoryForIdentity(
-		"/tmp", root, mountID, jobDirectory, uint32(os.Geteuid()), uint32(os.Getegid()),
-	) {
-		t.Fatal("validateRuntimeJobDirectoryForIdentity(valid) = false")
+	jobDirectory := filepath.Join(rootPath, name)
+	job, err := captureRuntimeJobDirectory(jobDirectory)
+	if err != nil {
+		t.Fatalf("captureRuntimeJobDirectory() error = %v", err)
 	}
-	if validateRuntimeJobDirectoryForIdentity(
-		"/tmp", root, mountID+1, jobDirectory, uint32(os.Geteuid()), uint32(os.Getegid()),
-	) {
-		t.Fatal("validateRuntimeJobDirectoryForIdentity(wrong mount ID) = true")
+	t.Cleanup(func() {
+		_ = removeRuntimeJobDirectoryForIdentity(
+			rootPath, root, jobDirectory, job, uint32(os.Geteuid()), uint32(os.Getegid()), false,
+		)
+		if job.file != nil {
+			_ = job.file.Close()
+		}
+	})
+	if !runtimeJobPathMatches(root, mountID, jobDirectory, job, uint32(os.Geteuid()), uint32(os.Getegid())) {
+		t.Fatal("runtimeJobPathMatches(valid) = false")
+	}
+	if runtimeJobPathMatches(root, mountID+1, jobDirectory, job, uint32(os.Geteuid()), uint32(os.Getegid())) {
+		t.Fatal("runtimeJobPathMatches(wrong mount ID) = true")
 	}
 	if err := os.Mkdir(filepath.Join(jobDirectory, "nested"), 0o700); err != nil {
 		t.Fatalf("mkdir nested runtime data: %v", err)
@@ -312,10 +353,49 @@ func TestLinuxRuntimeJobPathIsRecheckedAndCleanupIsDescriptorAnchored(t *testing
 	if err := os.WriteFile(filepath.Join(jobDirectory, "nested", "data"), []byte("non-secret fixture"), 0o600); err != nil {
 		t.Fatalf("write nested runtime data: %v", err)
 	}
-	if err := removeRuntimeJobDirectory(root, jobDirectory); err != nil {
-		t.Fatalf("removeRuntimeJobDirectory() error = %v", err)
+	if err := removeRuntimeJobDirectoryForIdentity(
+		rootPath, root, jobDirectory, job, uint32(os.Geteuid()), uint32(os.Getegid()), false,
+	); err != nil {
+		t.Fatalf("removeRuntimeJobDirectoryForIdentity() error = %v", err)
 	}
 	if _, err := os.Stat(jobDirectory); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("runtime job directory still exists: %v", err)
+	}
+}
+
+func TestLinuxRuntimeCleanupRejectsRenameAndDecoy(t *testing.T) {
+	rootPath := t.TempDir()
+	root, err := os.Open(rootPath)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+	name, err := createPrivateDirectoryAt(int(root.Fd()), "aiops-executor-test-", uint32(os.Geteuid()), uint32(os.Getegid()))
+	if err != nil {
+		t.Fatalf("create private job: %v", err)
+	}
+	jobDirectory := filepath.Join(rootPath, name)
+	job, err := captureRuntimeJobDirectory(jobDirectory)
+	if err != nil {
+		t.Fatalf("capture job: %v", err)
+	}
+	defer job.file.Close()
+	relocated := filepath.Join(rootPath, name+"-relocated")
+	if err := os.Rename(jobDirectory, relocated); err != nil {
+		t.Fatalf("rename original job: %v", err)
+	}
+	if err := os.Mkdir(jobDirectory, 0o700); err != nil {
+		t.Fatalf("create decoy: %v", err)
+	}
+	if err := removeRuntimeJobDirectoryForIdentity(
+		rootPath, root, jobDirectory, job, uint32(os.Geteuid()), uint32(os.Getegid()), false,
+	); !errors.Is(err, ErrTerminationUnconfirmed) {
+		t.Fatalf("removeRuntimeJobDirectoryForIdentity(rename+decoy) = %v", err)
+	}
+	if _, err := os.Stat(relocated); err != nil {
+		t.Fatalf("original inode was not retained for uncertainty evidence: %v", err)
+	}
+	if _, err := os.Stat(jobDirectory); err != nil {
+		t.Fatalf("decoy was unexpectedly treated as original: %v", err)
 	}
 }

@@ -47,54 +47,62 @@ func (supervisor *Supervisor) startProcess() (*childProcess, error) {
 	if supervisor == nil || !supervisor.settings.valid() {
 		return nil, ErrInvalidConfiguration
 	}
-	jobDirectory, err := supervisor.createJobDirectory()
+	release, err := supervisor.reserveJob()
 	if err != nil {
 		return nil, err
 	}
-	cleanupJob := func() { _ = supervisor.removeJobDirectory(jobDirectory) }
+	jobDirectory, job, err := supervisor.createJobDirectory()
+	if err != nil {
+		release()
+		return nil, err
+	}
+	cleanupJob := func() error {
+		cleanupErr := supervisor.removeJobDirectory(jobDirectory, job)
+		if cleanupErr == nil {
+			release()
+		}
+		return cleanupErr
+	}
+	fail := func(cause error) (*childProcess, error) {
+		return nil, errors.Join(cause, cleanupJob())
+	}
 	prepareReader, prepareWriter, err := os.Pipe()
 	if err != nil {
-		cleanupJob()
-		return nil, ErrInvalidConfiguration
+		return fail(ErrInvalidConfiguration)
 	}
 	goReader, goWriter, err := os.Pipe()
 	if err != nil {
 		closeFiles(prepareReader, prepareWriter)
-		cleanupJob()
-		return nil, ErrInvalidConfiguration
+		return fail(ErrInvalidConfiguration)
 	}
 	responseReader, responseWriter, err := os.Pipe()
 	if err != nil {
 		closeFiles(prepareReader, prepareWriter, goReader, goWriter)
-		cleanupJob()
-		return nil, ErrInvalidConfiguration
+		return fail(ErrInvalidConfiguration)
 	}
 	budget := newOutputBudget(supervisor.settings.outputLimit)
 	command := supervisor.buildCommand(jobDirectory, []*os.File{prepareReader, goReader, responseWriter}, budget)
-	if command == nil || !supervisor.validateJobDirectory(jobDirectory) {
+	if command == nil || !supervisor.validateJobDirectory(jobDirectory, job) {
 		closeFiles(prepareReader, prepareWriter, goReader, goWriter, responseReader, responseWriter)
-		cleanupJob()
-		return nil, ErrInvalidConfiguration
+		return fail(ErrInvalidConfiguration)
 	}
 	if err := command.Start(); err != nil {
 		closeFiles(prepareReader, prepareWriter, goReader, goWriter, responseReader, responseWriter)
-		cleanupJob()
-		return nil, ErrNotReady
+		return fail(ErrNotReady)
 	}
 	stableHandle := stableProcessHandle(command)
 	if stableHandle < 0 {
 		_ = command.Process.Kill()
 		_ = command.Wait()
 		closeFiles(prepareReader, prepareWriter, goReader, goWriter, responseReader, responseWriter)
-		cleanupJob()
-		return nil, ErrUnsupportedPlatform
+		return fail(ErrUnsupportedPlatform)
 	}
 	closeFiles(prepareReader, goReader, responseWriter)
 	process := &childProcess{
 		command: command, pid: command.Process.Pid, stableHandle: stableHandle, jobDirectory: jobDirectory,
 		prepareWriter: prepareWriter, goWriter: goWriter, responseReader: responseReader,
 		output: budget, exitDone: make(chan struct{}), waitDone: make(chan struct{}),
-		cleanupJob: func() error { return supervisor.removeJobDirectory(jobDirectory) },
+		cleanupJob: cleanupJob,
 	}
 	go func() {
 		exitErr := waitStableProcessExit(stableHandle)
@@ -316,23 +324,24 @@ func (process *childProcess) cleanup(confirmed bool) error {
 	return process.cleanupErr
 }
 
-func (supervisor *Supervisor) createJobDirectory() (string, error) {
+func (supervisor *Supervisor) createJobDirectory() (string, *runtimeJobDirectory, error) {
 	if supervisor == nil {
-		return "", ErrInvalidConfiguration
+		return "", nil, ErrInvalidConfiguration
 	}
 	if supervisor.boundary != nil {
 		boundary := supervisor.boundary
 		boundary.mu.RLock()
 		defer boundary.mu.RUnlock()
 		if boundary.closed || boundary.root == nil {
-			return "", ErrInvalidConfiguration
+			return "", nil, ErrInvalidConfiguration
 		}
 		return createRuntimeJobDirectory(supervisor.settings.tempRoot, boundary.root, boundary.mount)
 	}
-	return createJobDirectory(supervisor.settings.tempRoot)
+	directory, err := createJobDirectory(supervisor.settings.tempRoot)
+	return directory, nil, err
 }
 
-func (supervisor *Supervisor) validateJobDirectory(jobDirectory string) bool {
+func (supervisor *Supervisor) validateJobDirectory(jobDirectory string, job *runtimeJobDirectory) bool {
 	if supervisor == nil {
 		return false
 	}
@@ -343,10 +352,10 @@ func (supervisor *Supervisor) validateJobDirectory(jobDirectory string) bool {
 	boundary.mu.RLock()
 	defer boundary.mu.RUnlock()
 	return !boundary.closed && boundary.root != nil &&
-		validateRuntimeJobDirectory(supervisor.settings.tempRoot, boundary.root, boundary.mount, jobDirectory)
+		validateRuntimeJobDirectory(supervisor.settings.tempRoot, boundary.root, boundary.mount, jobDirectory, job)
 }
 
-func (supervisor *Supervisor) removeJobDirectory(jobDirectory string) error {
+func (supervisor *Supervisor) removeJobDirectory(jobDirectory string, job *runtimeJobDirectory) error {
 	if supervisor == nil {
 		return ErrInvalidConfiguration
 	}
@@ -359,7 +368,7 @@ func (supervisor *Supervisor) removeJobDirectory(jobDirectory string) error {
 	if boundary.closed || boundary.root == nil {
 		return ErrTerminationUnconfirmed
 	}
-	return removeRuntimeJobDirectory(boundary.root, jobDirectory)
+	return removeRuntimeJobDirectory(boundary.root, jobDirectory, job)
 }
 
 func (supervisor *Supervisor) buildCommand(

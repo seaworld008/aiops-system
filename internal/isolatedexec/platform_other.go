@@ -16,13 +16,17 @@ func openRuntimeBoundary(string) (*os.File, uint64, error) {
 	return nil, 0, ErrUnsupportedPlatform
 }
 
-func createRuntimeJobDirectory(string, *os.File, uint64) (string, error) {
-	return "", ErrUnsupportedPlatform
+func createRuntimeJobDirectory(string, *os.File, uint64) (string, *runtimeJobDirectory, error) {
+	return "", nil, ErrUnsupportedPlatform
 }
 
-func validateRuntimeJobDirectory(string, *os.File, uint64, string) bool { return false }
+func validateRuntimeJobDirectory(string, *os.File, uint64, string, *runtimeJobDirectory) bool {
+	return false
+}
 
-func removeRuntimeJobDirectory(*os.File, string) error { return ErrUnsupportedPlatform }
+func removeRuntimeJobDirectory(*os.File, string, *runtimeJobDirectory) error {
+	return ErrUnsupportedPlatform
+}
 
 func configureProcess(*exec.Cmd) {}
 

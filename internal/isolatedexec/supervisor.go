@@ -76,7 +76,14 @@ type runtimeBoundary struct {
 	mu     sync.RWMutex
 	root   *os.File
 	mount  uint64
+	active int
 	closed bool
+}
+
+type runtimeJobDirectory struct {
+	file   *os.File
+	device uint64
+	inode  uint64
 }
 
 func New() (*Supervisor, error) {
@@ -128,11 +135,41 @@ func (supervisor *Supervisor) Close() error {
 	if boundary.closed {
 		return nil
 	}
+	if boundary.active != 0 {
+		return ErrTerminationUnconfirmed
+	}
 	boundary.closed = true
 	if boundary.root == nil {
 		return ErrInvalidConfiguration
 	}
 	return boundary.root.Close()
+}
+
+func (supervisor *Supervisor) reserveJob() (func(), error) {
+	if supervisor == nil {
+		return nil, ErrInvalidConfiguration
+	}
+	if supervisor.boundary == nil {
+		return func() {}, nil
+	}
+	boundary := supervisor.boundary
+	boundary.mu.Lock()
+	if boundary.closed || boundary.root == nil || boundary.mount == 0 {
+		boundary.mu.Unlock()
+		return nil, ErrInvalidConfiguration
+	}
+	boundary.active++
+	boundary.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			boundary.mu.Lock()
+			if boundary.active > 0 {
+				boundary.active--
+			}
+			boundary.mu.Unlock()
+		})
+	}, nil
 }
 
 type outputBudget struct {

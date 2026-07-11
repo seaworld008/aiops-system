@@ -112,7 +112,8 @@ NetworkPolicy、独立 ServiceAccount/CA/Vault role，以及禁止 swap/core dum
   `UNCERTAIN`，Secret buffer 使用后销毁；
 - Linux 进程：忽略 TERM、fork descendant、结果后挂起、无结果退出、输出洪泛、GO
   前后取消与强杀，均验证 `Wait`/reap 和 process-group 消失；Runner 作为 child
-  subreaper 只按 PGID/PPID/zombie 状态回收已收养后代；
+  subreaper 只按 PGID/PPID/zombie 状态回收已收养后代；rename+decoy 与 `/tmp`
+  metadata 漂移必须阻止清理确认；
 - 依赖边界：`cmd/read-runner` 依赖图不得包含隔离执行、凭据或 mutation 包；
 - 镜像边界：CI 导出文件系统，验证 READ/WRITE 产物互斥、无 shell、非 root、固定入口；
 - 配置边界：只读根 + 由 FD/mount ID 绑定验证的 16 MiB、`0700`、

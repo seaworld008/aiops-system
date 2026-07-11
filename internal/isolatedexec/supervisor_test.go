@@ -26,6 +26,28 @@ func TestSupervisorCopiesShareClosedRuntimeBoundary(t *testing.T) {
 	}
 }
 
+func TestSupervisorCloseCannotCrossActiveStartReservation(t *testing.T) {
+	root, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open temp root: %v", err)
+	}
+	supervisor := &Supervisor{boundary: &runtimeBoundary{root: root, mount: 1}}
+	release, err := supervisor.reserveJob()
+	if err != nil {
+		t.Fatalf("reserveJob() error = %v", err)
+	}
+	if err := supervisor.Close(); !errors.Is(err, ErrTerminationUnconfirmed) {
+		t.Fatalf("Close(active) error = %v", err)
+	}
+	if supervisor.boundary.closed {
+		t.Fatal("active Close marked boundary closed")
+	}
+	release()
+	if err := supervisor.Close(); err != nil {
+		t.Fatalf("Close(after release) error = %v", err)
+	}
+}
+
 func TestDefaultSettingsKeepFixedTerminationAndResourceBounds(t *testing.T) {
 	settings := defaultSettings()
 	if settings.readyTimeout != 10*time.Second {

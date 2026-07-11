@@ -143,25 +143,51 @@ func openRuntimeBoundary(tempRoot string) (*os.File, uint64, error) {
 	return file, tempMountID, nil
 }
 
-func createRuntimeJobDirectory(root string, handle *os.File, expectedMountID uint64) (string, error) {
+func createRuntimeJobDirectory(
+	root string,
+	handle *os.File,
+	expectedMountID uint64,
+) (string, *runtimeJobDirectory, error) {
 	if root != "/tmp" || handle == nil || expectedMountID == 0 ||
 		!runtimeRootPathMatches(root, handle, expectedMountID) {
-		return "", ErrInvalidConfiguration
+		return "", nil, ErrInvalidConfiguration
 	}
 	descriptor := int(handle.Fd())
 	if descriptor < 0 {
-		return "", ErrInvalidConfiguration
+		return "", nil, ErrInvalidConfiguration
 	}
 	name, err := createPrivateDirectoryAt(descriptor, "aiops-executor-", isolatedRuntimeUID, isolatedRuntimeGID)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	jobDirectory := filepath.Join(root, name)
-	if !validateRuntimeJobDirectory(root, handle, expectedMountID, jobDirectory) {
+	job, err := captureRuntimeJobDirectory(jobDirectory)
+	if err != nil || !validateRuntimeJobDirectory(root, handle, expectedMountID, jobDirectory, job) {
+		if job != nil && job.file != nil {
+			_ = job.file.Close()
+		}
 		_ = unix.Unlinkat(descriptor, name, unix.AT_REMOVEDIR)
-		return "", ErrUnsupportedPlatform
+		return "", nil, ErrUnsupportedPlatform
 	}
-	return jobDirectory, nil
+	return jobDirectory, job, nil
+}
+
+func captureRuntimeJobDirectory(jobDirectory string) (*runtimeJobDirectory, error) {
+	descriptor, err := unix.Open(jobDirectory, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, ErrUnsupportedPlatform
+	}
+	var metadata unix.Stat_t
+	if err := unix.Fstat(descriptor, &metadata); err != nil {
+		_ = unix.Close(descriptor)
+		return nil, ErrUnsupportedPlatform
+	}
+	file := os.NewFile(uintptr(descriptor), "aiops-isolated-job-directory")
+	if file == nil {
+		_ = unix.Close(descriptor)
+		return nil, ErrUnsupportedPlatform
+	}
+	return &runtimeJobDirectory{file: file, device: uint64(metadata.Dev), inode: metadata.Ino}, nil
 }
 
 func runtimeRootPathMatches(root string, handle *os.File, expectedMountID uint64) bool {
@@ -180,25 +206,46 @@ func runtimeRootPathMatches(root string, handle *os.File, expectedMountID uint64
 	retainedMountID, retainedOK := descriptorMountID(retainedDescriptor)
 	pathMountID, pathOK := descriptorMountID(pathDescriptor)
 	var retained, observed unix.Stat_t
+	var retainedFilesystem, observedFilesystem unix.Statfs_t
 	return retainedOK && pathOK && retainedMountID == expectedMountID && pathMountID == expectedMountID &&
 		unix.Fstat(retainedDescriptor, &retained) == nil && unix.Fstat(pathDescriptor, &observed) == nil &&
-		retained.Dev == observed.Dev && retained.Ino == observed.Ino
+		unix.Fstatfs(retainedDescriptor, &retainedFilesystem) == nil &&
+		unix.Fstatfs(pathDescriptor, &observedFilesystem) == nil &&
+		runtimeRootDescriptorsSecure(
+			retained, observed, retainedFilesystem, observedFilesystem, isolatedRuntimeUID, isolatedRuntimeGID,
+		)
 }
 
-func validateRuntimeJobDirectory(root string, handle *os.File, expectedMountID uint64, jobDirectory string) bool {
-	return validateRuntimeJobDirectoryForIdentity(
-		root, handle, expectedMountID, jobDirectory, isolatedRuntimeUID, isolatedRuntimeGID,
-	)
+func runtimeRootDescriptorsSecure(
+	retained, observed unix.Stat_t,
+	retainedFilesystem, observedFilesystem unix.Statfs_t,
+	expectedUID, expectedGID uint32,
+) bool {
+	return retained.Dev == observed.Dev && retained.Ino == observed.Ino &&
+		tempRootMetadataSecure(retained, expectedUID, expectedGID) &&
+		tempRootMetadataSecure(observed, expectedUID, expectedGID) &&
+		statfsHasSecureTempRoot(retainedFilesystem) && statfsHasSecureTempRoot(observedFilesystem)
 }
 
-func validateRuntimeJobDirectoryForIdentity(
+func validateRuntimeJobDirectory(
 	root string,
 	handle *os.File,
 	expectedMountID uint64,
 	jobDirectory string,
+	job *runtimeJobDirectory,
+) bool {
+	return runtimeRootPathMatches(root, handle, expectedMountID) && filepath.Dir(jobDirectory) == root &&
+		runtimeJobPathMatches(handle, expectedMountID, jobDirectory, job, isolatedRuntimeUID, isolatedRuntimeGID)
+}
+
+func runtimeJobPathMatches(
+	handle *os.File,
+	expectedMountID uint64,
+	jobDirectory string,
+	job *runtimeJobDirectory,
 	expectedUID, expectedGID uint32,
 ) bool {
-	if !runtimeRootPathMatches(root, handle, expectedMountID) || filepath.Dir(jobDirectory) != root {
+	if handle == nil || job == nil || job.file == nil || expectedMountID == 0 {
 		return false
 	}
 	name := filepath.Base(jobDirectory)
@@ -211,16 +258,34 @@ func validateRuntimeJobDirectoryForIdentity(
 		return false
 	}
 	defer unix.Close(pathDescriptor)
-	pathMountID, ok := descriptorMountID(pathDescriptor)
-	var expected, observed unix.Stat_t
-	return ok && pathMountID == expectedMountID &&
+	pathMountID, pathOK := descriptorMountID(pathDescriptor)
+	jobMountID, jobOK := descriptorMountID(int(job.file.Fd()))
+	var expected, observed, retained unix.Stat_t
+	return pathOK && jobOK && pathMountID == expectedMountID && jobMountID == expectedMountID &&
 		unix.Fstatat(retainedDescriptor, name, &expected, unix.AT_SYMLINK_NOFOLLOW) == nil &&
-		unix.Fstat(pathDescriptor, &observed) == nil && expected.Dev == observed.Dev && expected.Ino == observed.Ino &&
-		tempRootMetadataSecure(observed, expectedUID, expectedGID)
+		unix.Fstat(pathDescriptor, &observed) == nil && unix.Fstat(int(job.file.Fd()), &retained) == nil &&
+		uint64(expected.Dev) == job.device && expected.Ino == job.inode &&
+		uint64(observed.Dev) == job.device && observed.Ino == job.inode &&
+		uint64(retained.Dev) == job.device && retained.Ino == job.inode && retained.Nlink > 0 &&
+		tempRootMetadataSecure(observed, expectedUID, expectedGID) &&
+		tempRootMetadataSecure(retained, expectedUID, expectedGID)
 }
 
-func removeRuntimeJobDirectory(handle *os.File, jobDirectory string) error {
-	if handle == nil || filepath.Dir(jobDirectory) != "/tmp" {
+func removeRuntimeJobDirectory(handle *os.File, jobDirectory string, job *runtimeJobDirectory) error {
+	return removeRuntimeJobDirectoryForIdentity(
+		"/tmp", handle, jobDirectory, job, isolatedRuntimeUID, isolatedRuntimeGID, true,
+	)
+}
+
+func removeRuntimeJobDirectoryForIdentity(
+	root string,
+	handle *os.File,
+	jobDirectory string,
+	job *runtimeJobDirectory,
+	expectedUID, expectedGID uint32,
+	requireSecureRoot bool,
+) error {
+	if handle == nil || job == nil || job.file == nil || filepath.Dir(jobDirectory) != root {
 		return ErrInvalidConfiguration
 	}
 	name := filepath.Base(jobDirectory)
@@ -231,15 +296,27 @@ func removeRuntimeJobDirectory(handle *os.File, jobDirectory string) error {
 	if descriptor < 0 {
 		return ErrInvalidConfiguration
 	}
+	mountID, ok := descriptorMountID(descriptor)
+	if !ok || (requireSecureRoot && !runtimeRootPathMatches(root, handle, mountID)) ||
+		!runtimeJobPathMatches(handle, mountID, jobDirectory, job, expectedUID, expectedGID) {
+		return ErrTerminationUnconfirmed
+	}
 	anchored := filepath.Join("/proc/self/fd", strconv.Itoa(descriptor), name)
 	if err := os.RemoveAll(anchored); err != nil {
 		return ErrTerminationUnconfirmed
 	}
-	var metadata unix.Stat_t
-	if err := unix.Fstatat(descriptor, name, &metadata, unix.AT_SYMLINK_NOFOLLOW); errors.Is(err, syscall.ENOENT) {
-		return nil
+	var retained, named unix.Stat_t
+	nameErr := unix.Fstatat(descriptor, name, &named, unix.AT_SYMLINK_NOFOLLOW)
+	if err := unix.Fstat(int(job.file.Fd()), &retained); err != nil || uint64(retained.Dev) != job.device ||
+		retained.Ino != job.inode || retained.Nlink != 0 || !errors.Is(nameErr, syscall.ENOENT) ||
+		(requireSecureRoot && !runtimeRootPathMatches(root, handle, mountID)) {
+		return ErrTerminationUnconfirmed
 	}
-	return ErrTerminationUnconfirmed
+	if err := job.file.Close(); err != nil {
+		return ErrTerminationUnconfirmed
+	}
+	job.file = nil
+	return nil
 }
 
 func createPrivateDirectoryAt(descriptor int, prefix string, expectedUID, expectedGID uint32) (string, error) {
