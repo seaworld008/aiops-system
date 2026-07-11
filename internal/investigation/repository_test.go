@@ -39,7 +39,10 @@ func TestCanonicalTaskSpecsRejectConnectionAndCredentialMaterial(t *testing.T) {
 		"key value":                      `{"parameters":[{"key":"endpoint","value":"db.internal"}]}`,
 		"query target":                   `{"query":"https://169.254.169.254/latest"}`,
 		"scheme relative target":         `{"query":"//169.254.169.254/latest"}`,
+		"scheme relative authority":      `{"query":"//reader@db.internal:5432/metrics"}`,
+		"host port path":                 `{"query":"db.internal:5432/metrics"}`,
 		"query host and port assignment": `{"query":"host=db.internal port=5432"}`,
+		"pseudo selector connection":     `{"query":"connect({host=\"db.internal\",port=\"5432\"})"}`,
 		"text dsn assignment":            `{"text":"dsn=postgresql://db.internal/app"}`,
 		"text endpoint assignment":       `{"text":"endpoint=db.internal"}`,
 		"text url assignment":            `{"text":"url=internal.invalid/path"}`,
@@ -62,7 +65,9 @@ func TestCanonicalTaskSpecsRejectConnectionAndCredentialMaterial(t *testing.T) {
 
 	for name, query := range map[string]string{
 		"promql":                    `rate(http_requests_total{service="payments"}[5m]) > 0`,
+		"promql host selector":      `rate(metric{host="api-1"}[5m]) > 0`,
 		"promql target-like labels": `rate(http_requests_total{host="api.internal", cluster="prod"}[5m]) > 0`,
+		"bare logql":                `{app="payments"}`,
 		"logql":                     `{app="payments"} |= "timeout: upstream"`,
 		"logql target-like labels":  `{server="api.internal", cluster=~"prod-.+"} |= "timeout"`,
 	} {

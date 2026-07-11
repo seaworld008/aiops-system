@@ -24,10 +24,11 @@ var (
 var taskKeyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,63}$`)
 
 var (
-	targetURISchemePattern      = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://`)
-	targetSchemeRelativePattern = regexp.MustCompile(`(?i)(?:^|[\s"\x27(=])//(?:[a-z0-9.-]+|\[[0-9a-f:]+\])(?::[0-9]{1,5})?(?:[/#?]|$)`)
-	targetHostPortPattern       = regexp.MustCompile(`(?i)^(?:[a-z0-9.-]+|\[[0-9a-f:]+\]):[0-9]{1,5}$`)
-	targetAssignmentPattern     = regexp.MustCompile(`(?i)(^|[^a-z0-9])(host(?:[\s_.-]*name)?|port|dsn|endpoint|url|uri|address|server|target|cluster)[\s_.-]*[:=][\s]*`)
+	targetURISchemePattern        = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://`)
+	targetSchemeRelativePattern   = regexp.MustCompile(`(?i)(?:^|[\s"\x27(=])//(?:[a-z0-9._~%!$&()*+,;=:-]+@)?(?:[a-z0-9.-]+|\[[0-9a-f:]+\])(?::[0-9]{1,5})?(?:[/#?]|$)`)
+	targetHostPortPattern         = regexp.MustCompile(`(?i)^(?:[a-z0-9.-]+|\[[0-9a-f:]+\]):[0-9]{1,5}(?:[/#?][^\s]*)?$`)
+	targetAssignmentPattern       = regexp.MustCompile(`(?i)(^|[^a-z0-9])(host(?:[\s_.-]*name)?|port|dsn|endpoint|url|uri|address|server|target|cluster)[\s_.-]*[:=][\s]*`)
+	targetMetricIdentifierPattern = regexp.MustCompile(`^[A-Za-z_:][A-Za-z0-9_:]*$`)
 )
 
 type TaskSpec struct {
@@ -315,7 +316,7 @@ func containsTaskTargetAssignment(value string) bool {
 			continue
 		}
 		remaining := value[valueStart:]
-		if insideTaskSelector(value, match[4]) &&
+		if insideAllowedTaskSelector(value, match[4]) &&
 			(strings.HasPrefix(remaining, `"`) || strings.HasPrefix(remaining, `~"`)) {
 			continue
 		}
@@ -324,8 +325,8 @@ func containsTaskTargetAssignment(value string) bool {
 	return false
 }
 
-func insideTaskSelector(value string, position int) bool {
-	depth := 0
+func insideAllowedTaskSelector(value string, position int) bool {
+	selectorStarts := make([]int, 0, 1)
 	quoted := false
 	escaped := false
 	for index := 0; index < position; index++ {
@@ -337,10 +338,30 @@ func insideTaskSelector(value string, position int) bool {
 		case current == '"':
 			quoted = !quoted
 		case !quoted && current == '{':
-			depth++
-		case !quoted && current == '}' && depth > 0:
-			depth--
+			selectorStarts = append(selectorStarts, index)
+		case !quoted && current == '}' && len(selectorStarts) > 0:
+			selectorStarts = selectorStarts[:len(selectorStarts)-1]
 		}
 	}
-	return depth > 0
+	if len(selectorStarts) == 0 {
+		return false
+	}
+	selectorStart := selectorStarts[len(selectorStarts)-1]
+	if selectorStart == 0 {
+		return true
+	}
+	previous := selectorStart - 1
+	for previous >= 0 && strings.ContainsRune(" \t\r\n", rune(value[previous])) {
+		previous--
+	}
+	identifierEnd := previous + 1
+	for previous >= 0 && isTaskMetricIdentifierByte(value[previous]) {
+		previous--
+	}
+	return targetMetricIdentifierPattern.MatchString(value[previous+1 : identifierEnd])
+}
+
+func isTaskMetricIdentifierByte(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' ||
+		value >= '0' && value <= '9' || value == '_' || value == ':'
 }

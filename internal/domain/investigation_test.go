@@ -195,6 +195,38 @@ func TestSafeJSONObjectRejectsSensitivePathsNamesAndValuesWithoutEcho(t *testing
 	}
 }
 
+func TestValidateSafeJSONObjectRejectsRawInvalidUTF8WithoutEcho(t *testing.T) {
+	value := append([]byte(`{"message":"pass`), 0xff)
+	value = append(value, []byte(`word=canary"}`)...)
+
+	err := domain.ValidateSafeJSONObject(value)
+	if err == nil {
+		t.Fatal("ValidateSafeJSONObject() error = nil, want invalid UTF-8 rejection")
+	}
+	if strings.Contains(err.Error(), "canary") {
+		t.Fatalf("ValidateSafeJSONObject() echoed invalid input: %v", err)
+	}
+}
+
+func TestValidateSafeJSONObjectRejectsReplacementRuneInKeysAndStringsWithoutEcho(t *testing.T) {
+	for name, value := range map[string]json.RawMessage{
+		"escaped lone surrogate value": json.RawMessage(`{"message":"canary-\ud800"}`),
+		"escaped lone surrogate key":   json.RawMessage(`{"\ud800":"canary"}`),
+		"replacement rune value":       json.RawMessage(`{"message":"canary-�"}`),
+		"replacement rune key":         json.RawMessage(`{"�":"canary"}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := domain.ValidateSafeJSONObject(value)
+			if err == nil {
+				t.Fatal("ValidateSafeJSONObject() error = nil, want invalid Unicode rejection")
+			}
+			if strings.Contains(err.Error(), "canary") {
+				t.Fatalf("ValidateSafeJSONObject() echoed invalid input: %v", err)
+			}
+		})
+	}
+}
+
 func TestEvidenceAttributesRejectSensitiveNamesAndValues(t *testing.T) {
 	now := time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC)
 	payload := json.RawMessage(`{"series_count":3}`)

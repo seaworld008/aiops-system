@@ -1,6 +1,7 @@
 package domain_test
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -53,6 +54,56 @@ func TestOnlyExplicitHumanFeedbackConfirmsRootCause(t *testing.T) {
 	}
 	if hypothesis.Status != domain.HypothesisConfirmed {
 		t.Fatalf("hypothesis status = %s, want CONFIRMED", hypothesis.Status)
+	}
+}
+
+func TestIncidentRootCauseConfirmationRejectsInvalidActorWithoutMutation(t *testing.T) {
+	now := time.Date(2026, 7, 12, 17, 0, 0, 0, time.UTC)
+	incident := domain.NewIncident("incident-1", "workspace-1", now)
+	hypothesis := validRootCauseHypothesis(now, "hypothesis-1", "workspace-1", "incident-1")
+	wantIncident := incident
+	wantHypothesis := hypothesis
+
+	err := incident.ConfirmRootCauseAt(&hypothesis, domain.Actor{Type: domain.ActorHuman, ID: "user\x00other"}, now)
+	if err == nil {
+		t.Fatal("ConfirmRootCauseAt() error = nil, want invalid actor rejection")
+	}
+	if !reflect.DeepEqual(incident, wantIncident) || !reflect.DeepEqual(hypothesis, wantHypothesis) {
+		t.Fatalf("failed confirmation mutated objects: %#v / %#v", incident, hypothesis)
+	}
+}
+
+func TestIncidentRootCauseConfirmationRejectsInvalidIncidentWithoutMutation(t *testing.T) {
+	now := time.Date(2026, 7, 12, 17, 15, 0, 0, time.UTC)
+	incident := domain.NewIncident("incident-1", "workspace-1", now)
+	incident.TenantID = "tenant\x00other"
+	hypothesis := validRootCauseHypothesis(now, "hypothesis-1", "workspace-1", "incident-1")
+	wantIncident := incident
+	wantHypothesis := hypothesis
+
+	err := incident.ConfirmRootCauseAt(&hypothesis, domain.Actor{Type: domain.ActorHuman, ID: "user-1"}, now)
+	if err == nil {
+		t.Fatal("ConfirmRootCauseAt() error = nil, want invalid incident rejection")
+	}
+	if !reflect.DeepEqual(incident, wantIncident) || !reflect.DeepEqual(hypothesis, wantHypothesis) {
+		t.Fatalf("failed confirmation mutated objects: %#v / %#v", incident, hypothesis)
+	}
+}
+
+func TestIncidentRootCauseConfirmationDoesNotCommitInvalidCandidate(t *testing.T) {
+	now := time.Date(2026, 7, 12, 17, 30, 0, 0, time.UTC)
+	incident := domain.NewIncident("incident-1", "workspace-1", now)
+	incident.Version = int64(^uint64(0) >> 1)
+	hypothesis := validRootCauseHypothesis(now, "hypothesis-1", "workspace-1", "incident-1")
+	wantIncident := incident
+	wantHypothesis := hypothesis
+
+	err := incident.ConfirmRootCauseAt(&hypothesis, domain.Actor{Type: domain.ActorHuman, ID: "user-1"}, now)
+	if err == nil {
+		t.Fatal("ConfirmRootCauseAt() error = nil, want invalid candidate rejection")
+	}
+	if !reflect.DeepEqual(incident, wantIncident) || !reflect.DeepEqual(hypothesis, wantHypothesis) {
+		t.Fatalf("failed confirmation committed partial mutation: %#v / %#v", incident, hypothesis)
 	}
 }
 

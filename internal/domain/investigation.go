@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const MaxInvestigationJSONBytes = 64 * 1024
@@ -346,7 +347,10 @@ func ValidOperation(value string) bool {
 }
 
 func ValidateSafeJSONObject(value json.RawMessage) error {
-	if len(value) == 0 || len(value) > MaxInvestigationJSONBytes || !json.Valid(value) {
+	if len(value) == 0 || len(value) > MaxInvestigationJSONBytes || !utf8.Valid(value) {
+		return fmt.Errorf("JSON must be a valid object of at most %d bytes", MaxInvestigationJSONBytes)
+	}
+	if !json.Valid(value) {
 		return fmt.Errorf("JSON must be a valid object of at most %d bytes", MaxInvestigationJSONBytes)
 	}
 	if err := validateStrictJSONTokens(value); err != nil {
@@ -459,8 +463,13 @@ func consumeJSONToken(decoder *json.Decoder, token json.Token, depth int) error 
 	if depth > maxInvestigationJSONDepth {
 		return fmt.Errorf("JSON nesting exceeds limit")
 	}
-	if text, ok := token.(string); ok && unsafeSecurityValue(text) {
-		return fmt.Errorf("JSON contains forbidden sensitive metadata")
+	if text, ok := token.(string); ok {
+		if !validStrictJSONString(text) {
+			return fmt.Errorf("JSON contains invalid Unicode")
+		}
+		if unsafeSecurityValue(text) {
+			return fmt.Errorf("JSON contains forbidden sensitive metadata")
+		}
 	}
 	delimiter, composite := token.(json.Delim)
 	if !composite {
@@ -477,6 +486,9 @@ func consumeJSONToken(decoder *json.Decoder, token json.Token, depth int) error 
 			key, ok := keyToken.(string)
 			if !ok {
 				return fmt.Errorf("JSON contains invalid object key")
+			}
+			if !validStrictJSONString(key) {
+				return fmt.Errorf("JSON contains invalid Unicode")
 			}
 			if unsafeSecurityValue(key) {
 				return fmt.Errorf("JSON contains forbidden sensitive metadata")
@@ -510,6 +522,10 @@ func consumeJSONToken(decoder *json.Decoder, token json.Token, depth int) error 
 		return fmt.Errorf("JSON contains unterminated structure")
 	}
 	return nil
+}
+
+func validStrictJSONString(value string) bool {
+	return utf8.ValidString(value) && !strings.ContainsRune(value, utf8.RuneError)
 }
 
 func unsafeSecurityPath(path []string) bool {

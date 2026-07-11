@@ -144,14 +144,23 @@ func (incident *Incident) ConfirmRootCause(hypothesis *Hypothesis, actor Actor) 
 }
 
 func (incident *Incident) ConfirmRootCauseAt(hypothesis *Hypothesis, actor Actor, now time.Time) error {
-	if actor.Type != ActorHuman || actor.ID == "" {
+	if incident == nil {
+		return fmt.Errorf("root cause confirmation requires a valid incident")
+	}
+	if err := incident.Validate(); err != nil {
+		return fmt.Errorf("root cause confirmation requires a valid incident")
+	}
+	if actor.Type != ActorHuman || !ValidResourceID(actor.ID) {
 		return fmt.Errorf("root cause confirmation requires an authenticated human")
 	}
-	if hypothesis == nil || hypothesis.ID == "" || hypothesis.Status != HypothesisProposed {
-		return fmt.Errorf("only a proposed hypothesis can be confirmed")
+	if hypothesis == nil {
+		return fmt.Errorf("root cause confirmation requires a valid hypothesis")
 	}
 	if err := hypothesis.Validate(); err != nil {
 		return fmt.Errorf("root cause confirmation requires a valid hypothesis")
+	}
+	if hypothesis.Status != HypothesisProposed {
+		return fmt.Errorf("only a proposed hypothesis can be confirmed")
 	}
 	if hypothesis.WorkspaceID != incident.WorkspaceID || hypothesis.IncidentID != incident.ID {
 		return fmt.Errorf("hypothesis does not belong to this incident")
@@ -159,9 +168,19 @@ func (incident *Incident) ConfirmRootCauseAt(hypothesis *Hypothesis, actor Actor
 	if now.IsZero() || now.Before(incident.UpdatedAt) {
 		return fmt.Errorf("root cause confirmation time cannot move backward")
 	}
-	hypothesis.Status = HypothesisConfirmed
-	incident.ConfirmedHypothesisID = hypothesis.ID
-	incident.UpdatedAt = now.UTC()
-	incident.Version++
+	hypothesisCandidate := *hypothesis
+	hypothesisCandidate.Status = HypothesisConfirmed
+	incidentCandidate := *incident
+	incidentCandidate.ConfirmedHypothesisID = hypothesis.ID
+	incidentCandidate.UpdatedAt = now.UTC()
+	incidentCandidate.Version++
+	if err := hypothesisCandidate.Validate(); err != nil {
+		return fmt.Errorf("root cause confirmation produced an invalid hypothesis")
+	}
+	if err := incidentCandidate.Validate(); err != nil {
+		return fmt.Errorf("root cause confirmation produced an invalid incident")
+	}
+	*incident = incidentCandidate
+	*hypothesis = hypothesisCandidate
 	return nil
 }
