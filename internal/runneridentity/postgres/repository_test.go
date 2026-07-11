@@ -172,6 +172,11 @@ func TestRepositoryAuthenticateMapsUniqueSPIFFEToCertificateBoundDatabaseRunnerA
 	if len(bindings) != 1 || bindings[0].WorkspaceID != testWorkspaceID || bindings[0].EnvironmentID != testEnvironmentID {
 		t.Fatalf("Authenticate().Bindings() = %#v", bindings)
 	}
+	if !authenticated.Allows(testWorkspaceID, testEnvironmentID) ||
+		authenticated.Allows(testWorkspaceID, "40000000-0000-4000-8000-000000000004") ||
+		authenticated.Allows("50000000-0000-4000-8000-000000000005", testEnvironmentID) {
+		t.Fatal("AuthenticatedRunner.Allows() did not preserve exact workspace/environment pairs")
+	}
 	bindings[0].WorkspaceID = "mutated"
 	if authenticated.Bindings()[0].WorkspaceID != testWorkspaceID {
 		t.Fatal("AuthenticatedRunner.Bindings() returned shared mutable state")

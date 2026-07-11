@@ -36,8 +36,14 @@
           "200": {
             "$ref": "#/components/responses/RunnerIdentityOK"
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "403": {
             "$ref": "#/components/responses/Forbidden"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
           },
           "503": {
             "$ref": "#/components/responses/Unavailable"
@@ -55,6 +61,8 @@
         "description": "This is the only job operation that returns a raw job lease token. READ returns 204 until the investigation runtime is enabled.",
         "x-aiops-max-request-body-bytes": 262144,
         "x-aiops-max-response-body-bytes": 262144,
+        "x-aiops-200-required-pool": "WRITE",
+        "x-aiops-read-behavior": "204-no-job-without-queue-dispatch",
         "requestBody": {
           "required": true,
           "content": {
@@ -108,6 +116,7 @@
         "description": "Gateway never holds a Vault manager/revoker token, child token, or dynamic Secret. The closed phases are AUTHORIZE_CHILD_CREATE, RECORD_ANCHOR, ACTIVATE, NO_CREDENTIAL and REQUEST_REVOCATION. Runner cannot submit issuer routes, roles, paths, scopes, TTLs or arbitrary parameters. RECORD_ANCHOR is the only phase carrying a revoke-only accessor, and dynamic issuance is forbidden until its durable ACK.",
         "x-aiops-max-request-body-bytes": 65536,
         "x-aiops-max-response-body-bytes": 65536,
+        "x-aiops-required-pool": "WRITE",
         "security": [
           {
             "mutualTLS": [],
@@ -170,6 +179,7 @@
         "description": "The server revalidates signature, approval/CEL policy, environment and target revisions, Safety/Kill Switch, production classification, certificate, registration, scope revision, epoch, and lease token.",
         "x-aiops-max-request-body-bytes": 65536,
         "x-aiops-max-response-body-bytes": 65536,
+        "x-aiops-required-pool": "WRITE",
         "security": [
           {
             "mutualTLS": [],
@@ -232,6 +242,7 @@
         "description": "Lease extension is selected by the Gateway. Replayed sequences do not extend a lease. Certificate revocation or Runner disable returns 403 without extension; scope revision change or cancellation returns 200 TERMINATE without extension.",
         "x-aiops-max-request-body-bytes": 65536,
         "x-aiops-max-response-body-bytes": 65536,
+        "x-aiops-required-pool": "WRITE",
         "security": [
           {
             "mutualTLS": [],
@@ -294,6 +305,7 @@
         "description": "Only LEASED jobs may be returned to QUEUED. The server derives the detail hash and retry delay from the allowlisted reason code.",
         "x-aiops-max-request-body-bytes": 65536,
         "x-aiops-max-response-body-bytes": 65536,
+        "x-aiops-required-pool": "WRITE",
         "security": [
           {
             "mutualTLS": [],
@@ -356,6 +368,7 @@
         "description": "Runner never submits a result hash. Gateway binds job, plan, Runner, client certificate, epoch, scope revision and structured result before JCS/SHA-256.",
         "x-aiops-max-request-body-bytes": 65536,
         "x-aiops-max-response-body-bytes": 65536,
+        "x-aiops-required-pool": "WRITE",
         "security": [
           {
             "mutualTLS": [],
@@ -612,7 +625,7 @@
         "in": "path",
         "required": true,
         "schema": {
-          "$ref": "#/components/schemas/Identifier"
+          "$ref": "#/components/schemas/RunnerJobID"
         }
       },
       "RevocationID": {
@@ -791,7 +804,18 @@
         "content": {
           "application/json": {
             "schema": {
-              "$ref": "#/components/schemas/JobCompletionResponse"
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/JobCompletionResponse"
+                },
+                {
+                  "properties": {
+                    "status": {
+                      "const": "FINALIZING"
+                    }
+                  }
+                }
+              ]
             }
           }
         }
@@ -809,7 +833,22 @@
         "content": {
           "application/json": {
             "schema": {
-              "$ref": "#/components/schemas/JobCompletionResponse"
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/JobCompletionResponse"
+                },
+                {
+                  "properties": {
+                    "status": {
+                      "enum": [
+                        "UNCERTAIN",
+                        "SUCCEEDED",
+                        "FAILED"
+                      ]
+                    }
+                  }
+                }
+              ]
             }
           }
         }
@@ -1364,10 +1403,16 @@
         "maxLength": 256,
         "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@-]*$"
       },
+      "RunnerJobID": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._@-]{0,255}$"
+      },
       "UUID": {
         "type": "string",
         "format": "uuid",
-        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
       },
       "SHA256Hex": {
         "type": "string",
@@ -1375,11 +1420,13 @@
       },
       "DecimalInt64": {
         "type": "string",
-        "pattern": "^(0|[1-9][0-9]{0,18})$"
+        "pattern": "^(0|[1-9][0-9]{0,18})$",
+        "x-aiops-maximum-int64": "9223372036854775807"
       },
       "PositiveDecimalInt64": {
         "type": "string",
-        "pattern": "^[1-9][0-9]{0,18}$"
+        "pattern": "^[1-9][0-9]{0,18}$",
+        "x-aiops-maximum-int64": "9223372036854775807"
       },
       "RFC3339Timestamp": {
         "type": "string",
@@ -1530,7 +1577,7 @@
         ],
         "properties": {
           "id": {
-            "$ref": "#/components/schemas/Identifier"
+            "$ref": "#/components/schemas/RunnerJobID"
           },
           "kind": {
             "type": "string",
@@ -1583,7 +1630,7 @@
             "const": "action-envelope.v1"
           },
           "action_id": {
-            "$ref": "#/components/schemas/Identifier"
+            "$ref": "#/components/schemas/RunnerJobID"
           },
           "workspace_id": {
             "$ref": "#/components/schemas/Identifier"
@@ -2444,7 +2491,7 @@
             "const": "runner-job-start-response.v1"
           },
           "job_id": {
-            "$ref": "#/components/schemas/Identifier"
+            "$ref": "#/components/schemas/RunnerJobID"
           },
           "status": {
             "type": "string",
@@ -2672,7 +2719,7 @@
             "const": "runner-credential-anchor-response.v1"
           },
           "job_id": {
-            "$ref": "#/components/schemas/Identifier"
+            "$ref": "#/components/schemas/RunnerJobID"
           },
           "revocation_id": {
             "$ref": "#/components/schemas/UUID"
@@ -2709,7 +2756,7 @@
             "const": "runner-credential-anchor-response.v1"
           },
           "job_id": {
-            "$ref": "#/components/schemas/Identifier"
+            "$ref": "#/components/schemas/RunnerJobID"
           },
           "revocation_id": {
             "$ref": "#/components/schemas/UUID"
@@ -2766,7 +2813,7 @@
             "const": "runner-job-heartbeat-response.v1"
           },
           "job_id": {
-            "$ref": "#/components/schemas/Identifier"
+            "$ref": "#/components/schemas/RunnerJobID"
           },
           "accepted_sequence": {
             "$ref": "#/components/schemas/PositiveDecimalInt64"
@@ -2956,7 +3003,7 @@
             "const": "runner-job-state-response.v1"
           },
           "job_id": {
-            "$ref": "#/components/schemas/Identifier"
+            "$ref": "#/components/schemas/RunnerJobID"
           },
           "status": {
             "type": "string",
@@ -2993,7 +3040,7 @@
             "const": "runner-job-completion-response.v1"
           },
           "job_id": {
-            "$ref": "#/components/schemas/Identifier"
+            "$ref": "#/components/schemas/RunnerJobID"
           },
           "status": {
             "type": "string",
@@ -3024,7 +3071,78 @@
               "MANUAL_REQUIRED"
             ]
           }
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "SUCCEEDED"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "properties": {
+                "completion_status": {
+                  "const": "SUCCEEDED"
+                },
+                "credential_cleanup_status": {
+                  "enum": [
+                    "NOT_REQUIRED",
+                    "TERMINAL"
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "FAILED"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "properties": {
+                "completion_status": {
+                  "const": "FAILED"
+                },
+                "credential_cleanup_status": {
+                  "enum": [
+                    "NOT_REQUIRED",
+                    "TERMINAL"
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "UNCERTAIN"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "properties": {
+                "completion_status": {
+                  "const": "UNCERTAIN"
+                }
+              }
+            }
+          }
+        ]
       },
       "RevocationLeaseRequest": {
         "type": "object",
@@ -3254,7 +3372,33 @@
           "available_at": {
             "$ref": "#/components/schemas/RFC3339Timestamp"
           }
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "REVOCATION_PENDING"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "required": [
+                "available_at"
+              ]
+            },
+            "else": {
+              "not": {
+                "required": [
+                  "available_at"
+                ]
+              }
+            }
+          }
+        ]
       }
     }
   }

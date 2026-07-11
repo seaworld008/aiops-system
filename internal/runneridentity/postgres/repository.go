@@ -132,6 +132,18 @@ func (runner AuthenticatedRunner) Bindings() []execution.RunnerScopeBinding {
 	return append([]execution.RunnerScopeBinding(nil), runner.state.bindings...)
 }
 
+func (runner AuthenticatedRunner) Allows(workspaceID, environmentID string) bool {
+	if !runner.Valid() {
+		return false
+	}
+	for _, binding := range runner.state.bindings {
+		if binding.WorkspaceID == workspaceID && binding.EnvironmentID == environmentID {
+			return true
+		}
+	}
+	return false
+}
+
 func (runner AuthenticatedRunner) RunnerScope() (execution.RunnerScope, error) {
 	if !runner.Valid() {
 		return execution.RunnerScope{}, runneridentity.ErrAuthenticationFailed

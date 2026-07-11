@@ -3,6 +3,7 @@ package openapi_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"sort"
 	"strconv"
@@ -101,8 +102,10 @@ func TestRunnerV1Contract(t *testing.T) {
 	}
 	assertClosedObjects(t, schemas, "components.schemas")
 	assertRunnerCapabilityBoundary(t, schemas)
+	assertRunnerWirePrimitives(t, components, paths, schemas)
 	assertTypedActionEnvelope(t, schemas)
 	assertExecutorResultUnion(t, schemas)
+	assertCompletionResponseBoundary(t, components, schemas)
 	if countMapKey(document, "lease_token") != 1 || countMapKey(document, "claim_token") != 1 {
 		t.Errorf("raw lease/claim token schema locations = %d/%d, want 1/1",
 			countMapKey(document, "lease_token"), countMapKey(document, "claim_token"))
@@ -115,6 +118,134 @@ func TestRunnerV1Contract(t *testing.T) {
 			countMapKey(document, "child_create_permit"), countMapKey(document, "revoke_accessor_b64u"))
 	}
 	assertProblemContracts(t, document, components)
+}
+
+func assertCompletionResponseBoundary(t *testing.T, components, schemas map[string]any) {
+	t.Helper()
+	completion := object(t, schemas["JobCompletionResponse"], "JobCompletionResponse")
+	conditions, ok := completion["allOf"].([]any)
+	if !ok || len(conditions) != 3 {
+		t.Fatalf("JobCompletionResponse.allOf = %#v, want three result-correlation conditions", completion["allOf"])
+	}
+	seen := make(map[string]bool, 3)
+	for index, rawCondition := range conditions {
+		condition := object(t, rawCondition, fmt.Sprintf("JobCompletionResponse.allOf[%d]", index))
+		ifSchema := object(t, condition["if"], "JobCompletionResponse.if")
+		ifProperties := object(t, ifSchema["properties"], "JobCompletionResponse.if.properties")
+		status, _ := object(t, ifProperties["status"], "JobCompletionResponse.if.status")["const"].(string)
+		thenSchema := object(t, condition["then"], "JobCompletionResponse.then")
+		properties := object(t, thenSchema["properties"], "JobCompletionResponse.then.properties")
+		if object(t, properties["completion_status"], "JobCompletionResponse.then.completion_status")["const"] != status {
+			t.Errorf("%s completion status is not correlated", status)
+		}
+		if status == "SUCCEEDED" || status == "FAILED" {
+			cleanup := object(t, properties["credential_cleanup_status"], "JobCompletionResponse.then.cleanup")
+			values, enumOK := cleanup["enum"].([]any)
+			if !enumOK || len(values) != 2 || values[0] != "NOT_REQUIRED" || values[1] != "TERMINAL" {
+				t.Errorf("%s credential cleanup enum = %#v", status, cleanup["enum"])
+			}
+		}
+		seen[status] = true
+	}
+	for _, status := range []string{"SUCCEEDED", "FAILED", "UNCERTAIN"} {
+		if !seen[status] {
+			t.Errorf("JobCompletionResponse lacks %s correlation", status)
+		}
+	}
+
+	responses := object(t, components["responses"], "components.responses")
+	assertCompletionHTTPStatusSchema(t, responses, "JobCompletionAccepted", "FINALIZING")
+	assertCompletionHTTPStatusSchema(t, responses, "JobCompletionOK", "UNCERTAIN", "SUCCEEDED", "FAILED")
+
+	revocation := object(t, schemas["RevocationCompletionResponse"], "RevocationCompletionResponse")
+	revocationConditions, ok := revocation["allOf"].([]any)
+	if !ok || len(revocationConditions) != 1 {
+		t.Fatalf("RevocationCompletionResponse.allOf = %#v", revocation["allOf"])
+	}
+	condition := object(t, revocationConditions[0], "RevocationCompletionResponse.allOf[0]")
+	thenSchema := object(t, condition["then"], "RevocationCompletionResponse.then")
+	thenRequired, thenOK := thenSchema["required"].([]any)
+	elseSchema := object(t, condition["else"], "RevocationCompletionResponse.else")
+	forbidden := object(t, elseSchema["not"], "RevocationCompletionResponse.else.not")
+	elseRequired, elseOK := forbidden["required"].([]any)
+	if !thenOK || !elseOK || len(thenRequired) != 1 || len(elseRequired) != 1 ||
+		thenRequired[0] != "available_at" || elseRequired[0] != "available_at" {
+		t.Error("RevocationCompletionResponse does not make available_at PENDING-only")
+	}
+}
+
+func assertCompletionHTTPStatusSchema(t *testing.T, responses map[string]any, name string, statuses ...string) {
+	t.Helper()
+	response := object(t, responses[name], name)
+	content := object(t, response["content"], name+".content")
+	media := object(t, content["application/json"], name+".application/json")
+	schema := object(t, media["schema"], name+".schema")
+	parts, ok := schema["allOf"].([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("%s schema = %#v", name, schema)
+	}
+	restriction := object(t, parts[1], name+".restriction")
+	properties := object(t, restriction["properties"], name+".restriction.properties")
+	status := object(t, properties["status"], name+".restriction.status")
+	if len(statuses) == 1 {
+		if status["const"] != statuses[0] {
+			t.Errorf("%s status = %#v, want %s", name, status, statuses[0])
+		}
+		return
+	}
+	values, ok := status["enum"].([]any)
+	if !ok || len(values) != len(statuses) {
+		t.Errorf("%s status enum = %#v", name, status["enum"])
+		return
+	}
+	for index, want := range statuses {
+		if values[index] != want {
+			t.Errorf("%s status[%d] = %#v, want %s", name, index, values[index], want)
+		}
+	}
+}
+
+func assertRunnerWirePrimitives(t *testing.T, components, paths, schemas map[string]any) {
+	t.Helper()
+	parameters := object(t, components["parameters"], "components.parameters")
+	jobIDParameter := object(t, parameters["JobID"], "components.parameters.JobID")
+	if object(t, jobIDParameter["schema"], "JobID.schema")["$ref"] != "#/components/schemas/RunnerJobID" {
+		t.Error("job path parameter is not constrained to RunnerJobID")
+	}
+	for schemaName, propertyName := range map[string]string{
+		"JobDescriptor": "id", "ActionEnvelopeV1": "action_id",
+		"CredentialChildAuthorizationResponse": "job_id", "CredentialStateResponse": "job_id",
+		"JobStartResponse": "job_id", "JobHeartbeatResponse": "job_id", "JobStateResponse": "job_id",
+		"JobCompletionResponse": "job_id",
+	} {
+		schema := object(t, schemas[schemaName], schemaName)
+		properties := object(t, schema["properties"], schemaName+".properties")
+		property := object(t, properties[propertyName], schemaName+"."+propertyName)
+		if property["$ref"] != "#/components/schemas/RunnerJobID" {
+			t.Errorf("%s.%s = %#v, want RunnerJobID", schemaName, propertyName, property)
+		}
+	}
+	jobID := object(t, schemas["RunnerJobID"], "RunnerJobID")
+	if jobID["pattern"] != "^[A-Za-z0-9][A-Za-z0-9._@-]{0,255}$" {
+		t.Errorf("RunnerJobID pattern = %#v", jobID["pattern"])
+	}
+	uuid := object(t, schemas["UUID"], "UUID")
+	if uuid["pattern"] != "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" {
+		t.Errorf("UUID pattern = %#v, want domain-compatible v1-v5", uuid["pattern"])
+	}
+	for _, name := range []string{"DecimalInt64", "PositiveDecimalInt64"} {
+		schema := object(t, schemas[name], name)
+		if schema["x-aiops-maximum-int64"] != "9223372036854775807" {
+			t.Errorf("%s lacks exact int64 maximum: %#v", name, schema)
+		}
+	}
+	identity := object(t, object(t, paths["/runner/v1/identity"], "identity path")["get"], "identity get")
+	responses := object(t, identity["responses"], "identity responses")
+	for _, status := range []string{"400", "415"} {
+		if responses[status] == nil {
+			t.Errorf("identity operation does not declare runtime %s response", status)
+		}
+	}
 }
 
 func assertOperationContracts(t *testing.T, document, paths map[string]any) {
@@ -146,6 +277,9 @@ func assertOperationContracts(t *testing.T, document, paths map[string]any) {
 		}
 		if strings.Contains(path, "/jobs/{job_id}:") {
 			assertANDSecurity(t, operation, "jobLease", path)
+			if operation["x-aiops-required-pool"] != "WRITE" {
+				t.Errorf("%s pool boundary = %#v, want WRITE", path, operation["x-aiops-required-pool"])
+			}
 		}
 		if strings.Contains(path, "/revocations/{revocation_id}:") {
 			assertANDSecurity(t, operation, "revocationLease", path)
@@ -153,6 +287,13 @@ func assertOperationContracts(t *testing.T, document, paths map[string]any) {
 		if strings.Contains(path, "/revocations") {
 			if operation["x-aiops-required-pool"] != "WRITE" || operation["x-aiops-required-capability"] != "CREDENTIAL_REVOCATION" {
 				t.Errorf("%s capability boundary = pool %#v, capability %#v", path, operation["x-aiops-required-pool"], operation["x-aiops-required-capability"])
+			}
+		}
+		if path == "/runner/v1/jobs:lease" {
+			if operation["x-aiops-200-required-pool"] != "WRITE" ||
+				operation["x-aiops-read-behavior"] != "204-no-job-without-queue-dispatch" {
+				t.Errorf("%s mixed-pool boundary = %#v/%#v", path,
+					operation["x-aiops-200-required-pool"], operation["x-aiops-read-behavior"])
 			}
 		}
 	}
