@@ -73,12 +73,13 @@ flowchart LR
 
     TW --> GW[Runner Gateway]
     GW --> QR[只读 Runner]
-    GW --> WR[变更 Runner]
+    GW --> WR[WRITE Runner]
+    WR --> EX[固定单作业 Executor]
 
     QR --> SRC["Prometheus / VictoriaLogs / K8s / AWX / CI / Argo"]
-    WR --> K8S[Kubernetes API]
-    WR --> GIT["GitLab / GitHub GitOps Repo"]
-    WR --> AWX[AWX Job Template]
+    EX --> K8S[Kubernetes API]
+    EX --> GIT["GitLab / GitHub GitOps Repo"]
+    EX --> AWX[AWX Job Template]
 
     KC[Keycloak] --> CP
     VAULT[Vault] --> QR
@@ -91,7 +92,9 @@ flowchart LR
 | --- | --- |
 | `control-plane` | REST API、OIDC、领域服务、Webhook、Web/飞书后端 |
 | `workflow-worker` | Investigation、Approval、Execution Temporal Workflow/Activity |
-| `environment-runner` | 出站领取类型化任务；按模式启动为 read 或 write |
+| `read-runner` | 出站领取环境专属只读 Activity；二进制和镜像不包含 mutation Executor |
+| `write-runner` | 独立身份出站协调写任务；只允许调用固定路径的单作业 Executor |
+| `executor` | 通过匿名 FD 完成 READY/GO；不接受 payload 指定 binary、argv、shell 或环境变量 |
 | `web` | 事件、调查、证据、反馈、计划、审批、执行、审计页面 |
 
 首版使用 Go 模块化单体，不把 Incident、Agent、Approval、Audit 拆成微服务。当前开发工具链固定为 Go 1.26.5。
@@ -144,7 +147,7 @@ SignalEnvelope
 - Investigation：`QUEUED / RUNNING / PARTIAL / COMPLETED / FAILED / CANCELLED`。
 - Hypothesis：`PROPOSED / CONFIRMED / REJECTED`。
 - Approval：`PENDING / APPROVED / REJECTED / EXPIRED / REVOKED`。
-- Execution：`QUEUED / LEASED / RUNNING / WAITING_EXTERNAL_APPROVAL / WAITING_SYNC / VERIFYING / SUCCEEDED / FAILED / ROLLED_BACK / CANCELLED`。两个 `WAITING_*` 状态只用于GitOps外部控制点，不持有Runner租约或生产凭据。
+- Execution：`QUEUED / LEASED / RUNNING / FINALIZING / UNCERTAIN / WAITING_EXTERNAL_APPROVAL / WAITING_SYNC / VERIFYING / SUCCEEDED / FAILED / ROLLED_BACK / CANCELLED`。`FINALIZING` 在持久凭据吊销确认前持续占用目标锁；`UNCERTAIN` 在人工对账前同样占锁。两个 `WAITING_*` 状态只用于 GitOps 外部控制点，不持有 Runner 租约或生产凭据。
 
 不存在由模型直接填写的最终 `root_cause`。只有人工显式确认的 Hypothesis 才能成为 Incident 的 `confirmed_hypothesis_id`。
 
@@ -178,13 +181,25 @@ POST /api/v1/chatops/feishu/events
 POST /api/v1/chatops/feishu/actions
 ```
 
-Runner 只允许出站 HTTPS+mTLS：
+Runner 只允许通过独立 TLS 1.3 mTLS listener 出站通信；身份来自唯一 SPIFFE URI SAN 和
+服务端注册，不接受请求体或代理 header 提供 Runner/scope：
 
 ```text
+GET  /runner/v1/identity
 POST /runner/v1/jobs:lease
+POST /runner/v1/jobs/{id}:credential-anchor
+POST /runner/v1/jobs/{id}:start
 POST /runner/v1/jobs/{id}:heartbeat
+POST /runner/v1/jobs/{id}:release
 POST /runner/v1/jobs/{id}:complete
+POST /runner/v1/revocations:lease
+POST /runner/v1/revocations/{id}:heartbeat
+POST /runner/v1/revocations/{id}:complete
 ```
+
+Claim 是唯一返回原始 lease token 的操作；后续 token 只进入专用 Authorization header，
+不得进入 URL、日志、trace、审计或数据库明文。所有 JSON 拒绝未知/重复字段和尾随值，
+响应使用 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff` 与 RFC 9457 错误。
 
 除外部 Webhook 外，所有写请求要求 `Idempotency-Key`；同键不同请求哈希返回 409。Webhook 使用 `(integration_id, provider_event_id)` 唯一键和 payload hash，同一事件 ID 携带不同载荷时记录安全冲突并拒绝。PATCH要求 `If-Match`。列表使用不透明游标，默认50、最大100。错误使用 RFC 9457 `application/problem+json`。
 
@@ -239,7 +254,9 @@ signature{alg,key_id,value}
 - 检查用户/工作负载身份、Workspace、环境、服务所有权、白名单、维护窗、冻结、并发、爆炸半径和参数边界。
 - CRITICAL 动作首版直接拒绝。
 - 审批人与申请人分离；审批默认30分钟过期。
-- Vault 签发单任务、单目标、最长15分钟凭据；凭据只进入 Runner 内存/tmpfs。
+- Vault 使用作业级、非 orphan、不可续期且最长 15 分钟的 child token；只有 revoke-only
+  accessor 已加密持久化并收到 anchor ACK 后才能签发动态 Secret。Secret 只通过匿名 FD
+  进入 Executor 内存，完成或强杀后由持久任务按 accessor 吊销。
 - 试点期生产动作全局并发为1，并使用带 fencing token 的目标租约锁。
 
 ### 7.2 动作边界
@@ -276,7 +293,10 @@ signature{alg,key_id,value}
 
 - 企业 Kubernetes 管理集群自托管。
 - control-plane 与 workflow-worker 至少三副本。
-- 每个信任区分别部署 read/write Runner；无公网入站。
+- 每个信任区分别部署 READ/WRITE Runner；使用不同二进制、镜像、身份、Client CA、
+  ServiceAccount、Vault role 和 NetworkPolicy，且无公网入站。
+- WRITE 每作业还必须由目标环境提供 cgroup v2、审核过的 seccomp/AppArmor（或 SELinux）、
+  只读根文件系统和专用 `/tmp` tmpfs；缺失任一门禁时保持写模式 `disabled`。
 - PostgreSQL、Temporal、Keycloak、Vault 使用企业高可用能力，平台只集成、不负责其生命周期。
 - 目标可用性99.9%，RPO不超过5分钟，RTO不超过30分钟。
 - 原始脱敏证据保留30天，结构化调查保留90天，审批和审计保留365天。

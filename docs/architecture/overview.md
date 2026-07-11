@@ -24,7 +24,8 @@ flowchart TB
 
     subgraph Runners["Outbound environment runners"]
         READ["Read-only runner pool"]
-        WRITE["Isolated change runner pool"]
+        WRITE["Write runner pool"]
+        EXEC["Fixed per-job executor"]
     end
 
     SOURCES["Prometheus / VictoriaLogs / K8s / AWX / CI / Argo"]
@@ -40,14 +41,17 @@ flowchart TB
     TEMPORAL --> READ
     TEMPORAL --> WRITE
     READ --> SOURCES
-    WRITE --> TARGETS
+    WRITE --> EXEC
+    EXEC --> TARGETS
 ```
 
 ## Deployment units
 
 - `control-plane`: HTTP APIs, identity and authorization, domain transactions, service catalog, signal ingestion, policy decisions, approvals, and audit access.
 - `workflow-worker`: durable investigations, approval waits, execution orchestration, retries, and recovery. Workflow histories contain identifiers, never credentials or raw logs.
-- `environment-runner`: outbound-only evidence and mutation workers. Read and write pools use separate identities, nodes, queues, and network policy.
+- `read-runner`: outbound-only, environment-scoped read activities. Its binary and image contain no mutation executor.
+- `write-runner`: outbound-only write coordination. Its separate image can invoke only the fixed `/usr/local/libexec/aiops-executor`.
+- `executor`: one fixed child process per job, with no payload-selected binary, argv, shell, or environment. It receives a Secret only after READY/GO authorization.
 
 The codebase starts as a modular monolith. Module boundaries are explicit, but distributed services are introduced only when isolation, scaling, or ownership justifies the operational cost.
 
@@ -88,25 +92,32 @@ sequenceDiagram
     participant C as Control plane
     participant P as CEL policy
     participant V as Credential issuer
+    participant G as mTLS Runner Gateway
     participant Q as Persistent action queue
     participant R as Isolated write runner
+    participant E as Fixed executor
     participant T as Target
 
     U->>C: Submit exact typed plan
     C->>P: Evaluate plan and approval requirements
     C->>C: Seal canonical ActionEnvelope
     C->>Q: Persist immutable envelope and target lock
-    R->>Q: Scoped claim with fenced lease
-    R->>C: Resolve live environment and kill switches
-    R->>V: Request single-target short-lived credential
-    R->>P: Re-evaluate immediately before execution
-    R->>T: Execute one typed action
-    R->>T: Verify outcome
-    R->>Q: Complete, fail, or mark uncertain
-    R->>V: Revoke credential
+    R->>G: mTLS scoped claim with fenced lease
+    G->>Q: Atomically claim exact workspace/environment scope
+    R->>E: PREPARE typed action without a Secret
+    E-->>R: READY after fixed-handler validation
+    R->>G: Start and re-evaluate live gates
+    R->>V: Create anchored single-target credential
+    R->>E: Secret + GO through anonymous framed FD
+    E->>T: Execute one typed action and verify
+    E-->>R: Bounded structured result
+    R->>G: Complete, fail, or mark uncertain
+    G->>Q: FINALIZING while durable revocation converges
 ```
 
-The model can propose an action but cannot decide risk, permissions, approval, credential scope, or execution. Any drift in the plan, target revision, policy, approval, or environment invalidates the previous authorization.
+The model can propose an action but cannot decide risk, permissions, approval, credential scope, or execution. Any drift in the plan, target revision, policy, approval, or environment invalidates the previous authorization. A post-GO ambiguity or unconfirmed process-group termination becomes `UNCERTAIN` and retains the target lock.
+
+The current M4 implementation deliberately keeps Gateway action start closed and compiles no mutation adapters. `non-production` only performs the Linux isolation capability probe; no production write mode exists.
 
 ## Initial mutation boundary
 

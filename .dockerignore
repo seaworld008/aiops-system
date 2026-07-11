@@ -1,0 +1,12 @@
+.git
+.github
+.worktrees
+.env
+.env.*
+*.md
+api
+docs
+migrations
+**/.DS_Store
+**/*_test.go
+**/testdata
