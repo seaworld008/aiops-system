@@ -654,11 +654,7 @@ func (repository *Repository) CompleteRunnerTx(
 		return readtask.CompletionResult{}, err
 	}
 
-	projectionTime := databaseNow
-	if attempt.Status == readtask.AttemptCompleted {
-		projectionTime = attempt.TerminalAt
-	}
-	projection, err := readtask.ProjectCompletion(task.descriptor, attempt, completion, projectionTime)
+	projection, err := projectRunnerCompletion(task.descriptor, attempt, completion, databaseNow)
 	if err != nil {
 		return readtask.CompletionResult{}, readtask.ErrProjectionRejected
 	}
@@ -788,6 +784,25 @@ func (repository *Repository) CompleteRunnerTx(
 		return readtask.CompletionResult{}, persistenceError("validate READ completion result", errors.New("invalid completion projection"))
 	}
 	return result, nil
+}
+
+func projectRunnerCompletion(
+	descriptor readtask.Descriptor,
+	attempt readtask.Attempt,
+	completion readtask.Completion,
+	receivedAt time.Time,
+) (readtask.ProjectedCompletion, error) {
+	projectionAttempt := attempt
+	if attempt.Status == readtask.AttemptCompleted {
+		receivedAt = attempt.TerminalAt
+		// Rebuild the semantic request independently of committed hashes so a
+		// changed replay is a conflict, not a malformed projection.
+		projectionAttempt.Status = readtask.AttemptRunning
+		projectionAttempt.TerminalAt = time.Time{}
+		projectionAttempt.RequestHash = ""
+		projectionAttempt.ReceiptHash = ""
+	}
+	return readtask.ProjectCompletion(descriptor, projectionAttempt, completion, receivedAt)
 }
 
 func updateTerminalTask(

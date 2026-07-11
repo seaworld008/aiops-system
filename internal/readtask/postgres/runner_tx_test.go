@@ -503,6 +503,48 @@ func TestCompleteRunnerTxReplaysOriginalReceiptWithoutAnotherWrite(t *testing.T)
 	rollbackReadTaskTx(t, database, tx)
 }
 
+func TestProjectRunnerCompletionClassifiesChangedCommittedReplayByHash(t *testing.T) {
+	base := testNow()
+	certificate := readtask.CertificateBinding{SHA256: testCertificateHash, NotAfter: base.Add(time.Minute)}
+	descriptor, _ := testDescriptorAndInput()
+	fence, err := readtask.NewFence(testTaskID, testRunnerID, []byte(testLeaseToken), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fence.Destroy()
+	running := testAttempt(base, certificate, readtask.AttemptRunning)
+	running.StartedAt = base
+	completion := readtask.Completion{
+		Fence: fence, Outcome: readtask.CompletionEvidence,
+		Evidence: &readtask.EvidenceCompletion{
+			CollectedAt: base.Add(time.Second), Items: []json.RawMessage{json.RawMessage(`{"value":1}`)},
+		},
+	}
+	original, err := projectRunnerCompletion(descriptor, running, completion, base.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed := running
+	completed.Status = readtask.AttemptCompleted
+	completed.TerminalAt = base.Add(2 * time.Second)
+	completed.UpdatedAt = completed.TerminalAt
+	completed.RequestHash = original.RequestHash()
+	completed.ReceiptHash = original.ReceiptHash()
+
+	same, err := projectRunnerCompletion(descriptor, completed, completion, base.Add(5*time.Second))
+	if err != nil || same.RequestHash() != original.RequestHash() || same.ReceiptHash() != original.ReceiptHash() {
+		t.Fatalf("same committed replay projection = %#v, %v", same.Receipt(), err)
+	}
+	changed := completion
+	changed.Evidence = &readtask.EvidenceCompletion{
+		CollectedAt: base.Add(time.Second), Items: []json.RawMessage{json.RawMessage(`{"value":2}`)},
+	}
+	different, err := projectRunnerCompletion(descriptor, completed, changed, base.Add(5*time.Second))
+	if err != nil || different.RequestHash() == original.RequestHash() || different.ReceiptHash() == original.ReceiptHash() {
+		t.Fatalf("changed committed replay projection = %#v, %v", different.Receipt(), err)
+	}
+}
+
 func newReadTaskRepository(t *testing.T) (pgxmock.PgxPoolIface, *Repository) {
 	t.Helper()
 	database, err := pgxmock.NewPool()
