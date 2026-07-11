@@ -242,6 +242,8 @@ func TestSafeJSONObjectRejectsSensitivePathsNamesAndValuesWithoutEcho(t *testing
 		"token CLI option array":    json.RawMessage(`{"args":["collect","--token","` + canary + `"]}`),
 		"API key CLI option array":  json.RawMessage(`{"options":["--api-key=` + canary + `"]}`),
 		"accessor CLI option array": json.RawMessage(`{"command":["tool","--accessor","` + canary + `"]}`),
+		"embedded token CLI option": json.RawMessage(`{"message":"curl --token ` + canary + `"}`),
+		"quoted API key CLI option": json.RawMessage(`{"message":"tool \"--api-key\" ` + canary + `"}`),
 		"colon-obfuscated API key":  json.RawMessage(`{"api:key":"` + canary + `"}`),
 		"colon-obfuscated password": json.RawMessage(`{"pass:word":"` + canary + `"}`),
 		"colon-obfuscated assignment": json.RawMessage(
@@ -437,6 +439,8 @@ func TestSafeTextAndMetadataRejectCredentialAssignmentVariants(t *testing.T) {
 		"prefixed accessor":      "dbAccessor=canary",
 		"private key":            "private.key: canary",
 		"prefixed private key":   "clientPrivateKey=canary",
+		"embedded token option":  "curl --token canary",
+		"quoted API key option":  `tool "--api-key" canary`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if domain.ValidSafeText(value) {

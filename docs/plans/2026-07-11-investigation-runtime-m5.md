@@ -25,6 +25,8 @@
 
 终态写入必须绑定 Workspace、幂等键和规范化请求哈希；同键同请求返回原结果，同键不同请求失败。`internal/investigation` 提供 Memory 与后续 PostgreSQL 仓储共用的纯请求语义函数：正文先完成校验和深拷贝，再以版本化 operation schema、NUL 域分隔符和 JCS wire 生成 SHA-256。Create 与 TaskSpec 分别固定为 `investigation.create.v1`、`investigation.task-specs.v1`。Evidence Payload 与 Hypothesis Proposal 始终保留原始字节，并由其原始 SHA-256 参与语义哈希；不得用 JCS 改写这两类事实。Feedback Details 则在首次写入前通过严格安全 JSON 校验并保存为 JCS，因此仅空白或对象键顺序不同的重放具有相同语义。
 
+可变的服务端准入不能破坏已提交事实的幂等重放。Create 必须先用纯 canonical/hash 在读锁下检查已有 operation owner 和 idempotency record；只有新请求才在锁外调用 `TaskSpecAuthorizer`，并在写锁内二次检查并发赢家后创建。Signal 同样先应用静态安全规范化并检查既有事实；5 分钟 future-skew 只约束不存在的新 Signal，可信时钟回拨不能使历史重放失败。
+
 幂等操作响应与当前查询投影是两个不同契约。`StartModel` 和 `FinalizeInvestigation` 首次成功时保存独立深拷贝的响应快照；后续同键重放永远返回首次快照，即使 Investigation 已 finalize/fail，或 Feedback 已把实时 Hypothesis 投影从 `PROPOSED` 改为 `CONFIRMED/REJECTED`。调用方对首次结果或重放结果的修改也不得反向修改快照；需要最新状态时必须调用 Get/List 查询。
 
 Memory 的提交时间以可信时钟和已持久化相关事实取单调上界，防止时钟回拨产生倒序生命周期；Create 在锁内完成 ID 准备后，以 clock 与 Incident 的 `OpenedAt/LastSignalAt/UpdatedAt` 上界作为 Investigation、Tasks 和 Incident transition 的同一提交时间。Evidence 的 `CollectedAt` 不得晚于提交边界。`ListEvidence` 明确按 `CollectedAt → CreatedAt → ID` 升序返回，因此结果不依赖并发任务的完成/加锁顺序。

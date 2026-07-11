@@ -15,7 +15,7 @@ func (repository *Repository) RegisterSignal(ctx context.Context, signal domain.
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	normalized, err := investigation.NormalizeSignal(signal, repository.clock())
+	normalized, err := investigation.NormalizeSignalForReplay(signal)
 	if err != nil {
 		return false, err
 	}
@@ -28,6 +28,9 @@ func (repository *Repository) RegisterSignal(ctx context.Context, signal domain.
 			return false, nil
 		}
 		return false, store.ErrIdempotencyConflict
+	}
+	if err := investigation.ValidateNewSignalTime(signal, repository.clock()); err != nil {
+		return false, err
 	}
 	repository.signals[key] = signal
 	return true, nil

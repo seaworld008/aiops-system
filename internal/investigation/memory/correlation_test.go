@@ -448,6 +448,37 @@ func TestRegisterSignalNormalizesEquivalentObservedAtInstantsForReplay(t *testin
 	}
 }
 
+func TestRegisterSignalReplaySurvivesClockRollbackBeyondFutureSkew(t *testing.T) {
+	base := time.Date(2026, 7, 13, 6, 5, 0, 0, time.UTC)
+	clockNow := base
+	nextID := 0
+	repository, err := memory.New(memory.Options{
+		Clock: func() time.Time { return clockNow }, TenantResolver: testTenantResolver, TaskSpecAuthorizer: testTaskSpecAuthorizer,
+		IDFactory: func() string { nextID++; return fmt.Sprintf("signal-clock-replay-%d", nextID) },
+	})
+	if err != nil {
+		t.Fatalf("memory.New() error = %v", err)
+	}
+	accepted := testSignal("workspace-1", "signal-clock-replay", "firing", base.Add(4*time.Minute))
+	accepted.Labels = nil
+	if created, err := repository.RegisterSignal(context.Background(), accepted); err != nil || !created {
+		t.Fatalf("RegisterSignal(first) = %v, %v; want accepted", created, err)
+	}
+	clockNow = base.Add(-time.Hour)
+	replay := accepted
+	replay.Labels = map[string]string{}
+	if created, err := repository.RegisterSignal(context.Background(), replay); err != nil || created {
+		t.Fatalf("RegisterSignal(replay after rollback) = %v, %v; want existing fact", created, err)
+	}
+	newSignal := replay
+	newSignal.ID = "signal-clock-new"
+	newSignal.ProviderEventID = newSignal.ID
+	newSignal.PayloadHash = sha256Hex([]byte("payload-" + newSignal.ID))
+	if _, err := repository.RegisterSignal(context.Background(), newSignal); !errors.Is(err, investigation.ErrInvalidRequest) {
+		t.Fatalf("RegisterSignal(new future fact after rollback) error = %v, want ErrInvalidRequest", err)
+	}
+}
+
 func TestRegisterSignalEnforcesTrustedFutureSkewWithoutPartialWrite(t *testing.T) {
 	now := time.Date(2026, 7, 13, 6, 15, 0, 0, time.UTC)
 	repository := newRepository(t, now)

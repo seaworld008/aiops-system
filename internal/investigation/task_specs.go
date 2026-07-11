@@ -39,6 +39,9 @@ func AuthorizeTaskSpecs(ctx context.Context, authorizer TaskSpecAuthorizer, work
 			}
 			return fmt.Errorf("%w: task specification is not authorized", ErrInvalidRequest)
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
 	return nil
 }

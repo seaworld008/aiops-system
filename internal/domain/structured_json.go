@@ -274,14 +274,8 @@ func unsafeSecurityName(value string) bool {
 
 func unsafeSecurityValue(value string) bool {
 	trimmed := strings.TrimSpace(value)
-	if strings.HasPrefix(trimmed, "--") {
-		option := strings.TrimPrefix(trimmed, "--")
-		if separator := strings.IndexByte(option, '='); separator >= 0 {
-			option = option[:separator]
-		}
-		if unsafeSecurityName(option) {
-			return true
-		}
+	if containsUnsafeSecurityCLIOption(trimmed) {
+		return true
 	}
 	if containsUnsafeSecurityAssignment(value) {
 		return true
@@ -292,6 +286,23 @@ func unsafeSecurityValue(value string) bool {
 		"private key", "private-key", "private_key", "raw error body", "raw_error_body", "raw-error-body",
 	} {
 		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsUnsafeSecurityCLIOption(value string) bool {
+	for _, field := range strings.Fields(value) {
+		candidate := strings.Trim(field, "\\\"'`[](){}<>,;")
+		if !strings.HasPrefix(candidate, "--") {
+			continue
+		}
+		option := strings.TrimPrefix(candidate, "--")
+		if separator := strings.IndexAny(option, "=:"); separator >= 0 {
+			option = option[:separator]
+		}
+		if unsafeSecurityName(option) {
 			return true
 		}
 	}

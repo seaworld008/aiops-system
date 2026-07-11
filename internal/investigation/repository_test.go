@@ -1,6 +1,7 @@
 package investigation_test
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,20 @@ import (
 	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/investigation"
 )
+
+func TestAuthorizeTaskSpecsHonorsCancellationAfterAuthorizerReturns(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	spec := investigation.TaskSpec{
+		Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+	}
+	err := investigation.AuthorizeTaskSpecs(ctx, func(context.Context, string, investigation.TaskSpec) error {
+		cancel()
+		return nil
+	}, "workspace-1", []investigation.TaskSpec{spec})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("AuthorizeTaskSpecs() error = %v, want context.Canceled", err)
+	}
+}
 
 func TestCanonicalTaskSpecsRejectConnectionAndCredentialMaterial(t *testing.T) {
 	valid := investigation.TaskSpec{

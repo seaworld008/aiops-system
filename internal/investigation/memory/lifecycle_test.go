@@ -175,6 +175,62 @@ func TestCreateInvestigationRequiresTrustedTaskSpecAuthorizationWithoutPartialWr
 	}
 }
 
+func TestCreateInvestigationReplaySurvivesLaterTaskAuthorizationRevocation(t *testing.T) {
+	now := time.Date(2026, 7, 13, 5, 10, 0, 0, time.UTC)
+	authorized := true
+	nextID := 0
+	repository, err := memory.New(memory.Options{
+		Clock: func() time.Time { return now }, TenantResolver: testTenantResolver,
+		IDFactory: func() string { nextID++; return fmt.Sprintf("authorization-replay-%d", nextID) },
+		TaskSpecAuthorizer: func(context.Context, string, investigation.TaskSpec) error {
+			if !authorized {
+				return errors.New("revoked-task-authorizer-canary")
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("memory.New() error = %v", err)
+	}
+	incident := createIncident(t, repository, "workspace-1", "signal-registry-replay", now)
+	request := investigation.CreateOrGetInvestigationRequest{
+		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:authorization-replay",
+		Tasks: []investigation.TaskSpec{{
+			Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+		}},
+	}
+	first, err := repository.CreateOrGetInvestigation(context.Background(), request)
+	if err != nil || !first.Created {
+		t.Fatalf("CreateOrGetInvestigation(first) = %#v, %v; want created", first, err)
+	}
+	authorized = false
+	replay, err := repository.CreateOrGetInvestigation(context.Background(), request)
+	if err != nil || replay.Created || replay.Investigation.ID != first.Investigation.ID {
+		t.Fatalf("CreateOrGetInvestigation(replay after revocation) = %#v, %v; want original resource", replay, err)
+	}
+
+	conflict := request
+	conflict.Tasks = []investigation.TaskSpec{{
+		Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":16}`),
+	}}
+	if _, err := repository.CreateOrGetInvestigation(context.Background(), conflict); !errors.Is(err, store.ErrIdempotencyConflict) {
+		t.Fatalf("CreateOrGetInvestigation(conflicting replay) error = %v, want ErrIdempotencyConflict", err)
+	}
+
+	newKey := request
+	newKey.IdempotencyKey = "investigate:authorization-replay:new-key"
+	if _, err := repository.CreateOrGetInvestigation(context.Background(), newKey); !errors.Is(err, investigation.ErrInvalidRequest) {
+		t.Fatalf("CreateOrGetInvestigation(new key after revocation) error = %v, want authorization rejection", err)
+	} else if strings.Contains(err.Error(), "revoked-task-authorizer-canary") {
+		t.Fatalf("CreateOrGetInvestigation() leaked authorizer error: %v", err)
+	}
+	authorized = true
+	bound, err := repository.CreateOrGetInvestigation(context.Background(), newKey)
+	if err != nil || bound.Created || bound.Investigation.ID != first.Investigation.ID {
+		t.Fatalf("CreateOrGetInvestigation(new key after reauthorization) = %#v, %v; want active resource", bound, err)
+	}
+}
+
 func TestCreateInvestigationRejectsTaskSpecOutsideTrustedServerSchema(t *testing.T) {
 	now := time.Date(2026, 7, 13, 5, 0, 0, 0, time.UTC)
 	for name, spec := range map[string]investigation.TaskSpec{

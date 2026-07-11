@@ -23,24 +23,24 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 	if err != nil {
 		return investigation.CreateOrGetInvestigationResult{}, err
 	}
-	if err := investigation.AuthorizeTaskSpecs(ctx, repository.taskSpecAuthorizer, request.WorkspaceID, canonicalTasks); err != nil {
-		return investigation.CreateOrGetInvestigationResult{}, err
-	}
 	requestHash, err := investigation.CreateOrGetInvestigationRequestHash(request, taskHash)
 	if err != nil {
 		return investigation.CreateOrGetInvestigationResult{}, err
 	}
+	idempotencyKey := scoped(request.WorkspaceID, request.IdempotencyKey)
+	repository.mu.RLock()
+	replay, replayErr, handled := repository.createInvestigationReplayLocked(request.WorkspaceID, idempotencyKey, requestHash)
+	repository.mu.RUnlock()
+	if handled {
+		return replay, replayErr
+	}
+	if err := investigation.AuthorizeTaskSpecs(ctx, repository.taskSpecAuthorizer, request.WorkspaceID, canonicalTasks); err != nil {
+		return investigation.CreateOrGetInvestigationResult{}, err
+	}
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
-	idempotencyKey := scoped(request.WorkspaceID, request.IdempotencyKey)
-	if !repository.idempotencyOwnerMatches(idempotencyKey, "create_investigation") {
-		return investigation.CreateOrGetInvestigationResult{}, store.ErrIdempotencyConflict
-	}
-	if record, exists := repository.investigationIdempotency[idempotencyKey]; exists {
-		if record.requestHash != requestHash {
-			return investigation.CreateOrGetInvestigationResult{}, store.ErrIdempotencyConflict
-		}
-		return repository.investigationResult(request.WorkspaceID, record.resourceID, false)
+	if replay, replayErr, handled = repository.createInvestigationReplayLocked(request.WorkspaceID, idempotencyKey, requestHash); handled {
+		return replay, replayErr
 	}
 	incidentKey := scoped(request.WorkspaceID, request.IncidentID)
 	incident, exists := repository.incidents[incidentKey]
@@ -127,6 +127,28 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 	return investigation.CreateOrGetInvestigationResult{
 		Investigation: cloneInvestigation(item), Tasks: cloneTasks(createdTasks), Created: true,
 	}, nil
+}
+
+// createInvestigationReplayLocked checks the immutable workspace-scoped
+// idempotency owner before any mutable server-side authorization. The caller
+// must hold repository.mu for reading or writing.
+func (repository *Repository) createInvestigationReplayLocked(
+	workspaceID string,
+	idempotencyKey scopeKey,
+	requestHash string,
+) (investigation.CreateOrGetInvestigationResult, error, bool) {
+	if !repository.idempotencyOwnerMatches(idempotencyKey, "create_investigation") {
+		return investigation.CreateOrGetInvestigationResult{}, store.ErrIdempotencyConflict, true
+	}
+	record, exists := repository.investigationIdempotency[idempotencyKey]
+	if !exists {
+		return investigation.CreateOrGetInvestigationResult{}, nil, false
+	}
+	if record.requestHash != requestHash {
+		return investigation.CreateOrGetInvestigationResult{}, store.ErrIdempotencyConflict, true
+	}
+	result, err := repository.investigationResult(workspaceID, record.resourceID, false)
+	return result, err, true
 }
 
 func (repository *Repository) investigationResult(workspaceID, investigationID string, created bool) (investigation.CreateOrGetInvestigationResult, error) {
