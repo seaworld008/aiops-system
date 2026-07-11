@@ -206,7 +206,7 @@ func normalizeHypothesisSpecs(specs []HypothesisSpec) ([]HypothesisSpec, error) 
 			Summary:      spec.Summary,
 			Proposal:     bytes.Clone(spec.Proposal),
 			ProposalHash: spec.ProposalHash,
-			Unknowns:     append([]string(nil), spec.Unknowns...),
+			Unknowns:     append([]string{}, spec.Unknowns...),
 			EvidenceIDs:  append([]string(nil), spec.EvidenceIDs...),
 		}
 		candidate := domain.Hypothesis{
@@ -220,7 +220,7 @@ func normalizeHypothesisSpecs(specs []HypothesisSpec) ([]HypothesisSpec, error) 
 			Summary:         normalized[index].Summary,
 			Proposal:        bytes.Clone(normalized[index].Proposal),
 			ProposalHash:    normalized[index].ProposalHash,
-			Unknowns:        append([]string(nil), normalized[index].Unknowns...),
+			Unknowns:        append([]string{}, normalized[index].Unknowns...),
 			EvidenceIDs:     append([]string(nil), normalized[index].EvidenceIDs...),
 			CreatedAt:       time.Unix(1, 0).UTC(),
 		}

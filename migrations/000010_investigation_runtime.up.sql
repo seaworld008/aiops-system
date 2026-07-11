@@ -582,24 +582,29 @@ BEGIN
             MESSAGE = 'legacy rows cannot be promoted to investigation runtime by UPDATE',
             CONSTRAINT = 'investigations_runtime_marker_guard';
     END IF;
-    SELECT parent.* INTO incident
-    FROM incidents AS parent
-    WHERE parent.tenant_id = NEW.tenant_id
-      AND parent.workspace_id = NEW.workspace_id
-      AND parent.id = NEW.incident_id
-      AND parent.runtime_schema_version = 'investigation-runtime.v1'
-    FOR SHARE OF parent;
-    IF NOT FOUND OR
-       incident.service_id IS DISTINCT FROM NEW.service_id_snapshot OR
-       incident.environment_id IS DISTINCT FROM NEW.environment_id_snapshot OR
-       incident.mapping_status IS DISTINCT FROM NEW.mapping_status_snapshot THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '23514',
-            MESSAGE = 'investigation admission snapshot does not match its runtime incident',
-            CONSTRAINT = 'investigations_runtime_incident_snapshot_guard';
-    END IF;
-
-    IF TG_OP = 'INSERT' OR OLD.runtime_schema_version IS DISTINCT FROM 'investigation-runtime.v1' THEN
+    -- Runtime Incident correlation/scope and the Investigation admission
+    -- snapshot are independently immutable after creation. Re-locking the
+    -- Incident for every lifecycle UPDATE would invert the repository's
+    -- global Task -> Investigation order against Incident -> Investigation
+    -- creation/feedback transactions and can deadlock. Validate the exact
+    -- snapshot only at its admission boundary.
+    IF TG_OP = 'INSERT' THEN
+        SELECT parent.* INTO incident
+        FROM incidents AS parent
+        WHERE parent.tenant_id = NEW.tenant_id
+          AND parent.workspace_id = NEW.workspace_id
+          AND parent.id = NEW.incident_id
+          AND parent.runtime_schema_version = 'investigation-runtime.v1'
+        FOR SHARE OF parent;
+        IF NOT FOUND OR
+           incident.service_id IS DISTINCT FROM NEW.service_id_snapshot OR
+           incident.environment_id IS DISTINCT FROM NEW.environment_id_snapshot OR
+           incident.mapping_status IS DISTINCT FROM NEW.mapping_status_snapshot THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514',
+                MESSAGE = 'investigation admission snapshot does not match its runtime incident',
+                CONSTRAINT = 'investigations_runtime_incident_snapshot_guard';
+        END IF;
         RETURN NEW;
     END IF;
     IF OLD.status IN ('PARTIAL', 'COMPLETED', 'FAILED', 'CANCELLED') AND OLD IS DISTINCT FROM NEW THEN
@@ -1712,7 +1717,7 @@ CREATE TABLE investigation_idempotency_records (
         ) OR (
             result_snapshot IS NOT NULL AND result_snapshot_sha256 IS NOT NULL AND result_snapshot_version IS NOT NULL AND
             operation IN ('start_model', 'finalize_investigation') AND
-            octet_length(result_snapshot) BETWEEN 2 AND 2097152 AND
+            octet_length(result_snapshot) BETWEEN 2 AND 8388608 AND
             octet_length(result_snapshot_sha256) = 64 AND
             result_snapshot_sha256 COLLATE "C" !~ '[^a-f0-9]' AND
             encode(sha256(result_snapshot), 'hex') = result_snapshot_sha256 AND

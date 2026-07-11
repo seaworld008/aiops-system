@@ -85,6 +85,37 @@ func newPostgresHarness(t *testing.T) *postgresHarness {
 	return harness
 }
 
+// extendedPool mirrors pgx's production-default extended protocol while the
+// migration pool remains on simple protocol for transactional multi-statement
+// migration files. Repository integration tests must use this pool so binary
+// and text codec negotiation is exercised instead of being masked by simple
+// interpolation.
+func (harness *postgresHarness) extendedPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	config, err := pgxpool.ParseConfig(os.Getenv("AIOPS_TEST_POSTGRES_DSN"))
+	if err != nil {
+		t.Fatalf("parse PostgreSQL extended-protocol test DSN: %v", err)
+	}
+	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheStatement
+	if config.ConnConfig.RuntimeParams == nil {
+		config.ConnConfig.RuntimeParams = make(map[string]string)
+	}
+	config.ConnConfig.RuntimeParams["search_path"] = harness.schema
+	if config.MaxConns < 16 {
+		config.MaxConns = 16
+	}
+	database, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatalf("connect extended-protocol PostgreSQL test pool: %v", err)
+	}
+	if err := database.Ping(context.Background()); err != nil {
+		database.Close()
+		t.Fatalf("ping extended-protocol PostgreSQL test pool: %v", err)
+	}
+	t.Cleanup(database.Close)
+	return database
+}
+
 func (harness *postgresHarness) applyUpBeforeTen(t *testing.T) {
 	t.Helper()
 	harness.applyMigrations(t, ".up.sql", false, func(name string) bool {

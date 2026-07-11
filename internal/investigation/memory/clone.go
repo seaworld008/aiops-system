@@ -41,7 +41,7 @@ func cloneEvidence(evidence domain.Evidence) domain.Evidence {
 
 func cloneHypothesis(hypothesis domain.Hypothesis) domain.Hypothesis {
 	hypothesis.Proposal = bytes.Clone(hypothesis.Proposal)
-	hypothesis.Unknowns = append([]string(nil), hypothesis.Unknowns...)
+	hypothesis.Unknowns = append([]string{}, hypothesis.Unknowns...)
 	hypothesis.EvidenceIDs = append([]string(nil), hypothesis.EvidenceIDs...)
 	return hypothesis
 }

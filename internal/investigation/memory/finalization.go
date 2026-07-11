@@ -108,7 +108,7 @@ func (repository *Repository) FinalizeInvestigation(ctx context.Context, request
 			ID: hypothesisIDs[index], WorkspaceID: request.WorkspaceID, IncidentID: item.IncidentID, InvestigationID: item.ID,
 			Status: domain.HypothesisProposed, Rank: spec.Rank, Confidence: spec.Confidence, Summary: spec.Summary,
 			Proposal: bytes.Clone(spec.Proposal), ProposalHash: spec.ProposalHash,
-			Unknowns: append([]string(nil), spec.Unknowns...), EvidenceIDs: append([]string(nil), spec.EvidenceIDs...), CreatedAt: commitAt,
+			Unknowns: append([]string{}, spec.Unknowns...), EvidenceIDs: append([]string(nil), spec.EvidenceIDs...), CreatedAt: commitAt,
 		}
 		if validateErr := hypothesis.Validate(); validateErr != nil {
 			return investigation.FinalizeInvestigationResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, validateErr)
