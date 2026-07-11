@@ -911,7 +911,8 @@ func TestInvestigationRuntimeRejectsNullFactsReparentingAndStateRegression(t *te
 	completedAt := taskCompletedAt.Add(time.Second)
 	execSQL(t, database, `
 		UPDATE investigations
-		SET status = 'PARTIAL', model_status = 'COMPLETED', completed_at = $2, updated_at = $2
+		SET status = 'PARTIAL', model_status = 'FAILED', model_failure_code = 'model_unavailable',
+		    completed_at = $2, updated_at = $2
 		WHERE id = $1
 	`, testInvestigationID, completedAt)
 	expectSQLState(t, database, "23514", `
