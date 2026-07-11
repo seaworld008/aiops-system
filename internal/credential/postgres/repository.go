@@ -1669,9 +1669,9 @@ func (repository *Repository) failClaim(ctx context.Context, fence credential.Cl
 				claimed_by = NULL, claim_token_sha256 = NULL, claimed_at = NULL,
 				claim_expires_at = NULL, last_heartbeat_at = NULL,
 				failure_count = failure_count + 1, failure_code = $5, failure_detail_sha256 = $6,
-				manual_required_at = $7, updated_at = $7, version = version + 1
+				manual_required_at = $7::timestamptz, updated_at = $7::timestamptz, version = version + 1
 			WHERE revocation_id = $1 AND claimed_by = $2 AND claim_token_sha256 = $3 AND claim_epoch = $4
-			  AND status = 'REVOKING' AND claim_expires_at > $7
+			  AND status = 'REVOKING' AND claim_expires_at > $7::timestamptz
 			RETURNING ` + revocationProjection
 		auditAction, eventType = "credential.revocation.manual_required", "credential.revocation.manual_required.v1"
 	} else {
@@ -1679,7 +1679,7 @@ func (repository *Repository) failClaim(ctx context.Context, fence credential.Cl
 			UPDATE credential_revocations
 			SET status = CASE
 					WHEN attempt - retry_cycle_attempt_base >= $8
-					  OR retry_cycle_started_at <= $10 - make_interval(secs => $9::double precision)
+					  OR retry_cycle_started_at <= $10::timestamptz - make_interval(secs => $9::double precision)
 					THEN 'MANUAL_REQUIRED'
 					ELSE 'REVOCATION_PENDING'
 				END,
@@ -1688,19 +1688,19 @@ func (repository *Repository) failClaim(ctx context.Context, fence credential.Cl
 				failure_count = failure_count + 1, failure_code = $5, failure_detail_sha256 = $6,
 				available_at = CASE
 					WHEN attempt - retry_cycle_attempt_base >= $8
-					  OR retry_cycle_started_at <= $10 - make_interval(secs => $9::double precision)
+					  OR retry_cycle_started_at <= $10::timestamptz - make_interval(secs => $9::double precision)
 					THEN available_at
-					ELSE $10 + make_interval(secs => $7::double precision)
+					ELSE $10::timestamptz + make_interval(secs => $7::double precision)
 				END,
 				manual_required_at = CASE
 					WHEN attempt - retry_cycle_attempt_base >= $8
-					  OR retry_cycle_started_at <= $10 - make_interval(secs => $9::double precision)
-					THEN $10
+					  OR retry_cycle_started_at <= $10::timestamptz - make_interval(secs => $9::double precision)
+					THEN $10::timestamptz
 					ELSE manual_required_at
 				END,
-				updated_at = $10, version = version + 1
+				updated_at = $10::timestamptz, version = version + 1
 			WHERE revocation_id = $1 AND claimed_by = $2 AND claim_token_sha256 = $3 AND claim_epoch = $4
-			  AND status = 'REVOKING' AND claim_expires_at > $10
+			  AND status = 'REVOKING' AND claim_expires_at > $10::timestamptz
 			RETURNING ` + revocationProjection
 		auditAction, eventType = "credential.revocation.failed", "credential.revocation.failed.v1"
 	}

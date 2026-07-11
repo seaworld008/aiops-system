@@ -1618,7 +1618,8 @@ func exerciseRealCredentialRevocations(
 	if _, err := rebuilt.RetryRevocation(ctx, credential.RetryRevocationRequest{
 		Fence: reclaimed[0].Fence, Delay: 30 * time.Second,
 		FailureCode: credential.FailureIssuerUnavailable, FailureDetail: failureBody,
-	}); !errors.Is(err, credential.ErrRevocationPersistence) {
+	}); !errors.Is(err, credential.ErrRevocationPersistence) ||
+		!strings.Contains(err.Error(), "insert credential revocation outbox event") {
 		t.Fatalf("real credential RetryRevocation(forced outbox rollback) error = %v", err)
 	}
 	var rollbackStatus string
