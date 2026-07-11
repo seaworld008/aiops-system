@@ -125,16 +125,22 @@ func TestRepositoryManualTransitionsUseOneStableStatementTimestamp(t *testing.T)
 	if count := strings.Count(failClaimSource, "SELECT clock_timestamp()"); count != 1 {
 		t.Fatalf("failClaim lock-after transition clock reads = %d, want exactly one", count)
 	}
+	if count := strings.Count(failClaimSource, "$10::timestamptz"); count != 7 {
+		t.Fatalf("failClaim retry transition timestamp casts = %d, want 7", count)
+	}
+	if count := strings.Count(failClaimSource, "$7::timestamptz"); count != 3 {
+		t.Fatalf("failClaim manual transition timestamp casts = %d, want 3", count)
+	}
 	for _, fragment := range []string{
 		"where revocation_id = $1 and claimed_by = $2 and claim_token_sha256 = $3 and claim_epoch = $4",
 		"for update",
-		"retry_cycle_started_at <= $10 - make_interval",
-		"else $10 + make_interval",
-		"then $10",
-		"updated_at = $10",
-		"claim_expires_at > $10",
-		"manual_required_at = $7, updated_at = $7",
-		"claim_expires_at > $7",
+		"retry_cycle_started_at <= $10::timestamptz - make_interval",
+		"else $10::timestamptz + make_interval",
+		"then $10::timestamptz",
+		"updated_at = $10::timestamptz",
+		"claim_expires_at > $10::timestamptz",
+		"manual_required_at = $7::timestamptz, updated_at = $7::timestamptz",
+		"claim_expires_at > $7::timestamptz",
 	} {
 		if !strings.Contains(strings.ToLower(failClaimSource), fragment) {
 			t.Errorf("failClaim missing stable timestamp fragment %q", fragment)
