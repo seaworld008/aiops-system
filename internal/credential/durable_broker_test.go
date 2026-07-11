@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -42,6 +43,7 @@ func TestDurableBrokerIssuesOnlyAfterAnchoredInspectionAndActiveACK(t *testing.T
 	var order []string
 	record := func(step string) { order = append(order, step) }
 	issuer := &durableIssuerStub{
+		issuerID: profile.IssuerID, issuerRevision: profile.Revision,
 		validateManager: func(context.Context) error {
 			record("manager")
 			return nil
@@ -97,7 +99,7 @@ func TestDurableBrokerIssuesOnlyAfterAnchoredInspectionAndActiveACK(t *testing.T
 			if got := ctx.Value(durableTimeoutContextKey{}); got != "authorize-create" {
 				t.Fatalf("AuthorizeChildCreate context marker = %v", got)
 			}
-			if request.Permit != *permit || request.Fence != fence {
+			if request.Permit != (ChildCreatePermit{RevocationID: durableTestRevocationID, Token: "single-use-create-permit"}) || request.Fence != fence {
 				t.Fatalf("AuthorizeChildCreate request = %#v", request)
 			}
 			revocation := durablePreparedRevocation(now, selection, profile)
@@ -149,7 +151,7 @@ func TestDurableBrokerIssuesOnlyAfterAnchoredInspectionAndActiveACK(t *testing.T
 		},
 	}
 	finalizeCalls := 0
-	broker, err := NewDurableBroker(repository, resolver, DurableBrokerOptions{
+	broker, err := newDurableBroker(repository, resolver, DurableBrokerOptions{
 		UUIDSource: func() (string, error) { return durableTestRevocationID, nil },
 		Clock:      func() time.Time { return now },
 		TimeoutSource: func(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
@@ -171,7 +173,11 @@ func TestDurableBrokerIssuesOnlyAfterAnchoredInspectionAndActiveACK(t *testing.T
 		t.Fatalf("NewDurableBroker() error = %v", err)
 	}
 
-	credential, err := broker.Issue(context.Background(), IssueDurableCredentialRequest{Fence: fence, Selection: selection})
+	request := PrepareDurableCredentialRequest{
+		Fence: fence, Selection: selection, RequestedTTL: 5 * time.Minute,
+		PolicyExpiresAt: now.Add(10 * time.Minute),
+	}
+	credential, err := prepareAndIssue(broker, context.Background(), request)
 	if err != nil {
 		t.Fatalf("Issue() error = %v", err)
 	}
@@ -185,8 +191,17 @@ func TestDurableBrokerIssuesOnlyAfterAnchoredInspectionAndActiveACK(t *testing.T
 	if finalizeCalls != 3 {
 		t.Fatalf("FinalizeContextSource calls = %d, want 3", finalizeCalls)
 	}
-	if want := []string{"resolve", "manager", "prepare", "authorize", "create-child", "anchor", "inspect-child", "issue-dynamic", "activate"}; !reflect.DeepEqual(order, want) {
+	if want := []string{"resolve", "prepare", "manager", "authorize", "create-child", "anchor", "inspect-child", "issue-dynamic", "activate"}; !reflect.DeepEqual(order, want) {
 		t.Fatalf("operation order = %v, want %v", order, want)
+	}
+}
+
+func TestNewDurableBrokerAcceptsOnlyTheExactIssuerRegistry(t *testing.T) {
+	t.Parallel()
+
+	constructor := reflect.TypeOf(NewDurableBroker)
+	if got, want := constructor.In(1), reflect.TypeOf((*IssuerRegistry)(nil)); got != want {
+		t.Fatalf("NewDurableBroker issuer dependency = %v, want %v", got, want)
 	}
 }
 
@@ -228,7 +243,7 @@ func TestDurableBrokerClearsMaterialBeforePersistingPostAnchorFailure(t *testing
 				}
 			}
 
-			credential, err := harness.broker.Issue(context.Background(), harness.request)
+			credential, err := prepareAndIssue(harness.broker, context.Background(), harness.request)
 			if !errors.Is(err, ErrDurableCredentialIssuance) {
 				t.Fatalf("Issue() error = %v", err)
 			}
@@ -274,12 +289,40 @@ func TestDurableBrokerRejectsUnsafeProfileAndStaleIssuerResponses(t *testing.T) 
 			wantPrepareCalls: 0,
 		},
 		{
+			name: "resolved profile must match issuer identity",
+			mutate: func(harness *durableBrokerHarness) {
+				harness.profile.Revision = "rev-attacker"
+			},
+			wantPrepareCalls: 0,
+		},
+		{
 			name: "prepared row cannot switch to production",
 			mutate: func(harness *durableBrokerHarness) {
 				harness.prepared.Revocation.Production = true
 			},
 			wantPrepareCalls: 1,
 			wantRevokeCalls:  0,
+		},
+		{
+			name: "prepared row cannot switch tenant",
+			mutate: func(harness *durableBrokerHarness) {
+				harness.prepared.Revocation.TenantID = "tenant-attacker"
+			},
+			wantPrepareCalls: 1,
+		},
+		{
+			name: "prepared row cannot switch action type",
+			mutate: func(harness *durableBrokerHarness) {
+				harness.prepared.Revocation.ActionType = "OTHER_ACTION"
+			},
+			wantPrepareCalls: 1,
+		},
+		{
+			name: "prepared row cannot extend signed ttl",
+			mutate: func(harness *durableBrokerHarness) {
+				harness.prepared.Revocation.CredentialTTLSeconds++
+			},
+			wantPrepareCalls: 1,
 		},
 		{
 			name: "created prepare must be initial version",
@@ -417,7 +460,7 @@ func TestDurableBrokerRejectsUnsafeProfileAndStaleIssuerResponses(t *testing.T) 
 			harness := newDurableBrokerHarness(t)
 			test.mutate(harness)
 
-			credential, err := harness.broker.Issue(context.Background(), harness.request)
+			credential, err := prepareAndIssue(harness.broker, context.Background(), harness.request)
 			if !errors.Is(err, ErrDurableCredentialIssuance) {
 				t.Fatalf("Issue() error = %v", err)
 			}
@@ -469,21 +512,21 @@ func TestDurableBrokerNeverCreatesWithoutUniquePreparedAuthorization(t *testing.
 			mutate: func(harness *durableBrokerHarness) {
 				harness.managerErr = errors.New("manager-token-canary")
 			},
-			wantResolve: 1, wantManager: 1,
+			wantResolve: 1, wantManager: 1, wantPrepare: 1,
 		},
 		{
 			name: "identifier allocation error",
 			mutate: func(harness *durableBrokerHarness) {
 				harness.broker.uuidSource = func() (string, error) { return "", errors.New("uuid-canary") }
 			},
-			wantResolve: 1, wantManager: 1,
+			wantResolve: 1,
 		},
 		{
 			name: "prepare error",
 			mutate: func(harness *durableBrokerHarness) {
 				harness.prepareErr = errors.New("action-fence-token")
 			},
-			wantResolve: 1, wantManager: 1, wantPrepare: 1,
+			wantResolve: 1, wantPrepare: 1,
 		},
 		{
 			name: "prepare replay even if active",
@@ -491,14 +534,14 @@ func TestDurableBrokerNeverCreatesWithoutUniquePreparedAuthorization(t *testing.
 				harness.prepared.Created = false
 				harness.prepared.Revocation = harness.active
 			},
-			wantResolve: 1, wantManager: 1, wantPrepare: 1,
+			wantResolve: 1, wantPrepare: 1,
 		},
 		{
 			name: "creator response without permit",
 			mutate: func(harness *durableBrokerHarness) {
 				harness.prepared.Permit = nil
 			},
-			wantResolve: 1, wantManager: 1, wantPrepare: 1,
+			wantResolve: 1, wantPrepare: 1,
 		},
 		{
 			name: "database authorization error",
@@ -529,7 +572,7 @@ func TestDurableBrokerNeverCreatesWithoutUniquePreparedAuthorization(t *testing.
 			t.Parallel()
 			harness := newDurableBrokerHarness(t)
 			test.mutate(harness)
-			credential, err := harness.broker.Issue(context.Background(), harness.request)
+			credential, err := prepareAndIssue(harness.broker, context.Background(), harness.request)
 			if err == nil {
 				t.Fatal("Issue() error = nil")
 			}
@@ -596,7 +639,7 @@ func TestDurableBrokerRejectsInvalidCreateContextBeforeDatabaseAuthorization(t *
 			harness := newDurableBrokerHarness(t)
 			harness.broker.timeoutSource = test.source
 
-			credential, err := harness.broker.Issue(context.Background(), harness.request)
+			credential, err := prepareAndIssue(harness.broker, context.Background(), harness.request)
 			if !errors.Is(err, ErrDurableCredentialIssuance) {
 				t.Fatalf("Issue() error = %v", err)
 			}
@@ -638,7 +681,7 @@ func TestDurableBrokerCanceledCallerAfterChildDispatchStillAnchorsAndPersistsRev
 		return harness.pending, nil
 	}
 
-	credential, err := harness.broker.Issue(callerCtx, harness.request)
+	credential, err := prepareAndIssue(harness.broker, callerCtx, harness.request)
 	if !errors.Is(err, ErrDurableCredentialIssuance) {
 		t.Fatalf("Issue() error = %v", err)
 	}
@@ -707,7 +750,7 @@ func TestDurableBrokerRejectsInvalidFinalizeContextBeforeAuthorization(t *testin
 			harness := newDurableBrokerHarness(t)
 			harness.broker.finalizeContextSource = test.source
 
-			credential, err := harness.broker.Issue(context.Background(), harness.request)
+			credential, err := prepareAndIssue(harness.broker, context.Background(), harness.request)
 			if !errors.Is(err, ErrDurableCredentialIssuance) {
 				t.Fatalf("Issue() error = %v", err)
 			}
@@ -766,7 +809,7 @@ func TestDurableBrokerFallsBackWhenFinalizeSourceFailsAfterPreflight(t *testing.
 		return harness.pending, nil
 	}
 
-	credential, err := harness.broker.Issue(callerCtx, harness.request)
+	credential, err := prepareAndIssue(harness.broker, callerCtx, harness.request)
 	if !errors.Is(err, ErrDurableCredentialIssuance) {
 		t.Fatalf("Issue() error = %v", err)
 	}
@@ -800,7 +843,7 @@ func TestDurableBrokerAmbiguousCreateWithoutAccessorRemainsPrepared(t *testing.T
 	harness.child.Accessor = nil
 	harness.createErr = errors.New("Vault may have committed but returned no accessor")
 
-	credential, err := harness.broker.Issue(context.Background(), harness.request)
+	credential, err := prepareAndIssue(harness.broker, context.Background(), harness.request)
 	if !errors.Is(err, ErrDurableCredentialIssuance) {
 		t.Fatalf("Issue() error = %v", err)
 	}
@@ -822,7 +865,7 @@ func TestDurableCredentialFormattingCopiesAndDestroyAreSafe(t *testing.T) {
 	t.Parallel()
 
 	harness := newDurableBrokerHarness(t)
-	credential, err := harness.broker.Issue(context.Background(), harness.request)
+	credential, err := prepareAndIssue(harness.broker, context.Background(), harness.request)
 	if err != nil {
 		t.Fatalf("Issue() error = %v", err)
 	}
@@ -861,7 +904,7 @@ func TestDurableCredentialSecretFailsClosedAfterExpiry(t *testing.T) {
 	t.Parallel()
 
 	harness := newDurableBrokerHarness(t)
-	credential, err := harness.broker.Issue(context.Background(), harness.request)
+	credential, err := prepareAndIssue(harness.broker, context.Background(), harness.request)
 	if err != nil {
 		t.Fatalf("Issue() error = %v", err)
 	}
@@ -882,10 +925,13 @@ func TestDurableCredentialSecretFailsClosedAfterExpiry(t *testing.T) {
 	}
 }
 
-func TestIssueDurableCredentialRequestNeverRendersBearerOrAcceptsWirePayload(t *testing.T) {
+func TestPrepareDurableCredentialRequestNeverRendersBearerOrAcceptsWirePayload(t *testing.T) {
 	t.Parallel()
 
-	request := IssueDurableCredentialRequest{Fence: durableTestFence(), Selection: durableTestSelection()}
+	request := PrepareDurableCredentialRequest{
+		Fence: durableTestFence(), Selection: durableTestSelection(), RequestedTTL: 5 * time.Minute,
+		PolicyExpiresAt: time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC),
+	}
 	rendered := fmt.Sprintf("%v %+v %#v", request, request, request)
 	encoded, err := json.Marshal(request)
 	if err != nil {
@@ -897,14 +943,373 @@ func TestIssueDurableCredentialRequestNeverRendersBearerOrAcceptsWirePayload(t *
 	if !containsAny(rendered+string(encoded), "REDACTED", "fence_token_redacted") {
 		t.Fatalf("request did not make redaction explicit: %s / %s", rendered, encoded)
 	}
-	for _, forbidden := range []string{`"url"`, `"path"`, `"method"`, `"body"`} {
+	for _, forbidden := range []string{`"profile_id"`, `"url"`, `"path"`, `"method"`, `"body"`} {
 		if containsAny(string(encoded), forbidden) {
 			t.Fatalf("request JSON contains issuer-controlled field %s: %s", forbidden, encoded)
 		}
 	}
-	var decoded IssueDurableCredentialRequest
+	var decoded PrepareDurableCredentialRequest
 	if err := json.Unmarshal([]byte(`{"path":"sys/raw","method":"POST","body":{"token":"attacker"}}`), &decoded); !errors.Is(err, ErrInvalidDurableCredentialRequest) {
 		t.Fatalf("json.Unmarshal(untrusted request) error = %v", err)
+	}
+}
+
+func TestDurableBrokerPreparePinsIssuerWithoutCallingIt(t *testing.T) {
+	t.Parallel()
+
+	harness := newDurableBrokerHarness(t)
+	prepared, err := harness.broker.Prepare(context.Background(), harness.request)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if got := harness.calls; got["resolve"] != 1 || got["prepare"] != 1 || got["manager"] != 0 ||
+		got["authorize"] != 0 || got["create-child"] != 0 || got["anchor"] != 0 ||
+		got["inspect-child"] != 0 || got["issue-dynamic"] != 0 || got["activate"] != 0 {
+		t.Fatalf("Prepare() calls = %v", got)
+	}
+	harness.resolveErr = errors.New("must not resolve twice")
+	credential, err := harness.broker.Issue(context.Background(), prepared)
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+	t.Cleanup(credential.Destroy)
+	if harness.calls["resolve"] != 1 {
+		t.Fatalf("resolver calls = %d, want 1", harness.calls["resolve"])
+	}
+}
+
+func TestDurableBrokerPrepareCapsAbsoluteExpiryByProfileSignedTTLAndPolicy(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		profileTTL  time.Duration
+		requested   time.Duration
+		policyAfter time.Duration
+		wantAfter   time.Duration
+	}{
+		{name: "profile", profileTTL: 3 * time.Minute, requested: 5 * time.Minute, policyAfter: 10 * time.Minute, wantAfter: 3 * time.Minute},
+		{name: "signed ttl", profileTTL: 5 * time.Minute, requested: 2 * time.Minute, policyAfter: 10 * time.Minute, wantAfter: 2 * time.Minute},
+		{name: "absolute policy", profileTTL: 5 * time.Minute, requested: 5 * time.Minute, policyAfter: 90 * time.Second, wantAfter: 90 * time.Second},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			harness := newDurableBrokerHarness(t)
+			harness.profile.CredentialTTL = test.profileTTL
+			harness.request.RequestedTTL = test.requested
+			harness.request.PolicyExpiresAt = harness.now.Add(test.policyAfter)
+			wantExpiry := harness.now.Add(test.wantAfter)
+			harness.repository.prepare = func(_ context.Context, request PrepareRequest) (PrepareResult, error) {
+				harness.calls["prepare"]++
+				if request.CredentialExpiresAt != wantExpiry {
+					t.Fatalf("Prepare credential expiry = %s, want %s", request.CredentialExpiresAt, wantExpiry)
+				}
+				revocation := harness.prepared.Revocation
+				revocation.CredentialTTLSeconds = int32(test.requested / time.Second)
+				revocation.CredentialExpiresAt = wantExpiry
+				return PrepareResult{
+					Revocation: revocation, Created: true,
+					Permit: &ChildCreatePermit{RevocationID: durableTestRevocationID, Token: "expiry-create-permit"},
+				}, nil
+			}
+			if _, err := harness.broker.Prepare(context.Background(), harness.request); err != nil {
+				t.Fatalf("Prepare() error = %v", err)
+			}
+			if harness.calls["manager"] != 0 || harness.calls["authorize"] != 0 || harness.calls["create-child"] != 0 {
+				t.Fatalf("Prepare() called issuer path: %v", harness.calls)
+			}
+		})
+	}
+}
+
+func TestDurableBrokerPrepareRejectsUnusableCredentialWindowsBeforePersistence(t *testing.T) {
+	t.Parallel()
+
+	for name, mutate := range map[string]func(*durableBrokerHarness){
+		"zero ttl": func(harness *durableBrokerHarness) {
+			harness.request.RequestedTTL = 0
+		},
+		"below fixed reserve": func(harness *durableBrokerHarness) {
+			harness.request.RequestedTTL = ChildCreateExpiryReserve
+		},
+		"fractional ttl": func(harness *durableBrokerHarness) {
+			harness.request.RequestedTTL += time.Nanosecond
+		},
+		"ttl above maximum": func(harness *durableBrokerHarness) {
+			harness.request.RequestedTTL = MaxCredentialTTL + time.Second
+		},
+		"missing policy deadline": func(harness *durableBrokerHarness) {
+			harness.request.PolicyExpiresAt = time.Time{}
+		},
+		"expired policy deadline": func(harness *durableBrokerHarness) {
+			harness.request.PolicyExpiresAt = harness.now
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			harness := newDurableBrokerHarness(t)
+			mutate(harness)
+			if _, err := harness.broker.Prepare(context.Background(), harness.request); err == nil {
+				t.Fatal("Prepare() error = nil")
+			}
+			if harness.calls["prepare"] != 0 || harness.calls["manager"] != 0 || harness.calls["create-child"] != 0 {
+				t.Fatalf("calls = %v", harness.calls)
+			}
+		})
+	}
+}
+
+func TestDurableBrokerPrepareClearsUnexpectedPermitOnEveryRejectedResponse(t *testing.T) {
+	t.Parallel()
+
+	for name, mutate := range map[string]func(*durableBrokerHarness){
+		"repository error": func(harness *durableBrokerHarness) {
+			harness.prepareErr = errors.New("database response lost")
+		},
+		"not creator": func(harness *durableBrokerHarness) {
+			harness.prepared.Created = false
+		},
+		"invalid prepared snapshot": func(harness *durableBrokerHarness) {
+			harness.prepared.Revocation.ActionType = "OTHER_ACTION"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			harness := newDurableBrokerHarness(t)
+			permit := harness.prepared.Permit
+			mutate(harness)
+			if _, err := harness.broker.Prepare(context.Background(), harness.request); err == nil {
+				t.Fatal("Prepare() error = nil")
+			}
+			if permit.Token != "" {
+				t.Fatalf("rejected Prepare retained permit: %s", permit)
+			}
+			if harness.calls["manager"] != 0 || harness.calls["authorize"] != 0 {
+				t.Fatalf("calls = %v", harness.calls)
+			}
+		})
+	}
+}
+
+func TestPreparedDurableCredentialRecordNoCredentialConsumesEveryCopy(t *testing.T) {
+	t.Parallel()
+
+	harness := newDurableBrokerHarness(t)
+	noCredential := harness.prepared.Revocation
+	noCredential.Status = StatusNoCredential
+	noCredential.Version++
+	noCredential.UpdatedAt = harness.now.Add(time.Second)
+	harness.repository.recordNoCredential = func(_ context.Context, request ActionTransitionRequest) (Revocation, error) {
+		harness.calls["no-credential"]++
+		if request.RevocationID != durableTestRevocationID || request.Fence != harness.fence {
+			t.Fatalf("RecordNoCredential request = %#v", request)
+		}
+		return noCredential, nil
+	}
+	prepared, err := harness.broker.Prepare(context.Background(), harness.request)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	copyOfPrepared := prepared
+	result, err := harness.broker.RecordNoCredential(context.Background(), copyOfPrepared)
+	if err != nil || result.Status != StatusNoCredential {
+		t.Fatalf("RecordNoCredential() = %#v, %v", result, err)
+	}
+	if _, err := harness.broker.RecordNoCredential(context.Background(), prepared); !errors.Is(err, ErrDurableCredentialState) {
+		t.Fatalf("RecordNoCredential(reuse) error = %v", err)
+	}
+	if _, err := harness.broker.Issue(context.Background(), prepared); !errors.Is(err, ErrDurableCredentialState) {
+		t.Fatalf("Issue(after no credential) error = %v", err)
+	}
+	if got := harness.calls; got["no-credential"] != 1 || got["manager"] != 0 || got["authorize"] != 0 || got["create-child"] != 0 {
+		t.Fatalf("calls = %v", got)
+	}
+}
+
+func TestPreparedDurableCredentialCannotBeSerializedForgedOrUsedByAnotherBroker(t *testing.T) {
+	t.Parallel()
+
+	harness := newDurableBrokerHarness(t)
+	prepared, err := harness.broker.Prepare(context.Background(), harness.request)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	for _, rendered := range []string{
+		fmt.Sprintf("%v", prepared), fmt.Sprintf("%+v", prepared), fmt.Sprintf("%#v", prepared),
+	} {
+		if !strings.Contains(rendered, "REDACTED") || containsAny(rendered, harness.fence.Token, harness.prepared.Permit.Token) {
+			t.Fatalf("prepared handle formatting = %q", rendered)
+		}
+	}
+	if encoded, marshalErr := json.Marshal(prepared); !errors.Is(marshalErr, ErrDurableCredentialState) || encoded != nil {
+		t.Fatalf("json.Marshal(prepared) = %s, %v", encoded, marshalErr)
+	}
+	var decoded PreparedDurableCredential
+	if err := json.Unmarshal([]byte(`{"revocation_id":"30000000-0000-4000-8000-000000000020"}`), &decoded); !errors.Is(err, ErrDurableCredentialState) {
+		t.Fatalf("json.Unmarshal(prepared) error = %v", err)
+	}
+	if _, err := harness.broker.Issue(context.Background(), PreparedDurableCredential{}); !errors.Is(err, ErrDurableCredentialState) {
+		t.Fatalf("Issue(zero handle) error = %v", err)
+	}
+	tampered := prepared
+	tampered.revocationID = "40000000-0000-4000-8000-000000000099"
+	if _, err := harness.broker.Issue(context.Background(), tampered); !errors.Is(err, ErrDurableCredentialState) {
+		t.Fatalf("Issue(tampered handle) error = %v", err)
+	}
+	other, err := newDurableBroker(harness.repository, harness.broker.resolver, DurableBrokerOptions{Clock: func() time.Time { return harness.now }})
+	if err != nil {
+		t.Fatalf("NewDurableBroker(other) error = %v", err)
+	}
+	if _, err := other.Issue(context.Background(), prepared); !errors.Is(err, ErrDurableCredentialState) {
+		t.Fatalf("Issue(wrong broker) error = %v", err)
+	}
+	credential, err := harness.broker.Issue(context.Background(), prepared)
+	if err != nil {
+		t.Fatalf("Issue(owner after rejected forgeries) error = %v", err)
+	}
+	credential.Destroy()
+}
+
+func TestPreparedDurableCredentialConcurrentIssueHasOneWinner(t *testing.T) {
+	t.Parallel()
+
+	harness := newDurableBrokerHarness(t)
+	prepared, err := harness.broker.Prepare(context.Background(), harness.request)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	const callers = 32
+	start := make(chan struct{})
+	type result struct {
+		credential DurableCredential
+		err        error
+	}
+	results := make(chan result, callers)
+	for range callers {
+		copyOfPrepared := prepared
+		go func() {
+			<-start
+			credential, issueErr := harness.broker.Issue(context.Background(), copyOfPrepared)
+			results <- result{credential: credential, err: issueErr}
+		}()
+	}
+	close(start)
+	winners := 0
+	for range callers {
+		result := <-results
+		if result.err == nil {
+			winners++
+			result.credential.Destroy()
+			continue
+		}
+		if !errors.Is(result.err, ErrDurableCredentialState) {
+			t.Fatalf("Issue(concurrent loser) error = %v", result.err)
+		}
+	}
+	if winners != 1 || harness.calls["manager"] != 1 || harness.calls["authorize"] != 1 ||
+		harness.calls["create-child"] != 1 || harness.calls["issue-dynamic"] != 1 || harness.calls["activate"] != 1 {
+		t.Fatalf("winners/calls = %d/%v", winners, harness.calls)
+	}
+}
+
+func TestPreparedDurableCredentialIssueAndNoCredentialAreMutuallyExclusive(t *testing.T) {
+	t.Parallel()
+
+	for iteration := range 32 {
+		harness := newDurableBrokerHarness(t)
+		noCredential := harness.prepared.Revocation
+		noCredential.Status = StatusNoCredential
+		noCredential.Version++
+		noCredential.UpdatedAt = harness.now.Add(time.Second)
+		harness.repository.recordNoCredential = func(context.Context, ActionTransitionRequest) (Revocation, error) {
+			harness.calls["no-credential"]++
+			return noCredential, nil
+		}
+		prepared, err := harness.broker.Prepare(context.Background(), harness.request)
+		if err != nil {
+			t.Fatalf("iteration %d Prepare() error = %v", iteration, err)
+		}
+		start := make(chan struct{})
+		issueResult := make(chan error, 1)
+		noCredentialResult := make(chan error, 1)
+		go func() {
+			<-start
+			credential, issueErr := harness.broker.Issue(context.Background(), prepared)
+			credential.Destroy()
+			issueResult <- issueErr
+		}()
+		go func() {
+			<-start
+			_, noCredentialErr := harness.broker.RecordNoCredential(context.Background(), prepared)
+			noCredentialResult <- noCredentialErr
+		}()
+		close(start)
+		issueErr, noCredentialErr := <-issueResult, <-noCredentialResult
+		if (issueErr == nil) == (noCredentialErr == nil) {
+			t.Fatalf("iteration %d Issue/RecordNoCredential errors = %v/%v", iteration, issueErr, noCredentialErr)
+		}
+		loserErr := issueErr
+		if issueErr == nil {
+			loserErr = noCredentialErr
+		}
+		if !errors.Is(loserErr, ErrDurableCredentialState) {
+			t.Fatalf("iteration %d loser error = %v", iteration, loserErr)
+		}
+		if harness.calls["no-credential"]+harness.calls["manager"] != 1 {
+			t.Fatalf("iteration %d calls = %v", iteration, harness.calls)
+		}
+	}
+}
+
+func TestPreparedDurableCredentialFailedIssueCannotBeRetried(t *testing.T) {
+	t.Parallel()
+
+	harness := newDurableBrokerHarness(t)
+	harness.managerErr = errors.New("manager unavailable")
+	prepared, err := harness.broker.Prepare(context.Background(), harness.request)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if _, err := harness.broker.Issue(context.Background(), prepared); !errors.Is(err, ErrDurableCredentialIssuance) {
+		t.Fatalf("Issue(first) error = %v", err)
+	}
+	if _, err := harness.broker.Issue(context.Background(), prepared); !errors.Is(err, ErrDurableCredentialState) {
+		t.Fatalf("Issue(retry) error = %v", err)
+	}
+	if _, err := harness.broker.RecordNoCredential(context.Background(), prepared); !errors.Is(err, ErrDurableCredentialState) {
+		t.Fatalf("RecordNoCredential(after Issue) error = %v", err)
+	}
+	if harness.calls["manager"] != 1 || harness.calls["authorize"] != 0 || harness.calls["create-child"] != 0 {
+		t.Fatalf("calls = %v", harness.calls)
+	}
+}
+
+func TestPreparedDurableCredentialLostNoCredentialACKRemainsConsumed(t *testing.T) {
+	t.Parallel()
+
+	harness := newDurableBrokerHarness(t)
+	harness.repository.recordNoCredential = func(context.Context, ActionTransitionRequest) (Revocation, error) {
+		harness.calls["no-credential"]++
+		return Revocation{}, errors.New("database ack lost action-fence-token")
+	}
+	prepared, err := harness.broker.Prepare(context.Background(), harness.request)
+	if err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if _, err := harness.broker.RecordNoCredential(context.Background(), prepared); !errors.Is(err, ErrDurableCredentialIssuance) {
+		t.Fatalf("RecordNoCredential() error = %v", err)
+	} else if strings.Contains(err.Error(), "action-fence-token") {
+		t.Fatalf("RecordNoCredential() rendered upstream material: %v", err)
+	}
+	if _, err := harness.broker.RecordNoCredential(context.Background(), prepared); !errors.Is(err, ErrDurableCredentialState) {
+		t.Fatalf("RecordNoCredential(retry) error = %v", err)
+	}
+	if _, err := harness.broker.Issue(context.Background(), prepared); !errors.Is(err, ErrDurableCredentialState) {
+		t.Fatalf("Issue(after lost ACK) error = %v", err)
+	}
+	if harness.calls["no-credential"] != 1 || harness.calls["manager"] != 0 {
+		t.Fatalf("calls = %v", harness.calls)
 	}
 }
 
@@ -913,7 +1318,7 @@ func TestDurableBrokerRequestRevocationAcceptsRevokedWithoutAccessorAndRejectsWr
 
 	t.Run("revoked", func(t *testing.T) {
 		harness := newDurableBrokerHarness(t)
-		credential, err := harness.broker.Issue(context.Background(), harness.request)
+		credential, err := prepareAndIssue(harness.broker, context.Background(), harness.request)
 		if err != nil {
 			t.Fatalf("Issue() error = %v", err)
 		}
@@ -939,7 +1344,7 @@ func TestDurableBrokerRequestRevocationAcceptsRevokedWithoutAccessorAndRejectsWr
 
 	t.Run("wrong frozen workspace", func(t *testing.T) {
 		harness := newDurableBrokerHarness(t)
-		credential, err := harness.broker.Issue(context.Background(), harness.request)
+		credential, err := prepareAndIssue(harness.broker, context.Background(), harness.request)
 		if err != nil {
 			t.Fatalf("Issue() error = %v", err)
 		}
@@ -955,7 +1360,7 @@ func TestDurableBrokerRequestRevocationAcceptsRevokedWithoutAccessorAndRejectsWr
 
 	t.Run("tampered handle", func(t *testing.T) {
 		harness := newDurableBrokerHarness(t)
-		credential, err := harness.broker.Issue(context.Background(), harness.request)
+		credential, err := prepareAndIssue(harness.broker, context.Background(), harness.request)
 		if err != nil {
 			t.Fatalf("Issue() error = %v", err)
 		}
@@ -975,7 +1380,7 @@ func TestDurableBrokerRequestRevocationAcceptsRevokedWithoutAccessorAndRejectsWr
 
 func TestDurableBrokerRequestRevocationWaiterHonorsContext(t *testing.T) {
 	harness := newDurableBrokerHarness(t)
-	credential, err := harness.broker.Issue(context.Background(), harness.request)
+	credential, err := prepareAndIssue(harness.broker, context.Background(), harness.request)
 	if err != nil {
 		t.Fatalf("Issue() error = %v", err)
 	}
@@ -1028,7 +1433,7 @@ func TestDurableBrokerRequestRevocationWaiterHonorsContext(t *testing.T) {
 func TestDurableBrokerRequestRevocationCachesSuccessAndRetriesFailure(t *testing.T) {
 	t.Run("concurrent success is persisted once", func(t *testing.T) {
 		harness := newDurableBrokerHarness(t)
-		credential, err := harness.broker.Issue(context.Background(), harness.request)
+		credential, err := prepareAndIssue(harness.broker, context.Background(), harness.request)
 		if err != nil {
 			t.Fatalf("Issue() error = %v", err)
 		}
@@ -1069,7 +1474,7 @@ func TestDurableBrokerRequestRevocationCachesSuccessAndRetriesFailure(t *testing
 
 	t.Run("failure remains retryable", func(t *testing.T) {
 		harness := newDurableBrokerHarness(t)
-		credential, err := harness.broker.Issue(context.Background(), harness.request)
+		credential, err := prepareAndIssue(harness.broker, context.Background(), harness.request)
 		if err != nil {
 			t.Fatalf("Issue() error = %v", err)
 		}
@@ -1099,7 +1504,7 @@ type durableBrokerHarness struct {
 	fence               ActionFence
 	selection           DurableIssuerResolveRequest
 	profile             DurableIssuerProfile
-	request             IssueDurableCredentialRequest
+	request             PrepareDurableCredentialRequest
 	prepared            PrepareResult
 	authorization       ChildCreateAuthorization
 	child               DurableChild
@@ -1165,7 +1570,10 @@ func newDurableBrokerHarness(t *testing.T) *durableBrokerHarness {
 	pending.UpdatedAt = pending.RevocationRequestedAt
 	harness := &durableBrokerHarness{
 		t: t, now: now, fence: fence, selection: selection, profile: profile,
-		request:  IssueDurableCredentialRequest{Fence: fence, Selection: selection},
+		request: PrepareDurableCredentialRequest{
+			Fence: fence, Selection: selection, RequestedTTL: 5 * time.Minute,
+			PolicyExpiresAt: now.Add(10 * time.Minute),
+		},
 		prepared: PrepareResult{Revocation: preparedRevocation, Created: true, Permit: permit},
 		authorization: ChildCreateAuthorization{
 			Revocation: authorizedRevocation, DatabaseAuthorizedAt: now.Add(time.Second),
@@ -1177,6 +1585,7 @@ func newDurableBrokerHarness(t *testing.T) *durableBrokerHarness {
 		anchored: anchored, active: active, pending: pending, calls: make(map[string]int),
 	}
 	issuer := &durableIssuerStub{
+		issuerID: profile.IssuerID, issuerRevision: profile.Revision,
 		validateManager: func(context.Context) error {
 			harness.calls["manager"]++
 			return harness.managerErr
@@ -1226,7 +1635,7 @@ func newDurableBrokerHarness(t *testing.T) *durableBrokerHarness {
 			return harness.pending, harness.revocationErr
 		},
 	}
-	broker, err := NewDurableBroker(repository, resolver, DurableBrokerOptions{
+	broker, err := newDurableBroker(repository, resolver, DurableBrokerOptions{
 		UUIDSource: func() (string, error) { return durableTestRevocationID, nil },
 		Clock:      func() time.Time { return now },
 		TimeoutSource: func(parent context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
@@ -1240,6 +1649,18 @@ func newDurableBrokerHarness(t *testing.T) *durableBrokerHarness {
 	harness.repository = repository
 	harness.issuer = issuer
 	return harness
+}
+
+func prepareAndIssue(
+	broker *DurableBroker,
+	ctx context.Context,
+	request PrepareDurableCredentialRequest,
+) (DurableCredential, error) {
+	prepared, err := broker.Prepare(ctx, request)
+	if err != nil {
+		return DurableCredential{}, err
+	}
+	return broker.Issue(ctx, prepared)
 }
 
 func containsAny(value string, candidates ...string) bool {
@@ -1281,7 +1702,7 @@ func durableTestFence() ActionFence {
 
 func durableTestSelection() DurableIssuerResolveRequest {
 	return DurableIssuerResolveRequest{
-		ProfileID: "database-readwrite-nonprod", WorkspaceID: "workspace-1", EnvironmentID: "staging-1",
+		TenantID: "tenant-1", WorkspaceID: "workspace-1", EnvironmentID: "staging-1",
 		ActionType: "database.credentials", ConnectorID: "postgres-staging", Permission: "database.readwrite",
 		Resource: "postgres://inventory/orders",
 	}
@@ -1293,8 +1714,10 @@ func durablePreparedRevocation(now time.Time, selection DurableIssuerResolveRequ
 		EnvironmentID: selection.EnvironmentID, ActionID: durableTestActionID, TargetKey: "database/inventory/orders",
 		RunnerID: durableTestFence().RunnerID, ActionLeaseEpoch: durableTestFence().Epoch,
 		Issuer: profile.IssuerID, IssuerRevision: profile.Revision,
+		ActionType:  selection.ActionType,
 		ConnectorID: selection.ConnectorID, Permission: selection.Permission,
-		Resource: selection.Resource, CredentialExpiresAt: now.Add(profile.CredentialTTL), Status: StatusPrepared,
+		Resource: selection.Resource, CredentialTTLSeconds: int32((5 * time.Minute) / time.Second),
+		CredentialExpiresAt: now.Add(profile.CredentialTTL), Status: StatusPrepared,
 		CreatedAt: now, UpdatedAt: now, AvailableAt: now, Version: 1,
 	}
 }
@@ -1314,11 +1737,17 @@ func (resolver *durableIssuerResolverStub) ResolveDurableIssuer(
 }
 
 type durableIssuerStub struct {
+	issuerID        string
+	issuerRevision  string
 	validateManager func(context.Context) error
 	createChild     func(context.Context, DurableChildCreateRequest) (DurableChild, error)
 	inspectChild    func(context.Context, *SensitiveReference, DurableChildInspectionRequest) error
 	issueDynamic    func(context.Context, SensitiveValue, DurableDynamicIssueRequest) (DurableDynamicSecret, error)
 }
+
+func (issuer *durableIssuerStub) IssuerID() string { return issuer.issuerID }
+
+func (issuer *durableIssuerStub) IssuerRevision() string { return issuer.issuerRevision }
 
 func (issuer *durableIssuerStub) ValidateManager(ctx context.Context) error {
 	if issuer.validateManager == nil {
@@ -1362,6 +1791,7 @@ type durableBrokerRepositoryStub struct {
 	authorizeChildCreate func(context.Context, AuthorizeChildCreateRequest) (ChildCreateAuthorization, error)
 	recordAnchor         func(context.Context, RecordAnchorRequest) (Revocation, error)
 	activate             func(context.Context, ActionTransitionRequest) (Revocation, error)
+	recordNoCredential   func(context.Context, ActionTransitionRequest) (Revocation, error)
 	requestRevocation    func(context.Context, ActionTransitionRequest) (Revocation, error)
 }
 
@@ -1402,6 +1832,16 @@ func (repository *durableBrokerRepositoryStub) Activate(
 	return repository.activate(ctx, request)
 }
 
+func (repository *durableBrokerRepositoryStub) RecordNoCredential(
+	ctx context.Context,
+	request ActionTransitionRequest,
+) (Revocation, error) {
+	if repository.recordNoCredential == nil {
+		return Revocation{}, fmt.Errorf("unexpected RecordNoCredential call")
+	}
+	return repository.recordNoCredential(ctx, request)
+}
+
 func (repository *durableBrokerRepositoryStub) RequestRevocation(
 	ctx context.Context,
 	request ActionTransitionRequest,
@@ -1413,7 +1853,7 @@ func (repository *durableBrokerRepositoryStub) RequestRevocation(
 }
 
 var (
-	_ DurableIssuerResolver = (*durableIssuerResolverStub)(nil)
+	_ durableIssuerResolver = (*durableIssuerResolverStub)(nil)
 	_ DurableIssuer         = (*durableIssuerStub)(nil)
 	_ Repository            = (*durableBrokerRepositoryStub)(nil)
 	_                       = sync.Once{}

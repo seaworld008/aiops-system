@@ -98,17 +98,20 @@ func (repository *MemoryRepository) Prepare(ctx context.Context, request Prepare
 	if metadata.Production {
 		return PrepareResult{}, ErrInvalidRevocationRequest
 	}
-	if request.CredentialExpiresAt.After(metadata.AuthorizationExpiresAt) {
+	if request.CredentialExpiresAt.After(metadata.AuthorizationExpiresAt) ||
+		request.CredentialExpiresAt.After(signedCredentialExpiry(now, metadata.CredentialTTLSeconds)) {
 		return PrepareResult{}, ErrInvalidRevocationRequest
 	}
-	revalidated, err := repository.resolvePrepareAction(ctx, request.Fence, repository.now())
+	revalidatedAt := repository.now()
+	revalidated, err := repository.resolvePrepareAction(ctx, request.Fence, revalidatedAt)
 	if err != nil {
 		return PrepareResult{}, err
 	}
 	if !sameActionScope(metadata, revalidated) {
 		return PrepareResult{}, ErrStaleActionFence
 	}
-	if request.CredentialExpiresAt.After(revalidated.AuthorizationExpiresAt) {
+	if request.CredentialExpiresAt.After(revalidated.AuthorizationExpiresAt) ||
+		request.CredentialExpiresAt.After(signedCredentialExpiry(revalidatedAt, revalidated.CredentialTTLSeconds)) {
 		return PrepareResult{}, ErrStaleActionFence
 	}
 	metadata = revalidated
@@ -145,9 +148,11 @@ func (repository *MemoryRepository) Prepare(ctx context.Context, request Prepare
 		ID: request.RevocationID, TenantID: metadata.TenantID, WorkspaceID: metadata.WorkspaceID,
 		EnvironmentID: metadata.EnvironmentID, ActionID: metadata.ActionID, TargetKey: metadata.TargetKey,
 		Production: metadata.Production, RunnerID: metadata.RunnerID, ActionLeaseEpoch: metadata.LeaseEpoch,
-		Issuer: request.Issuer, IssuerRevision: request.IssuerRevision, ConnectorID: metadata.ConnectorID,
-		Permission: metadata.Permission, Resource: metadata.Resource,
-		CredentialExpiresAt: request.CredentialExpiresAt, Status: StatusPrepared, AvailableAt: now,
+		Issuer: request.Issuer, IssuerRevision: request.IssuerRevision, ActionType: metadata.ActionType,
+		ConnectorID: metadata.ConnectorID,
+		Permission:  metadata.Permission, Resource: metadata.Resource,
+		CredentialTTLSeconds: metadata.CredentialTTLSeconds,
+		CredentialExpiresAt:  request.CredentialExpiresAt, Status: StatusPrepared, AvailableAt: now,
 		CreatedAt: now, UpdatedAt: now, Version: 1,
 	}
 	record := &memoryRevocationRecord{
@@ -184,6 +189,7 @@ func (repository *MemoryRepository) AuthorizeChildCreate(
 			return ErrRevocationNotFound
 		}
 		if !frozenActionFenceMatches(record, request.Fence) || !inspectionScopeMatches(record.revocation, inspection.Metadata) ||
+			record.revocation.CredentialExpiresAt.After(inspection.Metadata.AuthorizationExpiresAt) ||
 			!inspectionFenceCurrent(record, inspection, now, 0) {
 			return ErrStaleActionFence
 		}
@@ -939,6 +945,7 @@ func (repository *MemoryRepository) resolveAction(ctx context.Context, fence Act
 		!metadata.AuthorizationExpiresAt.After(now) ||
 		!ValidIdentifier(metadata.TenantID, 256) || !ValidIdentifier(metadata.WorkspaceID, 256) ||
 		!ValidIdentifier(metadata.EnvironmentID, 256) || !ValidIdentifier(metadata.TargetKey, 512) ||
+		!ValidIdentifier(metadata.ActionType, 256) || !validCredentialTTLSeconds(metadata.CredentialTTLSeconds) ||
 		!ValidOpaqueText(metadata.ConnectorID, 256) || !ValidOpaqueText(metadata.Permission, 256) ||
 		!ValidOpaqueText(metadata.Resource, 2048) {
 		return ActionMetadata{}, ErrStaleActionFence
@@ -1010,8 +1017,9 @@ func (repository *MemoryRepository) resolvePrepareAction(ctx context.Context, fe
 func sameActionScope(left, right ActionMetadata) bool {
 	return left.ActionID == right.ActionID && left.TenantID == right.TenantID && left.WorkspaceID == right.WorkspaceID &&
 		left.EnvironmentID == right.EnvironmentID && left.TargetKey == right.TargetKey && left.Production == right.Production &&
-		left.RunnerID == right.RunnerID && left.LeaseEpoch == right.LeaseEpoch && left.ConnectorID == right.ConnectorID &&
-		left.Permission == right.Permission && left.Resource == right.Resource
+		left.RunnerID == right.RunnerID && left.LeaseEpoch == right.LeaseEpoch && left.ActionType == right.ActionType &&
+		left.ConnectorID == right.ConnectorID && left.Permission == right.Permission && left.Resource == right.Resource &&
+		left.CredentialTTLSeconds == right.CredentialTTLSeconds
 }
 
 func frozenActionFenceMatches(record *memoryRevocationRecord, fence ActionFence) bool {
@@ -1023,6 +1031,7 @@ func inspectionScopeMatches(revocation Revocation, metadata ActionMetadata) bool
 	return revocation.ActionID == metadata.ActionID && revocation.TenantID == metadata.TenantID &&
 		revocation.WorkspaceID == metadata.WorkspaceID && revocation.EnvironmentID == metadata.EnvironmentID &&
 		revocation.TargetKey == metadata.TargetKey && revocation.Production == metadata.Production &&
+		revocation.ActionType == metadata.ActionType && revocation.CredentialTTLSeconds == metadata.CredentialTTLSeconds &&
 		revocation.ConnectorID == metadata.ConnectorID && revocation.Permission == metadata.Permission &&
 		revocation.Resource == metadata.Resource
 }
@@ -1055,7 +1064,8 @@ func (repository *MemoryRepository) actionRecord(id string, fence ActionFence, m
 		record.revocation.ActionLeaseEpoch != fence.Epoch || record.actionTokenSHA256 != SHA256Hex([]byte(fence.Token)) ||
 		record.revocation.TenantID != metadata.TenantID || record.revocation.WorkspaceID != metadata.WorkspaceID ||
 		record.revocation.EnvironmentID != metadata.EnvironmentID || record.revocation.TargetKey != metadata.TargetKey ||
-		record.revocation.Production != metadata.Production || record.revocation.ConnectorID != metadata.ConnectorID ||
+		record.revocation.Production != metadata.Production || record.revocation.ActionType != metadata.ActionType ||
+		record.revocation.CredentialTTLSeconds != metadata.CredentialTTLSeconds || record.revocation.ConnectorID != metadata.ConnectorID ||
 		record.revocation.Permission != metadata.Permission || record.revocation.Resource != metadata.Resource {
 		return nil, ErrStaleActionFence
 	}
@@ -1089,8 +1099,17 @@ func samePrepare(existing Revocation, request PrepareRequest, metadata ActionMet
 		existing.TargetKey == metadata.TargetKey && existing.Production == metadata.Production && existing.RunnerID == metadata.RunnerID &&
 		existing.ActionLeaseEpoch == metadata.LeaseEpoch && existing.Issuer == request.Issuer &&
 		existing.IssuerRevision == request.IssuerRevision &&
+		existing.ActionType == metadata.ActionType && existing.CredentialTTLSeconds == metadata.CredentialTTLSeconds &&
 		existing.ConnectorID == metadata.ConnectorID && existing.Permission == metadata.Permission && existing.Resource == metadata.Resource &&
 		existing.CredentialExpiresAt.Equal(CanonicalCredentialExpiry(request.CredentialExpiresAt))
+}
+
+func validCredentialTTLSeconds(value int32) bool {
+	return value > 0 && time.Duration(value)*time.Second <= MaxCredentialTTL
+}
+
+func signedCredentialExpiry(now time.Time, ttlSeconds int32) time.Time {
+	return CanonicalCredentialExpiry(now.Add(time.Duration(ttlSeconds) * time.Second))
 }
 
 func (record *memoryRevocationRecord) bump(now time.Time) {

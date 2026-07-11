@@ -61,14 +61,15 @@ func TestPrepareDerivesTrustedActionScopeAndPersistsOnlyFenceDigest(t *testing.T
 		WillReturnRows(pgxmock.NewRows([]string{
 			"action_id", "tenant_id", "workspace_id", "environment_id", "target_key", "production", "runner_id",
 			"lease_epoch", "status", "lease_expires_at", "authorization_expires_at", "runner_pool", "scope_revision",
-			"cancel_requested_at", "connector_id", "permission", "resource", "database_now",
+			"cancel_requested_at", "action_type", "connector_id", "permission", "resource", "credential_ttl_seconds", "database_now",
 		}).AddRow(
 			fence.ActionID,
 			postgresTestTenantID,
 			postgresTestWorkspaceID,
 			postgresTestEnvironment,
 			"cluster-a/payments", false, fence.RunnerID, fence.Epoch, "RUNNING", now.Add(time.Minute), now.Add(10*time.Minute),
-			"WRITE", int64(7), nil, "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api", now,
+			"WRITE", int64(7), nil, "KUBERNETES_ROLLOUT_RESTART", "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART",
+			"cluster-a/payments/deployment/api", int64(600), now,
 		))
 	database.ExpectQuery("SELECT .* FROM credential_revocations.*WHERE action_id = \\$1 AND action_lease_epoch = \\$2.*FOR SHARE").
 		WithArgs(fence.ActionID, fence.Epoch).
@@ -80,8 +81,8 @@ func TestPrepareDerivesTrustedActionScopeAndPersistsOnlyFenceDigest(t *testing.T
 			postgresTestWorkspaceID,
 			postgresTestEnvironment,
 			fence.ActionID, "cluster-a/payments", false, fence.RunnerID, fence.Epoch, tokenDigest,
-			request.Issuer, request.IssuerRevision, "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api",
-			canonicalExpiry, credential.SHA256Hex([]byte(permitToken)),
+			request.Issuer, request.IssuerRevision, "KUBERNETES_ROLLOUT_RESTART", "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART",
+			"cluster-a/payments/deployment/api", int32(600), canonicalExpiry, credential.SHA256Hex([]byte(permitToken)),
 		).
 		WillReturnRows(pgxmock.NewRows([]string{"status", "available_at", "created_at", "updated_at", "version"}).
 			AddRow("PREPARED", now, now, now, int64(1)))
@@ -102,13 +103,14 @@ func TestPrepareDerivesTrustedActionScopeAndPersistsOnlyFenceDigest(t *testing.T
 
 	prepared, err := repository.Prepare(context.Background(), request)
 	if err != nil {
-		t.Fatalf("Prepare() error = %v", err)
+		t.Fatalf("Prepare() error = %v; expectations=%v", err, database.ExpectationsWereMet())
 	}
 	if !prepared.Created || prepared.Permit == nil || prepared.Permit.Token != permitToken ||
 		prepared.Revocation.Status != credential.StatusPrepared ||
 		prepared.Revocation.IssuerRevision != request.IssuerRevision ||
 		prepared.Revocation.WorkspaceID != postgresTestWorkspaceID ||
 		prepared.Revocation.EnvironmentID != postgresTestEnvironment || prepared.Revocation.TargetKey != "cluster-a/payments" ||
+		prepared.Revocation.ActionType != "KUBERNETES_ROLLOUT_RESTART" || prepared.Revocation.CredentialTTLSeconds != 600 ||
 		prepared.Revocation.ConnectorID != "kubernetes-prod" ||
 		!prepared.Revocation.CredentialExpiresAt.Equal(canonicalExpiry) {
 		t.Fatalf("prepared = %#v", prepared)
@@ -139,11 +141,12 @@ func TestPrepareRejectsProductionActionMetadata(t *testing.T) {
 		WillReturnRows(pgxmock.NewRows([]string{
 			"action_id", "tenant_id", "workspace_id", "environment_id", "target_key", "production", "runner_id",
 			"lease_epoch", "status", "lease_expires_at", "authorization_expires_at", "runner_pool", "scope_revision",
-			"cancel_requested_at", "connector_id", "permission", "resource", "database_now",
+			"cancel_requested_at", "action_type", "connector_id", "permission", "resource", "credential_ttl_seconds", "database_now",
 		}).AddRow(
 			fence.ActionID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment,
 			"cluster-a/payments", true, fence.RunnerID, fence.Epoch, "RUNNING", now.Add(time.Minute), now.Add(10*time.Minute),
-			"WRITE", int64(7), nil, "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api", now,
+			"WRITE", int64(7), nil, "KUBERNETES_ROLLOUT_RESTART", "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART",
+			"cluster-a/payments/deployment/api", int64(600), now,
 		))
 	database.ExpectRollback()
 
@@ -156,6 +159,88 @@ func TestPrepareRejectsProductionActionMetadata(t *testing.T) {
 	}
 	if err := database.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet pgx expectations: %v", err)
+	}
+}
+
+func TestPrepareRejectsExpiryBeyondSignedCredentialTTL(t *testing.T) {
+	t.Parallel()
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	repository, err := New(database, repositoryTestProtector(t), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 10, 15, 5, 30, 0, time.UTC)
+	fence := credential.ActionFence{
+		ActionID: postgresTestActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 4,
+	}
+	database.ExpectBegin()
+	database.ExpectQuery("SELECT action_id, runner_tenant_id::text").
+		WithArgs(fence.ActionID, fence.RunnerID, fence.Epoch, credential.SHA256Hex([]byte(fence.Token))).
+		WillReturnRows(actionMetadataRowsWithBinding(now, fence, now.Add(time.Minute), now.Add(10*time.Minute),
+			"KUBERNETES_ROLLOUT_RESTART", 60))
+	database.ExpectRollback()
+
+	result, err := repository.Prepare(context.Background(), credential.PrepareRequest{
+		RevocationID: postgresTestRevocationID, Fence: fence,
+		Issuer: "vault-production", IssuerRevision: "rev-1", CredentialExpiresAt: now.Add(60*time.Second + time.Microsecond),
+	})
+	if !errors.Is(err, credential.ErrInvalidRevocationRequest) || result != (credential.PrepareResult{}) {
+		t.Fatalf("Prepare(expiry beyond signed TTL) = %#v, %v", result, err)
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet pgx expectations: %v", err)
+	}
+}
+
+func TestPrepareRejectsMalformedTrustedActionCredentialBinding(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name       string
+		actionType string
+		ttlSeconds int32
+	}{
+		{name: "missing action type", actionType: "", ttlSeconds: 60},
+		{name: "invalid action type", actionType: "KUBERNETES RESTART", ttlSeconds: 60},
+		{name: "zero signed ttl", actionType: "KUBERNETES_ROLLOUT_RESTART", ttlSeconds: 0},
+		{name: "oversized signed ttl", actionType: "KUBERNETES_ROLLOUT_RESTART", ttlSeconds: 901},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			database, err := pgxmock.NewPool()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			repository, err := New(database, repositoryTestProtector(t), Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Date(2026, 7, 10, 15, 5, 45, 0, time.UTC)
+			fence := credential.ActionFence{
+				ActionID: postgresTestActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 4,
+			}
+			database.ExpectBegin()
+			database.ExpectQuery("SELECT action_id, runner_tenant_id::text").
+				WithArgs(fence.ActionID, fence.RunnerID, fence.Epoch, credential.SHA256Hex([]byte(fence.Token))).
+				WillReturnRows(actionMetadataRowsWithBinding(now, fence, now.Add(time.Minute), now.Add(10*time.Minute),
+					test.actionType, test.ttlSeconds))
+			database.ExpectRollback()
+
+			_, err = repository.Prepare(context.Background(), credential.PrepareRequest{
+				RevocationID: postgresTestRevocationID, Fence: fence,
+				Issuer: "vault-production", IssuerRevision: "rev-1", CredentialExpiresAt: now.Add(30 * time.Second),
+			})
+			if !errors.Is(err, credential.ErrStaleActionFence) {
+				t.Fatalf("Prepare(malformed trusted binding) error = %v", err)
+			}
+			if err := database.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet pgx expectations: %v", err)
+			}
+		})
 	}
 }
 
@@ -192,7 +277,8 @@ func TestPrepareRollsBackWhenActionCredentialMarkerCannotBeSet(t *testing.T) {
 		WithArgs(
 			request.RevocationID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment,
 			fence.ActionID, "cluster-a/payments", false, fence.RunnerID, fence.Epoch, tokenDigest,
-			request.Issuer, request.IssuerRevision, "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api",
+			request.Issuer, request.IssuerRevision, "KUBERNETES_ROLLOUT_RESTART", "kubernetes-prod",
+			"PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api", int32(600),
 			request.CredentialExpiresAt, credential.SHA256Hex([]byte("child-create-permit")),
 		).
 		WillReturnRows(pgxmock.NewRows([]string{"status", "available_at", "created_at", "updated_at", "version"}).
@@ -323,6 +409,53 @@ func TestAuthorizeChildCreateUsesDatabaseTimeAndConsumesPermitOnce(t *testing.T)
 		authorized.Revocation.Version != 2 || !authorized.DatabaseAuthorizedAt.Equal(now) ||
 		authorized.DatabaseAuthorizedAt.Add(authorized.TTL+credential.ChildCreateExpiryReserve).After(authorized.CredentialExpiresAt) {
 		t.Fatalf("AuthorizeChildCreate() = %#v, %v; expectations=%v", authorized, err, database.ExpectationsWereMet())
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet pgx expectations: %v", err)
+	}
+}
+
+func TestAuthorizeChildCreateRejectsCredentialExpiryBeyondActionAuthorization(t *testing.T) {
+	t.Parallel()
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	repository, err := New(database, repositoryTestProtector(t), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 10, 15, 10, 30, 0, time.UTC)
+	fence := credential.ActionFence{
+		ActionID: postgresTestActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 4,
+	}
+	permit := credential.ChildCreatePermit{RevocationID: postgresTestRevocationID, Token: "child-create-permit"}
+
+	database.ExpectBegin()
+	database.ExpectQuery("SELECT tenant_id::text, runner_pool, enabled, scope_revision.*FOR SHARE").
+		WithArgs(fence.RunnerID).
+		WillReturnRows(runnerRegistrationRows(true, "WRITE", 7))
+	database.ExpectQuery("SELECT action_id, runner_tenant_id::text.*FOR SHARE").
+		WithArgs(fence.ActionID, fence.RunnerID, fence.Epoch, credential.SHA256Hex([]byte(fence.Token))).
+		WillReturnRows(actionMetadataRowsWithLease(now, fence, now.Add(time.Minute), now.Add(30*time.Second)))
+	database.ExpectQuery("SELECT EXISTS.*FROM runner_scope_bindings").
+		WithArgs(fence.RunnerID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment).
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	database.ExpectQuery("SELECT .* FROM credential_revocations.*FOR UPDATE").
+		WithArgs(postgresTestRevocationID).
+		WillReturnRows(storedRevocationRows(now, storedRowOptions{
+			Status: credential.StatusPrepared, AvailableAt: now, Version: 1,
+			CredentialExpiresAt:     now.Add(time.Minute),
+			ChildCreatePermitSHA256: credential.SHA256Hex([]byte(permit.Token)),
+		}))
+	database.ExpectRollback()
+
+	authorized, err := repository.AuthorizeChildCreate(context.Background(), credential.AuthorizeChildCreateRequest{
+		Permit: permit, Fence: fence,
+	})
+	if !errors.Is(err, credential.ErrStaleActionFence) || authorized != (credential.ChildCreateAuthorization{}) {
+		t.Fatalf("AuthorizeChildCreate(expiry beyond action authorization) = %#v, %v", authorized, err)
 	}
 	if err := database.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet pgx expectations: %v", err)
@@ -571,17 +704,17 @@ func TestAuthorizeChildCreateEnforcesActionFenceReserveBoundary(t *testing.T) {
 			database.ExpectQuery("SELECT .* FROM credential_revocations.*FOR UPDATE").
 				WithArgs(postgresTestRevocationID).
 				WillReturnRows(storedRevocationRows(now, storedRowOptions{
-					Status: credential.StatusPrepared, AvailableAt: now, Version: 1, CredentialExpiresAt: now.Add(time.Minute),
+					Status: credential.StatusPrepared, AvailableAt: now, Version: 1, CredentialExpiresAt: now.Add(test.window),
 					ChildCreatePermitSHA256: permitDigest,
 				}))
 			database.ExpectQuery("SELECT clock_timestamp\\(\\)").
 				WillReturnRows(pgxmock.NewRows([]string{"database_now"}).AddRow(now))
 			if test.wantErr == nil {
 				database.ExpectQuery("UPDATE credential_revocations SET child_create_authorized_at").
-					WithArgs(postgresTestRevocationID, now, int32(45), permitDigest).
+					WithArgs(postgresTestRevocationID, now, int32(1), permitDigest).
 					WillReturnRows(storedRevocationRows(now, storedRowOptions{
-						Status: credential.StatusPrepared, AvailableAt: now, Version: 2, CredentialExpiresAt: now.Add(time.Minute),
-						ChildCreatePermitSHA256: permitDigest, ChildCreateAuthorizedAt: now, ChildCreateTTLSeconds: 45,
+						Status: credential.StatusPrepared, AvailableAt: now, Version: 2, CredentialExpiresAt: now.Add(test.window),
+						ChildCreatePermitSHA256: permitDigest, ChildCreateAuthorizedAt: now, ChildCreateTTLSeconds: 1,
 					}))
 				database.ExpectExec("INSERT INTO audit_records").
 					WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID,
@@ -600,7 +733,7 @@ func TestAuthorizeChildCreateEnforcesActionFenceReserveBoundary(t *testing.T) {
 			authorized, err := repository.AuthorizeChildCreate(context.Background(), credential.AuthorizeChildCreateRequest{
 				Permit: permit, Fence: fence,
 			})
-			if !errors.Is(err, test.wantErr) || (test.wantErr == nil && authorized.TTL != 45*time.Second) {
+			if !errors.Is(err, test.wantErr) || (test.wantErr == nil && authorized.TTL != credential.MinPostChildFenceWindow) {
 				t.Fatalf("AuthorizeChildCreate(action boundary) = %#v, %v, want %v", authorized, err, test.wantErr)
 			}
 			if err := database.ExpectationsWereMet(); err != nil {
@@ -641,7 +774,8 @@ func TestPrepareCommitResponseLossNeverAuthorizesChildCreationAndRetryIsNotCreat
 			WithArgs(
 				request.RevocationID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment,
 				fence.ActionID, "cluster-a/payments", false, fence.RunnerID, fence.Epoch, tokenDigest,
-				request.Issuer, request.IssuerRevision, "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api",
+				request.Issuer, request.IssuerRevision, "KUBERNETES_ROLLOUT_RESTART", "kubernetes-prod",
+				"PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api", int32(600),
 				request.CredentialExpiresAt, pgxmock.AnyArg(),
 			).
 			WillReturnRows(rows)
@@ -1407,7 +1541,8 @@ func TestPrepareRevalidatesFenceWindowImmediatelyBeforeCommit(t *testing.T) {
 		WithArgs(
 			request.RevocationID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment,
 			fence.ActionID, "cluster-a/payments", false, fence.RunnerID, fence.Epoch, tokenDigest,
-			request.Issuer, request.IssuerRevision, "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api",
+			request.Issuer, request.IssuerRevision, "KUBERNETES_ROLLOUT_RESTART", "kubernetes-prod",
+			"PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api", int32(600),
 			credential.CanonicalCredentialExpiry(request.CredentialExpiresAt), pgxmock.AnyArg(),
 		).
 		WillReturnRows(pgxmock.NewRows([]string{"status", "available_at", "created_at", "updated_at", "version"}).
@@ -1824,6 +1959,8 @@ type storedRowOptions struct {
 	RunnerID                  string
 	ActionLeaseEpoch          int64
 	ActionToken               string
+	ActionType                string
+	CredentialTTLSeconds      int32
 	Status                    credential.RevocationStatus
 	CredentialExpiresAt       time.Time
 	ChildCreatePermitSHA256   string
@@ -1904,6 +2041,12 @@ func addStoredRevocationRow(rows *pgxmock.Rows, now time.Time, options storedRow
 	if options.ActionToken == "" {
 		options.ActionToken = "action-token"
 	}
+	if options.ActionType == "" {
+		options.ActionType = "KUBERNETES_ROLLOUT_RESTART"
+	}
+	if options.CredentialTTLSeconds == 0 {
+		options.CredentialTTLSeconds = 600
+	}
 	permitDigest := options.ChildCreatePermitSHA256
 	if permitDigest == "" {
 		permitDigest = credential.SHA256Hex([]byte("child-create-permit"))
@@ -1926,8 +2069,9 @@ func addStoredRevocationRow(rows *pgxmock.Rows, now time.Time, options storedRow
 		options.RevocationID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment,
 		options.ActionID, "cluster-a/payments", false, options.RunnerID, options.ActionLeaseEpoch,
 		credential.SHA256Hex([]byte(options.ActionToken)),
-		"vault-production", "rev-1", "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api",
-		credentialExpiresAt, permitDigest, nullableTime(options.ChildCreateAuthorizedAt), nullableInt32(options.ChildCreateTTLSeconds),
+		"vault-production", "rev-1", options.ActionType, "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART",
+		"cluster-a/payments/deployment/api", int64(options.CredentialTTLSeconds), credentialExpiresAt, permitDigest,
+		nullableTime(options.ChildCreateAuthorizedAt), nullableInt32(options.ChildCreateTTLSeconds),
 		string(options.Status), nullableBytes(options.Protected.Ciphertext), nullableBytes(options.Protected.AccessorHMAC),
 		nullableString(options.Protected.KeyID), options.ClaimEpoch, nullableString(options.ClaimedBy), nullableString(options.ClaimTokenSHA256),
 		nullableTime(options.ClaimedAt), nullableTime(options.ClaimExpiresAt), nullableTime(options.HeartbeatAt),
@@ -1942,8 +2086,8 @@ func addStoredRevocationRow(rows *pgxmock.Rows, now time.Time, options storedRow
 func storedRevocationColumns() []string {
 	return []string{
 		"revocation_id", "tenant_id", "workspace_id", "environment_id", "action_id", "target_key", "production",
-		"runner_id", "action_lease_epoch", "action_lease_token_sha256", "issuer", "issuer_revision", "connector_id", "scope_permission",
-		"scope_resource", "credential_expires_at", "child_create_permit_sha256", "child_create_authorized_at",
+		"runner_id", "action_lease_epoch", "action_lease_token_sha256", "issuer", "issuer_revision", "action_type", "connector_id",
+		"scope_permission", "scope_resource", "credential_ttl_seconds", "credential_expires_at", "child_create_permit_sha256", "child_create_authorized_at",
 		"child_create_ttl_seconds", "status", "accessor_ciphertext", "accessor_hmac", "encryption_key_id",
 		"claim_epoch", "claimed_by", "claim_token_sha256", "claimed_at", "claim_expires_at", "last_heartbeat_at",
 		"completed_claim_epoch", "completed_claim_token_sha256", "completed_claimed_by", "attempt",
@@ -2097,12 +2241,12 @@ func actionMetadataRowsForState(
 	return pgxmock.NewRows([]string{
 		"action_id", "tenant_id", "workspace_id", "environment_id", "target_key", "production", "runner_id",
 		"lease_epoch", "status", "lease_expires_at", "authorization_expires_at", "runner_pool", "scope_revision",
-		"cancel_requested_at", "connector_id", "permission", "resource", "database_now",
+		"cancel_requested_at", "action_type", "connector_id", "permission", "resource", "credential_ttl_seconds", "database_now",
 	}).AddRow(
 		fence.ActionID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment,
 		"cluster-a/payments", false, fence.RunnerID, fence.Epoch, status, now.Add(time.Minute), now.Add(10*time.Minute),
-		"WRITE", scopeRevision, nullableTime(cancelRequestedAt), "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART",
-		"cluster-a/payments/deployment/api", now,
+		"WRITE", scopeRevision, nullableTime(cancelRequestedAt), "KUBERNETES_ROLLOUT_RESTART", "kubernetes-prod",
+		"PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api", int64(600), now,
 	)
 }
 
@@ -2111,14 +2255,26 @@ func actionMetadataRowsWithLease(
 	fence credential.ActionFence,
 	leaseExpiresAt, authorizationExpiresAt time.Time,
 ) *pgxmock.Rows {
+	return actionMetadataRowsWithBinding(now, fence, leaseExpiresAt, authorizationExpiresAt,
+		"KUBERNETES_ROLLOUT_RESTART", 600)
+}
+
+func actionMetadataRowsWithBinding(
+	now time.Time,
+	fence credential.ActionFence,
+	leaseExpiresAt, authorizationExpiresAt time.Time,
+	actionType string,
+	credentialTTLSeconds int32,
+) *pgxmock.Rows {
 	return pgxmock.NewRows([]string{
 		"action_id", "tenant_id", "workspace_id", "environment_id", "target_key", "production", "runner_id",
 		"lease_epoch", "status", "lease_expires_at", "authorization_expires_at", "runner_pool", "scope_revision",
-		"cancel_requested_at", "connector_id", "permission", "resource", "database_now",
+		"cancel_requested_at", "action_type", "connector_id", "permission", "resource", "credential_ttl_seconds", "database_now",
 	}).AddRow(
 		fence.ActionID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment,
 		"cluster-a/payments", false, fence.RunnerID, fence.Epoch, "RUNNING", leaseExpiresAt, authorizationExpiresAt,
-		"WRITE", int64(7), nil, "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api", now,
+		"WRITE", int64(7), nil, actionType, "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART",
+		"cluster-a/payments/deployment/api", int64(credentialTTLSeconds), now,
 	)
 }
 
@@ -2140,11 +2296,13 @@ func actionInspectionRows(now time.Time, fence credential.ActionFence, current b
 	return pgxmock.NewRows([]string{
 		"action_id", "tenant_id", "workspace_id", "environment_id", "target_key", "production",
 		"runner_id", "lease_epoch", "status", "lease_token_sha256", "lease_expires_at", "authorization_expires_at",
-		"runner_pool", "scope_revision", "cancel_requested_at", "connector_id", "permission", "resource", "database_now",
+		"runner_pool", "scope_revision", "cancel_requested_at", "action_type", "connector_id", "permission", "resource",
+		"credential_ttl_seconds", "database_now",
 	}).AddRow(
 		fence.ActionID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment,
 		"cluster-a/payments", false, runnerID, leaseEpoch, status, leaseTokenDigest, leaseExpiresAt, now.Add(15*time.Minute),
-		"WRITE", scopeRevision, nil, "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api", now,
+		"WRITE", scopeRevision, nil, "KUBERNETES_ROLLOUT_RESTART", "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART",
+		"cluster-a/payments/deployment/api", int64(600), now,
 	)
 }
 
@@ -2158,11 +2316,13 @@ func actionInspectionRowsForState(
 	return pgxmock.NewRows([]string{
 		"action_id", "tenant_id", "workspace_id", "environment_id", "target_key", "production",
 		"runner_id", "lease_epoch", "status", "lease_token_sha256", "lease_expires_at", "authorization_expires_at",
-		"runner_pool", "scope_revision", "cancel_requested_at", "connector_id", "permission", "resource", "database_now",
+		"runner_pool", "scope_revision", "cancel_requested_at", "action_type", "connector_id", "permission", "resource",
+		"credential_ttl_seconds", "database_now",
 	}).AddRow(
 		fence.ActionID, postgresTestTenantID, postgresTestWorkspaceID, postgresTestEnvironment,
 		"cluster-a/payments", false, fence.RunnerID, fence.Epoch, status, credential.SHA256Hex([]byte(fence.Token)),
 		now.Add(time.Minute), now.Add(15*time.Minute), "WRITE", scopeRevision, nullableTime(cancelRequestedAt),
-		"kubernetes-prod", "PATCH_DEPLOYMENT_RESTART", "cluster-a/payments/deployment/api", now,
+		"KUBERNETES_ROLLOUT_RESTART", "kubernetes-prod", "PATCH_DEPLOYMENT_RESTART",
+		"cluster-a/payments/deployment/api", int64(600), now,
 	)
 }

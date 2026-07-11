@@ -282,21 +282,135 @@ func exerciseRealCredentialRevocations(
 	if _, err := queue.Start(ctx, claimedAction.Execution.Fence()); err != nil {
 		t.Fatalf("start credential revocation action: %v", err)
 	}
+	expectDeferredConstraintAtCommit(t, ctx, database, "credential_revocations_action_marker_shape", `
+		INSERT INTO credential_revocations (
+			revocation_id, tenant_id, workspace_id, environment_id,
+			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
+			issuer, issuer_revision, action_type, connector_id, scope_permission, scope_resource,
+			credential_ttl_seconds, credential_expires_at, child_create_permit_sha256
+		)
+		SELECT '92000000-0000-4000-8000-000000000021', action.runner_tenant_id,
+			action.runner_workspace_id, action.runner_environment_id,
+			action.action_id, action.target_key, action.production, action.runner_id, action.lease_epoch,
+			action.lease_token_sha256, 'vault-production', 'rev-1', action.envelope ->> 'action_type',
+			'tampered-connector', action.envelope #>> '{credential_scope,permission}',
+			action.envelope #>> '{credential_scope,resource}',
+			(action.envelope #>> '{credential_scope,ttl_seconds}')::integer,
+			statement_timestamp() + interval '5 minutes', repeat('b', 64)
+		FROM action_queue AS action
+		WHERE action.action_id = $1 AND action.runner_id = $2 AND action.lease_epoch = $3
+		  AND action.lease_token_sha256 = $4;
+
+		UPDATE action_queue
+		SET credential_expected = true,
+			credential_lease_epoch = lease_epoch,
+			updated_at = statement_timestamp()
+		WHERE action_id = $1 AND runner_id = $2 AND lease_epoch = $3
+		  AND lease_token_sha256 = $4;
+	`, actionFence.ActionID, actionFence.RunnerID, actionFence.Epoch,
+		credential.SHA256Hex([]byte(actionFence.Token)))
+	authorizationBoundaryNow := time.Now().UTC()
+	authorizationBoundarySubmission := realActionSubmission(t, signer, authorizationBoundaryNow.Add(-25*time.Minute),
+		"91000000-0000-4000-8000-000000000023", workspaceID, environmentID, serviceID,
+		"payments-credential-authorization-boundary", 'a')
+	authorizationBoundarySubmission.Production = false
+	if _, err := queue.Submit(ctx, authorizationBoundarySubmission); err != nil {
+		t.Fatalf("submit credential authorization-boundary action: %v", err)
+	}
+	authorizationBoundaryAction, err := queue.Claim(ctx, execution.ActionClaimRequest{
+		Scope: realRunnerScope(t, ctx, database, "runner-postgres-2"), LeaseDuration: time.Minute,
+	})
+	if err != nil || authorizationBoundaryAction.Execution.ExecutionID != authorizationBoundarySubmission.Envelope.ActionID {
+		t.Fatalf("claim credential authorization-boundary action = %#v, %v", authorizationBoundaryAction, err)
+	}
+	authorizationBoundaryFence := credential.ActionFence{
+		ActionID: authorizationBoundaryAction.Execution.ExecutionID,
+		RunnerID: authorizationBoundaryAction.Execution.RunnerID,
+		Token:    authorizationBoundaryAction.Execution.LeaseToken,
+		Epoch:    authorizationBoundaryAction.Execution.LeaseEpoch,
+	}
+	expectDeferredConstraintAtCommit(t, ctx, database, "credential_revocations_action_marker_shape", `
+		INSERT INTO credential_revocations (
+			revocation_id, tenant_id, workspace_id, environment_id,
+			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
+			issuer, issuer_revision, action_type, connector_id, scope_permission, scope_resource,
+			credential_ttl_seconds, credential_expires_at, child_create_permit_sha256
+		)
+		SELECT '92000000-0000-4000-8000-000000000023', action.runner_tenant_id,
+			action.runner_workspace_id, action.runner_environment_id,
+			action.action_id, action.target_key, action.production, action.runner_id, action.lease_epoch,
+			action.lease_token_sha256, 'vault-production', 'rev-1', action.envelope ->> 'action_type',
+			action.envelope #>> '{credential_scope,connector_id}',
+			action.envelope #>> '{credential_scope,permission}',
+			action.envelope #>> '{credential_scope,resource}',
+			(action.envelope #>> '{credential_scope,ttl_seconds}')::integer,
+			action.authorization_expires_at + interval '1 microsecond', repeat('d', 64)
+		FROM action_queue AS action
+		WHERE action.action_id = $1 AND action.runner_id = $2 AND action.lease_epoch = $3
+		  AND action.lease_token_sha256 = $4;
+
+		UPDATE action_queue
+		SET credential_expected = true,
+			credential_lease_epoch = lease_epoch,
+			updated_at = statement_timestamp()
+		WHERE action_id = $1 AND runner_id = $2 AND lease_epoch = $3
+		  AND lease_token_sha256 = $4;
+	`, authorizationBoundaryFence.ActionID, authorizationBoundaryFence.RunnerID,
+		authorizationBoundaryFence.Epoch, credential.SHA256Hex([]byte(authorizationBoundaryFence.Token)))
+	if _, err := queue.Nack(ctx, execution.ActionNackRequest{
+		Lease: authorizationBoundaryAction.Execution.Fence(),
+		Reason: execution.ActionQueueReason{
+			Code: "CREDENTIAL_AUTHORIZATION_BOUNDARY_VERIFIED", DetailHash: strings.Repeat("a", 64),
+		},
+		RetryAfter: time.Second,
+	}); err != nil {
+		t.Fatalf("release credential authorization-boundary action: %v", err)
+	}
+	if cancelled, err := queue.Cancel(ctx, authorizationBoundaryAction.Execution.ExecutionID); err != nil ||
+		cancelled.Status != executionlease.StatusCancelled {
+		t.Fatalf("cancel credential authorization-boundary action = %#v, %v", cancelled, err)
+	}
+	expectSQLConstraint(t, ctx, database, "55000", "credential_revocations_created_at_guard", `
+		WITH frozen_clock AS (SELECT clock_timestamp() AS current_time)
+		INSERT INTO credential_revocations (
+			revocation_id, tenant_id, workspace_id, environment_id,
+			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
+			issuer, issuer_revision, action_type, connector_id, scope_permission, scope_resource,
+			credential_ttl_seconds, credential_expires_at, child_create_permit_sha256,
+			created_at, updated_at
+		)
+		SELECT '92000000-0000-4000-8000-000000000022', action.runner_tenant_id,
+			action.runner_workspace_id, action.runner_environment_id,
+			action.action_id, action.target_key, action.production, action.runner_id, action.lease_epoch,
+			action.lease_token_sha256, 'vault-production', 'rev-1', action.envelope ->> 'action_type',
+			action.envelope #>> '{credential_scope,connector_id}',
+			action.envelope #>> '{credential_scope,permission}',
+			action.envelope #>> '{credential_scope,resource}',
+			(action.envelope #>> '{credential_scope,ttl_seconds}')::integer,
+			frozen_clock.current_time + interval '2 minutes', repeat('c', 64),
+			frozen_clock.current_time + interval '1 minute', frozen_clock.current_time + interval '1 minute'
+		FROM action_queue AS action CROSS JOIN frozen_clock
+		WHERE action.action_id = $1 AND action.runner_id = $2 AND action.lease_epoch = $3
+		  AND action.lease_token_sha256 = $4
+	`, actionFence.ActionID, actionFence.RunnerID, actionFence.Epoch,
+		credential.SHA256Hex([]byte(actionFence.Token)))
 	expectSQLState(t, ctx, database, "23503", `
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
-			child_create_permit_sha256
+			issuer, issuer_revision, action_type, connector_id, scope_permission, scope_resource,
+			credential_ttl_seconds, credential_expires_at, child_create_permit_sha256
 		) VALUES (
 			'92000000-0000-4000-8000-000000000099', $1, $2, $3,
 			$4, $5, false, $6, $7, $8,
-			'vault-production', 'rev-1', $9, $10, $11, statement_timestamp() + interval '5 minutes', repeat('a', 64)
+			'vault-production', 'rev-1', $9, $10, $11, $12, $13,
+			statement_timestamp() + interval '5 minutes', repeat('a', 64)
 		)
 	`, otherTenantID, otherWorkspaceID, environmentID, actionFence.ActionID, submission.TargetKey,
 		actionFence.RunnerID, actionFence.Epoch, credential.SHA256Hex([]byte(actionFence.Token)),
-		submission.Envelope.CredentialScope.ConnectorID, submission.Envelope.CredentialScope.Permission,
-		submission.Envelope.CredentialScope.Resource)
+		string(submission.Envelope.ActionType), submission.Envelope.CredentialScope.ConnectorID,
+		submission.Envelope.CredentialScope.Permission, submission.Envelope.CredentialScope.Resource,
+		submission.Envelope.CredentialScope.TTLSeconds)
 	protector, err := credential.NewAESGCMProtector(credential.KeyRing{
 		ActiveKeyID: "credential-integration-key-1",
 		Keys: map[string]credential.ProtectionKey{
@@ -315,6 +429,14 @@ func exerciseRealCredentialRevocations(
 		t.Fatalf("create credential revocation repository: %v", err)
 	}
 	expectSQLState(t, ctx, database, "P0001", `TRUNCATE audit_records`)
+	signedTTL := time.Duration(submission.Envelope.CredentialScope.TTLSeconds) * time.Second
+	if _, err := repository.Prepare(ctx, credential.PrepareRequest{
+		RevocationID: "92000000-0000-4000-8000-000000000020", Fence: actionFence,
+		Issuer: "vault-production", IssuerRevision: "rev-1",
+		CredentialExpiresAt: time.Now().UTC().Add(signedTTL + time.Minute),
+	}); !errors.Is(err, credential.ErrInvalidRevocationRequest) {
+		t.Fatalf("real Prepare(expiry beyond signed TTL) error = %v", err)
+	}
 	credentialExpiry := now.Add(5*time.Minute + 999*time.Nanosecond)
 	canonicalCredentialExpiry := credential.CanonicalCredentialExpiry(credentialExpiry)
 	type prepareCallResult struct {
@@ -369,6 +491,8 @@ func exerciseRealCredentialRevocations(
 		if call.result.Revocation.ID != revocationID || call.result.Revocation.Status != credential.StatusPrepared ||
 			call.result.Revocation.WorkspaceID != workspaceID || call.result.Revocation.EnvironmentID != environmentID ||
 			call.result.Revocation.TargetKey != submission.TargetKey ||
+			call.result.Revocation.ActionType != string(submission.Envelope.ActionType) ||
+			call.result.Revocation.CredentialTTLSeconds != int32(submission.Envelope.CredentialScope.TTLSeconds) ||
 			!call.result.Revocation.CredentialExpiresAt.Equal(canonicalCredentialExpiry) {
 			t.Fatalf("real concurrent credential Prepare result = %#v", call.result)
 		}
@@ -860,12 +984,13 @@ func exerciseRealCredentialRevocations(
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
-			child_create_permit_sha256, status
+			issuer, issuer_revision, action_type, connector_id, scope_permission, scope_resource,
+			credential_ttl_seconds, credential_expires_at, child_create_permit_sha256, status
 		)
 		SELECT '92000000-0000-4000-8000-000000000007', tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch + 7000, action_lease_token_sha256,
-			issuer, issuer_revision, connector_id, scope_permission, scope_resource, statement_timestamp() + interval '5 minutes',
+			issuer, issuer_revision, action_type, connector_id, scope_permission, scope_resource,
+			credential_ttl_seconds, statement_timestamp() + interval '5 minutes',
 			repeat('7', 64), 'NO_CREDENTIAL'
 		FROM credential_revocations WHERE revocation_id = $1
 	`, revocationID)
@@ -881,15 +1006,28 @@ func exerciseRealCredentialRevocations(
 		WHERE revocation_id = $1
 	`, revocationID)
 	expectSQLState(t, ctx, database, "55000", `
+		UPDATE credential_revocations
+		SET action_type = 'KUBERNETES_SCALE', updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID)
+	expectSQLState(t, ctx, database, "55000", `
+		UPDATE credential_revocations
+		SET credential_ttl_seconds = credential_ttl_seconds - 1,
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID)
+	expectSQLState(t, ctx, database, "55000", `
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
+			issuer, issuer_revision, action_type, connector_id, scope_permission, scope_resource,
+			credential_ttl_seconds, credential_expires_at,
 			child_create_permit_sha256, child_create_authorized_at, child_create_ttl_seconds
 		)
 		SELECT '92000000-0000-4000-8000-000000000015', tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch + 7015, action_lease_token_sha256,
-			issuer, issuer_revision, connector_id, scope_permission, scope_resource, statement_timestamp() + interval '5 minutes',
+			issuer, issuer_revision, action_type, connector_id, scope_permission, scope_resource,
+			credential_ttl_seconds, statement_timestamp() + interval '5 minutes',
 			repeat('f', 64), statement_timestamp(), 30
 		FROM credential_revocations WHERE revocation_id = $1
 	`, revocationID)
@@ -898,14 +1036,16 @@ func exerciseRealCredentialRevocations(
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
+			issuer, issuer_revision, action_type, connector_id, scope_permission, scope_resource,
+			credential_ttl_seconds, credential_expires_at,
 			child_create_permit_sha256,
 			available_at, created_at, updated_at
 		)
 		SELECT '92000000-0000-4000-8000-000000000014', source.tenant_id, source.workspace_id, source.environment_id,
 			source.action_id, source.target_key, source.production, source.runner_id,
 			source.action_lease_epoch + 7004, source.action_lease_token_sha256,
-			source.issuer, source.issuer_revision, source.connector_id, source.scope_permission, source.scope_resource,
+			source.issuer, source.issuer_revision, source.action_type, source.connector_id, source.scope_permission, source.scope_resource,
+			source.credential_ttl_seconds,
 			clock.current_time + interval '15 minutes' + interval '1 microsecond', repeat('e', 64),
 			clock.current_time, clock.current_time, clock.current_time
 		FROM credential_revocations AS source CROSS JOIN clock
@@ -918,12 +1058,14 @@ func exerciseRealCredentialRevocations(
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
+			issuer, issuer_revision, action_type, connector_id, scope_permission, scope_resource,
+			credential_ttl_seconds, credential_expires_at,
 			child_create_permit_sha256
 		)
 		SELECT '92000000-0000-4000-8000-000000000019', tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch + 7019, action_lease_token_sha256,
-			issuer, issuer_revision, connector_id, scope_permission, scope_resource,
+			issuer, issuer_revision, action_type, connector_id, scope_permission, scope_resource,
+			credential_ttl_seconds,
 			statement_timestamp() + interval '5 minutes', repeat('1', 64)
 		FROM credential_revocations WHERE revocation_id = $1
 	`, revocationID)
@@ -2584,15 +2726,17 @@ func insertPreparedCredentialForAction(
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
+			issuer, issuer_revision, action_type, connector_id, scope_permission, scope_resource,
+			credential_ttl_seconds, credential_expires_at,
 			child_create_permit_sha256, available_at, created_at, updated_at
 		)
 		SELECT $5, action.runner_tenant_id, action.runner_workspace_id, action.runner_environment_id,
 			action.action_id, action.target_key, action.production, action.runner_id, action.lease_epoch,
-			action.lease_token_sha256, 'vault-production', 'rev-1',
+			action.lease_token_sha256, 'vault-production', 'rev-1', action.envelope ->> 'action_type',
 			action.envelope #>> '{credential_scope,connector_id}',
 			action.envelope #>> '{credential_scope,permission}',
 			action.envelope #>> '{credential_scope,resource}',
+			(action.envelope #>> '{credential_scope,ttl_seconds}')::integer,
 			$6, $7, $8, $8, $8
 		FROM action_queue AS action
 		WHERE action.action_id = $1

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/seaworld008/aiops-system/internal/action"
@@ -34,7 +35,6 @@ var (
 	ErrEnvironmentNotAllowed  = errors.New("runner is not allowed for the action environment")
 	ErrClaimsDisabled         = errors.New("write execution claims are disabled")
 	ErrCredentialDenied       = errors.New("execution credential is unavailable or denied")
-	ErrCredentialRevokeFailed = errors.New("execution credential revocation failed")
 	ErrPreExecutionDenied     = errors.New("pre-execution policy denied the action")
 	ErrExecutionFailed        = errors.New("execution completed with a definite failure")
 	ErrExecutionUncertain     = errors.New("execution outcome is uncertain")
@@ -90,11 +90,14 @@ type SafetyGate interface {
 }
 
 type CredentialBroker interface {
-	Issue(context.Context, action.Envelope) (credential.Credential, error)
-	Revoke(context.Context, *credential.Credential) error
+	Prepare(context.Context, credential.PrepareDurableCredentialRequest) (credential.PreparedDurableCredential, error)
+	Issue(context.Context, credential.PreparedDurableCredential) (credential.DurableCredential, error)
+	RecordNoCredential(context.Context, credential.PreparedDurableCredential) (credential.Revocation, error)
+	RequestRevocation(context.Context, credential.DurableCredential) (credential.Revocation, error)
 }
 
 type PreExecutionPolicy interface {
+	EvaluateCredentialIssue(context.Context, action.Envelope) (policy.Decision, error)
 	EvaluatePreExecution(context.Context, action.Envelope) (policy.Decision, error)
 }
 
@@ -168,19 +171,19 @@ type AWXServiceRestartCommand struct {
 }
 
 type KubernetesRolloutRestartExecutor interface {
-	ExecuteRolloutRestart(context.Context, KubernetesRolloutRestartCommand, *credential.Credential) (ExecutorResult, error)
+	ExecuteRolloutRestart(context.Context, KubernetesRolloutRestartCommand, credential.DurableCredential) (ExecutorResult, error)
 }
 
 type KubernetesScaleExecutor interface {
-	ExecuteScale(context.Context, KubernetesScaleCommand, *credential.Credential) (ExecutorResult, error)
+	ExecuteScale(context.Context, KubernetesScaleCommand, credential.DurableCredential) (ExecutorResult, error)
 }
 
 type GitOpsRevertExecutor interface {
-	ExecuteGitOpsRevert(context.Context, GitOpsRevertCommand, *credential.Credential) (ExecutorResult, error)
+	ExecuteGitOpsRevert(context.Context, GitOpsRevertCommand, credential.DurableCredential) (ExecutorResult, error)
 }
 
 type AWXServiceRestartExecutor interface {
-	ExecuteAWXServiceRestart(context.Context, AWXServiceRestartCommand, *credential.Credential) (ExecutorResult, error)
+	ExecuteAWXServiceRestart(context.Context, AWXServiceRestartCommand, credential.DurableCredential) (ExecutorResult, error)
 }
 
 type Executors struct {
@@ -290,32 +293,7 @@ func (service *Service) Submit(ctx context.Context, envelope action.Envelope) (e
 
 // RunNext runs one write job. ClaimsEnabled, queue pool, target key, and the
 // production bit are all internal values derived from trusted dependencies.
-func (service *Service) RunNext(ctx context.Context) (result executionlease.Execution, runErr error) {
-	var executionCredential credential.Credential
-	credentialIssued := false
-	revokeCredential := func() error {
-		if !credentialIssued {
-			return nil
-		}
-		credentialIssued = false
-		finalizeContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), service.finalizeTimeout)
-		defer cancel()
-		revokeErr := service.dependencies.Credentials.Revoke(finalizeContext, &executionCredential)
-		executionCredential.Destroy()
-		if revokeErr != nil {
-			return fmt.Errorf("%w: %v", ErrCredentialRevokeFailed, revokeErr)
-		}
-		return nil
-	}
-	defer func() {
-		if revokeErr := revokeCredential(); revokeErr != nil {
-			if runErr == nil {
-				runErr = revokeErr
-			} else {
-				runErr = errors.Join(runErr, revokeErr)
-			}
-		}
-	}()
+func (service *Service) RunNext(ctx context.Context) (executionlease.Execution, error) {
 	runnerScope, err := service.resolveRunnerScope(ctx)
 	if err != nil {
 		return executionlease.Execution{}, err
@@ -339,7 +317,10 @@ func (service *Service) RunNext(ctx context.Context) (result executionlease.Exec
 	// unverified metadata. Expiry recovery owns that decision.
 	if leased.ExecutionID != envelope.ActionID || leased.TargetKey != claimed.TargetKey ||
 		leased.Pool != executionlease.PoolWrite || leased.Production != claimed.Production ||
-		claimed.PlanHash != envelope.PlanHash || leased.Production {
+		claimed.PlanHash != envelope.PlanHash || leased.Production || leased.RunnerID != runnerScope.runnerID ||
+		leased.RunnerTenantID != runnerScope.tenantID || leased.RunnerWorkspaceID != envelope.WorkspaceID ||
+		leased.RunnerEnvironmentID != envelope.Target.EnvironmentID || leased.ScopeRevision != runnerScope.scopeRevision ||
+		!runnerScope.allows(envelope.WorkspaceID, envelope.Target.EnvironmentID) {
 		return redactActionExecution(leased), ErrJobConflict
 	}
 	leaseFence := leased.Fence()
@@ -362,19 +343,19 @@ func (service *Service) RunNext(ctx context.Context) (result executionlease.Exec
 		return service.rejectClaim(ctx, claimed, "ENVIRONMENT_DRIFT", ErrEnvironmentDrift)
 	}
 
-	executionCredential, err = service.dependencies.Credentials.Issue(ctx, envelope)
+	credentialDecision, err := service.dependencies.Policy.EvaluateCredentialIssue(ctx, envelope)
 	if err != nil {
-		if errors.Is(err, credential.ErrCredentialDenied) {
-			return service.rejectClaim(ctx, claimed, "CREDENTIAL_POLICY_DENIED", ErrCredentialDenied)
+		if ctx.Err() != nil {
+			return service.nackClaim(ctx, claimed, "CREDENTIAL_POLICY_CANCELLED", ctx.Err())
 		}
-		if errors.Is(err, credential.ErrUnsafeCredentialLease) {
-			return service.rejectClaim(ctx, claimed, "CREDENTIAL_LEASE_UNSAFE", ErrCredentialDenied)
-		}
-		return service.nackClaim(ctx, claimed, "CREDENTIAL_TEMPORARILY_UNAVAILABLE", ErrCredentialDenied)
+		return service.nackClaim(ctx, claimed, "CREDENTIAL_POLICY_TEMPORARILY_UNAVAILABLE", ErrCredentialDenied)
 	}
-	credentialIssued = true
-	if !validCredential(executionCredential, envelope, now) {
-		return service.nackClaim(ctx, claimed, "CREDENTIAL_INVALID", ErrCredentialDenied)
+	now, err = service.now()
+	if err != nil {
+		return service.nackClaim(ctx, claimed, "CLOCK_TEMPORARILY_UNAVAILABLE", err)
+	}
+	if !validCredentialIssueDecision(credentialDecision, envelope, now) {
+		return service.rejectClaim(ctx, claimed, "CREDENTIAL_POLICY_DENIED", ErrCredentialDenied)
 	}
 
 	decision, err := service.dependencies.Policy.EvaluatePreExecution(ctx, envelope)
@@ -388,7 +369,7 @@ func (service *Service) RunNext(ctx context.Context) (result executionlease.Exec
 	if err != nil {
 		return service.nackClaim(ctx, claimed, "CLOCK_TEMPORARILY_UNAVAILABLE", err)
 	}
-	if !validPreExecutionDecision(decision, envelope, now) || !executionCredential.ExpiresAt.After(now) {
+	if !validPreExecutionDecision(decision, envelope, now) || !samePolicySnapshot(credentialDecision, decision) {
 		return service.rejectClaim(ctx, claimed, "PRE_EXECUTION_POLICY_DENIED", ErrPreExecutionDenied)
 	}
 	startSafety, err := service.checkSafety(ctx, SafetyRequest{
@@ -396,7 +377,7 @@ func (service *Service) RunNext(ctx context.Context) (result executionlease.Exec
 		WorkspaceID: envelope.WorkspaceID, EnvironmentID: envelope.Target.EnvironmentID,
 		ConnectorID: envelope.CredentialScope.ConnectorID, ActionType: envelope.ActionType,
 	})
-	if err != nil || startSafety.Revision != decision.SafetyRevision {
+	if err != nil || startSafety.Revision != decision.SafetyRevision || startSafety.Revision != credentialDecision.SafetyRevision {
 		if err == nil {
 			err = ErrClaimsDisabled
 		}
@@ -414,27 +395,118 @@ func (service *Service) RunNext(ctx context.Context) (result executionlease.Exec
 		return service.nackClaim(ctx, claimed, "CLOCK_TEMPORARILY_UNAVAILABLE", err)
 	}
 	if !fresh(now, startSafety.ObservedAt, MaxSafetySnapshotAge) ||
-		!validPreExecutionDecision(decision, envelope, now) || !executionCredential.ExpiresAt.After(now) {
+		!validPreExecutionDecision(decision, envelope, now) ||
+		!validCredentialIssueDecision(credentialDecision, envelope, now) || !samePolicySnapshot(credentialDecision, decision) {
 		return service.nackClaim(ctx, claimed, "PRE_START_STATE_EXPIRED", ErrClaimsDisabled)
 	}
-	executorDeadline, err := boundedExecutionDeadline(ctx, envelope, executionCredential, now)
+	executorDeadline, err := boundedExecutionDeadline(ctx, envelope, credentialDecision.CredentialExpiresAt, now)
 	if err != nil {
 		return service.rejectClaim(ctx, claimed, "EXECUTION_DEADLINE_EXPIRED", ErrPreExecutionDenied)
 	}
+	credentialFence := credential.ActionFence{
+		ActionID: leaseFence.ExecutionID, RunnerID: leaseFence.RunnerID, Token: leaseFence.Token, Epoch: leaseFence.Epoch,
+	}
+	prepared, err := service.dependencies.Credentials.Prepare(ctx, credential.PrepareDurableCredentialRequest{
+		Fence: credentialFence,
+		Selection: credential.DurableIssuerResolveRequest{
+			TenantID: runnerScope.tenantID, WorkspaceID: envelope.WorkspaceID,
+			EnvironmentID: envelope.Target.EnvironmentID, Production: claimed.Production,
+			ActionType: string(envelope.ActionType), ConnectorID: envelope.CredentialScope.ConnectorID,
+			Permission: envelope.CredentialScope.Permission, Resource: envelope.CredentialScope.Resource,
+		},
+		RequestedTTL:    time.Duration(envelope.CredentialScope.TTLSeconds) * time.Second,
+		PolicyExpiresAt: credentialDecision.CredentialExpiresAt,
+	})
+	if err != nil {
+		// Prepare may have committed even when its response was lost. Never release
+		// the target fence on an ambiguous durable-authorization boundary.
+		return redactActionExecution(leased), errors.Join(ErrCredentialDenied, err)
+	}
 	started, err := service.dependencies.Queue.Start(ctx, leaseFence)
 	if err != nil {
-		return redactActionExecution(leased), err
+		noCredentialErr := service.recordNoCredential(ctx, prepared)
+		return redactActionExecution(leased), errors.Join(err, noCredentialErr)
+	}
+	if heartbeatErr := service.heartbeatOnce(ctx, runnerScope, leaseFence, 1); heartbeatErr != nil {
+		noCredentialErr := service.recordNoCredential(ctx, prepared)
+		return redactActionExecution(started), errors.Join(ErrExecutionUncertain, heartbeatErr, noCredentialErr)
 	}
 
 	// Convert the trusted wall-clock deadline to a duration before handing it to
 	// context, whose timer is based on the process clock. This keeps injected
 	// clocks deterministic and avoids treating a valid simulated deadline as
 	// already expired in real wall time.
+	now, err = service.now()
+	if err != nil || !executorDeadline.After(now) {
+		noCredentialErr := service.recordNoCredential(ctx, prepared)
+		if err == nil {
+			err = ErrPreExecutionDenied
+		}
+		return redactActionExecution(started), errors.Join(ErrExecutionUncertain, err, noCredentialErr)
+	}
 	executorContext, cancelExecutor := context.WithTimeout(ctx, executorDeadline.Sub(now))
 	defer cancelExecutor()
-	executorCredential := executionCredential
-	executorResult, executorErr, heartbeatErr := service.dispatchWithHeartbeat(executorContext, runnerScope, leaseFence, envelope, &executorCredential)
-	if heartbeatErr != nil {
+	heartbeats := service.startHeartbeatSession(executorContext, cancelExecutor, runnerScope, leaseFence, 2)
+
+	var executionCredential credential.DurableCredential
+	credentialIssued := false
+	revocationAttempted := false
+	requestRevocation := func() (credential.Revocation, error) {
+		if !credentialIssued {
+			return credential.Revocation{}, nil
+		}
+		revocationAttempted = true
+		finalizeContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), service.finalizeTimeout)
+		defer cancel()
+		revocation, requestErr := service.dependencies.Credentials.RequestRevocation(finalizeContext, executionCredential)
+		executionCredential.Destroy()
+		return revocation, requestErr
+	}
+	defer func() {
+		if credentialIssued && !revocationAttempted {
+			_, _ = requestRevocation()
+		}
+		executionCredential.Destroy()
+	}()
+
+	executionCredential, err = service.dependencies.Credentials.Issue(executorContext, prepared)
+	if err == nil {
+		credentialIssued = true
+	}
+	executionContext := executorContext
+	var executorResult ExecutorResult
+	var executorErr error
+	if err != nil {
+		executorErr = ErrCredentialDenied
+	} else {
+		issueNow, clockErr := service.now()
+		if clockErr != nil || !validDurableCredential(
+			executionCredential, envelope, credentialDecision.CredentialExpiresAt, issueNow,
+		) {
+			executorErr = ErrCredentialDenied
+		} else {
+			credentialExecutionContext, cancelCredentialDeadline := context.WithTimeout(
+				executorContext, executionCredential.ExpiresAt().Sub(issueNow),
+			)
+			executionContext = credentialExecutionContext
+			defer cancelCredentialDeadline()
+			// Keep the original supervisor and sequence alive through Complete, but
+			// cancel it if the shorter dynamic credential lifetime expires first.
+			stopCredentialDeadline := context.AfterFunc(executionContext, cancelExecutor)
+			defer stopCredentialDeadline()
+			if heartbeatErr := heartbeats.Checkpoint(executionContext); heartbeatErr != nil {
+				executorErr = heartbeatErr
+			} else {
+				executorResult, executorErr = service.dispatchWithHeartbeat(
+					executionContext, heartbeats, envelope, executionCredential,
+				)
+			}
+		}
+	}
+	// Keep the session alive after the executor returns. This checkpoint
+	// linearizes lease validity before the result receipt, while periodic
+	// heartbeats continue until Complete is acknowledged.
+	if heartbeatErr := heartbeats.Checkpoint(executionContext); heartbeatErr != nil {
 		executorResult = ExecutorResult{}
 		executorErr = heartbeatErr
 	}
@@ -444,16 +516,29 @@ func (service *Service) RunNext(ctx context.Context) (result executionlease.Exec
 		Lease: leaseFence, Summary: summary,
 	})
 	cancelComplete()
-	if completeErr != nil {
-		return redactActionExecution(started), errors.Join(ErrExecutionUncertain, completeErr)
+	if completeErr == nil {
+		heartbeats.AcknowledgeComplete()
 	}
-	if revokeErr := revokeCredential(); revokeErr != nil {
-		return finalizing, revokeErr
+	heartbeatErr := heartbeats.Stop()
+	if completeErr != nil {
+		_, cleanupErr := requestRevocation()
+		return redactActionExecution(started), errors.Join(ErrExecutionUncertain, completeErr, heartbeatErr, cleanupErr)
+	}
+	revocation, cleanupErr := requestRevocation()
+	if cleanupErr != nil {
+		return finalizing, errors.Join(ErrCredentialCleanupPending, cleanupErr)
+	}
+	completionStatus, _ := ResultSummaryStatus(summary)
+	if completionStatus != executionlease.StatusUncertain && credentialIssued && !revocation.Terminal() {
+		return finalizing, ErrCredentialCleanupPending
 	}
 	finalizeContext, cancelFinalize := context.WithTimeout(context.WithoutCancel(ctx), service.finalizeTimeout)
 	completed, finalizeErr := service.dependencies.Queue.Finalize(finalizeContext, leaseFence)
 	cancelFinalize()
 	if finalizeErr != nil {
+		if errors.Is(finalizeErr, ErrCredentialCleanupPending) {
+			return finalizing, ErrCredentialCleanupPending
+		}
 		return finalizing, errors.Join(ErrExecutionUncertain, finalizeErr)
 	}
 	switch completed.Status {
@@ -538,6 +623,22 @@ func (service *Service) nackClaim(ctx context.Context, claimed ClaimedAction, co
 	return released, cause
 }
 
+func (service *Service) recordNoCredential(
+	ctx context.Context,
+	prepared credential.PreparedDurableCredential,
+) error {
+	finalizeContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), service.finalizeTimeout)
+	defer cancel()
+	revocation, err := service.dependencies.Credentials.RecordNoCredential(finalizeContext, prepared)
+	if err != nil {
+		return err
+	}
+	if revocation.Status != credential.StatusNoCredential || !revocation.Terminal() {
+		return ErrCredentialCleanupPending
+	}
+	return nil
+}
+
 func queueReason(code string) ActionQueueReason {
 	digest := sha256.Sum256([]byte("aiops-action-queue-reason-detail.v1\x00" + code))
 	return ActionQueueReason{Code: code, DetailHash: hex.EncodeToString(digest[:])}
@@ -587,7 +688,12 @@ func deriveTargetKey(envelope action.Envelope) (string, error) {
 	return kind + ":sha256:" + hex.EncodeToString(digest[:]), nil
 }
 
-func (service *Service) dispatchSafely(ctx context.Context, envelope action.Envelope, executionCredential *credential.Credential) (result ExecutorResult, err error) {
+func (service *Service) dispatchSafely(
+	ctx context.Context,
+	envelope action.Envelope,
+	executionCredential credential.DurableCredential,
+	dispatchEntered chan<- struct{},
+) (result ExecutorResult, err error) {
 	defer func() {
 		if recover() != nil {
 			result = ExecutorResult{}
@@ -597,6 +703,9 @@ func (service *Service) dispatchSafely(ctx context.Context, envelope action.Enve
 	identity := CommandIdentity{
 		ActionID: envelope.ActionID, WorkspaceID: envelope.WorkspaceID, IncidentID: envelope.IncidentID,
 		ServiceID: envelope.Target.ServiceID, EnvironmentID: envelope.Target.EnvironmentID, TraceID: envelope.TraceID,
+	}
+	if dispatchEntered != nil {
+		close(dispatchEntered)
 	}
 	switch envelope.ActionType {
 	case action.ActionKubernetesRolloutRestart:
@@ -630,93 +739,214 @@ func (service *Service) dispatchSafely(ctx context.Context, envelope action.Enve
 	}
 }
 
-func (service *Service) dispatchWithHeartbeat(ctx context.Context, runnerScope RunnerScope, leaseFence executionlease.LeaseIdentity, envelope action.Envelope, executionCredential *credential.Credential) (ExecutorResult, error, error) {
-	executorContext, cancelExecutor := context.WithCancel(ctx)
-	defer cancelExecutor()
-	heartbeatContext, stopHeartbeat := context.WithCancel(context.WithoutCancel(ctx))
-	defer stopHeartbeat()
-	heartbeatDone := make(chan error, 1)
-	go service.heartbeatLoop(heartbeatContext, cancelExecutor, runnerScope, leaseFence, heartbeatDone)
+func (service *Service) dispatchWithHeartbeat(
+	ctx context.Context,
+	heartbeats *actionHeartbeatSession,
+	envelope action.Envelope,
+	executionCredential credential.DurableCredential,
+) (ExecutorResult, error) {
 	type executorCompletion struct {
 		result ExecutorResult
 		err    error
 	}
 	executorDone := make(chan executorCompletion, 1)
+	dispatchEntered := make(chan struct{})
+	// Serialize the final failure check with every heartbeat checkpoint. Once
+	// dispatchSafely signals entry, a later heartbeat loss cancels an execution
+	// that was legitimately started; an already-observed loss can never race
+	// through this gate and start the executor.
+	heartbeats.beatMu.Lock()
+	if dispatchErr := heartbeats.DispatchError(ctx); dispatchErr != nil {
+		heartbeats.beatMu.Unlock()
+		return ExecutorResult{}, dispatchErr
+	}
 	go func() {
-		result, err := service.dispatchSafely(executorContext, envelope, executionCredential)
+		result, err := service.dispatchSafely(ctx, envelope, executionCredential, dispatchEntered)
 		executorDone <- executorCompletion{result: result, err: err}
 	}()
+	<-dispatchEntered
+	heartbeats.beatMu.Unlock()
 
 	select {
 	case completed := <-executorDone:
-		stopHeartbeat()
-		heartbeatErr := <-heartbeatDone
 		if deadlineErr := ctx.Err(); deadlineErr != nil {
-			return ExecutorResult{}, deadlineErr, heartbeatErr
+			return ExecutorResult{}, deadlineErr
 		}
-		return completed.result, completed.err, heartbeatErr
-	case heartbeatErr := <-heartbeatDone:
-		cancelExecutor()
+		if heartbeatErr := heartbeats.Failure(); heartbeatErr != nil {
+			return ExecutorResult{}, heartbeatErr
+		}
+		return completed.result, completed.err
+	case <-heartbeats.Done():
+		heartbeatErr := heartbeats.Failure()
+		if heartbeatErr == nil {
+			heartbeatErr = ctx.Err()
+		}
 		if heartbeatErr == nil {
 			heartbeatErr = ErrExecutionUncertain
 		}
-		return ExecutorResult{}, heartbeatErr, heartbeatErr
+		return ExecutorResult{}, heartbeatErr
 	case <-ctx.Done():
-		cancelExecutor()
-		stopHeartbeat()
-		<-heartbeatDone
-		return ExecutorResult{}, ctx.Err(), nil
+		return ExecutorResult{}, errors.Join(ctx.Err(), heartbeats.Failure())
 	}
 }
 
-func (service *Service) heartbeatLoop(ctx context.Context, cancelExecutor context.CancelFunc, claimedScope RunnerScope, lease executionlease.LeaseIdentity, done chan<- error) {
+type actionHeartbeatSession struct {
+	mu              sync.Mutex
+	beatMu          sync.Mutex
+	stop            context.CancelFunc
+	cancelExecution context.CancelFunc
+	done            chan struct{}
+	failure         error
+	completeAcked   bool
+	service         *Service
+	claimedScope    RunnerScope
+	lease           executionlease.LeaseIdentity
+	nextSequence    int64
+}
+
+func (service *Service) startHeartbeatSession(
+	ctx context.Context,
+	cancelExecution context.CancelFunc,
+	claimedScope RunnerScope,
+	lease executionlease.LeaseIdentity,
+	firstSequence int64,
+) *actionHeartbeatSession {
+	heartbeatContext, stop := context.WithCancel(ctx)
+	session := &actionHeartbeatSession{
+		stop: stop, cancelExecution: cancelExecution, done: make(chan struct{}),
+		service: service, claimedScope: claimedScope, lease: lease, nextSequence: firstSequence,
+	}
+	go service.heartbeatLoop(heartbeatContext, session)
+	return session
+}
+
+func (service *Service) heartbeatLoop(
+	ctx context.Context,
+	session *actionHeartbeatSession,
+) {
+	defer close(session.done)
 	ticker := time.NewTicker(service.heartbeatInterval)
 	defer ticker.Stop()
-	sequence := int64(1)
 	for {
 		select {
 		case <-ctx.Done():
-			done <- nil
 			return
 		case <-ticker.C:
-			currentScope, scopeErr := service.resolveRunnerScope(ctx)
-			if scopeErr != nil && ctx.Err() != nil {
-				done <- nil
-				return
-			}
-			if scopeErr != nil || currentScope.runnerID != claimedScope.runnerID ||
-				currentScope.tenantID != claimedScope.tenantID || currentScope.pool != claimedScope.pool ||
-				currentScope.scopeRevision != claimedScope.scopeRevision {
-				cancelExecutor()
-				done <- ErrExecutionUncertain
-				return
-			}
-			timeout := service.heartbeatInterval
-			if timeout > service.finalizeTimeout {
-				timeout = service.finalizeTimeout
-			}
-			heartbeatContext, cancel := context.WithTimeout(ctx, timeout)
-			response, err := service.dependencies.Queue.Heartbeat(heartbeatContext, ActionHeartbeatRequest{
-				Lease: lease, Sequence: sequence, Extension: service.leaseDuration,
-			})
-			cancel()
-			if err != nil {
+			if err := session.checkpoint(ctx); err != nil {
 				if ctx.Err() != nil {
-					done <- nil
 					return
 				}
-				cancelExecutor()
-				done <- err
 				return
 			}
-			if response.Directive == HeartbeatTerminate {
-				cancelExecutor()
-				done <- ErrExecutionUncertain
-				return
-			}
-			sequence++
 		}
 	}
+}
+
+func (service *Service) heartbeatOnce(
+	ctx context.Context,
+	claimedScope RunnerScope,
+	lease executionlease.LeaseIdentity,
+	sequence int64,
+) error {
+	timeout := service.heartbeatInterval
+	if timeout > service.finalizeTimeout {
+		timeout = service.finalizeTimeout
+	}
+	heartbeatContext, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	currentScope, scopeErr := service.resolveRunnerScope(heartbeatContext)
+	if scopeErr != nil {
+		if heartbeatContext.Err() != nil {
+			return heartbeatContext.Err()
+		}
+		return ErrExecutionUncertain
+	}
+	if currentScope.runnerID != claimedScope.runnerID || currentScope.tenantID != claimedScope.tenantID ||
+		currentScope.pool != claimedScope.pool || currentScope.scopeRevision != claimedScope.scopeRevision {
+		return ErrExecutionUncertain
+	}
+	response, err := service.dependencies.Queue.Heartbeat(heartbeatContext, ActionHeartbeatRequest{
+		Lease: lease, Sequence: sequence, Extension: service.leaseDuration,
+	})
+	if err != nil {
+		return err
+	}
+	if response.Directive != HeartbeatContinue || response.Execution.ExecutionID != lease.ExecutionID ||
+		response.Execution.RunnerID != lease.RunnerID || response.Execution.LeaseEpoch != lease.Epoch ||
+		response.Execution.ScopeRevision != claimedScope.scopeRevision || response.Execution.Status != executionlease.StatusRunning {
+		return ErrExecutionUncertain
+	}
+	return nil
+}
+
+func (session *actionHeartbeatSession) fail(err error) {
+	if err == nil {
+		err = ErrExecutionUncertain
+	}
+	session.mu.Lock()
+	if session.failure == nil && !session.completeAcked {
+		session.failure = err
+		session.cancelExecution()
+	}
+	session.mu.Unlock()
+}
+
+func (session *actionHeartbeatSession) checkpoint(ctx context.Context) error {
+	session.beatMu.Lock()
+	defer session.beatMu.Unlock()
+	if err := session.DispatchError(ctx); err != nil {
+		return err
+	}
+	sequence := session.nextSequence
+	if err := session.service.heartbeatOnce(ctx, session.claimedScope, session.lease, sequence); err != nil {
+		if ctx.Err() == nil {
+			session.fail(err)
+		}
+		return err
+	}
+	session.mu.Lock()
+	session.nextSequence++
+	session.mu.Unlock()
+	return nil
+}
+
+func (session *actionHeartbeatSession) Checkpoint(ctx context.Context) error {
+	return session.checkpoint(ctx)
+}
+
+func (session *actionHeartbeatSession) DispatchError(ctx context.Context) error {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.failure != nil {
+		return session.failure
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (session *actionHeartbeatSession) Failure() error {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.failure
+}
+
+func (session *actionHeartbeatSession) AcknowledgeComplete() {
+	session.mu.Lock()
+	session.completeAcked = true
+	// A successful Complete ACK is the authoritative fence/result decision.
+	// Ignore a heartbeat that raced with the RUNNING -> FINALIZING commit.
+	session.failure = nil
+	session.mu.Unlock()
+}
+
+func (session *actionHeartbeatSession) Done() <-chan struct{} { return session.done }
+
+func (session *actionHeartbeatSession) Stop() error {
+	session.stop()
+	<-session.done
+	return session.Failure()
 }
 
 func classifyResult(result ExecutorResult, executorErr error) (executionlease.Status, ExecutorResult) {
@@ -758,9 +988,9 @@ func validExecutorResult(result ExecutorResult) bool {
 	}
 }
 
-func boundedExecutionDeadline(ctx context.Context, envelope action.Envelope, executionCredential credential.Credential, now time.Time) (time.Time, error) {
+func boundedExecutionDeadline(ctx context.Context, envelope action.Envelope, credentialExpiresAt time.Time, now time.Time) (time.Time, error) {
 	deadline := now.Add(time.Duration(envelope.Verification.TimeoutSeconds) * time.Second)
-	for _, candidate := range []time.Time{envelope.ExpiresAt, executionCredential.ExpiresAt} {
+	for _, candidate := range []time.Time{envelope.ExpiresAt, credentialExpiresAt} {
 		if candidate.Before(deadline) {
 			deadline = candidate
 		}
@@ -774,11 +1004,40 @@ func boundedExecutionDeadline(ctx context.Context, envelope action.Envelope, exe
 	return deadline, nil
 }
 
-func validCredential(value credential.Credential, envelope action.Envelope, now time.Time) bool {
+func validDurableCredential(
+	value credential.DurableCredential,
+	envelope action.Envelope,
+	policyExpiresAt time.Time,
+	now time.Time,
+) bool {
 	secret := value.Secret()
 	defer clear(secret)
-	return validIdentifier(value.LeaseID, 256) && len(secret) > 0 && len(secret) <= 64<<10 &&
-		value.ExpiresAt.After(now) && !value.ExpiresAt.After(envelope.ExpiresAt)
+	expiresAt := value.ExpiresAt()
+	return credential.ValidRevocationID(value.RevocationID()) && len(secret) > 0 && len(secret) <= credential.MaxSensitiveValueSize &&
+		expiresAt.After(now) && !expiresAt.After(policyExpiresAt) && !expiresAt.After(envelope.ExpiresAt)
+}
+
+func validCredentialIssueDecision(decision policy.Decision, envelope action.Envelope, now time.Time) bool {
+	requestedTTL := time.Duration(envelope.CredentialScope.TTLSeconds) * time.Second
+	signedCredentialDeadline := decision.EvaluatedAt.Add(requestedTTL)
+	if envelope.ExpiresAt.Before(signedCredentialDeadline) {
+		signedCredentialDeadline = envelope.ExpiresAt
+	}
+	return decision.Outcome == policy.OutcomeAllow && decision.Stage == policy.StageCredentialIssue &&
+		decision.PolicyVersion == envelope.PolicyVersion && decision.PlanHash == envelope.PlanHash &&
+		decision.SafetyRevision != "" && decision.TargetRevision != "" && decision.RiskRevision != "" &&
+		decision.LimitsRevision != "" && !decision.EvaluatedAt.IsZero() &&
+		!decision.EvaluatedAt.After(now.Add(maximumClockSkew)) && now.Sub(decision.EvaluatedAt) <= MaxPreExecutionDecisionAge &&
+		decision.CredentialExpiresAt.After(now) && !decision.CredentialExpiresAt.After(signedCredentialDeadline)
+}
+
+func samePolicySnapshot(credentialDecision, preExecutionDecision policy.Decision) bool {
+	return credentialDecision.PolicyVersion == preExecutionDecision.PolicyVersion &&
+		credentialDecision.PlanHash == preExecutionDecision.PlanHash &&
+		credentialDecision.SafetyRevision == preExecutionDecision.SafetyRevision &&
+		credentialDecision.TargetRevision == preExecutionDecision.TargetRevision &&
+		credentialDecision.RiskRevision == preExecutionDecision.RiskRevision &&
+		credentialDecision.LimitsRevision == preExecutionDecision.LimitsRevision
 }
 
 func validPreExecutionDecision(decision policy.Decision, envelope action.Envelope, now time.Time) bool {

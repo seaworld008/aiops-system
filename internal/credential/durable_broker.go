@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"sync"
 	"time"
@@ -25,7 +26,7 @@ const PostDispatchPersistenceTimeout = 20 * time.Second
 // deliberately has no URL, HTTP method, request body, command, or arbitrary
 // issuer parameters. A resolver binds these values to an immutable profile.
 type DurableIssuerResolveRequest struct {
-	ProfileID     string `json:"profile_id"`
+	TenantID      string `json:"tenant_id"`
 	WorkspaceID   string `json:"workspace_id"`
 	EnvironmentID string `json:"environment_id"`
 	Production    bool   `json:"production"`
@@ -80,7 +81,7 @@ type DurableDynamicSecret struct {
 	ExpiresAt time.Time
 }
 
-type DurableIssuerResolver interface {
+type durableIssuerResolver interface {
 	ResolveDurableIssuer(context.Context, DurableIssuerResolveRequest) (ResolvedDurableIssuer, error)
 }
 
@@ -88,6 +89,8 @@ type DurableIssuerResolver interface {
 // absent: foreground failure handling persists revocation intent and a
 // separate worker owns remote revoke-accessor calls.
 type DurableIssuer interface {
+	IssuerID() string
+	IssuerRevision() string
 	ValidateManager(context.Context) error
 	CreateChild(context.Context, DurableChildCreateRequest) (DurableChild, error)
 	// InspectChild must use the manager identity and lookup-accessor. A child
@@ -96,39 +99,92 @@ type DurableIssuer interface {
 	IssueDynamic(context.Context, SensitiveValue, DurableDynamicIssueRequest) (DurableDynamicSecret, error)
 }
 
-type IssueDurableCredentialRequest struct {
-	Fence     ActionFence
-	Selection DurableIssuerResolveRequest
+type PrepareDurableCredentialRequest struct {
+	Fence           ActionFence
+	Selection       DurableIssuerResolveRequest
+	RequestedTTL    time.Duration
+	PolicyExpiresAt time.Time
 }
 
-func (request IssueDurableCredentialRequest) String() string {
+func (request PrepareDurableCredentialRequest) String() string {
 	return fmt.Sprintf(
-		"IssueDurableCredentialRequest{ActionID:%q RunnerID:%q Epoch:%d ProfileID:%q WorkspaceID:%q EnvironmentID:%q Production:%t ActionType:%q ConnectorID:%q Permission:%q Resource:%q FenceToken:[REDACTED]}",
-		request.Fence.ActionID, request.Fence.RunnerID, request.Fence.Epoch, request.Selection.ProfileID,
-		request.Selection.WorkspaceID, request.Selection.EnvironmentID, request.Selection.Production, request.Selection.ActionType,
-		request.Selection.ConnectorID, request.Selection.Permission, request.Selection.Resource,
+		"PrepareDurableCredentialRequest{ActionID:%q RunnerID:%q Epoch:%d TenantID:%q WorkspaceID:%q EnvironmentID:%q Production:%t ActionType:%q ConnectorID:%q Permission:%q Resource:%q RequestedTTL:%s PolicyExpiresAt:%s FenceToken:[REDACTED]}",
+		request.Fence.ActionID, request.Fence.RunnerID, request.Fence.Epoch, request.Selection.TenantID,
+		request.Selection.WorkspaceID, request.Selection.EnvironmentID, request.Selection.Production,
+		request.Selection.ActionType, request.Selection.ConnectorID, request.Selection.Permission,
+		request.Selection.Resource, request.RequestedTTL, request.PolicyExpiresAt.UTC().Format(time.RFC3339Nano),
 	)
 }
 
-func (request IssueDurableCredentialRequest) GoString() string { return request.String() }
+func (request PrepareDurableCredentialRequest) GoString() string { return request.String() }
 
-func (request IssueDurableCredentialRequest) MarshalJSON() ([]byte, error) {
+func (request PrepareDurableCredentialRequest) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		ActionID  string                      `json:"action_id"`
-		RunnerID  string                      `json:"runner_id"`
-		Epoch     int64                       `json:"epoch"`
-		Selection DurableIssuerResolveRequest `json:"selection"`
-		Redacted  bool                        `json:"fence_token_redacted"`
+		ActionID           string                      `json:"action_id"`
+		RunnerID           string                      `json:"runner_id"`
+		Epoch              int64                       `json:"epoch"`
+		Selection          DurableIssuerResolveRequest `json:"selection"`
+		RequestedTTLSecond int64                       `json:"requested_ttl_seconds"`
+		PolicyExpiresAt    time.Time                   `json:"policy_expires_at"`
+		Redacted           bool                        `json:"fence_token_redacted"`
 	}{
 		ActionID: request.Fence.ActionID, RunnerID: request.Fence.RunnerID, Epoch: request.Fence.Epoch,
-		Selection: request.Selection, Redacted: true,
+		Selection: request.Selection, RequestedTTLSecond: int64(request.RequestedTTL / time.Second),
+		PolicyExpiresAt: request.PolicyExpiresAt, Redacted: true,
 	})
 }
 
-// Issue requests are constructed only after the trusted action/policy lookup.
+// Prepare requests are constructed only after the trusted action/policy lookup.
 // They are deliberately not a wire payload that can supply issuer behavior.
-func (*IssueDurableCredentialRequest) UnmarshalJSON([]byte) error {
+func (*PrepareDurableCredentialRequest) UnmarshalJSON([]byte) error {
 	return ErrInvalidDurableCredentialRequest
+}
+
+type preparedDurableCredentialPhase uint8
+
+const (
+	preparedDurableCredentialReady preparedDurableCredentialPhase = iota
+	preparedDurableCredentialIssuing
+	preparedDurableCredentialNoCredential
+)
+
+type preparedDurableCredentialState struct {
+	mu           sync.Mutex
+	broker       *DurableBroker
+	phase        preparedDurableCredentialPhase
+	request      PrepareDurableCredentialRequest
+	resolved     ResolvedDurableIssuer
+	prepared     Revocation
+	permit       ChildCreatePermit
+	revocationID string
+	expiresAt    time.Time
+}
+
+// PreparedDurableCredential is an opaque, Broker-owned, single-use handle.
+// Copies share one state and therefore cannot authorize duplicate issuance.
+type PreparedDurableCredential struct {
+	revocationID string
+	state        *preparedDurableCredentialState
+}
+
+func (PreparedDurableCredential) String() string {
+	return "[REDACTED PREPARED DURABLE CREDENTIAL]"
+}
+
+func (PreparedDurableCredential) GoString() string {
+	return "[REDACTED PREPARED DURABLE CREDENTIAL]"
+}
+
+func (PreparedDurableCredential) Format(state fmt.State, _ rune) {
+	_, _ = io.WriteString(state, "[REDACTED PREPARED DURABLE CREDENTIAL]")
+}
+
+func (PreparedDurableCredential) MarshalJSON() ([]byte, error) {
+	return nil, ErrDurableCredentialState
+}
+
+func (*PreparedDurableCredential) UnmarshalJSON([]byte) error {
+	return ErrDurableCredentialState
 }
 
 type DurableBrokerOptions struct {
@@ -142,7 +198,7 @@ type BoundedContextSource func(context.Context, time.Duration) (context.Context,
 
 type DurableBroker struct {
 	repository            Repository
-	resolver              DurableIssuerResolver
+	resolver              durableIssuerResolver
 	uuidSource            func() (string, error)
 	clock                 func() time.Time
 	timeoutSource         BoundedContextSource
@@ -151,7 +207,18 @@ type DurableBroker struct {
 
 func NewDurableBroker(
 	repository Repository,
-	resolver DurableIssuerResolver,
+	registry *IssuerRegistry,
+	options DurableBrokerOptions,
+) (*DurableBroker, error) {
+	return newDurableBroker(repository, registry, options)
+}
+
+// newDurableBroker is the package-local test seam for exercising hostile or
+// failing resolver behavior. Runtime callers must use the exact immutable
+// IssuerRegistry accepted by NewDurableBroker.
+func newDurableBroker(
+	repository Repository,
+	resolver durableIssuerResolver,
 	options DurableBrokerOptions,
 ) (*DurableBroker, error) {
 	if nilInterface(repository) || nilInterface(resolver) {
@@ -181,68 +248,135 @@ func NewDurableBroker(
 	}, nil
 }
 
-func (broker *DurableBroker) Issue(
+func (broker *DurableBroker) Prepare(
 	ctx context.Context,
-	request IssueDurableCredentialRequest,
-) (DurableCredential, error) {
+	request PrepareDurableCredentialRequest,
+) (PreparedDurableCredential, error) {
 	if broker == nil || ctx == nil || contextError(ctx) != nil || !validActionFence(request.Fence) ||
-		!validDurableSelection(request.Selection) {
-		return DurableCredential{}, ErrInvalidDurableCredentialRequest
+		!validDurableSelection(request.Selection) || !validDurableCredentialWindow(request) {
+		return PreparedDurableCredential{}, ErrInvalidDurableCredentialRequest
 	}
 	resolved, err := broker.resolver.ResolveDurableIssuer(ctx, request.Selection)
 	if err != nil || !validDurableResolution(resolved) {
-		return DurableCredential{}, durableIssuanceError("resolve issuer")
-	}
-	if err := resolved.Issuer.ValidateManager(ctx); err != nil {
-		return DurableCredential{}, durableIssuanceError("validate manager")
+		return PreparedDurableCredential{}, durableIssuanceError("resolve issuer")
 	}
 	if !broker.preflightFinalizeContext(ctx) {
-		return DurableCredential{}, durableIssuanceError("validate post-dispatch persistence context")
+		return PreparedDurableCredential{}, durableIssuanceError("validate post-dispatch persistence context")
 	}
 
 	revocationID, err := broker.uuidSource()
 	if err != nil || !ValidRevocationID(revocationID) {
-		return DurableCredential{}, durableIssuanceError("allocate revocation identifier")
+		return PreparedDurableCredential{}, durableIssuanceError("allocate revocation identifier")
 	}
-	now := broker.clock()
+	now := broker.clock().UTC()
 	if now.IsZero() {
-		return DurableCredential{}, durableIssuanceError("observe credential deadline")
+		return PreparedDurableCredential{}, durableIssuanceError("observe credential deadline")
 	}
-	credentialExpiresAt := CanonicalCredentialExpiry(now.Add(resolved.Profile.CredentialTTL))
+	credentialExpiresAt, ok := durableCredentialExpiry(now, request, resolved.Profile)
+	if !ok {
+		return PreparedDurableCredential{}, ErrInvalidDurableCredentialRequest
+	}
 	prepared, err := broker.repository.Prepare(ctx, PrepareRequest{
 		RevocationID: revocationID, Fence: request.Fence, Issuer: resolved.Profile.IssuerID,
 		IssuerRevision:      resolved.Profile.Revision,
 		CredentialExpiresAt: credentialExpiresAt,
 	})
+	if prepared.Permit != nil {
+		defer func() { prepared.Permit.Token = "" }()
+	}
 	if err != nil {
-		return DurableCredential{}, durableIssuanceError("prepare revocation")
+		return PreparedDurableCredential{}, durableIssuanceError("prepare revocation")
 	}
 	if !prepared.Created || prepared.Permit == nil {
-		return DurableCredential{}, durableIssuanceError("prepare creator election")
+		return PreparedDurableCredential{}, durableIssuanceError("prepare creator election")
 	}
 	if !validPreparedResult(prepared, revocationID, request, resolved.Profile, credentialExpiresAt) {
-		return DurableCredential{}, durableIssuanceError("validate prepared revocation")
+		return PreparedDurableCredential{}, durableIssuanceError("validate prepared revocation")
+	}
+	permit := *prepared.Permit
+	state := &preparedDurableCredentialState{
+		broker: broker, phase: preparedDurableCredentialReady, request: request,
+		resolved: resolved, prepared: prepared.Revocation, permit: permit,
+		revocationID: revocationID, expiresAt: credentialExpiresAt,
+	}
+	return PreparedDurableCredential{revocationID: revocationID, state: state}, nil
+}
+
+type consumedPreparedCredential struct {
+	request      PrepareDurableCredentialRequest
+	resolved     ResolvedDurableIssuer
+	prepared     Revocation
+	permit       ChildCreatePermit
+	revocationID string
+	expiresAt    time.Time
+}
+
+func (broker *DurableBroker) consumePrepared(
+	prepared PreparedDurableCredential,
+	phase preparedDurableCredentialPhase,
+) (consumedPreparedCredential, error) {
+	if broker == nil || prepared.state == nil {
+		return consumedPreparedCredential{}, ErrDurableCredentialState
+	}
+	state := prepared.state
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.broker != broker || state.phase != preparedDurableCredentialReady ||
+		prepared.revocationID != state.revocationID || state.prepared.ID != state.revocationID ||
+		state.permit.RevocationID != state.revocationID || !ValidOpaqueText(state.permit.Token, 4096) ||
+		state.expiresAt.IsZero() || !validDurableResolution(state.resolved) {
+		return consumedPreparedCredential{}, ErrDurableCredentialState
+	}
+	consumed := consumedPreparedCredential{
+		request: state.request, resolved: state.resolved, prepared: state.prepared,
+		permit: state.permit, revocationID: state.revocationID, expiresAt: state.expiresAt,
+	}
+	state.phase = phase
+	state.request = PrepareDurableCredentialRequest{}
+	state.resolved = ResolvedDurableIssuer{}
+	state.prepared = Revocation{}
+	state.permit.Token = ""
+	state.expiresAt = time.Time{}
+	return consumed, nil
+}
+
+func (broker *DurableBroker) Issue(
+	ctx context.Context,
+	preparedHandle PreparedDurableCredential,
+) (DurableCredential, error) {
+	if ctx == nil {
+		return DurableCredential{}, ErrInvalidDurableCredentialRequest
+	}
+	if err := ctx.Err(); err != nil {
+		return DurableCredential{}, err
+	}
+	prepared, err := broker.consumePrepared(preparedHandle, preparedDurableCredentialIssuing)
+	if err != nil {
+		return DurableCredential{}, err
+	}
+	defer func() { prepared.permit.Token = "" }()
+	request, resolved := prepared.request, prepared.resolved
+	revocationID, credentialExpiresAt := prepared.revocationID, prepared.expiresAt
+	if err := resolved.Issuer.ValidateManager(ctx); err != nil {
+		return DurableCredential{}, durableIssuanceError("validate manager")
 	}
 
 	createCtx, cancel, validCreateContext := newBoundedContext(
 		ctx, broker.timeoutSource, ChildCreateVaultCallBudget,
 	)
 	if !validCreateContext {
-		prepared.Permit.Token = ""
 		return DurableCredential{}, durableIssuanceError("create bounded issuer context")
 	}
-	permit := *prepared.Permit
 	authorized, err := broker.repository.AuthorizeChildCreate(createCtx, AuthorizeChildCreateRequest{
-		Permit: permit,
+		Permit: prepared.permit,
 		Fence:  request.Fence,
 	})
-	permit.Token = ""
-	prepared.Permit.Token = ""
+	prepared.permit.Token = ""
 	if err != nil {
 		cancel()
 		return DurableCredential{}, durableIssuanceError("authorize child creation")
 	}
-	if !validChildCreateAuthorization(authorized, prepared.Revocation, revocationID, request, resolved.Profile, credentialExpiresAt) {
+	if !validChildCreateAuthorization(authorized, prepared.prepared, revocationID, request, resolved.Profile, credentialExpiresAt) {
 		cancel()
 		return DurableCredential{}, durableIssuanceError("validate child creation authorization")
 	}
@@ -339,6 +473,31 @@ func (broker *DurableBroker) Issue(
 		return DurableCredential{}, durableIssuanceError("caller canceled before credential handoff")
 	}
 	return newDurableCredential(broker, activated, dynamic), nil
+}
+
+func (broker *DurableBroker) RecordNoCredential(
+	ctx context.Context,
+	preparedHandle PreparedDurableCredential,
+) (Revocation, error) {
+	if ctx == nil {
+		return Revocation{}, ErrInvalidDurableCredentialRequest
+	}
+	if err := ctx.Err(); err != nil {
+		return Revocation{}, err
+	}
+	prepared, err := broker.consumePrepared(preparedHandle, preparedDurableCredentialNoCredential)
+	if err != nil {
+		return Revocation{}, err
+	}
+	prepared.permit.Token = ""
+	revocation, err := broker.repository.RecordNoCredential(ctx, ActionTransitionRequest{
+		RevocationID: prepared.revocationID,
+		Fence:        prepared.request.Fence,
+	})
+	if err != nil || !validNoCredentialResult(revocation, prepared) {
+		return Revocation{}, durableIssuanceError("record no credential")
+	}
+	return revocation, nil
 }
 
 func (broker *DurableBroker) preflightFinalizeContext(parent context.Context) bool {
@@ -584,23 +743,53 @@ func (broker *DurableBroker) validDynamicSecret(
 }
 
 func validDurableSelection(request DurableIssuerResolveRequest) bool {
-	return !request.Production && ValidIdentifier(request.ProfileID, 256) && ValidIdentifier(request.WorkspaceID, 256) &&
+	return !request.Production && ValidIdentifier(request.TenantID, 256) && ValidIdentifier(request.WorkspaceID, 256) &&
 		ValidIdentifier(request.EnvironmentID, 256) && ValidIdentifier(request.ActionType, 256) &&
 		ValidIdentifier(request.ConnectorID, 256) && ValidIdentifier(request.Permission, 256) &&
-		ValidOpaqueText(request.Resource, 2048)
+		ValidIdentifier(request.Resource, 256)
+}
+
+func validDurableCredentialWindow(request PrepareDurableCredentialRequest) bool {
+	return request.RequestedTTL >= ChildCreateExpiryReserve+MinChildCreateTTL &&
+		request.RequestedTTL <= MaxCredentialTTL && request.RequestedTTL%VaultTTLQuantum == 0 &&
+		!request.PolicyExpiresAt.IsZero()
+}
+
+func durableCredentialExpiry(
+	now time.Time,
+	request PrepareDurableCredentialRequest,
+	profile DurableIssuerProfile,
+) (time.Time, bool) {
+	if now.IsZero() || !validDurableCredentialWindow(request) {
+		return time.Time{}, false
+	}
+	expiresAt := now.Add(profile.CredentialTTL)
+	if requested := now.Add(request.RequestedTTL); requested.Before(expiresAt) {
+		expiresAt = requested
+	}
+	if policy := request.PolicyExpiresAt.UTC(); policy.Before(expiresAt) {
+		expiresAt = policy
+	}
+	expiresAt = CanonicalCredentialExpiry(expiresAt)
+	minimum := now.Add(ChildCreateExpiryReserve + MinChildCreateTTL)
+	if expiresAt.Before(minimum) {
+		return time.Time{}, false
+	}
+	return expiresAt, true
 }
 
 func validDurableResolution(resolved ResolvedDurableIssuer) bool {
 	profile := resolved.Profile
 	return !nilInterface(resolved.Issuer) && ValidIdentifier(profile.IssuerID, 256) &&
 		ValidIdentifier(profile.Revision, 256) && profile.CredentialTTL >= ChildCreateExpiryReserve+MinChildCreateTTL &&
-		profile.CredentialTTL <= MaxCredentialTTL && profile.CredentialTTL%VaultTTLQuantum == 0
+		profile.CredentialTTL <= MaxCredentialTTL && profile.CredentialTTL%VaultTTLQuantum == 0 &&
+		resolved.Issuer.IssuerID() == profile.IssuerID && resolved.Issuer.IssuerRevision() == profile.Revision
 }
 
 func validPreparedResult(
 	result PrepareResult,
 	revocationID string,
-	request IssueDurableCredentialRequest,
+	request PrepareDurableCredentialRequest,
 	profile DurableIssuerProfile,
 	expiresAt time.Time,
 ) bool {
@@ -614,7 +803,7 @@ func validChildCreateAuthorization(
 	authorization ChildCreateAuthorization,
 	prepared Revocation,
 	revocationID string,
-	request IssueDurableCredentialRequest,
+	request PrepareDurableCredentialRequest,
 	profile DurableIssuerProfile,
 	expiresAt time.Time,
 ) bool {
@@ -641,7 +830,7 @@ func validAnchoredResult(
 	revocation Revocation,
 	authorized Revocation,
 	revocationID string,
-	request IssueDurableCredentialRequest,
+	request PrepareDurableCredentialRequest,
 	profile DurableIssuerProfile,
 	expiresAt time.Time,
 ) bool {
@@ -653,7 +842,7 @@ func validActiveResult(
 	revocation Revocation,
 	anchored Revocation,
 	revocationID string,
-	request IssueDurableCredentialRequest,
+	request PrepareDurableCredentialRequest,
 	profile DurableIssuerProfile,
 	expiresAt time.Time,
 ) bool {
@@ -664,19 +853,22 @@ func validActiveResult(
 func validFrozenRevocation(
 	revocation Revocation,
 	revocationID string,
-	request IssueDurableCredentialRequest,
+	request PrepareDurableCredentialRequest,
 	profile DurableIssuerProfile,
 	expiresAt time.Time,
 	status RevocationStatus,
 	accessorPresent bool,
 ) bool {
-	if revocation.ID != revocationID || revocation.WorkspaceID != request.Selection.WorkspaceID ||
+	if revocation.ID != revocationID || revocation.TenantID != request.Selection.TenantID ||
+		revocation.WorkspaceID != request.Selection.WorkspaceID ||
 		revocation.EnvironmentID != request.Selection.EnvironmentID || revocation.ActionID != request.Fence.ActionID ||
 		revocation.Production != request.Selection.Production ||
 		revocation.RunnerID != request.Fence.RunnerID || revocation.ActionLeaseEpoch != request.Fence.Epoch ||
 		revocation.Issuer != profile.IssuerID || revocation.IssuerRevision != profile.Revision ||
+		revocation.ActionType != request.Selection.ActionType ||
 		revocation.ConnectorID != request.Selection.ConnectorID ||
 		revocation.Permission != request.Selection.Permission || revocation.Resource != request.Selection.Resource ||
+		revocation.CredentialTTLSeconds != int32(request.RequestedTTL/time.Second) ||
 		revocation.CredentialExpiresAt != expiresAt || revocation.Status != status ||
 		revocation.AccessorPresent != accessorPresent || !ValidIdentifier(revocation.TenantID, 256) ||
 		!ValidOpaqueText(revocation.TargetKey, 1024) || revocation.Version < 1 || revocation.CreatedAt.IsZero() ||
@@ -685,7 +877,7 @@ func validFrozenRevocation(
 		return false
 	}
 	switch status {
-	case StatusPrepared:
+	case StatusPrepared, StatusNoCredential:
 		return revocation.AnchoredAt.IsZero() && revocation.ActivatedAt.IsZero()
 	case StatusAnchored:
 		return !revocation.AnchoredAt.IsZero() && revocation.ActivatedAt.IsZero() &&
@@ -703,9 +895,18 @@ func sameDurableFrozenRevocation(left, right Revocation) bool {
 		left.EnvironmentID == right.EnvironmentID && left.ActionID == right.ActionID && left.TargetKey == right.TargetKey &&
 		left.Production == right.Production && left.RunnerID == right.RunnerID &&
 		left.ActionLeaseEpoch == right.ActionLeaseEpoch && left.Issuer == right.Issuer &&
-		left.IssuerRevision == right.IssuerRevision &&
+		left.IssuerRevision == right.IssuerRevision && left.ActionType == right.ActionType &&
 		left.ConnectorID == right.ConnectorID && left.Permission == right.Permission && left.Resource == right.Resource &&
+		left.CredentialTTLSeconds == right.CredentialTTLSeconds &&
 		left.CredentialExpiresAt == right.CredentialExpiresAt && left.CreatedAt == right.CreatedAt
+}
+
+func validNoCredentialResult(revocation Revocation, prepared consumedPreparedCredential) bool {
+	return validFrozenRevocation(
+		revocation, prepared.revocationID, prepared.request, prepared.resolved.Profile,
+		prepared.expiresAt, StatusNoCredential, false,
+	) && sameDurableFrozenRevocation(revocation, prepared.prepared) &&
+		revocation.Version == prepared.prepared.Version+1
 }
 
 func validRequestedRevocation(revocation Revocation, state *durableCredentialState) bool {

@@ -105,6 +105,41 @@ func TestCredentialRevocationMigrationCapsCredentialTTLForPreparedRecoverySafety
 	}
 }
 
+func TestCredentialRevocationMigrationBindsCompleteSignedCredentialSelection(t *testing.T) {
+	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
+	for _, fragment := range []string{
+		"action_type text not null",
+		"credential_ttl_seconds integer not null",
+		"credential_ttl_seconds between 1 and 900",
+		"credential_expires_at <= created_at + make_interval(secs => credential_ttl_seconds)",
+		"action.envelope ->> 'action_type' = new.action_type",
+		"action.envelope #>> '{credential_scope,connector_id}' = new.connector_id",
+		"action.envelope #>> '{credential_scope,permission}' = new.scope_permission",
+		"action.envelope #>> '{credential_scope,resource}' = new.scope_resource",
+		"action.envelope #>> '{credential_scope,ttl_seconds}' = new.credential_ttl_seconds::text",
+		"old.action_type is distinct from new.action_type",
+		"old.credential_ttl_seconds is distinct from new.credential_ttl_seconds",
+	} {
+		if !strings.Contains(normalized, fragment) {
+			t.Errorf("up migration missing signed credential binding %q", fragment)
+		}
+	}
+}
+
+func TestCredentialRevocationMigrationRejectsFutureCreationTime(t *testing.T) {
+	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
+	if !strings.Contains(normalized, "new.created_at > clock_timestamp()") {
+		t.Fatal("up migration does not reject a future credential revocation creation time")
+	}
+}
+
+func TestCredentialRevocationMigrationCapsExpiryAtActionAuthorization(t *testing.T) {
+	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
+	if !strings.Contains(normalized, "new.credential_expires_at <= action.authorization_expires_at") {
+		t.Fatal("up migration does not cap credential expiry at the immutable action authorization")
+	}
+}
+
 func TestCredentialRevocationMigrationAddsAtomicActionCredentialMarker(t *testing.T) {
 	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
 	for _, fragment := range []string{
