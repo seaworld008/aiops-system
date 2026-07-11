@@ -176,18 +176,19 @@ type ActionCompleteRequest struct {
 }
 
 type RunnerResultReceipt struct {
-	ActionID         string
-	TenantID         string
-	WorkspaceID      string
-	EnvironmentID    string
-	PlanHash         string
-	RunnerID         string
-	LeaseEpoch       int64
-	ScopeRevision    int64
-	CompletionStatus executionlease.Status
-	Summary          ExecutorResult
-	ResultHash       string
-	ReceivedAt       time.Time
+	ActionID          string
+	TenantID          string
+	WorkspaceID       string
+	EnvironmentID     string
+	PlanHash          string
+	RunnerID          string
+	LeaseEpoch        int64
+	ScopeRevision     int64
+	CertificateSHA256 string
+	CompletionStatus  executionlease.Status
+	Summary           ExecutorResult
+	ResultHash        string
+	ReceivedAt        time.Time
 }
 
 // ActionQueue owns the atomic relationship between immutable action metadata
@@ -1010,34 +1011,62 @@ func ResultSummaryStatus(summary ExecutorResult) (executionlease.Status, error) 
 }
 
 func BuildRunnerResultReceipt(claimed ClaimedAction, request ActionCompleteRequest, completionStatus executionlease.Status, receivedAt time.Time) (RunnerResultReceipt, error) {
+	return buildRunnerResultReceipt(claimed, request, completionStatus, "runner-result.v1", "", receivedAt)
+}
+
+// BuildRunnerResultReceiptV2 binds the mTLS leaf fingerprint into the
+// server-generated JCS/SHA-256 proof. The Runner never supplies a result hash.
+func BuildRunnerResultReceiptV2(
+	claimed ClaimedAction,
+	request ActionCompleteRequest,
+	completionStatus executionlease.Status,
+	certificateSHA256 string,
+	receivedAt time.Time,
+) (RunnerResultReceipt, error) {
+	if !actionQueueSHA256Pattern.MatchString(certificateSHA256) {
+		return RunnerResultReceipt{}, executionlease.ErrInvalidRequest
+	}
+	return buildRunnerResultReceipt(claimed, request, completionStatus, "runner-result.v2", certificateSHA256, receivedAt)
+}
+
+func buildRunnerResultReceipt(
+	claimed ClaimedAction,
+	request ActionCompleteRequest,
+	completionStatus executionlease.Status,
+	schemaVersion string,
+	certificateSHA256 string,
+	receivedAt time.Time,
+) (RunnerResultReceipt, error) {
 	receipt := RunnerResultReceipt{
 		ActionID: claimed.Execution.ExecutionID, TenantID: claimed.Execution.RunnerTenantID,
 		WorkspaceID: claimed.Execution.RunnerWorkspaceID, EnvironmentID: claimed.Execution.RunnerEnvironmentID,
 		PlanHash: claimed.PlanHash,
 		RunnerID: request.Lease.RunnerID, LeaseEpoch: request.Lease.Epoch,
-		ScopeRevision: claimed.Execution.ScopeRevision, CompletionStatus: completionStatus,
+		ScopeRevision: claimed.Execution.ScopeRevision, CertificateSHA256: certificateSHA256, CompletionStatus: completionStatus,
 		Summary: request.Summary, ReceivedAt: receivedAt,
 	}
 	encoded, err := json.Marshal(struct {
-		SchemaVersion    string                `json:"schema_version"`
-		ActionID         string                `json:"action_id"`
-		TenantID         string                `json:"tenant_id"`
-		WorkspaceID      string                `json:"workspace_id"`
-		EnvironmentID    string                `json:"environment_id"`
-		PlanHash         string                `json:"plan_hash"`
-		RunnerID         string                `json:"runner_id"`
-		LeaseEpoch       string                `json:"lease_epoch"`
-		ScopeRevision    string                `json:"scope_revision"`
-		CompletionStatus executionlease.Status `json:"completion_status"`
-		Outcome          ExecutorOutcome       `json:"outcome"`
-		Code             string                `json:"code"`
-		Verification     Verification          `json:"verification"`
-		Changed          bool                  `json:"changed"`
-		ExternalRefHash  string                `json:"external_operation_ref_hash,omitempty"`
+		SchemaVersion     string                `json:"schema_version"`
+		ActionID          string                `json:"action_id"`
+		TenantID          string                `json:"tenant_id"`
+		WorkspaceID       string                `json:"workspace_id"`
+		EnvironmentID     string                `json:"environment_id"`
+		PlanHash          string                `json:"plan_hash"`
+		RunnerID          string                `json:"runner_id"`
+		LeaseEpoch        string                `json:"lease_epoch"`
+		ScopeRevision     string                `json:"scope_revision"`
+		CertificateSHA256 string                `json:"certificate_sha256,omitempty"`
+		CompletionStatus  executionlease.Status `json:"completion_status"`
+		Outcome           ExecutorOutcome       `json:"outcome"`
+		Code              string                `json:"code"`
+		Verification      Verification          `json:"verification"`
+		Changed           bool                  `json:"changed"`
+		ExternalRefHash   string                `json:"external_operation_ref_hash,omitempty"`
 	}{
-		SchemaVersion: "runner-result.v1", ActionID: receipt.ActionID, TenantID: receipt.TenantID, WorkspaceID: receipt.WorkspaceID,
+		SchemaVersion: schemaVersion, ActionID: receipt.ActionID, TenantID: receipt.TenantID, WorkspaceID: receipt.WorkspaceID,
 		EnvironmentID: receipt.EnvironmentID, PlanHash: receipt.PlanHash, RunnerID: receipt.RunnerID,
-		LeaseEpoch: strconv.FormatInt(receipt.LeaseEpoch, 10), ScopeRevision: strconv.FormatInt(receipt.ScopeRevision, 10), CompletionStatus: receipt.CompletionStatus,
+		LeaseEpoch: strconv.FormatInt(receipt.LeaseEpoch, 10), ScopeRevision: strconv.FormatInt(receipt.ScopeRevision, 10),
+		CertificateSHA256: receipt.CertificateSHA256, CompletionStatus: receipt.CompletionStatus,
 		Outcome: receipt.Summary.Outcome, Code: receipt.Summary.Code, Verification: receipt.Summary.Verification,
 		Changed: receipt.Summary.Changed, ExternalRefHash: receipt.Summary.ExternalOperationRefHash,
 	})
@@ -1051,7 +1080,7 @@ func BuildRunnerResultReceipt(claimed ClaimedAction, request ActionCompleteReque
 	if err != nil {
 		return RunnerResultReceipt{}, fmt.Errorf("canonicalize runner result receipt: %w", err)
 	}
-	digest := sha256.Sum256(append([]byte("runner-result.v1\x00"), canonical...))
+	digest := sha256.Sum256(append([]byte(schemaVersion+"\x00"), canonical...))
 	receipt.ResultHash = hex.EncodeToString(digest[:])
 	return receipt, nil
 }

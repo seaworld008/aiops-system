@@ -895,6 +895,52 @@ func TestRunnerResultReceiptHashesBigintFencesBeyondIJSONSafeIntegerAsStrings(t 
 	}
 }
 
+func TestRunnerResultReceiptV2BindsAuthenticatedCertificateIntoServerJCSHash(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 11, 9, 0, 0, 0, time.UTC)
+	envelope, _ := signedEnvelope(t, restartEnvelope(now))
+	claimed := ClaimedAction{
+		Execution: executionlease.Execution{
+			ExecutionID: envelope.ActionID, RunnerID: "runner-v2", RunnerTenantID: "tenant-test",
+			RunnerWorkspaceID: envelope.WorkspaceID, RunnerEnvironmentID: envelope.Target.EnvironmentID,
+			LeaseEpoch: 7, ScopeRevision: 9,
+		},
+		Envelope: envelope, PlanHash: envelope.PlanHash,
+	}
+	request := ActionCompleteRequest{
+		Lease: executionlease.LeaseIdentity{ExecutionID: envelope.ActionID, RunnerID: "runner-v2", Epoch: 7},
+		Summary: ExecutorResult{
+			Outcome: ExecutorSucceeded, Code: "V2_CERT_BOUND", Verification: VerificationPassed, Changed: true,
+		},
+	}
+	certificateA := strings.Repeat("a", 64)
+	first, err := BuildRunnerResultReceiptV2(claimed, request, executionlease.StatusSucceeded, certificateA, now)
+	if err != nil {
+		t.Fatalf("BuildRunnerResultReceiptV2() error = %v", err)
+	}
+	if first.CertificateSHA256 != certificateA || !actionQueueSHA256Pattern.MatchString(first.ResultHash) {
+		t.Fatalf("v2 receipt = %#v", first)
+	}
+	second, err := BuildRunnerResultReceiptV2(claimed, request, executionlease.StatusSucceeded, strings.Repeat("b", 64), now)
+	if err != nil {
+		t.Fatalf("BuildRunnerResultReceiptV2(second cert) error = %v", err)
+	}
+	if first.ResultHash == second.ResultHash {
+		t.Fatalf("different certificate fingerprints collided: %s", first.ResultHash)
+	}
+	legacy, err := BuildRunnerResultReceipt(claimed, request, executionlease.StatusSucceeded, now)
+	if err != nil {
+		t.Fatalf("BuildRunnerResultReceipt(v1) error = %v", err)
+	}
+	if first.ResultHash == legacy.ResultHash {
+		t.Fatal("runner-result.v1 and authenticated runner-result.v2 hashes collided")
+	}
+	if _, err := BuildRunnerResultReceiptV2(claimed, request, executionlease.StatusSucceeded, strings.Repeat("A", 64), now); !errors.Is(err, executionlease.ErrInvalidRequest) {
+		t.Fatalf("BuildRunnerResultReceiptV2(invalid certificate) error = %v", err)
+	}
+}
+
 func TestMemoryActionQueueSweepRecoversFinalizingAfterSignedCredentialBoundary(t *testing.T) {
 	t.Parallel()
 
