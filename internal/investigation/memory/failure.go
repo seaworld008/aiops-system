@@ -2,7 +2,6 @@ package memory
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
@@ -15,11 +14,13 @@ func (repository *Repository) FailInvestigation(ctx context.Context, request inv
 		return investigation.FailInvestigationResult{}, err
 	}
 	if !validResourceScope(request.WorkspaceID, request.InvestigationID) ||
-		!domain.ValidIdempotencyKey(request.IdempotencyKey) || !domain.ValidFailureCode(request.FailureCode) {
+		!domain.ValidIdempotencyKey(request.IdempotencyKey) {
 		return investigation.FailInvestigationResult{}, fmt.Errorf("%w: invalid investigation failure", investigation.ErrInvalidRequest)
 	}
-	digest := sha256.Sum256([]byte(request.InvestigationID + "\x00" + request.FailureCode))
-	requestHash := fmt.Sprintf("%x", digest)
+	requestHash, err := investigation.FailInvestigationRequestHash(request)
+	if err != nil {
+		return investigation.FailInvestigationResult{}, err
+	}
 
 	repository.mu.Lock()
 	defer repository.mu.Unlock()

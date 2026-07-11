@@ -3,11 +3,7 @@ package memory
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/json"
 	"fmt"
-	"sort"
-	"time"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/investigation"
@@ -18,27 +14,15 @@ func (repository *Repository) FinalizeInvestigation(ctx context.Context, request
 	if err := ctx.Err(); err != nil {
 		return investigation.FinalizeInvestigationResult{}, err
 	}
-	if !validResourceScope(request.WorkspaceID, request.InvestigationID) || !domain.ValidIdempotencyKey(request.IdempotencyKey) ||
-		!validFinalization(request.Status, request.ModelStatus, request.FailureCode, request.ModelFailureCode, len(request.Hypotheses)) {
+	if !validResourceScope(request.WorkspaceID, request.InvestigationID) || !domain.ValidIdempotencyKey(request.IdempotencyKey) {
 		return investigation.FinalizeInvestigationResult{}, fmt.Errorf("%w: invalid investigation finalization", investigation.ErrInvalidRequest)
 	}
-	canonical, err := canonicalHypothesisSpecs(request.Hypotheses)
+	normalizedRequest, requestHash, err := investigation.NormalizeFinalizeInvestigationRequest(request)
 	if err != nil {
 		return investigation.FinalizeInvestigationResult{}, err
 	}
-	wire, err := json.Marshal(struct {
-		InvestigationID  string
-		Status           domain.InvestigationStatus
-		ModelStatus      domain.ModelStatus
-		FailureCode      string
-		ModelFailureCode string
-		Hypotheses       []investigation.HypothesisSpec
-	}{request.InvestigationID, request.Status, request.ModelStatus, request.FailureCode, request.ModelFailureCode, canonical})
-	if err != nil {
-		return investigation.FinalizeInvestigationResult{}, fmt.Errorf("%w: encode finalization", investigation.ErrInvalidRequest)
-	}
-	digest := sha256.Sum256(wire)
-	requestHash := fmt.Sprintf("%x", digest[:])
+	request = normalizedRequest
+	canonical := request.Hypotheses
 
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
@@ -50,7 +34,9 @@ func (repository *Repository) FinalizeInvestigation(ctx context.Context, request
 		if record.requestHash != requestHash {
 			return investigation.FinalizeInvestigationResult{}, store.ErrIdempotencyConflict
 		}
-		return repository.finalizationResult(request.WorkspaceID, record.investigationID, true)
+		result := cloneFinalizeResult(record.result)
+		result.Replayed = true
+		return result, nil
 	}
 	item, exists := repository.investigations[scoped(request.WorkspaceID, request.InvestigationID)]
 	if !exists {
@@ -150,77 +136,15 @@ func (repository *Repository) FinalizeInvestigation(ctx context.Context, request
 	if repository.activeInvestigation[incidentKey] == item.ID {
 		delete(repository.activeInvestigation, incidentKey)
 	}
-	repository.finalizeIdempotency[idempotencyKey] = finalizeRecord{requestHash: requestHash, investigationID: item.ID}
-	repository.bindIdempotencyOwner(idempotencyKey, "finalize_investigation")
-	return investigation.FinalizeInvestigationResult{
+	result := investigation.FinalizeInvestigationResult{
 		Investigation: cloneInvestigation(item), Hypotheses: cloneHypotheses(createdHypotheses),
-	}, nil
-}
-
-func (repository *Repository) finalizationResult(workspaceID, investigationID string, replayed bool) (investigation.FinalizeInvestigationResult, error) {
-	item, exists := repository.investigations[scoped(workspaceID, investigationID)]
-	if !exists {
-		return investigation.FinalizeInvestigationResult{}, store.ErrNotFound
 	}
-	ids := repository.hypothesisIDsByInvestigation[scoped(workspaceID, investigationID)]
-	hypotheses := make([]domain.Hypothesis, 0, len(ids))
-	for _, hypothesisID := range ids {
-		hypothesis, found := repository.hypotheses[scoped(workspaceID, hypothesisID)]
-		if !found {
-			return investigation.FinalizeInvestigationResult{}, store.ErrNotFound
-		}
-		hypotheses = append(hypotheses, cloneHypothesis(hypothesis))
+	repository.finalizeIdempotency[idempotencyKey] = finalizeRecord{
+		requestHash: requestHash,
+		result:      cloneFinalizeResult(result),
 	}
-	return investigation.FinalizeInvestigationResult{
-		Investigation: cloneInvestigation(item), Hypotheses: hypotheses, Replayed: replayed,
-	}, nil
-}
-
-func canonicalHypothesisSpecs(specs []investigation.HypothesisSpec) ([]investigation.HypothesisSpec, error) {
-	if len(specs) > 20 {
-		return nil, fmt.Errorf("%w: hypothesis count exceeds 20", investigation.ErrInvalidRequest)
-	}
-	canonical := make([]investigation.HypothesisSpec, len(specs))
-	for index, spec := range specs {
-		canonical[index] = investigation.HypothesisSpec{
-			Rank: spec.Rank, Confidence: spec.Confidence, Summary: spec.Summary,
-			Proposal: bytes.Clone(spec.Proposal), ProposalHash: spec.ProposalHash,
-			Unknowns: append([]string(nil), spec.Unknowns...), EvidenceIDs: append([]string(nil), spec.EvidenceIDs...),
-		}
-		candidate := domain.Hypothesis{
-			ID: "validation", WorkspaceID: "validation", IncidentID: "validation", InvestigationID: "validation",
-			Status: domain.HypothesisProposed, Rank: spec.Rank, Confidence: spec.Confidence, Summary: spec.Summary,
-			Proposal: bytes.Clone(spec.Proposal), ProposalHash: spec.ProposalHash,
-			Unknowns: append([]string(nil), spec.Unknowns...), EvidenceIDs: append([]string(nil), spec.EvidenceIDs...), CreatedAt: time.Unix(1, 0).UTC(),
-		}
-		if err := candidate.Validate(); err != nil {
-			return nil, fmt.Errorf("%w: invalid hypothesis body", investigation.ErrInvalidRequest)
-		}
-	}
-	sort.SliceStable(canonical, func(left, right int) bool { return canonical[left].Rank < canonical[right].Rank })
-	for index := 1; index < len(canonical); index++ {
-		if canonical[index-1].Rank == canonical[index].Rank {
-			return nil, fmt.Errorf("%w: hypothesis ranks must be unique", investigation.ErrInvalidRequest)
-		}
-	}
-	return canonical, nil
-}
-
-func validFinalization(status domain.InvestigationStatus, modelStatus domain.ModelStatus, failureCode, modelFailureCode string, hypothesisCount int) bool {
-	switch status {
-	case domain.InvestigationCompleted, domain.InvestigationPartial:
-		if modelStatus == domain.ModelCompleted {
-			return failureCode == "" && modelFailureCode == "" && hypothesisCount > 0
-		}
-		if modelStatus == domain.ModelFailed {
-			return failureCode == "" && domain.ValidFailureCode(modelFailureCode) && hypothesisCount == 0
-		}
-		return modelStatus == domain.ModelSkipped && failureCode == "" && modelFailureCode == "" && hypothesisCount == 0
-	case domain.InvestigationCancelled:
-		return modelStatus == domain.ModelCancelled && domain.ValidFailureCode(failureCode) && modelFailureCode == "" && hypothesisCount == 0
-	default:
-		return false
-	}
+	repository.bindIdempotencyOwner(idempotencyKey, "finalize_investigation")
+	return cloneFinalizeResult(result), nil
 }
 
 func validModelFinalizationTransition(current, terminal domain.ModelStatus) bool {

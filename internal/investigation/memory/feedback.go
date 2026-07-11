@@ -3,8 +3,6 @@ package memory
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
@@ -17,23 +15,14 @@ func (repository *Repository) RecordFeedback(ctx context.Context, request invest
 		return investigation.RecordFeedbackResult{}, err
 	}
 	if !validResourceScope(request.WorkspaceID, request.IncidentID, request.InvestigationID, request.HypothesisID, request.Actor.ID) ||
-		request.Actor.Type != domain.ActorHuman || !domain.ValidIdempotencyKey(request.IdempotencyKey) {
+		!domain.ValidIdempotencyKey(request.IdempotencyKey) {
 		return investigation.RecordFeedbackResult{}, fmt.Errorf("%w: invalid feedback identity", investigation.ErrInvalidRequest)
 	}
-	switch request.Verdict {
-	case domain.FeedbackConfirmed, domain.FeedbackRejected, domain.FeedbackInconclusive:
-	default:
-		return investigation.RecordFeedbackResult{}, fmt.Errorf("%w: invalid feedback verdict", investigation.ErrInvalidRequest)
-	}
-	if err := domain.ValidateSafeJSONObject(request.Details); err != nil {
-		return investigation.RecordFeedbackResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, err)
-	}
-	wire, err := json.Marshal(request)
+	normalizedRequest, requestHash, err := investigation.NormalizeRecordFeedbackRequest(request)
 	if err != nil {
-		return investigation.RecordFeedbackResult{}, fmt.Errorf("%w: encode feedback", investigation.ErrInvalidRequest)
+		return investigation.RecordFeedbackResult{}, err
 	}
-	digest := sha256.Sum256(wire)
-	requestHash := fmt.Sprintf("%x", digest[:])
+	request = normalizedRequest
 
 	repository.mu.Lock()
 	defer repository.mu.Unlock()

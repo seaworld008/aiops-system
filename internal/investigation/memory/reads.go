@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/investigation"
@@ -50,6 +51,15 @@ func (repository *Repository) ListEvidence(ctx context.Context, request investig
 		}
 		items = append(items, cloneEvidence(evidence))
 	}
+	sort.Slice(items, func(left, right int) bool {
+		if !items[left].CollectedAt.Equal(items[right].CollectedAt) {
+			return items[left].CollectedAt.Before(items[right].CollectedAt)
+		}
+		if !items[left].CreatedAt.Equal(items[right].CreatedAt) {
+			return items[left].CreatedAt.Before(items[right].CreatedAt)
+		}
+		return items[left].ID < items[right].ID
+	})
 	return items, nil
 }
 

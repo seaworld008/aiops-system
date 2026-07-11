@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
+	"github.com/seaworld008/aiops-system/internal/investigation"
 )
 
 func laterTime(left, right time.Time) time.Time {
@@ -50,6 +51,12 @@ func cloneHypotheses(hypotheses []domain.Hypothesis) []domain.Hypothesis {
 	for index, hypothesis := range hypotheses {
 		result[index] = cloneHypothesis(hypothesis)
 	}
+	return result
+}
+
+func cloneFinalizeResult(result investigation.FinalizeInvestigationResult) investigation.FinalizeInvestigationResult {
+	result.Investigation = cloneInvestigation(result.Investigation)
+	result.Hypotheses = cloneHypotheses(result.Hypotheses)
 	return result
 }
 

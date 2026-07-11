@@ -46,8 +46,8 @@ type Incident struct {
 	Version               int64
 }
 
-// NewIncident is the legacy constructor that assumes tenant and workspace IDs are identical.
-// Persistence adapters with a trusted tenant mapping must use NewIncidentForTenant.
+// NewIncident is a legacy-only constructor that assumes tenant and workspace IDs are identical.
+// New repositories, including Memory and persistence adapters, must resolve a trusted tenant and use NewIncidentForTenant.
 func NewIncident(id, workspaceID string, now time.Time) Incident {
 	return NewIncidentForTenant(id, workspaceID, workspaceID, now)
 }

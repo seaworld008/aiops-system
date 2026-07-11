@@ -3,8 +3,6 @@ package memory
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
@@ -20,27 +18,11 @@ func (repository *Repository) CompleteTask(ctx context.Context, request investig
 		!domain.ValidIdempotencyKey(request.IdempotencyKey) {
 		return investigation.CompleteTaskResult{}, fmt.Errorf("%w: invalid task completion identity", investigation.ErrInvalidRequest)
 	}
-	switch request.Status {
-	case domain.ReadTaskEvidence:
-		if request.Evidence == nil || request.FailureCode != "" {
-			return investigation.CompleteTaskResult{}, fmt.Errorf("%w: evidence completion requires evidence only", investigation.ErrInvalidRequest)
-		}
-	case domain.ReadTaskFailed, domain.ReadTaskCancelled:
-		if request.Evidence != nil || !domain.ValidFailureCode(request.FailureCode) {
-			return investigation.CompleteTaskResult{}, fmt.Errorf("%w: failed completion requires a bounded failure code", investigation.ErrInvalidRequest)
-		}
-	default:
-		return investigation.CompleteTaskResult{}, fmt.Errorf("%w: invalid task completion status", investigation.ErrInvalidRequest)
-	}
-	if err := validateCompleteTaskBody(request); err != nil {
+	normalizedRequest, requestHash, err := investigation.NormalizeCompleteTaskRequest(request)
+	if err != nil {
 		return investigation.CompleteTaskResult{}, err
 	}
-	requestWire, err := json.Marshal(request)
-	if err != nil {
-		return investigation.CompleteTaskResult{}, fmt.Errorf("%w: encode task completion", investigation.ErrInvalidRequest)
-	}
-	requestDigest := sha256.Sum256(requestWire)
-	requestHash := fmt.Sprintf("%x", requestDigest[:])
+	request = normalizedRequest
 
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
@@ -152,25 +134,6 @@ func (repository *Repository) CompleteTask(ctx context.Context, request investig
 	repository.taskCompletionIdempotency[idempotencyKey] = record
 	repository.bindIdempotencyOwner(idempotencyKey, "complete_task")
 	return repository.taskCompletionResult(request.WorkspaceID, record, false)
-}
-
-func validateCompleteTaskBody(request investigation.CompleteTaskRequest) error {
-	if request.Status != domain.ReadTaskEvidence {
-		return nil
-	}
-	if err := domain.ValidateSafeJSONObject(request.Evidence.Payload); err != nil ||
-		!domain.ValidSHA256Hex(request.Evidence.ContentHash) ||
-		!hashMatches(request.Evidence.Payload, request.Evidence.ContentHash) ||
-		domain.ValidateSafeAttributes(request.Evidence.Attributes) != nil ||
-		request.Evidence.CollectedAt.IsZero() {
-		return fmt.Errorf("%w: invalid evidence body", investigation.ErrInvalidRequest)
-	}
-	return nil
-}
-
-func hashMatches(value []byte, expected string) bool {
-	digest := sha256.Sum256(value)
-	return fmt.Sprintf("%x", digest[:]) == expected
 }
 
 func (repository *Repository) taskCompletionResult(workspaceID string, record taskCompletionRecord, replayed bool) (investigation.CompleteTaskResult, error) {

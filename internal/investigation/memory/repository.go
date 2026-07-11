@@ -110,8 +110,8 @@ type taskCompletionRecord struct {
 }
 
 type finalizeRecord struct {
-	requestHash     string
-	investigationID string
+	requestHash string
+	result      investigation.FinalizeInvestigationResult
 }
 
 func (repository *Repository) newID() (string, error) {

@@ -2,7 +2,6 @@ package memory
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
@@ -17,8 +16,10 @@ func (repository *Repository) StartModel(ctx context.Context, request investigat
 	if !validResourceScope(request.WorkspaceID, request.InvestigationID) || !domain.ValidIdempotencyKey(request.IdempotencyKey) {
 		return investigation.StartModelResult{}, fmt.Errorf("%w: invalid model start request", investigation.ErrInvalidRequest)
 	}
-	digest := sha256.Sum256([]byte(request.InvestigationID))
-	requestHash := fmt.Sprintf("%x", digest[:])
+	requestHash, err := investigation.StartModelRequestHash(request)
+	if err != nil {
+		return investigation.StartModelResult{}, err
+	}
 	now := repository.clock().UTC()
 	if now.IsZero() {
 		return investigation.StartModelResult{}, fmt.Errorf("%w: clock returned zero time", investigation.ErrInvalidRequest)
