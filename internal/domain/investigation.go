@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -380,12 +381,18 @@ func ValidateSafeAttributes(attributes map[string]string) error {
 }
 
 func ValidSafeMetadata(name, value string) bool {
-	return !unsafeSecurityName(name) && !unsafeSecurityValue(value) &&
+	return validSafeUnicode(name) && validSafeUnicode(value) &&
+		!unsafeSecurityName(name) && !unsafeSecurityValue(value) &&
 		(normalizeSecurityName(name) != "name" || !unsafeSecurityName(value))
 }
 
 func ValidSafeText(value string) bool {
-	return !unsafeSecurityValue(value)
+	return validSafeUnicode(value) && !unsafeSecurityValue(value)
+}
+
+func validSafeUnicode(value string) bool {
+	return utf8.ValidString(value) && !strings.ContainsRune(value, utf8.RuneError) &&
+		strings.IndexFunc(value, unicode.IsControl) < 0
 }
 
 func validateHashedJSONObject(value json.RawMessage, hash string) error {

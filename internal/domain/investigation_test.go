@@ -236,27 +236,67 @@ func TestEvidenceAttributesRejectSensitiveNamesAndValues(t *testing.T) {
 		ContentHash: sha256Hex(payload), Payload: payload, CollectedAt: now, CreatedAt: now,
 	}
 	const canary = "attribute-sensitive-canary"
-	unsafe := []map[string]string{
-		{"authorization": canary},
-		{"credential_ref": canary},
-		{"raw_error_body": canary},
-		{"secret": canary},
-		{"access_token": canary},
-		{"password": canary},
-		{"name": "Authorization", "value": canary},
-		{"message": "Bearer " + canary},
-		{"message": "password : " + canary},
+	unsafe := map[string]map[string]string{
+		"authorization name":     {"authorization": canary},
+		"credential name":        {"credential_ref": canary},
+		"raw error name":         {"raw_error_body": canary},
+		"secret name":            {"secret": canary},
+		"token name":             {"access_token": canary},
+		"password name":          {"password": canary},
+		"semantic name":          {"name": "Authorization", "value": canary},
+		"bearer value":           {"message": "Bearer " + canary},
+		"credential assignment":  {"message": "password : " + canary},
+		"invalid UTF-8 value":    {"message": canary + string([]byte{0xff})},
+		"NUL value":              {"message": canary + "\x00text"},
+		"Unicode control value":  {"message": canary + "\u0085text"},
+		"replacement rune value": {"message": canary + "�"},
 	}
-	for _, attributes := range unsafe {
-		item := valid
-		item.Attributes = attributes
-		err := item.Validate()
-		if err == nil {
-			t.Fatalf("Evidence.Validate() accepted unsafe attributes %#v", attributes)
-		}
-		if strings.Contains(err.Error(), canary) {
-			t.Fatalf("Evidence.Validate() echoed sensitive attribute: %v", err)
-		}
+	for name, attributes := range unsafe {
+		t.Run(name, func(t *testing.T) {
+			item := valid
+			item.Attributes = attributes
+			err := item.Validate()
+			if err == nil {
+				t.Fatalf("Evidence.Validate() accepted unsafe attributes %#v", attributes)
+			}
+			if strings.Contains(err.Error(), canary) {
+				t.Fatalf("Evidence.Validate() echoed sensitive attribute: %v", err)
+			}
+		})
+	}
+	readableUnicode := valid
+	readableUnicode.Attributes = map[string]string{"message": "服务已经恢复"}
+	if err := readableUnicode.Validate(); err != nil {
+		t.Fatalf("Evidence.Validate(readable Unicode) error = %v", err)
+	}
+}
+
+func TestSafeTextAndMetadataEnforceUnicodeSafety(t *testing.T) {
+	invalidUTF8 := "canary" + string([]byte{0xff})
+	for name, value := range map[string]string{
+		"invalid UTF-8":    invalidUTF8,
+		"NUL":              "canary\x00text",
+		"Unicode control":  "canary\u0085text",
+		"replacement rune": "canary�",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if domain.ValidSafeText(value) {
+				t.Fatalf("ValidSafeText(%q) = true, want Unicode rejection", value)
+			}
+			if domain.ValidSafeMetadata("message", value) {
+				t.Fatalf("ValidSafeMetadata(value %q) = true, want Unicode rejection", value)
+			}
+			if domain.ValidSafeMetadata(value, "readable") {
+				t.Fatalf("ValidSafeMetadata(name %q) = true, want Unicode rejection", value)
+			}
+		})
+	}
+
+	if !domain.ValidSafeText("数据库连接池已恢复") {
+		t.Fatal("ValidSafeText() rejected readable Chinese text")
+	}
+	if !domain.ValidSafeMetadata("message", "服务已经恢复") {
+		t.Fatal("ValidSafeMetadata() rejected readable Chinese value")
 	}
 }
 

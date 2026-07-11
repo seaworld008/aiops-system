@@ -54,12 +54,23 @@ func TestHypothesisRejectsSensitiveSummaryAndUnknownTextWithoutEcho(t *testing.T
 		Status: domain.HypothesisProposed, Rank: 1, Confidence: 0.8, Summary: "Safe summary",
 		Proposal: proposal, ProposalHash: sha256Hex(proposal), EvidenceIDs: []string{"evidence-1"}, CreatedAt: now,
 	}
+	readableUnicode := base
+	readableUnicode.Summary = "数据库连接池已恢复"
+	readableUnicode.Unknowns = []string{"是否仍有重试流量"}
+	if err := readableUnicode.Validate(); err != nil {
+		t.Fatalf("Validate(readable Unicode) error = %v", err)
+	}
 	const canary = "hypothesis-sensitive-canary"
 	for name, mutate := range map[string]func(*domain.Hypothesis){
 		"bearer summary":              func(value *domain.Hypothesis) { value.Summary = "Bearer " + canary },
+		"invalid UTF-8 summary":       func(value *domain.Hypothesis) { value.Summary = canary + string([]byte{0xff}) },
 		"authorization summary":       func(value *domain.Hypothesis) { value.Summary = "Authorization " + canary },
 		"password assignment summary": func(value *domain.Hypothesis) { value.Summary = "PASSWORD = " + canary },
+		"NUL summary":                 func(value *domain.Hypothesis) { value.Summary = canary + "\x00text" },
 		"cookie unknown":              func(value *domain.Hypothesis) { value.Unknowns = []string{"Cookie " + canary} },
+		"invalid UTF-8 unknown":       func(value *domain.Hypothesis) { value.Unknowns = []string{canary + string([]byte{0xff})} },
+		"Unicode control unknown":     func(value *domain.Hypothesis) { value.Unknowns = []string{canary + "\u0085text"} },
+		"replacement rune unknown":    func(value *domain.Hypothesis) { value.Unknowns = []string{canary + "�"} },
 		"token assignment unknown":    func(value *domain.Hypothesis) { value.Unknowns = []string{"token: " + canary} },
 		"private key unknown":         func(value *domain.Hypothesis) { value.Unknowns = []string{"BEGIN PRIVATE KEY " + canary} },
 		"raw error unknown":           func(value *domain.Hypothesis) { value.Unknowns = []string{"raw error body " + canary} },
