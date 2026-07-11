@@ -11,7 +11,7 @@ This directory separates current architecture, executable delivery plans, and su
 
 - [SME internal pilot implementation plan](plans/2026-07-10-sme-internal-aiops-pilot.md) — phased implementation and acceptance plan.
 - [Roadmap and release gates](roadmap.md) — current delivery status and the conditions for enabling production writes.
-- [Runner Gateway identity-file staging](operations/runner-gateway-identity-files.md) — secure Kubernetes staging and rotation runbook for mTLS material.
+- [Runner Gateway security-file staging](operations/runner-gateway-identity-files.md) — secure Kubernetes staging and rotation runbook for mTLS and credential-protection material.
 
 ## Historical material
 

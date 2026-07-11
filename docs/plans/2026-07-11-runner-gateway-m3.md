@@ -108,7 +108,8 @@ M3 完成身份和协议，但在 M5 调查任务仓储就绪前 READ `jobs:leas
 
 - `internal/runneridentity`：SPIFFE、证书证据、不可由 wire 构造的身份、TLS 配置。
 - `internal/runneridentity/postgres`：每请求认证和事务内 revalidation。
-- 配置采用全有或全无：独立地址、server cert/key、READ/WRITE CA、trust domain。
+- 配置采用全有或全无：独立地址、server cert/key、READ/WRITE CA、trust domain，以及
+  采用独立 32-byte AES/HMAC 材料的私有 credential-protection keyring 文件。
 - 完成迁移及真实 PostgreSQL 身份、吊销、轮换、scope revision 测试。
 
 ### M3B：Authenticated ActionQueue 和 job API
@@ -127,6 +128,8 @@ M3 完成身份和协议，但在 M5 调查任务仓储就绪前 READ `jobs:leas
 - Revocation lease/heartbeat/complete 使用既有持久状态机，加 sequence/receipt。
 - 控制面预绑定两个 listener；任一初始化/serve 异常都会关闭另一个并退出。
 - 本地生成双 CA、双 Runner 证书，覆盖同一 keepalive 吊销/禁用/scope 收窄 E2E。
+- M3 的 control-plane 有意不注入最终 `StartAuthorizer`：identity 与持久吊销 API 可运行，
+  但 job lease/start 继续 fail closed；M4 隔离执行路径完成后才允许注入该依赖。
 
 ## HTTP 合同
 
