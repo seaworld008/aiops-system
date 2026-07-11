@@ -1239,7 +1239,7 @@ func (repository *Repository) RecoverExhausted(
 				claimed_by = NULL, claim_token_sha256 = NULL, claimed_at = NULL,
 				claim_expires_at = NULL, last_heartbeat_at = NULL,
 				failure_count = failure_count + 1, failure_code = $2, failure_detail_sha256 = $3,
-				manual_required_at = clock_timestamp(), updated_at = clock_timestamp(), version = version + 1
+				manual_required_at = statement_timestamp(), updated_at = statement_timestamp(), version = version + 1
 			WHERE revocation_id = $1
 			  AND (
 				status = 'REVOCATION_PENDING'
@@ -1473,7 +1473,7 @@ func (repository *Repository) ClaimRevocations(ctx context.Context, request cred
 					claimed_by = NULL, claim_token_sha256 = NULL, claimed_at = NULL,
 					claim_expires_at = NULL, last_heartbeat_at = NULL,
 					failure_count = failure_count + 1, failure_code = $5, failure_detail_sha256 = $6,
-					manual_required_at = clock_timestamp(), updated_at = clock_timestamp(), version = version + 1
+					manual_required_at = statement_timestamp(), updated_at = statement_timestamp(), version = version + 1
 				WHERE revocation_id = $1 AND claimed_by = $2 AND claim_token_sha256 = $3
 				  AND claim_epoch = $4 AND status = 'REVOKING'
 				RETURNING `+revocationProjection,
@@ -1639,6 +1639,28 @@ func (repository *Repository) failClaim(ctx context.Context, fence credential.Cl
 	}()
 	digest := credential.SHA256Hex([]byte(fence.Token))
 	detailHash := credential.SHA256Hex(detail)
+	var lockedRevocationID string
+	err = tx.QueryRow(ctx, `
+		SELECT revocation_id::text
+		FROM credential_revocations
+		WHERE revocation_id = $1 AND claimed_by = $2 AND claim_token_sha256 = $3 AND claim_epoch = $4
+		  AND status = 'REVOKING'
+		FOR UPDATE
+	`, fence.RevocationID, fence.WorkerID, digest, fence.Epoch).Scan(&lockedRevocationID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return credential.Revocation{}, repository.claimMissWith(ctx, tx, fence)
+	}
+	if err != nil {
+		return credential.Revocation{}, databaseError("lock failed credential revocation transition", err)
+	}
+	if lockedRevocationID != fence.RevocationID {
+		return credential.Revocation{}, credential.ErrRevocationPersistence
+	}
+	var transitionAt time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&transitionAt); err != nil {
+		return credential.Revocation{}, databaseError("read failed credential revocation transition time", err)
+	}
+	transitionAt = transitionAt.UTC()
 	var query, auditAction, eventType string
 	if manual {
 		query = `
@@ -1647,9 +1669,9 @@ func (repository *Repository) failClaim(ctx context.Context, fence credential.Cl
 				claimed_by = NULL, claim_token_sha256 = NULL, claimed_at = NULL,
 				claim_expires_at = NULL, last_heartbeat_at = NULL,
 				failure_count = failure_count + 1, failure_code = $5, failure_detail_sha256 = $6,
-				manual_required_at = clock_timestamp(), updated_at = clock_timestamp(), version = version + 1
+				manual_required_at = $7, updated_at = $7, version = version + 1
 			WHERE revocation_id = $1 AND claimed_by = $2 AND claim_token_sha256 = $3 AND claim_epoch = $4
-			  AND status = 'REVOKING' AND claim_expires_at > clock_timestamp()
+			  AND status = 'REVOKING' AND claim_expires_at > $7
 			RETURNING ` + revocationProjection
 		auditAction, eventType = "credential.revocation.manual_required", "credential.revocation.manual_required.v1"
 	} else {
@@ -1657,7 +1679,7 @@ func (repository *Repository) failClaim(ctx context.Context, fence credential.Cl
 			UPDATE credential_revocations
 			SET status = CASE
 					WHEN attempt - retry_cycle_attempt_base >= $8
-					  OR retry_cycle_started_at <= clock_timestamp() - make_interval(secs => $9::double precision)
+					  OR retry_cycle_started_at <= $10 - make_interval(secs => $9::double precision)
 					THEN 'MANUAL_REQUIRED'
 					ELSE 'REVOCATION_PENDING'
 				END,
@@ -1666,25 +1688,27 @@ func (repository *Repository) failClaim(ctx context.Context, fence credential.Cl
 				failure_count = failure_count + 1, failure_code = $5, failure_detail_sha256 = $6,
 				available_at = CASE
 					WHEN attempt - retry_cycle_attempt_base >= $8
-					  OR retry_cycle_started_at <= clock_timestamp() - make_interval(secs => $9::double precision)
+					  OR retry_cycle_started_at <= $10 - make_interval(secs => $9::double precision)
 					THEN available_at
-					ELSE clock_timestamp() + make_interval(secs => $7::double precision)
+					ELSE $10 + make_interval(secs => $7::double precision)
 				END,
 				manual_required_at = CASE
 					WHEN attempt - retry_cycle_attempt_base >= $8
-					  OR retry_cycle_started_at <= clock_timestamp() - make_interval(secs => $9::double precision)
-					THEN clock_timestamp()
+					  OR retry_cycle_started_at <= $10 - make_interval(secs => $9::double precision)
+					THEN $10
 					ELSE manual_required_at
 				END,
-				updated_at = clock_timestamp(), version = version + 1
+				updated_at = $10, version = version + 1
 			WHERE revocation_id = $1 AND claimed_by = $2 AND claim_token_sha256 = $3 AND claim_epoch = $4
-			  AND status = 'REVOKING' AND claim_expires_at > clock_timestamp()
+			  AND status = 'REVOKING' AND claim_expires_at > $10
 			RETURNING ` + revocationProjection
 		auditAction, eventType = "credential.revocation.failed", "credential.revocation.failed.v1"
 	}
 	args := []any{fence.RevocationID, fence.WorkerID, digest, fence.Epoch, string(code), detailHash}
 	if !manual {
-		args = append(args, delay.Seconds(), credential.MaxRevocationAttempts, credential.MaxRevocationElapsed.Seconds())
+		args = append(args, delay.Seconds(), credential.MaxRevocationAttempts, credential.MaxRevocationElapsed.Seconds(), transitionAt)
+	} else {
+		args = append(args, transitionAt)
 	}
 	record, err := selectStored(ctx, tx, query, args...)
 	if errors.Is(err, pgx.ErrNoRows) {

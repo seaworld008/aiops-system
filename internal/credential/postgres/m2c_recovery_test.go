@@ -107,10 +107,11 @@ func TestPostgresRetryRevocationAtomicallyEscalatesExhaustedCycle(t *testing.T) 
 	protected := protectTestReference(t, repository.protector, []byte("twelfth-attempt-accessor"))
 
 	database.ExpectBegin()
+	expectFailedClaimLockAndClock(database, postgresTestRevocationID, "revoker-threshold", claimDigest, 12, now)
 	database.ExpectQuery("UPDATE credential_revocations SET status = CASE").
 		WithArgs(postgresTestRevocationID, "revoker-threshold", claimDigest, int64(12), string(credential.FailureTimeout),
 			detailHash, credential.MinRevocationRetryDelay.Seconds(), credential.MaxRevocationAttempts,
-			credential.MaxRevocationElapsed.Seconds()).
+			credential.MaxRevocationElapsed.Seconds(), now).
 		WillReturnRows(storedRevocationRows(now, storedRowOptions{
 			Status: credential.StatusManualRequired, Protected: protected, AvailableAt: now.Add(-time.Second), Version: 30,
 			ClaimEpoch: 12, Attempt: credential.MaxRevocationAttempts, FailureCount: 1,

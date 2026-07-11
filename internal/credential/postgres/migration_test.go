@@ -105,6 +105,29 @@ func TestCredentialRevocationMigrationCapsCredentialTTLForPreparedRecoverySafety
 	}
 }
 
+func TestCredentialRevocationMigrationIndexesExactScopedManagementKeyset(t *testing.T) {
+	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
+	if !strings.Contains(normalized,
+		"create index credential_revocations_management_idx on credential_revocations (workspace_id, environment_id, status, created_at desc, revocation_id desc)") {
+		t.Fatal("up migration does not index exact workspace/environment/status management keyset")
+	}
+}
+
+func TestCredentialRevocationMigrationConstrainsManagementLifecycleTimes(t *testing.T) {
+	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
+	for _, fragment := range []string{
+		"created_at > '-infinity'::timestamptz and created_at < 'infinity'::timestamptz",
+		"manual_required_at >= created_at and manual_required_at <= updated_at",
+		"revoked_at >= created_at and revoked_at <= updated_at",
+		"manual_required_at is null or revoked_at is null or revoked_at >= manual_required_at",
+		"updated_at > '-infinity'::timestamptz and updated_at < 'infinity'::timestamptz",
+	} {
+		if !strings.Contains(normalized, fragment) {
+			t.Errorf("up migration missing management lifecycle time invariant %q", fragment)
+		}
+	}
+}
+
 func TestCredentialRevocationMigrationBindsCompleteSignedCredentialSelection(t *testing.T) {
 	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
 	for _, fragment := range []string{
@@ -632,7 +655,7 @@ func TestCredentialRevocationMigrationEnforcesSingleUseChildCreationAuthorizatio
 		"new.child_create_authorized_at is not null or new.child_create_ttl_seconds is not null",
 		"credential child creation authorization is immutable",
 		"old.child_create_permit_sha256 is distinct from new.child_create_permit_sha256",
-		"old.credential_expires_at <= clock_timestamp() - interval '1 minute'",
+		"old.credential_expires_at <= transition_at - interval '1 minute'",
 	} {
 		if !strings.Contains(normalized, fragment) {
 			t.Errorf("up migration missing child-create invariant %q", fragment)
@@ -651,10 +674,20 @@ func TestCredentialRevocationMigrationEnforcesRecoverableRetryCycles(t *testing.
 		"create index credential_revocations_exhausted_recovery_idx",
 		"include (attempt, retry_cycle_attempt_base, claim_expires_at)",
 		"old.attempt - old.retry_cycle_attempt_base < 12",
-		"old.retry_cycle_started_at > clock_timestamp() - interval '2 hours'",
+		"old.retry_cycle_started_at > transition_at - interval '2 hours'",
 		"old.attempt - old.retry_cycle_attempt_base >= 12",
-		"old.retry_cycle_started_at <= clock_timestamp() - interval '2 hours'",
+		"old.retry_cycle_started_at <= transition_at - interval '2 hours'",
+		"transition_at := clock_timestamp()",
 		"new.status := 'manual_required'",
+		"new.manual_required_at := transition_at",
+		"new.updated_at := greatest(new.updated_at, transition_at)",
+		"old.status in ('revocation_pending', 'revoking') and new.status = 'manual_required'",
+		"old.manual_required_at is distinct from new.manual_required_at",
+		"credential manual-required lifecycle evidence is database-controlled",
+		"old.status in ('revoking', 'manual_required') and new.status = 'revoked'",
+		"new.revoked_at := transition_at",
+		"old.revoked_at is distinct from new.revoked_at",
+		"credential revoked lifecycle evidence is database-controlled",
 		"new.retry_cycle_attempt_base = old.attempt",
 		"credential revocation retry cycle may only reset after authorization loss or manual repair",
 		"credential revocation may only reclaim an expired non-exhausted claim",
@@ -662,6 +695,15 @@ func TestCredentialRevocationMigrationEnforcesRecoverableRetryCycles(t *testing.
 		if !strings.Contains(normalized, fragment) {
 			t.Errorf("up migration missing retry-cycle invariant %q", fragment)
 		}
+	}
+	functionStart := strings.Index(normalized, "create or replace function enforce_credential_revocation_transition()")
+	functionEnd := strings.Index(normalized, "create trigger credential_revocations_state_machine")
+	if functionStart < 0 || functionEnd <= functionStart {
+		t.Fatal("credential transition function boundaries are missing")
+	}
+	transitionFunction := normalized[functionStart:functionEnd]
+	if count := strings.Count(transitionFunction, "clock_timestamp()"); count != 2 {
+		t.Fatalf("credential transition function clock reads = %d, want INSERT guard plus one locked UPDATE clock", count)
 	}
 }
 

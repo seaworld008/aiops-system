@@ -1747,9 +1747,10 @@ func TestRetryRevocationUsesDatabaseRelativeDelayAndNeverPersistsFailureBody(t *
 	protected := protectTestReference(t, protector, []byte("retry-accessor"))
 
 	database.ExpectBegin()
+	expectFailedClaimLockAndClock(database, postgresTestRevocationID, "revoker-1", claimDigest, 2, now)
 	database.ExpectQuery("UPDATE credential_revocations SET status = CASE").
 		WithArgs(postgresTestRevocationID, "revoker-1", claimDigest, int64(2), string(credential.FailureIssuerUnavailable), detailHash,
-			45.0, credential.MaxRevocationAttempts, credential.MaxRevocationElapsed.Seconds()).
+			45.0, credential.MaxRevocationAttempts, credential.MaxRevocationElapsed.Seconds(), now).
 		WillReturnRows(storedRevocationRows(now, storedRowOptions{
 			Status: credential.StatusRevocationPending, Protected: protected, AvailableAt: now.Add(delay), Version: 8,
 			ClaimEpoch: 2, Attempt: 2, FailureCount: 1, FailureCode: credential.FailureIssuerUnavailable,
@@ -1783,6 +1784,116 @@ func TestRetryRevocationUsesDatabaseRelativeDelayAndNeverPersistsFailureBody(t *
 	if err := database.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet pgx expectations: %v", err)
 	}
+}
+
+func TestRetryRevocationUsesClockAfterLockAndRejectsFenceExpiredWhileWaiting(t *testing.T) {
+	t.Parallel()
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	repository, err := New(database, repositoryTestProtector(t), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 10, 17, 30, 0, 0, time.UTC)
+	claimToken := "expired-while-waiting-claim-token"
+	claimDigest := credential.SHA256Hex([]byte(claimToken))
+	detail := []byte("worker.remote.timeout")
+	detailHash := credential.SHA256Hex(detail)
+	protected := protectTestReference(t, repository.protector, []byte("expired-while-waiting-accessor"))
+
+	database.ExpectBegin()
+	expectFailedClaimLockAndClock(database, postgresTestRevocationID, "revoker-lock-wait", claimDigest, 3, now)
+	database.ExpectQuery("UPDATE credential_revocations SET status = CASE").
+		WithArgs(postgresTestRevocationID, "revoker-lock-wait", claimDigest, int64(3), string(credential.FailureTimeout), detailHash,
+			credential.MinRevocationRetryDelay.Seconds(), credential.MaxRevocationAttempts,
+			credential.MaxRevocationElapsed.Seconds(), now).
+		WillReturnRows(pgxmock.NewRows(storedRevocationColumns()))
+	database.ExpectQuery("SELECT revocation_id::text, tenant_id::text.*FROM credential_revocations.*WHERE revocation_id = \\$1").
+		WithArgs(postgresTestRevocationID).
+		WillReturnRows(storedRevocationRows(now, storedRowOptions{
+			Status: credential.StatusRevoking, Protected: protected, Version: 9,
+			ClaimEpoch: 3, ClaimedBy: "revoker-lock-wait", ClaimTokenSHA256: claimDigest,
+			ClaimedAt: now.Add(-time.Minute), ClaimExpiresAt: now.Add(-time.Microsecond), HeartbeatAt: now.Add(-time.Second),
+			Attempt: 3,
+		}))
+	database.ExpectRollback()
+
+	record, err := repository.RetryRevocation(context.Background(), credential.RetryRevocationRequest{
+		Fence: credential.ClaimFence{
+			RevocationID: postgresTestRevocationID, WorkerID: "revoker-lock-wait", Token: claimToken, Epoch: 3,
+		},
+		Delay: credential.MinRevocationRetryDelay, FailureCode: credential.FailureTimeout, FailureDetail: detail,
+	})
+	if !errors.Is(err, credential.ErrStaleClaim) || record != (credential.Revocation{}) {
+		t.Fatalf("RetryRevocation(expired while waiting) = %#v, %v", record, err)
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations (audit/outbox must not run): %v", err)
+	}
+}
+
+func TestRequireManualUsesClockAfterLockAndRejectsFenceExpiredWhileWaiting(t *testing.T) {
+	t.Parallel()
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	repository, err := New(database, repositoryTestProtector(t), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 10, 17, 45, 0, 0, time.UTC)
+	claimToken := "expired-manual-claim-token"
+	claimDigest := credential.SHA256Hex([]byte(claimToken))
+	detail := []byte("worker.permission.denied")
+	detailHash := credential.SHA256Hex(detail)
+	protected := protectTestReference(t, repository.protector, []byte("expired-manual-accessor"))
+
+	database.ExpectBegin()
+	expectFailedClaimLockAndClock(database, postgresTestRevocationID, "revoker-manual-wait", claimDigest, 4, now)
+	database.ExpectQuery("UPDATE credential_revocations SET status = 'MANUAL_REQUIRED'").
+		WithArgs(postgresTestRevocationID, "revoker-manual-wait", claimDigest, int64(4),
+			string(credential.FailurePermissionDenied), detailHash, now).
+		WillReturnRows(pgxmock.NewRows(storedRevocationColumns()))
+	database.ExpectQuery("SELECT revocation_id::text, tenant_id::text.*FROM credential_revocations.*WHERE revocation_id = \\$1").
+		WithArgs(postgresTestRevocationID).
+		WillReturnRows(storedRevocationRows(now, storedRowOptions{
+			Status: credential.StatusRevoking, Protected: protected, Version: 10,
+			ClaimEpoch: 4, ClaimedBy: "revoker-manual-wait", ClaimTokenSHA256: claimDigest,
+			ClaimedAt: now.Add(-time.Minute), ClaimExpiresAt: now.Add(-time.Microsecond), HeartbeatAt: now.Add(-time.Second),
+			Attempt: 4,
+		}))
+	database.ExpectRollback()
+
+	record, err := repository.RequireManual(context.Background(), credential.RequireManualRequest{
+		Fence: credential.ClaimFence{
+			RevocationID: postgresTestRevocationID, WorkerID: "revoker-manual-wait", Token: claimToken, Epoch: 4,
+		},
+		FailureCode: credential.FailurePermissionDenied, FailureDetail: detail,
+	})
+	if !errors.Is(err, credential.ErrStaleClaim) || record != (credential.Revocation{}) {
+		t.Fatalf("RequireManual(expired while waiting) = %#v, %v", record, err)
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations (audit/outbox must not run): %v", err)
+	}
+}
+
+func expectFailedClaimLockAndClock(
+	database pgxmock.PgxPoolIface,
+	revocationID, workerID, claimDigest string,
+	epoch int64,
+	now time.Time,
+) {
+	database.ExpectQuery("SELECT revocation_id::text.*FROM credential_revocations.*FOR UPDATE").
+		WithArgs(revocationID, workerID, claimDigest, epoch).
+		WillReturnRows(pgxmock.NewRows([]string{"revocation_id"}).AddRow(revocationID))
+	database.ExpectQuery("SELECT clock_timestamp\\(\\)").
+		WillReturnRows(pgxmock.NewRows([]string{"clock_timestamp"}).AddRow(now))
 }
 
 func TestCompleteRevocationClearsDecryptableReferenceAndReplaysSameCompletionFence(t *testing.T) {
