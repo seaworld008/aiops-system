@@ -150,9 +150,11 @@ type ActionMetadata struct {
 	ScopeRevision        int64
 	RunnerScopeRevision  int64
 	ExactScopeAuthorized bool
+	ActionType           string
 	ConnectorID          string
 	Permission           string
 	Resource             string
+	CredentialTTLSeconds int32
 }
 
 type ActionFenceSource interface {
@@ -387,9 +389,13 @@ type Revocation struct {
 	ActionLeaseEpoch int64  `json:"action_lease_epoch"`
 	Issuer           string `json:"issuer"`
 	IssuerRevision   string `json:"issuer_revision"`
+	ActionType       string `json:"action_type"`
 	ConnectorID      string `json:"connector_id"`
 	Permission       string `json:"permission"`
 	Resource         string `json:"resource"`
+	// CredentialTTLSeconds is copied from the immutable signed action envelope.
+	// It caps the absolute credential deadline and never restarts at issuance.
+	CredentialTTLSeconds int32 `json:"credential_ttl_seconds"`
 	// CredentialExpiresAt is the durable absolute upper bound for the external
 	// child credential, not a relative TTL that restarts when issuance begins.
 	CredentialExpiresAt   time.Time        `json:"credential_expires_at"`

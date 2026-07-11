@@ -2,6 +2,7 @@ BEGIN;
 
 -- Credential revocation data is a safety boundary.
 -- Only REVOKED/NO_CREDENTIAL rows without evidence and with fully delivered outbox events are safe to discard.
+-- The immutable action_type and signed credential_ttl_seconds bindings are removed only with the guarded table drop.
 -- Lock every table participating in the guard so no writer can cross the check.
 LOCK TABLE action_queue, execution_leases, credential_revocations, credential_revocation_confirmations, audit_records, outbox_events IN ACCESS EXCLUSIVE MODE;
 

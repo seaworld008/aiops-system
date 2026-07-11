@@ -90,9 +90,11 @@ CREATE TABLE credential_revocations (
     action_lease_token_sha256 text NOT NULL,
     issuer text NOT NULL,
     issuer_revision text NOT NULL,
+    action_type text NOT NULL,
     connector_id text NOT NULL,
     scope_permission text NOT NULL,
     scope_resource text NOT NULL,
+    credential_ttl_seconds integer NOT NULL,
     credential_expires_at timestamptz NOT NULL,
     child_create_permit_sha256 text NOT NULL,
     child_create_authorized_at timestamptz,
@@ -164,18 +166,23 @@ CREATE TABLE credential_revocations (
         octet_length(issuer_revision) BETWEEN 1 AND 256 AND
         left(issuer_revision, 1) COLLATE "C" ~ '^[A-Za-z0-9]$' AND
         issuer_revision COLLATE "C" !~ '[^A-Za-z0-9._:/@-]' AND
+        octet_length(action_type) BETWEEN 1 AND 256 AND
+        left(action_type, 1) COLLATE "C" ~ '^[A-Za-z0-9]$' AND
+        action_type COLLATE "C" !~ '[^A-Za-z0-9._:/@-]' AND
         octet_length(connector_id) BETWEEN 1 AND 256 AND
         octet_length(scope_permission) BETWEEN 1 AND 256 AND
         octet_length(scope_resource) BETWEEN 1 AND 2048 AND
-        issuer = btrim(issuer) AND connector_id = btrim(connector_id) AND
+        issuer = btrim(issuer) AND action_type = btrim(action_type) AND connector_id = btrim(connector_id) AND
         scope_permission = btrim(scope_permission) AND scope_resource = btrim(scope_resource) AND
-        issuer !~ '[[:cntrl:]]' AND connector_id !~ '[[:cntrl:]]' AND
+        issuer !~ '[[:cntrl:]]' AND action_type !~ '[[:cntrl:]]' AND connector_id !~ '[[:cntrl:]]' AND
         scope_permission !~ '[[:cntrl:]]' AND scope_resource !~ '[[:cntrl:]]'
     ),
     CONSTRAINT credential_revocations_time_ck CHECK (
+        credential_ttl_seconds BETWEEN 1 AND 900 AND
         credential_expires_at > '-infinity'::timestamptz AND credential_expires_at < 'infinity'::timestamptz AND
         credential_expires_at > created_at AND
         credential_expires_at <= created_at + interval '15 minutes' AND
+        credential_expires_at <= created_at + make_interval(secs => credential_ttl_seconds) AND
         available_at > '-infinity'::timestamptz AND available_at < 'infinity'::timestamptz AND
         (retry_cycle_started_at IS NULL OR (
             retry_cycle_started_at > '-infinity'::timestamptz AND retry_cycle_started_at < 'infinity'::timestamptz
@@ -657,6 +664,12 @@ BEGIN
           AND action.lease_epoch = NEW.action_lease_epoch
           AND action.credential_expected = true
           AND action.credential_lease_epoch = NEW.action_lease_epoch
+          AND action.envelope ->> 'action_type' = NEW.action_type
+          AND action.envelope #>> '{credential_scope,connector_id}' = NEW.connector_id
+          AND action.envelope #>> '{credential_scope,permission}' = NEW.scope_permission
+          AND action.envelope #>> '{credential_scope,resource}' = NEW.scope_resource
+          AND action.envelope #>> '{credential_scope,ttl_seconds}' = NEW.credential_ttl_seconds::text
+          AND NEW.credential_expires_at <= action.authorization_expires_at
           AND action.status IN ('LEASED', 'RUNNING', 'FINALIZING', 'UNCERTAIN', 'SUCCEEDED', 'FAILED')
           AND CASE
               WHEN action.status IN ('LEASED', 'RUNNING') THEN action.lease_token_sha256
@@ -680,6 +693,12 @@ CREATE CONSTRAINT TRIGGER credential_revocations_action_marker_shape
 CREATE OR REPLACE FUNCTION enforce_credential_revocation_transition() RETURNS trigger AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
+        IF NEW.created_at > clock_timestamp() THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'credential revocation creation time cannot be in the future',
+                CONSTRAINT = 'credential_revocations_created_at_guard';
+        END IF;
         IF NEW.status <> 'PREPARED' OR NEW.version <> 1
            OR NEW.child_create_authorized_at IS NOT NULL
            OR NEW.child_create_ttl_seconds IS NOT NULL THEN
@@ -818,9 +837,11 @@ BEGIN
        OR OLD.child_create_permit_sha256 IS DISTINCT FROM NEW.child_create_permit_sha256
        OR OLD.issuer IS DISTINCT FROM NEW.issuer
        OR OLD.issuer_revision IS DISTINCT FROM NEW.issuer_revision
+       OR OLD.action_type IS DISTINCT FROM NEW.action_type
        OR OLD.connector_id IS DISTINCT FROM NEW.connector_id
        OR OLD.scope_permission IS DISTINCT FROM NEW.scope_permission
        OR OLD.scope_resource IS DISTINCT FROM NEW.scope_resource
+       OR OLD.credential_ttl_seconds IS DISTINCT FROM NEW.credential_ttl_seconds
        OR OLD.credential_expires_at IS DISTINCT FROM NEW.credential_expires_at
        OR OLD.created_at IS DISTINCT FROM NEW.created_at THEN
         RAISE EXCEPTION USING

@@ -73,9 +73,9 @@ func TestRunNextHardDisablesProductionWriteBeforeCredentialPolicyStartOrExecutor
 	if got, want := fixture.events.snapshot(), []string{"safety:claim", "lease:claim"}; !equalStrings(got, want) {
 		t.Fatalf("production WRITE boundary events = %v, want %v", got, want)
 	}
-	if fixture.environment.calls != 1 || fixture.issuer.revokeCalls != 0 || len(fixture.executors.calls) != 0 {
-		t.Fatalf("production WRITE reached a post-claim dependency: environment calls=%d revoke calls=%d executor calls=%v",
-			fixture.environment.calls, fixture.issuer.revokeCalls, fixture.executors.calls)
+	if fixture.environment.calls != 1 || fixture.credentials.requestRevocationCalls != 0 || len(fixture.executors.calls) != 0 {
+		t.Fatalf("production WRITE reached a post-claim dependency: environment calls=%d revocation requests=%d executor calls=%v",
+			fixture.environment.calls, fixture.credentials.requestRevocationCalls, fixture.executors.calls)
 	}
 	queued, getErr := fixture.leases.Get(context.Background(), envelope.ActionID)
 	if getErr != nil || queued.Status != executionlease.StatusQueued || !queued.Production {
@@ -119,10 +119,10 @@ func TestRunNextRetainsAnUnexpectedProductionWriteClaimBeforeTrustEvaluation(t *
 		t.Fatalf("unexpected queue handling: claims=%d mutations=%v retained token=%q",
 			fixture.queue.claimCalls, fixture.queue.mutations, fixture.queue.claimed.Execution.LeaseToken)
 	}
-	if fixture.keys.calls != 0 || fixture.environment.calls != 0 || fixture.credentials.issueCalls != 0 || fixture.credentials.revokeCalls != 0 ||
+	if fixture.keys.calls != 0 || fixture.environment.calls != 0 || fixture.credentials.issueCalls != 0 || fixture.credentials.requestRevocationCalls != 0 ||
 		len(fixture.policyEvents.snapshot()) != 0 || len(fixture.executors.calls) != 0 {
 		t.Fatalf("production WRITE claim crossed the trust boundary: keys=%d environment=%d credential issue/revoke=%d/%d policy=%v executors=%v",
-			fixture.keys.calls, fixture.environment.calls, fixture.credentials.issueCalls, fixture.credentials.revokeCalls,
+			fixture.keys.calls, fixture.environment.calls, fixture.credentials.issueCalls, fixture.credentials.requestRevocationCalls,
 			fixture.policyEvents.snapshot(), fixture.executors.calls)
 	}
 }
@@ -140,6 +140,8 @@ func TestRunNextRetainsClaimMetadataAnomaliesBeforeTrustEvaluation(t *testing.T)
 		Execution: executionlease.Execution{
 			ExecutionID: envelope.ActionID, TargetKey: targetKey, Pool: executionlease.PoolWrite,
 			Status: executionlease.StatusLeased, RunnerID: "runner-1", LeaseToken: "metadata-anomaly-token",
+			RunnerTenantID: "tenant-test", RunnerWorkspaceID: envelope.WorkspaceID,
+			RunnerEnvironmentID: envelope.Target.EnvironmentID, ScopeRevision: 1,
 			LeaseEpoch: 8, LeaseExpiresAt: now.Add(time.Minute),
 		},
 		Envelope: envelope, PlanHash: envelope.PlanHash, TargetKey: targetKey,
@@ -163,6 +165,10 @@ func TestRunNextRetainsClaimMetadataAnomaliesBeforeTrustEvaluation(t *testing.T)
 		},
 		"plan hash differs from envelope": func(claimed *ClaimedAction) {
 			claimed.PlanHash = strings.Repeat("f", 64)
+		},
+		"workspace and environment pair is outside runner scope": func(claimed *ClaimedAction) {
+			claimed.Envelope.WorkspaceID = "workspace-outside-runner-scope"
+			claimed.Execution.RunnerWorkspaceID = claimed.Envelope.WorkspaceID
 		},
 	}
 	for name, mutate := range tests {
@@ -311,12 +317,26 @@ func TestRunNextCallsSafetyClaimCredentialPolicyStartTypedExecutorAndCompleteInO
 		t.Fatalf("RunNext() execution = %#v", execution)
 	}
 	wantOrder := []string{
-		"safety:claim", "lease:claim", "environment:resolve", "credential:policy", "credential:issue",
-		"policy:pre-execution", "safety:start", "environment:resolve", "lease:start", "executor:kubernetes-rollout-restart", "lease:complete",
-		"credential:revoke", "lease:finalize",
+		"safety:claim", "lease:claim", "environment:resolve", "policy:credential-issue", "policy:pre-execution",
+		"safety:start", "environment:resolve", "credential:prepare", "lease:start", "lease:heartbeat",
+		"credential:issue", "credential:validate-manager", "credential:create-child", "credential:inspect-child",
+		"credential:issue-dynamic", "lease:heartbeat", "executor:kubernetes-rollout-restart", "lease:heartbeat",
+		"lease:complete", "credential:request-revocation", "lease:finalize",
 	}
 	if got := fixture.events.snapshot(); !equalStrings(got, wantOrder) {
 		t.Fatalf("call order = %v, want %v", got, wantOrder)
+	}
+	preparedRequest := fixture.credentials.preparedRequest
+	if preparedRequest.Selection.TenantID != "tenant-test" ||
+		preparedRequest.Selection.WorkspaceID != envelope.WorkspaceID ||
+		preparedRequest.Selection.EnvironmentID != envelope.Target.EnvironmentID ||
+		preparedRequest.Selection.Production || preparedRequest.Selection.ActionType != string(envelope.ActionType) ||
+		preparedRequest.Selection.ConnectorID != envelope.CredentialScope.ConnectorID ||
+		preparedRequest.Selection.Permission != envelope.CredentialScope.Permission ||
+		preparedRequest.Selection.Resource != envelope.CredentialScope.Resource ||
+		preparedRequest.RequestedTTL != time.Duration(envelope.CredentialScope.TTLSeconds)*time.Second ||
+		preparedRequest.PolicyExpiresAt != fixture.preExecution.credentialDecision.CredentialExpiresAt {
+		t.Fatalf("durable credential request was not built from trusted runner/envelope/policy state: %#v", preparedRequest)
 	}
 	if len(fixture.safety.requests) != 2 {
 		t.Fatalf("safety requests = %#v", fixture.safety.requests)
@@ -326,7 +346,7 @@ func TestRunNextCallsSafetyClaimCredentialPolicyStartTypedExecutorAndCompleteInO
 		startRequest.ConnectorID != envelope.CredentialScope.ConnectorID || startRequest.ActionType != envelope.ActionType {
 		t.Fatalf("start safety request is not action-scoped: %#v", startRequest)
 	}
-	if fixture.executors.capturedCredential == nil || fixture.executors.capturedCredential.Secret() != nil {
+	if !fixture.executors.credentialCaptured || fixture.executors.capturedCredential.Secret() != nil {
 		t.Fatal("credential was not destroyed after executor returned")
 	}
 }
@@ -461,7 +481,7 @@ func TestRunNextHeartbeatsTheRunningFenceUntilTypedExecutionCompletes(t *testing
 	}
 }
 
-func TestRunNextTreatsHeartbeatFailureAsUncertainAndCancelsTheExecutor(t *testing.T) {
+func TestRunNextInitialHeartbeatFailureRecordsNoCredentialBeforeIssuerOrExecutor(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
@@ -471,7 +491,6 @@ func TestRunNextTreatsHeartbeatFailureAsUncertainAndCancelsTheExecutor(t *testin
 	})
 	fixture.service.heartbeatInterval = 5 * time.Millisecond
 	fixture.leases.heartbeatErr = errors.New("heartbeat transport failed")
-	fixture.executors.waitForCancellation = true
 	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
 		t.Fatalf("Submit() error = %v", err)
 	}
@@ -480,11 +499,74 @@ func TestRunNextTreatsHeartbeatFailureAsUncertainAndCancelsTheExecutor(t *testin
 	if !errors.Is(err, ErrExecutionUncertain) {
 		t.Fatalf("RunNext() error = %v, want %v", err, ErrExecutionUncertain)
 	}
-	if execution.Status != executionlease.StatusUncertain || len(execution.ResultHash) != 64 {
+	if execution.Status != executionlease.StatusRunning || execution.ResultHash != "" {
 		t.Fatalf("execution = %#v", execution)
 	}
-	if fixture.executors.capturedCredential == nil || fixture.executors.capturedCredential.Secret() != nil {
-		t.Fatal("credential was not destroyed after heartbeat failure")
+	if fixture.credentials.issueCalls != 0 || fixture.credentials.recordNoCredentialCalls != 1 || len(fixture.executors.calls) != 0 {
+		t.Fatalf("initial heartbeat failure crossed issuance boundary: issue=%d no-credential=%d executors=%v",
+			fixture.credentials.issueCalls, fixture.credentials.recordNoCredentialCalls, fixture.executors.calls)
+	}
+}
+
+func TestRunNextHeartbeatLossDuringIssuanceNeverStartsExecutor(t *testing.T) {
+	now := time.Now().UTC()
+	envelope, keys := signedEnvelope(t, restartEnvelope(now))
+	fixture := newRunnerFixture(t, now, envelope, keys, ExecutorResult{
+		Outcome: ExecutorSucceeded, Code: "MUST_NOT_RUN", Verification: VerificationPassed, Changed: true,
+	})
+	fixture.service.heartbeatInterval = 5 * time.Millisecond
+	fixture.leases.heartbeatErr = errors.New("heartbeat lease lost")
+	fixture.leases.heartbeatErrAfter = 2
+	heartbeats := make(chan struct{}, 4)
+	fixture.leases.heartbeatObserved = heartbeats
+	issueEntered := make(chan struct{}, 1)
+	issueRelease := make(chan struct{})
+	fixture.issuer.issueEntered = issueEntered
+	fixture.issuer.issueRelease = issueRelease
+	fixture.issuer.ignoreCancellation = true
+	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	type runResult struct {
+		execution executionlease.Execution
+		err       error
+	}
+	runDone := make(chan runResult, 1)
+	go func() {
+		execution, err := fixture.service.RunNext(context.Background())
+		runDone <- runResult{execution: execution, err: err}
+	}()
+	select {
+	case <-issueEntered:
+	case <-time.After(time.Second):
+		t.Fatal("durable issuance did not reach the blocked dynamic issuer")
+	}
+	for observed := 0; observed < 2; observed++ {
+		select {
+		case <-heartbeats:
+		case <-time.After(time.Second):
+			t.Fatal("heartbeat loss was not observed during issuance")
+		}
+	}
+	close(issueRelease)
+	select {
+	case result := <-runDone:
+		if !errors.Is(result.err, ErrExecutionUncertain) || result.execution.Status != executionlease.StatusUncertain {
+			t.Fatalf("RunNext() = %#v, %v; want UNCERTAIN after issuance heartbeat loss", result.execution, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RunNext() did not converge after the late issuer returned")
+	}
+	if len(fixture.executors.calls) != 0 || fixture.credentials.issueCalls != 1 {
+		t.Fatalf("late issuance crossed executor gate: issue=%d executors=%v", fixture.credentials.issueCalls, fixture.executors.calls)
+	}
+	revocations, err := fixture.credentialRepo.List(context.Background(), credential.ListFilter{
+		WorkspaceID: envelope.WorkspaceID, Limit: 10,
+	})
+	if err != nil || len(revocations) != 1 ||
+		(revocations[0].Status != credential.StatusRevocationPending && revocations[0].Status != credential.StatusRevoking) {
+		t.Fatalf("credential cleanup after lost issuance heartbeat = %#v, %v", revocations, err)
 	}
 }
 
@@ -602,8 +684,8 @@ func TestRunNextPolicyDenialDoesNotStartOrDispatch(t *testing.T) {
 	}); !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
 		t.Fatalf("permanently denied action was redelivered: %v", err)
 	}
-	if fixture.issuer.revokeCalls != 1 {
-		t.Fatalf("credential revoke calls = %d, want 1", fixture.issuer.revokeCalls)
+	if fixture.credentials.requestRevocationCalls != 0 {
+		t.Fatalf("credential revocation requests = %d, want 0 before Prepare", fixture.credentials.requestRevocationCalls)
 	}
 }
 
@@ -679,6 +761,40 @@ func TestRunNextBoundsExecutorContextBySignedVerificationTimeout(t *testing.T) {
 	}
 }
 
+func TestRunNextCancelsExecutionAtTheActualDurableCredentialExpiry(t *testing.T) {
+	now := credential.CanonicalCredentialExpiry(time.Now().UTC())
+	envelope, keys := signedEnvelope(t, restartEnvelope(now))
+	fixture := newRunnerFixtureWithClock(t, time.Now, envelope, keys, ExecutorResult{
+		Outcome: ExecutorSucceeded, Code: "MUST_NOT_SURVIVE_CREDENTIAL_EXPIRY", Verification: VerificationPassed, Changed: true,
+	})
+	fixture.issuer.dynamicTTL = 250 * time.Millisecond
+	fixture.executors.waitForCancellation = true
+	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	startedAt := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	completed, err := fixture.service.RunNext(ctx)
+	elapsed := time.Since(startedAt)
+	if !errors.Is(err, ErrExecutionUncertain) || completed.Status != executionlease.StatusUncertain {
+		t.Fatalf("RunNext(short credential TTL) = %#v, %v; want UNCERTAIN", completed, err)
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("executor survived its 250ms credential TTL for %s", elapsed)
+	}
+	credentialExpiry := fixture.executors.capturedCredential.ExpiresAt()
+	if fixture.executors.capturedDeadline.IsZero() || credentialExpiry.IsZero() ||
+		fixture.executors.capturedDeadline.After(credentialExpiry.Add(100*time.Millisecond)) {
+		t.Fatalf("executor deadline = %s, credential expiry = %s", fixture.executors.capturedDeadline, credentialExpiry)
+	}
+	if fixture.credentials.requestRevocationCalls != 1 || fixture.executors.capturedCredential.Secret() != nil {
+		t.Fatalf("credential expiry cleanup = requests %d secret %v",
+			fixture.credentials.requestRevocationCalls, fixture.executors.capturedCredential.Secret())
+	}
+}
+
 func TestRunNextTreatsCompletionTransportFailureAsUncertain(t *testing.T) {
 	t.Parallel()
 
@@ -698,8 +814,8 @@ func TestRunNextTreatsCompletionTransportFailureAsUncertain(t *testing.T) {
 	if execution.LeaseToken != "" {
 		t.Fatalf("completion error leaked lease token %q", execution.LeaseToken)
 	}
-	if fixture.issuer.revokeCalls != 1 {
-		t.Fatalf("credential revoke calls = %d, want 1", fixture.issuer.revokeCalls)
+	if fixture.credentials.requestRevocationCalls != 1 {
+		t.Fatalf("credential revocation requests = %d, want 1", fixture.credentials.requestRevocationCalls)
 	}
 }
 
@@ -711,13 +827,14 @@ func TestRunNextCredentialRevokeFailureLeavesDurableFinalizingState(t *testing.T
 	fixture := newRunnerFixture(t, now, envelope, keys, ExecutorResult{
 		Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed, Changed: true,
 	})
-	fixture.issuer.revokeErr = errors.New("credential backend unavailable")
+	fixture.credentials.requestRevocationErr = errors.New("credential persistence unavailable")
 	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
 		t.Fatalf("Submit() error = %v", err)
 	}
 
 	result, err := fixture.service.RunNext(context.Background())
-	if !errors.Is(err, ErrCredentialRevokeFailed) || result.Status != executionlease.StatusFinalizing {
+	if !errors.Is(err, ErrCredentialCleanupPending) || result.Status != executionlease.StatusFinalizing ||
+		result.CompletionStatus != executionlease.StatusSucceeded {
 		t.Fatalf("RunNext() = %#v, %v; want durable FINALIZING revoke failure", result, err)
 	}
 	persisted, getErr := fixture.leases.Get(context.Background(), envelope.ActionID)
@@ -728,6 +845,34 @@ func TestRunNextCredentialRevokeFailureLeavesDurableFinalizingState(t *testing.T
 		if event == "lease:finalize" {
 			t.Fatalf("revoke failure invoked Finalize: %v", fixture.events.snapshot())
 		}
+	}
+}
+
+func TestRunNextSuccessfulExecutorKeepsOriginalCompletionWhileCleanupPending(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	envelope, keys := signedEnvelope(t, restartEnvelope(now))
+	fixture := newRunnerFixture(t, now, envelope, keys, ExecutorResult{
+		Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed, Changed: true,
+	})
+	fixture.credentials.terminalOnRequest = false
+	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	result, err := fixture.service.RunNext(context.Background())
+	if !errors.Is(err, ErrCredentialCleanupPending) || errors.Is(err, ErrExecutionFailed) ||
+		result.Status != executionlease.StatusFinalizing || result.CompletionStatus != executionlease.StatusSucceeded {
+		t.Fatalf("RunNext(cleanup pending) = %#v, %v", result, err)
+	}
+	if len(result.ResultHash) != 64 || fixture.credentials.requestRevocationCalls != 1 ||
+		fixture.executors.capturedCredential.Secret() != nil {
+		t.Fatalf("pending cleanup lost result or secret hygiene: result=%#v requests=%d",
+			result, fixture.credentials.requestRevocationCalls)
+	}
+	if contains(fixture.events.snapshot(), "lease:finalize") {
+		t.Fatalf("nonterminal cleanup invoked Finalize: %v", fixture.events.snapshot())
 	}
 }
 
@@ -763,7 +908,7 @@ func TestRunNextFinalizeFailureLeavesRecoverableFinalizingState(t *testing.T) {
 	}
 }
 
-func TestRunNextStopsExecutorWhenRunnerScopeRevisionChanges(t *testing.T) {
+func TestRunNextInitialHeartbeatScopeChangePreventsIssuerAndExecutor(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now().UTC()
@@ -781,18 +926,21 @@ func TestRunNextStopsExecutorWhenRunnerScopeRevisionChanges(t *testing.T) {
 		registrations: []RunnerRegistration{base, base, changed},
 	}
 	fixture.service.heartbeatInterval = 5 * time.Millisecond
-	fixture.executors.waitForCancellation = true
 	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
 		t.Fatalf("Submit() error = %v", err)
 	}
 
 	result, err := fixture.service.RunNext(context.Background())
-	if !errors.Is(err, ErrExecutionUncertain) || result.Status != executionlease.StatusUncertain {
+	if !errors.Is(err, ErrExecutionUncertain) || result.Status != executionlease.StatusRunning {
 		t.Fatalf("RunNext(scope revision changed) = %#v, %v", result, err)
+	}
+	if fixture.credentials.issueCalls != 0 || fixture.credentials.recordNoCredentialCalls != 1 || len(fixture.executors.calls) != 0 {
+		t.Fatalf("scope change crossed issuance boundary: issue=%d no-credential=%d executors=%v",
+			fixture.credentials.issueCalls, fixture.credentials.recordNoCredentialCalls, fixture.executors.calls)
 	}
 }
 
-func TestRunNextTreatsCanceledHeartbeatResolveAsNormalStopAfterExecutorSuccess(t *testing.T) {
+func TestRunNextBoundsInitialHeartbeatRegistryResolutionBeforeIssuer(t *testing.T) {
 	now := time.Now().UTC()
 	envelope, keys := signedEnvelope(t, restartEnvelope(now))
 	fixture := newRunnerFixture(t, now, envelope, keys, ExecutorResult{
@@ -815,7 +963,6 @@ func TestRunNextTreatsCanceledHeartbeatResolveAsNormalStopAfterExecutorSuccess(t
 			close(executorRelease)
 		}
 	}()
-	fixture.executors.release = executorRelease
 	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
 		t.Fatalf("Submit() error = %v", err)
 	}
@@ -836,11 +983,15 @@ func TestRunNextTreatsCanceledHeartbeatResolveAsNormalStopAfterExecutorSuccess(t
 	close(executorRelease)
 	select {
 	case result := <-runDone:
-		if result.err != nil || result.execution.Status != executionlease.StatusSucceeded {
-			t.Fatalf("RunNext() = %#v, %v; canceled heartbeat resolve must be a normal stop", result.execution, result.err)
+		if !errors.Is(result.err, ErrExecutionUncertain) || result.execution.Status != executionlease.StatusRunning {
+			t.Fatalf("RunNext() = %#v, %v; blocked initial heartbeat must fail closed", result.execution, result.err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("RunNext() did not finish after executor success")
+	}
+	if fixture.credentials.issueCalls != 0 || fixture.credentials.recordNoCredentialCalls != 1 || len(fixture.executors.calls) != 0 {
+		t.Fatalf("blocked initial heartbeat crossed issuance boundary: issue=%d no-credential=%d executors=%v",
+			fixture.credentials.issueCalls, fixture.credentials.recordNoCredentialCalls, fixture.executors.calls)
 	}
 }
 
@@ -852,15 +1003,15 @@ func TestRunNextExecutorCannotTamperWithCredentialRevocationMetadata(t *testing.
 	fixture := newRunnerFixture(t, now, envelope, keys, ExecutorResult{
 		Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed, Changed: true,
 	})
-	fixture.executors.mutateCredentialMetadata = true
+	fixture.executors.destroyCredential = true
 	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
 		t.Fatalf("Submit() error = %v", err)
 	}
 	if _, err := fixture.service.RunNext(context.Background()); err != nil {
 		t.Fatalf("RunNext() error = %v", err)
 	}
-	if fixture.issuer.revokeCalls != 1 || fixture.issuer.revokedLeaseID != "credential-lease-1" {
-		t.Fatalf("credential revocation = calls %d lease %q", fixture.issuer.revokeCalls, fixture.issuer.revokedLeaseID)
+	if fixture.credentials.requestRevocationCalls != 1 {
+		t.Fatalf("credential revocation requests = %d, want 1", fixture.credentials.requestRevocationCalls)
 	}
 }
 
@@ -1060,6 +1211,12 @@ func TestRunNextStaleFenceNeverDispatchesExecutor(t *testing.T) {
 	if len(fixture.executors.calls) != 0 {
 		t.Fatalf("stale fence dispatched executor: %v", fixture.executors.calls)
 	}
+	if fixture.credentials.prepareCalls != 1 || fixture.credentials.recordNoCredentialCalls != 1 ||
+		fixture.credentials.issueCalls != 0 || fixture.issuer.createCalls != 0 {
+		t.Fatalf("Start failure cleanup = prepare/no-credential/issue/create %d/%d/%d/%d",
+			fixture.credentials.prepareCalls, fixture.credentials.recordNoCredentialCalls,
+			fixture.credentials.issueCalls, fixture.issuer.createCalls)
+	}
 }
 
 func TestDeriveTargetKeyUsesExactKubernetesAndGitOpsIdentityAndInventoryWideAWXLock(t *testing.T) {
@@ -1148,8 +1305,10 @@ type runnerFixture struct {
 	environment    *fakeEnvironmentResolver
 	safety         *fakeSafetyGate
 	preExecution   *fakePreExecutionGate
-	credentialGate *fakeCredentialPolicyGate
-	issuer         *fakeDynamicIssuer
+	credentialGate *fakePreExecutionGate
+	credentials    *serviceDurableCredentialBroker
+	credentialRepo *credential.MemoryRepository
+	issuer         *serviceDurableIssuer
 	executors      *recordingExecutors
 	events         *eventLog
 }
@@ -1162,25 +1321,80 @@ func newRunnerFixture(t *testing.T, now time.Time, envelope action.Envelope, key
 func newRunnerFixtureWithClock(t *testing.T, clock func() time.Time, envelope action.Envelope, keys action.KeyResolver, result ExecutorResult) *runnerFixture {
 	t.Helper()
 	events := &eventLog{}
-	memoryQueue := mustMemoryActionQueue(t, clock)
-	leases := &recordingActionQueue{ActionQueue: memoryQueue, memory: memoryQueue, events: events}
+	actionSource := &serviceActionFenceSource{}
+	protector, err := credential.NewAESGCMProtector(credential.KeyRing{
+		ActiveKeyID: "execution-test-key",
+		Keys: map[string]credential.ProtectionKey{
+			"execution-test-key": {
+				EncryptionKey: []byte("0123456789abcdef0123456789abcdef"),
+				HMACKey:       []byte("abcdef0123456789abcdef0123456789"),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("credential.NewAESGCMProtector() error = %v", err)
+	}
+	credentialRepo, err := credential.NewMemoryRepository(actionSource, protector, credential.MemoryRepositoryOptions{
+		Clock: clock,
+		TokenSource: func() (string, error) {
+			return "execution-revocation-claim-token", nil
+		},
+		PermitSource: func() (string, error) {
+			return "execution-child-create-permit", nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("credential.NewMemoryRepository() error = %v", err)
+	}
+	memoryQueue, err := NewMemoryActionQueue(MemoryActionQueueOptions{
+		Clock: clock, CredentialFinalizationGate: credentialRepo,
+		TokenSource: func() (string, error) { return "queue-lease-token", nil },
+	})
+	if err != nil {
+		t.Fatalf("NewMemoryActionQueue() error = %v", err)
+	}
+	leases := &recordingActionQueue{ActionQueue: memoryQueue, memory: memoryQueue, events: events, actionSource: actionSource}
 	environment := &fakeEnvironmentResolver{snapshots: []EnvironmentSnapshot{nonProductionEnvironment(envelope, clock()), nonProductionEnvironment(envelope, clock())}, events: events}
 	safety := &fakeSafetyGate{snapshots: []ClaimSafetySnapshot{validSafety(clock()), validStartSafety(envelope, clock())}, events: events}
-	credentialGate := &fakeCredentialPolicyGate{decision: credentialDecision(envelope, clock()), events: events}
-	issuer := &fakeDynamicIssuer{expiresAt: clock().Add(5 * time.Minute), events: events}
-	broker, err := credential.NewBroker(credentialGate, issuer, clock)
-	if err != nil {
-		t.Fatalf("credential.NewBroker() error = %v", err)
+	preExecution := &fakePreExecutionGate{
+		decision: preExecutionDecision(envelope, clock()), credentialDecision: credentialDecision(envelope, clock()), events: events,
 	}
-	preExecution := &fakePreExecutionGate{decision: preExecutionDecision(envelope, clock()), events: events}
+	issuer := &serviceDurableIssuer{clock: clock, events: events}
+	registry, err := credential.NewIssuerRegistry([]credential.IssuerRegistration{{
+		Selection: credential.DurableIssuerResolveRequest{
+			TenantID: "tenant-test", WorkspaceID: envelope.WorkspaceID, EnvironmentID: envelope.Target.EnvironmentID,
+			Production: false, ActionType: string(envelope.ActionType), ConnectorID: envelope.CredentialScope.ConnectorID,
+			Permission: envelope.CredentialScope.Permission, Resource: envelope.CredentialScope.Resource,
+		},
+		Profile: credential.DurableIssuerProfile{
+			IssuerID: issuer.IssuerID(), Revision: issuer.IssuerRevision(), CredentialTTL: 5 * time.Minute,
+		},
+		Issuer: issuer,
+	}})
+	if err != nil {
+		t.Fatalf("credential.NewIssuerRegistry() error = %v", err)
+	}
+	broker, err := credential.NewDurableBroker(credentialRepo, registry, credential.DurableBrokerOptions{
+		Clock: clock,
+		UUIDSource: func() (string, error) {
+			return "11111111-1111-4111-8111-111111111111", nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("credential.NewDurableBroker() error = %v", err)
+	}
+	credentials := &serviceDurableCredentialBroker{
+		broker: broker, repository: credentialRepo, events: events, terminalOnRequest: true,
+	}
 	executors := &recordingExecutors{result: result, events: events}
 	service := mustService(t, Dependencies{
 		Queue: leases, Keys: keys, Environments: environment, Safety: safety,
-		Credentials: broker, Policy: preExecution, Executors: executors.asDependencies(),
+		Credentials: credentials, Policy: preExecution, Executors: executors.asDependencies(),
 	}, Options{RunnerID: "runner-1", LeaseDuration: time.Minute, FinalizeTimeout: time.Second, Clock: clock})
 	return &runnerFixture{
 		service: service, leases: leases, environment: environment, safety: safety,
-		preExecution: preExecution, credentialGate: credentialGate, issuer: issuer,
+		preExecution: preExecution, credentialGate: preExecution, credentials: credentials,
+		credentialRepo: credentialRepo, issuer: issuer,
 		executors: executors, events: events,
 	}
 }
@@ -1278,8 +1492,11 @@ type recordingActionQueue struct {
 	ActionQueue
 	memory            *MemoryActionQueue
 	events            *eventLog
+	actionSource      *serviceActionFenceSource
 	startErr          error
 	heartbeatErr      error
+	heartbeatErrAfter int
+	heartbeatCalls    int
 	completeErr       error
 	finalizeErr       error
 	heartbeatObserved chan<- struct{}
@@ -1314,7 +1531,11 @@ func (queue *forcedClaimActionQueue) Nack(context.Context, ActionNackRequest) (e
 
 func (repository *recordingActionQueue) Claim(ctx context.Context, request ActionClaimRequest) (ClaimedAction, error) {
 	repository.events.add("lease:claim")
-	return repository.ActionQueue.Claim(ctx, request)
+	claimed, err := repository.ActionQueue.Claim(ctx, request)
+	if err == nil && repository.actionSource != nil {
+		repository.actionSource.update(claimed.Execution, claimed.Envelope)
+	}
+	return claimed, err
 }
 
 func (repository *recordingActionQueue) Start(ctx context.Context, lease executionlease.LeaseIdentity) (executionlease.Execution, error) {
@@ -1322,7 +1543,11 @@ func (repository *recordingActionQueue) Start(ctx context.Context, lease executi
 	if repository.startErr != nil {
 		return executionlease.Execution{}, repository.startErr
 	}
-	return repository.ActionQueue.Start(ctx, lease)
+	started, err := repository.ActionQueue.Start(ctx, lease)
+	if err == nil && repository.actionSource != nil {
+		repository.actionSource.updateExecution(started)
+	}
+	return started, err
 }
 
 func (repository *recordingActionQueue) Complete(ctx context.Context, request ActionCompleteRequest) (executionlease.Execution, error) {
@@ -1343,16 +1568,22 @@ func (repository *recordingActionQueue) Finalize(ctx context.Context, lease exec
 
 func (repository *recordingActionQueue) Heartbeat(ctx context.Context, request ActionHeartbeatRequest) (ActionHeartbeatResult, error) {
 	repository.events.add("lease:heartbeat")
+	repository.heartbeatCalls++
 	if repository.heartbeatObserved != nil {
 		select {
 		case repository.heartbeatObserved <- struct{}{}:
 		default:
 		}
 	}
-	if repository.heartbeatErr != nil {
+	if repository.heartbeatErr != nil &&
+		(repository.heartbeatErrAfter == 0 || repository.heartbeatCalls >= repository.heartbeatErrAfter) {
 		return ActionHeartbeatResult{}, repository.heartbeatErr
 	}
-	return repository.ActionQueue.Heartbeat(ctx, request)
+	result, err := repository.ActionQueue.Heartbeat(ctx, request)
+	if err == nil && repository.actionSource != nil {
+		repository.actionSource.updateExecution(result.Execution)
+	}
+	return result, err
 }
 
 func (repository *recordingActionQueue) Get(ctx context.Context, executionID string) (executionlease.Execution, error) {
@@ -1408,57 +1639,330 @@ func (gate *fakeSafetyGate) Evaluate(_ context.Context, request SafetyRequest) (
 	return snapshot, nil
 }
 
-type fakeCredentialPolicyGate struct {
-	decision policy.Decision
-	events   *eventLog
-}
-
-func (gate *fakeCredentialPolicyGate) EvaluateCredentialIssue(context.Context, action.Envelope) (policy.Decision, error) {
-	gate.events.add("credential:policy")
-	return gate.decision, nil
-}
-
-type fakeDynamicIssuer struct {
-	expiresAt      time.Time
-	events         *eventLog
-	revokeCalls    int
-	revokedLeaseID string
-	revokeErr      error
-}
-
-func (issuer *fakeDynamicIssuer) Issue(context.Context, credential.IssueRequest) (credential.IssuedLease, error) {
-	issuer.events.add("credential:issue")
-	return credential.IssuedLease{LeaseID: "credential-lease-1", Secret: []byte("ephemeral-secret"), ExpiresAt: issuer.expiresAt}, nil
-}
-
-func (issuer *fakeDynamicIssuer) Revoke(_ context.Context, leaseID string) error {
-	issuer.revokeCalls++
-	issuer.revokedLeaseID = leaseID
-	issuer.events.add("credential:revoke")
-	return issuer.revokeErr
-}
-
 type fakeCredentialBroker struct{ err error }
 
-func (broker *fakeCredentialBroker) Issue(context.Context, action.Envelope) (credential.Credential, error) {
-	return credential.Credential{}, broker.err
+type serviceActionFenceSource struct {
+	mu         sync.Mutex
+	execution  executionlease.Execution
+	envelope   action.Envelope
+	leaseToken string
 }
 
-func (*fakeCredentialBroker) Revoke(context.Context, *credential.Credential) error { return nil }
+func (source *serviceActionFenceSource) update(execution executionlease.Execution, envelope action.Envelope) {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	source.execution = execution
+	source.envelope = cloneEnvelope(envelope)
+	source.leaseToken = execution.LeaseToken
+}
+
+func (source *serviceActionFenceSource) updateExecution(execution executionlease.Execution) {
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	if execution.ExecutionID == source.execution.ExecutionID {
+		leaseToken := source.leaseToken
+		source.execution = execution
+		source.leaseToken = leaseToken
+	}
+}
+
+func (source *serviceActionFenceSource) ResolveActionFence(ctx context.Context, fence credential.ActionFence) (credential.ActionMetadata, error) {
+	if err := ctx.Err(); err != nil {
+		return credential.ActionMetadata{}, err
+	}
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	if !source.matchesFence(fence) {
+		return credential.ActionMetadata{}, credential.ErrStaleActionFence
+	}
+	return source.metadata(), nil
+}
+
+func (source *serviceActionFenceSource) InspectAction(ctx context.Context, actionID string) (credential.ActionInspection, error) {
+	if err := ctx.Err(); err != nil {
+		return credential.ActionInspection{}, err
+	}
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	if source.execution.ExecutionID != actionID {
+		return credential.ActionInspection{}, credential.ErrStaleActionFence
+	}
+	return credential.ActionInspection{
+		Metadata: source.metadata(), LeaseTokenSHA256: credential.SHA256Hex([]byte(source.leaseToken)),
+	}, nil
+}
+
+func (source *serviceActionFenceSource) WithLockedActionInspection(
+	ctx context.Context,
+	actionID string,
+	operation func(credential.ActionInspection) error,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	if source.execution.ExecutionID != actionID {
+		return credential.ErrStaleActionFence
+	}
+	return operation(credential.ActionInspection{
+		Metadata: source.metadata(), LeaseTokenSHA256: credential.SHA256Hex([]byte(source.leaseToken)),
+	})
+}
+
+func (source *serviceActionFenceSource) matchesFence(fence credential.ActionFence) bool {
+	return source.execution.ExecutionID == fence.ActionID && source.execution.RunnerID == fence.RunnerID &&
+		source.execution.LeaseEpoch == fence.Epoch && source.leaseToken == fence.Token
+}
+
+func (source *serviceActionFenceSource) metadata() credential.ActionMetadata {
+	value := source.execution
+	return credential.ActionMetadata{
+		ActionID: value.ExecutionID, TenantID: value.RunnerTenantID, WorkspaceID: value.RunnerWorkspaceID,
+		EnvironmentID: value.RunnerEnvironmentID, TargetKey: value.TargetKey, Production: value.Production,
+		RunnerID: value.RunnerID, LeaseEpoch: value.LeaseEpoch, Status: credential.ActionStatus(value.Status),
+		LeaseExpiresAt: value.LeaseExpiresAt, AuthorizationExpiresAt: source.envelope.ExpiresAt,
+		CancelRequestedAt: value.CancelRequestedAt, RunnerEnabled: true, RunnerPool: string(value.Pool),
+		ScopeRevision: value.ScopeRevision, RunnerScopeRevision: value.ScopeRevision, ExactScopeAuthorized: true,
+		ActionType: string(source.envelope.ActionType), CredentialTTLSeconds: source.envelope.CredentialScope.TTLSeconds,
+		ConnectorID: source.envelope.CredentialScope.ConnectorID,
+		Permission:  source.envelope.CredentialScope.Permission,
+		Resource:    source.envelope.CredentialScope.Resource,
+	}
+}
+
+type serviceDurableIssuer struct {
+	clock              func() time.Time
+	events             *eventLog
+	validateCalls      int
+	createCalls        int
+	inspectCalls       int
+	issueCalls         int
+	validateErr        error
+	createErr          error
+	inspectErr         error
+	issueErr           error
+	issueEntered       chan<- struct{}
+	issueRelease       <-chan struct{}
+	ignoreCancellation bool
+	dynamicTTL         time.Duration
+}
+
+func (*serviceDurableIssuer) IssuerID() string       { return "execution-vault-nonprod" }
+func (*serviceDurableIssuer) IssuerRevision() string { return "revision-1" }
+
+func (issuer *serviceDurableIssuer) ValidateManager(ctx context.Context) error {
+	issuer.validateCalls++
+	if issuer.events != nil {
+		issuer.events.add("credential:validate-manager")
+	}
+	if issuer.validateErr != nil {
+		return issuer.validateErr
+	}
+	return ctx.Err()
+}
+
+func (issuer *serviceDurableIssuer) CreateChild(
+	ctx context.Context,
+	request credential.DurableChildCreateRequest,
+) (credential.DurableChild, error) {
+	issuer.createCalls++
+	if issuer.events != nil {
+		issuer.events.add("credential:create-child")
+	}
+	if issuer.createErr != nil {
+		return credential.DurableChild{}, issuer.createErr
+	}
+	token, err := credential.NewSensitiveValue([]byte("execution-child-token"))
+	if err != nil {
+		return credential.DurableChild{}, err
+	}
+	accessor, err := credential.NewSensitiveReference([]byte("execution-child-accessor"))
+	if err != nil {
+		token.Destroy()
+		return credential.DurableChild{}, err
+	}
+	return credential.DurableChild{
+		Token: token, Accessor: accessor, ExpiresAt: request.DatabaseAuthorizedAt.Add(request.TTL),
+	}, ctx.Err()
+}
+
+func (issuer *serviceDurableIssuer) InspectChild(
+	ctx context.Context,
+	_ *credential.SensitiveReference,
+	_ credential.DurableChildInspectionRequest,
+) error {
+	issuer.inspectCalls++
+	if issuer.events != nil {
+		issuer.events.add("credential:inspect-child")
+	}
+	if issuer.inspectErr != nil {
+		return issuer.inspectErr
+	}
+	return ctx.Err()
+}
+
+func (issuer *serviceDurableIssuer) IssueDynamic(
+	ctx context.Context,
+	_ credential.SensitiveValue,
+	request credential.DurableDynamicIssueRequest,
+) (credential.DurableDynamicSecret, error) {
+	issuer.issueCalls++
+	if issuer.events != nil {
+		issuer.events.add("credential:issue-dynamic")
+	}
+	if issuer.issueEntered != nil {
+		select {
+		case issuer.issueEntered <- struct{}{}:
+		default:
+		}
+	}
+	if issuer.issueRelease != nil {
+		if issuer.ignoreCancellation {
+			<-issuer.issueRelease
+		} else {
+			select {
+			case <-ctx.Done():
+				return credential.DurableDynamicSecret{}, ctx.Err()
+			case <-issuer.issueRelease:
+			}
+		}
+	}
+	if issuer.issueErr != nil {
+		return credential.DurableDynamicSecret{}, issuer.issueErr
+	}
+	secret, err := credential.NewSensitiveValue([]byte("execution-dynamic-secret"))
+	if err != nil {
+		return credential.DurableDynamicSecret{}, err
+	}
+	dynamicTTL := issuer.dynamicTTL
+	if dynamicTTL == 0 {
+		dynamicTTL = 2 * time.Minute
+	}
+	expiresAt := credential.CanonicalCredentialExpiry(issuer.clock().Add(dynamicTTL))
+	if request.CredentialExpiresAt.Before(expiresAt) {
+		expiresAt = request.CredentialExpiresAt
+	}
+	return credential.DurableDynamicSecret{Secret: secret, ExpiresAt: expiresAt}, nil
+}
+
+type serviceDurableCredentialBroker struct {
+	broker                  *credential.DurableBroker
+	repository              credential.Repository
+	events                  *eventLog
+	terminalOnRequest       bool
+	prepareCalls            int
+	issueCalls              int
+	recordNoCredentialCalls int
+	requestRevocationCalls  int
+	requestRevocationErr    error
+	preparedRequest         credential.PrepareDurableCredentialRequest
+}
+
+func (broker *serviceDurableCredentialBroker) Prepare(
+	ctx context.Context,
+	request credential.PrepareDurableCredentialRequest,
+) (credential.PreparedDurableCredential, error) {
+	broker.prepareCalls++
+	broker.preparedRequest = request
+	if broker.events != nil {
+		broker.events.add("credential:prepare")
+	}
+	return broker.broker.Prepare(ctx, request)
+}
+
+func (broker *serviceDurableCredentialBroker) Issue(
+	ctx context.Context,
+	prepared credential.PreparedDurableCredential,
+) (credential.DurableCredential, error) {
+	broker.issueCalls++
+	if broker.events != nil {
+		broker.events.add("credential:issue")
+	}
+	return broker.broker.Issue(ctx, prepared)
+}
+
+func (broker *serviceDurableCredentialBroker) RecordNoCredential(
+	ctx context.Context,
+	prepared credential.PreparedDurableCredential,
+) (credential.Revocation, error) {
+	broker.recordNoCredentialCalls++
+	if broker.events != nil {
+		broker.events.add("credential:no-credential")
+	}
+	return broker.broker.RecordNoCredential(ctx, prepared)
+}
+
+func (broker *serviceDurableCredentialBroker) RequestRevocation(
+	ctx context.Context,
+	executionCredential credential.DurableCredential,
+) (credential.Revocation, error) {
+	broker.requestRevocationCalls++
+	if broker.events != nil {
+		broker.events.add("credential:request-revocation")
+	}
+	if broker.requestRevocationErr != nil {
+		executionCredential.Destroy()
+		return credential.Revocation{}, broker.requestRevocationErr
+	}
+	revocation, err := broker.broker.RequestRevocation(ctx, executionCredential)
+	if err != nil || !broker.terminalOnRequest || revocation.Terminal() {
+		return revocation, err
+	}
+	claims, err := broker.repository.ClaimRevocations(ctx, credential.ClaimRevocationsRequest{
+		WorkerID: "execution-test-worker", Limit: 1, LeaseDuration: credential.RevocationClaimLease,
+	})
+	if err != nil {
+		return credential.Revocation{}, err
+	}
+	if len(claims) != 1 || claims[0].Revocation.ID != revocation.ID {
+		return credential.Revocation{}, errors.New("unexpected credential revocation claim")
+	}
+	defer claims[0].Accessor.Destroy()
+	return broker.repository.CompleteRevocation(ctx, credential.CompleteRevocationRequest{Fence: claims[0].Fence})
+}
+
+func (broker *fakeCredentialBroker) Prepare(context.Context, credential.PrepareDurableCredentialRequest) (credential.PreparedDurableCredential, error) {
+	return credential.PreparedDurableCredential{}, broker.err
+}
+
+func (broker *fakeCredentialBroker) Issue(context.Context, credential.PreparedDurableCredential) (credential.DurableCredential, error) {
+	return credential.DurableCredential{}, broker.err
+}
+
+func (broker *fakeCredentialBroker) RecordNoCredential(context.Context, credential.PreparedDurableCredential) (credential.Revocation, error) {
+	return credential.Revocation{}, broker.err
+}
+
+func (broker *fakeCredentialBroker) RequestRevocation(context.Context, credential.DurableCredential) (credential.Revocation, error) {
+	return credential.Revocation{}, broker.err
+}
 
 type countingCredentialBroker struct {
-	issueCalls  int
-	revokeCalls int
+	prepareCalls            int
+	issueCalls              int
+	recordNoCredentialCalls int
+	requestRevocationCalls  int
 }
 
-func (broker *countingCredentialBroker) Issue(context.Context, action.Envelope) (credential.Credential, error) {
+func (broker *countingCredentialBroker) Prepare(context.Context, credential.PrepareDurableCredentialRequest) (credential.PreparedDurableCredential, error) {
+	broker.prepareCalls++
+	return credential.PreparedDurableCredential{}, errors.New("unexpected credential prepare")
+}
+
+func (broker *countingCredentialBroker) Issue(context.Context, credential.PreparedDurableCredential) (credential.DurableCredential, error) {
 	broker.issueCalls++
-	return credential.Credential{}, errors.New("unexpected credential issue")
+	return credential.DurableCredential{}, errors.New("unexpected credential issue")
 }
 
-func (broker *countingCredentialBroker) Revoke(context.Context, *credential.Credential) error {
-	broker.revokeCalls++
-	return errors.New("unexpected credential revoke")
+func (broker *countingCredentialBroker) RecordNoCredential(context.Context, credential.PreparedDurableCredential) (credential.Revocation, error) {
+	broker.recordNoCredentialCalls++
+	return credential.Revocation{}, errors.New("unexpected no-credential transition")
+}
+
+func (broker *countingCredentialBroker) RequestRevocation(context.Context, credential.DurableCredential) (credential.Revocation, error) {
+	broker.requestRevocationCalls++
+	return credential.Revocation{}, errors.New("unexpected credential revocation request")
 }
 
 type countingKeyResolver struct{ calls int }
@@ -1469,9 +1973,17 @@ func (resolver *countingKeyResolver) Resolve(context.Context, string) (action.Ke
 }
 
 type fakePreExecutionGate struct {
-	decision policy.Decision
-	after    func()
-	events   *eventLog
+	decision           policy.Decision
+	credentialDecision policy.Decision
+	after              func()
+	events             *eventLog
+}
+
+func (gate *fakePreExecutionGate) EvaluateCredentialIssue(context.Context, action.Envelope) (policy.Decision, error) {
+	if gate.events != nil {
+		gate.events.add("policy:credential-issue")
+	}
+	return gate.credentialDecision, nil
 }
 
 func (gate *fakePreExecutionGate) EvaluatePreExecution(context.Context, action.Envelope) (policy.Decision, error) {
@@ -1485,17 +1997,18 @@ func (gate *fakePreExecutionGate) EvaluatePreExecution(context.Context, action.E
 }
 
 type recordingExecutors struct {
-	result                   ExecutorResult
-	err                      error
-	calls                    []string
-	events                   *eventLog
-	capturedCredential       *credential.Credential
-	release                  <-chan struct{}
-	waitForCancellation      bool
-	capturedDeadline         time.Time
-	mutateCredentialMetadata bool
-	ignoreCancellation       bool
-	finished                 chan<- struct{}
+	result              ExecutorResult
+	err                 error
+	calls               []string
+	events              *eventLog
+	capturedCredential  credential.DurableCredential
+	credentialCaptured  bool
+	release             <-chan struct{}
+	waitForCancellation bool
+	capturedDeadline    time.Time
+	destroyCredential   bool
+	ignoreCancellation  bool
+	finished            chan<- struct{}
 }
 
 func (executors *recordingExecutors) asDependencies() Executors {
@@ -1507,12 +2020,12 @@ func (executors *recordingExecutors) asDependencies() Executors {
 	}
 }
 
-func (executors *recordingExecutors) record(ctx context.Context, name string, credential *credential.Credential) (ExecutorResult, error) {
+func (executors *recordingExecutors) record(ctx context.Context, name string, executionCredential credential.DurableCredential) (ExecutorResult, error) {
 	executors.calls = append(executors.calls, name)
-	executors.capturedCredential = credential
-	if executors.mutateCredentialMetadata {
-		credential.LeaseID = "tampered-by-executor"
-		credential.ExpiresAt = time.Time{}
+	executors.capturedCredential = executionCredential
+	executors.credentialCaptured = true
+	if executors.destroyCredential {
+		executionCredential.Destroy()
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		executors.capturedDeadline = deadline
@@ -1541,32 +2054,32 @@ func (executors *recordingExecutors) record(ctx context.Context, name string, cr
 	return executors.result, executors.err
 }
 
-func (executors *recordingExecutors) ExecuteRolloutRestart(ctx context.Context, command KubernetesRolloutRestartCommand, credential *credential.Credential) (ExecutorResult, error) {
+func (executors *recordingExecutors) ExecuteRolloutRestart(ctx context.Context, command KubernetesRolloutRestartCommand, executionCredential credential.DurableCredential) (ExecutorResult, error) {
 	if command.Target.Name == "" || command.Parameters.Reason == "" {
 		return ExecutorResult{}, errors.New("missing typed restart command")
 	}
-	return executors.record(ctx, "kubernetes-rollout-restart", credential)
+	return executors.record(ctx, "kubernetes-rollout-restart", executionCredential)
 }
 
-func (executors *recordingExecutors) ExecuteScale(ctx context.Context, command KubernetesScaleCommand, credential *credential.Credential) (ExecutorResult, error) {
+func (executors *recordingExecutors) ExecuteScale(ctx context.Context, command KubernetesScaleCommand, executionCredential credential.DurableCredential) (ExecutorResult, error) {
 	if command.Target.Name == "" || command.Parameters.Replicas < 0 {
 		return ExecutorResult{}, errors.New("missing typed scale command")
 	}
-	return executors.record(ctx, "kubernetes-scale", credential)
+	return executors.record(ctx, "kubernetes-scale", executionCredential)
 }
 
-func (executors *recordingExecutors) ExecuteGitOpsRevert(ctx context.Context, command GitOpsRevertCommand, credential *credential.Credential) (ExecutorResult, error) {
+func (executors *recordingExecutors) ExecuteGitOpsRevert(ctx context.Context, command GitOpsRevertCommand, executionCredential credential.DurableCredential) (ExecutorResult, error) {
 	if command.Target.RepositoryID == "" || command.Parameters.RevertCommit == "" {
 		return ExecutorResult{}, errors.New("missing typed GitOps command")
 	}
-	return executors.record(ctx, "gitops-revert", credential)
+	return executors.record(ctx, "gitops-revert", executionCredential)
 }
 
-func (executors *recordingExecutors) ExecuteAWXServiceRestart(ctx context.Context, command AWXServiceRestartCommand, credential *credential.Credential) (ExecutorResult, error) {
+func (executors *recordingExecutors) ExecuteAWXServiceRestart(ctx context.Context, command AWXServiceRestartCommand, executionCredential credential.DurableCredential) (ExecutorResult, error) {
 	if command.Target.InventoryID == 0 || command.Parameters.JobTemplateID == 0 {
 		return ExecutorResult{}, errors.New("missing typed AWX command")
 	}
-	return executors.record(ctx, "awx-service-restart", credential)
+	return executors.record(ctx, "awx-service-restart", executionCredential)
 }
 
 func noOpExecutors() Executors {

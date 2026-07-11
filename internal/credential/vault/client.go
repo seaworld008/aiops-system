@@ -113,6 +113,20 @@ type RevocationClient struct {
 
 var _ credential.DurableIssuer = (*IssuerClient)(nil)
 
+func (client *IssuerClient) IssuerID() string {
+	if client == nil || client.profile == nil {
+		return ""
+	}
+	return client.profile.issuerID
+}
+
+func (client *IssuerClient) IssuerRevision() string {
+	if client == nil || client.profile == nil {
+		return ""
+	}
+	return client.profile.revision
+}
+
 func NewIssuerClient(profile *Profile, manager TokenSource) (*IssuerClient, error) {
 	if !validClientInputs(profile, manager) {
 		return nil, ErrInvalidClient

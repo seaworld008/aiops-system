@@ -39,7 +39,7 @@ func TestVaultClientsExposeDisjointCapabilitiesAndTokenSources(t *testing.T) {
 	issuerType := reflect.TypeOf((*IssuerClient)(nil))
 	revocationType := reflect.TypeOf((*RevocationClient)(nil))
 	if got, want := exportedMethodNames(issuerType), []string{
-		"CreateChild", "GoString", "InspectChild", "IssueDynamic", "MarshalJSON", "String", "ValidateManager",
+		"CreateChild", "GoString", "InspectChild", "IssueDynamic", "IssuerID", "IssuerRevision", "MarshalJSON", "String", "ValidateManager",
 	}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("IssuerClient methods = %v, want %v", got, want)
 	}
@@ -56,6 +56,20 @@ func TestVaultClientsExposeDisjointCapabilitiesAndTokenSources(t *testing.T) {
 	}
 	if got := tokenSourceFields(reflect.TypeOf(RevocationClient{})); !reflect.DeepEqual(got, []string{"revoker"}) {
 		t.Fatalf("RevocationClient TokenSource fields = %v, want revoker only", got)
+	}
+}
+
+func TestIssuerClientExposesOnlyItsImmutableProfileIdentity(t *testing.T) {
+	t.Parallel()
+
+	server := newVaultTLSServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	client := newTestClient(t, server)
+	if client.IssuerID() != "vault-database-nonprod" || client.IssuerRevision() != "rev-1" {
+		t.Fatalf("issuer identity = %q/%q", client.IssuerID(), client.IssuerRevision())
+	}
+	var nilClient *IssuerClient
+	if nilClient.IssuerID() != "" || nilClient.IssuerRevision() != "" {
+		t.Fatalf("nil issuer identity = %q/%q", nilClient.IssuerID(), nilClient.IssuerRevision())
 	}
 }
 

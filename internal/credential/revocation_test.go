@@ -167,6 +167,16 @@ func TestMemoryRevocationPrepareIsImmutableAndNoCredentialIsTerminal(t *testing.
 		t.Fatalf("RecordNoCredential(changed trusted credential scope) error = %v", err)
 	}
 	source.metadata.Permission = "PATCH_DEPLOYMENT_RESTART"
+	source.metadata.ActionType = "KUBERNETES_SCALE"
+	if _, err := repository.RecordNoCredential(ctx, ActionTransitionRequest{RevocationID: testRevocationID, Fence: fence}); !errors.Is(err, ErrStaleActionFence) {
+		t.Fatalf("RecordNoCredential(changed trusted action type) error = %v", err)
+	}
+	source.metadata.ActionType = "KUBERNETES_ROLLOUT_RESTART"
+	source.metadata.CredentialTTLSeconds = 599
+	if _, err := repository.RecordNoCredential(ctx, ActionTransitionRequest{RevocationID: testRevocationID, Fence: fence}); !errors.Is(err, ErrStaleActionFence) {
+		t.Fatalf("RecordNoCredential(changed signed credential TTL) error = %v", err)
+	}
+	source.metadata.CredentialTTLSeconds = 600
 
 	noCredential, err := repository.RecordNoCredential(ctx, ActionTransitionRequest{RevocationID: testRevocationID, Fence: fence})
 	if err != nil || noCredential.Status != StatusNoCredential || noCredential.AccessorPresent || noCredential.AccessorHMAC != "" {
@@ -333,7 +343,7 @@ func TestMemoryChildCreateAuthorizationEnforcesActionFenceReserveBoundary(t *tes
 			repository := newTestMemoryRepository(t, source, func() time.Time { return base }, sequenceTokens("unused"))
 			prepared, err := repository.Prepare(context.Background(), PrepareRequest{
 				RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production", IssuerRevision: "rev-1",
-				CredentialExpiresAt: base.Add(time.Minute),
+				CredentialExpiresAt: base.Add(test.window),
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -349,6 +359,31 @@ func TestMemoryChildCreateAuthorizationEnforcesActionFenceReserveBoundary(t *tes
 				t.Fatalf("AuthorizeChildCreate(action boundary) error = %v, want %v", err, test.wantErr)
 			}
 		})
+	}
+}
+
+func TestMemoryChildCreateAuthorizationRejectsExpiryBeyondActionAuthorization(t *testing.T) {
+	base := time.Date(2026, 7, 10, 11, 17, 17, 0, time.UTC)
+	fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
+	metadata := activeActionMetadata(base, fence)
+	source := &fakeActionFenceSource{fence: fence, metadata: metadata}
+	repository := newTestMemoryRepository(t, source, func() time.Time { return base }, sequenceTokens("unused"))
+	prepared, err := repository.Prepare(context.Background(), PrepareRequest{
+		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production", IssuerRevision: "rev-1",
+		CredentialExpiresAt: base.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.mu.Lock()
+	source.metadata.AuthorizationExpiresAt = base.Add(30 * time.Second)
+	source.mu.Unlock()
+
+	authorized, err := repository.AuthorizeChildCreate(context.Background(), AuthorizeChildCreateRequest{
+		Permit: *prepared.Permit, Fence: fence,
+	})
+	if !errors.Is(err, ErrStaleActionFence) || authorized != (ChildCreateAuthorization{}) {
+		t.Fatalf("AuthorizeChildCreate(expiry beyond action authorization) = %#v, %v", authorized, err)
 	}
 }
 
@@ -1196,6 +1231,63 @@ func TestMemoryPrepareRejectsCredentialTTLBeyondFifteenMinutes(t *testing.T) {
 	}
 }
 
+func TestMemoryPrepareBindsActionTypeAndSignedCredentialTTL(t *testing.T) {
+	now := time.Date(2026, 7, 10, 11, 52, 0, 0, time.UTC)
+	fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 4}
+	metadata := activeActionMetadata(now, fence)
+	metadata.ActionType = "KUBERNETES_ROLLOUT_RESTART"
+	metadata.CredentialTTLSeconds = 90
+	metadata.AuthorizationExpiresAt = now.Add(30 * time.Minute)
+	repository := newTestMemoryRepository(t, &fakeActionFenceSource{fence: fence, metadata: metadata},
+		func() time.Time { return now }, sequenceTokens("unused"))
+
+	if _, err := repository.Prepare(context.Background(), PrepareRequest{
+		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production", IssuerRevision: "rev-1",
+		CredentialExpiresAt: now.Add(90*time.Second + time.Microsecond),
+	}); !errors.Is(err, ErrInvalidRevocationRequest) {
+		t.Fatalf("Prepare(expiry beyond signed TTL) error = %v", err)
+	}
+
+	prepared, err := repository.Prepare(context.Background(), PrepareRequest{
+		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production", IssuerRevision: "rev-1",
+		CredentialExpiresAt: now.Add(90 * time.Second),
+	})
+	if err != nil || prepared.Revocation.ActionType != metadata.ActionType ||
+		prepared.Revocation.CredentialTTLSeconds != metadata.CredentialTTLSeconds {
+		t.Fatalf("Prepare(signed binding) = %#v, %v", prepared, err)
+	}
+}
+
+func TestMemoryPrepareRejectsMalformedTrustedActionCredentialBinding(t *testing.T) {
+	now := time.Date(2026, 7, 10, 11, 53, 0, 0, time.UTC)
+	fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 4}
+	for _, test := range []struct {
+		name       string
+		actionType string
+		ttlSeconds int32
+	}{
+		{name: "missing action type", ttlSeconds: 60},
+		{name: "invalid action type", actionType: "KUBERNETES RESTART", ttlSeconds: 60},
+		{name: "zero signed ttl", actionType: "KUBERNETES_ROLLOUT_RESTART"},
+		{name: "oversized signed ttl", actionType: "KUBERNETES_ROLLOUT_RESTART", ttlSeconds: 901},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			metadata := activeActionMetadata(now, fence)
+			metadata.ActionType = test.actionType
+			metadata.CredentialTTLSeconds = test.ttlSeconds
+			repository := newTestMemoryRepository(t, &fakeActionFenceSource{fence: fence, metadata: metadata},
+				func() time.Time { return now }, sequenceTokens("unused"))
+			_, err := repository.Prepare(context.Background(), PrepareRequest{
+				RevocationID: testRevocationID, Fence: fence, Issuer: "vault-production", IssuerRevision: "rev-1",
+				CredentialExpiresAt: now.Add(30 * time.Second),
+			})
+			if !errors.Is(err, ErrStaleActionFence) {
+				t.Fatalf("Prepare(malformed trusted binding) error = %v", err)
+			}
+		})
+	}
+}
+
 func TestMemoryPrepareRevalidatesOneSecondFenceWindowBeforeCreation(t *testing.T) {
 	base := time.Date(2026, 7, 10, 11, 55, 0, 0, time.UTC)
 	fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 4}
@@ -1512,8 +1604,8 @@ func activeActionMetadata(now time.Time, fence ActionFence) ActionMetadata {
 		TargetKey: "cluster-a/payments", Production: false, RunnerID: fence.RunnerID, LeaseEpoch: fence.Epoch,
 		Status: ActionStatusRunning, LeaseExpiresAt: now.Add(time.Minute), AuthorizationExpiresAt: now.Add(15 * time.Minute),
 		RunnerEnabled: true, RunnerPool: "WRITE", ScopeRevision: 7, RunnerScopeRevision: 7, ExactScopeAuthorized: true,
-		ConnectorID: "kubernetes-prod",
-		Permission:  "PATCH_DEPLOYMENT_RESTART", Resource: "cluster-a/payments/deployment/api",
+		ActionType: "KUBERNETES_ROLLOUT_RESTART", ConnectorID: "kubernetes-prod",
+		Permission: "PATCH_DEPLOYMENT_RESTART", Resource: "cluster-a/payments/deployment/api", CredentialTTLSeconds: 600,
 	}
 }
 
