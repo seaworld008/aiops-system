@@ -3,6 +3,7 @@
 package isolatedexec
 
 import (
+	"os"
 	"os/exec"
 	"syscall"
 )
@@ -10,6 +11,12 @@ import (
 func validatePlatform(string, bool) error {
 	return ErrUnsupportedPlatform
 }
+
+func openRuntimeBoundary(string) (*os.File, error) {
+	return nil, ErrUnsupportedPlatform
+}
+
+func createRuntimeJobDirectory(string, *os.File) (string, error) { return "", ErrUnsupportedPlatform }
 
 func configureProcess(*exec.Cmd) {}
 

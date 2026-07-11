@@ -4,7 +4,10 @@ package isolatedexec
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +16,14 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+)
+
+const (
+	isolatedRuntimeUID = 65532
+	isolatedRuntimeGID = 65532
+	tempRootMaxBytes   = 16 << 20
+	mountInfoMaxBytes  = 1 << 20
+	fdInfoMaxBytes     = 16 << 10
 )
 
 func validatePlatform(executablePath string, allowCurrentOwner bool) error {
@@ -59,6 +70,265 @@ func validatePlatform(executablePath string, allowCurrentOwner bool) error {
 		return ErrUnsupportedPlatform
 	}
 	return nil
+}
+
+// validateRuntimeBoundary is part of the non-production startup capability
+// probe. It intentionally rejects a host directory, an inherited root mount,
+// or an unbounded tmpfs before the runner can wait for work.
+func openRuntimeBoundary(tempRoot string) (*os.File, error) {
+	if tempRoot != "/tmp" || os.Geteuid() != isolatedRuntimeUID || os.Getegid() != isolatedRuntimeGID {
+		return nil, ErrUnsupportedPlatform
+	}
+	descriptor, err := unix.Open(tempRoot, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, ErrUnsupportedPlatform
+	}
+	fail := func() (*os.File, error) {
+		_ = unix.Close(descriptor)
+		return nil, ErrUnsupportedPlatform
+	}
+	var metadata unix.Stat_t
+	if err := unix.Fstat(descriptor, &metadata); err != nil ||
+		!tempRootMetadataSecure(metadata, isolatedRuntimeUID, isolatedRuntimeGID) {
+		return fail()
+	}
+	var filesystem unix.Statfs_t
+	if err := unix.Fstatfs(descriptor, &filesystem); err != nil || !statfsHasSecureTempRoot(filesystem) {
+		return fail()
+	}
+	tempMountID, ok := descriptorMountID(descriptor)
+	if !ok {
+		return fail()
+	}
+	rootDescriptor, err := unix.Open("/", unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fail()
+	}
+	defer unix.Close(rootDescriptor)
+	var rootFilesystem unix.Statfs_t
+	rootMountID, rootMountOK := descriptorMountID(rootDescriptor)
+	if err := unix.Fstatfs(rootDescriptor, &rootFilesystem); err != nil || !statfsReadOnly(rootFilesystem) || !rootMountOK {
+		return fail()
+	}
+	mountInfo, err := readMountInfo()
+	if err != nil || !mountInfoHasSecureRuntimeRoots(mountInfo, tempRoot, tempMountID, rootMountID) {
+		return fail()
+	}
+	canary, err := createPrivateDirectoryAt(descriptor, "aiops-capability-", isolatedRuntimeUID, isolatedRuntimeGID)
+	if err != nil || unix.Unlinkat(descriptor, canary, unix.AT_REMOVEDIR) != nil {
+		return fail()
+	}
+	file := os.NewFile(uintptr(descriptor), "aiops-isolated-temp-root")
+	if file == nil {
+		return fail()
+	}
+	return file, nil
+}
+
+func createRuntimeJobDirectory(root string, handle *os.File) (string, error) {
+	if root != "/tmp" || handle == nil {
+		return "", ErrInvalidConfiguration
+	}
+	descriptor := int(handle.Fd())
+	if descriptor < 0 {
+		return "", ErrInvalidConfiguration
+	}
+	name, err := createPrivateDirectoryAt(descriptor, "aiops-executor-", isolatedRuntimeUID, isolatedRuntimeGID)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, name), nil
+}
+
+func createPrivateDirectoryAt(descriptor int, prefix string, expectedUID, expectedGID uint32) (string, error) {
+	if descriptor < 0 || prefix == "" || strings.ContainsAny(prefix, "/\\\x00") {
+		return "", ErrInvalidConfiguration
+	}
+	for attempt := 0; attempt < 8; attempt++ {
+		random := make([]byte, 16)
+		if _, err := rand.Read(random); err != nil {
+			return "", ErrUnsupportedPlatform
+		}
+		name := prefix + hex.EncodeToString(random)
+		if err := unix.Mkdirat(descriptor, name, 0o700); errors.Is(err, syscall.EEXIST) {
+			continue
+		} else if err != nil {
+			return "", ErrUnsupportedPlatform
+		}
+		var metadata unix.Stat_t
+		if err := unix.Fstatat(descriptor, name, &metadata, unix.AT_SYMLINK_NOFOLLOW); err == nil &&
+			tempRootMetadataSecure(metadata, expectedUID, expectedGID) {
+			return name, nil
+		}
+		_ = unix.Unlinkat(descriptor, name, unix.AT_REMOVEDIR)
+		return "", ErrUnsupportedPlatform
+	}
+	return "", ErrUnsupportedPlatform
+}
+
+func tempRootMetadataSecure(value unix.Stat_t, expectedUID, expectedGID uint32) bool {
+	return value.Mode&unix.S_IFMT == unix.S_IFDIR && value.Mode&0o7777 == 0o700 &&
+		value.Uid == expectedUID && value.Gid == expectedGID
+}
+
+func readMountInfo() ([]byte, error) {
+	return readBoundedProcFile("/proc/self/mountinfo", mountInfoMaxBytes)
+}
+
+func readBoundedProcFile(path string, maximum int64) ([]byte, error) {
+	if path == "" || maximum < 1 || maximum > mountInfoMaxBytes {
+		return nil, ErrUnsupportedPlatform
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	contents, err := io.ReadAll(io.LimitReader(file, maximum+1))
+	if err != nil || len(contents) == 0 || int64(len(contents)) > maximum {
+		return nil, ErrUnsupportedPlatform
+	}
+	return contents, nil
+}
+
+func parseFDInfoMountID(contents []byte) (uint64, bool) {
+	if len(contents) == 0 || len(contents) > fdInfoMaxBytes || bytes.IndexByte(contents, 0) >= 0 {
+		return 0, false
+	}
+	found := false
+	var mountID uint64
+	for _, line := range bytes.Split(contents, []byte{'\n'}) {
+		fields := bytes.Fields(line)
+		if len(fields) == 0 || !bytes.Equal(fields[0], []byte("mnt_id:")) {
+			continue
+		}
+		if found || len(fields) != 2 {
+			return 0, false
+		}
+		parsed, err := strconv.ParseUint(string(fields[1]), 10, 64)
+		if err != nil || parsed == 0 {
+			return 0, false
+		}
+		mountID = parsed
+		found = true
+	}
+	return mountID, found
+}
+
+func descriptorMountID(descriptor int) (uint64, bool) {
+	if descriptor < 0 {
+		return 0, false
+	}
+	fdInfo, err := readBoundedProcFile(filepath.Join("/proc/self/fdinfo", strconv.Itoa(descriptor)), fdInfoMaxBytes)
+	if err != nil {
+		return 0, false
+	}
+	return parseFDInfoMountID(fdInfo)
+}
+
+func mountInfoHasSecureRuntimeRoots(contents []byte, tempRoot string, expectedTempMountID, expectedRootMountID uint64) bool {
+	if tempRoot != "/tmp" || expectedTempMountID == 0 || expectedRootMountID == 0 ||
+		expectedTempMountID == expectedRootMountID || len(contents) == 0 || len(contents) > mountInfoMaxBytes ||
+		bytes.IndexByte(contents, 0) >= 0 {
+		return false
+	}
+	matches := 0
+	rootMatches := 0
+	var rootMountID uint64
+	for _, line := range bytes.Split(contents, []byte{'\n'}) {
+		if len(line) == 0 {
+			continue
+		}
+		fields := bytes.Fields(line)
+		if len(fields) < 10 {
+			return false
+		}
+		separator := -1
+		for index := 6; index < len(fields); index++ {
+			if bytes.Equal(fields[index], []byte{'-'}) {
+				separator = index
+				break
+			}
+		}
+		if separator < 6 || separator+3 >= len(fields) {
+			return false
+		}
+		mountPoint := string(fields[4])
+		if mountPoint == "/" {
+			rootMatches++
+			parsed, err := strconv.ParseUint(string(fields[0]), 10, 64)
+			if err != nil || parsed != expectedRootMountID || rootMatches != 1 ||
+				!mountOptionsContainAll(string(fields[5]), "ro") || mountOptionsContainAny(string(fields[5]), "rw") {
+				return false
+			}
+			rootMountID = parsed
+		}
+		if strings.HasPrefix(mountPoint, tempRoot+"/") {
+			return false
+		}
+		if mountPoint != tempRoot {
+			continue
+		}
+		matches++
+		mountID, err := strconv.ParseUint(string(fields[0]), 10, 64)
+		if matches != 1 || err != nil || mountID != expectedTempMountID || separator != 6 ||
+			!bytes.Equal(fields[3], []byte{'/'}) ||
+			!bytes.Equal(fields[separator+1], []byte("tmpfs")) ||
+			!mountOptionsContainAll(string(fields[5]), "rw", "nosuid", "nodev", "noexec") ||
+			mountOptionsContainAny(string(fields[5]), "ro", "suid", "dev", "exec") {
+			return false
+		}
+	}
+	return matches == 1 && rootMatches == 1 && rootMountID == expectedRootMountID
+}
+
+func mountOptionsContainAny(value string, candidates ...string) bool {
+	options := make(map[string]struct{}, len(candidates))
+	for _, option := range strings.Split(value, ",") {
+		options[option] = struct{}{}
+	}
+	for _, candidate := range candidates {
+		if _, ok := options[candidate]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func mountOptionsContainAll(value string, required ...string) bool {
+	options := make(map[string]struct{}, len(required))
+	for _, option := range strings.Split(value, ",") {
+		if option == "" {
+			return false
+		}
+		options[option] = struct{}{}
+	}
+	for _, option := range required {
+		if _, ok := options[option]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func statfsHasSecureTempRoot(value unix.Statfs_t) bool {
+	flags := uint64(value.Flags)
+	required := uint64(unix.ST_NOSUID | unix.ST_NODEV | unix.ST_NOEXEC)
+	fragmentSize := int64(value.Frsize)
+	if fragmentSize <= 0 {
+		fragmentSize = int64(value.Bsize)
+	}
+	blocks := uint64(value.Blocks)
+	if value.Type != unix.TMPFS_MAGIC || flags&required != required || flags&uint64(unix.ST_RDONLY) != 0 ||
+		fragmentSize <= 0 || blocks == 0 {
+		return false
+	}
+	unit := uint64(fragmentSize)
+	return unit <= tempRootMaxBytes && blocks <= uint64(tempRootMaxBytes)/unit
+}
+
+func statfsReadOnly(value unix.Statfs_t) bool {
+	return uint64(value.Flags)&uint64(unix.ST_RDONLY) != 0
 }
 
 func executableHasUnsafeMetadata(path string) bool {
@@ -164,19 +434,23 @@ func processGroupGone(pid int) (bool, error) {
 }
 
 func processGroupHasMembersExceptLeader(pid int) (bool, error) {
-	if pid <= 1 {
+	return processGroupHasMembersExceptLeaderAt(pid, "/proc")
+}
+
+func processGroupHasMembersExceptLeaderAt(pid int, procRoot string) (bool, error) {
+	if pid < 1 || procRoot == "" {
 		return false, ErrInvalidRequest
 	}
-	entries, err := os.ReadDir("/proc")
+	entries, err := os.ReadDir(procRoot)
 	if err != nil || len(entries) > 1<<20 {
 		return false, ErrTerminationUnconfirmed
 	}
 	for _, entry := range entries {
 		candidate, parseErr := strconv.Atoi(entry.Name())
-		if parseErr != nil || candidate <= 1 || candidate == pid {
+		if parseErr != nil || candidate < 1 || candidate == pid {
 			continue
 		}
-		contents, readErr := os.ReadFile(filepath.Join("/proc", entry.Name(), "stat"))
+		contents, readErr := os.ReadFile(filepath.Join(procRoot, entry.Name(), "stat"))
 		if errors.Is(readErr, os.ErrNotExist) {
 			continue
 		}

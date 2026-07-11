@@ -129,8 +129,31 @@ jobs:
             --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=65532,gid=65532 \
             --env AIOPS_WRITE_EXECUTION_MODE=non-production "${WRITE_RUNNER_IMAGE}")"
           sleep 1
-          test "$(docker inspect --format '{{.State.Running}}' "${probe_container}")" = "true"
+          if [ "$(docker inspect --format '{{.State.Running}}' "${probe_container}")" != "true" ]; then
+            docker logs "${probe_container}" >&2
+            docker inspect --format 'exit={{.State.ExitCode}} error={{.State.Error}}' "${probe_container}" >&2
+            exit 1
+          fi
           docker stop --time 5 "${probe_container}" >/dev/null
+          docker rm "${probe_container}" >/dev/null
+          probe_container=""
+
+          probe_container="$(docker run --detach --read-only \
+            --security-opt no-new-privileges:true \
+            --env AIOPS_WRITE_EXECUTION_MODE=non-production "${WRITE_RUNNER_IMAGE}")"
+          sleep 1
+          test "$(docker inspect --format '{{.State.Running}}' "${probe_container}")" = "false"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "${probe_container}")" != "0"
+          docker rm "${probe_container}" >/dev/null
+          probe_container=""
+
+          probe_container="$(docker run --detach --read-only \
+            --security-opt no-new-privileges:true \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=32m,mode=0750,uid=65532,gid=65532 \
+            --env AIOPS_WRITE_EXECUTION_MODE=non-production "${WRITE_RUNNER_IMAGE}")"
+          sleep 1
+          test "$(docker inspect --format '{{.State.Running}}' "${probe_container}")" = "false"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "${probe_container}")" != "0"
           docker rm "${probe_container}" >/dev/null
           probe_container=""
 

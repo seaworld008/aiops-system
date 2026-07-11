@@ -45,7 +45,7 @@ func (supervisor *Supervisor) startProcess() (*childProcess, error) {
 	if supervisor == nil || !supervisor.settings.valid() {
 		return nil, ErrInvalidConfiguration
 	}
-	jobDirectory, err := createJobDirectory(supervisor.settings.tempRoot)
+	jobDirectory, err := supervisor.createJobDirectory()
 	if err != nil {
 		return nil, err
 	}
@@ -286,6 +286,22 @@ func (process *childProcess) cleanup(confirmed bool) {
 	process.cleanupOnce.Do(func() {
 		_ = os.RemoveAll(process.jobDirectory)
 	})
+}
+
+func (supervisor *Supervisor) createJobDirectory() (string, error) {
+	if supervisor == nil {
+		return "", ErrInvalidConfiguration
+	}
+	if supervisor.boundary != nil {
+		boundary := supervisor.boundary
+		boundary.mu.RLock()
+		defer boundary.mu.RUnlock()
+		if boundary.closed || boundary.root == nil {
+			return "", ErrInvalidConfiguration
+		}
+		return createRuntimeJobDirectory(supervisor.settings.tempRoot, boundary.root)
+	}
+	return createJobDirectory(supervisor.settings.tempRoot)
 }
 
 func (supervisor *Supervisor) buildCommand(

@@ -114,8 +114,10 @@ NetworkPolicy、独立 ServiceAccount/CA/Vault role，以及禁止 swap/core dum
   前后取消与强杀，均验证 `Wait`/reap 和 process-group 消失；
 - 依赖边界：`cmd/read-runner` 依赖图不得包含隔离执行、凭据或 mutation 包；
 - 镜像边界：CI 导出文件系统，验证 READ/WRITE 产物互斥、无 shell、非 root、固定入口；
-- 配置边界：只读根 + `/tmp` tmpfs 下 `non-production` capability probe 保持运行，
-  镜像本身不包含 `/tmp`，且 `production` 必须非零退出；
+- 配置边界：只读根 + 由 FD/mount ID 绑定验证的 16 MiB、`0700`、
+  `rw,nosuid,nodev,noexec` `/tmp` tmpfs 下 `non-production` capability probe 保持运行；
+  缺失或不安全的 `/tmp` 在启动时非零退出，镜像本身不包含 `/tmp`，且 `production`
+  必须非零退出；验证后的 `/tmp` FD 保留并用于 `mkdirat` 创建每作业目录；
 - 全仓门禁：race、shuffle、vet、五个入口构建、真实 PostgreSQL/Vault 与 vulnerability
   scan 全部通过。
 

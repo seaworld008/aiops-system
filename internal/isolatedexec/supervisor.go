@@ -3,6 +3,7 @@ package isolatedexec
 import (
 	"errors"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -68,6 +69,13 @@ func validTempRoot(value string) bool {
 type Supervisor struct {
 	executablePath string
 	settings       settings
+	boundary       *runtimeBoundary
+}
+
+type runtimeBoundary struct {
+	mu     sync.RWMutex
+	root   *os.File
+	closed bool
 }
 
 func New() (*Supervisor, error) {
@@ -87,7 +95,42 @@ func newSupervisorWithOwner(executablePath string, configuration settings, allow
 	if err := validatePlatform(executablePath, allowCurrentOwner); err != nil {
 		return nil, err
 	}
-	return &Supervisor{executablePath: executablePath, settings: configuration}, nil
+	// Only the exported production constructor enforces the fixed runtime
+	// identity and /tmp mount. Package tests use an owner-local fixture and a
+	// private temporary root, but external callers have no bypass.
+	var tempRoot *os.File
+	if !allowCurrentOwner {
+		var err error
+		tempRoot, err = openRuntimeBoundary(configuration.tempRoot)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var boundary *runtimeBoundary
+	if tempRoot != nil {
+		boundary = &runtimeBoundary{root: tempRoot}
+	}
+	return &Supervisor{executablePath: executablePath, settings: configuration, boundary: boundary}, nil
+}
+
+// Close releases the retained, verified runtime root. Copies of Supervisor
+// share the same private boundary state, so closing one copy cannot make a
+// stale descriptor usable through another.
+func (supervisor *Supervisor) Close() error {
+	if supervisor == nil || supervisor.boundary == nil {
+		return nil
+	}
+	boundary := supervisor.boundary
+	boundary.mu.Lock()
+	defer boundary.mu.Unlock()
+	if boundary.closed {
+		return nil
+	}
+	boundary.closed = true
+	if boundary.root == nil {
+		return ErrInvalidConfiguration
+	}
+	return boundary.root.Close()
 }
 
 type outputBudget struct {

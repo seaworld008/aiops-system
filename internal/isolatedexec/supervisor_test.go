@@ -2,9 +2,29 @@ package isolatedexec
 
 import (
 	"bytes"
+	"errors"
+	"os"
 	"testing"
 	"time"
 )
+
+func TestSupervisorCopiesShareClosedRuntimeBoundary(t *testing.T) {
+	root, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open temp root: %v", err)
+	}
+	supervisor := &Supervisor{boundary: &runtimeBoundary{root: root}}
+	copy := *supervisor
+	if err := copy.Close(); err != nil {
+		t.Fatalf("copy.Close() error = %v", err)
+	}
+	if err := supervisor.Close(); err != nil {
+		t.Fatalf("Supervisor.Close() after copy error = %v", err)
+	}
+	if _, err := root.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("retained root remains open: %v", err)
+	}
+}
 
 func TestDefaultSettingsKeepFixedTerminationAndResourceBounds(t *testing.T) {
 	settings := defaultSettings()

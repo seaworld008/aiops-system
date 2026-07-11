@@ -18,8 +18,13 @@ var (
 	errInvalidMode       = errors.New("WRITE execution mode must be disabled or non-production")
 )
 
-type capabilityProbe func() error
 type processHardener func() error
+
+type capabilityHandle interface {
+	Close() error
+}
+
+type capabilityProbe func() (capabilityHandle, error)
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -30,7 +35,7 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, args []string, mode string, harden processHardener, probe capabilityProbe) error {
+func run(ctx context.Context, args []string, mode string, harden processHardener, probe capabilityProbe) (resultErr error) {
 	if ctx == nil || len(args) != 0 || harden == nil || probe == nil {
 		return errInvalidInvocation
 	}
@@ -41,9 +46,21 @@ func run(ctx context.Context, args []string, mode string, harden processHardener
 		if err := harden(); err != nil {
 			return fmt.Errorf("harden WRITE runner process: %w", err)
 		}
-		if err := probe(); err != nil {
+		capability, err := probe()
+		if err != nil {
+			if capability != nil {
+				_ = capability.Close()
+			}
 			return fmt.Errorf("verify isolated executor capability: %w", err)
 		}
+		if capability == nil {
+			return errInvalidInvocation
+		}
+		defer func() {
+			if err := capability.Close(); err != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("close isolated executor capability: %w", err))
+			}
+		}()
 	default:
 		return errInvalidMode
 	}
@@ -53,7 +70,6 @@ func run(ctx context.Context, args []string, mode string, harden processHardener
 	return nil
 }
 
-func probeIsolation() error {
-	_, err := isolatedexec.New()
-	return err
+func probeIsolation() (capabilityHandle, error) {
+	return isolatedexec.New()
 }

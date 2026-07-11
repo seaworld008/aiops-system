@@ -90,8 +90,18 @@ docker run --rm --read-only \
   root-owned 且不可写；
 - 容器 runtime 在 exec 前设置 `no_new_privs`；WRITE Runner 与 Executor 枚举所有线程
   并确认均为 1，同时读回验证 core hard limit 为 0、dumpable 为 0；
-- UID/GID 为 `65532:65532`，root filesystem 为只读，只有独立 `/tmp` tmpfs 可写；
+- UID/GID 为 `65532:65532`；根目录 FD 的 `fstatfs` 与 mount ID 同时证明 root
+  filesystem 为只读；启动探针通过同一个 `O_PATH|O_NOFOLLOW` `/tmp` FD 核对目录
+  UID/GID、精确 `0700` mode、`fdinfo.mnt_id`、mountinfo 中唯一且无传播/子挂载的
+  `/tmp`、tmpfs 类型与 `rw,nosuid,nodev,noexec`，并通过 `fstatfs` 拒绝超过
+  16 MiB 的挂载；
+- 探针先以 `mkdirat/fstatat/unlinkat` 验证可写；验证后的目录 FD 保留在 Supervisor
+  生命周期内，所有作业目录继续经该 FD 创建，不重新信任可替换的路径解析；
 - `production`、`enabled`、`true` 等值均立即非零退出。
+
+缺失 `/tmp`、使用宿主目录、错误 owner/mode、重复叠加挂载、危险 mount flag 或超过
+16 MiB 的 tmpfs 均在 Runner 等待作业前失败。CI 同时覆盖安全配置保持运行与两组错误
+配置立即退出；目标集群仍必须在实际 CRI/内核/LSM 下复验相同证据。
 
 `non-production` 不是环境标签的替代品。后续 M6 还必须由 Gateway 的可信注册、精确
 workspace/environment scope 和服务端 action 属性共同拒绝 `production=true`，不得只
@@ -138,9 +148,13 @@ spec:
             sizeLimit: 16Mi
 ```
 
-占位 digest 不能部署。`emptyDir` 还需由准入规则确保 `nosuid,nodev,noexec` 等挂载约束；
-如果集群无法表达或验证这些约束，保持 WRITE Runner 关闭。节点必须禁止 swap，限制
-core dump，并保护休眠镜像和物理内存采集。
+占位 digest 不能部署。标准 `emptyDir.medium: Memory` 与 `sizeLimit` 只能提供 tmpfs 和
+容量边界，Pod API/准入规则本身不能施加 `nosuid,nodev,noexec`，也不能单凭
+`runAsUser/runAsGroup` 证明卷根已是 `65532:65532`、`0700`。目标集群必须通过受审计的
+RuntimeClass、CRI/CSI 或节点策略实际施加这些属性，再由进程内探针验证；否则此示例会
+正确地启动失败，WRITE Runner 必须保持关闭。不得用特权 init container remount 或
+`hostPath` 绕过门禁。节点还必须禁止 swap，限制 core dump，并保护休眠镜像和物理内存
+采集。
 
 ## 尚未由 M4 提供的强隔离
 
