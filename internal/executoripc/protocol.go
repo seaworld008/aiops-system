@@ -62,6 +62,8 @@ type PrepareRequest struct {
 	JobID               string          `json:"job_id"`
 	PlanHash            string          `json:"plan_hash"`
 	EnvironmentRevision string          `json:"environment_revision"`
+	LeaseEpoch          int64           `json:"lease_epoch"`
+	ScopeRevision       int64           `json:"scope_revision"`
 	Production          bool            `json:"production"`
 	Payload             action.Envelope `json:"payload"`
 }
@@ -71,6 +73,8 @@ type Ready struct {
 	JobID               string `json:"job_id"`
 	PlanHash            string `json:"plan_hash"`
 	EnvironmentRevision string `json:"environment_revision"`
+	LeaseEpoch          int64  `json:"lease_epoch"`
+	ScopeRevision       int64  `json:"scope_revision"`
 }
 
 type resultFrame struct {
@@ -78,6 +82,8 @@ type resultFrame struct {
 	JobID               string                   `json:"job_id"`
 	PlanHash            string                   `json:"plan_hash"`
 	EnvironmentRevision string                   `json:"environment_revision"`
+	LeaseEpoch          int64                    `json:"lease_epoch"`
+	ScopeRevision       int64                    `json:"scope_revision"`
 	Result              execution.ExecutorResult `json:"result"`
 }
 
@@ -172,7 +178,7 @@ func Serve(
 	}
 	ready := Ready{
 		SchemaVersion: ReadySchemaVersionV1, JobID: request.JobID, PlanHash: request.PlanHash,
-		EnvironmentRevision: request.EnvironmentRevision,
+		EnvironmentRevision: request.EnvironmentRevision, LeaseEpoch: request.LeaseEpoch, ScopeRevision: request.ScopeRevision,
 	}
 	if err := writeJSONFrame(responseWriter, frameReady, ready, resultBodyLimit); err != nil {
 		return err
@@ -205,7 +211,8 @@ func Serve(
 	}
 	response := resultFrame{
 		SchemaVersion: ResultSchemaVersionV1, JobID: request.JobID, PlanHash: request.PlanHash,
-		EnvironmentRevision: request.EnvironmentRevision, Result: result,
+		EnvironmentRevision: request.EnvironmentRevision, LeaseEpoch: request.LeaseEpoch,
+		ScopeRevision: request.ScopeRevision, Result: result,
 	}
 	return writeJSONFrame(responseWriter, frameResult, response, resultBodyLimit)
 }
@@ -245,6 +252,7 @@ func executeSafely(
 func (request PrepareRequest) validStructure() bool {
 	return request.SchemaVersion == PrepareSchemaVersionV1 && !request.Production &&
 		identifierPattern.MatchString(request.JobID) && identifierPattern.MatchString(request.EnvironmentRevision) &&
+		request.LeaseEpoch > 0 && request.ScopeRevision > 0 &&
 		hashPattern.MatchString(request.PlanHash) && request.JobID == request.Payload.ActionID &&
 		request.PlanHash == request.Payload.PlanHash && request.Payload.Signature != (action.Signature{}) &&
 		request.Payload.Validate() == nil
@@ -256,12 +264,14 @@ func (request PrepareRequest) validAt(now time.Time) bool {
 
 func (ready Ready) matches(expected PrepareRequest) bool {
 	return ready.SchemaVersion == ReadySchemaVersionV1 && ready.JobID == expected.JobID &&
-		ready.PlanHash == expected.PlanHash && ready.EnvironmentRevision == expected.EnvironmentRevision
+		ready.PlanHash == expected.PlanHash && ready.EnvironmentRevision == expected.EnvironmentRevision &&
+		ready.LeaseEpoch == expected.LeaseEpoch && ready.ScopeRevision == expected.ScopeRevision
 }
 
 func (response resultFrame) matches(expected PrepareRequest) bool {
 	return response.SchemaVersion == ResultSchemaVersionV1 && response.JobID == expected.JobID &&
-		response.PlanHash == expected.PlanHash && response.EnvironmentRevision == expected.EnvironmentRevision
+		response.PlanHash == expected.PlanHash && response.EnvironmentRevision == expected.EnvironmentRevision &&
+		response.LeaseEpoch == expected.LeaseEpoch && response.ScopeRevision == expected.ScopeRevision
 }
 
 func writeJSONFrame(writer io.Writer, kind frameType, value any, limit int) error {

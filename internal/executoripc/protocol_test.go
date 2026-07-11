@@ -104,6 +104,8 @@ func TestServeRejectsUnsafePrepareBindingsBeforeHandlerValidation(t *testing.T) 
 			request.PlanHash = strings.Repeat("c", 64)
 		},
 		"environment revision missing": func(request *executoripc.PrepareRequest) { request.EnvironmentRevision = "" },
+		"lease epoch missing":          func(request *executoripc.PrepareRequest) { request.LeaseEpoch = 0 },
+		"scope revision missing":       func(request *executoripc.PrepareRequest) { request.ScopeRevision = 0 },
 		"unsigned payload":             func(request *executoripc.PrepareRequest) { request.Payload.Signature = action.Signature{} },
 		"expired payload": func(request *executoripc.PrepareRequest) {
 			request.Payload.NotBefore = now.Add(-15 * time.Minute)
@@ -456,6 +458,7 @@ func TestReadReadyRejectsCrossJobAndNonStrictResponses(t *testing.T) {
 	ready := executoripc.Ready{
 		SchemaVersion: executoripc.ReadySchemaVersionV1, JobID: request.JobID,
 		PlanHash: request.PlanHash, EnvironmentRevision: request.EnvironmentRevision,
+		LeaseEpoch: request.LeaseEpoch, ScopeRevision: request.ScopeRevision,
 	}
 	canonical, err := json.Marshal(ready)
 	if err != nil {
@@ -597,7 +600,7 @@ func validPrepareRequest(now time.Time) executoripc.PrepareRequest {
 	return executoripc.PrepareRequest{
 		SchemaVersion: "executor-prepare.v1", JobID: envelope.ActionID,
 		PlanHash: envelope.PlanHash, EnvironmentRevision: "staging-revision-17",
-		Production: false, Payload: envelope,
+		LeaseEpoch: 7, ScopeRevision: 11, Production: false, Payload: envelope,
 	}
 }
 

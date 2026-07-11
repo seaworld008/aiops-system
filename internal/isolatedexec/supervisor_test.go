@@ -23,6 +23,9 @@ func TestDefaultSettingsKeepFixedTerminationAndResourceBounds(t *testing.T) {
 	if settings.exitTimeout != 2*time.Second {
 		t.Fatalf("post-result exit timeout = %s, want 2s", settings.exitTimeout)
 	}
+	if settings.tempRoot != "/tmp" {
+		t.Fatalf("temporary root = %q, want /tmp", settings.tempRoot)
+	}
 }
 
 func TestOutputBudgetDiscardsContentAndSignalsOverflowOnce(t *testing.T) {
@@ -54,5 +57,23 @@ func TestNewOutputBudgetRejectsNonPositiveLimit(t *testing.T) {
 		if budget := newOutputBudget(limit); budget != nil {
 			t.Fatalf("newOutputBudget(%d) = %#v, want nil", limit, budget)
 		}
+	}
+}
+
+func TestCompletionAllowsReleaseOnlyBeforeGoAndAfterConfirmedTermination(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		completion Completion
+		want       bool
+	}{
+		{name: "pre-GO confirmed", completion: Completion{TerminationConfirmed: true}, want: true},
+		{name: "pre-GO unconfirmed", completion: Completion{}, want: false},
+		{name: "post-GO confirmed", completion: Completion{GOAttempted: true, TerminationConfirmed: true}, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.completion.SafeToRelease(); got != test.want {
+				t.Fatalf("SafeToRelease() = %t, want %t", got, test.want)
+			}
+		})
 	}
 }

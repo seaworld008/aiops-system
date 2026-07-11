@@ -3,6 +3,8 @@ package isolatedexec
 import (
 	"errors"
 	"math"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,11 +13,12 @@ import (
 const ExecutorPath = "/usr/local/libexec/aiops-executor"
 
 var (
-	ErrUnsupportedPlatform  = errors.New("isolated executor requires Linux")
-	ErrInvalidConfiguration = errors.New("invalid isolated executor configuration")
-	ErrInvalidRequest       = errors.New("invalid isolated executor request")
-	ErrNotReady             = errors.New("isolated executor did not become ready")
-	ErrSessionConsumed      = errors.New("isolated executor session is already consumed")
+	ErrUnsupportedPlatform    = errors.New("isolated executor requires Linux")
+	ErrInvalidConfiguration   = errors.New("invalid isolated executor configuration")
+	ErrInvalidRequest         = errors.New("invalid isolated executor request")
+	ErrNotReady               = errors.New("isolated executor did not become ready")
+	ErrSessionConsumed        = errors.New("isolated executor session is already consumed")
+	ErrTerminationUnconfirmed = errors.New("isolated executor termination is unconfirmed")
 )
 
 type settings struct {
@@ -24,6 +27,7 @@ type settings struct {
 	killConfirmTimeout time.Duration
 	exitTimeout        time.Duration
 	outputLimit        int64
+	tempRoot           string
 }
 
 func defaultSettings() settings {
@@ -33,6 +37,7 @@ func defaultSettings() settings {
 		killConfirmTimeout: 5 * time.Second,
 		exitTimeout:        2 * time.Second,
 		outputLimit:        64 << 10,
+		tempRoot:           "/tmp",
 	}
 }
 
@@ -41,7 +46,20 @@ func (value settings) valid() bool {
 		value.termGrace == 2*time.Second &&
 		value.killConfirmTimeout > 0 && value.killConfirmTimeout <= 30*time.Second &&
 		value.exitTimeout > 0 && value.exitTimeout <= 10*time.Second &&
-		value.outputLimit >= 1 && value.outputLimit <= 1<<20
+		value.outputLimit >= 1 && value.outputLimit <= 1<<20 && validTempRoot(value.tempRoot)
+}
+
+func validTempRoot(value string) bool {
+	if value == "" || len(value) > 4096 || !filepath.IsAbs(value) || filepath.Clean(value) != value ||
+		strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // Supervisor owns the fixed Executor process boundary. The production
@@ -53,16 +71,20 @@ type Supervisor struct {
 }
 
 func New() (*Supervisor, error) {
-	return newSupervisor(ExecutorPath, defaultSettings())
+	return newSupervisorWithOwner(ExecutorPath, defaultSettings(), false)
 }
 
 // newSupervisor is package-private so tests can exercise the real process
 // boundary with a purpose-built helper. Runtime callers only have New.
 func newSupervisor(executablePath string, configuration settings) (*Supervisor, error) {
+	return newSupervisorWithOwner(executablePath, configuration, true)
+}
+
+func newSupervisorWithOwner(executablePath string, configuration settings, allowCurrentOwner bool) (*Supervisor, error) {
 	if !configuration.valid() {
 		return nil, ErrInvalidConfiguration
 	}
-	if err := validatePlatform(executablePath); err != nil {
+	if err := validatePlatform(executablePath, allowCurrentOwner); err != nil {
 		return nil, err
 	}
 	return &Supervisor{executablePath: executablePath, settings: configuration}, nil
