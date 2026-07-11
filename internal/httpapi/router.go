@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -33,11 +34,12 @@ type Authenticator interface {
 }
 
 type Dependencies struct {
-	Version         string
-	Ready           func() error
-	SignalIngestor  SignalIngestor
-	WebhookVerifier WebhookVerifier
-	Authenticator   Authenticator
+	Version               string
+	Ready                 func() error
+	SignalIngestor        SignalIngestor
+	WebhookVerifier       WebhookVerifier
+	Authenticator         Authenticator
+	CredentialRevocations CredentialRevocationManager
 }
 
 func NewRouter(deps Dependencies) http.Handler {
@@ -47,6 +49,7 @@ func NewRouter(deps Dependencies) http.Handler {
 
 	router := chi.NewRouter()
 	router.Use(requestIDMiddleware)
+	router.Use(credentialManagementResponseHeaders)
 	router.NotFound(func(w http.ResponseWriter, _ *http.Request) {
 		writeProblem(w, http.StatusNotFound, "route_not_found", "The requested route does not exist")
 	})
@@ -68,6 +71,22 @@ func NewRouter(deps Dependencies) http.Handler {
 	})
 	router.Post("/api/v1/integrations/{integrationID}/webhooks/{provider}", webhookHandler(deps.SignalIngestor, deps.WebhookVerifier))
 	router.With(authenticationMiddleware(deps.Authenticator)).Get("/api/v1/session", sessionHandler)
+	router.With(authenticationMiddleware(deps.Authenticator)).Get(
+		"/api/v1/workspaces/{workspaceID}/environments/{environmentID}/credential-revocations",
+		credentialRevocationListHandler(deps.CredentialRevocations),
+	)
+	router.With(authenticationMiddleware(deps.Authenticator)).Get(
+		"/api/v1/workspaces/{workspaceID}/environments/{environmentID}/credential-revocations/{revocationID}",
+		credentialRevocationGetHandler(deps.CredentialRevocations),
+	)
+	router.With(authenticationMiddleware(deps.Authenticator)).Post(
+		"/api/v1/workspaces/{workspaceID}/environments/{environmentID}/credential-revocations/{revocationID}/requeues",
+		credentialRevocationRequeueHandler(deps.CredentialRevocations),
+	)
+	router.With(authenticationMiddleware(deps.Authenticator)).Post(
+		"/api/v1/workspaces/{workspaceID}/environments/{environmentID}/credential-revocations/{revocationID}/external-confirmations",
+		credentialRevocationConfirmationHandler(deps.CredentialRevocations),
+	)
 
 	return router
 }
@@ -75,7 +94,7 @@ func NewRouter(deps Dependencies) http.Handler {
 func authenticationMiddleware(authenticator Authenticator) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-			if authenticator == nil {
+			if nilHTTPDependency(authenticator) {
 				writeProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "OIDC authentication is unavailable")
 				return
 			}
@@ -87,6 +106,15 @@ func authenticationMiddleware(authenticator Authenticator) func(http.Handler) ht
 			next.ServeHTTP(w, request.WithContext(authn.WithPrincipal(request.Context(), principal)))
 		})
 	}
+}
+
+func nilHTTPDependency(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	return (reflected.Kind() == reflect.Chan || reflected.Kind() == reflect.Func || reflected.Kind() == reflect.Interface ||
+		reflected.Kind() == reflect.Map || reflected.Kind() == reflect.Pointer || reflected.Kind() == reflect.Slice) && reflected.IsNil()
 }
 
 func sessionHandler(w http.ResponseWriter, request *http.Request) {
