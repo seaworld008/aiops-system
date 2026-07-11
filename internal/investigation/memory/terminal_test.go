@@ -16,7 +16,8 @@ func TestFinalizeCancellationPreservesRunningTaskStartTime(t *testing.T) {
 	commitAt := createdAt.Add(time.Minute)
 	repository, err := New(Options{
 		Clock: func() time.Time { return commitAt }, IDFactory: func() string { return "unused" },
-		TenantResolver: func(string) (string, error) { return "tenant-1", nil },
+		TenantResolver:     func(string) (string, error) { return "tenant-1", nil },
+		TaskSpecAuthorizer: allowTaskSpecForTest,
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -68,7 +69,8 @@ func TestCompleteTaskReadsCommitClockAfterLockedPreparation(t *testing.T) {
 			clockNow = commitAt
 			return "receipt-1"
 		},
-		TenantResolver: func(string) (string, error) { return "tenant-1", nil },
+		TenantResolver:     func(string) (string, error) { return "tenant-1", nil },
+		TaskSpecAuthorizer: allowTaskSpecForTest,
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -102,4 +104,8 @@ func TestCompleteTaskReadsCommitClockAfterLockedPreparation(t *testing.T) {
 	if result.Task.CompletedAt != commitAt || result.Receipt.ReceivedAt != commitAt {
 		t.Fatalf("commit times = task %s receipt %s, want post-preparation %s", result.Task.CompletedAt, result.Receipt.ReceivedAt, commitAt)
 	}
+}
+
+func allowTaskSpecForTest(context.Context, string, investigation.TaskSpec) error {
+	return nil
 }

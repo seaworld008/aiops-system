@@ -1,9 +1,11 @@
 package memory_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -19,8 +21,9 @@ func newRepository(t *testing.T, now time.Time) *memory.Repository {
 	var mu sync.Mutex
 	next := 0
 	repository, err := memory.New(memory.Options{
-		Clock:          func() time.Time { return now },
-		TenantResolver: testTenantResolver,
+		Clock:              func() time.Time { return now },
+		TenantResolver:     testTenantResolver,
+		TaskSpecAuthorizer: testTaskSpecAuthorizer,
 		IDFactory: func() string {
 			mu.Lock()
 			defer mu.Unlock()
@@ -32,6 +35,23 @@ func newRepository(t *testing.T, now time.Time) *memory.Repository {
 		t.Fatalf("memory.New() error = %v", err)
 	}
 	return repository
+}
+
+func testTaskSpecAuthorizer(_ context.Context, _ string, spec investigation.TaskSpec) error {
+	allowed := spec.ConnectorID == "prometheus-prod" && spec.Operation == "range_query" ||
+		(spec.ConnectorID == "victorialogs-prod" || spec.ConnectorID == "tempo-prod") && spec.Operation == "search"
+	if !allowed {
+		return fmt.Errorf("unsupported task specification")
+	}
+	var input struct {
+		LookbackMinutes int `json:"lookback_minutes"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(spec.Input))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil || input.LookbackMinutes < 1 || input.LookbackMinutes > 1440 {
+		return fmt.Errorf("invalid task input schema")
+	}
+	return nil
 }
 
 func testTenantResolver(workspaceID string) (string, error) {

@@ -113,7 +113,7 @@ func TestListEvidenceUsesCollectedCreatedAndIDOrder(t *testing.T) {
 	}
 	nextID := 0
 	repository, err := memory.New(memory.Options{
-		Clock: func() time.Time { return now }, TenantResolver: testTenantResolver,
+		Clock: func() time.Time { return now }, TenantResolver: testTenantResolver, TaskSpecAuthorizer: testTaskSpecAuthorizer,
 		IDFactory: func() string {
 			id := ids[nextID]
 			nextID++

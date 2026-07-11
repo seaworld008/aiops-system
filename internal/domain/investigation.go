@@ -59,6 +59,9 @@ func (investigation Investigation) Validate() error {
 	default:
 		return fmt.Errorf("invalid model status %q", investigation.ModelStatus)
 	}
+	if !validInvestigationModelState(investigation.Status, investigation.ModelStatus) {
+		return fmt.Errorf("investigation and model statuses are inconsistent")
+	}
 	if !ValidIdempotencyKey(investigation.IdempotencyKey) {
 		return fmt.Errorf("investigation idempotency key is invalid")
 	}
@@ -86,7 +89,8 @@ func (investigation Investigation) Validate() error {
 		return fmt.Errorf("investigation timestamps are invalid")
 	}
 	if !timeWithin(investigation.StartedAt, investigation.CreatedAt, investigation.UpdatedAt) ||
-		!timeWithin(investigation.CompletedAt, investigation.CreatedAt, investigation.UpdatedAt) {
+		!timeWithin(investigation.CompletedAt, investigation.CreatedAt, investigation.UpdatedAt) ||
+		(!investigation.StartedAt.IsZero() && !investigation.CompletedAt.IsZero() && investigation.CompletedAt.Before(investigation.StartedAt)) {
 		return fmt.Errorf("investigation lifecycle timestamps are invalid")
 	}
 	switch investigation.Status {
@@ -113,6 +117,21 @@ func (investigation Investigation) Validate() error {
 		}
 	}
 	return nil
+}
+
+func validInvestigationModelState(status InvestigationStatus, modelStatus ModelStatus) bool {
+	switch status {
+	case InvestigationQueued:
+		return modelStatus == ModelPending
+	case InvestigationRunning:
+		return modelStatus == ModelPending || modelStatus == ModelRunning
+	case InvestigationCompleted, InvestigationPartial:
+		return modelStatus == ModelCompleted || modelStatus == ModelFailed || modelStatus == ModelSkipped
+	case InvestigationFailed, InvestigationCancelled:
+		return modelStatus == ModelCancelled
+	default:
+		return false
+	}
 }
 
 func timeWithin(value, notBefore, notAfter time.Time) bool {

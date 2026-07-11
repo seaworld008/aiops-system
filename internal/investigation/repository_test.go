@@ -1,8 +1,10 @@
 package investigation_test
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -56,6 +58,14 @@ func TestCanonicalTaskSpecsRejectConnectionAndCredentialMaterial(t *testing.T) {
 		"text target assignment":         `{"text":"target=payments.internal"}`,
 		"text cluster assignment":        `{"text":"cluster=prod-east"}`,
 		"proxy server":                   `{"proxy_server":"proxy.internal:8443"}`,
+		"destination field":              `{"destination":"payments.internal"}`,
+		"obfuscated destination field":   `{"desti:nation":"payments.internal"}`,
+		"args carrier":                   `{"args":["collect","--host","db.internal"]}`,
+		"obfuscated args carrier":        `{"arg:s":["collect","--host","db.internal"]}`,
+		"environment carrier":            `{"env":{"HOST":"db.internal"}}`,
+		"command carrier":                `{"command":["collect","--endpoint","db.internal"]}`,
+		"options carrier":                `{"options":["--url=https://internal.invalid"]}`,
+		"target CLI long option":         `{"query":"collect --cluster prod-east"}`,
 		"non-object":                     `[]`,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -114,9 +124,18 @@ func TestCanonicalTaskSpecsUsesJCSForSemanticReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CanonicalTaskSpecs(second) error = %v", err)
 	}
-	if hashFirst != hashSecond || string(canonicalFirst[0].Input) != string(canonicalSecond[0].Input) ||
+	const goldenTaskSpecsHash = "b5e6f624c14d96df5bd8e4ee6adf12a9aa081eab4d6f09cc3f15624672cdb316"
+	if hashFirst != hashSecond || hashFirst != goldenTaskSpecsHash || string(canonicalFirst[0].Input) != string(canonicalSecond[0].Input) ||
 		strings.Contains(string(canonicalFirst[0].Input), `\u003e`) {
 		t.Fatalf("canonical semantic replay mismatch: %q/%q %q/%q", canonicalFirst[0].Input, canonicalSecond[0].Input, hashFirst, hashSecond)
+	}
+	legacyWire, err := json.Marshal(canonicalFirst)
+	if err != nil {
+		t.Fatalf("json.Marshal(canonical tasks) error = %v", err)
+	}
+	legacyDigest := sha256.Sum256(legacyWire)
+	if hashFirst == fmt.Sprintf("%x", legacyDigest[:]) {
+		t.Fatal("CanonicalTaskSpecs() hash lacks versioned task-spec domain separation")
 	}
 }
 

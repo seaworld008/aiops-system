@@ -2,16 +2,46 @@ package investigation
 
 import (
 	"bytes"
-	"crypto/sha256"
+	"context"
 	"encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
 	"github.com/seaworld008/aiops-system/internal/domain"
 )
+
+const taskSpecsSemanticsV1 = "investigation.task-specs.v1"
+
+// TaskSpecAuthorizer is a trusted server-side registry/schema boundary. It
+// authorizes an exact connector/operation pair and validates its typed input.
+type TaskSpecAuthorizer func(context.Context, string, TaskSpec) error
+
+// AuthorizeTaskSpecs applies the trusted server-side registry/schema to
+// detached canonical task specifications. Authorizer diagnostics are folded
+// into a low-sensitivity repository error.
+func AuthorizeTaskSpecs(ctx context.Context, authorizer TaskSpecAuthorizer, workspaceID string, specs []TaskSpec) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if authorizer == nil {
+		return fmt.Errorf("%w: trusted task specification authorizer is required", ErrInvalidRequest)
+	}
+	for _, spec := range specs {
+		detached := spec
+		detached.Input = bytes.Clone(spec.Input)
+		if err := authorizer(ctx, workspaceID, detached); err != nil {
+			if contextErr := ctx.Err(); contextErr != nil {
+				return contextErr
+			}
+			return fmt.Errorf("%w: task specification is not authorized", ErrInvalidRequest)
+		}
+	}
+	return nil
+}
 
 var taskKeyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,63}$`)
 
@@ -69,12 +99,11 @@ func CanonicalTaskSpecs(specs []TaskSpec) ([]TaskSpec, string, error) {
 		}
 		return bytes.Compare(canonical[left].Input, canonical[right].Input) < 0
 	})
-	wire, err := json.Marshal(canonical)
+	hash, err := semanticRequestHash(taskSpecsSemanticsV1, canonical)
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: encode canonical tasks", ErrInvalidRequest)
+		return nil, "", err
 	}
-	digest := sha256.Sum256(wire)
-	return canonical, fmt.Sprintf("%x", digest[:]), nil
+	return canonical, hash, nil
 }
 
 func containsTaskTargetMaterial(value any) bool {
@@ -114,14 +143,28 @@ func containsTaskTargetMaterialAt(value any, parentKey string) bool {
 }
 
 func normalizeTaskFieldName(value string) string {
-	return strings.NewReplacer("_", "", "-", "", ".", "", " ", "", "/", "").Replace(strings.ToLower(value))
+	var normalized strings.Builder
+	for _, character := range value {
+		if unicode.IsLetter(character) || unicode.IsDigit(character) {
+			normalized.WriteRune(unicode.ToLower(character))
+		}
+	}
+	return normalized.String()
 }
 
 func forbiddenTaskFieldName(value string) bool {
 	normalized := normalizeTaskFieldName(value)
+	for _, carrier := range []string{
+		"args", "arguments", "argv", "env", "environment", "environmentvariables",
+		"command", "cmd", "options", "flags",
+	} {
+		if normalized == carrier {
+			return true
+		}
+	}
 	for _, forbidden := range []string{
 		"url", "endpoint", "header", "auth", "secret", "token", "password", "credential",
-		"host", "hostname", "port", "dsn", "uri", "address", "socket", "proxy", "server", "target", "cluster",
+		"host", "hostname", "port", "dsn", "uri", "address", "socket", "proxy", "server", "target", "cluster", "destination",
 	} {
 		if strings.Contains(normalized, forbidden) {
 			return true
@@ -132,8 +175,24 @@ func forbiddenTaskFieldName(value string) bool {
 
 func unsafeTaskTargetValue(value string) bool {
 	trimmed := strings.TrimSpace(value)
-	return targetURISchemePattern.MatchString(trimmed) || targetSchemeRelativePattern.MatchString(trimmed) ||
+	return containsTaskTargetCLIOption(trimmed) || targetURISchemePattern.MatchString(trimmed) || targetSchemeRelativePattern.MatchString(trimmed) ||
 		targetHostPortPattern.MatchString(trimmed) || containsTaskTargetAssignment(trimmed)
+}
+
+func containsTaskTargetCLIOption(value string) bool {
+	for _, field := range strings.Fields(value) {
+		if !strings.HasPrefix(field, "--") {
+			continue
+		}
+		option := strings.TrimPrefix(field, "--")
+		if separator := strings.IndexByte(option, '='); separator >= 0 {
+			option = option[:separator]
+		}
+		if forbiddenTaskFieldName(option) {
+			return true
+		}
+	}
+	return false
 }
 
 func containsTaskTargetAssignment(value string) bool {

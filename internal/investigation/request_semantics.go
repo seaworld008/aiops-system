@@ -13,12 +13,25 @@ import (
 )
 
 const (
+	createInvestigationRequestSemanticsV1   = "investigation.create.v1"
 	completeTaskRequestSemanticsV1          = "investigation.complete-task.v1"
 	finalizeInvestigationRequestSemanticsV1 = "investigation.finalize.v1"
 	recordFeedbackRequestSemanticsV1        = "investigation.feedback.v1"
 	startModelRequestSemanticsV1            = "investigation.start-model.v1"
 	failInvestigationRequestSemanticsV1     = "investigation.fail.v1"
 )
+
+// CreateOrGetInvestigationRequestHash returns the stable semantic hash for a
+// create operation after its task specifications have been canonicalized.
+func CreateOrGetInvestigationRequestHash(request CreateOrGetInvestigationRequest, taskSpecsHash string) (string, error) {
+	if !domain.ValidSHA256Hex(taskSpecsHash) {
+		return "", fmt.Errorf("%w: invalid canonical task specification hash", ErrInvalidRequest)
+	}
+	return semanticRequestHash(createInvestigationRequestSemanticsV1, struct {
+		IncidentID    string `json:"incident_id"`
+		TaskSpecsHash string `json:"task_specs_hash"`
+	}{IncidentID: request.IncidentID, TaskSpecsHash: taskSpecsHash})
+}
 
 // NormalizeCompleteTaskRequest validates the task-completion body, detaches all
 // caller-owned data and returns a stable hash of the operation semantics.

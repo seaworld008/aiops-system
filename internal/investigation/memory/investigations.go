@@ -23,13 +23,13 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 	if err != nil {
 		return investigation.CreateOrGetInvestigationResult{}, err
 	}
-	requestDigest := sha256.Sum256([]byte(request.IncidentID + "\x00" + taskHash))
-	requestHash := fmt.Sprintf("%x", requestDigest[:])
-	now := repository.clock().UTC()
-	if now.IsZero() {
-		return investigation.CreateOrGetInvestigationResult{}, fmt.Errorf("%w: clock returned zero time", investigation.ErrInvalidRequest)
+	if err := investigation.AuthorizeTaskSpecs(ctx, repository.taskSpecAuthorizer, request.WorkspaceID, canonicalTasks); err != nil {
+		return investigation.CreateOrGetInvestigationResult{}, err
 	}
-
+	requestHash, err := investigation.CreateOrGetInvestigationRequestHash(request, taskHash)
+	if err != nil {
+		return investigation.CreateOrGetInvestigationResult{}, err
+	}
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
 	idempotencyKey := scoped(request.WorkspaceID, request.IdempotencyKey)
@@ -67,18 +67,9 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 	if _, duplicate := repository.investigations[scoped(request.WorkspaceID, investigationID)]; duplicate {
 		return investigation.CreateOrGetInvestigationResult{}, fmt.Errorf("%w: ID factory returned duplicate investigation ID", investigation.ErrInvalidRequest)
 	}
-	item := domain.Investigation{
-		ID: investigationID, WorkspaceID: request.WorkspaceID, IncidentID: request.IncidentID,
-		Status: domain.InvestigationQueued, ModelStatus: domain.ModelPending,
-		IdempotencyKey: request.IdempotencyKey, RequestHash: requestHash, CreatedAt: now, UpdatedAt: now,
-	}
-	if err := item.Validate(); err != nil {
-		return investigation.CreateOrGetInvestigationResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, err)
-	}
-	taskIDs := make([]string, 0, len(canonicalTasks))
-	createdTasks := make([]domain.ReadTask, 0, len(canonicalTasks))
+	taskIDs := make([]string, len(canonicalTasks))
 	createdTaskIDs := make(map[string]struct{}, len(canonicalTasks))
-	for index, spec := range canonicalTasks {
+	for index := range canonicalTasks {
 		taskID, idErr := repository.newID()
 		if idErr != nil {
 			return investigation.CreateOrGetInvestigationResult{}, idErr
@@ -90,21 +81,37 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 			return investigation.CreateOrGetInvestigationResult{}, fmt.Errorf("%w: ID factory returned duplicate task ID", investigation.ErrInvalidRequest)
 		}
 		createdTaskIDs[taskID] = struct{}{}
+		taskIDs[index] = taskID
+	}
+	now := repository.clock().UTC()
+	if now.IsZero() {
+		return investigation.CreateOrGetInvestigationResult{}, fmt.Errorf("%w: clock returned zero time", investigation.ErrInvalidRequest)
+	}
+	commitAt := latestTime(now, incident.OpenedAt, incident.LastSignalAt, incident.UpdatedAt)
+	item := domain.Investigation{
+		ID: investigationID, WorkspaceID: request.WorkspaceID, IncidentID: request.IncidentID,
+		Status: domain.InvestigationQueued, ModelStatus: domain.ModelPending,
+		IdempotencyKey: request.IdempotencyKey, RequestHash: requestHash, CreatedAt: commitAt, UpdatedAt: commitAt,
+	}
+	if err := item.Validate(); err != nil {
+		return investigation.CreateOrGetInvestigationResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, err)
+	}
+	createdTasks := make([]domain.ReadTask, 0, len(canonicalTasks))
+	for index, spec := range canonicalTasks {
 		inputDigest := sha256.Sum256(spec.Input)
 		task := domain.ReadTask{
-			ID: taskID, WorkspaceID: request.WorkspaceID, IncidentID: request.IncidentID, InvestigationID: item.ID,
+			ID: taskIDs[index], WorkspaceID: request.WorkspaceID, IncidentID: request.IncidentID, InvestigationID: item.ID,
 			Key: spec.Key, Position: index + 1, ConnectorID: spec.ConnectorID, Operation: spec.Operation,
 			Input: bytes.Clone(spec.Input), InputHash: fmt.Sprintf("%x", inputDigest[:]), Status: domain.ReadTaskQueued,
-			CreatedAt: now, UpdatedAt: now,
+			CreatedAt: commitAt, UpdatedAt: commitAt,
 		}
 		if validateErr := task.Validate(); validateErr != nil {
 			return investigation.CreateOrGetInvestigationResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, validateErr)
 		}
-		taskIDs = append(taskIDs, task.ID)
 		createdTasks = append(createdTasks, task)
 	}
 	if incident.Status == domain.IncidentOpen {
-		if err := incident.TransitionAt(domain.IncidentInvestigating, laterTime(now, incident.UpdatedAt)); err != nil {
+		if err := incident.TransitionAt(domain.IncidentInvestigating, commitAt); err != nil {
 			return investigation.CreateOrGetInvestigationResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidTransition, err)
 		}
 		repository.incidents[incidentKey] = incident

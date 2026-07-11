@@ -46,6 +46,91 @@ func TestCorrelateFiringSignalCreatesOneIncidentAndReplayDoesNotRecount(t *testi
 	}
 }
 
+func TestCorrelateSignalKeepsExistingIncidentUpdatedAtMonotonic(t *testing.T) {
+	base := time.Date(2026, 7, 13, 2, 0, 0, 0, time.UTC)
+	clockNow := base.Add(10 * time.Minute)
+	nextID := 0
+	repository, err := memory.New(memory.Options{
+		Clock: func() time.Time { return clockNow }, TenantResolver: testTenantResolver, TaskSpecAuthorizer: testTaskSpecAuthorizer,
+		IDFactory: func() string { nextID++; return fmt.Sprintf("monotonic-correlation-%d", nextID) },
+	})
+	if err != nil {
+		t.Fatalf("memory.New() error = %v", err)
+	}
+	request := investigation.CorrelateSignalRequest{
+		WorkspaceID: "workspace-1", CorrelationKey: "payments:prod:monotonic",
+		ServiceID: "payments", EnvironmentID: "prod", MappingStatus: domain.MappingExact,
+	}
+	firstSignal := testSignal("workspace-1", "signal-monotonic-1", "firing", base)
+	if _, err := repository.RegisterSignal(context.Background(), firstSignal); err != nil {
+		t.Fatalf("RegisterSignal(first) error = %v", err)
+	}
+	request.SignalID = firstSignal.ID
+	first, err := repository.CorrelateSignal(context.Background(), request)
+	if err != nil {
+		t.Fatalf("CorrelateSignal(first) error = %v", err)
+	}
+
+	clockNow = base.Add(5 * time.Minute)
+	secondSignal := testSignal("workspace-1", "signal-monotonic-2", "firing", base.Add(time.Minute))
+	if _, err := repository.RegisterSignal(context.Background(), secondSignal); err != nil {
+		t.Fatalf("RegisterSignal(second) error = %v", err)
+	}
+	request.SignalID = secondSignal.ID
+	second, err := repository.CorrelateSignal(context.Background(), request)
+	if err != nil {
+		t.Fatalf("CorrelateSignal(second) error = %v", err)
+	}
+	if second.Incident.UpdatedAt != first.Incident.UpdatedAt {
+		t.Fatalf("UpdatedAt = %s, want monotonic previous %s", second.Incident.UpdatedAt, first.Incident.UpdatedAt)
+	}
+}
+
+func TestCorrelateSignalRejectsActiveIncidentMappingMismatchWithoutPartialWrite(t *testing.T) {
+	now := time.Date(2026, 7, 13, 2, 30, 0, 0, time.UTC)
+	for name, mutate := range map[string]func(*investigation.CorrelateSignalRequest){
+		"mapping status": func(request *investigation.CorrelateSignalRequest) { request.MappingStatus = domain.MappingAmbiguous },
+		"service":        func(request *investigation.CorrelateSignalRequest) { request.ServiceID = "checkout" },
+		"environment":    func(request *investigation.CorrelateSignalRequest) { request.EnvironmentID = "staging" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			repository := newRepository(t, now)
+			suffix := strings.ReplaceAll(name, " ", "-")
+			firstSignal := testSignal("workspace-1", "signal-mapping-first-"+suffix, "firing", now)
+			secondSignal := testSignal("workspace-1", "signal-mapping-second-"+suffix, "firing", now.Add(time.Minute))
+			for _, signal := range []domain.Signal{firstSignal, secondSignal} {
+				if _, err := repository.RegisterSignal(context.Background(), signal); err != nil {
+					t.Fatalf("RegisterSignal(%s) error = %v", signal.ID, err)
+				}
+			}
+			request := investigation.CorrelateSignalRequest{
+				WorkspaceID: "workspace-1", SignalID: firstSignal.ID, CorrelationKey: "payments:prod:mapping-" + suffix,
+				ServiceID: "payments", EnvironmentID: "prod", MappingStatus: domain.MappingExact,
+			}
+			first, err := repository.CorrelateSignal(context.Background(), request)
+			if err != nil {
+				t.Fatalf("CorrelateSignal(first) error = %v", err)
+			}
+			mismatched := request
+			mismatched.SignalID = secondSignal.ID
+			mutate(&mismatched)
+			if _, err := repository.CorrelateSignal(context.Background(), mismatched); !errors.Is(err, store.ErrScopeViolation) {
+				t.Fatalf("CorrelateSignal(mismatched %s) error = %v, want ErrScopeViolation", name, err)
+			}
+			stored, err := repository.GetIncident(context.Background(), "workspace-1", first.Incident.ID)
+			if err != nil || stored != first.Incident {
+				t.Fatalf("GetIncident(after mismatch) = %#v, %v; want unchanged %#v", stored, err, first.Incident)
+			}
+			corrected := request
+			corrected.SignalID = secondSignal.ID
+			accepted, err := repository.CorrelateSignal(context.Background(), corrected)
+			if err != nil || accepted.Incident.SignalCount != 2 {
+				t.Fatalf("CorrelateSignal(corrected) = %#v, %v; mismatch left partial association", accepted, err)
+			}
+		})
+	}
+}
+
 func TestCorrelateSignalReplayRequiresOriginalRequestSemantics(t *testing.T) {
 	now := time.Date(2026, 7, 12, 16, 0, 0, 0, time.UTC)
 	repository := newRepository(t, now)
@@ -217,8 +302,9 @@ func TestCorrelateSignalUsesTrustedTenantResolverWithoutPartialWrites(t *testing
 	now := time.Date(2026, 7, 12, 19, 15, 0, 0, time.UTC)
 	resolverFails := true
 	repository, err := memory.New(memory.Options{
-		Clock:     func() time.Time { return now },
-		IDFactory: func() string { return "incident-tenant" },
+		Clock:              func() time.Time { return now },
+		IDFactory:          func() string { return "incident-tenant" },
+		TaskSpecAuthorizer: testTaskSpecAuthorizer,
 		TenantResolver: func(workspaceID string) (string, error) {
 			if resolverFails {
 				return "", errors.New("tenant resolver unavailable")
@@ -258,8 +344,20 @@ func TestNewRepositoryRequiresTrustedTenantResolver(t *testing.T) {
 	now := time.Date(2026, 7, 12, 19, 20, 0, 0, time.UTC)
 	if _, err := memory.New(memory.Options{
 		Clock: func() time.Time { return now }, IDFactory: func() string { return "generated-1" },
+		TaskSpecAuthorizer: testTaskSpecAuthorizer,
 	}); !errors.Is(err, investigation.ErrInvalidRequest) {
 		t.Fatalf("memory.New(without TenantResolver) error = %v, want ErrInvalidRequest", err)
+	}
+}
+
+func TestNewRepositoryRequiresTrustedTaskSpecAuthorizer(t *testing.T) {
+	_, err := memory.New(memory.Options{
+		Clock:          func() time.Time { return time.Date(2026, 7, 13, 4, 30, 0, 0, time.UTC) },
+		IDFactory:      func() string { return "generated-1" },
+		TenantResolver: testTenantResolver,
+	})
+	if !errors.Is(err, investigation.ErrInvalidRequest) {
+		t.Fatalf("memory.New(without TaskSpecAuthorizer) error = %v, want ErrInvalidRequest", err)
 	}
 }
 
@@ -268,7 +366,7 @@ func TestConcurrentSignalStormMergesIntoOneIncidentWithExactTimeBounds(t *testin
 	repository := newRepository(t, now)
 	const goroutines = 64
 	for index := 0; index < goroutines; index++ {
-		signal := testSignal("workspace-1", fmt.Sprintf("storm-%02d", index), "firing", now.Add(time.Duration(index)*time.Minute))
+		signal := testSignal("workspace-1", fmt.Sprintf("storm-%02d", index), "firing", now.Add(time.Duration(index-(goroutines-1))*time.Minute))
 		if _, err := repository.RegisterSignal(context.Background(), signal); err != nil {
 			t.Fatalf("RegisterSignal(%d) error = %v", index, err)
 		}
@@ -316,8 +414,8 @@ func TestConcurrentSignalStormMergesIntoOneIncidentWithExactTimeBounds(t *testin
 	if err != nil {
 		t.Fatalf("GetIncident() error = %v", err)
 	}
-	if created != 1 || stored.SignalCount != goroutines || stored.OpenedAt != now ||
-		stored.LastSignalAt != now.Add((goroutines-1)*time.Minute) {
+	if created != 1 || stored.SignalCount != goroutines || stored.OpenedAt != now.Add(-(goroutines-1)*time.Minute) ||
+		stored.LastSignalAt != now {
 		t.Fatalf("storm result created=%d incident=%#v", created, stored)
 	}
 }
@@ -334,6 +432,36 @@ func TestRegisterSignalCopiesCallerLabels(t *testing.T) {
 	created, err := repository.RegisterSignal(context.Background(), replay)
 	if err != nil || created {
 		t.Fatalf("RegisterSignal(replay) = %v, %v; want false, nil after caller mutation", created, err)
+	}
+}
+
+func TestRegisterSignalNormalizesEquivalentObservedAtInstantsForReplay(t *testing.T) {
+	now := time.Date(2026, 7, 13, 6, 0, 0, 0, time.UTC)
+	repository := newRepository(t, now)
+	first := testSignal("workspace-1", "signal-timezone-replay", "firing", now.In(time.FixedZone("UTC+8", 8*60*60)))
+	if created, err := repository.RegisterSignal(context.Background(), first); err != nil || !created {
+		t.Fatalf("RegisterSignal(first) = %v, %v; want created", created, err)
+	}
+	replay := testSignal("workspace-1", "signal-timezone-replay", "firing", now)
+	if created, err := repository.RegisterSignal(context.Background(), replay); err != nil || created {
+		t.Fatalf("RegisterSignal(equivalent instant replay) = %v, %v; want false, nil", created, err)
+	}
+}
+
+func TestRegisterSignalEnforcesTrustedFutureSkewWithoutPartialWrite(t *testing.T) {
+	now := time.Date(2026, 7, 13, 6, 15, 0, 0, time.UTC)
+	repository := newRepository(t, now)
+	boundary := testSignal("workspace-1", "signal-future-boundary", "firing", now.Add(investigation.MaxSignalFutureSkew))
+	if created, err := repository.RegisterSignal(context.Background(), boundary); err != nil || !created {
+		t.Fatalf("RegisterSignal(boundary) = %v, %v; want accepted", created, err)
+	}
+	tooFuture := testSignal("workspace-1", "signal-too-future", "firing", now.Add(investigation.MaxSignalFutureSkew+time.Nanosecond))
+	if _, err := repository.RegisterSignal(context.Background(), tooFuture); !errors.Is(err, investigation.ErrInvalidRequest) {
+		t.Fatalf("RegisterSignal(too future) error = %v, want ErrInvalidRequest", err)
+	}
+	corrected := testSignal("workspace-1", tooFuture.ID, "firing", now)
+	if created, err := repository.RegisterSignal(context.Background(), corrected); err != nil || !created {
+		t.Fatalf("RegisterSignal(corrected) = %v, %v; future rejection left partial write", created, err)
 	}
 }
 
@@ -408,6 +536,7 @@ func TestCorrelateSignalRejectsDuplicateGeneratedIncidentIDWithoutPartialWrites(
 	now := time.Date(2026, 7, 12, 15, 0, 0, 0, time.UTC)
 	repository, err := memory.New(memory.Options{
 		Clock: func() time.Time { return now }, IDFactory: func() string { return "duplicate-incident" }, TenantResolver: testTenantResolver,
+		TaskSpecAuthorizer: testTaskSpecAuthorizer,
 	})
 	if err != nil {
 		t.Fatalf("memory.New() error = %v", err)

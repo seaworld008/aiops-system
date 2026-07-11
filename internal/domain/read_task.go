@@ -63,7 +63,8 @@ func (task ReadTask) Validate() error {
 	}
 	if task.CreatedAt.IsZero() || task.UpdatedAt.IsZero() || task.UpdatedAt.Before(task.CreatedAt) ||
 		!timeWithin(task.StartedAt, task.CreatedAt, task.UpdatedAt) ||
-		!timeWithin(task.CompletedAt, task.CreatedAt, task.UpdatedAt) {
+		!timeWithin(task.CompletedAt, task.CreatedAt, task.UpdatedAt) ||
+		(!task.StartedAt.IsZero() && !task.CompletedAt.IsZero() && task.CompletedAt.Before(task.StartedAt)) {
 		return fmt.Errorf("read task timestamps are invalid")
 	}
 	switch task.Status {

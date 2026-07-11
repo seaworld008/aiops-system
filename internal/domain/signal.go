@@ -40,6 +40,10 @@ func (signal Signal) Validate() error {
 	if len(signal.Provider) > 64 || len(signal.ProviderEventID) > 512 || len(signal.Fingerprint) > 512 || len(signal.PayloadHash) > 128 {
 		return fmt.Errorf("signal indexed fields exceed byte limits")
 	}
+	if !lowCardinalityPattern.MatchString(signal.Provider) || !ValidSafeText(signal.Provider) ||
+		!ValidSafeText(signal.ProviderEventID) || !ValidSafeText(signal.Fingerprint) {
+		return fmt.Errorf("signal indexed metadata is unsafe")
+	}
 	if signal.Status != "firing" && signal.Status != "resolved" {
 		return fmt.Errorf("signal status must be firing or resolved")
 	}

@@ -16,6 +16,7 @@ func TestRepositoryRejectsInvalidOrDuplicateFactoryIDsWithoutPartialInvestigatio
 	now := time.Date(2026, 7, 11, 21, 0, 0, 0, time.UTC)
 	invalidFactory, err := memory.New(memory.Options{
 		Clock: func() time.Time { return now }, IDFactory: func() string { return "invalid id" }, TenantResolver: testTenantResolver,
+		TaskSpecAuthorizer: testTaskSpecAuthorizer,
 	})
 	if err != nil {
 		t.Fatalf("memory.New(invalid ID factory) error = %v", err)
@@ -34,8 +35,9 @@ func TestRepositoryRejectsInvalidOrDuplicateFactoryIDsWithoutPartialInvestigatio
 	ids := []string{"incident-generated", "investigation-generated", "duplicate-task", "duplicate-task"}
 	index := 0
 	duplicateFactory, err := memory.New(memory.Options{
-		Clock:          func() time.Time { return now },
-		TenantResolver: testTenantResolver,
+		Clock:              func() time.Time { return now },
+		TenantResolver:     testTenantResolver,
+		TaskSpecAuthorizer: testTaskSpecAuthorizer,
 		IDFactory: func() string {
 			value := ids[index]
 			index++

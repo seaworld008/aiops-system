@@ -10,9 +10,10 @@ import (
 )
 
 type Options struct {
-	Clock          func() time.Time
-	IDFactory      func() string
-	TenantResolver func(workspaceID string) (string, error)
+	Clock              func() time.Time
+	IDFactory          func() string
+	TenantResolver     func(workspaceID string) (string, error)
+	TaskSpecAuthorizer investigation.TaskSpecAuthorizer
 }
 
 type Repository struct {
@@ -37,19 +38,20 @@ type Repository struct {
 	failureIdempotency           map[scopeKey]idempotencyRecord
 	feedback                     map[scopeKey]domain.Feedback
 	feedbackIdempotency          map[scopeKey]idempotencyRecord
-	modelStartIdempotency        map[scopeKey]idempotencyRecord
+	modelStartIdempotency        map[scopeKey]modelStartRecord
 	idempotencyOwners            map[scopeKey]string
 
-	clock          func() time.Time
-	idFactory      func() string
-	tenantResolver func(workspaceID string) (string, error)
+	clock              func() time.Time
+	idFactory          func() string
+	tenantResolver     func(workspaceID string) (string, error)
+	taskSpecAuthorizer investigation.TaskSpecAuthorizer
 }
 
 var _ investigation.Repository = (*Repository)(nil)
 
 func New(options Options) (*Repository, error) {
-	if options.Clock == nil || options.IDFactory == nil || options.TenantResolver == nil {
-		return nil, fmt.Errorf("%w: clock, ID factory and tenant resolver are required", investigation.ErrInvalidRequest)
+	if options.Clock == nil || options.IDFactory == nil || options.TenantResolver == nil || options.TaskSpecAuthorizer == nil {
+		return nil, fmt.Errorf("%w: trusted repository dependencies are required", investigation.ErrInvalidRequest)
 	}
 	if options.Clock().IsZero() {
 		return nil, fmt.Errorf("%w: clock returned zero time", investigation.ErrInvalidRequest)
@@ -74,11 +76,12 @@ func New(options Options) (*Repository, error) {
 		failureIdempotency:           make(map[scopeKey]idempotencyRecord),
 		feedback:                     make(map[scopeKey]domain.Feedback),
 		feedbackIdempotency:          make(map[scopeKey]idempotencyRecord),
-		modelStartIdempotency:        make(map[scopeKey]idempotencyRecord),
+		modelStartIdempotency:        make(map[scopeKey]modelStartRecord),
 		idempotencyOwners:            make(map[scopeKey]string),
 		clock:                        options.Clock,
 		idFactory:                    options.IDFactory,
 		tenantResolver:               options.TenantResolver,
+		taskSpecAuthorizer:           options.TaskSpecAuthorizer,
 	}, nil
 }
 
@@ -112,6 +115,11 @@ type taskCompletionRecord struct {
 type finalizeRecord struct {
 	requestHash string
 	result      investigation.FinalizeInvestigationResult
+}
+
+type modelStartRecord struct {
+	requestHash string
+	result      investigation.StartModelResult
 }
 
 func (repository *Repository) newID() (string, error) {

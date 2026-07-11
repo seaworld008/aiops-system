@@ -60,6 +60,11 @@ func cloneFinalizeResult(result investigation.FinalizeInvestigationResult) inves
 	return result
 }
 
+func cloneStartModelResult(result investigation.StartModelResult) investigation.StartModelResult {
+	result.Investigation = cloneInvestigation(result.Investigation)
+	return result
+}
+
 func cloneFeedback(feedback domain.Feedback) domain.Feedback {
 	feedback.Details = bytes.Clone(feedback.Details)
 	return feedback

@@ -4,35 +4,22 @@ import (
 	"context"
 	"fmt"
 	"reflect"
-	"regexp"
 	"sort"
-	"strings"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/investigation"
 	"github.com/seaworld008/aiops-system/internal/store"
 )
 
-const (
-	maxSignalLabels     = 64
-	maxSignalLabelValue = 512
-)
-
-var signalLabelKeyPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,127}$`)
-
 func (repository *Repository) RegisterSignal(ctx context.Context, signal domain.Signal) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	if !validInvestigationSignal(signal) {
-		return false, fmt.Errorf("%w: invalid signal scope", investigation.ErrInvalidRequest)
+	normalized, err := investigation.NormalizeSignal(signal, repository.clock())
+	if err != nil {
+		return false, err
 	}
-	if err := signal.Validate(); err != nil {
-		return false, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, err)
-	}
-	signal = cloneSignal(signal)
+	signal = normalized
 	key := scoped(signal.WorkspaceID, signal.ID)
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
@@ -44,21 +31,6 @@ func (repository *Repository) RegisterSignal(ctx context.Context, signal domain.
 	}
 	repository.signals[key] = signal
 	return true, nil
-}
-
-func validInvestigationSignal(signal domain.Signal) bool {
-	if !domain.ValidResourceID(signal.WorkspaceID) || !domain.ValidResourceID(signal.ID) ||
-		!domain.ValidResourceID(signal.IntegrationID) || !domain.ValidSHA256Hex(signal.PayloadHash) ||
-		len(signal.Labels) > maxSignalLabels {
-		return false
-	}
-	for key, value := range signal.Labels {
-		if !signalLabelKeyPattern.MatchString(key) || len(value) > maxSignalLabelValue || !utf8.ValidString(value) ||
-			strings.IndexFunc(value, unicode.IsControl) >= 0 || !domain.ValidSafeMetadata(key, value) {
-			return false
-		}
-	}
-	return true
 }
 
 func (repository *Repository) CorrelateSignal(ctx context.Context, request investigation.CorrelateSignalRequest) (investigation.CorrelateSignalResult, error) {
@@ -103,6 +75,10 @@ func (repository *Repository) CorrelateSignal(ctx context.Context, request inves
 	if active && incident.TenantID != tenantID {
 		return investigation.CorrelateSignalResult{}, store.ErrScopeViolation
 	}
+	if active && (incident.CorrelationKey != request.CorrelationKey || incident.MappingStatus != request.MappingStatus ||
+		incident.ServiceID != request.ServiceID || incident.EnvironmentID != request.EnvironmentID) {
+		return investigation.CorrelateSignalResult{}, store.ErrScopeViolation
+	}
 	if !active && signal.Status == "resolved" {
 		repository.signalIncident[signalKey] = signalAssociationRecord{
 			correlationKey: request.CorrelationKey, mappingStatus: request.MappingStatus,
@@ -144,7 +120,7 @@ func (repository *Repository) CorrelateSignal(ctx context.Context, request inves
 		if signal.ObservedAt.After(incident.LastSignalAt) {
 			incident.LastSignalAt = signal.ObservedAt.UTC()
 		}
-		incident.UpdatedAt = laterTime(now, incident.LastSignalAt)
+		incident.UpdatedAt = latestTime(incident.UpdatedAt, now, incident.LastSignalAt)
 		incident.Version++
 		if err := incident.Validate(); err != nil {
 			return investigation.CorrelateSignalResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, err)

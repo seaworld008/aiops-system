@@ -17,11 +17,10 @@ const MaxResourceIDBytes = 256
 const maxInvestigationJSONDepth = 32
 
 var (
-	sha256HexPattern            = regexp.MustCompile(`^[a-f0-9]{64}$`)
-	identifierPattern           = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@-]*$`)
-	idempotencyKeyPattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9._:/-]{0,127}$`)
-	lowCardinalityPattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]*$`)
-	credentialAssignmentPattern = regexp.MustCompile(`(?i)(?:password|token|secret|credential|authorization|cookie|api[\s_.-]*key|accessor|private[\s_.-]*key)[\s_.-]*[:=]`)
+	sha256HexPattern      = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	identifierPattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@-]*$`)
+	idempotencyKeyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._:/-]{0,127}$`)
+	lowCardinalityPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]*$`)
 )
 
 func ValidSHA256Hex(value string) bool {
@@ -93,7 +92,9 @@ func ValidSafeText(value string) bool {
 
 func validSafeUnicode(value string) bool {
 	return utf8.ValidString(value) && !strings.ContainsRune(value, utf8.RuneError) &&
-		strings.IndexFunc(value, unicode.IsControl) < 0
+		strings.IndexFunc(value, func(character rune) bool {
+			return unicode.IsControl(character) || unicode.Is(unicode.Cf, character)
+		}) < 0
 }
 
 func validateHashedJSONObject(value json.RawMessage, hash string) error {
@@ -249,7 +250,13 @@ func unsafeSecurityPath(path []string) bool {
 }
 
 func normalizeSecurityName(value string) string {
-	return strings.NewReplacer("_", "", "-", "", ".", "", " ", "", "/", "").Replace(strings.ToLower(value))
+	var normalized strings.Builder
+	for _, character := range value {
+		if unicode.IsLetter(character) || unicode.IsDigit(character) {
+			normalized.WriteRune(unicode.ToLower(character))
+		}
+	}
+	return normalized.String()
 }
 
 func unsafeSecurityName(value string) bool {
@@ -266,16 +273,44 @@ func unsafeSecurityName(value string) bool {
 }
 
 func unsafeSecurityValue(value string) bool {
-	if credentialAssignmentPattern.MatchString(value) {
+	trimmed := strings.TrimSpace(value)
+	if strings.HasPrefix(trimmed, "--") {
+		option := strings.TrimPrefix(trimmed, "--")
+		if separator := strings.IndexByte(option, '='); separator >= 0 {
+			option = option[:separator]
+		}
+		if unsafeSecurityName(option) {
+			return true
+		}
+	}
+	if containsUnsafeSecurityAssignment(value) {
 		return true
 	}
-	normalized := strings.ToLower(strings.TrimSpace(value))
+	normalized := strings.ToLower(trimmed)
 	for _, marker := range []string{
 		"bearer ", "authorization", "cookie", "set-cookie", "begin private key", "begin rsa private key",
 		"private key", "private-key", "private_key", "raw error body", "raw_error_body", "raw-error-body",
 	} {
 		if strings.Contains(normalized, marker) {
 			return true
+		}
+	}
+	return false
+}
+
+func containsUnsafeSecurityAssignment(value string) bool {
+	for index, character := range value {
+		if character != ':' && character != '=' {
+			continue
+		}
+		skeleton := normalizeSecurityName(value[:index])
+		for _, marker := range []string{
+			"authorization", "authentication", "auth", "apikey", "accessor", "credential",
+			"rawerror", "errorbody", "secret", "token", "password", "cookie", "privatekey",
+		} {
+			if strings.HasSuffix(skeleton, marker) {
+				return true
+			}
 		}
 	}
 	return false

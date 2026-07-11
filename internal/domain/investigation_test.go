@@ -165,6 +165,46 @@ func TestInvestigationAndReadTaskValidateLifecycleShape(t *testing.T) {
 	}
 }
 
+func TestInvestigationValidateRejectsModelStateOutsideLifecycleMatrix(t *testing.T) {
+	now := time.Date(2026, 7, 13, 1, 0, 0, 0, time.UTC)
+	running := domain.Investigation{
+		ID: "investigation-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
+		Status: domain.InvestigationRunning, ModelStatus: domain.ModelCompleted,
+		IdempotencyKey: "investigate:matrix", RequestHash: strings.Repeat("a", 64),
+		CreatedAt: now, StartedAt: now, UpdatedAt: now,
+	}
+	if err := running.Validate(); err == nil {
+		t.Fatal("RUNNING Investigation accepted COMPLETED ModelStatus")
+	}
+}
+
+func TestInvestigationValidateRejectsCompletionBeforeStart(t *testing.T) {
+	now := time.Date(2026, 7, 13, 1, 15, 0, 0, time.UTC)
+	completed := domain.Investigation{
+		ID: "investigation-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
+		Status: domain.InvestigationCompleted, ModelStatus: domain.ModelCompleted,
+		IdempotencyKey: "investigate:time-order", RequestHash: strings.Repeat("a", 64),
+		CreatedAt: now, StartedAt: now.Add(2 * time.Minute), CompletedAt: now.Add(time.Minute), UpdatedAt: now.Add(3 * time.Minute),
+	}
+	if err := completed.Validate(); err == nil {
+		t.Fatal("Investigation accepted CompletedAt before StartedAt")
+	}
+}
+
+func TestReadTaskValidateRejectsCompletionBeforeStart(t *testing.T) {
+	now := time.Date(2026, 7, 13, 1, 30, 0, 0, time.UTC)
+	input := json.RawMessage(`{"lookback_minutes":15}`)
+	task := domain.ReadTask{
+		ID: "task-1", WorkspaceID: "workspace-1", IncidentID: "incident-1", InvestigationID: "investigation-1",
+		Key: "metrics", Position: 1, ConnectorID: "prometheus-prod", Operation: "range_query",
+		Input: input, InputHash: sha256Hex(input), Status: domain.ReadTaskFailed, FailureCode: "source_failed",
+		CreatedAt: now, StartedAt: now.Add(2 * time.Minute), CompletedAt: now.Add(time.Minute), UpdatedAt: now.Add(3 * time.Minute),
+	}
+	if err := task.Validate(); err == nil {
+		t.Fatal("ReadTask accepted CompletedAt before StartedAt")
+	}
+}
+
 func TestCancelledReadTaskAllowsPreStartCancellation(t *testing.T) {
 	now := time.Date(2026, 7, 12, 18, 30, 0, 0, time.UTC)
 	input := json.RawMessage(`{"lookback_minutes":15}`)
@@ -199,6 +239,16 @@ func TestSafeJSONObjectRejectsSensitivePathsNamesAndValuesWithoutEcho(t *testing
 		"password assignment value": json.RawMessage(`{"message":"password=` + canary + `"}`),
 		"cookie value":              json.RawMessage(`{"message":"Cookie: session=` + canary + `"}`),
 		"private key value":         json.RawMessage(`{"message":"-----BEGIN PRIVATE KEY-----` + canary + `"}`),
+		"token CLI option array":    json.RawMessage(`{"args":["collect","--token","` + canary + `"]}`),
+		"API key CLI option array":  json.RawMessage(`{"options":["--api-key=` + canary + `"]}`),
+		"accessor CLI option array": json.RawMessage(`{"command":["tool","--accessor","` + canary + `"]}`),
+		"colon-obfuscated API key":  json.RawMessage(`{"api:key":"` + canary + `"}`),
+		"colon-obfuscated password": json.RawMessage(`{"pass:word":"` + canary + `"}`),
+		"colon-obfuscated assignment": json.RawMessage(
+			`{"message":"api:key=` + canary + ` pass:word=` + canary + `"}`,
+		),
+		"slash-obfuscated assignment":     json.RawMessage(`{"message":"pass/word=` + canary + `"}`),
+		"fullwidth-obfuscated assignment": json.RawMessage(`{"message":"api：key=` + canary + `"}`),
 	}
 	for name, value := range unsafe {
 		t.Run(name, func(t *testing.T) {
@@ -210,6 +260,9 @@ func TestSafeJSONObjectRejectsSensitivePathsNamesAndValuesWithoutEcho(t *testing
 				t.Fatalf("error echoed sensitive input: %v", err)
 			}
 		})
+	}
+	if err := domain.ValidateSafeJSONObject(json.RawMessage(`{"message":"tokenization completed"}`)); err != nil {
+		t.Fatalf("ValidateSafeJSONObject(tokenization text) error = %v, want legal text", err)
 	}
 }
 
@@ -240,6 +293,25 @@ func TestValidateSafeJSONObjectRejectsReplacementRuneInKeysAndStringsWithoutEcho
 			}
 			if strings.Contains(err.Error(), "canary") {
 				t.Fatalf("ValidateSafeJSONObject() echoed invalid input: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateSafeJSONObjectRejectsUnicodeFormatCharactersWithoutEcho(t *testing.T) {
+	const canary = "unicode-format-canary"
+	for name, value := range map[string]json.RawMessage{
+		"zero width space value": json.RawMessage(`{"message":"` + canary + `​"}`),
+		"right-to-left override": json.RawMessage(`{"message":"` + canary + `‮"}`),
+		"word joiner key":        json.RawMessage(`{"field⁠":"` + canary + `"}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := domain.ValidateSafeJSONObject(value)
+			if err == nil {
+				t.Fatal("ValidateSafeJSONObject() error = nil, want Unicode Cf rejection")
+			}
+			if strings.Contains(err.Error(), canary) {
+				t.Fatalf("ValidateSafeJSONObject() echoed input: %v", err)
 			}
 		})
 	}

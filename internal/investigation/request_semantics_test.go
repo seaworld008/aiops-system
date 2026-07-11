@@ -240,6 +240,39 @@ func TestStartAndFailInvestigationRequestHashesAreCentralizedAndSemantic(t *test
 	}
 }
 
+func TestCreateInvestigationRequestHashIsVersionedAndScopeIndependent(t *testing.T) {
+	_, taskHash, err := investigation.CanonicalTaskSpecs([]investigation.TaskSpec{{
+		Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+	}})
+	if err != nil {
+		t.Fatalf("CanonicalTaskSpecs() error = %v", err)
+	}
+	request := investigation.CreateOrGetInvestigationRequest{
+		WorkspaceID: "workspace-1", IncidentID: "incident-1", IdempotencyKey: "investigate:create-hash",
+	}
+	requestHash, err := investigation.CreateOrGetInvestigationRequestHash(request, taskHash)
+	const goldenCreateHash = "ce7078b6d0af8770614bf44c1142987fdde706f978269d5e3fca5dffa5e1e79b"
+	if err != nil || requestHash != goldenCreateHash {
+		t.Fatalf("CreateOrGetInvestigationRequestHash() = %q, %v", requestHash, err)
+	}
+	differentScope := request
+	differentScope.WorkspaceID = "workspace-2"
+	differentScope.IdempotencyKey = "different-key"
+	scopeHash, err := investigation.CreateOrGetInvestigationRequestHash(differentScope, taskHash)
+	if err != nil || scopeHash != requestHash {
+		t.Fatalf("scope-only hash = %q, %v; want %q", scopeHash, err, requestHash)
+	}
+	differentIncident := request
+	differentIncident.IncidentID = "incident-2"
+	incidentHash, err := investigation.CreateOrGetInvestigationRequestHash(differentIncident, taskHash)
+	if err != nil || incidentHash == requestHash {
+		t.Fatalf("different incident hash = %q, %v; want semantic difference", incidentHash, err)
+	}
+	if _, err := investigation.CreateOrGetInvestigationRequestHash(request, "invalid"); !errors.Is(err, investigation.ErrInvalidRequest) {
+		t.Fatalf("invalid task hash error = %v, want ErrInvalidRequest", err)
+	}
+}
+
 func testSHA256Hex(value []byte) string {
 	digest := sha256.Sum256(value)
 	return fmt.Sprintf("%x", digest[:])
