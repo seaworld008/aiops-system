@@ -2517,6 +2517,8 @@
         "required": [
           "revocation_id",
           "child_create_permit",
+          "issuer_id",
+          "issuer_revision",
           "credential_expires_at"
         ],
         "properties": {
@@ -2525,6 +2527,12 @@
           },
           "child_create_permit": {
             "$ref": "#/components/schemas/OpaqueOneTimePermit"
+          },
+          "issuer_id": {
+            "$ref": "#/components/schemas/RunnerResourceID"
+          },
+          "issuer_revision": {
+            "$ref": "#/components/schemas/RunnerResourceID"
           },
           "credential_expires_at": {
             "$ref": "#/components/schemas/RFC3339Timestamp"

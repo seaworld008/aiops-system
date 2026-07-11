@@ -617,7 +617,9 @@ func TestBackendResponsesAreBoundToTheAuthenticatedRequestFence(t *testing.T) {
 		JobStartResponse{
 			SchemaVersion: "runner-job-start-response.v1", JobID: "job-1", Status: "RUNNING", LeaseEpoch: 7,
 			ScopeRevision: 1, StartedAt: now, CredentialPrepare: CredentialPrepare{
-				RevocationID: revocationID, ChildCreatePermit: testLeaseToken, CredentialExpiresAt: now.Add(10 * time.Minute),
+				RevocationID: revocationID, ChildCreatePermit: testLeaseToken,
+				IssuerID: "vault-issuer", IssuerRevision: "issuer-revision-1",
+				CredentialExpiresAt: now.Add(10 * time.Minute),
 			},
 		},
 		JobHeartbeatResponse{
@@ -961,6 +963,7 @@ func validStartResponse() JobStartResponse {
 		ScopeRevision: 1, StartedAt: time.Date(2040, 1, 2, 3, 4, 5, 0, time.UTC),
 		CredentialPrepare: CredentialPrepare{
 			RevocationID: "11111111-1111-4111-8111-111111111111", ChildCreatePermit: testLeaseToken,
+			IssuerID: "vault-issuer", IssuerRevision: "issuer-revision-1",
 			CredentialExpiresAt: time.Date(2040, 1, 2, 3, 14, 5, 0, time.UTC),
 		},
 	}

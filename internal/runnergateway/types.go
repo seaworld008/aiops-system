@@ -166,6 +166,8 @@ type JobStartRequest struct {
 type CredentialPrepare struct {
 	RevocationID        string    `json:"revocation_id"`
 	ChildCreatePermit   string    `json:"child_create_permit"`
+	IssuerID            string    `json:"issuer_id"`
+	IssuerRevision      string    `json:"issuer_revision"`
 	CredentialExpiresAt time.Time `json:"credential_expires_at"`
 }
 

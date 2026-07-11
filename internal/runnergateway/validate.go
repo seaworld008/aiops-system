@@ -257,6 +257,7 @@ func (response CredentialAnchorResponse) valid() bool {
 
 func (response CredentialPrepare) valid() bool {
 	return uuidPattern.MatchString(response.RevocationID) && tokenPattern.MatchString(response.ChildCreatePermit) &&
+		validResourceID(response.IssuerID) && validResourceID(response.IssuerRevision) &&
 		!response.CredentialExpiresAt.IsZero()
 }
 
