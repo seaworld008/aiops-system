@@ -6,9 +6,13 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -28,6 +32,9 @@ import (
 	"github.com/seaworld008/aiops-system/internal/execution"
 	executionpostgres "github.com/seaworld008/aiops-system/internal/execution/postgres"
 	"github.com/seaworld008/aiops-system/internal/executionlease"
+	"github.com/seaworld008/aiops-system/internal/runneridentity"
+	runneridentitypostgres "github.com/seaworld008/aiops-system/internal/runneridentity/postgres"
+	"github.com/seaworld008/aiops-system/internal/runneridentity/testpki"
 	"github.com/seaworld008/aiops-system/internal/store"
 	postgresstore "github.com/seaworld008/aiops-system/internal/store/postgres"
 )
@@ -2098,16 +2105,23 @@ func exerciseRealRunnerGatewayMigration(
 ) {
 	t.Helper()
 	const (
-		runnerID           = "runner-postgres-m3-action"
-		revocationRunnerID = "runner-postgres-m3-revoker"
+		runnerID            = "runner-postgres-m3-action"
+		revocationRunnerID  = "runner-postgres-m3-revoker"
+		transactionRunnerID = "runner-postgres-m3-tx-revoker"
 	)
 	registerRealWriteRunner(t, ctx, database, runnerID, tenantID, workspaceID, environmentID)
 	registerRealWriteRunner(t, ctx, database, revocationRunnerID, tenantID, workspaceID, environmentID)
+	registerRealWriteRunner(t, ctx, database, transactionRunnerID, tenantID, workspaceID, environmentID)
 	execSQL(t, ctx, database, `
 		UPDATE runner_registrations
 		SET credential_revocation_capable = true, updated_at = statement_timestamp()
-		WHERE runner_id IN ($1, $2)
-	`, runnerID, revocationRunnerID)
+		WHERE runner_id IN ($1, $2, $3)
+	`, runnerID, revocationRunnerID, transactionRunnerID)
+	execSQL(t, ctx, database, `
+		UPDATE runner_registrations
+		SET max_concurrency = 4, updated_at = statement_timestamp()
+		WHERE runner_id = $1
+	`, transactionRunnerID)
 
 	var certificateSHA256 string
 	if err := database.QueryRow(ctx, `
@@ -2154,6 +2168,8 @@ func exerciseRealRunnerGatewayMigration(
 	expectSQLState(t, ctx, database, "23514", `
 		UPDATE runner_registrations SET runner_pool = 'READ' WHERE runner_id = $1
 	`, runnerID)
+	exerciseRealRunnerRevocationTransactions(t, ctx, database, queue, repository, signer,
+		transactionRunnerID, tenantID, workspaceID, environmentID, serviceID)
 	exerciseCredentialSystemRecoveryReceipts(t, ctx, database, queue, repository, signer,
 		tenantID, workspaceID, environmentID, serviceID, runnerID)
 
@@ -2643,6 +2659,433 @@ func exerciseRealRunnerGatewayMigration(
 
 	expectMigrationSQLState(t, ctx, database,
 		filepath.Join(migrationDirectory, "000009_runner_gateway_mtls.down.sql"), "55000")
+}
+
+func exerciseRealRunnerRevocationTransactions(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	queue execution.ActionQueue,
+	credentialRepository *credentialpostgres.Repository,
+	signer action.Signer,
+	runnerID, tenantID, workspaceID, environmentID, serviceID string,
+) {
+	t.Helper()
+	const (
+		decoyEnvironmentID  = "25000000-0000-4000-8000-000000000003"
+		failedActionID      = "94200000-0000-4000-8000-000000000001"
+		failedRevocationID  = "95200000-0000-4000-8000-000000000001"
+		revokedActionID     = "94200000-0000-4000-8000-000000000002"
+		revokedRevocationID = "95200000-0000-4000-8000-000000000002"
+	)
+
+	execSQL(t, ctx, database, `
+		INSERT INTO environments (id, tenant_id, workspace_id, name, kind)
+		VALUES ($1, $2, $3, 'runner-transaction-decoy', 'DEV')
+	`, decoyEnvironmentID, tenantID, workspaceID)
+	execSQL(t, ctx, database, `
+		INSERT INTO runner_scope_bindings (runner_id, tenant_id, workspace_id, environment_id)
+		VALUES ($1, $2, $3, $4)
+	`, runnerID, tenantID, workspaceID, decoyEnvironmentID)
+
+	identity := registerRealRunnerIdentityCertificate(t, ctx, database, runnerID, tenantID)
+	identityRepository, err := runneridentitypostgres.New(database)
+	if err != nil {
+		t.Fatalf("create real Runner identity repository: %v", err)
+	}
+
+	prepareM3ClaimableRevocation(t, ctx, database, queue, credentialRepository, signer,
+		failedActionID, failedRevocationID, workspaceID, environmentID, serviceID,
+		"payments-m3-runner-tx-failed", 'e', runnerID)
+	failedClaim := claimRealRunnerRevocation(t, ctx, database, identityRepository,
+		credentialRepository, identity, failedRevocationID)
+	defer failedClaim.Accessor.Destroy()
+	assertRawRevocationTokenNotPersisted(t, ctx, database, failedClaim.Fence)
+
+	var claimScopeRevision int64
+	if err := database.QueryRow(ctx, `
+		SELECT scope_revision FROM runner_registrations WHERE runner_id = $1
+	`, runnerID).Scan(&claimScopeRevision); err != nil {
+		t.Fatalf("read Runner claim scope revision: %v", err)
+	}
+	execSQL(t, ctx, database, `
+		DELETE FROM runner_scope_bindings
+		WHERE runner_id = $1 AND tenant_id = $2 AND workspace_id = $3 AND environment_id = $4
+	`, runnerID, tenantID, workspaceID, environmentID)
+	var narrowedScopeRevision int64
+	if err := database.QueryRow(ctx, `
+		SELECT scope_revision FROM runner_registrations WHERE runner_id = $1
+	`, runnerID).Scan(&narrowedScopeRevision); err != nil || narrowedScopeRevision <= claimScopeRevision {
+		t.Fatalf("narrowed Runner scope revision = %d after %d, %v", narrowedScopeRevision, claimScopeRevision, err)
+	}
+	terminated := heartbeatRealRunnerRevocation(t, ctx, database, identityRepository,
+		credentialRepository, identity, failedClaim.Fence, 1)
+	if terminated.Directive != credential.RunnerRevocationTerminate || terminated.AcceptedSequence != 1 {
+		t.Fatalf("real Runner heartbeat after exact-scope loss = %#v", terminated)
+	}
+	var sequenceAfterTermination int64
+	if err := database.QueryRow(ctx, `
+		SELECT heartbeat_seq FROM credential_revocations WHERE revocation_id = $1
+	`, failedRevocationID).Scan(&sequenceAfterTermination); err != nil || sequenceAfterTermination != 0 {
+		t.Fatalf("terminated heartbeat persisted sequence = %d, %v", sequenceAfterTermination, err)
+	}
+	execSQL(t, ctx, database, `
+		INSERT INTO runner_scope_bindings (runner_id, tenant_id, workspace_id, environment_id)
+		VALUES ($1, $2, $3, $4)
+	`, runnerID, tenantID, workspaceID, environmentID)
+	var restoredScopeRevision int64
+	if err := database.QueryRow(ctx, `
+		SELECT scope_revision FROM runner_registrations WHERE runner_id = $1
+	`, runnerID).Scan(&restoredScopeRevision); err != nil || restoredScopeRevision <= narrowedScopeRevision {
+		t.Fatalf("restored Runner scope revision = %d after %d, %v", restoredScopeRevision, narrowedScopeRevision, err)
+	}
+
+	firstHeartbeat := heartbeatRealRunnerRevocation(t, ctx, database, identityRepository,
+		credentialRepository, identity, failedClaim.Fence, 1)
+	replayedHeartbeat := heartbeatRealRunnerRevocation(t, ctx, database, identityRepository,
+		credentialRepository, identity, failedClaim.Fence, 1)
+	if firstHeartbeat.Directive != credential.RunnerRevocationContinue ||
+		replayedHeartbeat.Directive != credential.RunnerRevocationContinue ||
+		firstHeartbeat.AcceptedSequence != 1 || replayedHeartbeat.AcceptedSequence != 1 ||
+		!replayedHeartbeat.ClaimExpiresAt.Equal(firstHeartbeat.ClaimExpiresAt) {
+		t.Fatalf("real Runner monotonic/replayed heartbeat = %#v / %#v", firstHeartbeat, replayedHeartbeat)
+	}
+	assertRevokedCertificateCannotAuthenticate(t, ctx, database, identityRepository, identity)
+
+	failedCompletion := completeRealRunnerRevocation(t, ctx, database, identityRepository,
+		credentialRepository, identity, failedClaim.Fence,
+		credential.RunnerRevocationFailed, credential.FailureTimeout)
+	if failedCompletion.Revocation.Status != credential.StatusRevocationPending ||
+		failedCompletion.Receipt.Outcome != credential.RunnerRevocationFailed ||
+		failedCompletion.Receipt.HeartbeatSequence != 1 || failedCompletion.RetryDelay <= 0 {
+		t.Fatalf("real Runner failed revocation completion = %#v", failedCompletion)
+	}
+	assertRealRunnerRevocationReceipt(t, ctx, database, failedCompletion.Receipt, failedClaim.Fence)
+	assertRawRevocationTokenNotPersisted(t, ctx, database, failedClaim.Fence)
+	var failedCiphertext, failedHMAC []byte
+	var failedKeyID *string
+	var failureAuditCount, failureOutboxCount int
+	if err := database.QueryRow(ctx, `
+		SELECT parent.accessor_ciphertext, parent.accessor_hmac, parent.encryption_key_id,
+			(SELECT count(*) FROM audit_records
+			 WHERE resource_id = $1 AND action = 'credential.revocation.failed'),
+			(SELECT count(*) FROM outbox_events
+			 WHERE aggregate_id = $1::uuid AND event_type = 'credential.revocation.failed.v1')
+		FROM credential_revocations AS parent WHERE parent.revocation_id = $1
+	`, failedRevocationID).Scan(
+		&failedCiphertext, &failedHMAC, &failedKeyID, &failureAuditCount, &failureOutboxCount,
+	); err != nil || len(failedCiphertext) == 0 || len(failedHMAC) == 0 || failedKeyID == nil ||
+		failureAuditCount != 1 || failureOutboxCount != 1 {
+		t.Fatalf("failed Runner revocation retained reference/alert = cipher-%d hmac-%d key-%v audit-%d outbox-%d, %v",
+			len(failedCiphertext), len(failedHMAC), failedKeyID, failureAuditCount, failureOutboxCount, err)
+	}
+	// Keep the retryable failure outside this Runner's current exact scope so
+	// the next claim proves paired-scope selection instead of racing retry
+	// backoff wall-clock time.
+	execSQL(t, ctx, database, `
+		DELETE FROM runner_scope_bindings
+		WHERE runner_id = $1 AND tenant_id = $2 AND workspace_id = $3 AND environment_id = $4
+	`, runnerID, tenantID, workspaceID, environmentID)
+
+	prepareM3ClaimableRevocation(t, ctx, database, queue, credentialRepository, signer,
+		revokedActionID, revokedRevocationID, workspaceID, decoyEnvironmentID, serviceID,
+		"payments-m3-runner-tx-revoked", 'f', runnerID)
+	var originalAccessorHMAC []byte
+	if err := database.QueryRow(ctx, `
+		SELECT accessor_hmac FROM credential_revocations WHERE revocation_id = $1
+	`, revokedRevocationID).Scan(&originalAccessorHMAC); err != nil || len(originalAccessorHMAC) == 0 {
+		t.Fatalf("read original Runner revocation accessor HMAC = %d, %v", len(originalAccessorHMAC), err)
+	}
+	revokedClaim := claimRealRunnerRevocation(t, ctx, database, identityRepository,
+		credentialRepository, identity, revokedRevocationID)
+	defer revokedClaim.Accessor.Destroy()
+	heartbeat := heartbeatRealRunnerRevocation(t, ctx, database, identityRepository,
+		credentialRepository, identity, revokedClaim.Fence, 1)
+	if heartbeat.Directive != credential.RunnerRevocationContinue || heartbeat.AcceptedSequence != 1 {
+		t.Fatalf("real Runner revoked-path heartbeat = %#v", heartbeat)
+	}
+	revokedCompletion := completeRealRunnerRevocation(t, ctx, database, identityRepository,
+		credentialRepository, identity, revokedClaim.Fence,
+		credential.RunnerRevocationRevoked, "")
+	if revokedCompletion.Revocation.Status != credential.StatusRevoked ||
+		revokedCompletion.Receipt.Outcome != credential.RunnerRevocationRevoked ||
+		revokedCompletion.RetryDelay != 0 {
+		t.Fatalf("real Runner revoked completion = %#v", revokedCompletion)
+	}
+	assertRealRunnerRevocationReceipt(t, ctx, database, revokedCompletion.Receipt, revokedClaim.Fence)
+	assertRawRevocationTokenNotPersisted(t, ctx, database, revokedClaim.Fence)
+	var revokedCiphertext []byte
+	var retainedAccessorHMAC []byte
+	var revokedKeyID *string
+	if err := database.QueryRow(ctx, `
+		SELECT accessor_ciphertext, accessor_hmac, encryption_key_id
+		FROM credential_revocations WHERE revocation_id = $1
+	`, revokedRevocationID).Scan(&revokedCiphertext, &retainedAccessorHMAC, &revokedKeyID); err != nil ||
+		revokedCiphertext != nil || revokedKeyID != nil || !bytes.Equal(retainedAccessorHMAC, originalAccessorHMAC) {
+		t.Fatalf("revoked Runner reference evidence = cipher-%d hmac-match-%t key-%v, %v",
+			len(revokedCiphertext), bytes.Equal(retainedAccessorHMAC, originalAccessorHMAC), revokedKeyID, err)
+	}
+}
+
+func registerRealRunnerIdentityCertificate(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	runnerID, tenantID string,
+) runneridentity.Identity {
+	t.Helper()
+	now := time.Now().UTC()
+	readAuthority, err := testpki.NewAuthority("runner-postgres-m3-read-root", now)
+	if err != nil {
+		t.Fatalf("create real READ Runner authority: %v", err)
+	}
+	writeAuthority, err := testpki.NewAuthority("runner-postgres-m3-write-root", now)
+	if err != nil {
+		t.Fatalf("create real WRITE Runner authority: %v", err)
+	}
+	spiffeURI, err := url.Parse("spiffe://integration.test/runner/write/" + runnerID)
+	if err != nil {
+		t.Fatalf("parse real Runner SPIFFE URI: %v", err)
+	}
+	client, err := writeAuthority.IssueClient(testpki.ClientOptions{URIs: []*url.URL{spiffeURI}}, now)
+	if err != nil {
+		t.Fatalf("issue real Runner client certificate: %v", err)
+	}
+	verifier, err := runneridentity.NewVerifier(runneridentity.Options{
+		TrustDomain: "integration.test",
+		ReadRoots:   []*x509.Certificate{readAuthority.Certificate},
+		WriteRoots:  []*x509.Certificate{writeAuthority.Certificate},
+		Clock:       func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("create real Runner identity verifier: %v", err)
+	}
+	chains, err := client.Leaf.Verify(x509.VerifyOptions{
+		Roots: writeAuthority.CertPool(), CurrentTime: now,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	})
+	if err != nil {
+		t.Fatalf("verify real Runner client certificate: %v", err)
+	}
+	identity, err := verifier.IdentityFromConnectionState(tls.ConnectionState{
+		Version: tls.VersionTLS13, HandshakeComplete: true,
+		PeerCertificates: []*x509.Certificate{client.Leaf, writeAuthority.Certificate},
+		VerifiedChains:   chains,
+	})
+	if err != nil {
+		t.Fatalf("derive real Runner mTLS identity: %v", err)
+	}
+	evidence := identity.Evidence()
+	execSQL(t, ctx, database, `
+		INSERT INTO runner_certificates (
+			certificate_sha256, runner_id, tenant_id, issuer_key_id, serial_hex, spki_sha256,
+			status, not_before, not_after
+		) VALUES ($1, $2, $3, $4, $5, $6, 'ACTIVE', $7, $8)
+	`, evidence.LeafSHA256(), runnerID, tenantID, evidence.AuthorityKeyIDHex(),
+		evidence.SerialHex(), evidence.SPKISHA256(), evidence.NotBefore(), evidence.NotAfter())
+	return identity
+}
+
+func authenticateRealRunnerTx(
+	t *testing.T,
+	ctx context.Context,
+	repository *runneridentitypostgres.Repository,
+	tx pgx.Tx,
+	identity runneridentity.Identity,
+) (runneridentitypostgres.AuthenticatedRunner, execution.RunnerScope) {
+	t.Helper()
+	authenticated, err := repository.AuthenticateTx(ctx, tx, identity)
+	if err != nil || !authenticated.Valid() || !authenticated.CredentialRevocationCapable() {
+		t.Fatalf("authenticate real revocation-capable Runner = %#v, %v", authenticated, err)
+	}
+	scope, err := authenticated.RunnerScope()
+	if err != nil {
+		t.Fatalf("derive real authenticated Runner scope: %v", err)
+	}
+	return authenticated, scope
+}
+
+func claimRealRunnerRevocation(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	identityRepository *runneridentitypostgres.Repository,
+	credentialRepository *credentialpostgres.Repository,
+	identity runneridentity.Identity,
+	revocationID string,
+) credential.ClaimedRevocation {
+	t.Helper()
+	tx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin real Runner revocation claim: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	authenticated, scope := authenticateRealRunnerTx(t, ctx, identityRepository, tx, identity)
+	ticket, err := credentialRepository.ClaimRevocationRunnerTx(
+		ctx, tx, scope, authenticated.CertificateSHA256())
+	if err != nil || ticket == nil {
+		t.Fatalf("claim real Runner revocation %s = %#v, %v", revocationID, ticket, err)
+	}
+	defer ticket.Discard()
+	if rendered := fmt.Sprintf("%#v", ticket); strings.Contains(rendered, revocationID) ||
+		strings.Contains(rendered, authenticated.CertificateSHA256()) {
+		t.Fatalf("real Runner claim ticket rendered sensitive identity: %q", rendered)
+	}
+	if encoded, marshalErr := json.Marshal(ticket); marshalErr == nil || encoded != nil {
+		t.Fatalf("real Runner claim ticket serialized = %q, %v", encoded, marshalErr)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit real Runner revocation claim: %v", err)
+	}
+	claim, err := credentialRepository.FinalizeRevocationClaimAfterCommit(ctx, ticket)
+	if err != nil || claim.Revocation.ID != revocationID || claim.Fence.RevocationID != revocationID ||
+		claim.Fence.WorkerID != authenticated.RunnerID() || claim.Fence.Token == "" || claim.Accessor == nil ||
+		len(claim.Accessor.Bytes()) == 0 {
+		if claim.Accessor != nil {
+			claim.Accessor.Destroy()
+		}
+		t.Fatalf("finalize committed real Runner revocation claim = %#v, %v", claim.Revocation, err)
+	}
+	return claim
+}
+
+func heartbeatRealRunnerRevocation(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	identityRepository *runneridentitypostgres.Repository,
+	credentialRepository *credentialpostgres.Repository,
+	identity runneridentity.Identity,
+	fence credential.ClaimFence,
+	sequence int64,
+) credential.RunnerRevocationHeartbeatResult {
+	t.Helper()
+	tx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin real Runner revocation heartbeat: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	_, scope := authenticateRealRunnerTx(t, ctx, identityRepository, tx, identity)
+	result, err := credentialRepository.HeartbeatRevocationRunnerTx(ctx, tx, scope, fence, sequence)
+	if err != nil {
+		t.Fatalf("heartbeat real Runner revocation sequence %d: %v", sequence, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit real Runner revocation heartbeat: %v", err)
+	}
+	return result
+}
+
+func completeRealRunnerRevocation(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	identityRepository *runneridentitypostgres.Repository,
+	credentialRepository *credentialpostgres.Repository,
+	identity runneridentity.Identity,
+	fence credential.ClaimFence,
+	outcome credential.RunnerRevocationOutcome,
+	failureCode credential.FailureCode,
+) credential.RunnerRevocationCompletionResult {
+	t.Helper()
+	tx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin real Runner revocation completion: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	authenticated, scope := authenticateRealRunnerTx(t, ctx, identityRepository, tx, identity)
+	result, err := credentialRepository.CompleteRevocationRunnerTx(
+		ctx, tx, scope, fence, outcome, failureCode, authenticated.CertificateSHA256())
+	if err != nil {
+		t.Fatalf("complete real Runner revocation %s: %v", outcome, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit real Runner revocation completion: %v", err)
+	}
+	return result
+}
+
+func assertRevokedCertificateCannotAuthenticate(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	repository *runneridentitypostgres.Repository,
+	identity runneridentity.Identity,
+) {
+	t.Helper()
+	tx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin Runner certificate loss proof: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `
+		UPDATE runner_certificates
+		SET status = 'REVOKED', revocation_reason = 'integration transaction proof'
+		WHERE certificate_sha256 = $1
+	`, identity.Evidence().LeafSHA256()); err != nil {
+		t.Fatalf("temporarily revoke real Runner certificate: %v", err)
+	}
+	if authenticated, err := repository.AuthenticateTx(ctx, tx, identity); !errors.Is(err, runneridentity.ErrAuthenticationFailed) || authenticated.Valid() {
+		t.Fatalf("AuthenticateTx(revoked certificate) = %#v, %v", authenticated, err)
+	}
+}
+
+func assertRealRunnerRevocationReceipt(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	want credential.RunnerRevocationReceipt,
+	fence credential.ClaimFence,
+) {
+	t.Helper()
+	var outcome, claimTokenSHA256, receiptHash, certificateSHA256 string
+	var heartbeatSequence int64
+	if err := database.QueryRow(ctx, `
+		SELECT outcome, claim_token_sha256, receipt_hash, certificate_sha256, heartbeat_seq
+		FROM credential_revocation_receipts
+		WHERE revocation_id = $1 AND claim_epoch = $2
+	`, fence.RevocationID, fence.Epoch).Scan(
+		&outcome, &claimTokenSHA256, &receiptHash, &certificateSHA256, &heartbeatSequence,
+	); err != nil || outcome != string(want.Outcome) || claimTokenSHA256 != credential.SHA256Hex([]byte(fence.Token)) ||
+		receiptHash != want.ReceiptHash || certificateSHA256 != want.CertificateSHA256 ||
+		heartbeatSequence != want.HeartbeatSequence {
+		t.Fatalf("real Runner revocation receipt = %s/%s/%s/%s/seq-%d, want %#v, %v",
+			outcome, claimTokenSHA256, receiptHash, certificateSHA256, heartbeatSequence, want, err)
+	}
+}
+
+func assertRawRevocationTokenNotPersisted(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	fence credential.ClaimFence,
+) {
+	t.Helper()
+	var storedDigest string
+	var parentLeak, receiptLeak, auditLeak, outboxLeak bool
+	if err := database.QueryRow(ctx, `
+		SELECT COALESCE(
+			parent.claim_token_sha256,
+			parent.completed_claim_token_sha256,
+			(SELECT receipt.claim_token_sha256 FROM credential_revocation_receipts AS receipt
+			 WHERE receipt.revocation_id = $1 AND receipt.claim_epoch = $3)
+		),
+			strpos(to_jsonb(parent)::text, $2) > 0,
+			EXISTS (SELECT 1 FROM credential_revocation_receipts AS receipt
+				WHERE receipt.revocation_id = $1 AND strpos(to_jsonb(receipt)::text, $2) > 0),
+			EXISTS (SELECT 1 FROM audit_records AS audit
+				WHERE audit.resource_id = $1::text AND strpos(to_jsonb(audit)::text, $2) > 0),
+			EXISTS (SELECT 1 FROM outbox_events AS event
+				WHERE event.aggregate_id = $1::uuid AND strpos(to_jsonb(event)::text, $2) > 0)
+		FROM credential_revocations AS parent WHERE parent.revocation_id = $1
+	`, fence.RevocationID, fence.Token, fence.Epoch).Scan(
+		&storedDigest, &parentLeak, &receiptLeak, &auditLeak, &outboxLeak,
+	); err != nil || storedDigest != credential.SHA256Hex([]byte(fence.Token)) ||
+		parentLeak || receiptLeak || auditLeak || outboxLeak {
+		t.Fatalf("raw Runner revocation token persistence = digest-match-%t leaks=%t/%t/%t/%t, %v",
+			storedDigest == credential.SHA256Hex([]byte(fence.Token)),
+			parentLeak, receiptLeak, auditLeak, outboxLeak, err)
+	}
 }
 
 func exerciseCredentialSystemRecoveryReceipts(
