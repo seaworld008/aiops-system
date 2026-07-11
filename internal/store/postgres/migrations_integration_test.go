@@ -69,6 +69,7 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	applyMigrationFile(t, ctx, database, filepath.Join(migrationDirectory, "000007_runner_execution_hardening.up.sql"))
 	verifyLegacyExecutionLeaseTokenHashes(t, ctx, database)
 	execSQL(t, ctx, database, `DELETE FROM execution_leases`)
+	applyMigrationFile(t, ctx, database, filepath.Join(migrationDirectory, "000008_credential_revocations.up.sql"))
 	exerciseRealLegacySemanticRetry(t, ctx, database, legacyAction)
 
 	const (
@@ -216,13 +217,16 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	}
 
 	exerciseRealActionQueue(t, ctx, database, tenant1, workspace1, environment1, service1)
-	applyMigrationFile(t, ctx, database, filepath.Join(migrationDirectory, "000008_credential_revocations.up.sql"))
 	exerciseRealCredentialRevocations(t, ctx, database, migrationDirectory,
 		tenant1, tenant2, workspace1, workspace2, environment1, service1)
 	expectSQLState(t, ctx, database, "P0001", `TRUNCATE runner_result_receipts`)
 	expectMigrationSQLState(t, ctx, database, filepath.Join(migrationDirectory, "000007_runner_execution_hardening.down.sql"), "55000")
 	execSQL(t, ctx, database, `DROP TRIGGER runner_result_receipts_no_truncate ON runner_result_receipts`)
 	execSQL(t, ctx, database, `TRUNCATE runner_result_receipts`)
+	// The production schema makes ActionQueue history immutable. The privileged
+	// migration harness disables only the DELETE trigger after all guards have
+	// been exercised so reverse-migration fixtures can be removed.
+	execSQL(t, ctx, database, `ALTER TABLE action_queue DISABLE TRIGGER action_queue_no_delete`)
 	execSQL(t, ctx, database, `DELETE FROM action_queue`)
 	execSQL(t, ctx, database, `DELETE FROM runner_certificates`)
 	execSQL(t, ctx, database, `DELETE FROM runner_scope_bindings`)
@@ -638,33 +642,14 @@ func exerciseRealCredentialRevocations(
 	const authorizedExpiredRecoveryID = "92000000-0000-4000-8000-000000000016"
 	authorizedExpiredPermitToken := "authorized-expired-child-create-permit"
 	authorizedExpiredPermitDigest := credential.SHA256Hex([]byte(authorizedExpiredPermitToken))
-	execSQL(t, ctx, database, `
-		UPDATE action_queue
-		SET lease_expires_at = clock_timestamp() + interval '2 minutes'
-		WHERE action_id = $1;
-		WITH clock AS (SELECT clock_timestamp() AS current_time)
-		INSERT INTO credential_revocations (
-			revocation_id, tenant_id, workspace_id, environment_id,
-			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
-			child_create_permit_sha256, available_at, created_at, updated_at
-		)
-		SELECT $2, action.runner_tenant_id, action.runner_workspace_id, action.runner_environment_id,
-			action.action_id, action.target_key, action.production, action.runner_id, action.lease_epoch,
-			action.lease_token_sha256, 'vault-production', 'rev-1',
-			action.envelope #>> '{credential_scope,connector_id}',
-			action.envelope #>> '{credential_scope,permission}',
-			action.envelope #>> '{credential_scope,resource}',
-			clock.current_time - interval '70 seconds', $3,
-			clock.current_time - interval '2 minutes', clock.current_time - interval '2 minutes',
-			clock.current_time - interval '2 minutes'
-		FROM action_queue AS action CROSS JOIN clock
-		WHERE action.action_id = $1;
-		UPDATE credential_revocations
-		SET child_create_authorized_at = created_at + interval '5 seconds',
-			child_create_ttl_seconds = 10, updated_at = clock_timestamp(), version = version + 1
-		WHERE revocation_id = $2;
-	`, crossLoserFence.ActionID, authorizedExpiredRecoveryID, authorizedExpiredPermitDigest)
+	authorizedExpiredFence := claimStartedCredentialAction(t, ctx, database, queue, signer,
+		"91000000-0000-4000-8000-000000000007", workspaceID, environmentID, serviceID,
+		"payments-authorized-expired-recovery", 'c', "runner-postgres-fixture-authorized-expired")
+	authorizedExpiredCreatedAt := time.Now().UTC().Add(-2 * time.Minute)
+	insertPreparedCredentialForAction(t, ctx, database, authorizedExpiredFence,
+		authorizedExpiredRecoveryID, authorizedExpiredPermitDigest,
+		authorizedExpiredCreatedAt, authorizedExpiredCreatedAt.Add(50*time.Second),
+		authorizedExpiredCreatedAt.Add(5*time.Second), 10*time.Second)
 	authorizedRecoveryContext, cancelAuthorizedRecovery := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelAuthorizedRecovery()
 	authorizedRecoveryStart := make(chan struct{})
@@ -683,7 +668,7 @@ func exerciseRealCredentialRevocations(
 		<-authorizedRecoveryStart
 		_, authorizeErr := repository.AuthorizeChildCreate(authorizedRecoveryContext, credential.AuthorizeChildCreateRequest{
 			Permit: credential.ChildCreatePermit{RevocationID: authorizedExpiredRecoveryID, Token: authorizedExpiredPermitToken},
-			Fence:  crossLoserFence,
+			Fence:  authorizedExpiredFence,
 		})
 		authorizedRetryResult <- authorizeErr
 	}()
@@ -926,19 +911,30 @@ func exerciseRealCredentialRevocations(
 		FROM credential_revocations AS source CROSS JOIN clock
 		WHERE source.revocation_id = $1
 	`, revocationID)
-	const noCredentialRevocationID = "92000000-0000-4000-8000-000000000008"
-	execSQL(t, ctx, database, `
+	// This row is otherwise a valid PREPARED insert. Its implicit transaction
+	// must fail only when the initially-deferred exact action-marker proof runs
+	// at COMMIT; a caller cannot persist an unanchored credential intent.
+	expectDeferredConstraintAtCommit(t, ctx, database, "credential_revocations_action_marker_shape", `
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
 			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
 			child_create_permit_sha256
 		)
-		SELECT $2, tenant_id, workspace_id, environment_id,
-			action_id, target_key, production, runner_id, action_lease_epoch + 7001, action_lease_token_sha256,
-			issuer, issuer_revision, connector_id, scope_permission, scope_resource, statement_timestamp() + interval '5 minutes', repeat('8', 64)
+		SELECT '92000000-0000-4000-8000-000000000019', tenant_id, workspace_id, environment_id,
+			action_id, target_key, production, runner_id, action_lease_epoch + 7019, action_lease_token_sha256,
+			issuer, issuer_revision, connector_id, scope_permission, scope_resource,
+			statement_timestamp() + interval '5 minutes', repeat('1', 64)
 		FROM credential_revocations WHERE revocation_id = $1
-	`, revocationID, noCredentialRevocationID)
+	`, revocationID)
+	const noCredentialRevocationID = "92000000-0000-4000-8000-000000000008"
+	noCredentialFence := claimStartedCredentialAction(t, ctx, database, queue, signer,
+		"91000000-0000-4000-8000-000000000008", workspaceID, environmentID, serviceID,
+		"payments-no-credential-guard", 'd', "runner-postgres-fixture-no-credential")
+	noCredentialCreatedAt := time.Now().UTC()
+	insertPreparedCredentialForAction(t, ctx, database, noCredentialFence,
+		noCredentialRevocationID, strings.Repeat("8", 64),
+		noCredentialCreatedAt, noCredentialCreatedAt.Add(5*time.Minute), time.Time{}, 0)
 	expectSQLState(t, ctx, database, "23514", `
 		UPDATE credential_revocations
 		SET child_create_authorized_at = clock_timestamp(), child_create_ttl_seconds = 900,
@@ -962,26 +958,14 @@ func exerciseRealCredentialRevocations(
 		WHERE revocation_id = $1
 	`, noCredentialRevocationID)
 	const authorizedNoCredentialGuardID = "92000000-0000-4000-8000-000000000018"
-	execSQL(t, ctx, database, `
-		WITH clock AS (SELECT clock_timestamp() AS current_time)
-		INSERT INTO credential_revocations (
-			revocation_id, tenant_id, workspace_id, environment_id,
-			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
-			child_create_permit_sha256, available_at, created_at, updated_at
-		)
-		SELECT $2, source.tenant_id, source.workspace_id, source.environment_id,
-			source.action_id, source.target_key, source.production, source.runner_id,
-			source.action_lease_epoch + 7018, source.action_lease_token_sha256,
-			source.issuer, source.issuer_revision, source.connector_id, source.scope_permission, source.scope_resource,
-			clock.current_time + interval '60 seconds', repeat('d', 64),
-			clock.current_time, clock.current_time, clock.current_time
-		FROM credential_revocations AS source CROSS JOIN clock WHERE source.revocation_id = $1;
-		UPDATE credential_revocations
-		SET child_create_authorized_at = created_at, child_create_ttl_seconds = 45,
-			updated_at = clock_timestamp(), version = version + 1
-		WHERE revocation_id = $2;
-	`, revocationID, authorizedNoCredentialGuardID)
+	authorizedNoCredentialFence := claimStartedCredentialAction(t, ctx, database, queue, signer,
+		"91000000-0000-4000-8000-000000000009", workspaceID, environmentID, serviceID,
+		"payments-authorized-no-credential-guard", 'e', "runner-postgres-fixture-authorized-guard")
+	authorizedNoCredentialCreatedAt := time.Now().UTC()
+	insertPreparedCredentialForAction(t, ctx, database, authorizedNoCredentialFence,
+		authorizedNoCredentialGuardID, strings.Repeat("d", 64),
+		authorizedNoCredentialCreatedAt, authorizedNoCredentialCreatedAt.Add(time.Minute),
+		authorizedNoCredentialCreatedAt, 45*time.Second)
 	expectSQLState(t, ctx, database, "55000", `
 		UPDATE credential_revocations
 		SET status = 'NO_CREDENTIAL', updated_at = clock_timestamp(), version = version + 1
@@ -994,29 +978,17 @@ func exerciseRealCredentialRevocations(
 		expectSQLState(t, ctx, database, "55000", statement, noCredentialRevocationID)
 	}
 
-	insertPreparedRecoveryCandidate := func(id, permitDigest string, epochOffset int64, ageSeconds, ttlSeconds float64) {
-		execSQL(t, ctx, database, `
-			WITH clock AS (SELECT statement_timestamp() AS current_time)
-			INSERT INTO credential_revocations (
-				revocation_id, tenant_id, workspace_id, environment_id,
-				action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-				issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
-				child_create_permit_sha256,
-				available_at, created_at, updated_at
-			)
-			SELECT $2, source.tenant_id, source.workspace_id, source.environment_id,
-				source.action_id, source.target_key, source.production, source.runner_id,
-				source.action_lease_epoch + $3, source.action_lease_token_sha256,
-				source.issuer, source.issuer_revision, source.connector_id, source.scope_permission, source.scope_resource,
-				clock.current_time - make_interval(secs => $4::double precision) +
-					make_interval(secs => $5::double precision),
-				$6,
-				clock.current_time - make_interval(secs => $4::double precision),
-				clock.current_time - make_interval(secs => $4::double precision),
-				clock.current_time - make_interval(secs => $4::double precision)
-			FROM credential_revocations AS source CROSS JOIN clock
-			WHERE source.revocation_id = $1
-		`, revocationID, id, epochOffset, ageSeconds, ttlSeconds, permitDigest)
+	insertPreparedRecoveryCandidate := func(
+		id, actionID, deployment string,
+		digestByte byte,
+		runnerID, permitDigest string,
+		age, ttl time.Duration,
+	) {
+		fence := claimStartedCredentialAction(t, ctx, database, queue, signer,
+			actionID, workspaceID, environmentID, serviceID, deployment, digestByte, runnerID)
+		createdAt := time.Now().UTC().Add(-age)
+		insertPreparedCredentialForAction(t, ctx, database, fence, id, permitDigest,
+			createdAt, createdAt.Add(ttl), time.Time{}, 0)
 	}
 	const (
 		beforeRecoveryID   = "92000000-0000-4000-8000-000000000009"
@@ -1026,12 +998,16 @@ func exerciseRealCredentialRevocations(
 	// A two-minute absolute TTL proves recovery is keyed to the persisted
 	// deadline rather than waiting for the maximum created_at+15m ceiling.
 	defaultRecoveryPermit := strings.Repeat("9", 64)
-	insertPreparedRecoveryCandidate(beforeRecoveryID, defaultRecoveryPermit, 8001, 2*60+30, 2*60)
+	insertPreparedRecoveryCandidate(beforeRecoveryID,
+		"91000000-0000-4000-8000-000000000010", "payments-before-recovery-boundary", '0',
+		"runner-postgres-fixture-recovery-before", defaultRecoveryPermit, 150*time.Second, 2*time.Minute)
 	beforeRecovery, err := repository.RecoverPrepared(ctx, credential.RecoverPreparedRequest{Limit: 10})
 	if err != nil || len(beforeRecovery) != 0 {
 		t.Fatalf("real RecoverPrepared(before DB boundary) = %#v, %v", beforeRecovery, err)
 	}
-	insertPreparedRecoveryCandidate(expiredRecoveryID, defaultRecoveryPermit, 8002, 3*60, 2*60)
+	insertPreparedRecoveryCandidate(expiredRecoveryID,
+		"91000000-0000-4000-8000-000000000011", "payments-expired-recovery-boundary", '1',
+		"runner-postgres-fixture-recovery-expired", defaultRecoveryPermit, 3*time.Minute, 2*time.Minute)
 	type preparedRecoveryResult struct {
 		revocations []credential.Revocation
 		err         error
@@ -1079,7 +1055,9 @@ func exerciseRealCredentialRevocations(
 		t.Fatalf("prepared recovery audit/outbox = %d/%d, %v", recoveryAuditCount, recoveryOutboxCount, err)
 	}
 
-	insertPreparedRecoveryCandidate(rollbackRecoveryID, defaultRecoveryPermit, 8003, 3*60, 2*60)
+	insertPreparedRecoveryCandidate(rollbackRecoveryID,
+		"91000000-0000-4000-8000-000000000012", "payments-recovery-rollback", '2',
+		"runner-postgres-fixture-recovery-rollback", defaultRecoveryPermit, 3*time.Minute, 2*time.Minute)
 	execSQL(t, ctx, database, `
 		CREATE FUNCTION reject_test_prepared_recovery_outbox() RETURNS trigger AS $$
 		BEGIN
@@ -1642,6 +1620,19 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 			VALUES ($1, $2, $3, $4)
 		`, runnerID, tenantID, workspaceID, environmentID)
 	}
+	for _, runnerID := range []string{
+		"runner-postgres-fixture-authorized-expired",
+		"runner-postgres-fixture-no-credential",
+		"runner-postgres-fixture-authorized-guard",
+		"runner-postgres-fixture-recovery-before",
+		"runner-postgres-fixture-recovery-expired",
+		"runner-postgres-fixture-recovery-rollback",
+	} {
+		registerRealWriteRunner(t, ctx, database, runnerID, tenantID, workspaceID, environmentID)
+	}
+	exerciseRealActionQueueProofGuards(t, ctx, database, queue, signer, workspaceID, environmentID, serviceID)
+	exerciseRealActionQueueIdentityGuards(t, ctx, database, queue, signer, workspaceID, environmentID, serviceID)
+	exerciseRealProductionWriteHardOff(t, ctx, database, queue, signer, workspaceID, environmentID, serviceID)
 	exerciseRealClaimAuthorization(t, ctx, database, queue, signer, workspaceID, environmentID, serviceID)
 	exerciseRealRegistrationRaces(t, ctx, database, queue, signer, tenantID, workspaceID, environmentID, serviceID)
 	expectSQLState(t, ctx, database, "55000", `TRUNCATE runner_scope_bindings`)
@@ -1726,6 +1717,10 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 		realActionSubmission(t, signer, now, "90000000-0000-4000-8000-000000000001", workspaceID, environmentID, serviceID, "payments-api", 'a'),
 		realActionSubmission(t, signer, now, "90000000-0000-4000-8000-000000000002", workspaceID, environmentID, serviceID, "payments-worker", 'b'),
 	}
+	// Both non-production jobs intentionally address the same target. The
+	// target lock, rather than the removed global production slot, must select
+	// exactly one concurrent winner.
+	submissions[1].TargetKey = submissions[0].TargetKey
 	for _, submission := range submissions {
 		if _, err := queue.Submit(ctx, submission); err != nil {
 			t.Fatalf("real ActionQueue.Submit(%s): %v", submission.Envelope.ActionID, err)
@@ -1792,7 +1787,7 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 		}
 	}
 	if winners != 1 || blocked != 1 || claimed.Execution.LeaseToken == "" {
-		t.Fatalf("real production claim winners=%d blocked=%d claim=%#v", winners, blocked, claimed)
+		t.Fatalf("real same-target claim winners=%d blocked=%d claim=%#v", winners, blocked, claimed)
 	}
 	var persistedTokenHash string
 	if err := database.QueryRow(ctx, `SELECT lease_token_sha256 FROM action_queue WHERE action_id = $1`, claimed.Execution.ExecutionID).Scan(&persistedTokenHash); err != nil {
@@ -1807,6 +1802,8 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	if err != nil || started.Status != executionlease.StatusRunning || started.LeaseToken != "" {
 		t.Fatalf("real ActionQueue.Start = %#v, %v", started, err)
 	}
+	recordNoCredentialForAction(t, ctx, database, fence,
+		"93000000-0000-4000-8000-000000000001")
 	heartbeat, err := queue.Heartbeat(ctx, execution.ActionHeartbeatRequest{Lease: fence, Sequence: 1, Extension: 2 * time.Minute})
 	if err != nil || heartbeat.Execution.LeaseToken != "" || !heartbeat.Execution.LeaseExpiresAt.After(started.LeaseExpiresAt) {
 		t.Fatalf("real ActionQueue.Heartbeat = %#v, %v", heartbeat, err)
@@ -1858,6 +1855,8 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	if err != nil {
 		t.Fatalf("real ActionQueue.Start(second): %v", err)
 	}
+	recordNoCredentialForAction(t, ctx, database, secondFence,
+		"93000000-0000-4000-8000-000000000002")
 	cancelled, err := queue.Cancel(ctx, second.Execution.ExecutionID)
 	if err != nil || cancelled.Status != executionlease.StatusRunning || cancelled.CancelRequestedAt.IsZero() || cancelled.LeaseToken != "" {
 		t.Fatalf("real ActionQueue.Cancel = %#v, %v", cancelled, err)
@@ -1869,6 +1868,7 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	}
 
 	third := realActionSubmission(t, signer, now, "90000000-0000-4000-8000-000000000003", workspaceID, environmentID, serviceID, "payments-jobs", 'd')
+	third.TargetKey = submissions[0].TargetKey
 	if _, err := queue.Submit(ctx, third); err != nil {
 		t.Fatalf("real ActionQueue.Submit(third): %v", err)
 	}
@@ -1885,14 +1885,14 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 		Scope: realRunnerScope(t, ctx, database, "runner-postgres-4"), LeaseDuration: time.Minute,
 	}
 	if _, err := queue.Claim(ctx, blockedClaim); !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
-		t.Fatalf("FINALIZING released production slot: %v", err)
+		t.Fatalf("FINALIZING released same-target lock: %v", err)
 	}
 	secondUncertain, err := queue.Finalize(ctx, secondFence)
 	if err != nil || secondUncertain.Status != executionlease.StatusUncertain {
 		t.Fatalf("real ActionQueue.Finalize(cancelled running) = %#v, %v", secondUncertain, err)
 	}
 	if _, err := queue.Claim(ctx, blockedClaim); !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
-		t.Fatalf("UNCERTAIN released production slot: %v", err)
+		t.Fatalf("UNCERTAIN released same-target lock: %v", err)
 	}
 	if _, err := queue.Reconcile(ctx, executionlease.ReconcileRequest{
 		ExecutionID: second.Execution.ExecutionID, ReconciliationID: "reconcile-postgres-cancel",
@@ -1909,6 +1909,8 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	if _, err := queue.Start(ctx, thirdClaim.Execution.Fence()); err != nil {
 		t.Fatalf("real ActionQueue.Start(third): %v", err)
 	}
+	recordNoCredentialForAction(t, ctx, database, thirdClaim.Execution.Fence(),
+		"93000000-0000-4000-8000-000000000003")
 	execSQL(t, ctx, database, `
 		UPDATE action_queue
 		SET lease_expires_at = statement_timestamp() - interval '1 second',
@@ -1929,18 +1931,18 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 
 	// Exercise the database proof constraints directly so application regressions
 	// cannot create terminal state without a complete Runner or reconciliation proof.
-	expectSQLState(t, ctx, database, "23514", `
+	expectSQLConstraint(t, ctx, database, "55000", "action_queue_terminal_immutable_guard", `
 		UPDATE action_queue
 		SET reconciliation_id = 'incomplete-reconciliation', reconciliation_actor = NULL,
 			reconciliation_result_hash = $2, reconciled_at = statement_timestamp()
 		WHERE action_id = $1
 	`, claimed.Execution.ExecutionID, strings.Repeat("f", 64))
-	expectSQLState(t, ctx, database, "23514", `
+	expectSQLConstraint(t, ctx, database, "55000", "action_queue_terminal_immutable_guard", `
 		UPDATE action_queue
 		SET completed_lease_token_sha256 = NULL, completed_lease_epoch = NULL
 		WHERE action_id = $1
 	`, claimed.Execution.ExecutionID)
-	expectSQLState(t, ctx, database, "23514", `
+	expectSQLConstraint(t, ctx, database, "55000", "action_queue_terminal_immutable_guard", `
 		UPDATE action_queue
 		SET status = 'LEASED', lease_epoch = 0,
 			lease_token_sha256 = $2, lease_acquired_at = statement_timestamp(),
@@ -1965,12 +1967,679 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	if _, err := queue.Cancel(ctx, shapeSubmission.Envelope.ActionID); err != nil {
 		t.Fatalf("cancel runner identity shape action: %v", err)
 	}
-	expectSQLState(t, ctx, database, "23514", `
+	expectSQLConstraint(t, ctx, database, "55000", "action_queue_terminal_immutable_guard", `
 		UPDATE action_queue
 		SET runner_id = 'runner-postgres-1', runner_tenant_id = $2,
 			runner_workspace_id = $3, runner_environment_id = $4
 		WHERE action_id = $1
 	`, shapeSubmission.Envelope.ActionID, tenantID, workspaceID, environmentID)
+}
+
+func exerciseRealActionQueueProofGuards(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	queue execution.ActionQueue,
+	signer action.Signer,
+	workspaceID, environmentID, serviceID string,
+) {
+	t.Helper()
+
+	rejectedSubmission := realActionSubmission(t, signer, time.Now().UTC(),
+		"90000000-0000-4000-8000-000000000085", workspaceID, environmentID, serviceID,
+		"payments-proof-reject", '4')
+	if _, err := queue.Submit(ctx, rejectedSubmission); err != nil {
+		t.Fatalf("submit rejection proof fixture: %v", err)
+	}
+	rejectedClaim, err := queue.Claim(ctx, execution.ActionClaimRequest{
+		Scope: realRunnerScope(t, ctx, database, "runner-postgres-5"), LeaseDuration: time.Minute,
+	})
+	if err != nil || rejectedClaim.Execution.ExecutionID != rejectedSubmission.Envelope.ActionID {
+		t.Fatalf("claim rejection proof fixture = %#v, %v", rejectedClaim, err)
+	}
+	expectSQLConstraint(t, ctx, database, "55000", "action_queue_active_fence_guard", `
+		UPDATE action_queue
+		SET status = 'FAILED', completion_status = 'FAILED', result_hash = repeat('1', 64),
+			completed_lease_token_sha256 = repeat('0', 64), completed_lease_epoch = lease_epoch,
+			lease_token_sha256 = NULL, lease_expires_at = NULL,
+			completed_at = statement_timestamp(), updated_at = statement_timestamp()
+		WHERE action_id = $1
+	`, rejectedSubmission.Envelope.ActionID)
+	expectSQLConstraint(t, ctx, database, "55000", "action_queue_rejection_proof_guard", `
+		UPDATE action_queue
+		SET status = 'FAILED', completion_status = 'SUCCEEDED', result_hash = repeat('2', 64),
+			completed_lease_token_sha256 = lease_token_sha256, completed_lease_epoch = lease_epoch,
+			lease_token_sha256 = NULL, lease_expires_at = NULL,
+			completed_at = statement_timestamp(), updated_at = statement_timestamp()
+		WHERE action_id = $1
+	`, rejectedSubmission.Envelope.ActionID)
+	rejected, err := queue.Reject(ctx, execution.ActionRejectRequest{
+		Lease:  rejectedClaim.Execution.Fence(),
+		Reason: execution.ActionQueueReason{Code: "PROOF_GUARD_REJECTED", DetailHash: strings.Repeat("3", 64)},
+	})
+	if err != nil || rejected.Status != executionlease.StatusFailed {
+		t.Fatalf("Reject(proof guard fixture) = %#v, %v", rejected, err)
+	}
+	expectSQLConstraint(t, ctx, database, "55000", "action_queue_terminal_immutable_guard", `
+		UPDATE action_queue
+		SET completed_lease_token_sha256 = repeat('4', 64)
+		WHERE action_id = $1
+	`, rejectedSubmission.Envelope.ActionID)
+
+	proofSubmission := realActionSubmission(t, signer, time.Now().UTC(),
+		"90000000-0000-4000-8000-000000000086", workspaceID, environmentID, serviceID,
+		"payments-finalizing-proof", '5')
+	if _, err := queue.Submit(ctx, proofSubmission); err != nil {
+		t.Fatalf("submit finalizing proof fixture: %v", err)
+	}
+	proofClaim, err := queue.Claim(ctx, execution.ActionClaimRequest{
+		Scope: realRunnerScope(t, ctx, database, "runner-postgres-5"), LeaseDuration: time.Minute,
+	})
+	if err != nil || proofClaim.Execution.ExecutionID != proofSubmission.Envelope.ActionID {
+		t.Fatalf("claim finalizing proof fixture = %#v, %v", proofClaim, err)
+	}
+	proofFence := proofClaim.Execution.Fence()
+	if _, err := queue.Start(ctx, proofFence); err != nil {
+		t.Fatalf("start finalizing proof fixture: %v", err)
+	}
+	expectSQLConstraint(t, ctx, database, "55000", "action_queue_state_transition_guard", `
+		UPDATE action_queue SET status = 'SUCCEEDED' WHERE action_id = $1
+	`, proofSubmission.Envelope.ActionID)
+	expectDeferredConstraintAtCommit(t, ctx, database, "action_queue_finalizing_receipt_shape", `
+		UPDATE action_queue
+		SET status = 'FINALIZING', completion_status = 'UNCERTAIN', result_hash = repeat('5', 64),
+			completed_lease_token_sha256 = lease_token_sha256, completed_lease_epoch = lease_epoch,
+			lease_token_sha256 = NULL, lease_expires_at = NULL,
+			updated_at = statement_timestamp()
+		WHERE action_id = $1
+	`, proofSubmission.Envelope.ActionID)
+	assertActionStatus(t, ctx, database, proofSubmission.Envelope.ActionID, executionlease.StatusRunning)
+	recordNoCredentialForAction(t, ctx, database, proofFence,
+		"93000000-0000-4000-8000-000000000007")
+	finalizing, err := queue.Complete(ctx, execution.ActionCompleteRequest{
+		Lease: proofFence,
+		Summary: execution.ExecutorResult{
+			Outcome: execution.ExecutorUncertain, Code: "PROOF_GUARD_UNCERTAIN",
+			Verification: execution.VerificationUnknown,
+		},
+	})
+	if err != nil || finalizing.Status != executionlease.StatusFinalizing ||
+		finalizing.CompletionStatus != executionlease.StatusUncertain {
+		t.Fatalf("Complete(uncertain proof fixture) = %#v, %v", finalizing, err)
+	}
+	expectSQLConstraint(t, ctx, database, "55000", "action_queue_result_receipt_guard", `
+		UPDATE action_queue
+		SET status = 'FAILED', completed_at = statement_timestamp(), updated_at = statement_timestamp()
+		WHERE action_id = $1
+	`, proofSubmission.Envelope.ActionID)
+	uncertain, err := queue.Finalize(ctx, proofFence)
+	if err != nil || uncertain.Status != executionlease.StatusUncertain {
+		t.Fatalf("Finalize(uncertain proof fixture) = %#v, %v", uncertain, err)
+	}
+	expectSQLConstraint(t, ctx, database, "55000", "action_queue_reconciliation_proof_guard", `
+		UPDATE action_queue SET status = 'FAILED', updated_at = statement_timestamp() WHERE action_id = $1
+	`, proofSubmission.Envelope.ActionID)
+	reconciled, err := queue.Reconcile(ctx, executionlease.ReconcileRequest{
+		ExecutionID:      proofSubmission.Envelope.ActionID,
+		ReconciliationID: "reconcile-postgres-proof-guard",
+		ActorID:          "sre-postgres-proof-guard",
+		Status:           executionlease.StatusFailed,
+		ResultHash:       strings.Repeat("6", 64),
+	})
+	if err != nil || reconciled.Status != executionlease.StatusFailed {
+		t.Fatalf("Reconcile(proof guard fixture) = %#v, %v", reconciled, err)
+	}
+}
+
+func exerciseRealActionQueueIdentityGuards(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	queue execution.ActionQueue,
+	signer action.Signer,
+	workspaceID, environmentID, serviceID string,
+) {
+	t.Helper()
+	submissionMutations := []struct {
+		name      string
+		statement string
+	}{
+		{name: "action_id", statement: `UPDATE action_queue SET action_id = action_id || '-tampered' WHERE action_id = $1`},
+		{name: "envelope", statement: `UPDATE action_queue SET envelope = envelope || '{"tampered":true}'::jsonb WHERE action_id = $1`},
+		{name: "submission_hash", statement: `UPDATE action_queue SET submission_hash = repeat('1', 64) WHERE action_id = $1`},
+		{name: "idempotency_key", statement: `UPDATE action_queue SET idempotency_key = idempotency_key || '-tampered' WHERE action_id = $1`},
+		{name: "request_hash", statement: `UPDATE action_queue SET request_hash = repeat('2', 64) WHERE action_id = $1`},
+		{name: "request_hash_version", statement: `UPDATE action_queue SET request_hash_version = 'legacy-submission.v1' WHERE action_id = $1`},
+		{name: "plan_hash", statement: `UPDATE action_queue SET plan_hash = repeat('3', 64) WHERE action_id = $1`},
+		{name: "workspace_id", statement: `UPDATE action_queue SET workspace_id = workspace_id || '-tampered' WHERE action_id = $1`},
+		{name: "environment_id", statement: `UPDATE action_queue SET environment_id = environment_id || '-tampered' WHERE action_id = $1`},
+		{name: "target_key", statement: `UPDATE action_queue SET target_key = target_key || '-tampered' WHERE action_id = $1`},
+		{name: "environment_revision", statement: `UPDATE action_queue SET environment_revision = environment_revision || '-tampered' WHERE action_id = $1`},
+		{name: "authorization_expires_at", statement: `UPDATE action_queue SET authorization_expires_at = authorization_expires_at + interval '1 minute' WHERE action_id = $1`},
+		{name: "runner_pool", statement: `UPDATE action_queue SET runner_pool = 'READ' WHERE action_id = $1`},
+		{name: "production", statement: `UPDATE action_queue SET production = true WHERE action_id = $1`},
+		{name: "created_at", statement: `UPDATE action_queue SET created_at = created_at + interval '1 second' WHERE action_id = $1`},
+	}
+	assertSubmissionIdentityFrozen := func(state, actionID, targetKey string) {
+		t.Helper()
+		constraintName := "action_queue_submission_identity_guard"
+		if state == "SUCCEEDED" || state == "FAILED" || state == "CANCELLED" {
+			constraintName = "action_queue_terminal_immutable_guard"
+		}
+		for _, test := range submissionMutations {
+			t.Run(strings.ToLower(state)+"_submission_"+test.name, func(t *testing.T) {
+				expectSQLConstraint(t, ctx, database, "55000", constraintName,
+					test.statement, actionID)
+				var storedStatus, storedTarget string
+				if err := database.QueryRow(ctx, `
+					SELECT status, target_key FROM action_queue WHERE action_id = $1
+				`, actionID).Scan(&storedStatus, &storedTarget); err != nil {
+					t.Fatalf("read %s action after rejected %s mutation: %v", state, test.name, err)
+				}
+				if storedStatus != state || storedTarget != targetKey {
+					t.Fatalf("%s action after rejected %s mutation = status %q target %q, want %q/%q",
+						state, test.name, storedStatus, storedTarget, state, targetKey)
+				}
+			})
+		}
+	}
+
+	queued := realActionSubmission(t, signer, time.Now().UTC(),
+		"90000000-0000-4000-8000-000000000088", workspaceID, environmentID, serviceID,
+		"payments-submission-identity-guard", '5')
+	if _, err := queue.Submit(ctx, queued); err != nil {
+		t.Fatalf("submit queued submission identity fixture: %v", err)
+	}
+	expectSQLConstraint(t, ctx, database, "55000", "action_queue_history_immutable_guard", `
+		DELETE FROM action_queue WHERE action_id = $1
+	`, queued.Envelope.ActionID)
+	expectSQLConstraint(t, ctx, database, "55000", "action_queue_history_immutable_guard", `
+		TRUNCATE action_queue CASCADE
+	`)
+	assertSubmissionIdentityFrozen("QUEUED", queued.Envelope.ActionID, queued.TargetKey)
+	// Scheduling remains mutable without weakening the signed submission.
+	execSQL(t, ctx, database, `
+		UPDATE action_queue SET not_before = not_before + interval '1 second'
+		WHERE action_id = $1
+	`, queued.Envelope.ActionID)
+	if _, err := queue.Cancel(ctx, queued.Envelope.ActionID); err != nil {
+		t.Fatalf("cancel queued submission identity fixture: %v", err)
+	}
+	assertSubmissionIdentityFrozen("CANCELLED", queued.Envelope.ActionID, queued.TargetKey)
+
+	now := time.Now().UTC()
+	holder := realActionSubmission(t, signer, now,
+		"90000000-0000-4000-8000-000000000089", workspaceID, environmentID, serviceID,
+		"payments-active-fence-holder", '7')
+	contender := realActionSubmission(t, signer, now,
+		"90000000-0000-4000-8000-000000000090", workspaceID, environmentID, serviceID,
+		"payments-active-fence-contender", '8')
+	contender.TargetKey = holder.TargetKey
+	if _, err := queue.Submit(ctx, holder); err != nil {
+		t.Fatalf("submit active fence holder: %v", err)
+	}
+	if _, err := queue.Submit(ctx, contender); err != nil {
+		t.Fatalf("submit active fence contender: %v", err)
+	}
+	execSQL(t, ctx, database, `
+		UPDATE action_queue SET not_before = statement_timestamp() + interval '1 hour'
+		WHERE action_id = $1
+	`, contender.Envelope.ActionID)
+	claimed, err := queue.Claim(ctx, execution.ActionClaimRequest{
+		Scope: realRunnerScope(t, ctx, database, "runner-postgres-1"), LeaseDuration: 5 * time.Minute,
+	})
+	if err != nil || claimed.Execution.ExecutionID != holder.Envelope.ActionID {
+		t.Fatalf("claim active fence holder = %#v, %v", claimed, err)
+	}
+	execSQL(t, ctx, database, `
+		UPDATE action_queue SET not_before = statement_timestamp()
+		WHERE action_id = $1
+	`, contender.Envelope.ActionID)
+
+	assertTargetLocked := func(state string) {
+		t.Helper()
+		if _, claimErr := queue.Claim(ctx, execution.ActionClaimRequest{
+			Scope: realRunnerScope(t, ctx, database, "runner-postgres-2"), LeaseDuration: time.Minute,
+		}); !errors.Is(claimErr, executionlease.ErrNoLeaseAvailable) {
+			t.Fatalf("%s holder released original target after rejected mutation: %v", state, claimErr)
+		}
+	}
+	assertActiveFenceFrozen := func(state string) {
+		t.Helper()
+		expectSQLConstraint(t, ctx, database, "55000", "action_queue_history_immutable_guard", `
+			DELETE FROM action_queue WHERE action_id = $1
+		`, holder.Envelope.ActionID)
+		for _, test := range []struct {
+			name           string
+			constraintName string
+			statement      string
+		}{
+			{name: "target", constraintName: "action_queue_submission_identity_guard", statement: `UPDATE action_queue SET target_key = target_key || '-tampered' WHERE action_id = $1`},
+			{name: "runner", constraintName: "action_queue_active_fence_guard", statement: `UPDATE action_queue SET runner_id = NULL WHERE action_id = $1`},
+			{name: "tenant", constraintName: "action_queue_active_fence_guard", statement: `UPDATE action_queue SET runner_tenant_id = NULL WHERE action_id = $1`},
+			{name: "workspace", constraintName: "action_queue_active_fence_guard", statement: `UPDATE action_queue SET runner_workspace_id = NULL WHERE action_id = $1`},
+			{name: "environment", constraintName: "action_queue_active_fence_guard", statement: `UPDATE action_queue SET runner_environment_id = NULL WHERE action_id = $1`},
+			{name: "scope", constraintName: "action_queue_active_fence_guard", statement: `UPDATE action_queue SET scope_revision = NULL WHERE action_id = $1`},
+			{name: "epoch", constraintName: "action_queue_active_fence_guard", statement: `UPDATE action_queue SET lease_epoch = lease_epoch + 1 WHERE action_id = $1`},
+			{name: "token", constraintName: "action_queue_active_fence_guard", statement: `UPDATE action_queue SET lease_token_sha256 = NULL WHERE action_id = $1`},
+		} {
+			t.Run(strings.ToLower(state)+"_"+test.name, func(t *testing.T) {
+				expectSQLConstraint(t, ctx, database, "55000", test.constraintName,
+					test.statement, holder.Envelope.ActionID)
+			})
+		}
+		assertTargetLocked(state)
+	}
+	assertCompletedFenceFrozen := func(state string) {
+		t.Helper()
+		expectSQLConstraint(t, ctx, database, "55000", "action_queue_history_immutable_guard", `
+			DELETE FROM action_queue WHERE action_id = $1
+		`, holder.Envelope.ActionID)
+		for _, test := range []struct {
+			name           string
+			constraintName string
+			statement      string
+		}{
+			{name: "target", constraintName: "action_queue_submission_identity_guard", statement: `UPDATE action_queue SET target_key = target_key || '-tampered' WHERE action_id = $1`},
+			{name: "runner", constraintName: "action_queue_active_fence_guard", statement: `UPDATE action_queue SET runner_id = NULL WHERE action_id = $1`},
+			{name: "scope", constraintName: "action_queue_active_fence_guard", statement: `UPDATE action_queue SET scope_revision = NULL WHERE action_id = $1`},
+			{name: "epoch", constraintName: "action_queue_active_fence_guard", statement: `UPDATE action_queue SET lease_epoch = lease_epoch + 1 WHERE action_id = $1`},
+			{name: "completed_epoch", constraintName: "action_queue_active_fence_guard", statement: `UPDATE action_queue SET completed_lease_epoch = NULL WHERE action_id = $1`},
+			{name: "completed_token", constraintName: "action_queue_active_fence_guard", statement: `UPDATE action_queue SET completed_lease_token_sha256 = NULL WHERE action_id = $1`},
+		} {
+			t.Run(strings.ToLower(state)+"_"+test.name, func(t *testing.T) {
+				expectSQLConstraint(t, ctx, database, "55000", test.constraintName,
+					test.statement, holder.Envelope.ActionID)
+			})
+		}
+		assertTargetLocked(state)
+	}
+
+	assertSubmissionIdentityFrozen("LEASED", holder.Envelope.ActionID, holder.TargetKey)
+	assertActiveFenceFrozen("LEASED")
+	fence := claimed.Execution.Fence()
+	if _, err := queue.Start(ctx, fence); err != nil {
+		t.Fatalf("start active fence holder: %v", err)
+	}
+	assertSubmissionIdentityFrozen("RUNNING", holder.Envelope.ActionID, holder.TargetKey)
+	assertActiveFenceFrozen("RUNNING")
+	for _, test := range []struct {
+		name      string
+		statement string
+	}{
+		{
+			name: "substituted_completed_token",
+			statement: `
+				UPDATE action_queue
+				SET status = 'FINALIZING', completion_status = 'UNCERTAIN', result_hash = repeat('4', 64),
+					completed_lease_token_sha256 = repeat('0', 64), completed_lease_epoch = lease_epoch,
+					lease_token_sha256 = NULL, lease_expires_at = NULL
+				WHERE action_id = $1
+			`,
+		},
+		{
+			name: "substituted_completed_epoch",
+			statement: `
+				UPDATE action_queue
+				SET status = 'FINALIZING', completion_status = 'UNCERTAIN', result_hash = repeat('4', 64),
+					completed_lease_token_sha256 = lease_token_sha256, completed_lease_epoch = lease_epoch + 1,
+					lease_token_sha256 = NULL, lease_expires_at = NULL
+				WHERE action_id = $1
+			`,
+		},
+	} {
+		t.Run("running_transition_"+test.name, func(t *testing.T) {
+			expectSQLConstraint(t, ctx, database, "55000", "action_queue_active_fence_guard",
+				test.statement, holder.Envelope.ActionID)
+		})
+	}
+	recordNoCredentialForAction(t, ctx, database, fence,
+		"93000000-0000-4000-8000-000000000005")
+	completion := execution.ActionCompleteRequest{
+		Lease: fence,
+		Summary: execution.ExecutorResult{
+			Outcome: execution.ExecutorUncertain, Code: "IDENTITY_GUARD_FIXTURE",
+			Verification: execution.VerificationUnknown,
+		},
+	}
+	if finalizing, err := queue.Complete(ctx, completion); err != nil || finalizing.Status != executionlease.StatusFinalizing {
+		t.Fatalf("complete active fence holder = %#v, %v", finalizing, err)
+	}
+	assertSubmissionIdentityFrozen("FINALIZING", holder.Envelope.ActionID, holder.TargetKey)
+	assertCompletedFenceFrozen("FINALIZING")
+	if uncertain, err := queue.Finalize(ctx, fence); err != nil || uncertain.Status != executionlease.StatusUncertain {
+		t.Fatalf("finalize active fence holder = %#v, %v", uncertain, err)
+	}
+	assertSubmissionIdentityFrozen("UNCERTAIN", holder.Envelope.ActionID, holder.TargetKey)
+	assertCompletedFenceFrozen("UNCERTAIN")
+	if _, err := queue.Reconcile(ctx, executionlease.ReconcileRequest{
+		ExecutionID:      holder.Envelope.ActionID,
+		ReconciliationID: "reconcile-postgres-identity-guard", ActorID: "sre-postgres-identity-guard",
+		Status: executionlease.StatusFailed, ResultHash: strings.Repeat("9", 64),
+	}); err != nil {
+		t.Fatalf("reconcile active fence holder: %v", err)
+	}
+	assertSubmissionIdentityFrozen("FAILED", holder.Envelope.ActionID, holder.TargetKey)
+	expectSQLConstraint(t, ctx, database, "55000", "action_queue_history_immutable_guard", `
+		DELETE FROM action_queue WHERE action_id = $1
+	`, holder.Envelope.ActionID)
+	contenderClaim, err := queue.Claim(ctx, execution.ActionClaimRequest{
+		Scope: realRunnerScope(t, ctx, database, "runner-postgres-2"), LeaseDuration: time.Minute,
+	})
+	if err != nil || contenderClaim.Execution.ExecutionID != contender.Envelope.ActionID {
+		t.Fatalf("claim contender after reconciliation = %#v, %v", contenderClaim, err)
+	}
+	if _, err := queue.Cancel(ctx, contender.Envelope.ActionID); err != nil {
+		t.Fatalf("cancel active fence contender: %v", err)
+	}
+
+	succeeded := realActionSubmission(t, signer, time.Now().UTC(),
+		"90000000-0000-4000-8000-000000000087", workspaceID, environmentID, serviceID,
+		"payments-submission-identity-succeeded", '0')
+	if _, err := queue.Submit(ctx, succeeded); err != nil {
+		t.Fatalf("submit succeeded submission identity fixture: %v", err)
+	}
+	succeededClaim, err := queue.Claim(ctx, execution.ActionClaimRequest{
+		Scope: realRunnerScope(t, ctx, database, "runner-postgres-1"), LeaseDuration: time.Minute,
+	})
+	if err != nil || succeededClaim.Execution.ExecutionID != succeeded.Envelope.ActionID {
+		t.Fatalf("claim succeeded submission identity fixture = %#v, %v", succeededClaim, err)
+	}
+	succeededFence := succeededClaim.Execution.Fence()
+	if _, err := queue.Start(ctx, succeededFence); err != nil {
+		t.Fatalf("start succeeded submission identity fixture: %v", err)
+	}
+	recordNoCredentialForAction(t, ctx, database, succeededFence,
+		"93000000-0000-4000-8000-000000000006")
+	if finalizing, err := queue.Complete(ctx, execution.ActionCompleteRequest{
+		Lease: succeededFence,
+		Summary: execution.ExecutorResult{
+			Outcome: execution.ExecutorSucceeded, Code: "IDENTITY_GUARD_SUCCEEDED",
+			Verification: execution.VerificationPassed,
+		},
+	}); err != nil || finalizing.Status != executionlease.StatusFinalizing {
+		t.Fatalf("complete succeeded submission identity fixture = %#v, %v", finalizing, err)
+	}
+	if terminal, err := queue.Finalize(ctx, succeededFence); err != nil || terminal.Status != executionlease.StatusSucceeded {
+		t.Fatalf("finalize succeeded submission identity fixture = %#v, %v", terminal, err)
+	}
+	assertSubmissionIdentityFrozen("SUCCEEDED", succeeded.Envelope.ActionID, succeeded.TargetKey)
+}
+
+func exerciseRealProductionWriteHardOff(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	queue execution.ActionQueue,
+	signer action.Signer,
+	workspaceID, environmentID, serviceID string,
+) {
+	t.Helper()
+	submission := realActionSubmission(t, signer, time.Now().UTC(),
+		"90000000-0000-4000-8000-000000000091", workspaceID, environmentID, serviceID,
+		"payments-production-hard-off", '1')
+	submission.Production = true
+	created, err := queue.Submit(ctx, submission)
+	if err != nil || created.Status != executionlease.StatusQueued {
+		t.Fatalf("Submit(production WRITE hard-off) = %#v, %v", created, err)
+	}
+	if _, err := queue.Claim(ctx, execution.ActionClaimRequest{
+		Scope: realRunnerScope(t, ctx, database, "runner-postgres-1"), LeaseDuration: time.Minute,
+	}); !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
+		t.Fatalf("Claim(production WRITE hard-off) error = %v, want ErrNoLeaseAvailable", err)
+	}
+	stored, err := queue.Get(ctx, submission.Envelope.ActionID)
+	if err != nil || stored.Status != executionlease.StatusQueued || stored.RunnerID != "" || stored.LeaseEpoch != 0 {
+		t.Fatalf("Get(production WRITE hard-off) = %#v, %v", stored, err)
+	}
+	var activeProductionWrites int
+	if err := database.QueryRow(ctx, `
+		SELECT count(*) FROM action_queue
+		WHERE runner_pool = 'WRITE' AND production = true
+		  AND status IN ('LEASED', 'RUNNING', 'FINALIZING', 'UNCERTAIN')
+	`).Scan(&activeProductionWrites); err != nil || activeProductionWrites != 0 {
+		t.Fatalf("active production WRITE actions = %d, %v", activeProductionWrites, err)
+	}
+	cancelled, err := queue.Cancel(ctx, submission.Envelope.ActionID)
+	if err != nil || cancelled.Status != executionlease.StatusCancelled {
+		t.Fatalf("Cancel(production WRITE hard-off) = %#v, %v", cancelled, err)
+	}
+}
+
+func registerRealWriteRunner(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	runnerID, tenantID, workspaceID, environmentID string,
+) {
+	t.Helper()
+	execSQL(t, ctx, database, `
+		INSERT INTO runner_registrations (
+			runner_id, tenant_id, spiffe_uri, runner_pool, enabled, scope_revision, max_concurrency
+		) VALUES ($1, $2, 'spiffe://integration.test/runner/write/' || $1, 'WRITE', true, 1, 1)
+	`, runnerID, tenantID)
+	execSQL(t, ctx, database, `
+		INSERT INTO runner_scope_bindings (runner_id, tenant_id, workspace_id, environment_id)
+		VALUES ($1, $2, $3, $4)
+	`, runnerID, tenantID, workspaceID, environmentID)
+	certificateDigest := sha256.Sum256([]byte("integration-runner-certificate/" + runnerID))
+	spkiDigest := sha256.Sum256([]byte("integration-runner-spki/" + runnerID))
+	serialDigest := sha256.Sum256([]byte("integration-runner-serial/" + runnerID))
+	execSQL(t, ctx, database, `
+		INSERT INTO runner_certificates (
+			certificate_sha256, runner_id, tenant_id, issuer_key_id, serial_hex, spki_sha256,
+			status, not_before, not_after
+		) VALUES ($1, $2, $3, 'integration-fixture-ca', $4, $5, 'ACTIVE',
+			statement_timestamp() - interval '1 minute', statement_timestamp() + interval '1 hour')
+	`, hex.EncodeToString(certificateDigest[:]), runnerID, tenantID,
+		hex.EncodeToString(serialDigest[:16]), hex.EncodeToString(spkiDigest[:]))
+}
+
+// recordNoCredentialForAction exercises the real repository contract inside
+// one outer transaction: PREPARED and the exact action marker become visible
+// together, then NO_CREDENTIAL is persisted before the transaction commits.
+// The deferred database proof is therefore part of the helper's success
+// condition; no trigger or constraint is weakened for the integration test.
+func recordNoCredentialForAction(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	fence executionlease.LeaseIdentity,
+	revocationID string,
+) {
+	t.Helper()
+	protector, err := credential.NewAESGCMProtector(credential.KeyRing{
+		ActiveKeyID: "action-finalization-integration-key",
+		Keys: map[string]credential.ProtectionKey{
+			"action-finalization-integration-key": {
+				EncryptionKey: bytes.Repeat([]byte{0x41}, 32),
+				HMACKey:       bytes.Repeat([]byte{0x42}, 32),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create finalization credential protector: %v", err)
+	}
+	defer protector.Destroy()
+	tx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin finalization credential transaction: %v", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	repository, err := credentialpostgres.New(tx, protector, credentialpostgres.Options{})
+	if err != nil {
+		t.Fatalf("create transactional finalization credential repository: %v", err)
+	}
+	actionFence := credential.ActionFence{
+		ActionID: fence.ExecutionID, RunnerID: fence.RunnerID, Token: fence.Token, Epoch: fence.Epoch,
+	}
+	prepared, err := repository.Prepare(ctx, credential.PrepareRequest{
+		RevocationID:        revocationID,
+		Fence:               actionFence,
+		Issuer:              "integration-no-credential",
+		IssuerRevision:      "v1",
+		CredentialExpiresAt: time.Now().UTC().Add(5 * time.Minute),
+	})
+	if err != nil || !prepared.Created || prepared.Permit == nil || prepared.Revocation.Status != credential.StatusPrepared {
+		t.Fatalf("Prepare(finalization NO_CREDENTIAL) = %#v, %v", prepared, err)
+	}
+	terminal, err := repository.RecordNoCredential(ctx, credential.ActionTransitionRequest{
+		RevocationID: revocationID, Fence: actionFence,
+	})
+	if err != nil || terminal.Status != credential.StatusNoCredential {
+		t.Fatalf("RecordNoCredential(finalization) = %#v, %v", terminal, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit finalization credential transaction: %v", err)
+	}
+	committed = true
+	var exactTerminalRows int
+	if err := database.QueryRow(ctx, `
+		SELECT count(*)
+		FROM credential_revocations AS credential
+		JOIN action_queue AS action
+		  ON action.action_id = credential.action_id
+		 AND action.runner_tenant_id = credential.tenant_id
+		 AND action.runner_workspace_id = credential.workspace_id
+		 AND action.runner_environment_id = credential.environment_id
+		 AND action.target_key = credential.target_key
+		 AND action.production = credential.production
+		 AND action.runner_id = credential.runner_id
+		 AND action.lease_epoch = credential.action_lease_epoch
+		 AND action.lease_token_sha256 = credential.action_lease_token_sha256
+		WHERE credential.revocation_id = $1
+		  AND credential.status = 'NO_CREDENTIAL'
+		  AND action.credential_expected = true
+		  AND action.credential_lease_epoch = action.lease_epoch
+	`, revocationID).Scan(&exactTerminalRows); err != nil || exactTerminalRows != 1 {
+		t.Fatalf("exact terminal credential rows for %s = %d, %v", revocationID, exactTerminalRows, err)
+	}
+}
+
+func claimStartedCredentialAction(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	queue execution.ActionQueue,
+	signer action.Signer,
+	actionID, workspaceID, environmentID, serviceID, deployment string,
+	digestByte byte,
+	runnerID string,
+) credential.ActionFence {
+	t.Helper()
+	submission := realActionSubmission(t, signer, time.Now().UTC(), actionID, workspaceID, environmentID,
+		serviceID, deployment, digestByte)
+	if _, err := queue.Submit(ctx, submission); err != nil {
+		t.Fatalf("submit credential fixture action %s: %v", actionID, err)
+	}
+	claimed, err := queue.Claim(ctx, execution.ActionClaimRequest{
+		Scope: realRunnerScope(t, ctx, database, runnerID), LeaseDuration: time.Minute,
+	})
+	if err != nil || claimed.Execution.ExecutionID != actionID {
+		t.Fatalf("claim credential fixture action %s = %#v, %v", actionID, claimed, err)
+	}
+	if _, err := queue.Start(ctx, claimed.Execution.Fence()); err != nil {
+		t.Fatalf("start credential fixture action %s: %v", actionID, err)
+	}
+	return credential.ActionFence{
+		ActionID: claimed.Execution.ExecutionID,
+		RunnerID: claimed.Execution.RunnerID,
+		Token:    claimed.Execution.LeaseToken,
+		Epoch:    claimed.Execution.LeaseEpoch,
+	}
+}
+
+// insertPreparedCredentialForAction is reserved for recovery-boundary
+// fixtures whose persisted timestamps cannot be produced through Prepare's
+// current-time contract. Every row is attached to its own real RUNNING action
+// and exact lease fence, and the marker plus deferred proof commit atomically.
+func insertPreparedCredentialForAction(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	fence credential.ActionFence,
+	revocationID, permitDigest string,
+	createdAt, credentialExpiresAt time.Time,
+	childCreateAuthorizedAt time.Time,
+	childCreateTTL time.Duration,
+) {
+	t.Helper()
+	tx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin prepared credential fixture %s: %v", revocationID, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	tokenDigest := credential.SHA256Hex([]byte(fence.Token))
+	result, err := tx.Exec(ctx, `
+		INSERT INTO credential_revocations (
+			revocation_id, tenant_id, workspace_id, environment_id,
+			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
+			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
+			child_create_permit_sha256, available_at, created_at, updated_at
+		)
+		SELECT $5, action.runner_tenant_id, action.runner_workspace_id, action.runner_environment_id,
+			action.action_id, action.target_key, action.production, action.runner_id, action.lease_epoch,
+			action.lease_token_sha256, 'vault-production', 'rev-1',
+			action.envelope #>> '{credential_scope,connector_id}',
+			action.envelope #>> '{credential_scope,permission}',
+			action.envelope #>> '{credential_scope,resource}',
+			$6, $7, $8, $8, $8
+		FROM action_queue AS action
+		WHERE action.action_id = $1
+		  AND action.runner_id = $2
+		  AND action.lease_epoch = $3
+		  AND action.lease_token_sha256 = $4
+		  AND action.runner_pool = 'WRITE'
+		  AND action.production = false
+		  AND action.status = 'RUNNING'
+	`, fence.ActionID, fence.RunnerID, fence.Epoch, tokenDigest, revocationID,
+		credentialExpiresAt.UTC(), permitDigest, createdAt.UTC())
+	if err != nil || result.RowsAffected() != 1 {
+		t.Fatalf("insert prepared credential fixture %s rows=%d: %v", revocationID, result.RowsAffected(), err)
+	}
+	result, err = tx.Exec(ctx, `
+		UPDATE action_queue
+		SET credential_expected = true,
+			credential_lease_epoch = lease_epoch,
+			updated_at = statement_timestamp()
+		WHERE action_id = $1
+		  AND runner_id = $2
+		  AND lease_epoch = $3
+		  AND lease_token_sha256 = $4
+		  AND status = 'RUNNING'
+		  AND credential_expected = false
+		  AND credential_lease_epoch IS NULL
+	`, fence.ActionID, fence.RunnerID, fence.Epoch, tokenDigest)
+	if err != nil || result.RowsAffected() != 1 {
+		t.Fatalf("mark prepared credential fixture %s rows=%d: %v", revocationID, result.RowsAffected(), err)
+	}
+	if !childCreateAuthorizedAt.IsZero() {
+		result, err = tx.Exec(ctx, `
+			UPDATE credential_revocations
+			SET child_create_authorized_at = $2,
+				child_create_ttl_seconds = $3,
+				updated_at = $2,
+				version = version + 1
+			WHERE revocation_id = $1 AND status = 'PREPARED'
+		`, revocationID, childCreateAuthorizedAt.UTC(), int32(childCreateTTL/time.Second))
+		if err != nil || result.RowsAffected() != 1 {
+			t.Fatalf("authorize prepared credential fixture %s rows=%d: %v", revocationID, result.RowsAffected(), err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit prepared credential fixture %s: %v", revocationID, err)
+	}
+	committed = true
 }
 
 func exerciseRealClaimAuthorization(
@@ -2158,6 +2827,8 @@ func exerciseRealRegistrationRaces(
 		t.Fatalf("receipt count after rejected Complete = %d, %v", receiptCount, err)
 	}
 	setRunnerEnabled(t, ctx, database, runnerID, true)
+	recordNoCredentialForAction(t, ctx, database, fence,
+		"93000000-0000-4000-8000-000000000004")
 	finalizing, err := queue.Complete(ctx, completion)
 	if err != nil || finalizing.Status != executionlease.StatusFinalizing {
 		t.Fatalf("Complete(after re-enable) = %#v, %v", finalizing, err)
@@ -2349,7 +3020,7 @@ func realActionSubmission(t *testing.T, signer action.Signer, now time.Time, act
 	return execution.ActionSubmission{
 		Envelope: sealed, PlanHash: sealed.PlanHash,
 		TargetKey:           "k8s-deployment:sha256:" + strings.Repeat(string(digestByte), 64),
-		EnvironmentRevision: "environment-postgres-1", Production: true, Pool: executionlease.PoolWrite,
+		EnvironmentRevision: "environment-postgres-1", Production: false, Pool: executionlease.PoolWrite,
 	}
 }
 
@@ -2628,4 +3299,63 @@ func expectSQLState(t *testing.T, ctx context.Context, database *pgxpool.Pool, s
 	if !errors.As(err, &postgresError) || postgresError.Code != sqlState {
 		t.Fatalf("SQL error = %v, want SQLSTATE %s", err, sqlState)
 	}
+}
+
+func expectSQLConstraint(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	sqlState, constraintName, query string,
+	arguments ...any,
+) {
+	t.Helper()
+	_, err := database.Exec(ctx, query, arguments...)
+	if err == nil {
+		t.Fatalf("SQL unexpectedly succeeded; want SQLSTATE %s constraint %q", sqlState, constraintName)
+	}
+	var postgresError *pgconn.PgError
+	if !errors.As(err, &postgresError) || postgresError.Code != sqlState || postgresError.ConstraintName != constraintName {
+		t.Fatalf("SQL error = %v (constraint %q), want SQLSTATE %s constraint %q",
+			err, postgresErrorConstraint(postgresError), sqlState, constraintName)
+	}
+}
+
+func expectDeferredConstraintAtCommit(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	constraintName, query string,
+	arguments ...any,
+) {
+	t.Helper()
+	tx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin deferred constraint transaction: %v", err)
+	}
+	finished := false
+	defer func() {
+		if !finished {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	if _, err := tx.Exec(ctx, query, arguments...); err != nil {
+		t.Fatalf("statement failed before deferred constraint commit: %v", err)
+	}
+	err = tx.Commit(ctx)
+	finished = true
+	if err == nil {
+		t.Fatal("deferred constraint commit unexpectedly succeeded")
+	}
+	var postgresError *pgconn.PgError
+	if !errors.As(err, &postgresError) || postgresError.Code != "23514" || postgresError.ConstraintName != constraintName {
+		t.Fatalf("deferred commit error = %v (constraint %q), want SQLSTATE 23514 constraint %q",
+			err, postgresErrorConstraint(postgresError), constraintName)
+	}
+}
+
+func postgresErrorConstraint(err *pgconn.PgError) string {
+	if err == nil {
+		return ""
+	}
+	return err.ConstraintName
 }

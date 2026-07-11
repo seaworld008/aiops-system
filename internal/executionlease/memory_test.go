@@ -13,7 +13,28 @@ import (
 	"github.com/seaworld008/aiops-system/internal/executionlease"
 )
 
-func TestMemoryProductionWriteGlobalConcurrencyAndPoolIsolation(t *testing.T) {
+func TestMemoryNeverClaimsProductionWriteEvenWhenClaimsAreEnabled(t *testing.T) {
+	repository, _ := newMemoryRepository(t)
+	ctx := context.Background()
+	enqueue(t, repository, executionlease.EnqueueRequest{
+		ExecutionID: "production-write", TargetKey: "prod/cluster/deployment/api",
+		Pool: executionlease.PoolWrite, Production: true,
+	})
+
+	claimed, err := repository.Claim(ctx, executionlease.ClaimRequest{
+		Pool: executionlease.PoolWrite, RunnerID: "writer-01",
+		LeaseDuration: time.Minute, ClaimsEnabled: true,
+	})
+	if !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
+		t.Fatalf("Claim(production WRITE) = %+v, %v; want ErrNoLeaseAvailable", claimed, err)
+	}
+	queued, err := repository.Get(ctx, "production-write")
+	if err != nil || queued.Status != executionlease.StatusQueued || queued.RunnerID != "" || queued.LeaseEpoch != 0 {
+		t.Fatalf("production WRITE after Claim() = %+v, %v; want unchanged QUEUED execution", queued, err)
+	}
+}
+
+func TestMemoryProductionWriteClaimsStayDisabledUnderConcurrencyAndReadPoolIsIsolated(t *testing.T) {
 	repository, _ := newMemoryRepository(t)
 	ctx := context.Background()
 	for index := 0; index < 32; index++ {
@@ -49,8 +70,8 @@ func TestMemoryProductionWriteGlobalConcurrencyAndPoolIsolation(t *testing.T) {
 	}
 	close(start)
 	wait.Wait()
-	if got := successes.Load(); got != 1 {
-		t.Fatalf("successful production WRITE claims = %d, want 1", got)
+	if got := successes.Load(); got != 0 {
+		t.Fatalf("successful production WRITE claims = %d, want 0", got)
 	}
 
 	readLease, err := repository.Claim(ctx, executionlease.ClaimRequest{
@@ -107,6 +128,9 @@ func TestMemoryLifecycleHeartbeatAndCompletionIdempotency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Heartbeat() error = %v", err)
 	}
+	if heartbeat.LeaseToken != "" {
+		t.Fatalf("Heartbeat() leaked lease token %q", heartbeat.LeaseToken)
+	}
 	if want := clock.Now().Add(2 * time.Minute); !heartbeat.LeaseExpiresAt.Equal(want) {
 		t.Fatalf("lease expiry = %s, want %s", heartbeat.LeaseExpiresAt, want)
 	}
@@ -122,6 +146,9 @@ func TestMemoryLifecycleHeartbeatAndCompletionIdempotency(t *testing.T) {
 	running, err := repository.Start(ctx, fence)
 	if err != nil || running.Status != executionlease.StatusRunning {
 		t.Fatalf("Start() = %+v, %v", running, err)
+	}
+	if running.LeaseToken != "" {
+		t.Fatalf("Start() leaked lease token %q", running.LeaseToken)
 	}
 	resultHash := strings.Repeat("a", 64)
 	completed, err := repository.Complete(ctx, executionlease.CompleteRequest{
@@ -143,6 +170,13 @@ func TestMemoryLifecycleHeartbeatAndCompletionIdempotency(t *testing.T) {
 		Lease: fence, Status: executionlease.StatusSucceeded, ResultHash: strings.Repeat("b", 64),
 	}); !errors.Is(err, executionlease.ErrCompletionConflict) {
 		t.Fatalf("conflicting Complete() error = %v", err)
+	}
+	wrongToken := fence
+	wrongToken.Token = "000000000000000000000000000000ff"
+	if _, err := repository.Complete(ctx, executionlease.CompleteRequest{
+		Lease: wrongToken, Status: executionlease.StatusSucceeded, ResultHash: resultHash,
+	}); !errors.Is(err, executionlease.ErrStaleLease) {
+		t.Fatalf("idempotent Complete() with wrong token error = %v, want ErrStaleLease", err)
 	}
 	if _, err := repository.Heartbeat(ctx, executionlease.HeartbeatRequest{Lease: fence, Extension: time.Minute}); !errors.Is(err, executionlease.ErrStaleLease) {
 		t.Fatalf("post-completion Heartbeat() error = %v", err)
@@ -292,16 +326,16 @@ func TestMemoryCancelFencesLeasedAndRunningExecutions(t *testing.T) {
 	}
 }
 
-func TestMemoryUncertainProductionWriteKeepsGlobalWriteSlot(t *testing.T) {
+func TestMemoryUncertainWriteKeepsItsTargetReservationWithoutBlockingOtherTargets(t *testing.T) {
 	repository, clock := newMemoryRepository(t)
 	ctx := context.Background()
 	enqueue(t, repository, executionlease.EnqueueRequest{
-		ExecutionID: "production-write-old", TargetKey: "prod/cluster-a/deployment/api",
-		Pool: executionlease.PoolWrite, Production: true,
+		ExecutionID: "non-production-write-old", TargetKey: "nonprod/cluster-a/deployment/api",
+		Pool: executionlease.PoolWrite,
 	})
 	enqueue(t, repository, executionlease.EnqueueRequest{
-		ExecutionID: "production-write-next", TargetKey: "prod/cluster-b/deployment/worker",
-		Pool: executionlease.PoolWrite, Production: true,
+		ExecutionID: "non-production-write-next", TargetKey: "nonprod/cluster-b/deployment/worker",
+		Pool: executionlease.PoolWrite,
 	})
 	enqueue(t, repository, executionlease.EnqueueRequest{
 		ExecutionID: "read-after-uncertain", TargetKey: "prod/cluster-c/deployment/observer",
@@ -312,22 +346,23 @@ func TestMemoryUncertainProductionWriteKeepsGlobalWriteSlot(t *testing.T) {
 		Pool: executionlease.PoolWrite, RunnerID: "runner-old", LeaseDuration: time.Minute, ClaimsEnabled: true,
 	})
 	if err != nil {
-		t.Fatalf("Claim(production WRITE): %v", err)
+		t.Fatalf("Claim(non-production WRITE): %v", err)
 	}
 	if _, err := repository.Start(ctx, lease.Fence()); err != nil {
-		t.Fatalf("Start(production WRITE): %v", err)
+		t.Fatalf("Start(non-production WRITE): %v", err)
 	}
 	clock.Advance(time.Minute)
 
-	if _, err := repository.Claim(ctx, executionlease.ClaimRequest{
+	writeLease, err := repository.Claim(ctx, executionlease.ClaimRequest{
 		Pool: executionlease.PoolWrite, RunnerID: "runner-next", LeaseDuration: time.Minute, ClaimsEnabled: true,
-	}); !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
-		t.Fatalf("Claim(WRITE) behind UNCERTAIN production write error = %v", err)
+	})
+	if err != nil || writeLease.ExecutionID != "non-production-write-next" {
+		t.Fatalf("Claim(WRITE) on another target behind UNCERTAIN = %+v, %v", writeLease, err)
 	}
 	if _, err := repository.Claim(ctx, executionlease.ClaimRequest{
 		Pool: executionlease.PoolRead, RunnerID: "reader", LeaseDuration: time.Minute, ClaimsEnabled: true,
 	}); err != nil {
-		t.Fatalf("Claim(READ) behind UNCERTAIN production write: %v", err)
+		t.Fatalf("Claim(READ) behind UNCERTAIN non-production write: %v", err)
 	}
 }
 
@@ -335,15 +370,15 @@ func TestMemoryReconcileResolvesUncertainAndReleasesReservationsIdempotently(t *
 	repository, clock := newMemoryRepository(t)
 	ctx := context.Background()
 	enqueue(t, repository, executionlease.EnqueueRequest{
-		ExecutionID: "production-write-uncertain", TargetKey: "prod/cluster-a/deployment/api",
-		Pool: executionlease.PoolWrite, Production: true,
+		ExecutionID: "write-uncertain", TargetKey: "nonprod/cluster-a/deployment/api",
+		Pool: executionlease.PoolWrite,
 	})
 	enqueue(t, repository, executionlease.EnqueueRequest{
-		ExecutionID: "production-write-waiting", TargetKey: "prod/cluster-b/deployment/worker",
-		Pool: executionlease.PoolWrite, Production: true,
+		ExecutionID: "write-waiting", TargetKey: "nonprod/cluster-b/deployment/worker",
+		Pool: executionlease.PoolWrite,
 	})
 	enqueue(t, repository, executionlease.EnqueueRequest{
-		ExecutionID: "same-target-read-waiting", TargetKey: "prod/cluster-a/deployment/api",
+		ExecutionID: "same-target-read-waiting", TargetKey: "nonprod/cluster-a/deployment/api",
 		Pool: executionlease.PoolRead, Production: true,
 	})
 	lease, err := repository.Claim(ctx, executionlease.ClaimRequest{
@@ -356,11 +391,6 @@ func TestMemoryReconcileResolvesUncertainAndReleasesReservationsIdempotently(t *
 		t.Fatalf("Start(): %v", err)
 	}
 	clock.Advance(time.Minute)
-	if _, err := repository.Claim(ctx, executionlease.ClaimRequest{
-		Pool: executionlease.PoolWrite, RunnerID: "runner-blocked", LeaseDuration: time.Minute, ClaimsEnabled: true,
-	}); !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
-		t.Fatalf("Claim() before reconciliation error = %v", err)
-	}
 	if _, err := repository.Claim(ctx, executionlease.ClaimRequest{
 		Pool: executionlease.PoolRead, RunnerID: "reader-blocked", LeaseDuration: time.Minute, ClaimsEnabled: true,
 	}); !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
@@ -402,7 +432,7 @@ func TestMemoryReconcileResolvesUncertainAndReleasesReservationsIdempotently(t *
 	claimed, err := repository.Claim(ctx, executionlease.ClaimRequest{
 		Pool: executionlease.PoolWrite, RunnerID: "runner-next", LeaseDuration: time.Minute, ClaimsEnabled: true,
 	})
-	if err != nil || claimed.ExecutionID != "production-write-waiting" {
+	if err != nil || claimed.ExecutionID != "write-waiting" {
 		t.Fatalf("Claim() after reconciliation = %+v, %v", claimed, err)
 	}
 }

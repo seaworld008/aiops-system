@@ -3,6 +3,8 @@ package executionlease
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"math"
@@ -29,9 +31,16 @@ type MemoryOptions struct {
 type MemoryRepository struct {
 	mu          sync.Mutex
 	executions  map[string]Execution
+	leaseFences map[string]leaseFence
 	order       []string
 	clock       func() time.Time
 	tokenSource func() (string, error)
+}
+
+type leaseFence struct {
+	runnerID    string
+	epoch       int64
+	tokenSHA256 [sha256.Size]byte
 }
 
 var _ Repository = (*MemoryRepository)(nil)
@@ -48,6 +57,7 @@ func NewMemory(options MemoryOptions) (*MemoryRepository, error) {
 	}
 	return &MemoryRepository{
 		executions:  make(map[string]Execution),
+		leaseFences: make(map[string]leaseFence),
 		clock:       options.Clock,
 		tokenSource: options.TokenSource,
 	}, nil
@@ -110,7 +120,7 @@ func (repository *MemoryRepository) Claim(ctx context.Context, request ClaimRequ
 		if repository.targetUnavailable(execution.TargetKey, execution.ExecutionID) {
 			continue
 		}
-		if execution.Pool == PoolWrite && execution.Production && repository.productionWriteActive(execution.ExecutionID) {
+		if execution.Pool == PoolWrite && execution.Production {
 			continue
 		}
 		if execution.LeaseEpoch == math.MaxInt64 {
@@ -125,14 +135,21 @@ func (repository *MemoryRepository) Claim(ctx context.Context, request ClaimRequ
 		}
 		execution.Status = StatusLeased
 		execution.RunnerID = request.RunnerID
-		execution.LeaseToken = token
+		execution.LeaseToken = ""
 		execution.LeaseEpoch++
 		execution.LeaseAcquiredAt = now
 		execution.LastHeartbeatAt = now
 		execution.LeaseExpiresAt = now.Add(request.LeaseDuration)
 		execution.UpdatedAt = now
+		repository.leaseFences[executionID] = leaseFence{
+			runnerID:    request.RunnerID,
+			epoch:       execution.LeaseEpoch,
+			tokenSHA256: sha256.Sum256([]byte(token)),
+		}
 		repository.executions[executionID] = execution
-		return execution, nil
+		claimed := execution
+		claimed.LeaseToken = token
+		return claimed, nil
 	}
 	return Execution{}, ErrNoLeaseAvailable
 }
@@ -154,7 +171,8 @@ func (repository *MemoryRepository) Start(ctx context.Context, lease LeaseIdenti
 	if !exists {
 		return Execution{}, ErrNotFound
 	}
-	if !currentLease(execution, lease, now) {
+	fence, fenceExists := repository.leaseFences[execution.ExecutionID]
+	if !currentLease(execution, fence, fenceExists, lease, now) {
 		return Execution{}, ErrStaleLease
 	}
 	switch execution.Status {
@@ -167,7 +185,7 @@ func (repository *MemoryRepository) Start(ctx context.Context, lease LeaseIdenti
 	default:
 		return Execution{}, ErrInvalidTransition
 	}
-	return execution, nil
+	return redactedExecution(execution), nil
 }
 
 func (repository *MemoryRepository) Heartbeat(ctx context.Context, request HeartbeatRequest) (Execution, error) {
@@ -187,14 +205,15 @@ func (repository *MemoryRepository) Heartbeat(ctx context.Context, request Heart
 	if !exists {
 		return Execution{}, ErrNotFound
 	}
-	if !currentLease(execution, request.Lease, now) {
+	fence, fenceExists := repository.leaseFences[execution.ExecutionID]
+	if !currentLease(execution, fence, fenceExists, request.Lease, now) {
 		return Execution{}, ErrStaleLease
 	}
 	execution.LeaseExpiresAt = now.Add(request.Extension)
 	execution.LastHeartbeatAt = now
 	execution.UpdatedAt = now
 	repository.executions[execution.ExecutionID] = execution
-	return execution, nil
+	return redactedExecution(execution), nil
 }
 
 func (repository *MemoryRepository) Complete(ctx context.Context, request CompleteRequest) (Execution, error) {
@@ -220,8 +239,8 @@ func (repository *MemoryRepository) Complete(ctx context.Context, request Comple
 		if execution.ReconciliationID != "" {
 			return Execution{}, ErrStaleLease
 		}
-		if execution.RunnerID != request.Lease.RunnerID || execution.LeaseToken != request.Lease.Token ||
-			execution.LeaseEpoch != request.Lease.Epoch {
+		fence, fenceExists := repository.leaseFences[execution.ExecutionID]
+		if !fenceExists || !fence.matches(request.Lease) {
 			return Execution{}, ErrStaleLease
 		}
 		if execution.Status == request.Status && execution.ResultHash == request.ResultHash {
@@ -229,7 +248,8 @@ func (repository *MemoryRepository) Complete(ctx context.Context, request Comple
 		}
 		return Execution{}, ErrCompletionConflict
 	}
-	if !currentLease(execution, request.Lease, now) {
+	fence, fenceExists := repository.leaseFences[execution.ExecutionID]
+	if !currentLease(execution, fence, fenceExists, request.Lease, now) {
 		return Execution{}, ErrStaleLease
 	}
 	if execution.Status != StatusRunning {
@@ -240,6 +260,7 @@ func (repository *MemoryRepository) Complete(ctx context.Context, request Comple
 	execution.CompletedAt = now
 	execution.LeaseExpiresAt = time.Time{}
 	execution.UpdatedAt = now
+	execution.LeaseToken = ""
 	repository.executions[execution.ExecutionID] = execution
 	return redactedExecution(execution), nil
 }
@@ -270,6 +291,7 @@ func (repository *MemoryRepository) Reconcile(ctx context.Context, request Recon
 		if execution.ReconciliationID == request.ReconciliationID &&
 			execution.ReconciliationActor == request.ActorID &&
 			execution.Status == request.Status && execution.ReconciliationResultHash == request.ResultHash {
+			delete(repository.leaseFences, execution.ExecutionID)
 			return redactedExecution(execution), nil
 		}
 		return Execution{}, ErrReconciliationConflict
@@ -288,6 +310,7 @@ func (repository *MemoryRepository) Reconcile(ctx context.Context, request Recon
 	execution.ReconciliationActor = request.ActorID
 	execution.ReconciledAt = now
 	execution.UpdatedAt = now
+	delete(repository.leaseFences, execution.ExecutionID)
 	repository.executions[execution.ExecutionID] = execution
 	return redactedExecution(execution), nil
 }
@@ -337,6 +360,7 @@ func (repository *MemoryRepository) Cancel(ctx context.Context, executionID stri
 	execution.LeaseExpiresAt = time.Time{}
 	execution.CompletedAt = now
 	execution.UpdatedAt = now
+	delete(repository.leaseFences, execution.ExecutionID)
 	repository.executions[execution.ExecutionID] = execution
 	return redactedExecution(execution), nil
 }
@@ -385,6 +409,7 @@ func (repository *MemoryRepository) expireLeases(now time.Time) {
 		default:
 			continue
 		}
+		delete(repository.leaseFences, executionID)
 		repository.executions[executionID] = execution
 	}
 }
@@ -401,16 +426,6 @@ func (repository *MemoryRepository) targetUnavailable(targetKey, candidateID str
 	return false
 }
 
-func (repository *MemoryRepository) productionWriteActive(candidateID string) bool {
-	for executionID, execution := range repository.executions {
-		if executionID != candidateID && execution.Pool == PoolWrite && execution.Production &&
-			(execution.Status == StatusLeased || execution.Status == StatusRunning || execution.Status == StatusUncertain) {
-			return true
-		}
-	}
-	return false
-}
-
 func (repository *MemoryRepository) now() (time.Time, error) {
 	now := repository.clock().UTC()
 	if now.IsZero() {
@@ -419,11 +434,21 @@ func (repository *MemoryRepository) now() (time.Time, error) {
 	return now, nil
 }
 
-func currentLease(execution Execution, lease LeaseIdentity, now time.Time) bool {
+func currentLease(execution Execution, fence leaseFence, fenceExists bool, lease LeaseIdentity, now time.Time) bool {
 	return lease.ExecutionID == execution.ExecutionID && lease.RunnerID == execution.RunnerID &&
-		lease.Token == execution.LeaseToken &&
+		fenceExists && fence.matches(lease) &&
 		lease.Epoch > 0 && lease.Epoch == execution.LeaseEpoch &&
 		(execution.Status == StatusLeased || execution.Status == StatusRunning) && now.Before(execution.LeaseExpiresAt)
+}
+
+func (fence leaseFence) matches(lease LeaseIdentity) bool {
+	return fence.runnerID == lease.RunnerID && fence.epoch == lease.Epoch &&
+		tokenDigestMatches(fence.tokenSHA256, lease.Token)
+}
+
+func tokenDigestMatches(expected [sha256.Size]byte, token string) bool {
+	actual := sha256.Sum256([]byte(token))
+	return subtle.ConstantTimeCompare(expected[:], actual[:]) == 1
 }
 
 func validPool(pool Pool) bool {

@@ -447,6 +447,13 @@ type ConfirmationResult struct {
 	Confirmations []ExternalConfirmation `json:"confirmations"`
 }
 
+// CleanupInspector exposes only the credential cleanup fact required by an
+// execution finalization gate. It deliberately does not expose revocation
+// records or protected credential references.
+type CleanupInspector interface {
+	InspectCleanup(context.Context, string, int64) (present bool, terminal bool, err error)
+}
+
 // Repository is intentionally credential-domain-local. It is not part of the
 // broad store.Store interface and never exposes protected reference storage.
 type Repository interface {

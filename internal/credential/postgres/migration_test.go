@@ -105,6 +105,443 @@ func TestCredentialRevocationMigrationCapsCredentialTTLForPreparedRecoverySafety
 	}
 }
 
+func TestCredentialRevocationMigrationAddsAtomicActionCredentialMarker(t *testing.T) {
+	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
+	for _, fragment := range []string{
+		"lock table action_queue, execution_leases in access exclusive mode",
+		"add column credential_expected boolean not null default false",
+		"add column credential_lease_epoch bigint",
+		"constraint action_queue_credential_marker_shape_ck check",
+		"not credential_expected and credential_lease_epoch is null",
+		"credential_expected and runner_pool = 'write' and production = false",
+		"credential_lease_epoch is not null",
+		"credential_lease_epoch > 0 and credential_lease_epoch = lease_epoch",
+		"status <> 'queued'",
+		"constraint credential_revocations_non_production_ck check (production = false)",
+		"constraint action_queue_no_active_production_write_ck check ( runner_pool <> 'write' or production = false or status not in ('leased', 'running', 'finalizing', 'uncertain') )",
+		"constraint execution_leases_no_active_production_write_ck check ( runner_pool <> 'write' or production = false or status not in ('leased', 'running', 'uncertain') )",
+	} {
+		if !strings.Contains(normalized, fragment) {
+			t.Errorf("up migration missing atomic credential marker invariant %q", fragment)
+		}
+	}
+}
+
+func TestCredentialRevocationMigrationClosesActionMarkerAndCleanupBypasses(t *testing.T) {
+	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
+	for _, fragment := range []string{
+		"create or replace function enforce_action_queue_credential_cleanup()",
+		"where runner_pool = 'write' and status in ('leased', 'running', 'finalizing', 'uncertain')",
+		"where runner_pool = 'write' and status in ('leased', 'running', 'uncertain')",
+		"old.credential_expected = false and new.credential_expected = true",
+		") is not true or not exists ( select 1 from credential_revocations as revocation",
+		"old.status = new.status",
+		"old.status in ('leased', 'running')",
+		"new.credential_lease_epoch = old.lease_epoch",
+		"old.status = 'leased' and new.status = 'queued'",
+		"old.status in ('running', 'finalizing', 'uncertain')",
+		"old.status in ('leased', 'running') then old.lease_token_sha256",
+		"else old.completed_lease_token_sha256",
+		"constraint = 'action_queue_credential_marker_guard'",
+		"constraint = 'action_queue_credential_cleanup_gate'",
+		"if old.status = 'leased' and new.status = 'queued' then new.credential_expected := false; new.credential_lease_epoch := null; end if;",
+		"create trigger action_queue_credential_cleanup_gate before insert or update on action_queue",
+		"create or replace function validate_credential_revocation_action_marker()",
+		"create constraint trigger credential_revocations_action_marker_shape",
+		"after insert on credential_revocations",
+		"deferrable initially deferred",
+		"new.action_lease_token_sha256",
+		"revocation.tenant_id = new.runner_tenant_id",
+		"revocation.workspace_id = new.runner_workspace_id",
+		"revocation.environment_id = new.runner_environment_id",
+		"revocation.action_lease_token_sha256 = new.lease_token_sha256",
+		"terminal.action_lease_token_sha256 = fence_token_sha256",
+		"action.credential_expected = true",
+		"action.credential_lease_epoch = new.action_lease_epoch",
+	} {
+		if !strings.Contains(normalized, fragment) {
+			t.Errorf("up migration missing credential cleanup bypass defense %q", fragment)
+		}
+	}
+	if count := strings.Count(normalized, "constraint = 'action_queue_credential_cleanup_gate'"); count != 1 {
+		t.Fatalf("cleanup-pending constraint name occurs %d times, want only the active-to-inactive terminal gate", count)
+	}
+	functionStart := strings.Index(normalized, "create or replace function enforce_action_queue_credential_cleanup()")
+	triggerStart := strings.Index(normalized, "create trigger action_queue_credential_cleanup_gate")
+	if functionStart < 0 || triggerStart < 0 || triggerStart <= functionStart {
+		t.Fatal("action credential cleanup trigger function boundaries are missing")
+	}
+	actionGuard := normalized[functionStart:triggerStart]
+	for _, fragment := range []string{
+		"if tg_op = 'insert' then",
+		"if new.credential_expected = true or new.credential_lease_epoch is not null then",
+		"constraint = 'action_queue_credential_marker_guard'",
+		"return new; end if;",
+	} {
+		if !strings.Contains(actionGuard, fragment) {
+			t.Errorf("action marker INSERT guard missing %q", fragment)
+		}
+	}
+	for _, predicate := range []string{
+		"terminal.action_id = old.action_id",
+		"terminal.tenant_id = old.runner_tenant_id",
+		"terminal.workspace_id = old.runner_workspace_id",
+		"terminal.environment_id = old.runner_environment_id",
+		"terminal.target_key = old.target_key",
+		"terminal.production = old.production",
+		"terminal.runner_id = old.runner_id",
+		"terminal.action_lease_epoch = old.lease_epoch",
+		"terminal.action_lease_token_sha256 = fence_token_sha256",
+		"terminal.status in ('revoked', 'no_credential')",
+	} {
+		if !strings.Contains(normalized, predicate) {
+			t.Errorf("up migration cleanup gate missing full-fence predicate %q", predicate)
+		}
+	}
+	terminalQuery := strings.Index(normalized, "terminal.status in ('revoked', 'no_credential')")
+	autoClear := strings.Index(normalized, "new.credential_expected := false")
+	if terminalQuery < 0 || autoClear < 0 || autoClear < terminalQuery {
+		t.Fatal("LEASED to QUEUED marker auto-clear must run only after the exact terminal cleanup query")
+	}
+}
+
+func TestCredentialRevocationMigrationRoutesSubmissionIdentityOffHeartbeatTrigger(t *testing.T) {
+	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
+	identityFunction := strings.Index(normalized, "create or replace function reject_action_queue_submission_identity_mutation()")
+	identityTrigger := strings.Index(normalized, "create trigger action_queue_submission_identity_guard")
+	terminalFunction := strings.Index(normalized, "create or replace function reject_action_queue_terminal_mutation()")
+	terminalTrigger := strings.Index(normalized, "create trigger action_queue_00_terminal_immutable_guard")
+	cleanupFunction := strings.Index(normalized, "create or replace function enforce_action_queue_credential_cleanup()")
+	cleanupTrigger := strings.Index(normalized, "create trigger action_queue_credential_cleanup_gate")
+	if identityFunction < 0 || identityTrigger <= identityFunction {
+		t.Fatal("submission identity must use a dedicated trigger function")
+	}
+	if cleanupFunction < 0 || cleanupTrigger <= cleanupFunction {
+		t.Fatal("credential cleanup trigger function boundaries are missing")
+	}
+	if terminalFunction < 0 || terminalTrigger <= terminalFunction || cleanupFunction <= terminalTrigger {
+		t.Fatal("terminal immutability must use a dedicated trigger before the cleanup hot path")
+	}
+
+	identityGuard := normalized[identityFunction:identityTrigger]
+	for _, field := range []string{
+		"action_id",
+		"envelope",
+		"submission_hash",
+		"idempotency_key",
+		"request_hash",
+		"request_hash_version",
+		"plan_hash",
+		"workspace_id",
+		"environment_id",
+		"target_key",
+		"environment_revision",
+		"authorization_expires_at",
+		"runner_pool",
+		"production",
+		"created_at",
+	} {
+		fragment := "old." + field + " is distinct from new." + field
+		if !strings.Contains(identityGuard, fragment) {
+			t.Errorf("dedicated submission identity guard missing %q", fragment)
+		}
+	}
+	if !strings.Contains(normalized,
+		"before update of action_id, envelope, submission_hash, idempotency_key, request_hash, request_hash_version, plan_hash, workspace_id, environment_id, target_key, environment_revision, authorization_expires_at, runner_pool, production, created_at on action_queue") {
+		t.Fatal("submission identity trigger must be column-routed away from heartbeat updates")
+	}
+	if strings.Contains(normalized[cleanupFunction:cleanupTrigger], "old is distinct from new") {
+		t.Fatal("heartbeat cleanup trigger still performs a whole-row comparison")
+	}
+	if !strings.Contains(normalized[cleanupFunction:cleanupTrigger],
+		"if old.status = 'finalizing' and new.status in ('succeeded', 'failed', 'uncertain') then if new.status is distinct from old.completion_status or not exists") {
+		t.Fatal("FINALIZING receipt lookup must be structurally nested outside the heartbeat hot path")
+	}
+	if !strings.Contains(normalized,
+		"create trigger action_queue_00_terminal_immutable_guard before update on action_queue for each row when (old.status in ('succeeded', 'failed', 'cancelled')) execute function reject_action_queue_terminal_mutation()") {
+		t.Fatal("terminal whole-row comparison must be routed by a dedicated WHEN trigger")
+	}
+
+	down := normalizeMigration(readMigration(t, "000008_credential_revocations.down.sql"))
+	for _, fragment := range []string{
+		"drop trigger action_queue_00_terminal_immutable_guard on action_queue",
+		"drop function reject_action_queue_terminal_mutation()",
+		"drop trigger action_queue_submission_identity_guard on action_queue",
+		"drop function reject_action_queue_submission_identity_mutation()",
+	} {
+		if !strings.Contains(down, fragment) {
+			t.Errorf("down migration missing dedicated submission identity rollback %q", fragment)
+		}
+	}
+}
+
+func TestCredentialRevocationMigrationFreezesActionSubmissionIdentityAndActiveFence(t *testing.T) {
+	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
+	identityFunction := strings.Index(normalized, "create or replace function reject_action_queue_submission_identity_mutation()")
+	identityTrigger := strings.Index(normalized, "create trigger action_queue_submission_identity_guard")
+	if identityFunction < 0 || identityTrigger <= identityFunction {
+		t.Fatal("action submission identity trigger function boundaries are missing")
+	}
+	identityGuard := normalized[identityFunction:identityTrigger]
+	cleanupFunction := strings.Index(normalized, "create or replace function enforce_action_queue_credential_cleanup()")
+	cleanupTrigger := strings.Index(normalized, "create trigger action_queue_credential_cleanup_gate")
+	if cleanupFunction < 0 || cleanupTrigger <= cleanupFunction {
+		t.Fatal("action credential cleanup trigger function boundaries are missing")
+	}
+	actionGuard := normalized[cleanupFunction:cleanupTrigger]
+
+	for _, field := range []string{
+		"action_id",
+		"envelope",
+		"submission_hash",
+		"idempotency_key",
+		"request_hash",
+		"request_hash_version",
+		"plan_hash",
+		"workspace_id",
+		"environment_id",
+		"target_key",
+		"environment_revision",
+		"authorization_expires_at",
+		"runner_pool",
+		"production",
+		"created_at",
+	} {
+		fragment := "old." + field + " is distinct from new." + field
+		if !strings.Contains(identityGuard, fragment) {
+			t.Errorf("action submission identity guard missing NULL-safe comparison %q", fragment)
+		}
+	}
+	if strings.Contains(identityGuard, "old.not_before is distinct from new.not_before") {
+		t.Fatal("action submission identity guard must allow not_before scheduling updates")
+	}
+	if !strings.Contains(identityGuard, "constraint = 'action_queue_submission_identity_guard'") {
+		t.Fatal("dedicated submission identity guard must report its stable constraint name")
+	}
+
+	for _, fragment := range []string{
+		"old.status in ('leased', 'running', 'finalizing', 'uncertain', 'succeeded', 'failed') and new.status in ('leased', 'running', 'finalizing', 'uncertain', 'succeeded', 'failed')",
+		"old.runner_id is distinct from new.runner_id",
+		"old.runner_tenant_id is distinct from new.runner_tenant_id",
+		"old.runner_workspace_id is distinct from new.runner_workspace_id",
+		"old.runner_environment_id is distinct from new.runner_environment_id",
+		"old.scope_revision is distinct from new.scope_revision",
+		"old.lease_epoch is distinct from new.lease_epoch",
+		"case when old.status in ('leased', 'running') then old.lease_token_sha256 else old.completed_lease_token_sha256 end is distinct from case when new.status in ('leased', 'running') then new.lease_token_sha256 else new.completed_lease_token_sha256 end",
+		"old.status in ('finalizing', 'uncertain', 'succeeded', 'failed') and old.completed_lease_epoch is distinct from new.completed_lease_epoch",
+		"new.status in ('finalizing', 'uncertain', 'succeeded', 'failed') and new.completed_lease_epoch is distinct from new.lease_epoch",
+		"constraint = 'action_queue_active_fence_guard'",
+	} {
+		if !strings.Contains(actionGuard, fragment) {
+			t.Errorf("action active fence guard missing %q", fragment)
+		}
+	}
+}
+
+func TestCredentialRevocationMigrationEnforcesActionStateGraph(t *testing.T) {
+	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
+	functionStart := strings.Index(normalized, "create or replace function enforce_action_queue_credential_cleanup()")
+	triggerStart := strings.Index(normalized, "create trigger action_queue_credential_cleanup_gate")
+	if functionStart < 0 || triggerStart <= functionStart {
+		t.Fatal("action execution proof trigger function boundaries are missing")
+	}
+	actionGuard := normalized[functionStart:triggerStart]
+	for _, fragment := range []string{
+		"new.status <> 'queued'",
+		"old.status is distinct from new.status",
+		"old.status = 'queued' and new.status in ('leased', 'cancelled')",
+		"old.status = 'leased' and new.status in ('running', 'queued', 'failed', 'cancelled')",
+		"old.status = 'running' and new.status in ('finalizing', 'uncertain')",
+		"old.status = 'finalizing' and new.status in ('succeeded', 'failed', 'uncertain')",
+		"old.status = 'uncertain' and new.status in ('succeeded', 'failed')",
+		"constraint = 'action_queue_state_transition_guard'",
+	} {
+		if !strings.Contains(actionGuard, fragment) {
+			t.Errorf("action state graph missing %q", fragment)
+		}
+	}
+}
+
+func TestCredentialRevocationMigrationFreezesActionTerminalAndResultProof(t *testing.T) {
+	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
+	terminalFunction := strings.Index(normalized, "create or replace function reject_action_queue_terminal_mutation()")
+	terminalTrigger := strings.Index(normalized, "create trigger action_queue_00_terminal_immutable_guard")
+	functionStart := strings.Index(normalized, "create or replace function enforce_action_queue_credential_cleanup()")
+	triggerStart := strings.Index(normalized, "create trigger action_queue_credential_cleanup_gate")
+	if terminalFunction < 0 || terminalTrigger <= terminalFunction || functionStart <= terminalTrigger || triggerStart <= functionStart {
+		t.Fatal("action execution proof trigger function boundaries are missing")
+	}
+	terminalGuard := normalized[terminalFunction:terminalTrigger]
+	actionGuard := normalized[functionStart:triggerStart]
+	for _, fragment := range []string{
+		"old is distinct from new",
+		"constraint = 'action_queue_terminal_immutable_guard'",
+	} {
+		if !strings.Contains(terminalGuard, fragment) {
+			t.Errorf("action terminal guard missing %q", fragment)
+		}
+	}
+	for _, fragment := range []string{
+		"old.status in ('finalizing', 'uncertain', 'succeeded', 'failed', 'cancelled')",
+		"old.result_hash is distinct from new.result_hash",
+		"old.completion_status is distinct from new.completion_status",
+		"constraint = 'action_queue_result_proof_guard'",
+	} {
+		if !strings.Contains(actionGuard, fragment) {
+			t.Errorf("action terminal/result proof guard missing %q", fragment)
+		}
+	}
+}
+
+func TestCredentialRevocationMigrationRejectsActionQueueRemoval(t *testing.T) {
+	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
+	for _, fragment := range []string{
+		"create or replace function reject_action_queue_removal()",
+		"constraint = 'action_queue_history_immutable_guard'",
+		"create trigger action_queue_no_delete before delete on action_queue for each row execute function reject_action_queue_removal()",
+		"create trigger action_queue_no_truncate before truncate on action_queue for each statement execute function reject_action_queue_removal()",
+	} {
+		if !strings.Contains(normalized, fragment) {
+			t.Errorf("action queue removal guard missing %q", fragment)
+		}
+	}
+
+	down := normalizeMigration(readMigration(t, "000008_credential_revocations.down.sql"))
+	for _, fragment := range []string{
+		"drop trigger action_queue_no_truncate on action_queue",
+		"drop trigger action_queue_no_delete on action_queue",
+		"drop function reject_action_queue_removal()",
+	} {
+		if !strings.Contains(down, fragment) {
+			t.Errorf("down migration missing action queue removal guard rollback %q", fragment)
+		}
+	}
+}
+
+func TestCredentialRevocationMigrationRequiresExactActionCompletionProof(t *testing.T) {
+	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
+	functionStart := strings.Index(normalized, "create or replace function enforce_action_queue_credential_cleanup()")
+	triggerStart := strings.Index(normalized, "create trigger action_queue_credential_cleanup_gate")
+	if functionStart < 0 || triggerStart <= functionStart {
+		t.Fatal("action execution proof trigger function boundaries are missing")
+	}
+	actionGuard := normalized[functionStart:triggerStart]
+	for _, fragment := range []string{
+		"old.status = 'leased' and new.status = 'failed'",
+		"new.completion_status is distinct from 'failed'",
+		"constraint = 'action_queue_rejection_proof_guard'",
+		"old.status = 'finalizing' and new.status in ('succeeded', 'failed', 'uncertain')",
+		"new.status is distinct from old.completion_status",
+		"from runner_result_receipts as receipt",
+		"receipt.action_id = new.action_id",
+		"receipt.tenant_id = new.runner_tenant_id",
+		"receipt.workspace_id = new.runner_workspace_id",
+		"receipt.environment_id = new.runner_environment_id",
+		"receipt.runner_id = new.runner_id",
+		"receipt.lease_epoch = new.lease_epoch",
+		"receipt.scope_revision = new.scope_revision",
+		"receipt.receipt_hash = new.result_hash",
+		"receipt.completion_status = new.completion_status",
+		"receipt.schema_version = 'runner-result.v1'",
+		"constraint = 'action_queue_result_receipt_guard'",
+		"old.status = 'uncertain' and new.status in ('succeeded', 'failed')",
+		"new.reconciliation_id is null",
+		"new.reconciliation_actor is null",
+		"new.reconciliation_result_hash is null",
+		"new.reconciled_at is null",
+		"constraint = 'action_queue_reconciliation_proof_guard'",
+	} {
+		if !strings.Contains(actionGuard, fragment) {
+			t.Errorf("action completion proof guard missing %q", fragment)
+		}
+	}
+}
+
+func TestCredentialRevocationMigrationDefersFinalizingReceiptProofUntilCommit(t *testing.T) {
+	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
+	for _, fragment := range []string{
+		"create or replace function validate_action_queue_finalizing_receipt()",
+		"from runner_result_receipts as receipt",
+		"receipt.action_id = new.action_id",
+		"receipt.tenant_id = new.runner_tenant_id",
+		"receipt.workspace_id = new.runner_workspace_id",
+		"receipt.environment_id = new.runner_environment_id",
+		"receipt.runner_id = new.runner_id",
+		"receipt.lease_epoch = new.lease_epoch",
+		"receipt.scope_revision = new.scope_revision",
+		"receipt.receipt_hash = new.result_hash",
+		"receipt.completion_status = new.completion_status",
+		"receipt.schema_version = 'runner-result.v1'",
+		"constraint = 'action_queue_finalizing_receipt_shape'",
+		"create constraint trigger action_queue_finalizing_receipt_shape after insert or update on action_queue deferrable initially deferred for each row when (new.status = 'finalizing')",
+	} {
+		if !strings.Contains(normalized, fragment) {
+			t.Errorf("deferred FINALIZING receipt proof missing %q", fragment)
+		}
+	}
+
+	down := normalizeMigration(readMigration(t, "000008_credential_revocations.down.sql"))
+	for _, fragment := range []string{
+		"drop trigger action_queue_finalizing_receipt_shape on action_queue",
+		"drop function validate_action_queue_finalizing_receipt()",
+	} {
+		if !strings.Contains(down, fragment) {
+			t.Errorf("down migration missing FINALIZING receipt proof rollback %q", fragment)
+		}
+	}
+}
+
+func TestCredentialRevocationMigrationRejectsPreexistingFinalizingWithoutExactReceipt(t *testing.T) {
+	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
+	for _, fragment := range []string{
+		"lock table action_queue, execution_leases in access exclusive mode",
+		"from action_queue as finalizing where finalizing.status = 'finalizing' and not exists",
+		"receipt.action_id = finalizing.action_id",
+		"receipt.tenant_id = finalizing.runner_tenant_id",
+		"receipt.workspace_id = finalizing.runner_workspace_id",
+		"receipt.environment_id = finalizing.runner_environment_id",
+		"receipt.runner_id = finalizing.runner_id",
+		"receipt.lease_epoch = finalizing.lease_epoch",
+		"receipt.scope_revision = finalizing.scope_revision",
+		"receipt.receipt_hash = finalizing.result_hash",
+		"receipt.completion_status = finalizing.completion_status",
+		"receipt.schema_version = 'runner-result.v1'",
+		"message = 'unsafe credential revocation upgrade: finalizing actions require exact runner result receipts'",
+		"constraint = 'action_queue_finalizing_receipt_shape'",
+	} {
+		if !strings.Contains(normalized, fragment) {
+			t.Errorf("FINALIZING upgrade preflight missing %q", fragment)
+		}
+	}
+}
+
+func TestCredentialRevocationMigrationsDrainBothWriteLeaseStores(t *testing.T) {
+	for _, test := range []struct {
+		name                string
+		actionStates        string
+		executionLeaseState string
+	}{
+		{
+			name:                "000008_credential_revocations.up.sql",
+			actionStates:        "from action_queue where runner_pool = 'write' and status in ('leased', 'running', 'finalizing', 'uncertain')",
+			executionLeaseState: "from execution_leases where runner_pool = 'write' and status in ('leased', 'running', 'uncertain')",
+		},
+		{
+			name:                "000008_credential_revocations.down.sql",
+			actionStates:        "from action_queue where runner_pool = 'write' and status in ('leased', 'running', 'finalizing', 'uncertain')",
+			executionLeaseState: "from execution_leases where runner_pool = 'write' and status in ('leased', 'running', 'uncertain')",
+		},
+	} {
+		normalized := normalizeMigration(readMigration(t, test.name))
+		if !strings.Contains(normalized, test.actionStates) {
+			t.Errorf("%s does not drain active WRITE action_queue states", test.name)
+		}
+		if !strings.Contains(normalized, test.executionLeaseState) {
+			t.Errorf("%s does not drain active WRITE execution_leases states", test.name)
+		}
+	}
+}
+
 func TestCredentialRevocationMigrationMakesAADIdentityImmutable(t *testing.T) {
 	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
 	if !strings.Contains(normalized, "old.revocation_id is distinct from new.revocation_id") {
@@ -238,7 +675,7 @@ func TestCredentialRevocationDownMigrationGuardsUnsafeOrUndeliveredState(t *test
 	normalized := normalizeMigration(down)
 	required := []string{
 		"begin;",
-		"lock table action_queue, credential_revocations, credential_revocation_confirmations, audit_records, outbox_events in access exclusive mode",
+		"lock table action_queue, execution_leases, credential_revocations, credential_revocation_confirmations, audit_records, outbox_events in access exclusive mode",
 		"status not in ('revoked', 'no_credential')",
 		"accessor_ciphertext is not null",
 		"encryption_key_id is not null",
@@ -257,6 +694,43 @@ func TestCredentialRevocationDownMigrationGuardsUnsafeOrUndeliveredState(t *test
 	}
 	if !strings.Contains(strings.ToLower(down), "only revoked/no_credential rows without evidence and with fully delivered outbox events are safe to discard") {
 		t.Fatal("down migration does not document the narrow terminal-state discard rule")
+	}
+}
+
+func TestCredentialRevocationDownMigrationRemovesMarkerDefensesInSafeOrder(t *testing.T) {
+	down := normalizeMigration(readMigration(t, "000008_credential_revocations.down.sql"))
+	for _, fragment := range []string{
+		"lock table action_queue, execution_leases, credential_revocations, credential_revocation_confirmations, audit_records, outbox_events in access exclusive mode",
+		"drop trigger action_queue_finalizing_receipt_shape on action_queue",
+		"drop function validate_action_queue_finalizing_receipt()",
+		"drop trigger action_queue_submission_identity_guard on action_queue",
+		"drop function reject_action_queue_submission_identity_mutation()",
+		"drop trigger action_queue_credential_cleanup_gate on action_queue",
+		"drop function enforce_action_queue_credential_cleanup()",
+		"drop trigger credential_revocations_action_marker_shape on credential_revocations",
+		"drop function validate_credential_revocation_action_marker()",
+		"drop constraint action_queue_credential_marker_shape_ck",
+		"drop constraint action_queue_no_active_production_write_ck",
+		"drop column credential_lease_epoch",
+		"drop column credential_expected",
+		"drop constraint execution_leases_no_active_production_write_ck",
+	} {
+		if !strings.Contains(down, fragment) {
+			t.Errorf("down migration missing marker rollback step %q", fragment)
+		}
+	}
+
+	receiptTrigger := strings.Index(down, "drop trigger action_queue_finalizing_receipt_shape on action_queue")
+	identityTrigger := strings.Index(down, "drop trigger action_queue_submission_identity_guard on action_queue")
+	actionTrigger := strings.Index(down, "drop trigger action_queue_credential_cleanup_gate on action_queue")
+	markerTrigger := strings.Index(down, "drop trigger credential_revocations_action_marker_shape on credential_revocations")
+	revocationTable := strings.Index(down, "drop table credential_revocations")
+	markerColumn := strings.Index(down, "drop column credential_expected")
+	legacyConstraint := strings.Index(down, "drop constraint execution_leases_no_active_production_write_ck")
+	if receiptTrigger < 0 || identityTrigger < 0 || actionTrigger < 0 || markerTrigger < 0 || revocationTable < 0 ||
+		markerColumn < 0 || legacyConstraint < 0 || receiptTrigger > revocationTable || identityTrigger > revocationTable ||
+		actionTrigger > revocationTable || markerTrigger > revocationTable || revocationTable > markerColumn || markerColumn > legacyConstraint {
+		t.Fatal("down migration removes credential marker defenses in an unsafe order")
 	}
 }
 

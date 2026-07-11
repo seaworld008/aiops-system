@@ -54,6 +54,7 @@ type MemoryRepository struct {
 }
 
 var _ Repository = (*MemoryRepository)(nil)
+var _ CleanupInspector = (*MemoryRepository)(nil)
 
 func NewMemoryRepository(actions ActionFenceSource, protector ReferenceProtector, options MemoryRepositoryOptions) (*MemoryRepository, error) {
 	if actions == nil || protector == nil {
@@ -93,6 +94,9 @@ func (repository *MemoryRepository) Prepare(ctx context.Context, request Prepare
 	metadata, err := repository.resolvePrepareAction(ctx, request.Fence, now)
 	if err != nil {
 		return PrepareResult{}, err
+	}
+	if metadata.Production {
+		return PrepareResult{}, ErrInvalidRevocationRequest
 	}
 	if request.CredentialExpiresAt.After(metadata.AuthorizationExpiresAt) {
 		return PrepareResult{}, ErrInvalidRevocationRequest
@@ -818,6 +822,29 @@ func (repository *MemoryRepository) Get(ctx context.Context, revocationID string
 		return Revocation{}, ErrRevocationNotFound
 	}
 	return publicMemoryRevocation(record), nil
+}
+
+func (repository *MemoryRepository) InspectCleanup(ctx context.Context, actionID string, epoch int64) (bool, bool, error) {
+	if err := contextError(ctx); err != nil {
+		return false, false, err
+	}
+	if !ValidIdentifier(actionID, 256) || epoch <= 0 {
+		return false, false, ErrInvalidRevocationRequest
+	}
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	if err := contextError(ctx); err != nil {
+		return false, false, err
+	}
+	revocationID, present := repository.actionEpochs[actionEpochKey(actionID, epoch)]
+	if !present {
+		return false, false, nil
+	}
+	record := repository.records[revocationID]
+	if record == nil {
+		return false, false, fmt.Errorf("inspect credential cleanup: %w", ErrRevocationPersistence)
+	}
+	return true, record.revocation.Terminal(), nil
 }
 
 func (repository *MemoryRepository) List(ctx context.Context, filter ListFilter) ([]Revocation, error) {

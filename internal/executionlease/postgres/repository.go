@@ -121,8 +121,9 @@ func (repository *Repository) Claim(ctx context.Context, request executionlease.
 
 	var executionID string
 	var leaseEpoch int64
+	var production bool
 	err = tx.QueryRow(ctx, `
-		SELECT candidate.execution_id, candidate.lease_epoch
+		SELECT candidate.execution_id, candidate.lease_epoch, candidate.production
 		FROM execution_leases AS candidate
 		WHERE candidate.runner_pool = $1
 		  AND candidate.status = 'QUEUED'
@@ -133,22 +134,11 @@ func (repository *Repository) Claim(ctx context.Context, request executionlease.
 			  AND active.target_key = candidate.target_key
 			  AND active.status IN ('LEASED', 'RUNNING', 'UNCERTAIN')
 		  )
-		  AND (
-			candidate.runner_pool <> 'WRITE'
-			OR candidate.production = false
-			OR NOT EXISTS (
-				SELECT 1
-				FROM execution_leases AS active
-				WHERE active.execution_id <> candidate.execution_id
-				  AND active.runner_pool = 'WRITE'
-				  AND active.production = true
-				  AND active.status IN ('LEASED', 'RUNNING', 'UNCERTAIN')
-			)
-		  )
+		  AND (candidate.runner_pool <> 'WRITE' OR candidate.production = false)
 		ORDER BY candidate.created_at, candidate.execution_id
 		FOR UPDATE OF candidate SKIP LOCKED
 		LIMIT 1
-	`, request.Pool).Scan(&executionID, &leaseEpoch)
+	`, request.Pool).Scan(&executionID, &leaseEpoch, &production)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if err := tx.Commit(ctx); err != nil {
 			return executionlease.Execution{}, fmt.Errorf("commit execution expiry transitions: %w", err)
@@ -158,6 +148,9 @@ func (repository *Repository) Claim(ctx context.Context, request executionlease.
 	}
 	if err != nil {
 		return executionlease.Execution{}, fmt.Errorf("select execution claim candidate: %w", err)
+	}
+	if request.Pool == executionlease.PoolWrite && production {
+		return executionlease.Execution{}, executionlease.ErrNoLeaseAvailable
 	}
 	if leaseEpoch == math.MaxInt64 {
 		return executionlease.Execution{}, fmt.Errorf("%w: lease epoch exhausted", executionlease.ErrInvalidTransition)

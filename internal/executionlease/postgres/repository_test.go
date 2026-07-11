@@ -43,6 +43,58 @@ func TestEnqueuePersistsPoolTargetAndProductionIsolation(t *testing.T) {
 	assertExpectations(t, database)
 }
 
+func TestClaimNeverLeasesProductionWriteEvenWhenClaimsAreEnabled(t *testing.T) {
+	database, repository, _ := newPostgresRepository(t)
+	defer database.Close()
+	database.ExpectBegin()
+	expectGlobalSweep(database, 0, 0)
+	database.ExpectQuery("SELECT candidate.execution_id, candidate.lease_epoch").
+		WithArgs(executionlease.PoolWrite).
+		WillReturnRows(pgxmock.NewRows([]string{"execution_id", "lease_epoch", "production"}).
+			AddRow("production-write", int64(0), true))
+	database.ExpectRollback()
+
+	claimed, err := repository.Claim(context.Background(), executionlease.ClaimRequest{
+		Pool: executionlease.PoolWrite, RunnerID: "writer-01",
+		LeaseDuration: time.Minute, ClaimsEnabled: true,
+	})
+	if !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
+		t.Fatalf("Claim(production WRITE) = %+v, %v; want ErrNoLeaseAvailable", claimed, err)
+	}
+	assertExpectations(t, database)
+}
+
+func TestClaimAllowsProductionReadWhenClaimsAreEnabled(t *testing.T) {
+	database, repository, now := newPostgresRepository(t)
+	defer database.Close()
+	database.ExpectBegin()
+	expectGlobalSweep(database, 0, 0)
+	database.ExpectQuery("SELECT candidate.execution_id, candidate.lease_epoch").
+		WithArgs(executionlease.PoolRead).
+		WillReturnRows(pgxmock.NewRows([]string{"execution_id", "lease_epoch", "production"}).
+			AddRow("production-read", int64(0), true))
+	want := executionlease.Execution{
+		ExecutionID: "production-read", TargetKey: "prod/cluster/deployment/api",
+		Pool: executionlease.PoolRead, Production: true, Status: executionlease.StatusLeased,
+		RunnerID: "reader-01", LeaseToken: "lease-token-01", LeaseEpoch: 1,
+		LeaseAcquiredAt: now, LastHeartbeatAt: now, LeaseExpiresAt: now.Add(time.Minute),
+		CreatedAt: now.Add(-time.Minute), UpdatedAt: now,
+	}
+	database.ExpectQuery("UPDATE execution_leases AS execution").
+		WithArgs(want.ExecutionID, want.RunnerID, leaseTokenHash(want.LeaseToken), float64(60)).
+		WillReturnRows(executionRows(want))
+	database.ExpectCommit()
+
+	claimed, err := repository.Claim(context.Background(), executionlease.ClaimRequest{
+		Pool: executionlease.PoolRead, RunnerID: want.RunnerID,
+		LeaseDuration: time.Minute, ClaimsEnabled: true,
+	})
+	if err != nil || claimed != want {
+		t.Fatalf("Claim(production READ) = %+v, %v; want %+v", claimed, err, want)
+	}
+	assertExpectations(t, database)
+}
+
 func TestIdentifiersUseTheExactASCIIGrammarAndByteBounds(t *testing.T) {
 	database, repository, _ := newPostgresRepository(t)
 	defer database.Close()
@@ -61,7 +113,7 @@ func TestIdentifiersUseTheExactASCIIGrammarAndByteBounds(t *testing.T) {
 	assertExpectations(t, database)
 }
 
-func TestClaimSerializesExpiryAndEnforcesPoolTargetAndGlobalWriteGuards(t *testing.T) {
+func TestClaimSerializesExpiryAndEnforcesPoolTargetAndProductionWriteGuards(t *testing.T) {
 	database, repository, now := newPostgresRepository(t)
 	defer database.Close()
 	database.ExpectBegin()
@@ -72,12 +124,12 @@ func TestClaimSerializesExpiryAndEnforcesPoolTargetAndGlobalWriteGuards(t *testi
 		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 	database.ExpectExec("UPDATE execution_leases AS expired_lease").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
-	database.ExpectQuery(`(?s)SELECT candidate\.execution_id, candidate\.lease_epoch.*candidate\.runner_pool = \$1.*active\.target_key = candidate\.target_key.*active\.status IN \('LEASED', 'RUNNING', 'UNCERTAIN'\).*active\.runner_pool = 'WRITE'.*active\.production = true.*FOR UPDATE OF candidate SKIP LOCKED`).
+	database.ExpectQuery(`(?s)SELECT candidate\.execution_id, candidate\.lease_epoch, candidate\.production.*candidate\.runner_pool = \$1.*active\.target_key = candidate\.target_key.*active\.status IN \('LEASED', 'RUNNING', 'UNCERTAIN'\).*candidate\.runner_pool <> 'WRITE' OR candidate\.production = false.*FOR UPDATE OF candidate SKIP LOCKED`).
 		WithArgs(executionlease.PoolWrite).
-		WillReturnRows(pgxmock.NewRows([]string{"execution_id", "lease_epoch"}).AddRow("execution-01", int64(0)))
+		WillReturnRows(pgxmock.NewRows([]string{"execution_id", "lease_epoch", "production"}).AddRow("execution-01", int64(0), false))
 	want := executionlease.Execution{
-		ExecutionID: "execution-01", TargetKey: "prod/cluster/deployment/api",
-		Pool: executionlease.PoolWrite, Production: true, Status: executionlease.StatusLeased,
+		ExecutionID: "execution-01", TargetKey: "nonprod/cluster/deployment/api",
+		Pool: executionlease.PoolWrite, Production: false, Status: executionlease.StatusLeased,
 		RunnerID: "runner-01", LeaseToken: "lease-token-01", LeaseEpoch: 1,
 		LeaseAcquiredAt: now, LastHeartbeatAt: now, LeaseExpiresAt: now.Add(time.Minute),
 		CreatedAt: now.Add(-time.Minute), UpdatedAt: now,
@@ -106,10 +158,10 @@ func TestClaimReclaimsExpiredLeaseWithMonotonicallyHigherEpoch(t *testing.T) {
 	database.ExpectExec("UPDATE execution_leases AS expired_lease").WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	database.ExpectQuery("SELECT candidate.execution_id, candidate.lease_epoch").
 		WithArgs(executionlease.PoolWrite).
-		WillReturnRows(pgxmock.NewRows([]string{"execution_id", "lease_epoch"}).AddRow("execution-01", int64(1)))
+		WillReturnRows(pgxmock.NewRows([]string{"execution_id", "lease_epoch", "production"}).AddRow("execution-01", int64(1), false))
 	want := executionlease.Execution{
-		ExecutionID: "execution-01", TargetKey: "prod/cluster/deployment/api",
-		Pool: executionlease.PoolWrite, Production: true, Status: executionlease.StatusLeased,
+		ExecutionID: "execution-01", TargetKey: "nonprod/cluster/deployment/api",
+		Pool: executionlease.PoolWrite, Production: false, Status: executionlease.StatusLeased,
 		RunnerID: "runner-new", LeaseToken: "lease-token-01", LeaseEpoch: 2,
 		LeaseAcquiredAt: now, LastHeartbeatAt: now, LeaseExpiresAt: now.Add(time.Minute),
 		CreatedAt: now.Add(-2 * time.Minute), UpdatedAt: now,

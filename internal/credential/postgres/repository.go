@@ -55,6 +55,7 @@ type Repository struct {
 }
 
 var _ credential.Repository = (*Repository)(nil)
+var _ credential.CleanupInspector = (*Repository)(nil)
 
 type storedRevocation struct {
 	revocation                credential.Revocation
@@ -123,6 +124,9 @@ func (repository *Repository) Prepare(ctx context.Context, request credential.Pr
 	if err != nil {
 		return credential.PrepareResult{}, err
 	}
+	if metadata.Production {
+		return credential.PrepareResult{}, credential.ErrInvalidRevocationRequest
+	}
 	tokenDigest := credential.SHA256Hex([]byte(request.Fence.Token))
 	finishExisting := func(existing *storedRevocation) (credential.PrepareResult, error) {
 		if !samePrepare(existing, request, metadata, tokenDigest) {
@@ -140,6 +144,9 @@ func (repository *Repository) Prepare(ctx context.Context, request credential.Pr
 			if candidateOccupied {
 				return credential.PrepareResult{}, credential.ErrIdempotencyConflict
 			}
+		}
+		if err := markActionCredentialExpected(ctx, tx, metadata, tokenDigest); err != nil {
+			return credential.PrepareResult{}, err
 		}
 		if err := revalidatePrepareFence(ctx, tx, request, metadata); err != nil {
 			return credential.PrepareResult{}, err
@@ -214,6 +221,9 @@ func (repository *Repository) Prepare(ctx context.Context, request credential.Pr
 		Status: credential.RevocationStatus(status), AvailableAt: availableAt.UTC(), CreatedAt: createdAt.UTC(),
 		UpdatedAt: updatedAt.UTC(), Version: version,
 	}, actionTokenSHA256: tokenDigest, childCreatePermitSHA256: permitDigest}
+	if err := markActionCredentialExpected(ctx, tx, metadata, tokenDigest); err != nil {
+		return credential.PrepareResult{}, err
+	}
 	if err := writeStateChange(ctx, tx, record.revocation, "RUNNER", request.Fence.RunnerID,
 		"credential.revocation.prepared", "credential.revocation.prepared.v1"); err != nil {
 		return credential.PrepareResult{}, err
@@ -232,6 +242,43 @@ func (repository *Repository) Prepare(ctx context.Context, request credential.Pr
 		Revocation: publicRevocation(record), Created: true,
 		Permit: &credential.ChildCreatePermit{RevocationID: request.RevocationID, Token: permitToken},
 	}, nil
+}
+
+func markActionCredentialExpected(
+	ctx context.Context,
+	tx pgx.Tx,
+	metadata credential.ActionMetadata,
+	tokenDigest string,
+) error {
+	result, err := tx.Exec(ctx, `
+		UPDATE action_queue
+		SET credential_expected = true,
+			credential_lease_epoch = $8,
+			updated_at = statement_timestamp()
+		WHERE action_id = $1
+		  AND runner_tenant_id = $2::uuid
+		  AND runner_workspace_id = $3::uuid
+		  AND runner_environment_id = $4::uuid
+		  AND target_key = $5
+		  AND production = $6
+		  AND runner_id = $7
+		  AND lease_epoch = $8
+		  AND lease_token_sha256 = $9
+		  AND runner_pool = 'WRITE'
+		  AND status IN ('LEASED', 'RUNNING')
+		  AND (
+			(credential_expected = false AND credential_lease_epoch IS NULL) OR
+			(credential_expected = true AND credential_lease_epoch = $8)
+		  )
+	`, metadata.ActionID, metadata.TenantID, metadata.WorkspaceID, metadata.EnvironmentID,
+		metadata.TargetKey, metadata.Production, metadata.RunnerID, metadata.LeaseEpoch, tokenDigest)
+	if err != nil {
+		return databaseError("mark action credential expected", err)
+	}
+	if result.RowsAffected() != 1 {
+		return credential.ErrStaleActionFence
+	}
+	return nil
 }
 
 func (repository *Repository) AuthorizeChildCreate(
@@ -333,7 +380,7 @@ func (repository *Repository) AuthorizeChildCreate(
 }
 
 func resolveActionFence(ctx context.Context, tx pgx.Tx, fence credential.ActionFence, credentialExpiry time.Time) (credential.ActionMetadata, error) {
-	return resolveActionFenceWithWindow(ctx, tx, fence, credentialExpiry, 0)
+	return resolveActionFenceWithWindow(ctx, tx, fence, credentialExpiry, 0, false)
 }
 
 func resolveChildCreateActionFence(
@@ -416,7 +463,7 @@ func exactRunnerScopeBinding(
 }
 
 func resolvePrepareActionFence(ctx context.Context, tx pgx.Tx, fence credential.ActionFence, credentialExpiry time.Time) (credential.ActionMetadata, error) {
-	return resolveActionFenceWithWindow(ctx, tx, fence, credentialExpiry, credential.MinPrepareFenceWindow)
+	return resolveActionFenceWithWindow(ctx, tx, fence, credentialExpiry, credential.MinPrepareFenceWindow, true)
 }
 
 func resolveActionFenceWithWindow(
@@ -425,6 +472,7 @@ func resolveActionFenceWithWindow(
 	fence credential.ActionFence,
 	credentialExpiry time.Time,
 	minimumWindow time.Duration,
+	lockForUpdate bool,
 ) (credential.ActionMetadata, error) {
 	query := `
 		SELECT action_id, runner_tenant_id::text, runner_workspace_id::text, runner_environment_id::text,
@@ -440,7 +488,11 @@ func resolveActionFenceWithWindow(
 		  AND authorization_expires_at > statement_timestamp()
 	`
 	args := []any{fence.ActionID, fence.RunnerID, fence.Epoch, credential.SHA256Hex([]byte(fence.Token))}
-	query += ` FOR SHARE`
+	if lockForUpdate {
+		query += ` FOR UPDATE`
+	} else {
+		query += ` FOR SHARE`
+	}
 	var metadata credential.ActionMetadata
 	var status string
 	var databaseNow time.Time
@@ -1818,6 +1870,28 @@ func (repository *Repository) Get(ctx context.Context, revocationID string) (cre
 		return credential.Revocation{}, databaseError("get credential revocation", err)
 	}
 	return publicRevocation(record), nil
+}
+
+func (repository *Repository) InspectCleanup(ctx context.Context, actionID string, epoch int64) (bool, bool, error) {
+	if err := validateContext(ctx); err != nil {
+		return false, false, err
+	}
+	if !credential.ValidIdentifier(actionID, 256) || epoch <= 0 {
+		return false, false, credential.ErrInvalidRevocationRequest
+	}
+	var status credential.RevocationStatus
+	err := repository.database.QueryRow(ctx, `
+		SELECT status
+		FROM credential_revocations
+		WHERE action_id = $1 AND action_lease_epoch = $2
+	`, actionID, epoch).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, databaseError("inspect credential cleanup", err)
+	}
+	return true, status == credential.StatusRevoked || status == credential.StatusNoCredential, nil
 }
 
 func (repository *Repository) List(ctx context.Context, filter credential.ListFilter) ([]credential.Revocation, error) {

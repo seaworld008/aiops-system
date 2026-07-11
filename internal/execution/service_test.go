@@ -24,6 +24,7 @@ func TestSubmitDerivesWriteScopeProductionAndTargetOnlyFromVerifiedEnvelope(t *t
 	fixture := newRunnerFixture(t, now, envelope, keys, ExecutorResult{
 		Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed, Changed: true,
 	})
+	fixture.environment.snapshots = []EnvironmentSnapshot{validEnvironment(envelope, now)}
 
 	queued, err := fixture.service.Submit(context.Background(), envelope)
 	if err != nil {
@@ -45,6 +46,146 @@ func TestSubmitDerivesWriteScopeProductionAndTargetOnlyFromVerifiedEnvelope(t *t
 	}
 	if stored.TargetKey != wantTarget {
 		t.Fatalf("TargetKey = %q, want %q", stored.TargetKey, wantTarget)
+	}
+}
+
+func TestRunNextHardDisablesProductionWriteBeforeCredentialPolicyStartOrExecutor(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	envelope, keys := signedEnvelope(t, restartEnvelope(now))
+	fixture := newRunnerFixture(t, now, envelope, keys, ExecutorResult{
+		Outcome: ExecutorSucceeded, Code: "MUST_NOT_RUN", Verification: VerificationPassed, Changed: true,
+	})
+	fixture.environment.snapshots = []EnvironmentSnapshot{validEnvironment(envelope, now)}
+	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
+		t.Fatalf("Submit(production WRITE) error = %v", err)
+	}
+	fixture.events.reset()
+
+	result, err := fixture.service.RunNext(context.Background())
+	if !errors.Is(err, executionlease.ErrNoLeaseAvailable) {
+		t.Fatalf("RunNext(production WRITE) = %#v, %v; want %v", result, err, executionlease.ErrNoLeaseAvailable)
+	}
+	if result != (executionlease.Execution{}) {
+		t.Fatalf("RunNext(production WRITE) result = %#v, want zero execution", result)
+	}
+	if got, want := fixture.events.snapshot(), []string{"safety:claim", "lease:claim"}; !equalStrings(got, want) {
+		t.Fatalf("production WRITE boundary events = %v, want %v", got, want)
+	}
+	if fixture.environment.calls != 1 || fixture.issuer.revokeCalls != 0 || len(fixture.executors.calls) != 0 {
+		t.Fatalf("production WRITE reached a post-claim dependency: environment calls=%d revoke calls=%d executor calls=%v",
+			fixture.environment.calls, fixture.issuer.revokeCalls, fixture.executors.calls)
+	}
+	queued, getErr := fixture.leases.Get(context.Background(), envelope.ActionID)
+	if getErr != nil || queued.Status != executionlease.StatusQueued || !queued.Production {
+		t.Fatalf("Get(production WRITE after denied claim) = %#v, %v; want retained production QUEUED action", queued, getErr)
+	}
+}
+
+func TestRunNextRetainsAnUnexpectedProductionWriteClaimBeforeTrustEvaluation(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	envelope, _ := signedEnvelope(t, restartEnvelope(now))
+	targetKey, err := deriveTargetKey(envelope)
+	if err != nil {
+		t.Fatalf("deriveTargetKey() error = %v", err)
+	}
+	const leaseToken = "must-never-leave-the-queue-boundary"
+	claimed := ClaimedAction{
+		Execution: executionlease.Execution{
+			ExecutionID: envelope.ActionID, TargetKey: targetKey, Pool: executionlease.PoolWrite, Production: true,
+			Status: executionlease.StatusLeased, RunnerID: "runner-1", RunnerTenantID: "tenant-test",
+			RunnerWorkspaceID: envelope.WorkspaceID, RunnerEnvironmentID: envelope.Target.EnvironmentID,
+			ScopeRevision: 1, LeaseToken: leaseToken, LeaseEpoch: 7, LeaseExpiresAt: now.Add(time.Minute),
+		},
+		Envelope: envelope, PlanHash: envelope.PlanHash, TargetKey: targetKey,
+		EnvironmentRevision: "environment-1", Production: true,
+	}
+	fixture := newForcedClaimFixture(t, now, claimed)
+
+	result, runErr := fixture.service.RunNext(context.Background())
+	if runErr != ErrJobConflict {
+		t.Fatalf("RunNext(unexpected production WRITE claim) error = %v, want exact %v", runErr, ErrJobConflict)
+	}
+	if strings.Contains(runErr.Error(), leaseToken) || result.LeaseToken != "" {
+		t.Fatalf("production WRITE denial exposed its lease token: result=%#v error=%v", result, runErr)
+	}
+	if result.ExecutionID != envelope.ActionID || result.Status != executionlease.StatusLeased {
+		t.Fatalf("RunNext() result = %#v, want the redacted retained lease", result)
+	}
+	if fixture.queue.claimCalls != 1 || len(fixture.queue.mutations) != 0 || fixture.queue.claimed.Execution.LeaseToken != leaseToken {
+		t.Fatalf("unexpected queue handling: claims=%d mutations=%v retained token=%q",
+			fixture.queue.claimCalls, fixture.queue.mutations, fixture.queue.claimed.Execution.LeaseToken)
+	}
+	if fixture.keys.calls != 0 || fixture.environment.calls != 0 || fixture.credentials.issueCalls != 0 || fixture.credentials.revokeCalls != 0 ||
+		len(fixture.policyEvents.snapshot()) != 0 || len(fixture.executors.calls) != 0 {
+		t.Fatalf("production WRITE claim crossed the trust boundary: keys=%d environment=%d credential issue/revoke=%d/%d policy=%v executors=%v",
+			fixture.keys.calls, fixture.environment.calls, fixture.credentials.issueCalls, fixture.credentials.revokeCalls,
+			fixture.policyEvents.snapshot(), fixture.executors.calls)
+	}
+}
+
+func TestRunNextRetainsClaimMetadataAnomaliesBeforeTrustEvaluation(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
+	envelope, _ := signedEnvelope(t, restartEnvelope(now))
+	targetKey, err := deriveTargetKey(envelope)
+	if err != nil {
+		t.Fatalf("deriveTargetKey() error = %v", err)
+	}
+	baseClaim := ClaimedAction{
+		Execution: executionlease.Execution{
+			ExecutionID: envelope.ActionID, TargetKey: targetKey, Pool: executionlease.PoolWrite,
+			Status: executionlease.StatusLeased, RunnerID: "runner-1", LeaseToken: "metadata-anomaly-token",
+			LeaseEpoch: 8, LeaseExpiresAt: now.Add(time.Minute),
+		},
+		Envelope: envelope, PlanHash: envelope.PlanHash, TargetKey: targetKey,
+		EnvironmentRevision: "environment-1",
+	}
+	tests := map[string]func(*ClaimedAction){
+		"unexpected READ pool": func(claimed *ClaimedAction) {
+			claimed.Execution.Pool = executionlease.PoolRead
+		},
+		"production raised only on execution": func(claimed *ClaimedAction) {
+			claimed.Execution.Production = true
+		},
+		"production raised only on claimed metadata": func(claimed *ClaimedAction) {
+			claimed.Production = true
+		},
+		"execution id differs from envelope": func(claimed *ClaimedAction) {
+			claimed.Execution.ExecutionID = "another-action"
+		},
+		"target key differs from execution": func(claimed *ClaimedAction) {
+			claimed.TargetKey = "kubernetes-deployment:sha256:" + strings.Repeat("f", 64)
+		},
+		"plan hash differs from envelope": func(claimed *ClaimedAction) {
+			claimed.PlanHash = strings.Repeat("f", 64)
+		},
+	}
+	for name, mutate := range tests {
+		name, mutate := name, mutate
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			claimed := baseClaim
+			mutate(&claimed)
+			fixture := newForcedClaimFixture(t, now, claimed)
+
+			result, runErr := fixture.service.RunNext(context.Background())
+			if runErr != ErrJobConflict || strings.Contains(runErr.Error(), claimed.Execution.LeaseToken) ||
+				result.LeaseToken != "" || result.Status != executionlease.StatusLeased {
+				t.Fatalf("RunNext(metadata anomaly) = %#v, %v; want redacted retained lease and exact %v", result, runErr, ErrJobConflict)
+			}
+			if fixture.queue.claimCalls != 1 || len(fixture.queue.mutations) != 0 ||
+				fixture.keys.calls != 0 || fixture.environment.calls != 0 || fixture.credentials.issueCalls != 0 ||
+				len(fixture.policyEvents.snapshot()) != 0 || len(fixture.executors.calls) != 0 {
+				t.Fatalf("metadata anomaly crossed the trust boundary: claims=%d mutations=%v keys=%d environment=%d credentials=%d policy=%v executors=%v",
+					fixture.queue.claimCalls, fixture.queue.mutations, fixture.keys.calls, fixture.environment.calls,
+					fixture.credentials.issueCalls, fixture.policyEvents.snapshot(), fixture.executors.calls)
+			}
+		})
 	}
 }
 
@@ -359,17 +500,17 @@ func TestRunNextRejectsEnvironmentDriftOrExpiryBeforeCredentialOrSideEffect(t *t
 		status   executionlease.Status
 	}{
 		"revision drift": {snapshot: func() EnvironmentSnapshot {
-			snapshot := validEnvironment(envelope, now)
+			snapshot := nonProductionEnvironment(envelope, now)
 			snapshot.Revision = "environment-2"
 			return snapshot
 		}(), wantErr: ErrEnvironmentDrift, status: executionlease.StatusFailed},
 		"production classification drift": {snapshot: func() EnvironmentSnapshot {
-			snapshot := validEnvironment(envelope, now)
-			snapshot.Production = false
+			snapshot := nonProductionEnvironment(envelope, now)
+			snapshot.Production = true
 			return snapshot
 		}(), wantErr: ErrEnvironmentDrift, status: executionlease.StatusFailed},
 		"snapshot expired": {snapshot: func() EnvironmentSnapshot {
-			snapshot := validEnvironment(envelope, now)
+			snapshot := nonProductionEnvironment(envelope, now)
 			snapshot.ObservedAt = now.Add(-MaxEnvironmentSnapshotAge - time.Second)
 			return snapshot
 		}(), wantErr: ErrEnvironmentUnavailable, status: executionlease.StatusQueued},
@@ -380,7 +521,7 @@ func TestRunNextRejectsEnvironmentDriftOrExpiryBeforeCredentialOrSideEffect(t *t
 			fixture := newRunnerFixture(t, now, envelope, keys, ExecutorResult{
 				Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed, Changed: true,
 			})
-			fixture.environment.snapshots = []EnvironmentSnapshot{validEnvironment(envelope, now), test.snapshot}
+			fixture.environment.snapshots = []EnvironmentSnapshot{nonProductionEnvironment(envelope, now), test.snapshot}
 			if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
 				t.Fatalf("Submit() error = %v", err)
 			}
@@ -410,11 +551,10 @@ func TestRunNextRechecksEnvironmentImmediatelyBeforeStart(t *testing.T) {
 	fixture := newRunnerFixture(t, now, envelope, keys, ExecutorResult{
 		Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed, Changed: true,
 	})
-	changed := validEnvironment(envelope, now)
+	changed := nonProductionEnvironment(envelope, now)
 	changed.Revision = "environment-2"
-	changed.Production = false
 	fixture.environment.snapshots = []EnvironmentSnapshot{
-		validEnvironment(envelope, now), validEnvironment(envelope, now), changed,
+		nonProductionEnvironment(envelope, now), nonProductionEnvironment(envelope, now), changed,
 	}
 	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
 		t.Fatalf("Submit() error = %v", err)
@@ -475,7 +615,7 @@ func TestRunNextPermanentlyRejectsDeterministicCredentialPolicyDenial(t *testing
 	queue := mustMemoryActionQueue(t, func() time.Time { return now })
 	service := mustService(t, Dependencies{
 		Queue: queue, Keys: keys,
-		Environments: &fakeEnvironmentResolver{snapshots: []EnvironmentSnapshot{validEnvironment(envelope, now)}},
+		Environments: &fakeEnvironmentResolver{snapshots: []EnvironmentSnapshot{nonProductionEnvironment(envelope, now)}},
 		Safety:       &fakeSafetyGate{snapshots: []ClaimSafetySnapshot{validSafety(now)}},
 		Credentials:  &fakeCredentialBroker{err: credential.ErrCredentialDenied},
 		Policy:       &fakePreExecutionGate{}, Executors: noOpExecutors(),
@@ -969,6 +1109,39 @@ func assertTargetKeysDiffer(t *testing.T, firstEnvelope, secondEnvelope action.E
 	}
 }
 
+type forcedClaimFixture struct {
+	service      *Service
+	queue        *forcedClaimActionQueue
+	keys         *countingKeyResolver
+	environment  *fakeEnvironmentResolver
+	credentials  *countingCredentialBroker
+	policyEvents *eventLog
+	executors    *recordingExecutors
+}
+
+func newForcedClaimFixture(t *testing.T, now time.Time, claimed ClaimedAction) *forcedClaimFixture {
+	t.Helper()
+	queue := &forcedClaimActionQueue{claimed: claimed}
+	keys := &countingKeyResolver{}
+	environment := &fakeEnvironmentResolver{snapshots: []EnvironmentSnapshot{validEnvironment(claimed.Envelope, now)}}
+	credentials := &countingCredentialBroker{}
+	policyEvents := &eventLog{}
+	executors := &recordingExecutors{result: ExecutorResult{
+		Outcome: ExecutorSucceeded, Code: "MUST_NOT_RUN", Verification: VerificationPassed,
+	}}
+	service := mustService(t, Dependencies{
+		Queue: queue, Keys: keys, Environments: environment,
+		Safety:      &fakeSafetyGate{snapshots: []ClaimSafetySnapshot{validSafety(now)}},
+		Credentials: credentials,
+		Policy:      &fakePreExecutionGate{events: policyEvents},
+		Executors:   executors.asDependencies(),
+	}, Options{RunnerID: "runner-1", LeaseDuration: time.Minute, FinalizeTimeout: time.Second, Clock: func() time.Time { return now }})
+	return &forcedClaimFixture{
+		service: service, queue: queue, keys: keys, environment: environment,
+		credentials: credentials, policyEvents: policyEvents, executors: executors,
+	}
+}
+
 type runnerFixture struct {
 	service        *Service
 	leases         *recordingActionQueue
@@ -991,7 +1164,7 @@ func newRunnerFixtureWithClock(t *testing.T, clock func() time.Time, envelope ac
 	events := &eventLog{}
 	memoryQueue := mustMemoryActionQueue(t, clock)
 	leases := &recordingActionQueue{ActionQueue: memoryQueue, memory: memoryQueue, events: events}
-	environment := &fakeEnvironmentResolver{snapshots: []EnvironmentSnapshot{validEnvironment(envelope, clock()), validEnvironment(envelope, clock())}, events: events}
+	environment := &fakeEnvironmentResolver{snapshots: []EnvironmentSnapshot{nonProductionEnvironment(envelope, clock()), nonProductionEnvironment(envelope, clock())}, events: events}
 	safety := &fakeSafetyGate{snapshots: []ClaimSafetySnapshot{validSafety(clock()), validStartSafety(envelope, clock())}, events: events}
 	credentialGate := &fakeCredentialPolicyGate{decision: credentialDecision(envelope, clock()), events: events}
 	issuer := &fakeDynamicIssuer{expiresAt: clock().Add(5 * time.Minute), events: events}
@@ -1110,6 +1283,33 @@ type recordingActionQueue struct {
 	completeErr       error
 	finalizeErr       error
 	heartbeatObserved chan<- struct{}
+}
+
+type forcedClaimActionQueue struct {
+	ActionQueue
+	claimed    ClaimedAction
+	claimCalls int
+	mutations  []string
+}
+
+func (queue *forcedClaimActionQueue) Claim(context.Context, ActionClaimRequest) (ClaimedAction, error) {
+	queue.claimCalls++
+	return queue.claimed, nil
+}
+
+func (queue *forcedClaimActionQueue) Start(context.Context, executionlease.LeaseIdentity) (executionlease.Execution, error) {
+	queue.mutations = append(queue.mutations, "start")
+	return executionlease.Execution{}, errors.New("unexpected Start call")
+}
+
+func (queue *forcedClaimActionQueue) Reject(context.Context, ActionRejectRequest) (executionlease.Execution, error) {
+	queue.mutations = append(queue.mutations, "reject")
+	return executionlease.Execution{}, errors.New("unexpected Reject call")
+}
+
+func (queue *forcedClaimActionQueue) Nack(context.Context, ActionNackRequest) (executionlease.Execution, error) {
+	queue.mutations = append(queue.mutations, "nack")
+	return executionlease.Execution{}, errors.New("unexpected Nack call")
 }
 
 func (repository *recordingActionQueue) Claim(ctx context.Context, request ActionClaimRequest) (ClaimedAction, error) {
@@ -1246,6 +1446,28 @@ func (broker *fakeCredentialBroker) Issue(context.Context, action.Envelope) (cre
 
 func (*fakeCredentialBroker) Revoke(context.Context, *credential.Credential) error { return nil }
 
+type countingCredentialBroker struct {
+	issueCalls  int
+	revokeCalls int
+}
+
+func (broker *countingCredentialBroker) Issue(context.Context, action.Envelope) (credential.Credential, error) {
+	broker.issueCalls++
+	return credential.Credential{}, errors.New("unexpected credential issue")
+}
+
+func (broker *countingCredentialBroker) Revoke(context.Context, *credential.Credential) error {
+	broker.revokeCalls++
+	return errors.New("unexpected credential revoke")
+}
+
+type countingKeyResolver struct{ calls int }
+
+func (resolver *countingKeyResolver) Resolve(context.Context, string) (action.KeyRecord, error) {
+	resolver.calls++
+	return action.KeyRecord{}, errors.New("unexpected action verification")
+}
+
 type fakePreExecutionGate struct {
 	decision policy.Decision
 	after    func()
@@ -1378,6 +1600,12 @@ func validEnvironment(envelope action.Envelope, now time.Time) EnvironmentSnapsh
 		WorkspaceID: envelope.WorkspaceID, EnvironmentID: envelope.Target.EnvironmentID,
 		Production: true, Revision: "environment-1", ObservedAt: now,
 	}
+}
+
+func nonProductionEnvironment(envelope action.Envelope, now time.Time) EnvironmentSnapshot {
+	snapshot := validEnvironment(envelope, now)
+	snapshot.Production = false
+	return snapshot
 }
 
 func validSafety(now time.Time) ClaimSafetySnapshot {

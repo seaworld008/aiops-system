@@ -49,6 +49,17 @@ type DB interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
+type queryRower interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+type credentialCleanupMode uint8
+
+const (
+	credentialCleanupStrict credentialCleanupMode = iota
+	credentialCleanupAllowAbsent
+)
+
 type Options struct {
 	TokenSource func() (string, error)
 }
@@ -218,14 +229,7 @@ func (repository *Repository) Claim(ctx context.Context, request execution.Actio
 			  AND active.target_key = candidate.target_key
 			  AND active.status IN ('LEASED', 'RUNNING', 'FINALIZING', 'UNCERTAIN')
 		  )
-		  AND (
-			candidate.runner_pool <> 'WRITE' OR candidate.production = false OR NOT EXISTS (
-				SELECT 1 FROM action_queue AS active
-				WHERE active.action_id <> candidate.action_id
-				  AND active.runner_pool = 'WRITE' AND active.production = true
-				  AND active.status IN ('LEASED', 'RUNNING', 'FINALIZING', 'UNCERTAIN')
-			)
-		  )
+		  AND (candidate.runner_pool <> 'WRITE' OR candidate.production = false)
 		ORDER BY candidate.created_at, candidate.action_id
 		FOR SHARE OF registration
 		FOR UPDATE OF candidate SKIP LOCKED
@@ -260,6 +264,7 @@ func (repository *Repository) Claim(ctx context.Context, request execution.Actio
 			runner_tenant_id = $6, runner_workspace_id = $7, runner_environment_id = $8,
 			lease_token_sha256 = $3,
 			lease_epoch = queued.lease_epoch + 1,
+			credential_expected = false, credential_lease_epoch = NULL,
 			scope_revision = $5, heartbeat_seq = 0,
 			lease_acquired_at = statement_timestamp(), last_heartbeat_at = statement_timestamp(),
 			lease_expires_at = LEAST(
@@ -274,6 +279,7 @@ func (repository *Repository) Claim(ctx context.Context, request execution.Actio
 			updated_at = statement_timestamp()
 		WHERE queued.action_id = $1 AND queued.status = 'QUEUED'
 		  AND queued.authorization_expires_at > statement_timestamp()
+		  AND (queued.runner_pool <> 'WRITE' OR queued.production = false)
 		RETURNING `+actionQueueProjection,
 			actionID, request.Scope.RunnerID(), digest, request.LeaseDuration.Seconds(), scopeRevision,
 			runnerTenantID, runnerWorkspaceID, runnerEnvironmentID,
@@ -284,7 +290,8 @@ func (repository *Repository) Claim(ctx context.Context, request execution.Actio
 		if err != nil {
 			return execution.ClaimedAction{}, fmt.Errorf("lease scoped action: %w", err)
 		}
-		if record.leaseTokenHash != digest || record.claimed.Execution.RunnerID != request.Scope.RunnerID() ||
+		if (record.claimed.Execution.Pool == executionlease.PoolWrite && record.claimed.Execution.Production) ||
+			record.leaseTokenHash != digest || record.claimed.Execution.RunnerID != request.Scope.RunnerID() ||
 			record.claimed.Execution.RunnerTenantID != runnerTenantID ||
 			record.claimed.Execution.RunnerWorkspaceID != runnerWorkspaceID ||
 			record.claimed.Execution.RunnerEnvironmentID != runnerEnvironmentID {
@@ -692,40 +699,190 @@ func (repository *Repository) Finalize(ctx context.Context, fence executionlease
 	if !validFence(fence) {
 		return executionlease.Execution{}, executionlease.ErrInvalidRequest
 	}
+	tx, err := repository.database.Begin(ctx)
+	if err != nil {
+		return executionlease.Execution{}, fmt.Errorf("begin action finalization: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
 	digest := tokenHash(fence.Token)
-	record, err := scanStoredAction(repository.database.QueryRow(ctx, `
-		UPDATE action_queue AS finalizing
-		SET status = finalizing.completion_status, completed_at = statement_timestamp(), updated_at = statement_timestamp()
-		WHERE finalizing.action_id = $1 AND finalizing.runner_id = $2
-		  AND finalizing.completed_lease_token_sha256 = $3 AND finalizing.completed_lease_epoch = $4
-		  AND finalizing.status = 'FINALIZING'
-		  AND EXISTS (
-			SELECT 1 FROM runner_result_receipts AS receipt
-			WHERE receipt.action_id = finalizing.action_id AND receipt.lease_epoch = finalizing.lease_epoch
-			  AND receipt.receipt_hash = finalizing.result_hash
-			  AND receipt.completion_status = finalizing.completion_status
-		  )
-		RETURNING `+actionQueueProjection,
-		fence.ExecutionID, fence.RunnerID, digest, fence.Epoch,
-	))
+	tryFinalize := func() (storedAction, error) {
+		return scanStoredAction(tx.QueryRow(ctx, `
+			UPDATE action_queue AS finalizing
+			SET status = finalizing.completion_status, completed_at = statement_timestamp(), updated_at = statement_timestamp()
+			WHERE finalizing.action_id = $1 AND finalizing.runner_id = $2
+			  AND finalizing.completed_lease_token_sha256 = $3 AND finalizing.completed_lease_epoch = $4
+			  AND finalizing.status = 'FINALIZING'
+			  AND EXISTS (
+				SELECT 1 FROM runner_result_receipts AS receipt
+				WHERE receipt.action_id = finalizing.action_id AND receipt.lease_epoch = finalizing.lease_epoch
+				  AND receipt.tenant_id = finalizing.runner_tenant_id
+				  AND receipt.workspace_id = finalizing.runner_workspace_id
+				  AND receipt.environment_id = finalizing.runner_environment_id
+				  AND receipt.runner_id = finalizing.runner_id
+				  AND receipt.scope_revision = finalizing.scope_revision
+				  AND receipt.receipt_hash = finalizing.result_hash
+				  AND receipt.completion_status = finalizing.completion_status
+				  AND receipt.schema_version = 'runner-result.v1'
+			  )
+			  AND (
+				finalizing.completion_status = 'UNCERTAIN' OR
+				`+credentialCleanupPredicate("finalizing", "completed_lease_token_sha256", credentialCleanupStrict)+`
+			  )
+			RETURNING `+actionQueueProjection,
+			fence.ExecutionID, fence.RunnerID, digest, fence.Epoch,
+		))
+	}
+	record, err := tryFinalize()
 	if errors.Is(err, pgx.ErrNoRows) {
-		record, getErr := repository.get(ctx, fence.ExecutionID)
-		if getErr != nil {
-			return executionlease.Execution{}, getErr
+		record, err = scanStoredAction(tx.QueryRow(ctx, `
+			SELECT `+actionQueueProjection+`
+			FROM action_queue
+			WHERE action_id = $1
+			FOR UPDATE
+		`, fence.ExecutionID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return executionlease.Execution{}, executionlease.ErrNotFound
+		}
+		if err != nil {
+			return executionlease.Execution{}, fmt.Errorf("read action finalization state: %w", err)
 		}
 		if record.claimed.Execution.ReconciliationID != "" || record.claimed.Execution.RunnerID != fence.RunnerID ||
 			record.completedLeaseTokenHash != digest || record.completedLeaseEpoch != fence.Epoch {
 			return executionlease.Execution{}, executionlease.ErrStaleLease
 		}
 		if record.claimed.Execution.Terminal() {
+			if err := tx.Commit(ctx); err != nil {
+				return executionlease.Execution{}, fmt.Errorf("commit idempotent action finalization: %w", err)
+			}
+			committed = true
 			return redact(record.claimed.Execution), nil
+		}
+		if record.claimed.Execution.Status == executionlease.StatusFinalizing &&
+			(record.claimed.Execution.CompletionStatus == executionlease.StatusSucceeded ||
+				record.claimed.Execution.CompletionStatus == executionlease.StatusFailed) {
+			cleanupAllowed, inspectErr := inspectCredentialCleanup(
+				ctx, tx, fence.ExecutionID, fence.Epoch, credentialCleanupStrict,
+			)
+			if inspectErr != nil {
+				return executionlease.Execution{}, inspectErr
+			}
+			if !cleanupAllowed {
+				return executionlease.Execution{}, execution.ErrCredentialCleanupPending
+			}
+			record, err = tryFinalize()
+			if err == nil {
+				if err := tx.Commit(ctx); err != nil {
+					return executionlease.Execution{}, fmt.Errorf("commit action finalization after credential cleanup: %w", err)
+				}
+				committed = true
+				return redact(record.claimed.Execution), nil
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return executionlease.Execution{}, fmt.Errorf("finalize action after credential cleanup: %w", err)
+			}
 		}
 		return executionlease.Execution{}, executionlease.ErrInvalidTransition
 	}
 	if err != nil {
 		return executionlease.Execution{}, fmt.Errorf("finalize action result receipt: %w", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return executionlease.Execution{}, fmt.Errorf("commit action finalization: %w", err)
+	}
+	committed = true
 	return redact(record.claimed.Execution), nil
+}
+
+func credentialCleanupPredicate(alias, tokenColumn string, mode credentialCleanupMode) string {
+	terminal := `(
+		` + alias + `.credential_expected = true
+		AND ` + alias + `.credential_lease_epoch = ` + alias + `.lease_epoch
+		AND EXISTS (
+			SELECT 1
+			FROM credential_revocations AS cleanup
+			WHERE cleanup.action_id = ` + alias + `.action_id
+			  AND cleanup.tenant_id = ` + alias + `.runner_tenant_id
+			  AND cleanup.workspace_id = ` + alias + `.runner_workspace_id
+			  AND cleanup.environment_id = ` + alias + `.runner_environment_id
+			  AND cleanup.target_key = ` + alias + `.target_key
+			  AND cleanup.production = ` + alias + `.production
+			  AND cleanup.runner_id = ` + alias + `.runner_id
+			  AND cleanup.action_lease_epoch = ` + alias + `.lease_epoch
+			  AND cleanup.action_lease_token_sha256 = ` + alias + `.` + tokenColumn + `
+			  AND cleanup.status IN ('REVOKED', 'NO_CREDENTIAL')
+		)
+	)`
+	if mode == credentialCleanupStrict {
+		return `(` + alias + `.runner_pool <> 'WRITE' OR ` + terminal + `)`
+	}
+	return `(
+		` + alias + `.runner_pool <> 'WRITE' OR
+		(
+			(
+				` + alias + `.credential_expected = false
+				AND ` + alias + `.credential_lease_epoch IS NULL
+				AND NOT EXISTS (
+					SELECT 1
+					FROM credential_revocations AS existing_cleanup
+					WHERE existing_cleanup.action_id = ` + alias + `.action_id
+					  AND existing_cleanup.action_lease_epoch = ` + alias + `.lease_epoch
+				)
+			) OR ` + terminal + `
+		)
+	)`
+}
+
+func inspectCredentialCleanup(
+	ctx context.Context,
+	database queryRower,
+	actionID string,
+	leaseEpoch int64,
+	mode credentialCleanupMode,
+) (bool, error) {
+	tokenColumn := "completed_lease_token_sha256"
+	if mode == credentialCleanupAllowAbsent {
+		tokenColumn = "lease_token_sha256"
+	}
+	var cleanupAllowed bool
+	err := database.QueryRow(ctx, `
+		SELECT `+credentialCleanupPredicate("action", tokenColumn, mode)+` AS cleanup_allowed
+		FROM action_queue AS action
+		WHERE action.action_id = $1 AND action.lease_epoch = $2
+	`, actionID, leaseEpoch).Scan(&cleanupAllowed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, executionlease.ErrStaleLease
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect action credential cleanup: %w", err)
+	}
+	return cleanupAllowed, nil
+}
+
+func inspectCurrentLeaseCleanup(
+	ctx context.Context,
+	database queryRower,
+	actionID string,
+	leaseEpoch int64,
+) (bool, bool, error) {
+	var leaseCurrent, cleanupAllowed bool
+	err := database.QueryRow(ctx, `
+		SELECT COALESCE(action.lease_expires_at > statement_timestamp(), false) AS lease_current,
+			`+credentialCleanupPredicate("action", "lease_token_sha256", credentialCleanupAllowAbsent)+` AS cleanup_allowed
+		FROM action_queue AS action
+		WHERE action.action_id = $1 AND action.lease_epoch = $2
+	`, actionID, leaseEpoch).Scan(&leaseCurrent, &cleanupAllowed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, false, executionlease.ErrStaleLease
+	}
+	if err != nil {
+		return false, false, fmt.Errorf("inspect current action lease cleanup: %w", err)
+	}
+	return leaseCurrent, cleanupAllowed, nil
 }
 
 func (repository *Repository) Reject(ctx context.Context, request execution.ActionRejectRequest) (executionlease.Execution, error) {
@@ -751,13 +908,15 @@ func (repository *Repository) Reject(ctx context.Context, request execution.Acti
 	}()
 	digest := tokenHash(request.Lease.Token)
 	record, err := scanStoredAction(tx.QueryRow(ctx, `
-		UPDATE action_queue
+		UPDATE action_queue AS leased
 		SET status = 'FAILED', completion_status = 'FAILED', completed_lease_token_sha256 = lease_token_sha256,
 			completed_lease_epoch = lease_epoch, lease_token_sha256 = NULL,
 			lease_expires_at = NULL, result_hash = $5,
 			completed_at = statement_timestamp(), updated_at = statement_timestamp()
-		WHERE action_id = $1 AND runner_id = $2 AND lease_token_sha256 = $3 AND lease_epoch = $4
-		  AND status = 'LEASED' AND lease_expires_at > statement_timestamp()
+		WHERE leased.action_id = $1 AND leased.runner_id = $2
+		  AND leased.lease_token_sha256 = $3 AND leased.lease_epoch = $4
+		  AND leased.status = 'LEASED' AND leased.lease_expires_at > statement_timestamp()
+		  AND `+credentialCleanupPredicate("leased", "lease_token_sha256", credentialCleanupAllowAbsent)+`
 		RETURNING `+actionQueueProjection,
 		request.Lease.ExecutionID, request.Lease.RunnerID, digest, request.Lease.Epoch, resultHash,
 	))
@@ -796,6 +955,18 @@ func (repository *Repository) Reject(ctx context.Context, request execution.Acti
 	if record.claimed.Execution.Status != executionlease.StatusLeased {
 		return executionlease.Execution{}, executionlease.ErrInvalidTransition
 	}
+	leaseCurrent, cleanupAllowed, inspectErr := inspectCurrentLeaseCleanup(
+		ctx, tx, request.Lease.ExecutionID, request.Lease.Epoch,
+	)
+	if inspectErr != nil {
+		return executionlease.Execution{}, inspectErr
+	}
+	if !leaseCurrent {
+		return executionlease.Execution{}, executionlease.ErrStaleLease
+	}
+	if !cleanupAllowed {
+		return executionlease.Execution{}, execution.ErrCredentialCleanupPending
+	}
 	return executionlease.Execution{}, executionlease.ErrStaleLease
 }
 
@@ -813,16 +984,19 @@ func (repository *Repository) Nack(ctx context.Context, request execution.Action
 	}
 	digest := tokenHash(request.Lease.Token)
 	record, err := scanStoredAction(repository.database.QueryRow(ctx, `
-		UPDATE action_queue
+		UPDATE action_queue AS leased
 		SET status = 'QUEUED', last_nack_hash = $5,
 			not_before = statement_timestamp() + make_interval(secs => $6::double precision),
 			runner_id = NULL, runner_tenant_id = NULL, runner_workspace_id = NULL, runner_environment_id = NULL,
 			lease_token_sha256 = NULL, lease_acquired_at = NULL,
 			lease_expires_at = NULL, last_heartbeat_at = NULL, scope_revision = NULL,
 			heartbeat_seq = 0, cancel_requested_at = NULL, cancel_reason_hash = NULL,
+			credential_expected = false, credential_lease_epoch = NULL,
 			updated_at = statement_timestamp()
-		WHERE action_id = $1 AND runner_id = $2 AND lease_token_sha256 = $3 AND lease_epoch = $4
-		  AND status = 'LEASED' AND lease_expires_at > statement_timestamp()
+		WHERE leased.action_id = $1 AND leased.runner_id = $2
+		  AND leased.lease_token_sha256 = $3 AND leased.lease_epoch = $4
+		  AND leased.status = 'LEASED' AND leased.lease_expires_at > statement_timestamp()
+		  AND `+credentialCleanupPredicate("leased", "lease_token_sha256", credentialCleanupAllowAbsent)+`
 		RETURNING `+actionQueueProjection,
 		request.Lease.ExecutionID, request.Lease.RunnerID, digest, request.Lease.Epoch,
 		lastNackHash, request.RetryAfter.Seconds(),
@@ -863,11 +1037,12 @@ func (repository *Repository) Reconcile(ctx context.Context, request executionle
 		return executionlease.Execution{}, err
 	}
 	record, err := scanStoredAction(tx.QueryRow(ctx, `
-		UPDATE action_queue
+		UPDATE action_queue AS uncertain
 		SET reconciliation_id = $2, reconciliation_actor = $3, status = $4,
 			reconciliation_result_hash = $5, reconciled_at = statement_timestamp(),
 			updated_at = statement_timestamp()
-		WHERE action_id = $1 AND status = 'UNCERTAIN' AND reconciliation_id IS NULL
+		WHERE uncertain.action_id = $1 AND uncertain.status = 'UNCERTAIN' AND uncertain.reconciliation_id IS NULL
+		  AND `+credentialCleanupPredicate("uncertain", "completed_lease_token_sha256", credentialCleanupStrict)+`
 		RETURNING `+actionQueueProjection,
 		request.ExecutionID, request.ReconciliationID, request.ActorID, request.Status, request.ResultHash,
 	))
@@ -892,6 +1067,17 @@ func (repository *Repository) Reconcile(ctx context.Context, request executionle
 		return executionlease.Execution{}, fmt.Errorf("read action reconciliation state: %w", err)
 	}
 	if record.claimed.Execution.ReconciliationID == "" {
+		if record.claimed.Execution.Status == executionlease.StatusUncertain {
+			cleanupAllowed, inspectErr := inspectCredentialCleanup(
+				ctx, tx, request.ExecutionID, record.claimed.Execution.LeaseEpoch, credentialCleanupStrict,
+			)
+			if inspectErr != nil {
+				return executionlease.Execution{}, inspectErr
+			}
+			if !cleanupAllowed {
+				return executionlease.Execution{}, execution.ErrCredentialCleanupPending
+			}
+		}
 		return executionlease.Execution{}, executionlease.ErrInvalidTransition
 	}
 	if record.claimed.Execution.ReconciliationID != request.ReconciliationID ||
@@ -914,37 +1100,92 @@ func (repository *Repository) Cancel(ctx context.Context, actionID string) (exec
 	if !validIdentifier(actionID, 256) {
 		return executionlease.Execution{}, executionlease.ErrInvalidRequest
 	}
-	record, err := scanStoredAction(repository.database.QueryRow(ctx, `
-		UPDATE action_queue
-		SET status = CASE WHEN status = 'RUNNING' THEN status ELSE 'CANCELLED' END,
-			cancel_requested_at = CASE WHEN status = 'RUNNING' THEN COALESCE(cancel_requested_at, statement_timestamp()) ELSE NULL END,
-			cancel_reason_hash = CASE WHEN status = 'RUNNING' THEN COALESCE(cancel_reason_hash, $2) ELSE NULL END,
-			runner_id = CASE WHEN status = 'RUNNING' THEN runner_id ELSE NULL END,
-			runner_tenant_id = CASE WHEN status = 'RUNNING' THEN runner_tenant_id ELSE NULL END,
-			runner_workspace_id = CASE WHEN status = 'RUNNING' THEN runner_workspace_id ELSE NULL END,
-			runner_environment_id = CASE WHEN status = 'RUNNING' THEN runner_environment_id ELSE NULL END,
-			scope_revision = CASE WHEN status = 'RUNNING' THEN scope_revision ELSE NULL END,
-			lease_token_sha256 = CASE WHEN status = 'RUNNING' THEN lease_token_sha256 ELSE NULL END,
-			lease_expires_at = CASE WHEN status = 'RUNNING' THEN lease_expires_at ELSE NULL END,
-			completed_at = CASE WHEN status = 'RUNNING' THEN completed_at ELSE statement_timestamp() END,
-			updated_at = CASE WHEN status = 'RUNNING' AND cancel_requested_at IS NOT NULL THEN updated_at ELSE statement_timestamp() END
-		WHERE action_id = $1 AND status IN ('QUEUED', 'LEASED', 'RUNNING')
-		RETURNING `+actionQueueProjection,
-		actionID, cancellationResultHash(),
-	))
+	tx, err := repository.database.Begin(ctx)
+	if err != nil {
+		return executionlease.Execution{}, fmt.Errorf("begin action cancellation: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	tryCancel := func() (storedAction, error) {
+		return scanStoredAction(tx.QueryRow(ctx, `
+			UPDATE action_queue AS cancellable
+			SET status = CASE WHEN status = 'RUNNING' THEN status ELSE 'CANCELLED' END,
+				cancel_requested_at = CASE WHEN status = 'RUNNING' THEN COALESCE(cancel_requested_at, statement_timestamp()) ELSE NULL END,
+				cancel_reason_hash = CASE WHEN status = 'RUNNING' THEN COALESCE(cancel_reason_hash, $2) ELSE NULL END,
+				runner_id = CASE WHEN status = 'RUNNING' THEN runner_id ELSE NULL END,
+				runner_tenant_id = CASE WHEN status = 'RUNNING' THEN runner_tenant_id ELSE NULL END,
+				runner_workspace_id = CASE WHEN status = 'RUNNING' THEN runner_workspace_id ELSE NULL END,
+				runner_environment_id = CASE WHEN status = 'RUNNING' THEN runner_environment_id ELSE NULL END,
+				scope_revision = CASE WHEN status = 'RUNNING' THEN scope_revision ELSE NULL END,
+				lease_token_sha256 = CASE WHEN status = 'RUNNING' THEN lease_token_sha256 ELSE NULL END,
+				lease_expires_at = CASE WHEN status = 'RUNNING' THEN lease_expires_at ELSE NULL END,
+				completed_at = CASE WHEN status = 'RUNNING' THEN completed_at ELSE statement_timestamp() END,
+				updated_at = CASE WHEN status = 'RUNNING' AND cancel_requested_at IS NOT NULL THEN updated_at ELSE statement_timestamp() END
+			WHERE cancellable.action_id = $1 AND cancellable.status IN ('QUEUED', 'LEASED', 'RUNNING')
+			  AND (
+				cancellable.status <> 'LEASED' OR
+				`+credentialCleanupPredicate("cancellable", "lease_token_sha256", credentialCleanupAllowAbsent)+`
+			  )
+			RETURNING `+actionQueueProjection,
+			actionID, cancellationResultHash(),
+		))
+	}
+	record, err := tryCancel()
 	if errors.Is(err, pgx.ErrNoRows) {
-		existing, getErr := repository.get(ctx, actionID)
+		existing, getErr := scanStoredAction(tx.QueryRow(ctx, `
+			SELECT `+actionQueueProjection+`
+			FROM action_queue
+			WHERE action_id = $1
+			FOR UPDATE
+		`, actionID))
+		if errors.Is(getErr, pgx.ErrNoRows) {
+			return executionlease.Execution{}, executionlease.ErrNotFound
+		}
 		if getErr != nil {
-			return executionlease.Execution{}, getErr
+			return executionlease.Execution{}, fmt.Errorf("read action cancellation state: %w", getErr)
 		}
 		if existing.claimed.Execution.Terminal() {
+			if err := tx.Commit(ctx); err != nil {
+				return executionlease.Execution{}, fmt.Errorf("commit idempotent action cancellation: %w", err)
+			}
+			committed = true
 			return redact(existing.claimed.Execution), nil
+		}
+		if existing.claimed.Execution.Status == executionlease.StatusLeased {
+			cleanupAllowed, inspectErr := inspectCredentialCleanup(
+				ctx, tx, actionID, existing.claimed.Execution.LeaseEpoch, credentialCleanupAllowAbsent,
+			)
+			if inspectErr != nil {
+				return executionlease.Execution{}, inspectErr
+			}
+			if !cleanupAllowed {
+				return executionlease.Execution{}, execution.ErrCredentialCleanupPending
+			}
+			record, err = tryCancel()
+			if err == nil {
+				if err := tx.Commit(ctx); err != nil {
+					return executionlease.Execution{}, fmt.Errorf("commit action cancellation after credential cleanup: %w", err)
+				}
+				committed = true
+				return redact(record.claimed.Execution), nil
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return executionlease.Execution{}, fmt.Errorf("cancel action after credential cleanup: %w", err)
+			}
 		}
 		return executionlease.Execution{}, executionlease.ErrInvalidTransition
 	}
 	if err != nil {
 		return executionlease.Execution{}, fmt.Errorf("cancel action execution: %w", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return executionlease.Execution{}, fmt.Errorf("commit action cancellation: %w", err)
+	}
+	committed = true
 	return redact(record.claimed.Execution), nil
 }
 
@@ -1003,13 +1244,14 @@ func (repository *Repository) leaseMiss(ctx context.Context, fence executionleas
 	var runnerID, storedTokenHash pgtype.Text
 	var epoch int64
 	var status string
-	var leaseCurrent bool
+	var leaseCurrent, cleanupAllowed bool
 	err := repository.database.QueryRow(ctx, `
 		SELECT runner_id, lease_epoch, lease_token_sha256, status,
-			COALESCE(lease_expires_at > statement_timestamp(), false) AS lease_current
-		FROM action_queue
-		WHERE action_id = $1
-	`, fence.ExecutionID).Scan(&runnerID, &epoch, &storedTokenHash, &status, &leaseCurrent)
+			COALESCE(lease_expires_at > statement_timestamp(), false) AS lease_current,
+			`+credentialCleanupPredicate("action", "lease_token_sha256", credentialCleanupAllowAbsent)+` AS cleanup_allowed
+		FROM action_queue AS action
+		WHERE action.action_id = $1
+	`, fence.ExecutionID).Scan(&runnerID, &epoch, &storedTokenHash, &status, &leaseCurrent, &cleanupAllowed)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return executionlease.Execution{}, executionlease.ErrNotFound
 	}
@@ -1022,6 +1264,9 @@ func (repository *Repository) leaseMiss(ctx context.Context, fence executionleas
 	}
 	for _, allowed := range allowedStatuses {
 		if executionlease.Status(status) == allowed {
+			if !cleanupAllowed {
+				return executionlease.Execution{}, execution.ErrCredentialCleanupPending
+			}
 			return executionlease.Execution{}, executionlease.ErrStaleLease
 		}
 	}
@@ -1080,24 +1325,46 @@ func sweepExpired(ctx context.Context, tx pgx.Tx, actionID string) error {
 	}
 	predicate = ""
 	args = nil
+	limit := "100"
 	if actionID != "" {
-		predicate = " AND expired_finalizing.action_id = $1"
+		predicate = " AND finalizing.action_id = $1"
 		args = append(args, actionID)
+		limit = "1"
 	}
 	if _, err := tx.Exec(ctx, `
-		UPDATE action_queue AS expired_finalizing
-		SET status = expired_finalizing.completion_status,
+		WITH recoverable_finalizing AS (
+			SELECT finalizing.action_id
+			FROM action_queue AS finalizing
+			WHERE finalizing.status = 'FINALIZING'
+			  AND EXISTS (
+				SELECT 1
+				FROM runner_result_receipts AS receipt
+				WHERE receipt.action_id = finalizing.action_id
+				  AND receipt.tenant_id = finalizing.runner_tenant_id
+				  AND receipt.workspace_id = finalizing.runner_workspace_id
+				  AND receipt.environment_id = finalizing.runner_environment_id
+				  AND receipt.runner_id = finalizing.runner_id
+				  AND receipt.lease_epoch = finalizing.lease_epoch
+				  AND receipt.scope_revision = finalizing.scope_revision
+				  AND receipt.receipt_hash = finalizing.result_hash
+				  AND receipt.completion_status = finalizing.completion_status
+				  AND receipt.schema_version = 'runner-result.v1'
+			  )
+			  AND (
+				finalizing.completion_status = 'UNCERTAIN' OR
+				`+credentialCleanupPredicate("finalizing", "completed_lease_token_sha256", credentialCleanupStrict)+`
+			  )
+			`+predicate+`
+			ORDER BY finalizing.updated_at, finalizing.action_id
+			FOR UPDATE OF finalizing SKIP LOCKED
+			LIMIT `+limit+`
+		)
+		UPDATE action_queue AS finalizing
+		SET status = finalizing.completion_status,
 			completed_at = statement_timestamp(), updated_at = statement_timestamp()
-		WHERE expired_finalizing.status = 'FINALIZING'
-		  AND expired_finalizing.authorization_expires_at <= statement_timestamp()
-		  AND EXISTS (
-			SELECT 1 FROM runner_result_receipts AS receipt
-			WHERE receipt.action_id = expired_finalizing.action_id
-			  AND receipt.lease_epoch = expired_finalizing.lease_epoch
-			  AND receipt.receipt_hash = expired_finalizing.result_hash
-			  AND receipt.completion_status = expired_finalizing.completion_status
-		  )
-	`+predicate, args...); err != nil {
+		FROM recoverable_finalizing
+		WHERE finalizing.action_id = recoverable_finalizing.action_id
+	`, args...); err != nil {
 		return fmt.Errorf("recover expired finalizing action: %w", err)
 	}
 	predicate = ""
@@ -1113,9 +1380,11 @@ func sweepExpired(ctx context.Context, tx pgx.Tx, actionID string) error {
 			lease_token_sha256 = NULL,
 			lease_acquired_at = NULL, lease_expires_at = NULL, last_heartbeat_at = NULL,
 			scope_revision = NULL, heartbeat_seq = 0, cancel_requested_at = NULL, cancel_reason_hash = NULL,
+			credential_expected = false, credential_lease_epoch = NULL,
 			not_before = statement_timestamp(), updated_at = statement_timestamp()
 		WHERE expired_lease.status = 'LEASED'
 		  AND expired_lease.lease_expires_at <= statement_timestamp()
+		  AND `+credentialCleanupPredicate("expired_lease", "lease_token_sha256", credentialCleanupAllowAbsent)+`
 	`+predicate, args...); err != nil {
 		return fmt.Errorf("release expired unstarted action: %w", err)
 	}
