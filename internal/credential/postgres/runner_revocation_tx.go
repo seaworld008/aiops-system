@@ -149,15 +149,15 @@ func (repository *Repository) ClaimRevocationRunnerTx(
 	tokenDigest := credential.SHA256Hex([]byte(rawToken))
 	record, err := selectStored(ctx, tx, `
 		WITH claim_boundary AS (
-			SELECT clock_timestamp() AS claimed_at
+			SELECT clock_timestamp() AS boundary_at
 		)
 		UPDATE credential_revocations AS candidate
 		SET status = 'REVOKING', claim_epoch = candidate.claim_epoch + 1,
 			claimed_by = $2, claim_token_sha256 = $3,
-			claimed_at = claim_boundary.claimed_at, last_heartbeat_at = claim_boundary.claimed_at,
-			claim_expires_at = claim_boundary.claimed_at + interval '30 seconds',
+			claimed_at = claim_boundary.boundary_at, last_heartbeat_at = claim_boundary.boundary_at,
+			claim_expires_at = claim_boundary.boundary_at + interval '30 seconds',
 			heartbeat_seq = 0, attempt = candidate.attempt + 1,
-			updated_at = claim_boundary.claimed_at, version = candidate.version + 1
+			updated_at = claim_boundary.boundary_at, version = candidate.version + 1
 		FROM claim_boundary
 		WHERE candidate.revocation_id = $1::uuid
 		  AND candidate.tenant_id = $4::uuid

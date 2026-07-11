@@ -45,7 +45,7 @@ func TestClaimRevocationRunnerTxDefersSecretsUntilCommittedTicketFinalization(t 
 		WithArgs(scope.RunnerID(), scope.TenantID(), []string{postgresTestWorkspaceID}, []string{postgresTestEnvironment},
 			credential.MaxRevocationAttempts, credential.MaxRevocationElapsed.Seconds()).
 		WillReturnRows(pgxmock.NewRows([]string{"revocation_id"}).AddRow(postgresTestRevocationID))
-	database.ExpectQuery(`(?s)WITH claim_boundary AS \(\s*SELECT clock_timestamp\(\) AS claimed_at\s*\).*UPDATE credential_revocations AS candidate.*claimed_at = claim_boundary\.claimed_at, last_heartbeat_at = claim_boundary\.claimed_at.*claim_expires_at = claim_boundary\.claimed_at \+ interval '30 seconds'.*heartbeat_seq = 0.*updated_at = claim_boundary\.claimed_at.*FROM claim_boundary.*registration\.credential_revocation_capable = true.*binding\.workspace_id = candidate\.workspace_id.*certificate\.certificate_sha256 = \$8.*RETURNING`).
+	database.ExpectQuery(`(?s)WITH claim_boundary AS \(\s*SELECT clock_timestamp\(\) AS boundary_at\s*\).*UPDATE credential_revocations AS candidate.*claimed_at = claim_boundary\.boundary_at, last_heartbeat_at = claim_boundary\.boundary_at.*claim_expires_at = claim_boundary\.boundary_at \+ interval '30 seconds'.*heartbeat_seq = 0.*updated_at = claim_boundary\.boundary_at.*FROM claim_boundary.*registration\.credential_revocation_capable = true.*binding\.workspace_id = candidate\.workspace_id.*certificate\.certificate_sha256 = \$8.*RETURNING`).
 		WithArgs(postgresTestRevocationID, scope.RunnerID(), tokenDigest, scope.TenantID(),
 			credential.MaxRevocationAttempts, credential.MaxRevocationElapsed.Seconds(), scope.ScopeRevision(),
 			runnerRevocationCertificateSHA256).
