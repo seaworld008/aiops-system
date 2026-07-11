@@ -1,0 +1,525 @@
+package domain_test
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/seaworld008/aiops-system/internal/domain"
+)
+
+func TestInvestigationValidateEnforcesBoundedStateAndIntegrityMetadata(t *testing.T) {
+	now := time.Date(2026, 7, 11, 10, 0, 0, 0, time.UTC)
+	valid := domain.Investigation{
+		ID:             "investigation-1",
+		WorkspaceID:    "workspace-1",
+		IncidentID:     "incident-1",
+		Status:         domain.InvestigationQueued,
+		ModelStatus:    domain.ModelPending,
+		IdempotencyKey: "investigate:incident-1:v1",
+		RequestHash:    strings.Repeat("a", 64),
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want valid investigation", err)
+	}
+
+	for name, mutate := range map[string]func(*domain.Investigation){
+		"status":          func(value *domain.Investigation) { value.Status = "UNKNOWN" },
+		"model status":    func(value *domain.Investigation) { value.ModelStatus = "UNKNOWN" },
+		"uppercase hash":  func(value *domain.Investigation) { value.RequestHash = strings.Repeat("A", 64) },
+		"oversized key":   func(value *domain.Investigation) { value.IdempotencyKey = strings.Repeat("a", 129) },
+		"unsafe key":      func(value *domain.Investigation) { value.IdempotencyKey = "incident 1" },
+		"failure detail":  func(value *domain.Investigation) { value.FailureCode = "raw backend error: timeout" },
+		"backward update": func(value *domain.Investigation) { value.UpdatedAt = value.CreatedAt.Add(-time.Nanosecond) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			item := valid
+			mutate(&item)
+			if err := item.Validate(); err == nil {
+				t.Fatal("Validate() error = nil, want contract rejection")
+			}
+		})
+	}
+}
+
+func TestReadTaskAndEvidenceRejectUnsafeOrUnboundedJSON(t *testing.T) {
+	now := time.Date(2026, 7, 11, 10, 0, 0, 0, time.UTC)
+	input := json.RawMessage(`{"lookback_minutes":15}`)
+	task := domain.ReadTask{
+		ID: "task-1", WorkspaceID: "workspace-1", IncidentID: "incident-1", InvestigationID: "investigation-1",
+		Key: "metrics", Position: 1, ConnectorID: "prometheus-prod", Operation: "range_query", Input: input,
+		InputHash: sha256Hex(input), Status: domain.ReadTaskQueued, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := task.Validate(); err != nil {
+		t.Fatalf("ReadTask.Validate() error = %v", err)
+	}
+	evidencePayload := json.RawMessage(`{"series_count":3}`)
+	evidence := domain.Evidence{
+		ID: "evidence-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
+		InvestigationID: "investigation-1", TaskID: "task-1", ConnectorID: "prometheus-prod",
+		ContentHash: sha256Hex(evidencePayload), Payload: evidencePayload, CollectedAt: now, CreatedAt: now,
+	}
+	if err := evidence.Validate(); err != nil {
+		t.Fatalf("Evidence.Validate() error = %v", err)
+	}
+
+	for name, unsafe := range map[string]json.RawMessage{
+		"array":          json.RawMessage(`[]`),
+		"credential":     json.RawMessage(`{"nested":{"credential":"redacted"}}`),
+		"authorization":  json.RawMessage(`{"headers":{"Authorization":"Bearer redacted"}}`),
+		"raw error body": json.RawMessage(`{"raw_error_body":"backend response"}`),
+		"oversized":      json.RawMessage(`{"value":"` + strings.Repeat("x", domain.MaxInvestigationJSONBytes) + `"}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			item := task
+			item.Input = unsafe
+			item.InputHash = sha256Hex(unsafe)
+			if err := item.Validate(); err == nil {
+				t.Fatal("ReadTask.Validate() error = nil, want unsafe JSON rejection")
+			}
+		})
+	}
+}
+
+func sha256Hex(value []byte) string {
+	digest := sha256.Sum256(value)
+	return hex.EncodeToString(digest[:])
+}
+
+func TestFeedbackAndRunnerReceiptExposeOnlyBoundedStructuredMetadata(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	feedback := domain.Feedback{
+		ID: "feedback-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
+		InvestigationID: "investigation-1", HypothesisID: "hypothesis-1",
+		Actor: domain.Actor{Type: domain.ActorHuman, ID: "user-1"}, Verdict: domain.FeedbackConfirmed,
+		Details: json.RawMessage(`{"reason_code":"evidence_matches"}`), CreatedAt: now,
+	}
+	if err := feedback.Validate(); err != nil {
+		t.Fatalf("Feedback.Validate() error = %v", err)
+	}
+	receipt := domain.RunnerEvidenceReceipt{
+		ID: "receipt-1", WorkspaceID: "workspace-1", InvestigationID: "investigation-1", TaskID: "task-1",
+		RunnerID: "runner-1", ConnectorID: "prometheus-prod", EvidenceID: "evidence-1",
+		ContentHash: strings.Repeat("a", 64), IdempotencyKey: "task-1:attempt-1", ReceivedAt: now,
+	}
+	if err := receipt.Validate(); err != nil {
+		t.Fatalf("RunnerEvidenceReceipt.Validate() error = %v", err)
+	}
+
+	feedback.Actor.Type = domain.ActorModel
+	if err := feedback.Validate(); err == nil {
+		t.Fatal("Feedback.Validate() accepted non-human actor")
+	}
+	receipt.FailureCode = "upstream returned: 401 Authorization: Bearer secret"
+	if err := receipt.Validate(); err == nil {
+		t.Fatal("RunnerEvidenceReceipt.Validate() accepted raw failure detail")
+	}
+}
+
+func TestInvestigationAndReadTaskValidateLifecycleShape(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 30, 0, 0, time.UTC)
+	queued := domain.Investigation{
+		ID: "investigation-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
+		Status: domain.InvestigationQueued, ModelStatus: domain.ModelPending,
+		IdempotencyKey: "investigate:1", RequestHash: strings.Repeat("a", 64), CreatedAt: now, UpdatedAt: now,
+	}
+	queued.StartedAt = now
+	if err := queued.Validate(); err == nil {
+		t.Fatal("queued Investigation accepted StartedAt")
+	}
+	running := queued
+	running.Status = domain.InvestigationRunning
+	running.StartedAt = time.Time{}
+	if err := running.Validate(); err == nil {
+		t.Fatal("running Investigation accepted missing StartedAt")
+	}
+	completed := queued
+	completed.Status = domain.InvestigationCompleted
+	completed.ModelStatus = domain.ModelCompleted
+	completed.StartedAt = now
+	if err := completed.Validate(); err == nil {
+		t.Fatal("completed Investigation accepted missing CompletedAt")
+	}
+
+	input := json.RawMessage(`{"lookback_minutes":15}`)
+	task := domain.ReadTask{
+		ID: "task-1", WorkspaceID: "workspace-1", IncidentID: "incident-1", InvestigationID: "investigation-1",
+		Key: "metrics", Position: 1, ConnectorID: "prometheus-prod", Operation: "range_query",
+		Input: input, InputHash: sha256Hex(input), Status: domain.ReadTaskQueued, CreatedAt: now, UpdatedAt: now,
+	}
+	task.EvidenceID = "evidence-1"
+	if err := task.Validate(); err == nil {
+		t.Fatal("queued ReadTask accepted EvidenceID")
+	}
+	task.Status = domain.ReadTaskEvidence
+	task.StartedAt = now
+	task.CompletedAt = now
+	task.EvidenceID = ""
+	if err := task.Validate(); err == nil {
+		t.Fatal("EVIDENCE ReadTask accepted missing EvidenceID")
+	}
+}
+
+func TestInvestigationValidateRejectsModelStateOutsideLifecycleMatrix(t *testing.T) {
+	now := time.Date(2026, 7, 13, 1, 0, 0, 0, time.UTC)
+	running := domain.Investigation{
+		ID: "investigation-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
+		Status: domain.InvestigationRunning, ModelStatus: domain.ModelCompleted,
+		IdempotencyKey: "investigate:matrix", RequestHash: strings.Repeat("a", 64),
+		CreatedAt: now, StartedAt: now, UpdatedAt: now,
+	}
+	if err := running.Validate(); err == nil {
+		t.Fatal("RUNNING Investigation accepted COMPLETED ModelStatus")
+	}
+}
+
+func TestInvestigationValidateRejectsCompletionBeforeStart(t *testing.T) {
+	now := time.Date(2026, 7, 13, 1, 15, 0, 0, time.UTC)
+	completed := domain.Investigation{
+		ID: "investigation-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
+		Status: domain.InvestigationCompleted, ModelStatus: domain.ModelCompleted,
+		IdempotencyKey: "investigate:time-order", RequestHash: strings.Repeat("a", 64),
+		CreatedAt: now, StartedAt: now.Add(2 * time.Minute), CompletedAt: now.Add(time.Minute), UpdatedAt: now.Add(3 * time.Minute),
+	}
+	if err := completed.Validate(); err == nil {
+		t.Fatal("Investigation accepted CompletedAt before StartedAt")
+	}
+}
+
+func TestReadTaskValidateRejectsCompletionBeforeStart(t *testing.T) {
+	now := time.Date(2026, 7, 13, 1, 30, 0, 0, time.UTC)
+	input := json.RawMessage(`{"lookback_minutes":15}`)
+	task := domain.ReadTask{
+		ID: "task-1", WorkspaceID: "workspace-1", IncidentID: "incident-1", InvestigationID: "investigation-1",
+		Key: "metrics", Position: 1, ConnectorID: "prometheus-prod", Operation: "range_query",
+		Input: input, InputHash: sha256Hex(input), Status: domain.ReadTaskFailed, FailureCode: "source_failed",
+		CreatedAt: now, StartedAt: now.Add(2 * time.Minute), CompletedAt: now.Add(time.Minute), UpdatedAt: now.Add(3 * time.Minute),
+	}
+	if err := task.Validate(); err == nil {
+		t.Fatal("ReadTask accepted CompletedAt before StartedAt")
+	}
+}
+
+func TestCancelledReadTaskAllowsPreStartCancellation(t *testing.T) {
+	now := time.Date(2026, 7, 12, 18, 30, 0, 0, time.UTC)
+	input := json.RawMessage(`{"lookback_minutes":15}`)
+	task := domain.ReadTask{
+		ID: "task-1", WorkspaceID: "workspace-1", IncidentID: "incident-1", InvestigationID: "investigation-1",
+		Key: "metrics", Position: 1, ConnectorID: "prometheus-prod", Operation: "range_query",
+		Input: input, InputHash: sha256Hex(input), Status: domain.ReadTaskCancelled, FailureCode: "investigation_cancelled",
+		CreatedAt: now, CompletedAt: now, UpdatedAt: now,
+	}
+	if err := task.Validate(); err != nil {
+		t.Fatalf("Validate(pre-start CANCELLED) error = %v", err)
+	}
+}
+
+func TestSafeJSONObjectRejectsSensitivePathsNamesAndValuesWithoutEcho(t *testing.T) {
+	const canary = "sensitive-canary-value"
+	unsafe := map[string]json.RawMessage{
+		"API key field":                json.RawMessage(`{"api_key":"` + canary + `"}`),
+		"auth field":                   json.RawMessage(`{"auth":"` + canary + `"}`),
+		"accessor field":               json.RawMessage(`{"accessor":"` + canary + `"}`),
+		"control-obfuscated password":  json.RawMessage(`{"pass\u0000word":"` + canary + `"}`),
+		"duplicate field hides bearer": json.RawMessage(`{"message":"Bearer ` + canary + `","message":"ok"}`),
+		"error body path":              json.RawMessage(`{"error":{"body":"` + canary + `"}}`),
+		"nested raw error path":        json.RawMessage(`{"error":{"details":{"body":"raw-error-` + canary + `"}}}`),
+		"authorization name value": json.RawMessage(
+			`{"headers":[{"name":"Authorization","value":"` + canary + `"}]}`,
+		),
+		"authorization key value": json.RawMessage(
+			`{"headers":[{"key":"Authorization","value":"` + canary + `"}]}`,
+		),
+		"bearer value":              json.RawMessage(`{"message":"Bearer ` + canary + `"}`),
+		"password assignment value": json.RawMessage(`{"message":"password=` + canary + `"}`),
+		"cookie value":              json.RawMessage(`{"message":"Cookie: session=` + canary + `"}`),
+		"private key value":         json.RawMessage(`{"message":"-----BEGIN PRIVATE KEY-----` + canary + `"}`),
+		"token CLI option array":    json.RawMessage(`{"args":["collect","--token","` + canary + `"]}`),
+		"API key CLI option array":  json.RawMessage(`{"options":["--api-key=` + canary + `"]}`),
+		"accessor CLI option array": json.RawMessage(`{"command":["tool","--accessor","` + canary + `"]}`),
+		"embedded token CLI option": json.RawMessage(`{"message":"curl --token ` + canary + `"}`),
+		"quoted API key CLI option": json.RawMessage(`{"message":"tool \"--api-key\" ` + canary + `"}`),
+		"colon-obfuscated API key":  json.RawMessage(`{"api:key":"` + canary + `"}`),
+		"colon-obfuscated password": json.RawMessage(`{"pass:word":"` + canary + `"}`),
+		"colon-obfuscated assignment": json.RawMessage(
+			`{"message":"api:key=` + canary + ` pass:word=` + canary + `"}`,
+		),
+		"slash-obfuscated assignment":     json.RawMessage(`{"message":"pass/word=` + canary + `"}`),
+		"fullwidth-obfuscated assignment": json.RawMessage(`{"message":"api：key=` + canary + `"}`),
+	}
+	for name, value := range unsafe {
+		t.Run(name, func(t *testing.T) {
+			err := domain.ValidateSafeJSONObject(value)
+			if err == nil {
+				t.Fatal("ValidateSafeJSONObject() error = nil, want sensitive input rejection")
+			}
+			if strings.Contains(err.Error(), canary) {
+				t.Fatalf("error echoed sensitive input: %v", err)
+			}
+		})
+	}
+	if err := domain.ValidateSafeJSONObject(json.RawMessage(`{"message":"tokenization completed"}`)); err != nil {
+		t.Fatalf("ValidateSafeJSONObject(tokenization text) error = %v, want legal text", err)
+	}
+}
+
+func TestValidateSafeJSONObjectRejectsRawInvalidUTF8WithoutEcho(t *testing.T) {
+	value := append([]byte(`{"message":"pass`), 0xff)
+	value = append(value, []byte(`word=canary"}`)...)
+
+	err := domain.ValidateSafeJSONObject(value)
+	if err == nil {
+		t.Fatal("ValidateSafeJSONObject() error = nil, want invalid UTF-8 rejection")
+	}
+	if strings.Contains(err.Error(), "canary") {
+		t.Fatalf("ValidateSafeJSONObject() echoed invalid input: %v", err)
+	}
+}
+
+func TestValidateSafeJSONObjectRejectsReplacementRuneInKeysAndStringsWithoutEcho(t *testing.T) {
+	for name, value := range map[string]json.RawMessage{
+		"escaped lone surrogate value": json.RawMessage(`{"message":"canary-\ud800"}`),
+		"escaped lone surrogate key":   json.RawMessage(`{"\ud800":"canary"}`),
+		"replacement rune value":       json.RawMessage(`{"message":"canary-�"}`),
+		"replacement rune key":         json.RawMessage(`{"�":"canary"}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := domain.ValidateSafeJSONObject(value)
+			if err == nil {
+				t.Fatal("ValidateSafeJSONObject() error = nil, want invalid Unicode rejection")
+			}
+			if strings.Contains(err.Error(), "canary") {
+				t.Fatalf("ValidateSafeJSONObject() echoed invalid input: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateSafeJSONObjectRejectsUnicodeFormatCharactersWithoutEcho(t *testing.T) {
+	const canary = "unicode-format-canary"
+	for name, value := range map[string]json.RawMessage{
+		"zero width space value": json.RawMessage(`{"message":"` + canary + `​"}`),
+		"right-to-left override": json.RawMessage(`{"message":"` + canary + `‮"}`),
+		"word joiner key":        json.RawMessage(`{"field⁠":"` + canary + `"}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := domain.ValidateSafeJSONObject(value)
+			if err == nil {
+				t.Fatal("ValidateSafeJSONObject() error = nil, want Unicode Cf rejection")
+			}
+			if strings.Contains(err.Error(), canary) {
+				t.Fatalf("ValidateSafeJSONObject() echoed input: %v", err)
+			}
+		})
+	}
+}
+
+func TestEvidenceAttributesRejectSensitiveNamesAndValues(t *testing.T) {
+	now := time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC)
+	payload := json.RawMessage(`{"series_count":3}`)
+	valid := domain.Evidence{
+		ID: "evidence-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
+		InvestigationID: "investigation-1", TaskID: "task-1", ConnectorID: "prometheus-prod",
+		ContentHash: sha256Hex(payload), Payload: payload, CollectedAt: now, CreatedAt: now,
+	}
+	const canary = "attribute-sensitive-canary"
+	unsafe := map[string]map[string]string{
+		"authorization name":             {"authorization": canary},
+		"credential name":                {"credential_ref": canary},
+		"raw error name":                 {"raw_error_body": canary},
+		"secret name":                    {"secret": canary},
+		"token name":                     {"access_token": canary},
+		"password name":                  {"password": canary},
+		"semantic name":                  {"name": "Authorization", "value": canary},
+		"bearer value":                   {"message": "Bearer " + canary},
+		"credential assignment":          {"message": "password : " + canary},
+		"prefixed credential assignment": {"message": "client_secret: " + canary},
+		"invalid UTF-8 value":            {"message": canary + string([]byte{0xff})},
+		"NUL value":                      {"message": canary + "\x00text"},
+		"Unicode control value":          {"message": canary + "\u0085text"},
+		"replacement rune value":         {"message": canary + "�"},
+	}
+	for name, attributes := range unsafe {
+		t.Run(name, func(t *testing.T) {
+			item := valid
+			item.Attributes = attributes
+			err := item.Validate()
+			if err == nil {
+				t.Fatalf("Evidence.Validate() accepted unsafe attributes %#v", attributes)
+			}
+			if strings.Contains(err.Error(), canary) {
+				t.Fatalf("Evidence.Validate() echoed sensitive attribute: %v", err)
+			}
+		})
+	}
+	readableUnicode := valid
+	readableUnicode.Attributes = map[string]string{"message": "服务已经恢复"}
+	if err := readableUnicode.Validate(); err != nil {
+		t.Fatalf("Evidence.Validate(readable Unicode) error = %v", err)
+	}
+}
+
+func TestEvidenceRejectsSensitivePayloadJSONWithoutEcho(t *testing.T) {
+	now := time.Date(2026, 7, 12, 18, 15, 0, 0, time.UTC)
+	const canary = "evidence-json-canary"
+	for name, payload := range map[string]json.RawMessage{
+		"API key":            json.RawMessage(`{"api_key":"` + canary + `"}`),
+		"auth":               json.RawMessage(`{"auth":"` + canary + `"}`),
+		"accessor":           json.RawMessage(`{"accessor":"` + canary + `"}`),
+		"control-obfuscated": json.RawMessage(`{"pass\u0000word":"` + canary + `"}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			evidence := domain.Evidence{
+				ID: "evidence-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
+				InvestigationID: "investigation-1", TaskID: "task-1", ConnectorID: "prometheus-prod",
+				ContentHash: sha256Hex(payload), Payload: payload, CollectedAt: now, CreatedAt: now,
+			}
+			err := evidence.Validate()
+			if err == nil {
+				t.Fatal("Validate() error = nil, want sensitive payload rejection")
+			}
+			if strings.Contains(err.Error(), canary) {
+				t.Fatalf("Validate() echoed sensitive payload: %v", err)
+			}
+		})
+	}
+}
+
+func TestSafeTextAndMetadataEnforceUnicodeSafety(t *testing.T) {
+	invalidUTF8 := "canary" + string([]byte{0xff})
+	for name, value := range map[string]string{
+		"invalid UTF-8":    invalidUTF8,
+		"NUL":              "canary\x00text",
+		"Unicode control":  "canary\u0085text",
+		"replacement rune": "canary�",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if domain.ValidSafeText(value) {
+				t.Fatalf("ValidSafeText(%q) = true, want Unicode rejection", value)
+			}
+			if domain.ValidSafeMetadata("message", value) {
+				t.Fatalf("ValidSafeMetadata(value %q) = true, want Unicode rejection", value)
+			}
+			if domain.ValidSafeMetadata(value, "readable") {
+				t.Fatalf("ValidSafeMetadata(name %q) = true, want Unicode rejection", value)
+			}
+		})
+	}
+
+	if !domain.ValidSafeText("数据库连接池已恢复") {
+		t.Fatal("ValidSafeText() rejected readable Chinese text")
+	}
+	if !domain.ValidSafeMetadata("message", "服务已经恢复") {
+		t.Fatal("ValidSafeMetadata() rejected readable Chinese value")
+	}
+}
+
+func TestSafeTextAndMetadataRejectCredentialAssignmentVariants(t *testing.T) {
+	for name, value := range map[string]string{
+		"password":               "password=canary",
+		"prefixed password":      "dbPassword=canary",
+		"token":                  "TOKEN : canary",
+		"prefixed token":         "accessToken=canary",
+		"secret":                 "secret = canary",
+		"prefixed secret":        "client_secret: canary",
+		"credential":             "credential:canary",
+		"prefixed credential":    "dbCredential=canary",
+		"authorization":          "authorization = canary",
+		"prefixed authorization": "httpAuthorization=canary",
+		"cookie":                 "cookie: canary",
+		"prefixed cookie":        "sessionCookie=canary",
+		"api key":                "api-key = canary",
+		"prefixed API key":       "clientApiKey=canary",
+		"accessor":               "accessor=canary",
+		"prefixed accessor":      "dbAccessor=canary",
+		"private key":            "private.key: canary",
+		"prefixed private key":   "clientPrivateKey=canary",
+		"embedded token option":  "curl --token canary",
+		"quoted API key option":  `tool "--api-key" canary`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if domain.ValidSafeText(value) {
+				t.Fatalf("ValidSafeText(%q) = true, want credential assignment rejection", value)
+			}
+			if domain.ValidSafeMetadata("message", value) {
+				t.Fatalf("ValidSafeMetadata(%q) = true, want credential assignment rejection", value)
+			}
+		})
+	}
+
+	if !domain.ValidSafeText("tokenization completed") {
+		t.Fatal("ValidSafeText() rejected ordinary non-assignment text")
+	}
+	if !domain.ValidSafeMetadata("message", "tokenization completed") {
+		t.Fatal("ValidSafeMetadata() rejected ordinary non-assignment text")
+	}
+}
+
+func TestIdempotencyKeyUsesDedicatedLowercaseBoundedGrammar(t *testing.T) {
+	for _, valid := range []string{"investigate:incident-1", "task/complete_1", "a.b-c:d/e"} {
+		if !domain.ValidIdempotencyKey(valid) {
+			t.Fatalf("ValidIdempotencyKey(%q) = false, want true", valid)
+		}
+	}
+	for _, invalid := range []string{
+		"Investigate:incident-1", "user@example", "with space", "line\nbreak", "nul\x00byte", strings.Repeat("a", 129),
+	} {
+		if domain.ValidIdempotencyKey(invalid) {
+			t.Fatalf("ValidIdempotencyKey(%q) = true, want false", invalid)
+		}
+	}
+}
+
+func TestInvestigationFailureCodeIsBoundToFailureStates(t *testing.T) {
+	now := time.Date(2026, 7, 12, 11, 30, 0, 0, time.UTC)
+	queued := domain.Investigation{
+		ID: "investigation-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
+		Status: domain.InvestigationQueued, ModelStatus: domain.ModelPending,
+		IdempotencyKey: "investigate:1", RequestHash: strings.Repeat("a", 64),
+		CreatedAt: now, UpdatedAt: now,
+	}
+	queued.FailureCode = "internal_failure"
+	if err := queued.Validate(); err == nil {
+		t.Fatal("QUEUED Investigation accepted FailureCode")
+	}
+
+	failed := queued
+	failed.Status = domain.InvestigationFailed
+	failed.ModelStatus = domain.ModelCancelled
+	failed.FailureCode = ""
+	failed.CompletedAt = now
+	if err := failed.Validate(); err == nil {
+		t.Fatal("FAILED Investigation accepted empty FailureCode")
+	}
+	failed.FailureCode = "internal_failure"
+	if err := failed.Validate(); err != nil {
+		t.Fatalf("FAILED Investigation valid failure code error = %v", err)
+	}
+	failed.ModelStatus = domain.ModelFailed
+	failed.ModelFailureCode = "model_unavailable"
+	if err := failed.Validate(); err == nil {
+		t.Fatal("FAILED Investigation accepted model-owned failure state")
+	}
+}
+
+func TestCancelledInvestigationUsesDistinctModelCancelledStatus(t *testing.T) {
+	now := time.Date(2026, 7, 12, 13, 30, 0, 0, time.UTC)
+	cancelled := domain.Investigation{
+		ID: "investigation-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
+		Status: domain.InvestigationCancelled, ModelStatus: domain.ModelSkipped, FailureCode: "cancelled",
+		IdempotencyKey: "investigate:1", RequestHash: strings.Repeat("a", 64),
+		CreatedAt: now, CompletedAt: now, UpdatedAt: now,
+	}
+	if err := cancelled.Validate(); err == nil {
+		t.Fatal("CANCELLED Investigation accepted SKIPPED model status")
+	}
+	cancelled.ModelStatus = domain.ModelCancelled
+	if err := cancelled.Validate(); err != nil {
+		t.Fatalf("CANCELLED Investigation with ModelCancelled error = %v", err)
+	}
+}

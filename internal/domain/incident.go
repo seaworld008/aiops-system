@@ -2,8 +2,13 @@ package domain
 
 import (
 	"fmt"
+	"regexp"
 	"time"
 )
+
+const MaxCorrelationKeyBytes = 512
+
+var correlationKeyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._:/@-]*$`)
 
 type IncidentStatus string
 
@@ -24,34 +29,54 @@ var incidentTransitions = map[IncidentStatus]IncidentStatus{
 
 type Incident struct {
 	ID                    string
+	TenantID              string
 	WorkspaceID           string
 	ServiceID             string
 	EnvironmentID         string
+	CorrelationKey        string
+	MappingStatus         MappingStatus
 	Severity              string
 	Title                 string
 	Status                IncidentStatus
 	ConfirmedHypothesisID string
 	OpenedAt              time.Time
+	LastSignalAt          time.Time
 	UpdatedAt             time.Time
+	SignalCount           int
 	Version               int64
 }
 
+// NewIncident is a legacy-only constructor that assumes tenant and workspace IDs are identical.
+// New repositories, including Memory and persistence adapters, must resolve a trusted tenant and use NewIncidentForTenant.
 func NewIncident(id, workspaceID string, now time.Time) Incident {
+	return NewIncidentForTenant(id, workspaceID, workspaceID, now)
+}
+
+// NewIncidentForTenant constructs an incident with independently trusted tenant and workspace scope.
+func NewIncidentForTenant(id, tenantID, workspaceID string, now time.Time) Incident {
 	return Incident{
-		ID:          id,
-		WorkspaceID: workspaceID,
-		Severity:    "UNKNOWN",
-		Title:       "Unclassified operational incident",
-		Status:      IncidentOpen,
-		OpenedAt:    now,
-		UpdatedAt:   now,
-		Version:     1,
+		ID:            id,
+		TenantID:      tenantID,
+		WorkspaceID:   workspaceID,
+		MappingStatus: MappingUnresolved,
+		Severity:      "UNKNOWN",
+		Title:         "Unclassified operational incident",
+		Status:        IncidentOpen,
+		OpenedAt:      now,
+		UpdatedAt:     now,
+		Version:       1,
 	}
 }
 
 func (incident Incident) Validate() error {
-	if incident.ID == "" || incident.WorkspaceID == "" || incident.Severity == "" || incident.Title == "" {
-		return fmt.Errorf("incident id, workspace id, severity and title are required")
+	if !ValidResourceID(incident.ID) || !ValidResourceID(incident.TenantID) || !ValidResourceID(incident.WorkspaceID) ||
+		(incident.ServiceID != "" && !ValidResourceID(incident.ServiceID)) ||
+		(incident.EnvironmentID != "" && !ValidResourceID(incident.EnvironmentID)) ||
+		(incident.ConfirmedHypothesisID != "" && !ValidResourceID(incident.ConfirmedHypothesisID)) {
+		return fmt.Errorf("incident resource identifiers are invalid")
+	}
+	if incident.Severity == "" || incident.Title == "" {
+		return fmt.Errorf("incident id, tenant id, workspace id, severity and title are required")
 	}
 	if incident.OpenedAt.IsZero() || incident.UpdatedAt.IsZero() || incident.UpdatedAt.Before(incident.OpenedAt) {
 		return fmt.Errorf("incident timestamps are invalid")
@@ -59,12 +84,38 @@ func (incident Incident) Validate() error {
 	if incident.Version <= 0 {
 		return fmt.Errorf("incident version must be positive")
 	}
+	if incident.CorrelationKey == "" {
+		if !incident.LastSignalAt.IsZero() || incident.SignalCount != 0 {
+			return fmt.Errorf("uncorrelated incident cannot have signal metadata")
+		}
+	} else {
+		if !ValidCorrelationKey(incident.CorrelationKey) {
+			return fmt.Errorf("incident correlation key is not canonical")
+		}
+		if incident.LastSignalAt.IsZero() || incident.SignalCount <= 0 ||
+			incident.LastSignalAt.Before(incident.OpenedAt) || incident.LastSignalAt.After(incident.UpdatedAt) {
+			return fmt.Errorf("correlated incident signal time and count are inconsistent")
+		}
+	}
+	switch incident.MappingStatus {
+	case MappingExact:
+		if incident.ServiceID == "" || incident.EnvironmentID == "" {
+			return fmt.Errorf("exact incident mapping requires service and environment")
+		}
+	case MappingAmbiguous, MappingUnresolved:
+	default:
+		return fmt.Errorf("invalid incident mapping status %q", incident.MappingStatus)
+	}
 	switch incident.Status {
 	case IncidentOpen, IncidentInvestigating, IncidentMitigating, IncidentResolved, IncidentClosed:
 	default:
 		return fmt.Errorf("invalid incident status %q", incident.Status)
 	}
 	return nil
+}
+
+func ValidCorrelationKey(value string) bool {
+	return len(value) > 0 && len(value) <= MaxCorrelationKeyBytes && correlationKeyPattern.MatchString(value)
 }
 
 func (incident Incident) ValidateForCreate() error {
@@ -100,10 +151,25 @@ func (incident *Incident) ConfirmRootCause(hypothesis *Hypothesis, actor Actor) 
 }
 
 func (incident *Incident) ConfirmRootCauseAt(hypothesis *Hypothesis, actor Actor, now time.Time) error {
-	if actor.Type != ActorHuman || actor.ID == "" {
+	if incident == nil {
+		return fmt.Errorf("root cause confirmation requires a valid incident")
+	}
+	if err := incident.Validate(); err != nil {
+		return fmt.Errorf("root cause confirmation requires a valid incident")
+	}
+	if incident.ConfirmedHypothesisID != "" {
+		return fmt.Errorf("incident already has a confirmed root cause")
+	}
+	if actor.Type != ActorHuman || !ValidResourceID(actor.ID) {
 		return fmt.Errorf("root cause confirmation requires an authenticated human")
 	}
-	if hypothesis == nil || hypothesis.ID == "" || hypothesis.Status != HypothesisProposed {
+	if hypothesis == nil {
+		return fmt.Errorf("root cause confirmation requires a valid hypothesis")
+	}
+	if err := hypothesis.Validate(); err != nil {
+		return fmt.Errorf("root cause confirmation requires a valid hypothesis")
+	}
+	if hypothesis.Status != HypothesisProposed {
 		return fmt.Errorf("only a proposed hypothesis can be confirmed")
 	}
 	if hypothesis.WorkspaceID != incident.WorkspaceID || hypothesis.IncidentID != incident.ID {
@@ -112,9 +178,19 @@ func (incident *Incident) ConfirmRootCauseAt(hypothesis *Hypothesis, actor Actor
 	if now.IsZero() || now.Before(incident.UpdatedAt) {
 		return fmt.Errorf("root cause confirmation time cannot move backward")
 	}
-	hypothesis.Status = HypothesisConfirmed
-	incident.ConfirmedHypothesisID = hypothesis.ID
-	incident.UpdatedAt = now.UTC()
-	incident.Version++
+	hypothesisCandidate := *hypothesis
+	hypothesisCandidate.Status = HypothesisConfirmed
+	incidentCandidate := *incident
+	incidentCandidate.ConfirmedHypothesisID = hypothesis.ID
+	incidentCandidate.UpdatedAt = now.UTC()
+	incidentCandidate.Version++
+	if err := hypothesisCandidate.Validate(); err != nil {
+		return fmt.Errorf("root cause confirmation produced an invalid hypothesis")
+	}
+	if err := incidentCandidate.Validate(); err != nil {
+		return fmt.Errorf("root cause confirmation produced an invalid incident")
+	}
+	*incident = incidentCandidate
+	*hypothesis = hypothesisCandidate
 	return nil
 }
