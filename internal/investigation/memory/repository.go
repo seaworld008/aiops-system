@@ -20,7 +20,7 @@ type Repository struct {
 	signals                      map[scopeKey]domain.Signal
 	incidents                    map[scopeKey]domain.Incident
 	activeIncidentByCorrelation  map[scopeKey]string
-	signalIncident               map[scopeKey]string
+	signalIncident               map[scopeKey]signalAssociationRecord
 	investigations               map[scopeKey]domain.Investigation
 	tasks                        map[scopeKey]domain.ReadTask
 	taskIDsByInvestigation       map[scopeKey][]string
@@ -55,7 +55,7 @@ func New(options Options) (*Repository, error) {
 		signals:                      make(map[scopeKey]domain.Signal),
 		incidents:                    make(map[scopeKey]domain.Incident),
 		activeIncidentByCorrelation:  make(map[scopeKey]string),
-		signalIncident:               make(map[scopeKey]string),
+		signalIncident:               make(map[scopeKey]signalAssociationRecord),
 		investigations:               make(map[scopeKey]domain.Investigation),
 		tasks:                        make(map[scopeKey]domain.ReadTask),
 		taskIDsByInvestigation:       make(map[scopeKey][]string),
@@ -80,6 +80,21 @@ func New(options Options) (*Repository, error) {
 type idempotencyRecord struct {
 	requestHash string
 	resourceID  string
+}
+
+type signalAssociationRecord struct {
+	incidentID     string
+	correlationKey string
+	mappingStatus  domain.MappingStatus
+	serviceID      string
+	environmentID  string
+}
+
+func (record signalAssociationRecord) matches(request investigation.CorrelateSignalRequest) bool {
+	return record.correlationKey == request.CorrelationKey &&
+		record.mappingStatus == request.MappingStatus &&
+		record.serviceID == request.ServiceID &&
+		record.environmentID == request.EnvironmentID
 }
 
 type taskCompletionRecord struct {

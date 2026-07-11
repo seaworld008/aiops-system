@@ -24,8 +24,10 @@ var (
 var taskKeyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,63}$`)
 
 var (
-	targetURISchemePattern = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://`)
-	targetHostPortPattern  = regexp.MustCompile(`(?i)^(?:[a-z0-9.-]+|\[[0-9a-f:]+\]):[0-9]{1,5}$`)
+	targetURISchemePattern      = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://`)
+	targetSchemeRelativePattern = regexp.MustCompile(`(?i)(?:^|[\s"\x27(=])//(?:[a-z0-9.-]+|\[[0-9a-f:]+\])(?::[0-9]{1,5})?(?:[/#?]|$)`)
+	targetHostPortPattern       = regexp.MustCompile(`(?i)^(?:[a-z0-9.-]+|\[[0-9a-f:]+\]):[0-9]{1,5}$`)
+	targetAssignmentPattern     = regexp.MustCompile(`(?i)(^|[^a-z0-9])(host(?:[\s_.-]*name)?|port|dsn|endpoint|url|uri|address|server|target|cluster)[\s_.-]*[:=][\s]*`)
 )
 
 type TaskSpec struct {
@@ -302,5 +304,43 @@ func forbiddenTaskFieldName(value string) bool {
 
 func unsafeTaskTargetValue(value string) bool {
 	trimmed := strings.TrimSpace(value)
-	return targetURISchemePattern.MatchString(trimmed) || targetHostPortPattern.MatchString(trimmed)
+	return targetURISchemePattern.MatchString(trimmed) || targetSchemeRelativePattern.MatchString(trimmed) ||
+		targetHostPortPattern.MatchString(trimmed) || containsTaskTargetAssignment(trimmed)
+}
+
+func containsTaskTargetAssignment(value string) bool {
+	for _, match := range targetAssignmentPattern.FindAllStringSubmatchIndex(value, -1) {
+		valueStart := match[1]
+		if valueStart >= len(value) {
+			continue
+		}
+		remaining := value[valueStart:]
+		if insideTaskSelector(value, match[4]) &&
+			(strings.HasPrefix(remaining, `"`) || strings.HasPrefix(remaining, `~"`)) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func insideTaskSelector(value string, position int) bool {
+	depth := 0
+	quoted := false
+	escaped := false
+	for index := 0; index < position; index++ {
+		switch current := value[index]; {
+		case escaped:
+			escaped = false
+		case quoted && current == '\\':
+			escaped = true
+		case current == '"':
+			quoted = !quoted
+		case !quoted && current == '{':
+			depth++
+		case !quoted && current == '}' && depth > 0:
+			depth--
+		}
+	}
+	return depth > 0
 }

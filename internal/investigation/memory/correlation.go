@@ -81,8 +81,11 @@ func (repository *Repository) CorrelateSignal(ctx context.Context, request inves
 	if !exists {
 		return investigation.CorrelateSignalResult{}, store.ErrNotFound
 	}
-	if incidentID, associated := repository.signalIncident[signalKey]; associated {
-		incident, incidentExists := repository.incidents[scoped(request.WorkspaceID, incidentID)]
+	if association, associated := repository.signalIncident[signalKey]; associated {
+		if !association.matches(request) {
+			return investigation.CorrelateSignalResult{}, store.ErrIdempotencyConflict
+		}
+		incident, incidentExists := repository.incidents[scoped(request.WorkspaceID, association.incidentID)]
 		if !incidentExists {
 			return investigation.CorrelateSignalResult{}, store.ErrNotFound
 		}
@@ -142,7 +145,10 @@ func (repository *Repository) CorrelateSignal(ctx context.Context, request inves
 		}
 		repository.incidents[scoped(request.WorkspaceID, incident.ID)] = incident
 	}
-	repository.signalIncident[signalKey] = incident.ID
+	repository.signalIncident[signalKey] = signalAssociationRecord{
+		incidentID: incident.ID, correlationKey: request.CorrelationKey, mappingStatus: request.MappingStatus,
+		serviceID: request.ServiceID, environmentID: request.EnvironmentID,
+	}
 	return investigation.CorrelateSignalResult{
 		Incident: cloneIncident(incident), Created: created, Associated: true, Counted: true,
 	}, nil

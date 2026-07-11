@@ -25,21 +25,31 @@ func TestCanonicalTaskSpecsRejectConnectionAndCredentialMaterial(t *testing.T) {
 	}
 
 	for name, input := range map[string]string{
-		"url":           `{"target_url":"https://example.invalid"}`,
-		"endpoint":      `{"endpoint":"internal"}`,
-		"header":        `{"headers":{"x-scope":"value"}}`,
-		"auth":          `{"auth_mode":"bearer"}`,
-		"secret":        `{"secret_ref":"vault/path"}`,
-		"token":         `{"page_token":"opaque"}`,
-		"password":      `{"password":"redacted"}`,
-		"credential":    `{"credential_id":"id"}`,
-		"host and port": `{"host":"db.internal","port":5432}`,
-		"dsn":           `{"dsn":"postgres://db.internal:5432/app"}`,
-		"name value":    `{"name":"endpoint","value":"https://internal.invalid"}`,
-		"key value":     `{"parameters":[{"key":"endpoint","value":"db.internal"}]}`,
-		"query target":  `{"query":"https://169.254.169.254/latest"}`,
-		"proxy server":  `{"proxy_server":"proxy.internal:8443"}`,
-		"non-object":    `[]`,
+		"url":                            `{"target_url":"https://example.invalid"}`,
+		"endpoint":                       `{"endpoint":"internal"}`,
+		"header":                         `{"headers":{"x-scope":"value"}}`,
+		"auth":                           `{"auth_mode":"bearer"}`,
+		"secret":                         `{"secret_ref":"vault/path"}`,
+		"token":                          `{"page_token":"opaque"}`,
+		"password":                       `{"password":"redacted"}`,
+		"credential":                     `{"credential_id":"id"}`,
+		"host and port":                  `{"host":"db.internal","port":5432}`,
+		"dsn":                            `{"dsn":"postgres://db.internal:5432/app"}`,
+		"name value":                     `{"name":"endpoint","value":"https://internal.invalid"}`,
+		"key value":                      `{"parameters":[{"key":"endpoint","value":"db.internal"}]}`,
+		"query target":                   `{"query":"https://169.254.169.254/latest"}`,
+		"scheme relative target":         `{"query":"//169.254.169.254/latest"}`,
+		"query host and port assignment": `{"query":"host=db.internal port=5432"}`,
+		"text dsn assignment":            `{"text":"dsn=postgresql://db.internal/app"}`,
+		"text endpoint assignment":       `{"text":"endpoint=db.internal"}`,
+		"text url assignment":            `{"text":"url=internal.invalid/path"}`,
+		"text uri assignment":            `{"text":"uri=/admin"}`,
+		"text address assignment":        `{"text":"address=10.0.0.8"}`,
+		"text server assignment":         `{"text":"server=db.internal"}`,
+		"text target assignment":         `{"text":"target=payments.internal"}`,
+		"text cluster assignment":        `{"text":"cluster=prod-east"}`,
+		"proxy server":                   `{"proxy_server":"proxy.internal:8443"}`,
+		"non-object":                     `[]`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			item := valid
@@ -51,8 +61,10 @@ func TestCanonicalTaskSpecsRejectConnectionAndCredentialMaterial(t *testing.T) {
 	}
 
 	for name, query := range map[string]string{
-		"promql": `rate(http_requests_total{service="payments"}[5m]) > 0`,
-		"logql":  `{app="payments"} |= "timeout: upstream"`,
+		"promql":                    `rate(http_requests_total{service="payments"}[5m]) > 0`,
+		"promql target-like labels": `rate(http_requests_total{host="api.internal", cluster="prod"}[5m]) > 0`,
+		"logql":                     `{app="payments"} |= "timeout: upstream"`,
+		"logql target-like labels":  `{server="api.internal", cluster=~"prod-.+"} |= "timeout"`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			input := []byte(`{"query":` + string(mustJSON(t, query)) + `}`)

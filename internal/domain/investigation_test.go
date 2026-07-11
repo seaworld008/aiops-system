@@ -177,9 +177,10 @@ func TestSafeJSONObjectRejectsSensitivePathsNamesAndValuesWithoutEcho(t *testing
 		"authorization key value": json.RawMessage(
 			`{"headers":[{"key":"Authorization","value":"` + canary + `"}]}`,
 		),
-		"bearer value":      json.RawMessage(`{"message":"Bearer ` + canary + `"}`),
-		"cookie value":      json.RawMessage(`{"message":"Cookie: session=` + canary + `"}`),
-		"private key value": json.RawMessage(`{"message":"-----BEGIN PRIVATE KEY-----` + canary + `"}`),
+		"bearer value":              json.RawMessage(`{"message":"Bearer ` + canary + `"}`),
+		"password assignment value": json.RawMessage(`{"message":"password=` + canary + `"}`),
+		"cookie value":              json.RawMessage(`{"message":"Cookie: session=` + canary + `"}`),
+		"private key value":         json.RawMessage(`{"message":"-----BEGIN PRIVATE KEY-----` + canary + `"}`),
 	}
 	for name, value := range unsafe {
 		t.Run(name, func(t *testing.T) {
@@ -212,6 +213,7 @@ func TestEvidenceAttributesRejectSensitiveNamesAndValues(t *testing.T) {
 		{"password": canary},
 		{"name": "Authorization", "value": canary},
 		{"message": "Bearer " + canary},
+		{"message": "password : " + canary},
 	}
 	for _, attributes := range unsafe {
 		item := valid
@@ -223,6 +225,26 @@ func TestEvidenceAttributesRejectSensitiveNamesAndValues(t *testing.T) {
 		if strings.Contains(err.Error(), canary) {
 			t.Fatalf("Evidence.Validate() echoed sensitive attribute: %v", err)
 		}
+	}
+}
+
+func TestValidSafeTextRejectsCredentialAssignmentVariants(t *testing.T) {
+	for name, value := range map[string]string{
+		"password":      "password=canary",
+		"token":         "TOKEN : canary",
+		"secret":        "secret = canary",
+		"credential":    "credential:canary",
+		"authorization": "authorization = canary",
+		"cookie":        "cookie: canary",
+		"api key":       "api-key = canary",
+		"accessor":      "accessor=canary",
+		"private key":   "private.key: canary",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if domain.ValidSafeText(value) {
+				t.Fatalf("ValidSafeText(%q) = true, want credential assignment rejection", value)
+			}
+		})
 	}
 }
 

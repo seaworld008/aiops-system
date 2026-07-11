@@ -48,6 +48,56 @@ func TestCorrelateFiringSignalCreatesOneIncidentAndReplayDoesNotRecount(t *testi
 	}
 }
 
+func TestCorrelateSignalReplayRequiresOriginalRequestSemantics(t *testing.T) {
+	now := time.Date(2026, 7, 12, 16, 0, 0, 0, time.UTC)
+	repository := newRepository(t, now)
+	signal := testSignal("workspace-1", "signal-replay", "firing", now)
+	if created, err := repository.RegisterSignal(context.Background(), signal); err != nil || !created {
+		t.Fatalf("RegisterSignal() = %v, %v; want true, nil", created, err)
+	}
+	request := investigation.CorrelateSignalRequest{
+		WorkspaceID: "workspace-1", SignalID: signal.ID, CorrelationKey: "key-a",
+		ServiceID: "payments", EnvironmentID: "prod", MappingStatus: domain.MappingExact,
+	}
+	first, err := repository.CorrelateSignal(context.Background(), request)
+	if err != nil {
+		t.Fatalf("CorrelateSignal(first) error = %v", err)
+	}
+	replay, err := repository.CorrelateSignal(context.Background(), request)
+	if err != nil {
+		t.Fatalf("CorrelateSignal(exact replay) error = %v", err)
+	}
+	if replay.Incident.ID != first.Incident.ID || replay.Counted || !replay.Associated {
+		t.Fatalf("CorrelateSignal(exact replay) = %#v, want same uncounted incident", replay)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*investigation.CorrelateSignalRequest)
+	}{
+		{name: "correlation key", mutate: func(value *investigation.CorrelateSignalRequest) { value.CorrelationKey = "key-b" }},
+		{name: "mapping status", mutate: func(value *investigation.CorrelateSignalRequest) { value.MappingStatus = domain.MappingAmbiguous }},
+		{name: "service ID", mutate: func(value *investigation.CorrelateSignalRequest) { value.ServiceID = "checkout" }},
+		{name: "environment ID", mutate: func(value *investigation.CorrelateSignalRequest) { value.EnvironmentID = "staging" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			changed := request
+			test.mutate(&changed)
+			if _, err := repository.CorrelateSignal(context.Background(), changed); !errors.Is(err, store.ErrIdempotencyConflict) {
+				t.Fatalf("CorrelateSignal(changed replay) error = %v, want ErrIdempotencyConflict", err)
+			}
+		})
+	}
+
+	incident, err := repository.GetIncident(context.Background(), request.WorkspaceID, first.Incident.ID)
+	if err != nil {
+		t.Fatalf("GetIncident() error = %v", err)
+	}
+	if incident.SignalCount != 1 {
+		t.Fatalf("SignalCount = %d, want unchanged count 1", incident.SignalCount)
+	}
+}
+
 func TestResolvedSignalOnlyAssociatesAnExistingActiveIncidentOnce(t *testing.T) {
 	now := time.Date(2026, 7, 11, 13, 0, 0, 0, time.UTC)
 	repository := newRepository(t, now)

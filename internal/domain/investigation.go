@@ -16,10 +16,11 @@ const MaxResourceIDBytes = 256
 const maxInvestigationJSONDepth = 32
 
 var (
-	sha256HexPattern      = regexp.MustCompile(`^[a-f0-9]{64}$`)
-	identifierPattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@-]*$`)
-	idempotencyKeyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._:/-]{0,127}$`)
-	lowCardinalityPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]*$`)
+	sha256HexPattern            = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	identifierPattern           = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@-]*$`)
+	idempotencyKeyPattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9._:/-]{0,127}$`)
+	lowCardinalityPattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]*$`)
+	credentialAssignmentPattern = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])(?:password|token|secret|credential|authorization|cookie|api[\s_.-]*key|accessor|private[\s_.-]*key)[\s_.-]*[:=]`)
 )
 
 type InvestigationStatus string
@@ -544,6 +545,9 @@ func unsafeSecurityName(value string) bool {
 }
 
 func unsafeSecurityValue(value string) bool {
+	if credentialAssignmentPattern.MatchString(value) {
+		return true
+	}
 	normalized := strings.ToLower(strings.TrimSpace(value))
 	for _, marker := range []string{
 		"bearer ", "authorization", "cookie", "set-cookie", "begin private key", "begin rsa private key",

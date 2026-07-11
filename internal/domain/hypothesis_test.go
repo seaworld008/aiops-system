@@ -56,11 +56,13 @@ func TestHypothesisRejectsSensitiveSummaryAndUnknownTextWithoutEcho(t *testing.T
 	}
 	const canary = "hypothesis-sensitive-canary"
 	for name, mutate := range map[string]func(*domain.Hypothesis){
-		"bearer summary":        func(value *domain.Hypothesis) { value.Summary = "Bearer " + canary },
-		"authorization summary": func(value *domain.Hypothesis) { value.Summary = "Authorization " + canary },
-		"cookie unknown":        func(value *domain.Hypothesis) { value.Unknowns = []string{"Cookie " + canary} },
-		"private key unknown":   func(value *domain.Hypothesis) { value.Unknowns = []string{"BEGIN PRIVATE KEY " + canary} },
-		"raw error unknown":     func(value *domain.Hypothesis) { value.Unknowns = []string{"raw error body " + canary} },
+		"bearer summary":              func(value *domain.Hypothesis) { value.Summary = "Bearer " + canary },
+		"authorization summary":       func(value *domain.Hypothesis) { value.Summary = "Authorization " + canary },
+		"password assignment summary": func(value *domain.Hypothesis) { value.Summary = "PASSWORD = " + canary },
+		"cookie unknown":              func(value *domain.Hypothesis) { value.Unknowns = []string{"Cookie " + canary} },
+		"token assignment unknown":    func(value *domain.Hypothesis) { value.Unknowns = []string{"token: " + canary} },
+		"private key unknown":         func(value *domain.Hypothesis) { value.Unknowns = []string{"BEGIN PRIVATE KEY " + canary} },
+		"raw error unknown":           func(value *domain.Hypothesis) { value.Unknowns = []string{"raw error body " + canary} },
 	} {
 		t.Run(name, func(t *testing.T) {
 			item := base
