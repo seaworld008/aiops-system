@@ -179,6 +179,7 @@ CREATE TABLE credential_revocations (
     ),
     CONSTRAINT credential_revocations_time_ck CHECK (
         credential_ttl_seconds BETWEEN 1 AND 900 AND
+        created_at > '-infinity'::timestamptz AND created_at < 'infinity'::timestamptz AND
         credential_expires_at > '-infinity'::timestamptz AND credential_expires_at < 'infinity'::timestamptz AND
         credential_expires_at > created_at AND
         credential_expires_at <= created_at + interval '15 minutes' AND
@@ -187,6 +188,16 @@ CREATE TABLE credential_revocations (
         (retry_cycle_started_at IS NULL OR (
             retry_cycle_started_at > '-infinity'::timestamptz AND retry_cycle_started_at < 'infinity'::timestamptz
         )) AND
+        (manual_required_at IS NULL OR (
+            manual_required_at > '-infinity'::timestamptz AND manual_required_at < 'infinity'::timestamptz AND
+            manual_required_at >= created_at AND manual_required_at <= updated_at
+        )) AND
+        (revoked_at IS NULL OR (
+            revoked_at > '-infinity'::timestamptz AND revoked_at < 'infinity'::timestamptz AND
+            revoked_at >= created_at AND revoked_at <= updated_at
+        )) AND
+        (manual_required_at IS NULL OR revoked_at IS NULL OR revoked_at >= manual_required_at) AND
+        updated_at > '-infinity'::timestamptz AND updated_at < 'infinity'::timestamptz AND
         updated_at >= created_at
     ),
     CONSTRAINT credential_revocations_hashes_ck CHECK (
@@ -330,6 +341,9 @@ CREATE INDEX credential_revocations_exhausted_recovery_idx
     ON credential_revocations (retry_cycle_started_at, revocation_id)
     INCLUDE (attempt, retry_cycle_attempt_base, claim_expires_at)
     WHERE status IN ('REVOCATION_PENDING', 'REVOKING');
+
+CREATE INDEX credential_revocations_management_idx
+    ON credential_revocations (workspace_id, environment_id, status, created_at DESC, revocation_id DESC);
 
 -- Signed submission columns are routed through an UPDATE OF trigger so routine
 -- heartbeat updates never detoast and compare the bounded 256 KiB envelope.
@@ -691,6 +705,8 @@ CREATE CONSTRAINT TRIGGER credential_revocations_action_marker_shape
     FOR EACH ROW EXECUTE FUNCTION validate_credential_revocation_action_marker();
 
 CREATE OR REPLACE FUNCTION enforce_credential_revocation_transition() RETURNS trigger AS $$
+DECLARE
+    transition_at timestamptz;
 BEGIN
     IF TG_OP = 'INSERT' THEN
         IF NEW.created_at > clock_timestamp() THEN
@@ -726,6 +742,9 @@ BEGIN
             MESSAGE = 'credential revocation counters and time must advance monotonically';
     END IF;
 
+    transition_at := clock_timestamp();
+    NEW.updated_at := GREATEST(NEW.updated_at, transition_at);
+
     IF (
         OLD.retry_cycle_attempt_base IS DISTINCT FROM NEW.retry_cycle_attempt_base OR
         OLD.retry_cycle_started_at IS DISTINCT FROM NEW.retry_cycle_started_at
@@ -735,7 +754,7 @@ BEGIN
         NEW.retry_cycle_attempt_base = OLD.attempt AND
         NEW.retry_cycle_started_at IS NOT NULL AND
         NEW.retry_cycle_started_at >= OLD.updated_at AND
-        NEW.retry_cycle_started_at <= clock_timestamp()
+        NEW.retry_cycle_started_at <= transition_at
     ) THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000',
@@ -762,11 +781,28 @@ BEGIN
 
     IF OLD.status = 'REVOKING' AND NEW.status = 'REVOCATION_PENDING' AND (
         OLD.attempt - OLD.retry_cycle_attempt_base >= 12 OR
-        OLD.retry_cycle_started_at <= clock_timestamp() - interval '2 hours'
+        OLD.retry_cycle_started_at <= transition_at - interval '2 hours'
     ) THEN
         NEW.status := 'MANUAL_REQUIRED';
         NEW.available_at := OLD.available_at;
-        NEW.manual_required_at := clock_timestamp();
+        NEW.manual_required_at := transition_at;
+        NEW.updated_at := GREATEST(NEW.updated_at, transition_at);
+    END IF;
+
+    IF OLD.status IN ('REVOCATION_PENDING', 'REVOKING') AND NEW.status = 'MANUAL_REQUIRED' THEN
+        NEW.manual_required_at := transition_at;
+    ELSIF OLD.manual_required_at IS DISTINCT FROM NEW.manual_required_at THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'credential manual-required lifecycle evidence is database-controlled';
+    END IF;
+
+    IF OLD.status IN ('REVOKING', 'MANUAL_REQUIRED') AND NEW.status = 'REVOKED' THEN
+        NEW.revoked_at := transition_at;
+    ELSIF OLD.revoked_at IS DISTINCT FROM NEW.revoked_at THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'credential revoked lifecycle evidence is database-controlled';
     END IF;
 
     IF OLD.status = NEW.status THEN
@@ -775,9 +811,9 @@ BEGIN
             NEW.attempt IS DISTINCT FROM OLD.attempt
         ) AND NOT (
             OLD.status = 'REVOKING' AND
-            OLD.claim_expires_at <= clock_timestamp() AND
+            OLD.claim_expires_at <= transition_at AND
             OLD.attempt - OLD.retry_cycle_attempt_base < 12 AND
-            OLD.retry_cycle_started_at > clock_timestamp() - interval '2 hours' AND
+            OLD.retry_cycle_started_at > transition_at - interval '2 hours' AND
             NEW.claim_epoch = OLD.claim_epoch + 1 AND
             NEW.attempt = OLD.attempt + 1
         ) THEN
@@ -792,21 +828,21 @@ BEGIN
         (OLD.status = 'PREPARED' AND NEW.status = 'ANCHORED' AND OLD.child_create_authorized_at IS NOT NULL) OR
         (OLD.status = 'PREPARED' AND NEW.status = 'NO_CREDENTIAL' AND (
             OLD.child_create_authorized_at IS NULL OR
-            OLD.credential_expires_at <= clock_timestamp() - interval '1 minute'
+            OLD.credential_expires_at <= transition_at - interval '1 minute'
         )) OR
         (OLD.status = 'ANCHORED' AND NEW.status IN ('ACTIVE', 'REVOCATION_PENDING')) OR
         (OLD.status = 'ACTIVE' AND NEW.status = 'REVOCATION_PENDING') OR
         (OLD.status = 'REVOCATION_PENDING' AND NEW.status = 'REVOKING' AND
             OLD.attempt - OLD.retry_cycle_attempt_base < 12 AND
-            OLD.retry_cycle_started_at > clock_timestamp() - interval '2 hours' AND
+            OLD.retry_cycle_started_at > transition_at - interval '2 hours' AND
             NEW.claim_epoch = OLD.claim_epoch + 1 AND NEW.attempt = OLD.attempt + 1) OR
         (OLD.status = 'REVOCATION_PENDING' AND NEW.status = 'MANUAL_REQUIRED' AND (
             OLD.attempt - OLD.retry_cycle_attempt_base >= 12 OR
-            OLD.retry_cycle_started_at <= clock_timestamp() - interval '2 hours'
+            OLD.retry_cycle_started_at <= transition_at - interval '2 hours'
         )) OR
         (OLD.status = 'REVOKING' AND NEW.status = 'REVOCATION_PENDING' AND
             OLD.attempt - OLD.retry_cycle_attempt_base < 12 AND
-            OLD.retry_cycle_started_at > clock_timestamp() - interval '2 hours') OR
+            OLD.retry_cycle_started_at > transition_at - interval '2 hours') OR
         (OLD.status = 'REVOKING' AND NEW.status IN ('MANUAL_REQUIRED', 'REVOKED')) OR
         (OLD.status = 'MANUAL_REQUIRED' AND NEW.status IN ('REVOCATION_PENDING', 'REVOKED'))
     ) THEN

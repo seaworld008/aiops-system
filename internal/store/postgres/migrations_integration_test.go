@@ -249,6 +249,11 @@ func exerciseRealCredentialRevocations(
 	migrationDirectory, tenantID, otherTenantID, workspaceID, otherWorkspaceID, environmentID, serviceID string,
 ) {
 	t.Helper()
+	const otherEnvironmentID = "25000000-0000-4000-8000-000000000002"
+	execSQL(t, ctx, database, `
+		INSERT INTO environments (id, tenant_id, workspace_id, name, kind)
+		VALUES ($1, $2, $3, 'management-cross-scope', 'DEV')
+	`, otherEnvironmentID, otherTenantID, otherWorkspaceID)
 	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("generate credential revocation action key: %v", err)
@@ -1676,10 +1681,179 @@ func exerciseRealCredentialRevocations(
 	if err != nil || manual.Status != credential.StatusManualRequired {
 		t.Fatalf("real credential RequireManual = %#v, %v", manual, err)
 	}
-	if _, err := rebuilt.RequeueManual(ctx, credential.RequeueManualRequest{
-		RevocationID: revocationID, ActorSubject: "oidc:platform-admin-requeue",
-	}); err != nil {
-		t.Fatalf("real credential RequeueManual: %v", err)
+	var beforeManagementManualAt, beforeManagementUpdatedAt time.Time
+	var beforeManagementVersion int64
+	if err := database.QueryRow(ctx, `
+		SELECT manual_required_at, updated_at, version
+		FROM credential_revocations WHERE revocation_id = $1
+	`, revocationID).Scan(&beforeManagementManualAt, &beforeManagementUpdatedAt, &beforeManagementVersion); err != nil {
+		t.Fatal(err)
+	}
+	expectSQLState(t, ctx, database, "55000", `
+		UPDATE credential_revocations
+		SET manual_required_at = updated_at + interval '1 day', version = version + 1
+		WHERE revocation_id = $1 AND status = 'MANUAL_REQUIRED'
+	`, revocationID)
+	expectSQLState(t, ctx, database, "55000", `
+		UPDATE credential_revocations
+		SET manual_required_at = manual_required_at + interval '1 microsecond',
+			updated_at = updated_at + interval '1 second', version = version + 1
+		WHERE revocation_id = $1 AND status = 'MANUAL_REQUIRED'
+	`, revocationID)
+	expectSQLState(t, ctx, database, "23514", `
+		UPDATE credential_revocations
+		SET updated_at = 'infinity'::timestamptz, version = version + 1
+		WHERE revocation_id = $1 AND status = 'MANUAL_REQUIRED'
+	`, revocationID)
+	var afterManagementManualAt, afterManagementUpdatedAt time.Time
+	var afterManagementVersion int64
+	if err := database.QueryRow(ctx, `
+		SELECT manual_required_at, updated_at, version
+		FROM credential_revocations WHERE revocation_id = $1
+	`, revocationID).Scan(&afterManagementManualAt, &afterManagementUpdatedAt, &afterManagementVersion); err != nil ||
+		!afterManagementManualAt.Equal(beforeManagementManualAt) ||
+		!afterManagementUpdatedAt.Equal(beforeManagementUpdatedAt) || afterManagementVersion != beforeManagementVersion {
+		t.Fatalf("management lifecycle time attacks did not roll back: manual=%s/%s updated=%s/%s version=%d/%d, %v",
+			afterManagementManualAt, beforeManagementManualAt, afterManagementUpdatedAt, beforeManagementUpdatedAt,
+			afterManagementVersion, beforeManagementVersion, err)
+	}
+	managementStore, err := credentialpostgres.NewManagement(database)
+	if err != nil {
+		t.Fatalf("create credential management store: %v", err)
+	}
+	managementScope := credential.ManagementScope{WorkspaceID: workspaceID, EnvironmentID: environmentID}
+	managementAdmin := credential.ManagementActor{Subject: "oidc:platform-admin-requeue", PlatformAdmin: true}
+	managedRecord, err := managementStore.GetManagement(ctx, credential.ManagementGetRequest{
+		Scope: managementScope, Actor: credential.ManagementActor{Subject: "oidc:management-reader"}, RevocationID: revocationID,
+	})
+	if err != nil || managedRecord.Status != credential.StatusManualRequired || !managedRecord.AccessorPresent ||
+		managedRecord.FailureCount == 0 || managedRecord.FailureDetailSHA256 == "" {
+		t.Fatalf("real management GetManagement = %#v, %v", managedRecord, err)
+	}
+	managedJSON, err := json.Marshal(managedRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, canary := range []string{
+		string(accessorValue), storedKeyID, actionFence.Token, firstClaim.Fence.Token,
+		"accessor_ciphertext", "accessor_hmac", "encryption_key_id", "claim_token_sha256", "claimed_by", "runner_id",
+	} {
+		if canary != "" && bytes.Contains(managedJSON, []byte(canary)) {
+			t.Fatalf("management record leaked credential/claim canary %q: %s", canary, managedJSON)
+		}
+	}
+	if _, err := managementStore.GetManagement(ctx, credential.ManagementGetRequest{
+		Scope: credential.ManagementScope{WorkspaceID: otherWorkspaceID, EnvironmentID: otherEnvironmentID},
+		Actor: credential.ManagementActor{Subject: "oidc:cross-scope-reader"}, RevocationID: revocationID,
+	}); !errors.Is(err, credential.ErrRevocationNotFound) {
+		t.Fatalf("real management cross-scope GetManagement error = %v", err)
+	}
+	firstPage, err := managementStore.ListManagement(ctx, credential.ManagementListRequest{
+		Scope: managementScope, Actor: credential.ManagementActor{Subject: "oidc:management-list-reader"},
+		Status: credential.StatusManualRequired, Limit: 1,
+	})
+	if err != nil || len(firstPage.Items) != 1 || firstPage.Next == nil {
+		t.Fatalf("real management first keyset page = %#v, %v", firstPage, err)
+	}
+	secondPage, err := managementStore.ListManagement(ctx, credential.ManagementListRequest{
+		Scope: managementScope, Actor: credential.ManagementActor{Subject: "oidc:management-list-reader"},
+		Status: credential.StatusManualRequired, Limit: 1, After: firstPage.Next,
+	})
+	if err != nil || len(secondPage.Items) != 1 || secondPage.Items[0].ID == firstPage.Items[0].ID {
+		t.Fatalf("real management second keyset page = %#v, %v", secondPage, err)
+	}
+	var managementIndexDefinition string
+	if err := database.QueryRow(ctx, `
+		SELECT indexdef FROM pg_indexes
+		WHERE schemaname = current_schema() AND indexname = 'credential_revocations_management_idx'
+	`).Scan(&managementIndexDefinition); err != nil ||
+		!strings.Contains(managementIndexDefinition, "(workspace_id, environment_id, status, created_at DESC, revocation_id DESC)") {
+		t.Fatalf("credential management keyset index = %q, %v", managementIndexDefinition, err)
+	}
+	if _, err := managementStore.RequeueManagement(ctx, credential.ManagementRequeueRequest{
+		Scope: credential.ManagementScope{WorkspaceID: otherWorkspaceID, EnvironmentID: otherEnvironmentID},
+		Actor: managementAdmin, RevocationID: revocationID,
+	}); !errors.Is(err, credential.ErrRevocationNotFound) {
+		t.Fatalf("real management cross-scope RequeueManagement error = %v", err)
+	}
+	execSQL(t, ctx, database, `
+		CREATE FUNCTION reject_test_management_requeue_outbox() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.event_type = 'credential.revocation.requeued.v1' THEN
+				RAISE EXCEPTION 'forced management requeue outbox failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER reject_test_management_requeue_outbox_insert
+		BEFORE INSERT ON outbox_events
+		FOR EACH ROW EXECUTE FUNCTION reject_test_management_requeue_outbox();
+	`)
+	if _, err := managementStore.RequeueManagement(ctx, credential.ManagementRequeueRequest{
+		Scope: managementScope, Actor: managementAdmin, RevocationID: revocationID,
+	}); !errors.Is(err, credential.ErrRevocationPersistence) {
+		t.Fatalf("real management RequeueManagement(forced outbox rollback) error = %v", err)
+	}
+	var managementRollbackStatus string
+	var managementRollbackAudit, managementRollbackOutbox int
+	if err := database.QueryRow(ctx, `
+		SELECT status,
+			(SELECT count(*) FROM audit_records WHERE action = 'credential.revocation.requeued' AND resource_id = $1),
+			(SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'credential.revocation.requeued.v1')
+		FROM credential_revocations WHERE revocation_id = $1
+	`, revocationID).Scan(&managementRollbackStatus, &managementRollbackAudit, &managementRollbackOutbox); err != nil ||
+		managementRollbackStatus != string(credential.StatusManualRequired) || managementRollbackAudit != 0 || managementRollbackOutbox != 0 {
+		t.Fatalf("management requeue rollback state=%s audit/outbox=%d/%d, %v",
+			managementRollbackStatus, managementRollbackAudit, managementRollbackOutbox, err)
+	}
+	execSQL(t, ctx, database, `
+		DROP TRIGGER reject_test_management_requeue_outbox_insert ON outbox_events;
+		DROP FUNCTION reject_test_management_requeue_outbox();
+	`)
+	type managementRequeueResult struct {
+		record credential.ManagementRecord
+		err    error
+	}
+	requeueContext, cancelManagementRequeues := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelManagementRequeues()
+	requeueStart := make(chan struct{})
+	requeueResults := make(chan managementRequeueResult, 2)
+	for range 2 {
+		go func() {
+			<-requeueStart
+			record, requeueErr := managementStore.RequeueManagement(requeueContext, credential.ManagementRequeueRequest{
+				Scope: managementScope, Actor: managementAdmin, RevocationID: revocationID,
+			})
+			requeueResults <- managementRequeueResult{record: record, err: requeueErr}
+		}()
+	}
+	close(requeueStart)
+	var requeueVersion int64
+	for range 2 {
+		var result managementRequeueResult
+		select {
+		case result = <-requeueResults:
+		case <-requeueContext.Done():
+			t.Fatalf("timed out waiting for concurrent management requeues: %v", requeueContext.Err())
+		}
+		if result.err != nil || result.record.Status != credential.StatusRevocationPending {
+			t.Fatalf("real concurrent management RequeueManagement = %#v, %v", result.record, result.err)
+		}
+		if requeueVersion == 0 {
+			requeueVersion = result.record.Version
+		} else if result.record.Version != requeueVersion {
+			t.Fatalf("concurrent management requeues returned versions %d and %d", requeueVersion, result.record.Version)
+		}
+	}
+	var managementRequeueOutbox, managementRequeueReplayAudit int
+	if err := database.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'credential.revocation.requeued.v1'),
+			(SELECT count(*) FROM audit_records WHERE resource_id = $1 AND action = 'credential.revocation.requeue_replayed')
+	`, revocationID).Scan(&managementRequeueOutbox, &managementRequeueReplayAudit); err != nil ||
+		managementRequeueOutbox != 1 || managementRequeueReplayAudit != 1 {
+		t.Fatalf("management requeue event/replay audit=%d/%d, %v",
+			managementRequeueOutbox, managementRequeueReplayAudit, err)
 	}
 	execSQL(t, ctx, database, `
 		UPDATE credential_revocations
@@ -1700,29 +1874,139 @@ func exerciseRealCredentialRevocations(
 		t.Fatal(err)
 	}
 	evidenceHash := strings.Repeat("a", 64)
-	firstConfirmation, err := rebuilt.SubmitExternalConfirmation(ctx, credential.ExternalConfirmationRequest{
-		RevocationID: revocationID, Subject: "oidc:operator-1", EvidenceHash: evidenceHash,
-	})
-	if err != nil || firstConfirmation.Revocation.Status != credential.StatusManualRequired || len(firstConfirmation.Confirmations) != 1 {
-		t.Fatalf("real first external confirmation = %#v, %v", firstConfirmation, err)
+	mismatchedEvidenceHash := strings.Repeat("b", 64)
+	var beforeDirectAttackVersion int64
+	if err := database.QueryRow(ctx, `SELECT version FROM credential_revocations WHERE revocation_id = $1`, revocationID).
+		Scan(&beforeDirectAttackVersion); err != nil {
+		t.Fatal(err)
+	}
+	expectSQLState(t, ctx, database, "23514", `
+		UPDATE credential_revocations
+		SET evidence_hash = $2, updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1 AND status = 'MANUAL_REQUIRED' AND evidence_hash IS NULL;
+		INSERT INTO credential_revocation_confirmations (
+			revocation_id, subject, evidence_hash, platform_admin
+		) VALUES ($1, 'oidc:direct-non-admin-1', $2, false);
+		INSERT INTO credential_revocation_confirmations (
+			revocation_id, subject, evidence_hash, platform_admin
+		) VALUES ($1, 'oidc:direct-non-admin-2', $2, false);
+	`, revocationID, evidenceHash)
+	expectSQLState(t, ctx, database, "23514", `
+		UPDATE credential_revocations
+		SET evidence_hash = $2, updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1 AND status = 'MANUAL_REQUIRED' AND evidence_hash IS NULL;
+		INSERT INTO credential_revocation_confirmations (
+			revocation_id, subject, evidence_hash, platform_admin
+		) VALUES ($1, 'oidc:direct-hash-a', $2, false);
+		INSERT INTO credential_revocation_confirmations (
+			revocation_id, subject, evidence_hash, platform_admin
+		) VALUES ($1, 'oidc:direct-hash-b-admin', $3, true);
+	`, revocationID, evidenceHash, mismatchedEvidenceHash)
+	var afterDirectAttackEvidence *string
+	var afterDirectAttackVersion int64
+	var afterDirectAttackConfirmations int
+	if err := database.QueryRow(ctx, `
+		SELECT revocation.evidence_hash, revocation.version,
+			(SELECT count(*) FROM credential_revocation_confirmations AS confirmation
+			 WHERE confirmation.revocation_id = revocation.revocation_id)
+		FROM credential_revocations AS revocation
+		WHERE revocation.revocation_id = $1
+	`, revocationID).Scan(
+		&afterDirectAttackEvidence, &afterDirectAttackVersion, &afterDirectAttackConfirmations,
+	); err != nil || afterDirectAttackEvidence != nil || afterDirectAttackVersion != beforeDirectAttackVersion ||
+		afterDirectAttackConfirmations != 0 {
+		t.Fatalf("direct confirmation attacks did not roll back: evidence=%v version=%d/%d confirmations=%d, %v",
+			afterDirectAttackEvidence, afterDirectAttackVersion, beforeDirectAttackVersion,
+			afterDirectAttackConfirmations, err)
 	}
 	expectSQLState(t, ctx, database, "23514", `
 		INSERT INTO credential_revocation_confirmations (
 			revocation_id, subject, evidence_hash, platform_admin
 		) VALUES ($1, 'oidc:direct-admin-without-parent-transition', $2, true)
 	`, revocationID, evidenceHash)
-	secondConfirmation, err := rebuilt.SubmitExternalConfirmation(ctx, credential.ExternalConfirmationRequest{
-		RevocationID: revocationID, Subject: "oidc:platform-admin-1", EvidenceHash: evidenceHash, PlatformAdmin: true,
+	type managementConfirmationResult struct {
+		record credential.ManagementRecord
+		err    error
+	}
+	confirmationContext, cancelManagementConfirmations := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelManagementConfirmations()
+	confirmationStart := make(chan struct{})
+	confirmationResults := make(chan managementConfirmationResult, 2)
+	for _, actor := range []credential.ManagementActor{
+		{Subject: "oidc:operator-1"},
+		{Subject: "oidc:platform-admin-1", PlatformAdmin: true},
+	} {
+		actor := actor
+		go func() {
+			<-confirmationStart
+			record, confirmErr := managementStore.ConfirmManagement(confirmationContext, credential.ManagementConfirmationRequest{
+				Scope: managementScope, Actor: actor, RevocationID: revocationID, EvidenceHash: evidenceHash,
+			})
+			confirmationResults <- managementConfirmationResult{record: record, err: confirmErr}
+		}()
+	}
+	close(confirmationStart)
+	var secondConfirmation credential.ManagementRecord
+	manualConfirmationWinners := 0
+	revokedConfirmationWinners := 0
+	for range 2 {
+		var result managementConfirmationResult
+		select {
+		case result = <-confirmationResults:
+		case <-confirmationContext.Done():
+			t.Fatalf("timed out waiting for concurrent management confirmations: %v", confirmationContext.Err())
+		}
+		if result.err != nil {
+			t.Fatalf("real concurrent management confirmation = %#v, %v", result.record, result.err)
+		}
+		switch result.record.Status {
+		case credential.StatusManualRequired:
+			if result.record.ConfirmationCount != 1 {
+				t.Fatalf("real first concurrent management confirmation = %#v", result.record)
+			}
+			manualConfirmationWinners++
+		case credential.StatusRevoked:
+			if result.record.AccessorPresent || result.record.ConfirmationCount != 2 ||
+				!result.record.PlatformAdminConfirmed {
+				t.Fatalf("real second concurrent management confirmation = %#v", result.record)
+			}
+			secondConfirmation = result.record
+			revokedConfirmationWinners++
+		default:
+			t.Fatalf("unexpected concurrent management confirmation = %#v", result.record)
+		}
+	}
+	if manualConfirmationWinners != 1 || revokedConfirmationWinners != 1 {
+		t.Fatalf("concurrent management confirmation winners manual/revoked=%d/%d",
+			manualConfirmationWinners, revokedConfirmationWinners)
+	}
+	replayedConfirmation, err := managementStore.ConfirmManagement(ctx, credential.ManagementConfirmationRequest{
+		Scope: managementScope, Actor: credential.ManagementActor{Subject: "oidc:platform-admin-1", PlatformAdmin: true},
+		RevocationID: revocationID, EvidenceHash: evidenceHash,
 	})
-	if err != nil || secondConfirmation.Revocation.Status != credential.StatusRevoked ||
-		secondConfirmation.Revocation.AccessorPresent || len(secondConfirmation.Confirmations) != 2 {
-		t.Fatalf("real second external confirmation = %#v, %v", secondConfirmation, err)
+	if err != nil || replayedConfirmation.Status != credential.StatusRevoked ||
+		replayedConfirmation.Version != secondConfirmation.Version {
+		t.Fatalf("real external confirmation replay = %#v, %v", replayedConfirmation, err)
 	}
 	var finalCiphertext []byte
 	var finalKeyID *string
 	if err := database.QueryRow(ctx, `SELECT accessor_ciphertext, encryption_key_id FROM credential_revocations WHERE revocation_id = $1`, revocationID).
 		Scan(&finalCiphertext, &finalKeyID); err != nil || finalCiphertext != nil || finalKeyID != nil {
 		t.Fatalf("external confirmation retained decryptable accessor: cipher=%d key=%v err=%v", len(finalCiphertext), finalKeyID, err)
+	}
+	var confirmationOutbox, confirmationReplayAudit int
+	var confirmationPayload string
+	if err := database.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'credential.revocation.externally_confirmed.v1'),
+			(SELECT count(*) FROM audit_records WHERE resource_id = $1 AND action = 'credential.revocation.confirmation_replayed'),
+			(SELECT payload::text FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'credential.revocation.externally_confirmed.v1')
+	`, revocationID).Scan(&confirmationOutbox, &confirmationReplayAudit, &confirmationPayload); err != nil ||
+		confirmationOutbox != 1 || confirmationReplayAudit != 1 || strings.Contains(confirmationPayload, string(accessorValue)) ||
+		strings.Contains(confirmationPayload, storedKeyID) || strings.Contains(confirmationPayload, actionFence.Token) ||
+		strings.Contains(confirmationPayload, firstClaim.Fence.Token) {
+		t.Fatalf("unsafe management confirmation outbox/replay audit=%d/%d payload=%s, %v",
+			confirmationOutbox, confirmationReplayAudit, confirmationPayload, err)
 	}
 	expectMigrationSQLState(t, ctx, database, filepath.Join(migrationDirectory, "000008_credential_revocations.down.sql"), "55000")
 
