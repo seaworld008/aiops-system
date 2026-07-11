@@ -1,11 +1,32 @@
 package isolatedexec
 
 import (
+	"errors"
 	"os"
 	"reflect"
 	"testing"
 	"time"
 )
+
+func TestCleanupIsIdempotentAndPreservesBoundaryFailure(t *testing.T) {
+	cleanupError := errors.New("cleanup boundary")
+	calls := 0
+	process := &childProcess{cleanupJob: func() error {
+		calls++
+		return cleanupError
+	}}
+	if err := process.cleanup(false); err != nil || calls != 0 {
+		t.Fatalf("cleanup(unconfirmed) = %v, calls=%d", err, calls)
+	}
+	for range 2 {
+		if err := process.cleanup(true); !errors.Is(err, cleanupError) {
+			t.Fatalf("cleanup(confirmed) = %v", err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("cleanup calls = %d, want 1", calls)
+	}
+}
 
 func TestBuildCommandPinsPathArgumentsEnvironmentDirectoryAndDescriptors(t *testing.T) {
 	files := make([]*os.File, 3)

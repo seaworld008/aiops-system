@@ -102,6 +102,7 @@ func (handler *fixtureHandler) Execute(
 	case "ignore-term":
 		signal.Ignore(syscall.SIGTERM)
 		blockForever()
+		return execution.ExecutorResult{}, errors.New("unreachable")
 	case "flood-output":
 		block := bytes.Repeat([]byte{'x'}, 8<<10)
 		for range 16 {
@@ -115,6 +116,7 @@ func (handler *fixtureHandler) Execute(
 		}
 		signal.Ignore(syscall.SIGTERM)
 		blockForever()
+		return execution.ExecutorResult{}, errors.New("unreachable")
 	default:
 		return failed("UNKNOWN_FIXTURE_MODE"), nil
 	}

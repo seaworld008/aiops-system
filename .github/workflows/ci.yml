@@ -125,6 +125,7 @@ jobs:
           test "$(tar --numeric-owner -tvf /tmp/write-runner.tar | awk '$6 == "usr/local/libexec/aiops-executor" {print $1, $2}')" = "-r-xr-xr-x 0/0"
 
           probe_container="$(docker run --detach --read-only \
+            --cap-drop ALL \
             --security-opt no-new-privileges:true \
             --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=65532,gid=65532 \
             --env AIOPS_WRITE_EXECUTION_MODE=non-production "${WRITE_RUNNER_IMAGE}")"
@@ -139,6 +140,7 @@ jobs:
           probe_container=""
 
           probe_container="$(docker run --detach --read-only \
+            --cap-drop ALL \
             --security-opt no-new-privileges:true \
             --env AIOPS_WRITE_EXECUTION_MODE=non-production "${WRITE_RUNNER_IMAGE}")"
           sleep 1
@@ -148,6 +150,7 @@ jobs:
           probe_container=""
 
           probe_container="$(docker run --detach --read-only \
+            --cap-drop ALL \
             --security-opt no-new-privileges:true \
             --tmpfs /tmp:rw,nosuid,nodev,noexec,size=32m,mode=0750,uid=65532,gid=65532 \
             --env AIOPS_WRITE_EXECUTION_MODE=non-production "${WRITE_RUNNER_IMAGE}")"

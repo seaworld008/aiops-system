@@ -111,7 +111,8 @@ NetworkPolicy、独立 ServiceAccount/CA/Vault role，以及禁止 swap/core dum
 - 单元协议：严格 frame/JSON、READY 前拒绝、GO 后 handler 错误与 panic 均收敛为
   `UNCERTAIN`，Secret buffer 使用后销毁；
 - Linux 进程：忽略 TERM、fork descendant、结果后挂起、无结果退出、输出洪泛、GO
-  前后取消与强杀，均验证 `Wait`/reap 和 process-group 消失；
+  前后取消与强杀，均验证 `Wait`/reap 和 process-group 消失；Runner 作为 child
+  subreaper 只按 PGID/PPID/zombie 状态回收已收养后代；
 - 依赖边界：`cmd/read-runner` 依赖图不得包含隔离执行、凭据或 mutation 包；
 - 镜像边界：CI 导出文件系统，验证 READ/WRITE 产物互斥、无 shell、非 root、固定入口；
 - 配置边界：只读根 + 由 FD/mount ID 绑定验证的 16 MiB、`0700`、

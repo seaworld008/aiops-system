@@ -33,6 +33,8 @@ type childProcess struct {
 	closeOnce      sync.Once
 	handleOnce     sync.Once
 	cleanupOnce    sync.Once
+	cleanupJob     func() error
+	cleanupErr     error
 }
 
 type terminationResult struct {
@@ -49,33 +51,34 @@ func (supervisor *Supervisor) startProcess() (*childProcess, error) {
 	if err != nil {
 		return nil, err
 	}
+	cleanupJob := func() { _ = supervisor.removeJobDirectory(jobDirectory) }
 	prepareReader, prepareWriter, err := os.Pipe()
 	if err != nil {
-		_ = os.RemoveAll(jobDirectory)
+		cleanupJob()
 		return nil, ErrInvalidConfiguration
 	}
 	goReader, goWriter, err := os.Pipe()
 	if err != nil {
 		closeFiles(prepareReader, prepareWriter)
-		_ = os.RemoveAll(jobDirectory)
+		cleanupJob()
 		return nil, ErrInvalidConfiguration
 	}
 	responseReader, responseWriter, err := os.Pipe()
 	if err != nil {
 		closeFiles(prepareReader, prepareWriter, goReader, goWriter)
-		_ = os.RemoveAll(jobDirectory)
+		cleanupJob()
 		return nil, ErrInvalidConfiguration
 	}
 	budget := newOutputBudget(supervisor.settings.outputLimit)
 	command := supervisor.buildCommand(jobDirectory, []*os.File{prepareReader, goReader, responseWriter}, budget)
-	if command == nil {
+	if command == nil || !supervisor.validateJobDirectory(jobDirectory) {
 		closeFiles(prepareReader, prepareWriter, goReader, goWriter, responseReader, responseWriter)
-		_ = os.RemoveAll(jobDirectory)
+		cleanupJob()
 		return nil, ErrInvalidConfiguration
 	}
 	if err := command.Start(); err != nil {
 		closeFiles(prepareReader, prepareWriter, goReader, goWriter, responseReader, responseWriter)
-		_ = os.RemoveAll(jobDirectory)
+		cleanupJob()
 		return nil, ErrNotReady
 	}
 	stableHandle := stableProcessHandle(command)
@@ -83,7 +86,7 @@ func (supervisor *Supervisor) startProcess() (*childProcess, error) {
 		_ = command.Process.Kill()
 		_ = command.Wait()
 		closeFiles(prepareReader, prepareWriter, goReader, goWriter, responseReader, responseWriter)
-		_ = os.RemoveAll(jobDirectory)
+		cleanupJob()
 		return nil, ErrUnsupportedPlatform
 	}
 	closeFiles(prepareReader, goReader, responseWriter)
@@ -91,6 +94,7 @@ func (supervisor *Supervisor) startProcess() (*childProcess, error) {
 		command: command, pid: command.Process.Pid, stableHandle: stableHandle, jobDirectory: jobDirectory,
 		prepareWriter: prepareWriter, goWriter: goWriter, responseReader: responseReader,
 		output: budget, exitDone: make(chan struct{}), waitDone: make(chan struct{}),
+		cleanupJob: func() error { return supervisor.removeJobDirectory(jobDirectory) },
 	}
 	go func() {
 		exitErr := waitStableProcessExit(stableHandle)
@@ -191,13 +195,19 @@ func (process *childProcess) terminate(configuration settings) terminationResult
 	}
 	process.closePipes()
 	termErr := process.signalGroup(syscall.SIGTERM)
-	if process.waitForTermination(configuration.termGrace) {
-		result := terminationResult{confirmed: true, waitErr: process.observedWaitError(), boundaryErr: termErr}
-		process.cleanup(true)
+	if process.waitForTermination(configuration.termGrace, false) {
+		cleanupErr := process.cleanup(true)
+		result := terminationResult{
+			confirmed: cleanupErr == nil, waitErr: process.observedWaitError(),
+			boundaryErr: errors.Join(termErr, cleanupErr),
+		}
+		if cleanupErr != nil {
+			result.boundaryErr = errors.Join(result.boundaryErr, ErrTerminationUnconfirmed)
+		}
 		return result
 	}
 	killErr := process.signalGroup(syscall.SIGKILL)
-	confirmed := process.waitForTermination(configuration.killConfirmTimeout)
+	confirmed := process.waitForTermination(configuration.killConfirmTimeout, true)
 	result := terminationResult{
 		confirmed:   confirmed,
 		waitErr:     process.observedWaitError(),
@@ -206,7 +216,11 @@ func (process *childProcess) terminate(configuration settings) terminationResult
 	if !confirmed {
 		result.boundaryErr = errors.Join(result.boundaryErr, ErrTerminationUnconfirmed)
 	}
-	process.cleanup(confirmed)
+	cleanupErr := process.cleanup(confirmed)
+	if cleanupErr != nil {
+		result.confirmed = false
+		result.boundaryErr = errors.Join(result.boundaryErr, cleanupErr, ErrTerminationUnconfirmed)
+	}
 	return result
 }
 
@@ -215,20 +229,24 @@ func (process *childProcess) awaitCleanExit(ctx context.Context, timeout time.Du
 		return terminationResult{boundaryErr: ErrTerminationUnconfirmed}
 	}
 	process.closePipes()
-	confirmed := process.waitForTerminationContext(ctx, timeout)
+	confirmed := process.waitForTerminationContext(ctx, timeout, false)
 	result := terminationResult{confirmed: confirmed, waitErr: process.observedWaitError()}
 	if !confirmed {
 		result.boundaryErr = errors.Join(ctx.Err(), ErrTerminationUnconfirmed)
 	}
-	process.cleanup(confirmed)
+	cleanupErr := process.cleanup(confirmed)
+	if cleanupErr != nil {
+		result.confirmed = false
+		result.boundaryErr = errors.Join(result.boundaryErr, cleanupErr, ErrTerminationUnconfirmed)
+	}
 	return result
 }
 
-func (process *childProcess) waitForTermination(timeout time.Duration) bool {
-	return process.waitForTerminationContext(context.Background(), timeout)
+func (process *childProcess) waitForTermination(timeout time.Duration, reapAdopted bool) bool {
+	return process.waitForTerminationContext(context.Background(), timeout, reapAdopted)
 }
 
-func (process *childProcess) waitForTerminationContext(ctx context.Context, timeout time.Duration) bool {
+func (process *childProcess) waitForTerminationContext(ctx context.Context, timeout time.Duration, reapAdopted bool) bool {
 	if process == nil || ctx == nil || timeout <= 0 {
 		return false
 	}
@@ -237,20 +255,20 @@ func (process *childProcess) waitForTerminationContext(ctx context.Context, time
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if process.terminationConfirmed() {
+		if process.terminationConfirmed(reapAdopted) {
 			return true
 		}
 		select {
 		case <-ctx.Done():
 			return false
 		case <-deadline.C:
-			return process.terminationConfirmed()
+			return process.terminationConfirmed(reapAdopted)
 		case <-ticker.C:
 		}
 	}
 }
 
-func (process *childProcess) terminationConfirmed() bool {
+func (process *childProcess) terminationConfirmed(reapAdopted bool) bool {
 	if process == nil {
 		return false
 	}
@@ -261,6 +279,11 @@ func (process *childProcess) terminationConfirmed() bool {
 	}
 	if process.observedExitError() != nil {
 		return false
+	}
+	if reapAdopted {
+		if err := reapAdoptedProcessGroupZombies(process.pid, os.Getpid()); err != nil {
+			return false
+		}
 	}
 	members, err := processGroupHasMembersExceptLeader(process.pid)
 	if err != nil || members {
@@ -279,13 +302,18 @@ func (process *childProcess) terminationConfirmed() bool {
 	}
 }
 
-func (process *childProcess) cleanup(confirmed bool) {
+func (process *childProcess) cleanup(confirmed bool) error {
 	if process == nil || !confirmed {
-		return
+		return nil
 	}
 	process.cleanupOnce.Do(func() {
-		_ = os.RemoveAll(process.jobDirectory)
+		if process.cleanupJob == nil {
+			process.cleanupErr = ErrTerminationUnconfirmed
+			return
+		}
+		process.cleanupErr = process.cleanupJob()
 	})
+	return process.cleanupErr
 }
 
 func (supervisor *Supervisor) createJobDirectory() (string, error) {
@@ -299,9 +327,39 @@ func (supervisor *Supervisor) createJobDirectory() (string, error) {
 		if boundary.closed || boundary.root == nil {
 			return "", ErrInvalidConfiguration
 		}
-		return createRuntimeJobDirectory(supervisor.settings.tempRoot, boundary.root)
+		return createRuntimeJobDirectory(supervisor.settings.tempRoot, boundary.root, boundary.mount)
 	}
 	return createJobDirectory(supervisor.settings.tempRoot)
+}
+
+func (supervisor *Supervisor) validateJobDirectory(jobDirectory string) bool {
+	if supervisor == nil {
+		return false
+	}
+	if supervisor.boundary == nil {
+		return true
+	}
+	boundary := supervisor.boundary
+	boundary.mu.RLock()
+	defer boundary.mu.RUnlock()
+	return !boundary.closed && boundary.root != nil &&
+		validateRuntimeJobDirectory(supervisor.settings.tempRoot, boundary.root, boundary.mount, jobDirectory)
+}
+
+func (supervisor *Supervisor) removeJobDirectory(jobDirectory string) error {
+	if supervisor == nil {
+		return ErrInvalidConfiguration
+	}
+	if supervisor.boundary == nil {
+		return os.RemoveAll(jobDirectory)
+	}
+	boundary := supervisor.boundary
+	boundary.mu.RLock()
+	defer boundary.mu.RUnlock()
+	if boundary.closed || boundary.root == nil {
+		return ErrTerminationUnconfirmed
+	}
+	return removeRuntimeJobDirectory(boundary.root, jobDirectory)
 }
 
 func (supervisor *Supervisor) buildCommand(

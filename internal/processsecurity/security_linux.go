@@ -41,13 +41,13 @@ func Harden() error {
 		return ErrHardeningFailed
 	}
 	noNewPrivileges, err := prctlGet(prGetNoNewPrivs)
-	if err != nil || noNewPrivileges != 1 || !allThreadsNoNewPrivileges() {
+	if err != nil || noNewPrivileges != 1 || !allThreadsHardened() {
 		return ErrHardeningFailed
 	}
 	return nil
 }
 
-func allThreadsNoNewPrivileges() bool {
+func allThreadsHardened() bool {
 	for range 2 {
 		entries, err := os.ReadDir("/proc/self/task")
 		if err != nil || len(entries) == 0 || len(entries) > 1<<20 {
@@ -62,8 +62,7 @@ func allThreadsNoNewPrivileges() bool {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			if err != nil || len(status) == 0 || len(status) > 1<<20 ||
-				!bytes.Contains(status, []byte("\nNoNewPrivs:\t1\n")) {
+			if err != nil || len(status) == 0 || len(status) > 1<<20 || !threadStatusHardened(status) {
 				return false
 			}
 			checked++
@@ -73,6 +72,37 @@ func allThreadsNoNewPrivileges() bool {
 		}
 	}
 	return true
+}
+
+func threadStatusHardened(status []byte) bool {
+	if !statusNumericFieldEquals(status, "NoNewPrivs:", 10, 1) {
+		return false
+	}
+	for _, field := range []string{"CapInh:", "CapPrm:", "CapEff:", "CapAmb:"} {
+		if !statusNumericFieldEquals(status, field, 16, 0) {
+			return false
+		}
+	}
+	return true
+}
+
+func statusNumericFieldEquals(status []byte, name string, base int, expected uint64) bool {
+	found := false
+	for _, line := range bytes.Split(status, []byte{'\n'}) {
+		fields := bytes.Fields(line)
+		if len(fields) == 0 || string(fields[0]) != name {
+			continue
+		}
+		if found || len(fields) != 2 {
+			return false
+		}
+		value, err := strconv.ParseUint(string(fields[1]), base, 64)
+		if err != nil || value != expected {
+			return false
+		}
+		found = true
+	}
+	return found
 }
 
 func prctlSet(option, value uintptr) error {

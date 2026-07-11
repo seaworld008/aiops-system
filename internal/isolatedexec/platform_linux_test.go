@@ -100,6 +100,10 @@ func TestLinuxProcessGroupScanAllowsPIDOneWithoutRelaxingSignals(t *testing.T) {
 	if _, err := processGroupHasMembersExceptLeaderAt(0, procRoot); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("processGroupHasMembersExceptLeaderAt(0) error = %v, want invalid request", err)
 	}
+	members, err := processGroupMembersExceptLeaderAt(1, procRoot)
+	if err != nil || len(members) != 1 || members[0] != (processGroupMember{pid: 2, ppid: 1, state: 'S'}) {
+		t.Fatalf("processGroupMembersExceptLeaderAt(1) = %#v, %v", members, err)
+	}
 }
 
 func TestLinuxSecureTempRootMountInfoRequiresOneExactSafeTmpfs(t *testing.T) {
@@ -110,6 +114,7 @@ func TestLinuxSecureTempRootMountInfoRequiresOneExactSafeTmpfs(t *testing.T) {
 		"valid":            valid,
 		"parent-only":      root,
 		"writable-root":    strings.Replace(valid, "ro,relatime", "rw,relatime", 1),
+		"propagating-root": strings.Replace(valid, "ro,relatime -", "ro,relatime shared:7 -", 1),
 		"missing-noexec":   root + strings.Replace(temp, ",noexec", "", 1),
 		"missing-nodev":    root + strings.Replace(temp, ",nodev", "", 1),
 		"missing-nosuid":   root + strings.Replace(temp, ",nosuid", "", 1),
@@ -272,5 +277,45 @@ func TestLinuxPrivateJobDirectoryStaysBoundToRetainedDescriptor(t *testing.T) {
 	}
 	if err := unix.Unlinkat(descriptor, name, unix.AT_REMOVEDIR); err != nil {
 		t.Fatalf("unlink private directory: %v", err)
+	}
+}
+
+func TestLinuxRuntimeJobPathIsRecheckedAndCleanupIsDescriptorAnchored(t *testing.T) {
+	root, err := os.Open("/tmp")
+	if err != nil {
+		t.Fatalf("open /tmp: %v", err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	mountID, ok := descriptorMountID(int(root.Fd()))
+	if !ok {
+		t.Fatal("descriptorMountID(/tmp) failed")
+	}
+	name, err := createPrivateDirectoryAt(int(root.Fd()), "aiops-executor-test-", uint32(os.Geteuid()), uint32(os.Getegid()))
+	if err != nil {
+		t.Fatalf("create private runtime directory: %v", err)
+	}
+	jobDirectory := filepath.Join("/tmp", name)
+	t.Cleanup(func() { _ = removeRuntimeJobDirectory(root, jobDirectory) })
+	if !validateRuntimeJobDirectoryForIdentity(
+		"/tmp", root, mountID, jobDirectory, uint32(os.Geteuid()), uint32(os.Getegid()),
+	) {
+		t.Fatal("validateRuntimeJobDirectoryForIdentity(valid) = false")
+	}
+	if validateRuntimeJobDirectoryForIdentity(
+		"/tmp", root, mountID+1, jobDirectory, uint32(os.Geteuid()), uint32(os.Getegid()),
+	) {
+		t.Fatal("validateRuntimeJobDirectoryForIdentity(wrong mount ID) = true")
+	}
+	if err := os.Mkdir(filepath.Join(jobDirectory, "nested"), 0o700); err != nil {
+		t.Fatalf("mkdir nested runtime data: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(jobDirectory, "nested", "data"), []byte("non-secret fixture"), 0o600); err != nil {
+		t.Fatalf("write nested runtime data: %v", err)
+	}
+	if err := removeRuntimeJobDirectory(root, jobDirectory); err != nil {
+		t.Fatalf("removeRuntimeJobDirectory() error = %v", err)
+	}
+	if _, err := os.Stat(jobDirectory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("runtime job directory still exists: %v", err)
 	}
 }

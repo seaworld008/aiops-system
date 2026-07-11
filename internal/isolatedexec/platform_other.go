@@ -12,11 +12,17 @@ func validatePlatform(string, bool) error {
 	return ErrUnsupportedPlatform
 }
 
-func openRuntimeBoundary(string) (*os.File, error) {
-	return nil, ErrUnsupportedPlatform
+func openRuntimeBoundary(string) (*os.File, uint64, error) {
+	return nil, 0, ErrUnsupportedPlatform
 }
 
-func createRuntimeJobDirectory(string, *os.File) (string, error) { return "", ErrUnsupportedPlatform }
+func createRuntimeJobDirectory(string, *os.File, uint64) (string, error) {
+	return "", ErrUnsupportedPlatform
+}
+
+func validateRuntimeJobDirectory(string, *os.File, uint64, string) bool { return false }
+
+func removeRuntimeJobDirectory(*os.File, string) error { return ErrUnsupportedPlatform }
 
 func configureProcess(*exec.Cmd) {}
 
@@ -37,3 +43,5 @@ func processGroupGone(int) (bool, error) {
 func processGroupHasMembersExceptLeader(int) (bool, error) {
 	return false, ErrUnsupportedPlatform
 }
+
+func reapAdoptedProcessGroupZombies(int, int) error { return ErrUnsupportedPlatform }

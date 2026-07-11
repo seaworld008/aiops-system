@@ -53,3 +53,25 @@ func TestHardenDisablesCoreDumpDumpableAndPrivilegeGainInChild(t *testing.T) {
 		t.Fatalf("hardening helper failed: %v: %s", err, output)
 	}
 }
+
+func TestThreadStatusRequiresNoNewPrivilegesAndEmptyCapabilitySets(t *testing.T) {
+	valid := []byte("Name:\taiops\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\nNoNewPrivs:\t1\n")
+	if !threadStatusHardened(valid) {
+		t.Fatal("threadStatusHardened(valid) = false")
+	}
+	for _, replacement := range []string{
+		"CapInh:\t0000000000000001", "CapPrm:\t0000000000000001",
+		"CapEff:\t0000000000000001", "CapAmb:\t0000000000000001", "NoNewPrivs:\t0",
+	} {
+		candidate := strings.Replace(string(valid), strings.Split(replacement, "\t")[0]+"\t0000000000000000", replacement, 1)
+		if strings.HasPrefix(replacement, "NoNewPrivs") {
+			candidate = strings.Replace(string(valid), "NoNewPrivs:\t1", replacement, 1)
+		}
+		if threadStatusHardened([]byte(candidate)) {
+			t.Fatalf("threadStatusHardened(%q) = true", replacement)
+		}
+	}
+	if threadStatusHardened([]byte("NoNewPrivs:\t1\n")) {
+		t.Fatal("threadStatusHardened(missing capabilities) = true")
+	}
+}

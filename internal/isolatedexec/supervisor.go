@@ -75,6 +75,7 @@ type Supervisor struct {
 type runtimeBoundary struct {
 	mu     sync.RWMutex
 	root   *os.File
+	mount  uint64
 	closed bool
 }
 
@@ -99,16 +100,17 @@ func newSupervisorWithOwner(executablePath string, configuration settings, allow
 	// identity and /tmp mount. Package tests use an owner-local fixture and a
 	// private temporary root, but external callers have no bypass.
 	var tempRoot *os.File
+	var tempMountID uint64
 	if !allowCurrentOwner {
 		var err error
-		tempRoot, err = openRuntimeBoundary(configuration.tempRoot)
+		tempRoot, tempMountID, err = openRuntimeBoundary(configuration.tempRoot)
 		if err != nil {
 			return nil, err
 		}
 	}
 	var boundary *runtimeBoundary
 	if tempRoot != nil {
-		boundary = &runtimeBoundary{root: tempRoot}
+		boundary = &runtimeBoundary{root: tempRoot, mount: tempMountID}
 	}
 	return &Supervisor{executablePath: executablePath, settings: configuration, boundary: boundary}, nil
 }

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -58,6 +59,9 @@ func validatePlatform(executablePath string, allowCurrentOwner bool) error {
 			return ErrUnsupportedPlatform
 		}
 	}
+	if err := ensureChildSubreaper(); err != nil {
+		return ErrUnsupportedPlatform
+	}
 	if _, err := processGroupHasMembersExceptLeader(os.Getpid()); err != nil {
 		return ErrUnsupportedPlatform
 	}
@@ -72,20 +76,34 @@ func validatePlatform(executablePath string, allowCurrentOwner bool) error {
 	return nil
 }
 
+func ensureChildSubreaper() error {
+	if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
+		return err
+	}
+	var enabled int32
+	if err := unix.Prctl(unix.PR_GET_CHILD_SUBREAPER, uintptr(unsafe.Pointer(&enabled)), 0, 0, 0); err != nil {
+		return err
+	}
+	if enabled != 1 {
+		return ErrUnsupportedPlatform
+	}
+	return nil
+}
+
 // validateRuntimeBoundary is part of the non-production startup capability
 // probe. It intentionally rejects a host directory, an inherited root mount,
 // or an unbounded tmpfs before the runner can wait for work.
-func openRuntimeBoundary(tempRoot string) (*os.File, error) {
+func openRuntimeBoundary(tempRoot string) (*os.File, uint64, error) {
 	if tempRoot != "/tmp" || os.Geteuid() != isolatedRuntimeUID || os.Getegid() != isolatedRuntimeGID {
-		return nil, ErrUnsupportedPlatform
+		return nil, 0, ErrUnsupportedPlatform
 	}
 	descriptor, err := unix.Open(tempRoot, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, ErrUnsupportedPlatform
+		return nil, 0, ErrUnsupportedPlatform
 	}
-	fail := func() (*os.File, error) {
+	fail := func() (*os.File, uint64, error) {
 		_ = unix.Close(descriptor)
-		return nil, ErrUnsupportedPlatform
+		return nil, 0, ErrUnsupportedPlatform
 	}
 	var metadata unix.Stat_t
 	if err := unix.Fstat(descriptor, &metadata); err != nil ||
@@ -122,11 +140,12 @@ func openRuntimeBoundary(tempRoot string) (*os.File, error) {
 	if file == nil {
 		return fail()
 	}
-	return file, nil
+	return file, tempMountID, nil
 }
 
-func createRuntimeJobDirectory(root string, handle *os.File) (string, error) {
-	if root != "/tmp" || handle == nil {
+func createRuntimeJobDirectory(root string, handle *os.File, expectedMountID uint64) (string, error) {
+	if root != "/tmp" || handle == nil || expectedMountID == 0 ||
+		!runtimeRootPathMatches(root, handle, expectedMountID) {
 		return "", ErrInvalidConfiguration
 	}
 	descriptor := int(handle.Fd())
@@ -137,7 +156,90 @@ func createRuntimeJobDirectory(root string, handle *os.File) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(root, name), nil
+	jobDirectory := filepath.Join(root, name)
+	if !validateRuntimeJobDirectory(root, handle, expectedMountID, jobDirectory) {
+		_ = unix.Unlinkat(descriptor, name, unix.AT_REMOVEDIR)
+		return "", ErrUnsupportedPlatform
+	}
+	return jobDirectory, nil
+}
+
+func runtimeRootPathMatches(root string, handle *os.File, expectedMountID uint64) bool {
+	if root != "/tmp" || handle == nil || expectedMountID == 0 {
+		return false
+	}
+	retainedDescriptor := int(handle.Fd())
+	if retainedDescriptor < 0 {
+		return false
+	}
+	pathDescriptor, err := unix.Open(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return false
+	}
+	defer unix.Close(pathDescriptor)
+	retainedMountID, retainedOK := descriptorMountID(retainedDescriptor)
+	pathMountID, pathOK := descriptorMountID(pathDescriptor)
+	var retained, observed unix.Stat_t
+	return retainedOK && pathOK && retainedMountID == expectedMountID && pathMountID == expectedMountID &&
+		unix.Fstat(retainedDescriptor, &retained) == nil && unix.Fstat(pathDescriptor, &observed) == nil &&
+		retained.Dev == observed.Dev && retained.Ino == observed.Ino
+}
+
+func validateRuntimeJobDirectory(root string, handle *os.File, expectedMountID uint64, jobDirectory string) bool {
+	return validateRuntimeJobDirectoryForIdentity(
+		root, handle, expectedMountID, jobDirectory, isolatedRuntimeUID, isolatedRuntimeGID,
+	)
+}
+
+func validateRuntimeJobDirectoryForIdentity(
+	root string,
+	handle *os.File,
+	expectedMountID uint64,
+	jobDirectory string,
+	expectedUID, expectedGID uint32,
+) bool {
+	if !runtimeRootPathMatches(root, handle, expectedMountID) || filepath.Dir(jobDirectory) != root {
+		return false
+	}
+	name := filepath.Base(jobDirectory)
+	if !strings.HasPrefix(name, "aiops-executor-") || strings.ContainsAny(name, "/\\\x00") {
+		return false
+	}
+	retainedDescriptor := int(handle.Fd())
+	pathDescriptor, err := unix.Open(jobDirectory, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return false
+	}
+	defer unix.Close(pathDescriptor)
+	pathMountID, ok := descriptorMountID(pathDescriptor)
+	var expected, observed unix.Stat_t
+	return ok && pathMountID == expectedMountID &&
+		unix.Fstatat(retainedDescriptor, name, &expected, unix.AT_SYMLINK_NOFOLLOW) == nil &&
+		unix.Fstat(pathDescriptor, &observed) == nil && expected.Dev == observed.Dev && expected.Ino == observed.Ino &&
+		tempRootMetadataSecure(observed, expectedUID, expectedGID)
+}
+
+func removeRuntimeJobDirectory(handle *os.File, jobDirectory string) error {
+	if handle == nil || filepath.Dir(jobDirectory) != "/tmp" {
+		return ErrInvalidConfiguration
+	}
+	name := filepath.Base(jobDirectory)
+	if !strings.HasPrefix(name, "aiops-executor-") || strings.ContainsAny(name, "/\\\x00") {
+		return ErrInvalidConfiguration
+	}
+	descriptor := int(handle.Fd())
+	if descriptor < 0 {
+		return ErrInvalidConfiguration
+	}
+	anchored := filepath.Join("/proc/self/fd", strconv.Itoa(descriptor), name)
+	if err := os.RemoveAll(anchored); err != nil {
+		return ErrTerminationUnconfirmed
+	}
+	var metadata unix.Stat_t
+	if err := unix.Fstatat(descriptor, name, &metadata, unix.AT_SYMLINK_NOFOLLOW); errors.Is(err, syscall.ENOENT) {
+		return nil
+	}
+	return ErrTerminationUnconfirmed
 }
 
 func createPrivateDirectoryAt(descriptor int, prefix string, expectedUID, expectedGID uint32) (string, error) {
@@ -257,7 +359,7 @@ func mountInfoHasSecureRuntimeRoots(contents []byte, tempRoot string, expectedTe
 		if mountPoint == "/" {
 			rootMatches++
 			parsed, err := strconv.ParseUint(string(fields[0]), 10, 64)
-			if err != nil || parsed != expectedRootMountID || rootMatches != 1 ||
+			if err != nil || parsed != expectedRootMountID || rootMatches != 1 || separator != 6 ||
 				!mountOptionsContainAll(string(fields[5]), "ro") || mountOptionsContainAny(string(fields[5]), "rw") {
 				return false
 			}
@@ -434,17 +536,30 @@ func processGroupGone(pid int) (bool, error) {
 }
 
 func processGroupHasMembersExceptLeader(pid int) (bool, error) {
-	return processGroupHasMembersExceptLeaderAt(pid, "/proc")
+	members, err := processGroupMembersExceptLeaderAt(pid, "/proc")
+	return len(members) != 0, err
 }
 
 func processGroupHasMembersExceptLeaderAt(pid int, procRoot string) (bool, error) {
+	members, err := processGroupMembersExceptLeaderAt(pid, procRoot)
+	return len(members) != 0, err
+}
+
+type processGroupMember struct {
+	pid   int
+	ppid  int
+	state byte
+}
+
+func processGroupMembersExceptLeaderAt(pid int, procRoot string) ([]processGroupMember, error) {
 	if pid < 1 || procRoot == "" {
-		return false, ErrInvalidRequest
+		return nil, ErrInvalidRequest
 	}
 	entries, err := os.ReadDir(procRoot)
 	if err != nil || len(entries) > 1<<20 {
-		return false, ErrTerminationUnconfirmed
+		return nil, ErrTerminationUnconfirmed
 	}
+	members := make([]processGroupMember, 0, 4)
 	for _, entry := range entries {
 		candidate, parseErr := strconv.Atoi(entry.Name())
 		if parseErr != nil || candidate < 1 || candidate == pid {
@@ -455,23 +570,56 @@ func processGroupHasMembersExceptLeaderAt(pid int, procRoot string) (bool, error
 			continue
 		}
 		if readErr != nil || len(contents) == 0 || len(contents) > 4096 {
-			return false, ErrTerminationUnconfirmed
+			return nil, ErrTerminationUnconfirmed
 		}
 		closing := bytes.LastIndexByte(contents, ')')
 		if closing < 1 || closing+2 >= len(contents) || contents[closing+1] != ' ' {
-			return false, ErrTerminationUnconfirmed
+			return nil, ErrTerminationUnconfirmed
 		}
 		fields := bytes.Fields(contents[closing+2:])
-		if len(fields) < 3 {
-			return false, ErrTerminationUnconfirmed
+		if len(fields) < 3 || len(fields[0]) != 1 {
+			return nil, ErrTerminationUnconfirmed
 		}
+		parent, parentErr := strconv.Atoi(string(fields[1]))
 		group, groupErr := strconv.Atoi(string(fields[2]))
-		if groupErr != nil {
-			return false, ErrTerminationUnconfirmed
+		if parentErr != nil || groupErr != nil || parent < 0 {
+			return nil, ErrTerminationUnconfirmed
 		}
 		if group == pid {
-			return true, nil
+			members = append(members, processGroupMember{pid: candidate, ppid: parent, state: fields[0][0]})
+			if len(members) > 1<<16 {
+				return nil, ErrTerminationUnconfirmed
+			}
 		}
 	}
-	return false, nil
+	return members, nil
+}
+
+func reapAdoptedProcessGroupZombies(groupID, parentPID int) error {
+	if groupID <= 1 || parentPID < 1 {
+		return ErrInvalidRequest
+	}
+	members, err := processGroupMembersExceptLeaderAt(groupID, "/proc")
+	if err != nil {
+		return err
+	}
+	for _, member := range members {
+		if member.state != 'Z' || member.ppid != parentPID {
+			continue
+		}
+		var status syscall.WaitStatus
+		waited, waitErr := syscall.Wait4(member.pid, &status, syscall.WNOHANG, nil)
+		switch {
+		case waitErr == nil && (waited == 0 || waited == member.pid):
+			continue
+		case errors.Is(waitErr, syscall.ECHILD), errors.Is(waitErr, syscall.ESRCH):
+			if _, statErr := os.Stat(filepath.Join("/proc", strconv.Itoa(member.pid))); errors.Is(statErr, os.ErrNotExist) {
+				continue
+			}
+			return ErrTerminationUnconfirmed
+		default:
+			return ErrTerminationUnconfirmed
+		}
+	}
+	return nil
 }
