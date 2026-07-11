@@ -105,7 +105,8 @@ docker run --rm --read-only \
   `/proc/self/fd/<retained-root-fd>` 锚定，并且只有原目录 FD 最终读到 `nlink=0` 才算
   成功。rename+decoy、`/tmp` chmod、mount/statfs 漂移或任一清理失败都保持不确定态；
 - Supervisor 为每个作业持有 active reservation；`Close()` 在 active 非零时失败，不能
-  越过校验/Start 边界关闭根 FD。只有确认终止并成功清理原 inode 后才释放 reservation；
+  越过校验/Start 边界关闭根 FD。M4 固定每个 Supervisor 最多一个 active 作业，第二个
+  reserve 立即拒绝；只有确认终止并成功清理原 inode 后才释放 reservation；
 - Runner 设置并读回 `PR_SET_CHILD_SUBREAPER`。强杀后只回收同一 PGID、`ppid=self`、
   `state=Z` 且不是 direct leader 的已收养后代；direct leader 仍只由对应
   `exec.Cmd.Wait()` 回收，禁止全局 `wait4(-1)`；

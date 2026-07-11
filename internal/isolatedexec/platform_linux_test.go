@@ -315,9 +315,14 @@ func TestLinuxRuntimeJobPathIsRecheckedAndCleanupIsDescriptorAnchored(t *testing
 	if err := os.Chmod(rootPath, 0o700); err != nil {
 		t.Fatalf("chmod root: %v", err)
 	}
-	root, err := os.Open(rootPath)
+	rootDescriptor, err := unix.Open(rootPath, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		t.Fatalf("open root: %v", err)
+	}
+	root := os.NewFile(uintptr(rootDescriptor), "test-runtime-root")
+	if root == nil {
+		_ = unix.Close(rootDescriptor)
+		t.Fatal("wrap root descriptor")
 	}
 	t.Cleanup(func() { _ = root.Close() })
 	mountID, ok := descriptorMountID(int(root.Fd()))
@@ -365,9 +370,14 @@ func TestLinuxRuntimeJobPathIsRecheckedAndCleanupIsDescriptorAnchored(t *testing
 
 func TestLinuxRuntimeCleanupRejectsRenameAndDecoy(t *testing.T) {
 	rootPath := t.TempDir()
-	root, err := os.Open(rootPath)
+	rootDescriptor, err := unix.Open(rootPath, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		t.Fatalf("open root: %v", err)
+	}
+	root := os.NewFile(uintptr(rootDescriptor), "test-runtime-root")
+	if root == nil {
+		_ = unix.Close(rootDescriptor)
+		t.Fatal("wrap root descriptor")
 	}
 	defer root.Close()
 	name, err := createPrivateDirectoryAt(int(root.Fd()), "aiops-executor-test-", uint32(os.Geteuid()), uint32(os.Getegid()))

@@ -154,11 +154,11 @@ func (supervisor *Supervisor) reserveJob() (func(), error) {
 	}
 	boundary := supervisor.boundary
 	boundary.mu.Lock()
-	if boundary.closed || boundary.root == nil || boundary.mount == 0 {
+	if boundary.closed || boundary.root == nil || boundary.mount == 0 || boundary.active != 0 {
 		boundary.mu.Unlock()
-		return nil, ErrInvalidConfiguration
+		return nil, ErrSessionConsumed
 	}
-	boundary.active++
+	boundary.active = 1
 	boundary.mu.Unlock()
 	var once sync.Once
 	return func() {

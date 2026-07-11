@@ -42,6 +42,9 @@ func TestSupervisorCloseCannotCrossActiveStartReservation(t *testing.T) {
 	if supervisor.boundary.closed {
 		t.Fatal("active Close marked boundary closed")
 	}
+	if secondRelease, err := supervisor.reserveJob(); secondRelease != nil || !errors.Is(err, ErrSessionConsumed) {
+		t.Fatalf("second reserveJob() returned release=%t, error=%v", secondRelease != nil, err)
+	}
 	release()
 	if err := supervisor.Close(); err != nil {
 		t.Fatalf("Close(after release) error = %v", err)
