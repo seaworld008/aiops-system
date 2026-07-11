@@ -51,6 +51,7 @@ func TestLoadAcceptsCompleteRunnerGatewayConfiguration(t *testing.T) {
 		"AIOPS_RUNNER_GATEWAY_SERVER_KEY_FILE":      filepath.Join(root, "server-key.pem"),
 		"AIOPS_RUNNER_GATEWAY_READ_CLIENT_CA_FILE":  filepath.Join(root, "read-roots.pem"),
 		"AIOPS_RUNNER_GATEWAY_WRITE_CLIENT_CA_FILE": filepath.Join(root, "write-roots.pem"),
+		"AIOPS_CREDENTIAL_PROTECTION_KEYRING_FILE":  filepath.Join(root, "credential-keyring.json"),
 		"AIOPS_RUNNER_TRUST_DOMAIN":                 "aiops.example.internal",
 	}
 	for key, value := range values {
@@ -69,7 +70,8 @@ func TestLoadAcceptsCompleteRunnerGatewayConfiguration(t *testing.T) {
 		cfg.RunnerGateway.ServerCertFile != values["AIOPS_RUNNER_GATEWAY_SERVER_CERT_FILE"] ||
 		cfg.RunnerGateway.ServerKeyFile != values["AIOPS_RUNNER_GATEWAY_SERVER_KEY_FILE"] ||
 		cfg.RunnerGateway.ReadClientCAFile != values["AIOPS_RUNNER_GATEWAY_READ_CLIENT_CA_FILE"] ||
-		cfg.RunnerGateway.WriteClientCAFile != values["AIOPS_RUNNER_GATEWAY_WRITE_CLIENT_CA_FILE"] {
+		cfg.RunnerGateway.WriteClientCAFile != values["AIOPS_RUNNER_GATEWAY_WRITE_CLIENT_CA_FILE"] ||
+		cfg.RunnerGateway.CredentialKeyringFile != values["AIOPS_CREDENTIAL_PROTECTION_KEYRING_FILE"] {
 		t.Fatalf("RunnerGateway = %#v", cfg.RunnerGateway)
 	}
 }
@@ -81,6 +83,7 @@ func TestLoadRejectsPartialRunnerGatewayConfiguration(t *testing.T) {
 		"AIOPS_RUNNER_GATEWAY_SERVER_KEY_FILE",
 		"AIOPS_RUNNER_GATEWAY_READ_CLIENT_CA_FILE",
 		"AIOPS_RUNNER_GATEWAY_WRITE_CLIENT_CA_FILE",
+		"AIOPS_CREDENTIAL_PROTECTION_KEYRING_FILE",
 		"AIOPS_RUNNER_TRUST_DOMAIN",
 	}
 	for _, key := range keys {
@@ -128,6 +131,7 @@ func TestLoadRejectsUnsafeRunnerGatewayPathsAndAddresses(t *testing.T) {
 		{name: "relative cert", key: "AIOPS_RUNNER_GATEWAY_SERVER_CERT_FILE", value: "server.pem"},
 		{name: "unclean key", key: "AIOPS_RUNNER_GATEWAY_SERVER_KEY_FILE", value: "/safe/../server.key"},
 		{name: "control in ca", key: "AIOPS_RUNNER_GATEWAY_READ_CLIENT_CA_FILE", value: "/safe/read\n.pem"},
+		{name: "relative credential keyring", key: "AIOPS_CREDENTIAL_PROTECTION_KEYRING_FILE", value: "keyring.json"},
 		{name: "missing port", key: "AIOPS_RUNNER_GATEWAY_ADDR", value: "localhost"},
 		{name: "zero port", key: "AIOPS_RUNNER_GATEWAY_ADDR", value: ":0"},
 		{name: "public collision", key: "AIOPS_RUNNER_GATEWAY_ADDR", value: ":8080"},
@@ -147,6 +151,7 @@ func TestLoadRejectsOverlappingRunnerGatewayFiles(t *testing.T) {
 	for _, pair := range [][2]string{
 		{"AIOPS_RUNNER_GATEWAY_SERVER_CERT_FILE", "AIOPS_RUNNER_GATEWAY_SERVER_KEY_FILE"},
 		{"AIOPS_RUNNER_GATEWAY_READ_CLIENT_CA_FILE", "AIOPS_RUNNER_GATEWAY_WRITE_CLIENT_CA_FILE"},
+		{"AIOPS_RUNNER_GATEWAY_SERVER_KEY_FILE", "AIOPS_CREDENTIAL_PROTECTION_KEYRING_FILE"},
 	} {
 		t.Run(pair[0]+"="+pair[1], func(t *testing.T) {
 			setRunnerGatewayEnvironment(t)
@@ -341,6 +346,7 @@ func clearRunnerGatewayEnvironment(t *testing.T) {
 		"AIOPS_RUNNER_GATEWAY_SERVER_KEY_FILE",
 		"AIOPS_RUNNER_GATEWAY_READ_CLIENT_CA_FILE",
 		"AIOPS_RUNNER_GATEWAY_WRITE_CLIENT_CA_FILE",
+		"AIOPS_CREDENTIAL_PROTECTION_KEYRING_FILE",
 		"AIOPS_RUNNER_TRUST_DOMAIN",
 	} {
 		t.Setenv(key, "")
@@ -356,6 +362,7 @@ func setRunnerGatewayEnvironment(t *testing.T) {
 	t.Setenv("AIOPS_RUNNER_GATEWAY_SERVER_KEY_FILE", filepath.Join(root, "server-key.pem"))
 	t.Setenv("AIOPS_RUNNER_GATEWAY_READ_CLIENT_CA_FILE", filepath.Join(root, "read-roots.pem"))
 	t.Setenv("AIOPS_RUNNER_GATEWAY_WRITE_CLIENT_CA_FILE", filepath.Join(root, "write-roots.pem"))
+	t.Setenv("AIOPS_CREDENTIAL_PROTECTION_KEYRING_FILE", filepath.Join(root, "credential-keyring.json"))
 	t.Setenv("AIOPS_RUNNER_TRUST_DOMAIN", "aiops.example.internal")
 	t.Setenv("AIOPS_DATABASE_URL", "postgres://configured")
 }

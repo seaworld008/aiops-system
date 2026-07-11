@@ -26,12 +26,13 @@ const (
 )
 
 type RunnerGatewayConfig struct {
-	Addr              string
-	ServerCertFile    string
-	ServerKeyFile     string
-	ReadClientCAFile  string
-	WriteClientCAFile string
-	TrustDomain       string
+	Addr                  string
+	ServerCertFile        string
+	ServerKeyFile         string
+	ReadClientCAFile      string
+	WriteClientCAFile     string
+	CredentialKeyringFile string
+	TrustDomain           string
 }
 
 type Config struct {
@@ -149,6 +150,7 @@ func loadRunnerGatewayConfig(publicAddr, databaseURL string) (*RunnerGatewayConf
 		os.Getenv("AIOPS_RUNNER_GATEWAY_SERVER_KEY_FILE"),
 		os.Getenv("AIOPS_RUNNER_GATEWAY_READ_CLIENT_CA_FILE"),
 		os.Getenv("AIOPS_RUNNER_GATEWAY_WRITE_CLIENT_CA_FILE"),
+		os.Getenv("AIOPS_CREDENTIAL_PROTECTION_KEYRING_FILE"),
 		os.Getenv("AIOPS_RUNNER_TRUST_DOMAIN"),
 	}
 	nonEmpty := 0
@@ -168,7 +170,8 @@ func loadRunnerGatewayConfig(publicAddr, databaseURL string) (*RunnerGatewayConf
 	}
 	configuration := &RunnerGatewayConfig{
 		Addr: values[0], ServerCertFile: values[1], ServerKeyFile: values[2],
-		ReadClientCAFile: values[3], WriteClientCAFile: values[4], TrustDomain: values[5],
+		ReadClientCAFile: values[3], WriteClientCAFile: values[4],
+		CredentialKeyringFile: values[5], TrustDomain: values[6],
 	}
 	if !validListenAddress(configuration.Addr) || configuration.Addr == publicAddr {
 		return nil, fmt.Errorf("AIOPS_RUNNER_GATEWAY_ADDR must be a distinct bounded TCP listen address")
@@ -176,6 +179,7 @@ func loadRunnerGatewayConfig(publicAddr, databaseURL string) (*RunnerGatewayConf
 	paths := []string{
 		configuration.ServerCertFile, configuration.ServerKeyFile,
 		configuration.ReadClientCAFile, configuration.WriteClientCAFile,
+		configuration.CredentialKeyringFile,
 	}
 	seen := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
