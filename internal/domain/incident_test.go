@@ -1,6 +1,7 @@
 package domain_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -95,5 +96,70 @@ func TestIncidentRejectsBackwardTransitionTime(t *testing.T) {
 	incident := domain.NewIncident("incident-1", "workspace-1", now)
 	if err := incident.TransitionAt(domain.IncidentInvestigating, now.Add(-time.Second)); err == nil {
 		t.Fatal("TransitionAt() error = nil, want backward-time rejection")
+	}
+}
+
+func TestIncidentValidatesCorrelationMetadataAsOneConsistentUnit(t *testing.T) {
+	now := time.Date(2026, 7, 11, 9, 0, 0, 0, time.UTC)
+	incident := domain.NewIncident("incident-1", "workspace-1", now)
+	incident.CorrelationKey = "payments:production:latency"
+	incident.MappingStatus = domain.MappingExact
+	incident.ServiceID = "payments"
+	incident.EnvironmentID = "production"
+	incident.LastSignalAt = now
+	incident.SignalCount = 1
+
+	if err := incident.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want valid correlation metadata", err)
+	}
+
+	incident.SignalCount = 0
+	if err := incident.Validate(); err == nil {
+		t.Fatal("Validate() error = nil, want inconsistent signal count rejection")
+	}
+}
+
+func TestIncidentRejectsNonCanonicalCorrelationKeysAndInconsistentSignalTimes(t *testing.T) {
+	now := time.Date(2026, 7, 11, 9, 0, 0, 0, time.UTC)
+	valid := domain.NewIncident("incident-1", "workspace-1", now)
+	valid.CorrelationKey = "payments:production:latency"
+	valid.LastSignalAt = now
+	valid.SignalCount = 1
+
+	for name, mutate := range map[string]func(*domain.Incident){
+		"uppercase":  func(incident *domain.Incident) { incident.CorrelationKey = "Payments:latency" },
+		"whitespace": func(incident *domain.Incident) { incident.CorrelationKey = " payments:latency" },
+		"oversized":  func(incident *domain.Incident) { incident.CorrelationKey = strings.Repeat("a", 513) },
+		"before opened": func(incident *domain.Incident) {
+			incident.LastSignalAt = incident.OpenedAt.Add(-time.Nanosecond)
+		},
+		"after updated": func(incident *domain.Incident) {
+			incident.LastSignalAt = incident.UpdatedAt.Add(time.Nanosecond)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			incident := valid
+			mutate(&incident)
+			if err := incident.Validate(); err == nil {
+				t.Fatal("Validate() error = nil, want correlation contract rejection")
+			}
+		})
+	}
+}
+
+func TestIncidentExactMappingRequiresServiceAndEnvironment(t *testing.T) {
+	now := time.Date(2026, 7, 11, 9, 0, 0, 0, time.UTC)
+	incident := domain.NewIncident("incident-1", "workspace-1", now)
+	incident.CorrelationKey = "payments:production:latency"
+	incident.MappingStatus = domain.MappingExact
+	incident.LastSignalAt = now
+	incident.SignalCount = 1
+	if err := incident.Validate(); err == nil {
+		t.Fatal("Validate() error = nil, want incomplete EXACT mapping rejection")
+	}
+	incident.ServiceID = "payments"
+	incident.EnvironmentID = "production"
+	if err := incident.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want complete EXACT mapping", err)
 	}
 }
