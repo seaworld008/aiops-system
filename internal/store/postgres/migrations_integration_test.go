@@ -3242,7 +3242,7 @@ func exerciseCredentialSystemRecoveryReceipts(
 	const exhaustedRevocationID = "95100000-0000-4000-8000-000000000002"
 	prepareM3ClaimableRevocation(t, ctx, database, queue, repository, signer,
 		exhaustedActionID, exhaustedRevocationID, workspaceID, environmentID, serviceID,
-		"payments-m3-exhausted-recovery", 'e', runnerID)
+		"payments-m3-exhausted-recovery", '3', runnerID)
 	claims, err = repository.ClaimRevocations(ctx, credential.ClaimRevocationsRequest{
 		WorkerID: runnerID, Limit: 1, LeaseDuration: 30 * time.Second,
 	})
