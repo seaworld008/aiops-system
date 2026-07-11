@@ -38,9 +38,19 @@ Recommended checks:
 gofmt -w <changed-go-files>
 go test -race -shuffle=on -count=1 ./...
 go vet ./...
-go build ./cmd/control-plane ./cmd/worker ./cmd/runner
+go build ./cmd/control-plane ./cmd/worker ./cmd/read-runner ./cmd/write-runner ./cmd/executor
 git diff --check
 ```
+
+When Docker/BuildKit is available, also verify that the READ and WRITE trust domains remain
+physically separate:
+
+```bash
+make runner-images
+```
+
+Release builds must override `GO_BUILD_IMAGE` with an approved immutable digest; the Makefile's
+full-version tag is for local and CI verification only.
 
 If PostgreSQL is available:
 
@@ -61,6 +71,8 @@ Changes must preserve these invariants:
 - production approvals bind the plan hash, exact target, parameters, observed revision, policy version, and expiry;
 - stale leases cannot write results or repeat side effects;
 - uncertain outcomes retain locks until authorized reconciliation;
+- the READ image cannot contain a mutation executor, while the WRITE image can only invoke the
+  fixed `/usr/local/libexec/aiops-executor` without payload-selected argv or environment;
 - production writes remain disabled unless every documented release gate passes.
 
 An implementation that makes a demo easier but weakens one of these boundaries will not be accepted.

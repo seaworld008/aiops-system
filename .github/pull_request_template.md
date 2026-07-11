@@ -21,7 +21,7 @@ Write `None` only after checking each boundary.
 - [ ] New or changed behavior has tests.
 - [ ] `go test -race -shuffle=on -count=1 ./...`
 - [ ] `go vet ./...`
-- [ ] `go build ./cmd/control-plane ./cmd/worker ./cmd/runner`
+- [ ] `go build ./cmd/control-plane ./cmd/worker ./cmd/read-runner ./cmd/write-runner ./cmd/executor`
 - [ ] `git diff --check`
 - [ ] PostgreSQL migration/integration tests were run, or the reason they could not run is documented.
 
