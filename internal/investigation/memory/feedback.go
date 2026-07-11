@@ -34,10 +34,6 @@ func (repository *Repository) RecordFeedback(ctx context.Context, request invest
 	}
 	digest := sha256.Sum256(wire)
 	requestHash := fmt.Sprintf("%x", digest[:])
-	now := repository.clock().UTC()
-	if now.IsZero() {
-		return investigation.RecordFeedbackResult{}, fmt.Errorf("%w: clock returned zero time", investigation.ErrInvalidRequest)
-	}
 
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
@@ -79,17 +75,21 @@ func (repository *Repository) RecordFeedback(ctx context.Context, request invest
 	if _, duplicate := repository.feedback[scoped(request.WorkspaceID, feedbackID)]; duplicate {
 		return investigation.RecordFeedbackResult{}, fmt.Errorf("%w: ID factory returned duplicate feedback ID", investigation.ErrInvalidRequest)
 	}
+	commitAt, err := repository.investigationCommitTime(request.WorkspaceID, item, incident.UpdatedAt, hypothesis.CreatedAt)
+	if err != nil {
+		return investigation.RecordFeedbackResult{}, err
+	}
 	feedback := domain.Feedback{
 		ID: feedbackID, WorkspaceID: request.WorkspaceID, IncidentID: incident.ID,
 		InvestigationID: item.ID, HypothesisID: hypothesis.ID, Actor: request.Actor,
-		Verdict: request.Verdict, Details: bytes.Clone(request.Details), CreatedAt: now,
+		Verdict: request.Verdict, Details: bytes.Clone(request.Details), CreatedAt: commitAt,
 	}
 	if validateErr := feedback.Validate(); validateErr != nil {
 		return investigation.RecordFeedbackResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, validateErr)
 	}
 	switch request.Verdict {
 	case domain.FeedbackConfirmed:
-		if err := incident.ConfirmRootCauseAt(&hypothesis, request.Actor, now); err != nil {
+		if err := incident.ConfirmRootCauseAt(&hypothesis, request.Actor, commitAt); err != nil {
 			return investigation.RecordFeedbackResult{}, investigation.ErrInvalidTransition
 		}
 		repository.incidents[incidentKey] = incident

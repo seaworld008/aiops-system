@@ -33,6 +33,10 @@ func TestCanonicalTaskSpecsRejectConnectionAndCredentialMaterial(t *testing.T) {
 		"token":                          `{"page_token":"opaque"}`,
 		"password":                       `{"password":"redacted"}`,
 		"credential":                     `{"credential_id":"id"}`,
+		"API key JSON":                   `{"api_key":"task-json-canary"}`,
+		"auth JSON":                      `{"auth":"task-json-canary"}`,
+		"accessor JSON":                  `{"accessor":"task-json-canary"}`,
+		"control-obfuscated JSON":        `{"pass\u0000word":"task-json-canary"}`,
 		"host and port":                  `{"host":"db.internal","port":5432}`,
 		"dsn":                            `{"dsn":"postgres://db.internal:5432/app"}`,
 		"name value":                     `{"name":"endpoint","value":"https://internal.invalid"}`,
@@ -59,6 +63,8 @@ func TestCanonicalTaskSpecsRejectConnectionAndCredentialMaterial(t *testing.T) {
 			item.Input = []byte(input)
 			if _, _, err := investigation.CanonicalTaskSpecs([]investigation.TaskSpec{item}); !errors.Is(err, investigation.ErrInvalidRequest) {
 				t.Fatalf("CanonicalTaskSpecs() error = %v, want ErrInvalidRequest", err)
+			} else if strings.Contains(err.Error(), "task-json-canary") {
+				t.Fatalf("CanonicalTaskSpecs() echoed sensitive task input: %v", err)
 			}
 		})
 	}

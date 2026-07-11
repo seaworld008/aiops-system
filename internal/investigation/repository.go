@@ -147,6 +147,18 @@ type FinalizeInvestigationResult struct {
 	Replayed      bool
 }
 
+type FailInvestigationRequest struct {
+	WorkspaceID     string
+	InvestigationID string
+	IdempotencyKey  string
+	FailureCode     string
+}
+
+type FailInvestigationResult struct {
+	Investigation domain.Investigation
+	Replayed      bool
+}
+
 type StartModelRequest struct {
 	WorkspaceID     string
 	InvestigationID string
@@ -193,6 +205,7 @@ type Repository interface {
 	CompleteTask(context.Context, CompleteTaskRequest) (CompleteTaskResult, error)
 	StartModel(context.Context, StartModelRequest) (StartModelResult, error)
 	FinalizeInvestigation(context.Context, FinalizeInvestigationRequest) (FinalizeInvestigationResult, error)
+	FailInvestigation(context.Context, FailInvestigationRequest) (FailInvestigationResult, error)
 	RecordFeedback(context.Context, RecordFeedbackRequest) (RecordFeedbackResult, error)
 }
 

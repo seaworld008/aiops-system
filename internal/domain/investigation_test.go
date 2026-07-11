@@ -165,9 +165,27 @@ func TestInvestigationAndReadTaskValidateLifecycleShape(t *testing.T) {
 	}
 }
 
+func TestCancelledReadTaskAllowsPreStartCancellation(t *testing.T) {
+	now := time.Date(2026, 7, 12, 18, 30, 0, 0, time.UTC)
+	input := json.RawMessage(`{"lookback_minutes":15}`)
+	task := domain.ReadTask{
+		ID: "task-1", WorkspaceID: "workspace-1", IncidentID: "incident-1", InvestigationID: "investigation-1",
+		Key: "metrics", Position: 1, ConnectorID: "prometheus-prod", Operation: "range_query",
+		Input: input, InputHash: sha256Hex(input), Status: domain.ReadTaskCancelled, FailureCode: "investigation_cancelled",
+		CreatedAt: now, CompletedAt: now, UpdatedAt: now,
+	}
+	if err := task.Validate(); err != nil {
+		t.Fatalf("Validate(pre-start CANCELLED) error = %v", err)
+	}
+}
+
 func TestSafeJSONObjectRejectsSensitivePathsNamesAndValuesWithoutEcho(t *testing.T) {
 	const canary = "sensitive-canary-value"
 	unsafe := map[string]json.RawMessage{
+		"API key field":                json.RawMessage(`{"api_key":"` + canary + `"}`),
+		"auth field":                   json.RawMessage(`{"auth":"` + canary + `"}`),
+		"accessor field":               json.RawMessage(`{"accessor":"` + canary + `"}`),
+		"control-obfuscated password":  json.RawMessage(`{"pass\u0000word":"` + canary + `"}`),
 		"duplicate field hides bearer": json.RawMessage(`{"message":"Bearer ` + canary + `","message":"ok"}`),
 		"error body path":              json.RawMessage(`{"error":{"body":"` + canary + `"}}`),
 		"nested raw error path":        json.RawMessage(`{"error":{"details":{"body":"raw-error-` + canary + `"}}}`),
@@ -272,6 +290,32 @@ func TestEvidenceAttributesRejectSensitiveNamesAndValues(t *testing.T) {
 	}
 }
 
+func TestEvidenceRejectsSensitivePayloadJSONWithoutEcho(t *testing.T) {
+	now := time.Date(2026, 7, 12, 18, 15, 0, 0, time.UTC)
+	const canary = "evidence-json-canary"
+	for name, payload := range map[string]json.RawMessage{
+		"API key":            json.RawMessage(`{"api_key":"` + canary + `"}`),
+		"auth":               json.RawMessage(`{"auth":"` + canary + `"}`),
+		"accessor":           json.RawMessage(`{"accessor":"` + canary + `"}`),
+		"control-obfuscated": json.RawMessage(`{"pass\u0000word":"` + canary + `"}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			evidence := domain.Evidence{
+				ID: "evidence-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
+				InvestigationID: "investigation-1", TaskID: "task-1", ConnectorID: "prometheus-prod",
+				ContentHash: sha256Hex(payload), Payload: payload, CollectedAt: now, CreatedAt: now,
+			}
+			err := evidence.Validate()
+			if err == nil {
+				t.Fatal("Validate() error = nil, want sensitive payload rejection")
+			}
+			if strings.Contains(err.Error(), canary) {
+				t.Fatalf("Validate() echoed sensitive payload: %v", err)
+			}
+		})
+	}
+}
+
 func TestSafeTextAndMetadataEnforceUnicodeSafety(t *testing.T) {
 	invalidUTF8 := "canary" + string([]byte{0xff})
 	for name, value := range map[string]string{
@@ -370,8 +414,7 @@ func TestInvestigationFailureCodeIsBoundToFailureStates(t *testing.T) {
 
 	failed := queued
 	failed.Status = domain.InvestigationFailed
-	failed.ModelStatus = domain.ModelFailed
-	failed.ModelFailureCode = "model_unavailable"
+	failed.ModelStatus = domain.ModelCancelled
 	failed.FailureCode = ""
 	failed.CompletedAt = now
 	if err := failed.Validate(); err == nil {
@@ -380,6 +423,11 @@ func TestInvestigationFailureCodeIsBoundToFailureStates(t *testing.T) {
 	failed.FailureCode = "internal_failure"
 	if err := failed.Validate(); err != nil {
 		t.Fatalf("FAILED Investigation valid failure code error = %v", err)
+	}
+	failed.ModelStatus = domain.ModelFailed
+	failed.ModelFailureCode = "model_unavailable"
+	if err := failed.Validate(); err == nil {
+		t.Fatal("FAILED Investigation accepted model-owned failure state")
 	}
 }
 

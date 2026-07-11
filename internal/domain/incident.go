@@ -46,10 +46,17 @@ type Incident struct {
 	Version               int64
 }
 
+// NewIncident is the legacy constructor that assumes tenant and workspace IDs are identical.
+// Persistence adapters with a trusted tenant mapping must use NewIncidentForTenant.
 func NewIncident(id, workspaceID string, now time.Time) Incident {
+	return NewIncidentForTenant(id, workspaceID, workspaceID, now)
+}
+
+// NewIncidentForTenant constructs an incident with independently trusted tenant and workspace scope.
+func NewIncidentForTenant(id, tenantID, workspaceID string, now time.Time) Incident {
 	return Incident{
 		ID:            id,
-		TenantID:      workspaceID,
+		TenantID:      tenantID,
 		WorkspaceID:   workspaceID,
 		MappingStatus: MappingUnresolved,
 		Severity:      "UNKNOWN",
@@ -149,6 +156,9 @@ func (incident *Incident) ConfirmRootCauseAt(hypothesis *Hypothesis, actor Actor
 	}
 	if err := incident.Validate(); err != nil {
 		return fmt.Errorf("root cause confirmation requires a valid incident")
+	}
+	if incident.ConfirmedHypothesisID != "" {
+		return fmt.Errorf("incident already has a confirmed root cause")
 	}
 	if actor.Type != ActorHuman || !ValidResourceID(actor.ID) {
 		return fmt.Errorf("root cause confirmation requires an authenticated human")

@@ -57,6 +57,26 @@ func TestOnlyExplicitHumanFeedbackConfirmsRootCause(t *testing.T) {
 	}
 }
 
+func TestIncidentRejectsSecondRootCauseWithoutMutation(t *testing.T) {
+	now := time.Date(2026, 7, 12, 18, 45, 0, 0, time.UTC)
+	incident := domain.NewIncident("incident-1", "workspace-1", now)
+	first := validRootCauseHypothesis(now, "hypothesis-1", "workspace-1", incident.ID)
+	actor := domain.Actor{Type: domain.ActorHuman, ID: "user-1"}
+	if err := incident.ConfirmRootCauseAt(&first, actor, now); err != nil {
+		t.Fatalf("ConfirmRootCauseAt(first) error = %v", err)
+	}
+	second := validRootCauseHypothesis(now, "hypothesis-2", "workspace-1", incident.ID)
+	wantIncident := incident
+	wantSecond := second
+
+	if err := incident.ConfirmRootCauseAt(&second, actor, now.Add(time.Minute)); err == nil {
+		t.Fatal("ConfirmRootCauseAt(second) error = nil, want single-root-cause rejection")
+	}
+	if !reflect.DeepEqual(incident, wantIncident) || !reflect.DeepEqual(second, wantSecond) {
+		t.Fatalf("second confirmation mutated objects: %#v / %#v", incident, second)
+	}
+}
+
 func TestIncidentRootCauseConfirmationRejectsInvalidActorWithoutMutation(t *testing.T) {
 	now := time.Date(2026, 7, 12, 17, 0, 0, 0, time.UTC)
 	incident := domain.NewIncident("incident-1", "workspace-1", now)
@@ -136,6 +156,17 @@ func TestNewIncidentHasPersistableRequiredFields(t *testing.T) {
 	}
 	if err := incident.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestNewIncidentForTenantPreservesDistinctTenantAndWorkspace(t *testing.T) {
+	now := time.Date(2026, 7, 12, 19, 0, 0, 0, time.UTC)
+	incident := domain.NewIncidentForTenant("incident-1", "tenant-1", "workspace-1", now)
+	if incident.TenantID != "tenant-1" || incident.WorkspaceID != "workspace-1" {
+		t.Fatalf("tenant/workspace = %q/%q, want distinct trusted scope", incident.TenantID, incident.WorkspaceID)
+	}
+	if err := incident.ValidateForCreate(); err != nil {
+		t.Fatalf("ValidateForCreate() error = %v", err)
 	}
 }
 

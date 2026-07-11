@@ -10,8 +10,9 @@ import (
 )
 
 type Options struct {
-	Clock     func() time.Time
-	IDFactory func() string
+	Clock          func() time.Time
+	IDFactory      func() string
+	TenantResolver func(workspaceID string) (string, error)
 }
 
 type Repository struct {
@@ -33,20 +34,22 @@ type Repository struct {
 	hypotheses                   map[scopeKey]domain.Hypothesis
 	hypothesisIDsByInvestigation map[scopeKey][]string
 	finalizeIdempotency          map[scopeKey]finalizeRecord
+	failureIdempotency           map[scopeKey]idempotencyRecord
 	feedback                     map[scopeKey]domain.Feedback
 	feedbackIdempotency          map[scopeKey]idempotencyRecord
 	modelStartIdempotency        map[scopeKey]idempotencyRecord
 	idempotencyOwners            map[scopeKey]string
 
-	clock     func() time.Time
-	idFactory func() string
+	clock          func() time.Time
+	idFactory      func() string
+	tenantResolver func(workspaceID string) (string, error)
 }
 
 var _ investigation.Repository = (*Repository)(nil)
 
 func New(options Options) (*Repository, error) {
-	if options.Clock == nil || options.IDFactory == nil {
-		return nil, fmt.Errorf("%w: clock and ID factory are required", investigation.ErrInvalidRequest)
+	if options.Clock == nil || options.IDFactory == nil || options.TenantResolver == nil {
+		return nil, fmt.Errorf("%w: clock, ID factory and tenant resolver are required", investigation.ErrInvalidRequest)
 	}
 	if options.Clock().IsZero() {
 		return nil, fmt.Errorf("%w: clock returned zero time", investigation.ErrInvalidRequest)
@@ -68,12 +71,14 @@ func New(options Options) (*Repository, error) {
 		hypotheses:                   make(map[scopeKey]domain.Hypothesis),
 		hypothesisIDsByInvestigation: make(map[scopeKey][]string),
 		finalizeIdempotency:          make(map[scopeKey]finalizeRecord),
+		failureIdempotency:           make(map[scopeKey]idempotencyRecord),
 		feedback:                     make(map[scopeKey]domain.Feedback),
 		feedbackIdempotency:          make(map[scopeKey]idempotencyRecord),
 		modelStartIdempotency:        make(map[scopeKey]idempotencyRecord),
 		idempotencyOwners:            make(map[scopeKey]string),
 		clock:                        options.Clock,
 		idFactory:                    options.IDFactory,
+		tenantResolver:               options.TenantResolver,
 	}, nil
 }
 

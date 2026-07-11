@@ -90,3 +90,29 @@ func TestHypothesisRejectsSensitiveSummaryAndUnknownTextWithoutEcho(t *testing.T
 		})
 	}
 }
+
+func TestHypothesisRejectsSensitiveProposalJSONWithoutEcho(t *testing.T) {
+	now := time.Date(2026, 7, 12, 18, 0, 0, 0, time.UTC)
+	const canary = "hypothesis-json-canary"
+	for name, proposal := range map[string]json.RawMessage{
+		"API key":            json.RawMessage(`{"api_key":"` + canary + `"}`),
+		"auth":               json.RawMessage(`{"auth":"` + canary + `"}`),
+		"accessor":           json.RawMessage(`{"accessor":"` + canary + `"}`),
+		"control-obfuscated": json.RawMessage(`{"pass\u0000word":"` + canary + `"}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			hypothesis := domain.Hypothesis{
+				ID: "hypothesis-1", WorkspaceID: "workspace-1", IncidentID: "incident-1", InvestigationID: "investigation-1",
+				Status: domain.HypothesisProposed, Rank: 1, Confidence: 0.8, Summary: "Safe summary",
+				Proposal: proposal, ProposalHash: sha256Hex(proposal), EvidenceIDs: []string{"evidence-1"}, CreatedAt: now,
+			}
+			err := hypothesis.Validate()
+			if err == nil {
+				t.Fatal("Validate() error = nil, want sensitive proposal rejection")
+			}
+			if strings.Contains(err.Error(), canary) {
+				t.Fatalf("Validate() echoed sensitive proposal: %v", err)
+			}
+		})
+	}
+}

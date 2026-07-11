@@ -69,29 +69,28 @@ func (repository *Repository) CorrelateSignal(ctx context.Context, request inves
 		!validMapping(request.MappingStatus, request.ServiceID, request.EnvironmentID) {
 		return investigation.CorrelateSignalResult{}, fmt.Errorf("%w: invalid signal correlation", investigation.ErrInvalidRequest)
 	}
-	now := repository.clock().UTC()
-	if now.IsZero() {
-		return investigation.CorrelateSignalResult{}, fmt.Errorf("%w: clock returned zero time", investigation.ErrInvalidRequest)
+	signalKey := scoped(request.WorkspaceID, request.SignalID)
+	repository.mu.RLock()
+	result, err, handled := repository.correlationReplayLocked(signalKey, request)
+	repository.mu.RUnlock()
+	if handled {
+		return result, err
+	}
+	tenantID, err := repository.tenantResolver(request.WorkspaceID)
+	if err != nil || !domain.ValidResourceID(tenantID) {
+		return investigation.CorrelateSignalResult{}, fmt.Errorf("%w: trusted tenant resolution failed", investigation.ErrInvalidRequest)
 	}
 
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
-	signalKey := scoped(request.WorkspaceID, request.SignalID)
-	signal, exists := repository.signals[signalKey]
-	if !exists {
-		return investigation.CorrelateSignalResult{}, store.ErrNotFound
+	result, err, handled = repository.correlationReplayLocked(signalKey, request)
+	if handled {
+		return result, err
 	}
-	if association, associated := repository.signalIncident[signalKey]; associated {
-		if !association.matches(request) {
-			return investigation.CorrelateSignalResult{}, store.ErrIdempotencyConflict
-		}
-		incident, incidentExists := repository.incidents[scoped(request.WorkspaceID, association.incidentID)]
-		if !incidentExists {
-			return investigation.CorrelateSignalResult{}, store.ErrNotFound
-		}
-		return investigation.CorrelateSignalResult{
-			Incident: cloneIncident(incident), Associated: true,
-		}, nil
+	signal := repository.signals[signalKey]
+	now := repository.clock().UTC()
+	if now.IsZero() {
+		return investigation.CorrelateSignalResult{}, fmt.Errorf("%w: clock returned zero time", investigation.ErrInvalidRequest)
 	}
 
 	correlationKey := scoped(request.WorkspaceID, request.CorrelationKey)
@@ -101,7 +100,14 @@ func (repository *Repository) CorrelateSignal(ctx context.Context, request inves
 		delete(repository.activeIncidentByCorrelation, correlationKey)
 		active = false
 	}
+	if active && incident.TenantID != tenantID {
+		return investigation.CorrelateSignalResult{}, store.ErrScopeViolation
+	}
 	if !active && signal.Status == "resolved" {
+		repository.signalIncident[signalKey] = signalAssociationRecord{
+			correlationKey: request.CorrelationKey, mappingStatus: request.MappingStatus,
+			serviceID: request.ServiceID, environmentID: request.EnvironmentID,
+		}
 		return investigation.CorrelateSignalResult{}, nil
 	}
 
@@ -116,7 +122,7 @@ func (repository *Repository) CorrelateSignal(ctx context.Context, request inves
 		}
 		openedAt := signal.ObservedAt.UTC()
 		updatedAt := laterTime(now, openedAt)
-		incident = domain.NewIncident(incidentID, request.WorkspaceID, openedAt)
+		incident = domain.NewIncidentForTenant(incidentID, tenantID, request.WorkspaceID, openedAt)
 		incident.ServiceID = request.ServiceID
 		incident.EnvironmentID = request.EnvironmentID
 		incident.CorrelationKey = request.CorrelationKey
@@ -152,6 +158,29 @@ func (repository *Repository) CorrelateSignal(ctx context.Context, request inves
 	return investigation.CorrelateSignalResult{
 		Incident: cloneIncident(incident), Created: created, Associated: true, Counted: true,
 	}, nil
+}
+
+func (repository *Repository) correlationReplayLocked(signalKey scopeKey, request investigation.CorrelateSignalRequest) (investigation.CorrelateSignalResult, error, bool) {
+	if _, exists := repository.signals[signalKey]; !exists {
+		return investigation.CorrelateSignalResult{}, store.ErrNotFound, true
+	}
+	association, associated := repository.signalIncident[signalKey]
+	if !associated {
+		return investigation.CorrelateSignalResult{}, nil, false
+	}
+	if !association.matches(request) {
+		return investigation.CorrelateSignalResult{}, store.ErrIdempotencyConflict, true
+	}
+	if association.incidentID == "" {
+		return investigation.CorrelateSignalResult{}, nil, true
+	}
+	incident, exists := repository.incidents[scoped(request.WorkspaceID, association.incidentID)]
+	if !exists {
+		return investigation.CorrelateSignalResult{}, store.ErrNotFound, true
+	}
+	return investigation.CorrelateSignalResult{
+		Incident: cloneIncident(incident), Associated: true,
+	}, nil, true
 }
 
 func (repository *Repository) GetIncident(ctx context.Context, workspaceID, incidentID string) (domain.Incident, error) {

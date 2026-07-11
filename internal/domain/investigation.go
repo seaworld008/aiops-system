@@ -136,9 +136,13 @@ func (task ReadTask) Validate() error {
 		if task.StartedAt.IsZero() || task.CompletedAt.IsZero() || !validIdentifier(task.EvidenceID, 256) || task.FailureCode != "" {
 			return fmt.Errorf("evidence read task lifecycle is inconsistent")
 		}
-	case ReadTaskFailed, ReadTaskCancelled:
+	case ReadTaskFailed:
 		if task.StartedAt.IsZero() || task.CompletedAt.IsZero() || task.EvidenceID != "" || !ValidFailureCode(task.FailureCode) {
 			return fmt.Errorf("failed read task lifecycle is inconsistent")
+		}
+	case ReadTaskCancelled:
+		if task.CompletedAt.IsZero() || task.EvidenceID != "" || !ValidFailureCode(task.FailureCode) {
+			return fmt.Errorf("cancelled read task lifecycle is inconsistent")
 		}
 	}
 	return nil
@@ -312,7 +316,7 @@ func (investigation Investigation) Validate() error {
 			return fmt.Errorf("completed investigation lifecycle is inconsistent")
 		}
 	case InvestigationFailed:
-		if investigation.CompletedAt.IsZero() || investigation.ModelStatus != ModelFailed {
+		if investigation.CompletedAt.IsZero() || investigation.ModelStatus != ModelCancelled {
 			return fmt.Errorf("terminal investigation lifecycle is inconsistent")
 		}
 	case InvestigationCancelled:
@@ -532,7 +536,7 @@ func consumeJSONToken(decoder *json.Decoder, token json.Token, depth int) error 
 }
 
 func validStrictJSONString(value string) bool {
-	return utf8.ValidString(value) && !strings.ContainsRune(value, utf8.RuneError)
+	return validSafeUnicode(value)
 }
 
 func unsafeSecurityPath(path []string) bool {
@@ -558,7 +562,8 @@ func normalizeSecurityName(value string) string {
 func unsafeSecurityName(value string) bool {
 	normalized := normalizeSecurityName(value)
 	for _, marker := range []string{
-		"authorization", "credential", "rawerror", "errorbody", "secret", "token", "password", "cookie", "privatekey",
+		"authorization", "authentication", "auth", "apikey", "accessor", "credential",
+		"rawerror", "errorbody", "secret", "token", "password", "cookie", "privatekey",
 	} {
 		if strings.Contains(normalized, marker) {
 			return true

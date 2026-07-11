@@ -39,10 +39,6 @@ func (repository *Repository) FinalizeInvestigation(ctx context.Context, request
 	}
 	digest := sha256.Sum256(wire)
 	requestHash := fmt.Sprintf("%x", digest[:])
-	now := repository.clock().UTC()
-	if now.IsZero() {
-		return investigation.FinalizeInvestigationResult{}, fmt.Errorf("%w: clock returned zero time", investigation.ErrInvalidRequest)
-	}
 
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
@@ -84,9 +80,9 @@ func (repository *Repository) FinalizeInvestigation(ctx context.Context, request
 			return investigation.FinalizeInvestigationResult{}, investigation.ErrInvalidTransition
 		}
 	}
-	createdHypotheses := make([]domain.Hypothesis, 0, len(canonical))
+	hypothesisIDs := make([]string, len(canonical))
 	createdIDs := make(map[string]struct{}, len(canonical))
-	for _, spec := range canonical {
+	for index, spec := range canonical {
 		hypothesisID, idErr := repository.newID()
 		if idErr != nil {
 			return investigation.FinalizeInvestigationResult{}, idErr
@@ -98,16 +94,8 @@ func (repository *Repository) FinalizeInvestigation(ctx context.Context, request
 			return investigation.FinalizeInvestigationResult{}, fmt.Errorf("%w: ID factory returned duplicate hypothesis ID", investigation.ErrInvalidRequest)
 		}
 		createdIDs[hypothesisID] = struct{}{}
-		hypothesis := domain.Hypothesis{
-			ID: hypothesisID, WorkspaceID: request.WorkspaceID, IncidentID: item.IncidentID, InvestigationID: item.ID,
-			Status: domain.HypothesisProposed, Rank: spec.Rank, Confidence: spec.Confidence, Summary: spec.Summary,
-			Proposal: bytes.Clone(spec.Proposal), ProposalHash: spec.ProposalHash,
-			Unknowns: append([]string(nil), spec.Unknowns...), EvidenceIDs: append([]string(nil), spec.EvidenceIDs...), CreatedAt: now,
-		}
-		if validateErr := hypothesis.Validate(); validateErr != nil {
-			return investigation.FinalizeInvestigationResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, validateErr)
-		}
-		for _, evidenceID := range hypothesis.EvidenceIDs {
+		hypothesisIDs[index] = hypothesisID
+		for _, evidenceID := range spec.EvidenceIDs {
 			evidence, found := repository.evidence[scoped(request.WorkspaceID, evidenceID)]
 			if !found {
 				return investigation.FinalizeInvestigationResult{}, store.ErrNotFound
@@ -116,18 +104,42 @@ func (repository *Repository) FinalizeInvestigation(ctx context.Context, request
 				return investigation.FinalizeInvestigationResult{}, store.ErrScopeViolation
 			}
 		}
+	}
+	commitAt, err := repository.investigationCommitTime(request.WorkspaceID, item)
+	if err != nil {
+		return investigation.FinalizeInvestigationResult{}, err
+	}
+	var taskCandidates []domain.ReadTask
+	if request.Status == domain.InvestigationCancelled {
+		taskCandidates, err = repository.cancelledTaskCandidates(request.WorkspaceID, item.ID, request.FailureCode, commitAt)
+		if err != nil {
+			return investigation.FinalizeInvestigationResult{}, err
+		}
+	}
+	createdHypotheses := make([]domain.Hypothesis, 0, len(canonical))
+	for index, spec := range canonical {
+		hypothesis := domain.Hypothesis{
+			ID: hypothesisIDs[index], WorkspaceID: request.WorkspaceID, IncidentID: item.IncidentID, InvestigationID: item.ID,
+			Status: domain.HypothesisProposed, Rank: spec.Rank, Confidence: spec.Confidence, Summary: spec.Summary,
+			Proposal: bytes.Clone(spec.Proposal), ProposalHash: spec.ProposalHash,
+			Unknowns: append([]string(nil), spec.Unknowns...), EvidenceIDs: append([]string(nil), spec.EvidenceIDs...), CreatedAt: commitAt,
+		}
+		if validateErr := hypothesis.Validate(); validateErr != nil {
+			return investigation.FinalizeInvestigationResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, validateErr)
+		}
 		createdHypotheses = append(createdHypotheses, hypothesis)
 	}
 	item.Status = request.Status
 	item.ModelStatus = request.ModelStatus
 	item.FailureCode = request.FailureCode
 	item.ModelFailureCode = request.ModelFailureCode
-	item.CompletedAt = now
-	item.UpdatedAt = now
+	item.CompletedAt = commitAt
+	item.UpdatedAt = commitAt
 	if validateErr := item.Validate(); validateErr != nil {
 		return investigation.FinalizeInvestigationResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, validateErr)
 	}
 	repository.investigations[scoped(request.WorkspaceID, item.ID)] = item
+	repository.storeTaskCandidates(request.WorkspaceID, taskCandidates)
 	ids := make([]string, 0, len(createdHypotheses))
 	for _, hypothesis := range createdHypotheses {
 		repository.hypotheses[scoped(request.WorkspaceID, hypothesis.ID)] = cloneHypothesis(hypothesis)

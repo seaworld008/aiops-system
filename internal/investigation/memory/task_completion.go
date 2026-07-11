@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/investigation"
@@ -33,11 +32,7 @@ func (repository *Repository) CompleteTask(ctx context.Context, request investig
 	default:
 		return investigation.CompleteTaskResult{}, fmt.Errorf("%w: invalid task completion status", investigation.ErrInvalidRequest)
 	}
-	now := repository.clock().UTC()
-	if now.IsZero() {
-		return investigation.CompleteTaskResult{}, fmt.Errorf("%w: clock returned zero time", investigation.ErrInvalidRequest)
-	}
-	if err := validateCompleteTaskBody(request, now); err != nil {
+	if err := validateCompleteTaskBody(request); err != nil {
 		return investigation.CompleteTaskResult{}, err
 	}
 	requestWire, err := json.Marshal(request)
@@ -87,16 +82,6 @@ func (repository *Repository) CompleteTask(ctx context.Context, request investig
 		if _, duplicate := repository.evidence[scoped(request.WorkspaceID, evidenceID)]; duplicate {
 			return investigation.CompleteTaskResult{}, fmt.Errorf("%w: ID factory returned duplicate evidence ID", investigation.ErrInvalidRequest)
 		}
-		evidence := domain.Evidence{
-			ID: evidenceID, WorkspaceID: request.WorkspaceID, IncidentID: task.IncidentID,
-			InvestigationID: item.ID, TaskID: task.ID, ConnectorID: task.ConnectorID,
-			ContentHash: request.Evidence.ContentHash, Payload: bytes.Clone(request.Evidence.Payload),
-			Attributes: cloneStringMap(request.Evidence.Attributes), CollectedAt: request.Evidence.CollectedAt.UTC(), CreatedAt: now,
-		}
-		if validateErr := evidence.Validate(); validateErr != nil {
-			return investigation.CompleteTaskResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, validateErr)
-		}
-		storedEvidence = &evidence
 	}
 	receiptID, err := repository.newID()
 	if err != nil {
@@ -105,10 +90,29 @@ func (repository *Repository) CompleteTask(ctx context.Context, request investig
 	if _, duplicate := repository.receipts[scoped(request.WorkspaceID, receiptID)]; duplicate {
 		return investigation.CompleteTaskResult{}, fmt.Errorf("%w: ID factory returned duplicate receipt ID", investigation.ErrInvalidRequest)
 	}
+	commitAt, err := repository.investigationCommitTime(request.WorkspaceID, item)
+	if err != nil {
+		return investigation.CompleteTaskResult{}, err
+	}
+	if request.Evidence != nil && request.Evidence.CollectedAt.After(commitAt) {
+		return investigation.CompleteTaskResult{}, fmt.Errorf("%w: evidence collection time is in the future", investigation.ErrInvalidRequest)
+	}
+	if request.Status == domain.ReadTaskEvidence {
+		evidence := domain.Evidence{
+			ID: evidenceID, WorkspaceID: request.WorkspaceID, IncidentID: task.IncidentID,
+			InvestigationID: item.ID, TaskID: task.ID, ConnectorID: task.ConnectorID,
+			ContentHash: request.Evidence.ContentHash, Payload: bytes.Clone(request.Evidence.Payload),
+			Attributes: cloneStringMap(request.Evidence.Attributes), CollectedAt: request.Evidence.CollectedAt.UTC(), CreatedAt: commitAt,
+		}
+		if validateErr := evidence.Validate(); validateErr != nil {
+			return investigation.CompleteTaskResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, validateErr)
+		}
+		storedEvidence = &evidence
+	}
 	receipt := domain.RunnerEvidenceReceipt{
 		ID: receiptID, WorkspaceID: request.WorkspaceID, InvestigationID: item.ID, TaskID: task.ID,
 		RunnerID: request.RunnerID, ConnectorID: task.ConnectorID, EvidenceID: evidenceID,
-		FailureCode: request.FailureCode, IdempotencyKey: request.IdempotencyKey, ReceivedAt: now,
+		FailureCode: request.FailureCode, IdempotencyKey: request.IdempotencyKey, ReceivedAt: commitAt,
 	}
 	if storedEvidence != nil {
 		receipt.ContentHash = storedEvidence.ContentHash
@@ -117,21 +121,21 @@ func (repository *Repository) CompleteTask(ctx context.Context, request investig
 		return investigation.CompleteTaskResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, validateErr)
 	}
 	if task.StartedAt.IsZero() {
-		task.StartedAt = now
+		task.StartedAt = commitAt
 	}
 	task.Status = request.Status
 	task.EvidenceID = evidenceID
 	task.FailureCode = request.FailureCode
-	task.CompletedAt = now
-	task.UpdatedAt = now
+	task.CompletedAt = commitAt
+	task.UpdatedAt = commitAt
 	if validateErr := task.Validate(); validateErr != nil {
 		return investigation.CompleteTaskResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, validateErr)
 	}
 	if item.Status == domain.InvestigationQueued {
 		item.Status = domain.InvestigationRunning
-		item.StartedAt = now
+		item.StartedAt = commitAt
 	}
-	item.UpdatedAt = now
+	item.UpdatedAt = commitAt
 	if validateErr := item.Validate(); validateErr != nil {
 		return investigation.CompleteTaskResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, validateErr)
 	}
@@ -150,7 +154,7 @@ func (repository *Repository) CompleteTask(ctx context.Context, request investig
 	return repository.taskCompletionResult(request.WorkspaceID, record, false)
 }
 
-func validateCompleteTaskBody(request investigation.CompleteTaskRequest, now time.Time) error {
+func validateCompleteTaskBody(request investigation.CompleteTaskRequest) error {
 	if request.Status != domain.ReadTaskEvidence {
 		return nil
 	}
@@ -158,7 +162,7 @@ func validateCompleteTaskBody(request investigation.CompleteTaskRequest, now tim
 		!domain.ValidSHA256Hex(request.Evidence.ContentHash) ||
 		!hashMatches(request.Evidence.Payload, request.Evidence.ContentHash) ||
 		domain.ValidateSafeAttributes(request.Evidence.Attributes) != nil ||
-		request.Evidence.CollectedAt.IsZero() || request.Evidence.CollectedAt.After(now) {
+		request.Evidence.CollectedAt.IsZero() {
 		return fmt.Errorf("%w: invalid evidence body", investigation.ErrInvalidRequest)
 	}
 	return nil
