@@ -2653,6 +2653,9 @@ func exerciseRealRunnerGatewayMigration(
 	expectSQLConstraint(t, ctx, database, "55000", "runner_certificates_history_guard", `
 		DELETE FROM runner_certificates WHERE certificate_sha256 = $1
 	`, certificateSHA256)
+	expectSQLState(t, ctx, database, "0A000", `
+		TRUNCATE runner_certificates
+	`)
 	expectSQLConstraint(t, ctx, database, "55000", "runner_certificates_history_guard", `
 		TRUNCATE runner_certificates CASCADE
 	`)
