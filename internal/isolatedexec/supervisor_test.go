@@ -49,6 +49,9 @@ func TestSupervisorCloseCannotCrossActiveStartReservation(t *testing.T) {
 	if err := supervisor.Close(); err != nil {
 		t.Fatalf("Close(after release) error = %v", err)
 	}
+	if closedRelease, err := supervisor.reserveJob(); closedRelease != nil || !errors.Is(err, ErrInvalidConfiguration) {
+		t.Fatalf("reserveJob(closed) returned release=%t, error=%v", closedRelease != nil, err)
+	}
 }
 
 func TestDefaultSettingsKeepFixedTerminationAndResourceBounds(t *testing.T) {
