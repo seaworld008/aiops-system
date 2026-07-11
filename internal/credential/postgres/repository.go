@@ -1466,7 +1466,26 @@ func (repository *Repository) ClaimRevocations(ctx context.Context, request cred
 			if accessor != nil {
 				accessor.Destroy()
 			}
+			hardenedRecovery, err := hasCredentialRevocationSystemRecoverySchema(ctx, tx)
+			if err != nil {
+				return nil, err
+			}
 			detailHash := credential.SHA256Hex([]byte(credential.FailureDetailProtectedRefInvalid))
+			if hardenedRecovery {
+				alert := updated.revocation
+				alert.FailureCode = credential.FailureInvalidReference
+				alert.FailureDetailSHA256 = detailHash
+				if err := writeStateChange(ctx, tx, alert, "SYSTEM", request.WorkerID,
+					"credential.revocation.protected_reference_unavailable",
+					"credential.revocation.protected_reference_unavailable.v1"); err != nil {
+					return nil, err
+				}
+				continue
+			}
+
+			// M2 did not yet have a database-verifiable system recovery receipt.
+			// Preserve its immediate quarantine behavior only while that complete
+			// M3 schema capability is absent during a coordinated upgrade.
 			quarantined, quarantineErr := selectStored(ctx, tx, `
 				UPDATE credential_revocations
 				SET status = 'MANUAL_REQUIRED',
@@ -1508,6 +1527,39 @@ func (repository *Repository) ClaimRevocations(ctx context.Context, request cred
 	}
 	committed = true
 	return claims, nil
+}
+
+func hasCredentialRevocationSystemRecoverySchema(ctx context.Context, tx pgx.Tx) (bool, error) {
+	var available bool
+	err := tx.QueryRow(ctx, `
+		SELECT
+			EXISTS (
+				SELECT 1
+				FROM pg_catalog.pg_class AS relation
+				JOIN pg_catalog.pg_namespace AS namespace
+				  ON namespace.oid = relation.relnamespace
+				WHERE namespace.nspname = current_schema()
+				  AND relation.relname = 'credential_revocation_system_receipts'
+				  AND relation.relkind IN ('r', 'p')
+			) AND EXISTS (
+				SELECT 1
+				FROM pg_catalog.pg_class AS relation
+				JOIN pg_catalog.pg_namespace AS namespace
+				  ON namespace.oid = relation.relnamespace
+				JOIN pg_catalog.pg_attribute AS attribute
+				  ON attribute.attrelid = relation.oid
+				WHERE namespace.nspname = current_schema()
+				  AND relation.relname = 'credential_revocations'
+				  AND relation.relkind IN ('r', 'p')
+				  AND attribute.attname = 'heartbeat_seq'
+				  AND attribute.attnum > 0
+				  AND NOT attribute.attisdropped
+			)
+	`).Scan(&available)
+	if err != nil {
+		return false, databaseError("discover credential revocation system recovery schema", err)
+	}
+	return available, nil
 }
 
 func (repository *Repository) Heartbeat(ctx context.Context, request credential.HeartbeatRequest) (credential.Revocation, error) {

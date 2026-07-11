@@ -1,0 +1,3405 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "AIOps Runner Gateway API",
+    "version": "1.0.0",
+    "description": "Internal TLS 1.3/mTLS protocol. Runner identity is derived only from the verified client certificate and server-side registration. All responses are no-store."
+  },
+  "servers": [
+    {
+      "url": "https://runner-gateway.invalid:8443",
+      "description": "Deployment-specific TCP-passthrough endpoint"
+    }
+  ],
+  "security": [
+    {
+      "mutualTLS": []
+    }
+  ],
+  "x-aiops-strict-http": {
+    "content_type": "exactly-one-application/json-without-parameters",
+    "reject_duplicate_json_keys": true,
+    "reject_unknown_json_fields": true,
+    "reject_trailing_json_values": true,
+    "reject_content_encoding": true,
+    "reject_identity_headers": true,
+    "all_responses_no_store": true,
+    "all_responses_nosniff": true
+  },
+  "paths": {
+    "/runner/v1/identity": {
+      "get": {
+        "operationId": "getRunnerIdentity",
+        "summary": "Return the currently authenticated server-side Runner identity",
+        "x-aiops-max-response-body-bytes": 65536,
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/RunnerIdentityOK"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/runner/v1/jobs:lease": {
+      "post": {
+        "operationId": "leaseRunnerJob",
+        "summary": "Lease one server-selected job",
+        "description": "This is the only job operation that returns a raw job lease token. READ returns 204 until the investigation runtime is enabled.",
+        "x-aiops-max-request-body-bytes": 262144,
+        "x-aiops-max-response-body-bytes": 262144,
+        "x-aiops-200-required-pool": "WRITE",
+        "x-aiops-read-behavior": "204-no-job-without-queue-dispatch",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobLeaseRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/JobLeaseOK"
+          },
+          "204": {
+            "$ref": "#/components/responses/NoJob"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/runner/v1/jobs/{job_id}:credential-anchor": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobID"
+        }
+      ],
+      "post": {
+        "operationId": "anchorRunnerJobCredential",
+        "summary": "Advance one durable credential authorization or anchor phase",
+        "description": "Gateway never holds a Vault manager/revoker token, child token, or dynamic Secret. The closed phases are AUTHORIZE_CHILD_CREATE, RECORD_ANCHOR, ACTIVATE, NO_CREDENTIAL and REQUEST_REVOCATION. Runner cannot submit issuer routes, roles, paths, scopes, TTLs or arbitrary parameters. RECORD_ANCHOR is the only phase carrying a revoke-only accessor, and dynamic issuance is forbidden until its durable ACK.",
+        "x-aiops-max-request-body-bytes": 65536,
+        "x-aiops-max-response-body-bytes": 65536,
+        "x-aiops-required-pool": "WRITE",
+        "security": [
+          {
+            "mutualTLS": [],
+            "jobLease": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CredentialAnchorRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/CredentialAnchorOK"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/LeaseAuthenticationFailed"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/runner/v1/jobs/{job_id}:start": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobID"
+        }
+      ],
+      "post": {
+        "operationId": "startRunnerJob",
+        "summary": "Perform final server-side authorization and enter RUNNING",
+        "description": "The server revalidates signature, approval/CEL policy, environment and target revisions, Safety/Kill Switch, production classification, certificate, registration, scope revision, epoch, and lease token.",
+        "x-aiops-max-request-body-bytes": 65536,
+        "x-aiops-max-response-body-bytes": 65536,
+        "x-aiops-required-pool": "WRITE",
+        "security": [
+          {
+            "mutualTLS": [],
+            "jobLease": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobStartRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/JobStartOK"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/LeaseAuthenticationFailed"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/runner/v1/jobs/{job_id}:heartbeat": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobID"
+        }
+      ],
+      "post": {
+        "operationId": "heartbeatRunnerJob",
+        "summary": "Advance the job heartbeat sequence",
+        "description": "Lease extension is selected by the Gateway. Replayed sequences do not extend a lease. Certificate revocation or Runner disable returns 403 without extension; scope revision change or cancellation returns 200 TERMINATE without extension.",
+        "x-aiops-max-request-body-bytes": 65536,
+        "x-aiops-max-response-body-bytes": 65536,
+        "x-aiops-required-pool": "WRITE",
+        "security": [
+          {
+            "mutualTLS": [],
+            "jobLease": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobHeartbeatRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/JobHeartbeatOK"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/LeaseAuthenticationFailed"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/HeartbeatConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/runner/v1/jobs/{job_id}:release": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobID"
+        }
+      ],
+      "post": {
+        "operationId": "releaseRunnerJob",
+        "summary": "Release a LEASED job before start",
+        "description": "Only LEASED jobs may be returned to QUEUED. The server derives the detail hash and retry delay from the allowlisted reason code.",
+        "x-aiops-max-request-body-bytes": 65536,
+        "x-aiops-max-response-body-bytes": 65536,
+        "x-aiops-required-pool": "WRITE",
+        "security": [
+          {
+            "mutualTLS": [],
+            "jobLease": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobReleaseRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/JobStateOK"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/LeaseAuthenticationFailed"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/runner/v1/jobs/{job_id}:complete": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobID"
+        }
+      ],
+      "post": {
+        "operationId": "completeRunnerJob",
+        "summary": "Persist a certificate-bound result receipt and request credential revocation",
+        "description": "Runner never submits a result hash. Gateway binds job, plan, Runner, client certificate, epoch, scope revision and structured result before JCS/SHA-256.",
+        "x-aiops-max-request-body-bytes": 65536,
+        "x-aiops-max-response-body-bytes": 65536,
+        "x-aiops-required-pool": "WRITE",
+        "security": [
+          {
+            "mutualTLS": [],
+            "jobLease": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobCompleteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/JobCompletionOK"
+          },
+          "202": {
+            "$ref": "#/components/responses/JobCompletionAccepted"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/LeaseAuthenticationFailed"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/ResultConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/runner/v1/revocations:lease": {
+      "post": {
+        "operationId": "leaseCredentialRevocation",
+        "summary": "Lease one credential revocation to an authorized WRITE Runner",
+        "description": "This is the only revocation operation that returns a raw claim token and revoke-only accessor.",
+        "x-aiops-max-request-body-bytes": 262144,
+        "x-aiops-max-response-body-bytes": 262144,
+        "x-aiops-required-pool": "WRITE",
+        "x-aiops-required-capability": "CREDENTIAL_REVOCATION",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevocationLeaseRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/RevocationLeaseOK"
+          },
+          "204": {
+            "$ref": "#/components/responses/NoJob"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/runner/v1/revocations/{revocation_id}:heartbeat": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/RevocationID"
+        }
+      ],
+      "post": {
+        "operationId": "heartbeatCredentialRevocation",
+        "summary": "Advance the revocation heartbeat sequence",
+        "x-aiops-max-request-body-bytes": 65536,
+        "x-aiops-max-response-body-bytes": 65536,
+        "x-aiops-required-pool": "WRITE",
+        "x-aiops-required-capability": "CREDENTIAL_REVOCATION",
+        "security": [
+          {
+            "mutualTLS": [],
+            "revocationLease": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevocationHeartbeatRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/RevocationHeartbeatOK"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/LeaseAuthenticationFailed"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/HeartbeatConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/runner/v1/revocations/{revocation_id}:complete": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/RevocationID"
+        }
+      ],
+      "post": {
+        "operationId": "completeCredentialRevocation",
+        "summary": "Acknowledge a remote revoke result",
+        "description": "Runner submits only REVOKED or FAILED plus an allowlisted failure code. Gateway owns retry delay, jitter, exhaustion and manual escalation.",
+        "x-aiops-max-request-body-bytes": 65536,
+        "x-aiops-max-response-body-bytes": 65536,
+        "x-aiops-required-pool": "WRITE",
+        "x-aiops-required-capability": "CREDENTIAL_REVOCATION",
+        "security": [
+          {
+            "mutualTLS": [],
+            "revocationLease": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevocationCompleteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/RevocationCompletionOK"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/LeaseAuthenticationFailed"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "mutualTLS": {
+        "type": "mutualTLS",
+        "description": "TLS 1.3 client certificate with one canonical Runner SPIFFE URI SAN"
+      },
+      "jobLease": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "Authorization",
+        "description": "Authorization: AIOPS-Job-Lease <opaque-token>. Values are always redacted from logs and traces."
+      },
+      "revocationLease": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "Authorization",
+        "description": "Authorization: AIOPS-Revocation-Lease <opaque-token>. Values are always redacted from logs and traces."
+      }
+    },
+    "parameters": {
+      "JobID": {
+        "name": "job_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/RunnerJobID"
+        }
+      },
+      "RevocationID": {
+        "name": "revocation_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/UUID"
+        }
+      }
+    },
+    "headers": {
+      "NoStore": {
+        "schema": {
+          "type": "string",
+          "const": "no-store"
+        },
+        "required": true
+      },
+      "NoSniff": {
+        "schema": {
+          "type": "string",
+          "const": "nosniff"
+        },
+        "required": true
+      },
+      "RetryAfter": {
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600
+        },
+        "required": true
+      },
+      "LeaseChallenge": {
+        "schema": {
+          "type": "string",
+          "enum": [
+            "AIOPS-Job-Lease realm=\"runner-gateway\"",
+            "AIOPS-Revocation-Lease realm=\"runner-gateway\""
+          ]
+        },
+        "required": true
+      }
+    },
+    "responses": {
+      "RunnerIdentityOK": {
+        "description": "Authenticated identity",
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/RunnerIdentityResponse"
+            }
+          }
+        }
+      },
+      "JobLeaseOK": {
+        "description": "One job and its one-time-returned raw lease token",
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/JobLeaseResponse"
+            }
+          }
+        }
+      },
+      "NoJob": {
+        "description": "No eligible task",
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        }
+      },
+      "JobStartOK": {
+        "description": "Job entered RUNNING after final authorization",
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/JobStartResponse"
+            }
+          }
+        }
+      },
+      "CredentialAnchorOK": {
+        "description": "Durable credential phase authorization or state ACK; never a child token or dynamic Secret",
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/CredentialAnchorResponse"
+            }
+          }
+        }
+      },
+      "JobHeartbeatOK": {
+        "description": "Heartbeat decision",
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/JobHeartbeatResponse"
+            }
+          }
+        }
+      },
+      "JobStateOK": {
+        "description": "Current job state",
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/JobStateResponse"
+            }
+          }
+        }
+      },
+      "JobCompletionAccepted": {
+        "description": "New result receipt persisted in FINALIZING",
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/JobCompletionResponse"
+                },
+                {
+                  "properties": {
+                    "status": {
+                      "const": "FINALIZING"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "JobCompletionOK": {
+        "description": "Exact idempotent result replay",
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/JobCompletionResponse"
+                },
+                {
+                  "properties": {
+                    "status": {
+                      "enum": [
+                        "UNCERTAIN",
+                        "SUCCEEDED",
+                        "FAILED"
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "RevocationLeaseOK": {
+        "description": "One revocation claim with raw claim token and revoke-only accessor",
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/RevocationLeaseResponse"
+            }
+          }
+        }
+      },
+      "RevocationHeartbeatOK": {
+        "description": "Revocation heartbeat accepted",
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/RevocationHeartbeatResponse"
+            }
+          }
+        }
+      },
+      "RevocationCompletionOK": {
+        "description": "Revocation result persisted or replayed",
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/RevocationCompletionResponse"
+            }
+          }
+        }
+      },
+      "BadRequest": {
+        "$ref": "#/components/responses/Problem400"
+      },
+      "LeaseAuthenticationFailed": {
+        "$ref": "#/components/responses/Problem401"
+      },
+      "Forbidden": {
+        "$ref": "#/components/responses/Problem403"
+      },
+      "NotFound": {
+        "$ref": "#/components/responses/Problem404"
+      },
+      "Conflict": {
+        "$ref": "#/components/responses/Problem409"
+      },
+      "HeartbeatConflict": {
+        "$ref": "#/components/responses/Problem409"
+      },
+      "ResultConflict": {
+        "$ref": "#/components/responses/Problem409"
+      },
+      "PayloadTooLarge": {
+        "$ref": "#/components/responses/Problem413"
+      },
+      "UnsupportedMediaType": {
+        "$ref": "#/components/responses/Problem415"
+      },
+      "RateLimited": {
+        "description": "Server-side Runner rate limit",
+        "x-aiops-problems": [
+          {
+            "type": "urn:aiops:problem:runner:rate-limited",
+            "code": "runner_rate_limited"
+          }
+        ],
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          },
+          "Retry-After": {
+            "$ref": "#/components/headers/RetryAfter"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem429"
+            }
+          }
+        }
+      },
+      "Unavailable": {
+        "$ref": "#/components/responses/Problem503"
+      },
+      "InternalError": {
+        "$ref": "#/components/responses/Problem500"
+      },
+      "Problem400": {
+        "description": "Invalid strict request",
+        "x-aiops-problems": [
+          {
+            "type": "urn:aiops:problem:runner:invalid-request",
+            "code": "invalid_runner_request"
+          },
+          {
+            "type": "urn:aiops:problem:runner:invalid-json",
+            "code": "invalid_runner_json"
+          },
+          {
+            "type": "urn:aiops:problem:runner:forbidden-identity-field",
+            "code": "forbidden_runner_identity_field"
+          }
+        ],
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem400"
+            }
+          }
+        }
+      },
+      "Problem401": {
+        "description": "Missing or invalid lease Authorization",
+        "x-aiops-problems": [
+          {
+            "type": "urn:aiops:problem:runner:lease-authentication-failed",
+            "code": "runner_lease_authentication_failed"
+          }
+        ],
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          },
+          "WWW-Authenticate": {
+            "$ref": "#/components/headers/LeaseChallenge"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem401"
+            }
+          }
+        }
+      },
+      "Problem403": {
+        "description": "mTLS identity is not authorized",
+        "x-aiops-problems": [
+          {
+            "type": "urn:aiops:problem:runner:identity-rejected",
+            "code": "runner_identity_rejected"
+          }
+        ],
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem403"
+            }
+          }
+        }
+      },
+      "Problem404": {
+        "description": "Unknown or cross-Runner resource",
+        "x-aiops-problems": [
+          {
+            "type": "urn:aiops:problem:runner:resource-not-found",
+            "code": "runner_resource_not_found"
+          }
+        ],
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem404"
+            }
+          }
+        }
+      },
+      "Problem409": {
+        "description": "Fence, sequence, state, anchor, or result conflict",
+        "x-aiops-problems": [
+          {
+            "type": "urn:aiops:problem:runner:stale-lease",
+            "code": "runner_stale_lease"
+          },
+          {
+            "type": "urn:aiops:problem:runner:state-conflict",
+            "code": "runner_state_conflict"
+          },
+          {
+            "type": "urn:aiops:problem:runner:heartbeat-sequence-conflict",
+            "code": "runner_heartbeat_sequence_conflict"
+          },
+          {
+            "type": "urn:aiops:problem:runner:credential-anchor-conflict",
+            "code": "runner_credential_anchor_conflict"
+          },
+          {
+            "type": "urn:aiops:problem:runner:result-conflict",
+            "code": "runner_result_conflict"
+          }
+        ],
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem409"
+            }
+          }
+        }
+      },
+      "Problem413": {
+        "description": "Request body exceeds its endpoint limit",
+        "x-aiops-problems": [
+          {
+            "type": "urn:aiops:problem:runner:payload-too-large",
+            "code": "runner_payload_too_large"
+          }
+        ],
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem413"
+            }
+          }
+        }
+      },
+      "Problem415": {
+        "description": "Content-Type must be exactly application/json",
+        "x-aiops-problems": [
+          {
+            "type": "urn:aiops:problem:runner:unsupported-media-type",
+            "code": "runner_unsupported_media_type"
+          }
+        ],
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem415"
+            }
+          }
+        }
+      },
+      "Problem503": {
+        "description": "Claims are disabled or a required dependency is unavailable",
+        "x-aiops-problems": [
+          {
+            "type": "urn:aiops:problem:runner:claims-disabled",
+            "code": "runner_claims_disabled"
+          },
+          {
+            "type": "urn:aiops:problem:runner:dependency-unavailable",
+            "code": "runner_dependency_unavailable"
+          }
+        ],
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem503"
+            }
+          }
+        }
+      },
+      "Problem500": {
+        "description": "Sanitized internal error",
+        "x-aiops-problems": [
+          {
+            "type": "urn:aiops:problem:runner:internal-error",
+            "code": "runner_internal_error"
+          }
+        ],
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          },
+          "X-Content-Type-Options": {
+            "$ref": "#/components/headers/NoSniff"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem500"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Problem": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "title",
+          "status",
+          "code",
+          "detail",
+          "instance"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "pattern": "^urn:aiops:problem:runner:[a-z0-9-]+$"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "status": {
+            "type": "integer",
+            "minimum": 400,
+            "maximum": 599
+          },
+          "code": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,63}$"
+          },
+          "detail": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "instance": {
+            "type": "string",
+            "pattern": "^urn:aiops:request:[0-9a-f-]{36}$"
+          }
+        }
+      },
+      "Problem400": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Problem"
+          },
+          {
+            "properties": {
+              "status": {
+                "const": 400
+              }
+            }
+          }
+        ]
+      },
+      "Problem401": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Problem"
+          },
+          {
+            "properties": {
+              "status": {
+                "const": 401
+              }
+            }
+          }
+        ]
+      },
+      "Problem403": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Problem"
+          },
+          {
+            "properties": {
+              "status": {
+                "const": 403
+              }
+            }
+          }
+        ]
+      },
+      "Problem404": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Problem"
+          },
+          {
+            "properties": {
+              "status": {
+                "const": 404
+              }
+            }
+          }
+        ]
+      },
+      "Problem409": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Problem"
+          },
+          {
+            "properties": {
+              "status": {
+                "const": 409
+              }
+            }
+          }
+        ]
+      },
+      "Problem413": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Problem"
+          },
+          {
+            "properties": {
+              "status": {
+                "const": 413
+              }
+            }
+          }
+        ]
+      },
+      "Problem415": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Problem"
+          },
+          {
+            "properties": {
+              "status": {
+                "const": 415
+              }
+            }
+          }
+        ]
+      },
+      "Problem429": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Problem"
+          },
+          {
+            "properties": {
+              "status": {
+                "const": 429
+              }
+            }
+          }
+        ]
+      },
+      "Problem500": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Problem"
+          },
+          {
+            "properties": {
+              "status": {
+                "const": 500
+              }
+            }
+          }
+        ]
+      },
+      "Problem503": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Problem"
+          },
+          {
+            "properties": {
+              "status": {
+                "const": 503
+              }
+            }
+          }
+        ]
+      },
+      "Identifier": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@-]*$"
+      },
+      "RunnerJobID": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._@-]{0,255}$"
+      },
+      "UUID": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      },
+      "SHA256Hex": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{64}$"
+      },
+      "DecimalInt64": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]{0,18})$",
+        "x-aiops-maximum-int64": "9223372036854775807"
+      },
+      "PositiveDecimalInt64": {
+        "type": "string",
+        "pattern": "^[1-9][0-9]{0,18}$",
+        "x-aiops-maximum-int64": "9223372036854775807"
+      },
+      "RFC3339Timestamp": {
+        "type": "string",
+        "format": "date-time"
+      },
+      "Base64URLNoPadding": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 87382,
+        "pattern": "^[A-Za-z0-9_-]+$"
+      },
+      "Base64URL256KiB": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 349526,
+        "pattern": "^[A-Za-z0-9_-]+$"
+      },
+      "RevokeAccessorBase64URL": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 5462,
+        "pattern": "^[A-Za-z0-9_-]+$",
+        "x-sensitive": true,
+        "x-log-redact": true
+      },
+      "OpaqueLeaseToken": {
+        "type": "string",
+        "minLength": 32,
+        "maxLength": 256,
+        "pattern": "^[A-Za-z0-9_-]+$",
+        "readOnly": true,
+        "x-sensitive": true,
+        "x-log-redact": true
+      },
+      "OpaqueOneTimePermit": {
+        "type": "string",
+        "minLength": 32,
+        "maxLength": 256,
+        "pattern": "^[A-Za-z0-9_-]+$",
+        "x-sensitive": true,
+        "x-log-redact": true
+      },
+      "RunnerPool": {
+        "type": "string",
+        "enum": [
+          "READ",
+          "WRITE"
+        ]
+      },
+      "RunnerCapability": {
+        "type": "string",
+        "enum": [
+          "CREDENTIAL_REVOCATION"
+        ]
+      },
+      "RunnerIdentityResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "pool": {
+                  "const": "READ"
+                }
+              },
+              "required": [
+                "pool"
+              ]
+            },
+            "then": {
+              "properties": {
+                "capabilities": {
+                  "maxItems": 0
+                }
+              }
+            }
+          }
+        ],
+        "required": [
+          "schema_version",
+          "runner_id",
+          "pool",
+          "scope_revision",
+          "max_concurrency",
+          "capabilities",
+          "certificate_sha256",
+          "certificate_not_after"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-identity-response.v1"
+          },
+          "runner_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "pool": {
+            "$ref": "#/components/schemas/RunnerPool"
+          },
+          "scope_revision": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "max_concurrency": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1024
+          },
+          "capabilities": {
+            "type": "array",
+            "maxItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/RunnerCapability"
+            }
+          },
+          "certificate_sha256": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          },
+          "certificate_not_after": {
+            "$ref": "#/components/schemas/RFC3339Timestamp"
+          }
+        }
+      },
+      "JobLeaseRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-job-lease-request.v1"
+          }
+        }
+      },
+      "JobDescriptor": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "kind",
+          "payload",
+          "plan_hash",
+          "environment_revision",
+          "production"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/RunnerJobID"
+          },
+          "kind": {
+            "type": "string",
+            "const": "WRITE_ACTION"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/ActionEnvelopeV1"
+          },
+          "plan_hash": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          },
+          "environment_revision": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "production": {
+            "type": "boolean",
+            "const": false
+          }
+        }
+      },
+      "ActionEnvelopeV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "action_id",
+          "workspace_id",
+          "incident_id",
+          "requested_by",
+          "action_type",
+          "target_ref",
+          "parameters",
+          "observed_state",
+          "preconditions",
+          "verification",
+          "compensation",
+          "risk",
+          "policy_version",
+          "plan_hash",
+          "credential_scope",
+          "idempotency_key",
+          "not_before",
+          "expires_at",
+          "trace_id",
+          "signature"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "action-envelope.v1"
+          },
+          "action_id": {
+            "$ref": "#/components/schemas/RunnerJobID"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "incident_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "requested_by": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "action_type": {
+            "$ref": "#/components/schemas/ActionType"
+          },
+          "target_ref": {
+            "$ref": "#/components/schemas/ActionTargetRef"
+          },
+          "parameters": {
+            "$ref": "#/components/schemas/ActionParameters"
+          },
+          "observed_state": {
+            "$ref": "#/components/schemas/ActionObservedState"
+          },
+          "preconditions": {
+            "$ref": "#/components/schemas/ActionPreconditions"
+          },
+          "verification": {
+            "$ref": "#/components/schemas/ActionVerification"
+          },
+          "compensation": {
+            "$ref": "#/components/schemas/ActionCompensation"
+          },
+          "risk": {
+            "$ref": "#/components/schemas/ActionRisk"
+          },
+          "policy_version": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "plan_hash": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          },
+          "credential_scope": {
+            "$ref": "#/components/schemas/ActionCredentialScope"
+          },
+          "idempotency_key": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "not_before": {
+            "$ref": "#/components/schemas/RFC3339Timestamp"
+          },
+          "expires_at": {
+            "$ref": "#/components/schemas/RFC3339Timestamp"
+          },
+          "trace_id": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{32}$"
+          },
+          "signature": {
+            "$ref": "#/components/schemas/ActionSignature"
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "action_type": {
+                  "const": "K8S_ROLLOUT_RESTART"
+                }
+              },
+              "required": [
+                "action_type"
+              ]
+            },
+            "then": {
+              "properties": {
+                "target_ref": {
+                  "required": [
+                    "kubernetes_deployment"
+                  ]
+                },
+                "parameters": {
+                  "required": [
+                    "kubernetes_rollout_restart"
+                  ]
+                },
+                "observed_state": {
+                  "required": [
+                    "kubernetes_deployment"
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "action_type": {
+                  "const": "K8S_SCALE"
+                }
+              },
+              "required": [
+                "action_type"
+              ]
+            },
+            "then": {
+              "properties": {
+                "target_ref": {
+                  "required": [
+                    "kubernetes_deployment"
+                  ]
+                },
+                "parameters": {
+                  "required": [
+                    "kubernetes_scale"
+                  ]
+                },
+                "observed_state": {
+                  "required": [
+                    "kubernetes_deployment"
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "action_type": {
+                  "const": "GITOPS_REVERT"
+                }
+              },
+              "required": [
+                "action_type"
+              ]
+            },
+            "then": {
+              "properties": {
+                "target_ref": {
+                  "required": [
+                    "gitops_application"
+                  ]
+                },
+                "parameters": {
+                  "required": [
+                    "gitops_revert"
+                  ]
+                },
+                "observed_state": {
+                  "required": [
+                    "gitops_application"
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "action_type": {
+                  "const": "AWX_SERVICE_RESTART"
+                }
+              },
+              "required": [
+                "action_type"
+              ]
+            },
+            "then": {
+              "properties": {
+                "target_ref": {
+                  "required": [
+                    "awx_hosts"
+                  ]
+                },
+                "parameters": {
+                  "required": [
+                    "awx_service_restart"
+                  ]
+                },
+                "observed_state": {
+                  "required": [
+                    "awx_service"
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      },
+      "ActionType": {
+        "type": "string",
+        "enum": [
+          "K8S_ROLLOUT_RESTART",
+          "K8S_SCALE",
+          "GITOPS_REVERT",
+          "AWX_SERVICE_RESTART"
+        ]
+      },
+      "ActionTargetRef": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "service_id",
+          "environment_id"
+        ],
+        "properties": {
+          "service_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "environment_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "kubernetes_deployment": {
+            "$ref": "#/components/schemas/KubernetesDeploymentTarget"
+          },
+          "gitops_application": {
+            "$ref": "#/components/schemas/GitOpsTarget"
+          },
+          "awx_hosts": {
+            "$ref": "#/components/schemas/AWXTarget"
+          }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "kubernetes_deployment"
+            ]
+          },
+          {
+            "required": [
+              "gitops_application"
+            ]
+          },
+          {
+            "required": [
+              "awx_hosts"
+            ]
+          }
+        ]
+      },
+      "KubernetesDeploymentTarget": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "cluster_id",
+          "namespace",
+          "name",
+          "uid",
+          "resource_version"
+        ],
+        "properties": {
+          "cluster_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "namespace": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 63,
+            "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253,
+            "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+          },
+          "uid": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "resource_version": {
+            "$ref": "#/components/schemas/Identifier"
+          }
+        }
+      },
+      "GitOpsTarget": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "repository_id",
+          "application",
+          "path"
+        ],
+        "properties": {
+          "repository_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "application": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "pattern": "^[A-Za-z0-9._/-]+$"
+          }
+        }
+      },
+      "AWXTarget": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "inventory_id",
+          "host_ids",
+          "inventory_snapshot_sha256",
+          "job_template_snapshot_sha256"
+        ],
+        "properties": {
+          "inventory_id": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "host_ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 10,
+            "uniqueItems": true,
+            "items": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          },
+          "inventory_snapshot_sha256": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          },
+          "job_template_snapshot_sha256": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          }
+        }
+      },
+      "ActionParameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kubernetes_rollout_restart": {
+            "$ref": "#/components/schemas/KubernetesRolloutRestartParameters"
+          },
+          "kubernetes_scale": {
+            "$ref": "#/components/schemas/KubernetesScaleParameters"
+          },
+          "gitops_revert": {
+            "$ref": "#/components/schemas/GitOpsRevertParameters"
+          },
+          "awx_service_restart": {
+            "$ref": "#/components/schemas/AWXServiceRestartParameters"
+          }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "kubernetes_rollout_restart"
+            ]
+          },
+          {
+            "required": [
+              "kubernetes_scale"
+            ]
+          },
+          {
+            "required": [
+              "gitops_revert"
+            ]
+          },
+          {
+            "required": [
+              "awx_service_restart"
+            ]
+          }
+        ]
+      },
+      "KubernetesRolloutRestartParameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          }
+        }
+      },
+      "KubernetesScaleParameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "replicas",
+          "minimum",
+          "maximum",
+          "hpa_absent",
+          "pdb_checked",
+          "quota_checked"
+        ],
+        "properties": {
+          "replicas": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          },
+          "minimum": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          },
+          "maximum": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          },
+          "hpa_absent": {
+            "type": "boolean",
+            "const": true
+          },
+          "pdb_checked": {
+            "type": "boolean",
+            "const": true
+          },
+          "quota_checked": {
+            "type": "boolean",
+            "const": true
+          }
+        }
+      },
+      "GitOpsRevertParameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "provider",
+          "base_commit",
+          "head_commit",
+          "revert_commit",
+          "diff_sha256",
+          "tree_sha256"
+        ],
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": [
+              "GITHUB",
+              "GITLAB"
+            ]
+          },
+          "base_commit": {
+            "$ref": "#/components/schemas/GitOID"
+          },
+          "head_commit": {
+            "$ref": "#/components/schemas/GitOID"
+          },
+          "revert_commit": {
+            "$ref": "#/components/schemas/GitOID"
+          },
+          "diff_sha256": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          },
+          "tree_sha256": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          }
+        }
+      },
+      "GitOID": {
+        "type": "string",
+        "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$"
+      },
+      "AWXServiceRestartParameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "job_template_id",
+          "service_name",
+          "os_family",
+          "serial"
+        ],
+        "properties": {
+          "job_template_id": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "service_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.@-]*$"
+          },
+          "os_family": {
+            "type": "string",
+            "enum": [
+              "LINUX_SYSTEMD",
+              "WINDOWS_SERVICE"
+            ]
+          },
+          "serial": {
+            "type": "integer",
+            "const": 1
+          }
+        }
+      },
+      "ActionObservedState": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kubernetes_deployment": {
+            "$ref": "#/components/schemas/KubernetesDeploymentObservedState"
+          },
+          "gitops_application": {
+            "$ref": "#/components/schemas/GitOpsObservedState"
+          },
+          "awx_service": {
+            "$ref": "#/components/schemas/AWXServiceObservedState"
+          }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "kubernetes_deployment"
+            ]
+          },
+          {
+            "required": [
+              "gitops_application"
+            ]
+          },
+          {
+            "required": [
+              "awx_service"
+            ]
+          }
+        ]
+      },
+      "KubernetesDeploymentObservedState": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "generation",
+          "replicas",
+          "available_replicas",
+          "updated_replicas"
+        ],
+        "properties": {
+          "generation": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "replicas": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          },
+          "available_replicas": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          },
+          "updated_replicas": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          }
+        }
+      },
+      "GitOpsObservedState": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "live_revision",
+          "desired_revision",
+          "head_tree_sha256",
+          "sync_status",
+          "health_status"
+        ],
+        "properties": {
+          "live_revision": {
+            "$ref": "#/components/schemas/GitOID"
+          },
+          "desired_revision": {
+            "$ref": "#/components/schemas/GitOID"
+          },
+          "head_tree_sha256": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          },
+          "sync_status": {
+            "type": "string",
+            "enum": [
+              "SYNCED",
+              "OUT_OF_SYNC"
+            ]
+          },
+          "health_status": {
+            "type": "string",
+            "enum": [
+              "HEALTHY",
+              "DEGRADED",
+              "PROGRESSING",
+              "MISSING",
+              "UNKNOWN"
+            ]
+          }
+        }
+      },
+      "AWXServiceObservedState": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "host_count",
+          "service_state",
+          "inventory_snapshot_sha256",
+          "service_state_snapshot_sha256"
+        ],
+        "properties": {
+          "host_count": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10
+          },
+          "service_state": {
+            "type": "string",
+            "enum": [
+              "RUNNING",
+              "STOPPED",
+              "DEGRADED",
+              "UNKNOWN"
+            ]
+          },
+          "inventory_snapshot_sha256": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          },
+          "service_state_snapshot_sha256": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          }
+        }
+      },
+      "ActionPreconditions": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "mapping_result",
+          "expected_resource_version",
+          "expected_git_head_commit",
+          "require_whitelist"
+        ],
+        "properties": {
+          "mapping_result": {
+            "type": "string",
+            "const": "EXACT"
+          },
+          "expected_resource_version": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "expected_git_head_commit": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^(?:|[a-f0-9]{40}|[a-f0-9]{64})$"
+          },
+          "require_whitelist": {
+            "type": "boolean",
+            "const": true
+          }
+        }
+      },
+      "ActionVerification": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "mode",
+          "timeout_seconds"
+        ],
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "KUBERNETES_ROLLOUT",
+              "ARGO_CD_HEALTH",
+              "AWX_SERVICE_HEALTH"
+            ]
+          },
+          "timeout_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 900
+          }
+        }
+      },
+      "ActionCompensation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "mode",
+          "summary"
+        ],
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "MANUAL_ONLY",
+              "PROPOSE_ONLY"
+            ]
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          }
+        }
+      },
+      "ActionRisk": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "level",
+          "reason_codes"
+        ],
+        "properties": {
+          "level": {
+            "type": "string",
+            "enum": [
+              "LOW",
+              "MEDIUM",
+              "HIGH"
+            ]
+          },
+          "reason_codes": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 16,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          }
+        }
+      },
+      "ActionCredentialScope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "connector_id",
+          "permission",
+          "resource",
+          "ttl_seconds"
+        ],
+        "properties": {
+          "connector_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "permission": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "resource": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "ttl_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 900
+          }
+        }
+      },
+      "ActionSignature": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "alg",
+          "key_id",
+          "value"
+        ],
+        "properties": {
+          "alg": {
+            "type": "string",
+            "const": "Ed25519"
+          },
+          "key_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "value": {
+            "type": "string",
+            "minLength": 86,
+            "maxLength": 86,
+            "pattern": "^[A-Za-z0-9_-]{86}$"
+          }
+        }
+      },
+      "JobLeaseResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "job",
+          "lease_token",
+          "lease_epoch",
+          "scope_revision",
+          "lease_expires_at",
+          "heartbeat_after_seconds"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-job-lease-response.v1"
+          },
+          "job": {
+            "$ref": "#/components/schemas/JobDescriptor"
+          },
+          "lease_token": {
+            "$ref": "#/components/schemas/OpaqueLeaseToken"
+          },
+          "lease_epoch": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "scope_revision": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "lease_expires_at": {
+            "$ref": "#/components/schemas/RFC3339Timestamp"
+          },
+          "heartbeat_after_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 600
+          }
+        }
+      },
+      "JobStartRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "lease_epoch"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-job-start-request.v1"
+          },
+          "lease_epoch": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          }
+        }
+      },
+      "JobStartResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "job_id",
+          "status",
+          "lease_epoch",
+          "scope_revision",
+          "started_at",
+          "credential_prepare"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-job-start-response.v1"
+          },
+          "job_id": {
+            "$ref": "#/components/schemas/RunnerJobID"
+          },
+          "status": {
+            "type": "string",
+            "const": "RUNNING"
+          },
+          "lease_epoch": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "scope_revision": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "started_at": {
+            "$ref": "#/components/schemas/RFC3339Timestamp"
+          },
+          "credential_prepare": {
+            "$ref": "#/components/schemas/CredentialPrepare"
+          }
+        }
+      },
+      "CredentialPrepare": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "revocation_id",
+          "child_create_permit",
+          "credential_expires_at"
+        ],
+        "properties": {
+          "revocation_id": {
+            "$ref": "#/components/schemas/UUID"
+          },
+          "child_create_permit": {
+            "$ref": "#/components/schemas/OpaqueOneTimePermit"
+          },
+          "credential_expires_at": {
+            "$ref": "#/components/schemas/RFC3339Timestamp"
+          }
+        }
+      },
+      "CredentialAnchorRequest": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/CredentialAuthorizeChildRequest"
+          },
+          {
+            "$ref": "#/components/schemas/CredentialRecordAnchorRequest"
+          },
+          {
+            "$ref": "#/components/schemas/CredentialActivateRequest"
+          },
+          {
+            "$ref": "#/components/schemas/CredentialNoCredentialRequest"
+          },
+          {
+            "$ref": "#/components/schemas/CredentialRequestRevocationRequest"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "phase"
+        }
+      },
+      "CredentialAuthorizeChildRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "phase",
+          "lease_epoch",
+          "revocation_id",
+          "child_create_permit"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-credential-anchor-request.v1"
+          },
+          "phase": {
+            "type": "string",
+            "const": "AUTHORIZE_CHILD_CREATE"
+          },
+          "lease_epoch": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "revocation_id": {
+            "$ref": "#/components/schemas/UUID"
+          },
+          "child_create_permit": {
+            "$ref": "#/components/schemas/OpaqueOneTimePermit"
+          }
+        }
+      },
+      "CredentialRecordAnchorRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "phase",
+          "lease_epoch",
+          "revocation_id",
+          "revoke_accessor_b64u"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-credential-anchor-request.v1"
+          },
+          "phase": {
+            "type": "string",
+            "const": "RECORD_ANCHOR"
+          },
+          "lease_epoch": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "revocation_id": {
+            "$ref": "#/components/schemas/UUID"
+          },
+          "revoke_accessor_b64u": {
+            "$ref": "#/components/schemas/RevokeAccessorBase64URL"
+          }
+        }
+      },
+      "CredentialActivateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "phase",
+          "lease_epoch",
+          "revocation_id"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-credential-anchor-request.v1"
+          },
+          "phase": {
+            "type": "string",
+            "const": "ACTIVATE"
+          },
+          "lease_epoch": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "revocation_id": {
+            "$ref": "#/components/schemas/UUID"
+          }
+        }
+      },
+      "CredentialNoCredentialRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "phase",
+          "lease_epoch",
+          "revocation_id"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-credential-anchor-request.v1"
+          },
+          "phase": {
+            "type": "string",
+            "const": "NO_CREDENTIAL"
+          },
+          "lease_epoch": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "revocation_id": {
+            "$ref": "#/components/schemas/UUID"
+          }
+        }
+      },
+      "CredentialRequestRevocationRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "phase",
+          "lease_epoch",
+          "revocation_id"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-credential-anchor-request.v1"
+          },
+          "phase": {
+            "type": "string",
+            "const": "REQUEST_REVOCATION"
+          },
+          "lease_epoch": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "revocation_id": {
+            "$ref": "#/components/schemas/UUID"
+          }
+        }
+      },
+      "CredentialAnchorResponse": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/CredentialChildAuthorizationResponse"
+          },
+          {
+            "$ref": "#/components/schemas/CredentialStateResponse"
+          }
+        ]
+      },
+      "CredentialChildAuthorizationResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "job_id",
+          "revocation_id",
+          "status",
+          "database_authorized_at",
+          "child_ttl_seconds",
+          "credential_expires_at"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-credential-anchor-response.v1"
+          },
+          "job_id": {
+            "$ref": "#/components/schemas/RunnerJobID"
+          },
+          "revocation_id": {
+            "$ref": "#/components/schemas/UUID"
+          },
+          "status": {
+            "type": "string",
+            "const": "PREPARED"
+          },
+          "database_authorized_at": {
+            "$ref": "#/components/schemas/RFC3339Timestamp"
+          },
+          "child_ttl_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 900
+          },
+          "credential_expires_at": {
+            "$ref": "#/components/schemas/RFC3339Timestamp"
+          }
+        }
+      },
+      "CredentialStateResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "job_id",
+          "revocation_id",
+          "status"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-credential-anchor-response.v1"
+          },
+          "job_id": {
+            "$ref": "#/components/schemas/RunnerJobID"
+          },
+          "revocation_id": {
+            "$ref": "#/components/schemas/UUID"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ANCHORED",
+              "ACTIVE",
+              "NO_CREDENTIAL",
+              "REVOCATION_PENDING",
+              "REVOKING",
+              "REVOKED",
+              "MANUAL_REQUIRED"
+            ]
+          }
+        }
+      },
+      "JobHeartbeatRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "lease_epoch",
+          "sequence"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-job-heartbeat-request.v1"
+          },
+          "lease_epoch": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "sequence": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          }
+        }
+      },
+      "JobHeartbeatResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "job_id",
+          "accepted_sequence",
+          "directive",
+          "lease_expires_at",
+          "heartbeat_after_seconds"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-job-heartbeat-response.v1"
+          },
+          "job_id": {
+            "$ref": "#/components/schemas/RunnerJobID"
+          },
+          "accepted_sequence": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "directive": {
+            "type": "string",
+            "enum": [
+              "CONTINUE",
+              "TERMINATE"
+            ]
+          },
+          "lease_expires_at": {
+            "$ref": "#/components/schemas/RFC3339Timestamp"
+          },
+          "heartbeat_after_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 600
+          }
+        }
+      },
+      "JobReleaseRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "lease_epoch",
+          "reason_code"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-job-release-request.v1"
+          },
+          "lease_epoch": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "reason_code": {
+            "type": "string",
+            "enum": [
+              "EXECUTOR_NOT_READY",
+              "LOCAL_CAPACITY_UNAVAILABLE",
+              "TRANSIENT_RUNNER_FAILURE"
+            ]
+          }
+        }
+      },
+      "ExecutorResult": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ExecutorSucceededResult"
+          },
+          {
+            "$ref": "#/components/schemas/ExecutorFailedResult"
+          },
+          {
+            "$ref": "#/components/schemas/ExecutorUncertainResult"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "outcome"
+        }
+      },
+      "ExecutorSucceededResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "outcome",
+          "code",
+          "verification",
+          "changed"
+        ],
+        "properties": {
+          "outcome": {
+            "type": "string",
+            "const": "SUCCEEDED"
+          },
+          "code": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]{0,63}$"
+          },
+          "verification": {
+            "type": "string",
+            "const": "PASSED"
+          },
+          "changed": {
+            "type": "boolean"
+          },
+          "external_operation_ref_hash": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          }
+        }
+      },
+      "ExecutorFailedResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "outcome",
+          "code",
+          "verification",
+          "changed"
+        ],
+        "properties": {
+          "outcome": {
+            "type": "string",
+            "const": "FAILED"
+          },
+          "code": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]{0,63}$"
+          },
+          "verification": {
+            "type": "string",
+            "const": "FAILED"
+          },
+          "changed": {
+            "type": "boolean"
+          },
+          "external_operation_ref_hash": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          }
+        }
+      },
+      "ExecutorUncertainResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "outcome",
+          "code",
+          "verification",
+          "changed"
+        ],
+        "properties": {
+          "outcome": {
+            "type": "string",
+            "const": "UNCERTAIN"
+          },
+          "code": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]{0,63}$"
+          },
+          "verification": {
+            "type": "string",
+            "const": "UNKNOWN"
+          },
+          "changed": {
+            "type": "boolean"
+          },
+          "external_operation_ref_hash": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          }
+        }
+      },
+      "JobCompleteRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "lease_epoch",
+          "result"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-job-complete-request.v1"
+          },
+          "lease_epoch": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "result": {
+            "$ref": "#/components/schemas/ExecutorResult"
+          }
+        }
+      },
+      "JobStateResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "job_id",
+          "status",
+          "lease_epoch"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-job-state-response.v1"
+          },
+          "job_id": {
+            "$ref": "#/components/schemas/RunnerJobID"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "QUEUED",
+              "LEASED",
+              "RUNNING",
+              "FINALIZING",
+              "UNCERTAIN",
+              "SUCCEEDED",
+              "FAILED",
+              "CANCELLED"
+            ]
+          },
+          "lease_epoch": {
+            "$ref": "#/components/schemas/DecimalInt64"
+          }
+        }
+      },
+      "JobCompletionResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "job_id",
+          "status",
+          "completion_status",
+          "receipt_hash",
+          "credential_cleanup_status"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-job-completion-response.v1"
+          },
+          "job_id": {
+            "$ref": "#/components/schemas/RunnerJobID"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "FINALIZING",
+              "UNCERTAIN",
+              "SUCCEEDED",
+              "FAILED"
+            ]
+          },
+          "completion_status": {
+            "type": "string",
+            "enum": [
+              "SUCCEEDED",
+              "FAILED",
+              "UNCERTAIN"
+            ]
+          },
+          "receipt_hash": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          },
+          "credential_cleanup_status": {
+            "type": "string",
+            "enum": [
+              "NOT_REQUIRED",
+              "PENDING",
+              "TERMINAL",
+              "MANUAL_REQUIRED"
+            ]
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "SUCCEEDED"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "properties": {
+                "completion_status": {
+                  "const": "SUCCEEDED"
+                },
+                "credential_cleanup_status": {
+                  "enum": [
+                    "NOT_REQUIRED",
+                    "TERMINAL"
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "FAILED"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "properties": {
+                "completion_status": {
+                  "const": "FAILED"
+                },
+                "credential_cleanup_status": {
+                  "enum": [
+                    "NOT_REQUIRED",
+                    "TERMINAL"
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "UNCERTAIN"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "properties": {
+                "completion_status": {
+                  "const": "UNCERTAIN"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "RevocationLeaseRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-revocation-lease-request.v1"
+          }
+        }
+      },
+      "RevocationLeaseResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "revocation_id",
+          "claim_token",
+          "claim_epoch",
+          "claim_expires_at",
+          "heartbeat_after_seconds",
+          "tenant_id",
+          "workspace_id",
+          "environment_id",
+          "issuer_id",
+          "issuer_revision",
+          "revoke_accessor_b64u"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-revocation-lease-response.v1"
+          },
+          "revocation_id": {
+            "$ref": "#/components/schemas/UUID"
+          },
+          "claim_token": {
+            "$ref": "#/components/schemas/OpaqueLeaseToken"
+          },
+          "claim_epoch": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "claim_expires_at": {
+            "$ref": "#/components/schemas/RFC3339Timestamp"
+          },
+          "heartbeat_after_seconds": {
+            "type": "integer",
+            "const": 10
+          },
+          "tenant_id": {
+            "$ref": "#/components/schemas/UUID"
+          },
+          "workspace_id": {
+            "$ref": "#/components/schemas/UUID"
+          },
+          "environment_id": {
+            "$ref": "#/components/schemas/UUID"
+          },
+          "issuer_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "issuer_revision": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "revoke_accessor_b64u": {
+            "$ref": "#/components/schemas/RevokeAccessorBase64URL"
+          }
+        }
+      },
+      "RevocationHeartbeatRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "claim_epoch",
+          "sequence"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-revocation-heartbeat-request.v1"
+          },
+          "claim_epoch": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "sequence": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          }
+        }
+      },
+      "RevocationHeartbeatResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "revocation_id",
+          "accepted_sequence",
+          "directive",
+          "claim_expires_at",
+          "heartbeat_after_seconds"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-revocation-heartbeat-response.v1"
+          },
+          "revocation_id": {
+            "$ref": "#/components/schemas/UUID"
+          },
+          "accepted_sequence": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "directive": {
+            "type": "string",
+            "enum": [
+              "CONTINUE",
+              "TERMINATE"
+            ]
+          },
+          "claim_expires_at": {
+            "$ref": "#/components/schemas/RFC3339Timestamp"
+          },
+          "heartbeat_after_seconds": {
+            "type": "integer",
+            "const": 10
+          }
+        }
+      },
+      "RevocationFailureCode": {
+        "type": "string",
+        "enum": [
+          "ISSUER_UNAVAILABLE",
+          "RATE_LIMITED",
+          "TIMEOUT",
+          "AUTHENTICATION_FAILED",
+          "PERMISSION_DENIED",
+          "REFERENCE_NOT_FOUND",
+          "INVALID_REFERENCE",
+          "UNKNOWN"
+        ]
+      },
+      "RevocationCompleteRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "claim_epoch",
+          "outcome"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-revocation-complete-request.v1"
+          },
+          "claim_epoch": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "REVOKED",
+              "FAILED"
+            ]
+          },
+          "failure_code": {
+            "$ref": "#/components/schemas/RevocationFailureCode"
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "FAILED"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "required": [
+                "failure_code"
+              ]
+            },
+            "else": {
+              "not": {
+                "required": [
+                  "failure_code"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "RevocationCompletionResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "revocation_id",
+          "status",
+          "claim_epoch"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "runner-revocation-completion-response.v1"
+          },
+          "revocation_id": {
+            "$ref": "#/components/schemas/UUID"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "REVOCATION_PENDING",
+              "REVOKED",
+              "MANUAL_REQUIRED"
+            ]
+          },
+          "claim_epoch": {
+            "$ref": "#/components/schemas/PositiveDecimalInt64"
+          },
+          "available_at": {
+            "$ref": "#/components/schemas/RFC3339Timestamp"
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "REVOCATION_PENDING"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "required": [
+                "available_at"
+              ]
+            },
+            "else": {
+              "not": {
+                "required": [
+                  "available_at"
+                ]
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

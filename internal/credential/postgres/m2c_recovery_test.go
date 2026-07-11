@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -204,7 +205,7 @@ func TestPostgresRecoverManagedPreservesAuthorizationLockOrder(t *testing.T) {
 	}
 }
 
-func TestPostgresClaimQuarantinesPoisonWithoutStarvingValidCandidate(t *testing.T) {
+func TestPostgresClaimAlertsAndRetainsPoisonWithoutStarvingValidCandidate(t *testing.T) {
 	t.Parallel()
 	database, err := pgxmock.NewPool()
 	if err != nil {
@@ -266,22 +267,20 @@ func TestPostgresClaimQuarantinesPoisonWithoutStarvingValidCandidate(t *testing.
 	}
 	workerID := "revoker-poison-isolation"
 	expectClaimUpdate(postgresTestRevocationID, workerID, poisonDigest, 5, poisonProtected, postgresTestActionID)
-	database.ExpectQuery("UPDATE credential_revocations SET status = 'MANUAL_REQUIRED'").
-		WithArgs(postgresTestRevocationID, workerID, poisonDigest, int64(1),
-			string(credential.FailureInvalidReference), invalidDetailHash).
-		WillReturnRows(storedRevocationRows(now, storedRowOptions{
-			Status: credential.StatusManualRequired, Protected: poisonProtected, AvailableAt: now.Add(-time.Minute), Version: 6,
-			ClaimEpoch: 1, Attempt: 1, FailureCount: 1, FailureCode: credential.FailureInvalidReference,
-			FailureDetailSHA256: invalidDetailHash, ManualAt: now,
-		}))
+	database.ExpectQuery("FROM pg_catalog.pg_class AS relation").
+		WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(true))
 	database.ExpectExec("INSERT INTO audit_records").
 		WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID, "SYSTEM", workerID,
-			"credential.revocation.manual_required", postgresTestRevocationID,
-			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+			"credential.revocation.protected_reference_unavailable", postgresTestRevocationID,
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), redactedCredentialAlertDetails{
+				detailHash: invalidDetailHash, forbidden: tokens[0],
+			}).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	database.ExpectExec("INSERT INTO outbox_events").
 		WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID, postgresTestRevocationID,
-			int64(6), "credential.revocation.manual_required.v1", pgxmock.AnyArg()).
+			int64(5), "credential.revocation.protected_reference_unavailable.v1", redactedCredentialAlertDetails{
+				detailHash: invalidDetailHash, forbidden: tokens[0],
+			}).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	expectClaimUpdate(validRevocationID, workerID, validDigest, 11, validProtected, validActionID)
 	database.ExpectCommit()
@@ -303,4 +302,95 @@ func TestPostgresClaimQuarantinesPoisonWithoutStarvingValidCandidate(t *testing.
 	if err := database.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet pgx expectations: %v", err)
 	}
+}
+
+func TestPostgresClaimPreservesM2PoisonQuarantineBeforeRecoverySchemaExists(t *testing.T) {
+	t.Parallel()
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	protector := repositoryTestProtector(t)
+	claimToken := "m2-poison-token-never-returned"
+	repository, err := New(database, protector, Options{TokenSource: func() (string, error) {
+		return claimToken, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 11, 16, 30, 0, 0, time.UTC)
+	protected := protectTestReference(t, protector, []byte("m2-poison-accessor"))
+	protected.Ciphertext[0] ^= 0xff
+	digest := credential.SHA256Hex([]byte(claimToken))
+	detailHash := credential.SHA256Hex([]byte(credential.FailureDetailProtectedRefInvalid))
+
+	candidates := pgxmock.NewRows(storedRevocationColumns())
+	addStoredRevocationRow(candidates, now, storedRowOptions{
+		Status: credential.StatusRevocationPending, Protected: protected,
+		AvailableAt: now.Add(-time.Minute), Version: 4,
+	})
+	database.ExpectBegin()
+	database.ExpectQuery("SELECT revocation_id::text, tenant_id::text").
+		WithArgs(1, credential.MaxRevocationAttempts, credential.MaxRevocationElapsed.Seconds()).
+		WillReturnRows(candidates)
+	database.ExpectQuery("UPDATE credential_revocations SET status = 'REVOKING'").
+		WithArgs(postgresTestRevocationID, "m2-revoker", digest, credential.RevocationClaimLease.Seconds(),
+			credential.MaxRevocationAttempts, credential.MaxRevocationElapsed.Seconds()).
+		WillReturnRows(storedRevocationRows(now, storedRowOptions{
+			Status: credential.StatusRevoking, Protected: protected, AvailableAt: now.Add(-time.Minute), Version: 5,
+			ClaimEpoch: 1, ClaimedBy: "m2-revoker", ClaimTokenSHA256: digest,
+			ClaimedAt: now, ClaimExpiresAt: now.Add(credential.RevocationClaimLease), HeartbeatAt: now, Attempt: 1,
+		}))
+	database.ExpectExec("INSERT INTO audit_records").
+		WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID, "SYSTEM", "m2-revoker",
+			"credential.revocation.claimed", postgresTestRevocationID,
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	database.ExpectExec("INSERT INTO outbox_events").
+		WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID, postgresTestRevocationID,
+			int64(5), "credential.revocation.claimed.v1", pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	database.ExpectQuery("FROM pg_catalog.pg_class AS relation").
+		WillReturnRows(pgxmock.NewRows([]string{"available"}).AddRow(false))
+	database.ExpectQuery("UPDATE credential_revocations SET status = 'MANUAL_REQUIRED'").
+		WithArgs(postgresTestRevocationID, "m2-revoker", digest, int64(1),
+			string(credential.FailureInvalidReference), detailHash).
+		WillReturnRows(storedRevocationRows(now, storedRowOptions{
+			Status: credential.StatusManualRequired, Protected: protected, AvailableAt: now.Add(-time.Minute), Version: 6,
+			ClaimEpoch: 1, Attempt: 1, FailureCount: 1, FailureCode: credential.FailureInvalidReference,
+			FailureDetailSHA256: detailHash, ManualAt: now,
+		}))
+	database.ExpectExec("INSERT INTO audit_records").
+		WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID, "SYSTEM", "m2-revoker",
+			"credential.revocation.manual_required", postgresTestRevocationID,
+			pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	database.ExpectExec("INSERT INTO outbox_events").
+		WithArgs(pgxmock.AnyArg(), postgresTestTenantID, postgresTestWorkspaceID, postgresTestRevocationID,
+			int64(6), "credential.revocation.manual_required.v1", pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	database.ExpectCommit()
+
+	claims, err := repository.ClaimRevocations(context.Background(), credential.ClaimRevocationsRequest{
+		WorkerID: "m2-revoker", Limit: 1, LeaseDuration: credential.RevocationClaimLease,
+	})
+	if err != nil || len(claims) != 0 {
+		t.Fatalf("M2 ClaimRevocations(poison) = %#v, %v; want immediate quarantine", claims, err)
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet pgx expectations: %v", err)
+	}
+}
+
+type redactedCredentialAlertDetails struct {
+	detailHash string
+	forbidden  string
+}
+
+func (matcher redactedCredentialAlertDetails) Match(value any) bool {
+	details, ok := value.(string)
+	return ok && strings.Contains(details, `"detail_hash":"`+matcher.detailHash+`"`) &&
+		!strings.Contains(details, matcher.forbidden) && !strings.Contains(details, "accessor") &&
+		!strings.Contains(details, "ciphertext")
 }

@@ -11,7 +11,7 @@ This roadmap is deliberately gate-driven. Calendar progress never enables produc
 | Read-only connectors | Implemented foundation | Run contract and failure tests against pilot environments |
 | Investigation and model routing | Implemented foundation | Build a replay set of at least 100 historical incidents |
 | Identity, RBAC, policy, and signed plans | Implemented foundation | Complete real Keycloak/Vault integration and adversarial tests |
-| Fenced action execution | Implemented foundation | Validate PostgreSQL concurrency in CI; add durable credential revocation and isolated executors |
+| Fenced action execution | Secure queue, mTLS Gateway, and durable revocation foundation implemented | Validate PostgreSQL 16 in CI; add isolated executors and non-production adapters |
 | Temporal orchestration | Planned | Replay-safe investigation, approval, and execution workflows |
 | Web console and Feishu | Planned | Investigation, approval, execution, and audit user journeys |
 | Production pilot | Blocked by gates | Non-production drills plus formal Go/No-Go review |

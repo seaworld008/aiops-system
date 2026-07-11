@@ -6,9 +6,13 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -28,6 +32,9 @@ import (
 	"github.com/seaworld008/aiops-system/internal/execution"
 	executionpostgres "github.com/seaworld008/aiops-system/internal/execution/postgres"
 	"github.com/seaworld008/aiops-system/internal/executionlease"
+	"github.com/seaworld008/aiops-system/internal/runneridentity"
+	runneridentitypostgres "github.com/seaworld008/aiops-system/internal/runneridentity/postgres"
+	"github.com/seaworld008/aiops-system/internal/runneridentity/testpki"
 	"github.com/seaworld008/aiops-system/internal/store"
 	postgresstore "github.com/seaworld008/aiops-system/internal/store/postgres"
 )
@@ -228,6 +235,7 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	// been exercised so reverse-migration fixtures can be removed.
 	execSQL(t, ctx, database, `ALTER TABLE action_queue DISABLE TRIGGER action_queue_no_delete`)
 	execSQL(t, ctx, database, `DELETE FROM action_queue`)
+	execSQL(t, ctx, database, `DROP TRIGGER IF EXISTS runner_certificates_no_delete ON runner_certificates`)
 	execSQL(t, ctx, database, `DELETE FROM runner_certificates`)
 	execSQL(t, ctx, database, `DELETE FROM runner_scope_bindings`)
 	execSQL(t, ctx, database, `DELETE FROM runner_registrations`)
@@ -2011,16 +2019,1431 @@ func exerciseRealCredentialRevocations(
 	}
 	expectMigrationSQLState(t, ctx, database, filepath.Join(migrationDirectory, "000008_credential_revocations.down.sql"), "55000")
 
-	// Explicit destructive cleanup is test-only and occurs after proving the
-	// production down guard. It lets the shared harness continue through every
-	// reverse migration without weakening the shipped migration.
-	execSQL(t, ctx, database, `DROP TRIGGER credential_revocation_confirmations_no_mutation ON credential_revocation_confirmations`)
-	execSQL(t, ctx, database, `DROP TRIGGER credential_revocation_confirmations_no_truncate ON credential_revocation_confirmations`)
+	// Drain all M2-only state before the coordinated M3 cutover. Triggers are
+	// disabled only for this privileged migration harness and immediately
+	// restored so M3 exercises the shipped immutable-history defenses.
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocation_confirmations DISABLE TRIGGER credential_revocation_confirmations_no_mutation`)
 	execSQL(t, ctx, database, `DELETE FROM credential_revocation_confirmations`)
-	execSQL(t, ctx, database, `DROP TRIGGER credential_revocations_no_delete ON credential_revocations`)
-	execSQL(t, ctx, database, `DROP TRIGGER credential_revocations_no_truncate ON credential_revocations`)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocation_confirmations ENABLE TRIGGER credential_revocation_confirmations_no_mutation`)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations DISABLE TRIGGER credential_revocations_no_delete`)
 	execSQL(t, ctx, database, `DELETE FROM credential_revocations`)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations ENABLE TRIGGER credential_revocations_no_delete`)
 	execSQL(t, ctx, database, `DELETE FROM outbox_events WHERE event_type LIKE 'credential.revocation.%'`)
+	execSQL(t, ctx, database, `ALTER TABLE runner_result_receipts DISABLE TRIGGER runner_result_receipts_immutable`)
+	execSQL(t, ctx, database, `ALTER TABLE runner_result_receipts DISABLE TRIGGER runner_result_receipts_no_truncate`)
+	execSQL(t, ctx, database, `TRUNCATE runner_result_receipts`)
+	execSQL(t, ctx, database, `ALTER TABLE runner_result_receipts ENABLE TRIGGER runner_result_receipts_immutable`)
+	execSQL(t, ctx, database, `ALTER TABLE runner_result_receipts ENABLE TRIGGER runner_result_receipts_no_truncate`)
+	execSQL(t, ctx, database, `ALTER TABLE action_queue DISABLE TRIGGER action_queue_no_delete`)
+	execSQL(t, ctx, database, `DELETE FROM action_queue`)
+	execSQL(t, ctx, database, `ALTER TABLE action_queue ENABLE TRIGGER action_queue_no_delete`)
+
+	const historicalActionID = "93900000-0000-4000-8000-000000000001"
+	historicalFence := claimStartedCredentialAction(t, ctx, database, queue, signer,
+		historicalActionID, workspaceID, environmentID, serviceID,
+		"payments-historical-runner-result-v1", '9', "runner-postgres-1")
+	historicalExecutionFence := executionlease.LeaseIdentity{
+		ExecutionID: historicalFence.ActionID,
+		RunnerID:    historicalFence.RunnerID,
+		Token:       historicalFence.Token,
+		Epoch:       historicalFence.Epoch,
+	}
+	recordNoCredentialForAction(t, ctx, database, historicalExecutionFence,
+		"95900000-0000-4000-8000-000000000001")
+	if finalizing, err := queue.Complete(ctx, execution.ActionCompleteRequest{
+		Lease: historicalExecutionFence,
+		Summary: execution.ExecutorResult{
+			Outcome: execution.ExecutorSucceeded, Code: "HISTORICAL_V1_BEFORE_M3",
+			Verification: execution.VerificationPassed,
+		},
+	}); err != nil || finalizing.Status != executionlease.StatusFinalizing {
+		t.Fatalf("complete historical v1 action = %#v, %v", finalizing, err)
+	}
+	if completed, err := queue.Finalize(ctx, historicalExecutionFence); err != nil || completed.Status != executionlease.StatusSucceeded {
+		t.Fatalf("finalize historical v1 action = %#v, %v", completed, err)
+	}
+
+	m3UpMigration := filepath.Join(migrationDirectory, "000009_runner_gateway_mtls.up.sql")
+	m3DownMigration := filepath.Join(migrationDirectory, "000009_runner_gateway_mtls.down.sql")
+	exerciseLegacyExecutionLeaseUpgradeGate(t, ctx, database, m3UpMigration)
+	applyMigrationFile(t, ctx, database, m3UpMigration)
+	exerciseLegacyExecutionLeasePostCutoverGate(t, ctx, database, m3DownMigration)
+	var historicalV1Count int
+	if err := database.QueryRow(ctx, `
+		SELECT count(*) FROM runner_result_receipts
+		WHERE action_id = $1 AND schema_version = 'runner-result.v1'
+	`, historicalActionID).Scan(&historicalV1Count); err != nil || historicalV1Count != 1 {
+		t.Fatalf("historical runner-result.v1 rows after M3 = %d, %v", historicalV1Count, err)
+	}
+
+	exerciseRealRunnerGatewayMigration(t, ctx, database, migrationDirectory, queue, repository, signer,
+		tenantID, workspaceID, environmentID, serviceID)
+
+	// M3 completion evidence is immutable in production. The harness removes it
+	// only after every guard has been exercised so reverse migrations can run.
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocation_receipts DISABLE TRIGGER credential_revocation_receipts_immutable`)
+	execSQL(t, ctx, database, `DELETE FROM credential_revocation_receipts`)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocation_receipts ENABLE TRIGGER credential_revocation_receipts_immutable`)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocation_system_receipts DISABLE TRIGGER credential_revocation_system_receipts_immutable`)
+	execSQL(t, ctx, database, `DELETE FROM credential_revocation_system_receipts`)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocation_system_receipts ENABLE TRIGGER credential_revocation_system_receipts_immutable`)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations DISABLE TRIGGER credential_revocations_no_delete`)
+	execSQL(t, ctx, database, `DELETE FROM credential_revocations`)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations ENABLE TRIGGER credential_revocations_no_delete`)
+	execSQL(t, ctx, database, `DELETE FROM outbox_events WHERE event_type LIKE 'credential.revocation.%'`)
+}
+
+func exerciseRealRunnerGatewayMigration(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	migrationDirectory string,
+	queue execution.ActionQueue,
+	repository *credentialpostgres.Repository,
+	signer action.Signer,
+	tenantID, workspaceID, environmentID, serviceID string,
+) {
+	t.Helper()
+	const (
+		runnerID            = "runner-postgres-m3-action"
+		revocationRunnerID  = "runner-postgres-m3-revoker"
+		transactionRunnerID = "runner-postgres-m3-tx-revoker"
+	)
+	registerRealWriteRunner(t, ctx, database, runnerID, tenantID, workspaceID, environmentID)
+	registerRealWriteRunner(t, ctx, database, revocationRunnerID, tenantID, workspaceID, environmentID)
+	registerRealWriteRunner(t, ctx, database, transactionRunnerID, tenantID, workspaceID, environmentID)
+	execSQL(t, ctx, database, `
+		UPDATE runner_registrations
+		SET credential_revocation_capable = true, updated_at = statement_timestamp()
+		WHERE runner_id IN ($1, $2, $3)
+	`, runnerID, revocationRunnerID, transactionRunnerID)
+	execSQL(t, ctx, database, `
+		UPDATE runner_registrations
+		SET max_concurrency = 4, updated_at = statement_timestamp()
+		WHERE runner_id IN ($1, $2)
+	`, runnerID, transactionRunnerID)
+
+	var certificateSHA256 string
+	if err := database.QueryRow(ctx, `
+		SELECT certificate_sha256 FROM runner_certificates WHERE runner_id = $1
+	`, runnerID).Scan(&certificateSHA256); err != nil {
+		t.Fatalf("read M3 Runner certificate: %v", err)
+	}
+	var revocationCertificateSHA256 string
+	var revocationScopeRevision int64
+	if err := database.QueryRow(ctx, `
+		SELECT certificate.certificate_sha256, registration.scope_revision
+		FROM runner_certificates AS certificate
+		JOIN runner_registrations AS registration USING (runner_id, tenant_id)
+		WHERE certificate.runner_id = $1
+	`, revocationRunnerID).Scan(&revocationCertificateSHA256, &revocationScopeRevision); err != nil {
+		t.Fatalf("read M3 revocation Runner identity: %v", err)
+	}
+	certificateInsertStarted := time.Now().UTC()
+	execSQL(t, ctx, database, `
+		INSERT INTO runner_certificates (
+			certificate_sha256, runner_id, tenant_id, issuer_key_id, serial_hex, spki_sha256,
+			status, not_before, not_after, created_at
+		) VALUES (repeat('6', 64), $1, $2, 'integration-created-at-ca', '66', repeat('5', 64),
+			'ACTIVE', statement_timestamp() - interval '1 minute', statement_timestamp() + interval '1 hour',
+			'2000-01-01T00:00:00Z'::timestamptz)
+	`, runnerID, tenantID)
+	var controlledCertificateCreatedAt time.Time
+	if err := database.QueryRow(ctx, `
+		SELECT created_at FROM runner_certificates WHERE certificate_sha256 = repeat('6', 64)
+	`).Scan(&controlledCertificateCreatedAt); err != nil || controlledCertificateCreatedAt.Before(certificateInsertStarted) {
+		t.Fatalf("database-controlled certificate created_at = %s, started=%s, err=%v",
+			controlledCertificateCreatedAt, certificateInsertStarted, err)
+	}
+	expectSQLConstraint(t, ctx, database, "23514", "runner_certificates_time_ck", `
+		INSERT INTO runner_certificates (
+			certificate_sha256, runner_id, tenant_id, issuer_key_id, serial_hex, spki_sha256,
+			status, not_before, not_after
+		) VALUES (repeat('8', 64), $1, $2, 'integration-fixture-ca', '88', repeat('9', 64),
+			'ACTIVE', statement_timestamp() - interval '1 minute', 'infinity'::timestamptz)
+	`, runnerID, tenantID)
+	expectSQLConstraint(t, ctx, database, "55000", "runner_certificates_lifecycle_guard", `
+		UPDATE runner_certificates SET issuer_key_id = 'tampered-ca' WHERE certificate_sha256 = $1
+	`, certificateSHA256)
+	expectSQLState(t, ctx, database, "23514", `
+		UPDATE runner_registrations SET runner_pool = 'READ' WHERE runner_id = $1
+	`, runnerID)
+	exerciseRealRunnerRevocationTransactions(t, ctx, database, queue, repository, signer,
+		transactionRunnerID, tenantID, workspaceID, environmentID, serviceID)
+	exerciseCredentialSystemRecoveryReceipts(t, ctx, database, queue, repository, signer,
+		tenantID, workspaceID, environmentID, serviceID, runnerID)
+
+	// Build one authenticated credential-revocation claim before creating any
+	// M3 completion evidence. The rollback guard must reject the active claim.
+	const credentialActionID = "94000000-0000-4000-8000-000000000001"
+	credentialFence := claimStartedCredentialAction(t, ctx, database, queue, signer,
+		credentialActionID, workspaceID, environmentID, serviceID,
+		"payments-m3-credential-revocation", 'b', runnerID)
+	const revocationID = "95000000-0000-4000-8000-000000000001"
+	prepared, err := repository.Prepare(ctx, credential.PrepareRequest{
+		RevocationID:        revocationID,
+		Fence:               credentialFence,
+		Issuer:              "vault-m3-integration",
+		IssuerRevision:      "rev-1",
+		CredentialExpiresAt: time.Now().UTC().Add(5 * time.Minute),
+	})
+	if err != nil || !prepared.Created || prepared.Permit == nil {
+		t.Fatalf("prepare M3 credential revocation = %#v, %v", prepared, err)
+	}
+	if _, err := repository.AuthorizeChildCreate(ctx, credential.AuthorizeChildCreateRequest{
+		Permit: *prepared.Permit, Fence: credentialFence,
+	}); err != nil {
+		t.Fatalf("authorize M3 child create: %v", err)
+	}
+	accessor, err := credential.NewSensitiveReference([]byte("m3-integration-accessor"))
+	if err != nil {
+		t.Fatalf("create M3 accessor: %v", err)
+	}
+	if _, err := repository.RecordAnchor(ctx, credential.RecordAnchorRequest{
+		RevocationID: revocationID, Fence: credentialFence, Accessor: accessor,
+	}); err != nil {
+		accessor.Destroy()
+		t.Fatalf("anchor M3 credential: %v", err)
+	}
+	accessor.Destroy()
+	if _, err := repository.RequestRevocation(ctx, credential.ActionTransitionRequest{
+		RevocationID: revocationID, Fence: credentialFence,
+	}); err != nil {
+		t.Fatalf("request M3 credential revocation: %v", err)
+	}
+	execSQL(t, ctx, database, `
+		UPDATE credential_revocations
+		SET available_at = '2000-01-01T00:00:00Z'::timestamptz,
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID)
+	expectSQLConstraint(t, ctx, database, "55000", "credential_revocations_heartbeat_sequence_guard", `
+		UPDATE credential_revocations
+		SET status = 'REVOKING', claim_epoch = claim_epoch + 1,
+			claimed_by = $2, claim_token_sha256 = repeat('3', 64),
+			claimed_at = clock_timestamp(), last_heartbeat_at = clock_timestamp(),
+			claim_expires_at = clock_timestamp() + interval '30 seconds',
+			attempt = attempt + 1, heartbeat_seq = 0,
+			failure_count = failure_count + 1, failure_code = 'TIMEOUT',
+			failure_detail_sha256 = repeat('2', 64),
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID, runnerID)
+	if legacyClaims, legacyErr := repository.ClaimRevocations(ctx, credential.ClaimRevocationsRequest{
+		WorkerID: "legacy-m3-revoker", Limit: 1, LeaseDuration: 30 * time.Second,
+	}); legacyErr == nil || len(legacyClaims) != 0 {
+		for index := range legacyClaims {
+			legacyClaims[index].Accessor.Destroy()
+		}
+		t.Fatalf("legacy revoker claim after M3 = %#v, %v; want rejected", legacyClaims, legacyErr)
+	}
+	// A revocation-capable Runner may differ from the action Runner, but it must
+	// hold the exact current scope pair. Removing that pair makes a direct claim
+	// fail closed; restoring it advances the registration revision before the
+	// repository can claim the same pending credential.
+	execSQL(t, ctx, database, `
+		DELETE FROM runner_scope_bindings
+		WHERE runner_id = $1 AND tenant_id = $2 AND workspace_id = $3 AND environment_id = $4
+	`, revocationRunnerID, tenantID, workspaceID, environmentID)
+	expectSQLConstraint(t, ctx, database, "23514", "credential_revocations_heartbeat_sequence_guard", `
+		UPDATE credential_revocations
+		SET status = 'REVOKING', claim_epoch = claim_epoch + 1,
+			claimed_by = $2, claim_token_sha256 = repeat('4', 64),
+			claimed_at = clock_timestamp(), last_heartbeat_at = clock_timestamp(),
+			claim_expires_at = clock_timestamp() + interval '30 seconds',
+			attempt = attempt + 1, updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID, revocationRunnerID)
+	execSQL(t, ctx, database, `
+		INSERT INTO runner_scope_bindings (runner_id, tenant_id, workspace_id, environment_id)
+		VALUES ($1, $2, $3, $4)
+	`, revocationRunnerID, tenantID, workspaceID, environmentID)
+	if err := database.QueryRow(ctx, `
+		SELECT scope_revision FROM runner_registrations WHERE runner_id = $1
+	`, revocationRunnerID).Scan(&revocationScopeRevision); err != nil {
+		t.Fatalf("read restored M3 revocation scope revision: %v", err)
+	}
+
+	claims, err := repository.ClaimRevocations(ctx, credential.ClaimRevocationsRequest{
+		WorkerID: revocationRunnerID, Limit: 1, LeaseDuration: 30 * time.Second,
+	})
+	if err != nil || len(claims) != 1 || claims[0].Revocation.ID != revocationID {
+		t.Fatalf("claim M3 credential revocation = %#v, %v", claims, err)
+	}
+	claim := claims[0].Fence
+	claims[0].Accessor.Destroy()
+	var claimedAt, firstHeartbeatAt, firstClaimExpiresAt time.Time
+	if err := database.QueryRow(ctx, `
+		SELECT claimed_at, last_heartbeat_at, claim_expires_at
+		FROM credential_revocations WHERE revocation_id = $1
+	`, revocationID).Scan(&claimedAt, &firstHeartbeatAt, &firstClaimExpiresAt); err != nil ||
+		!claimedAt.Equal(firstHeartbeatAt) || firstClaimExpiresAt.Sub(firstHeartbeatAt) != 30*time.Second {
+		t.Fatalf("database-controlled initial claim times = %s/%s/%s, %v",
+			claimedAt, firstHeartbeatAt, firstClaimExpiresAt, err)
+	}
+	expectMigrationSQLState(t, ctx, database,
+		filepath.Join(migrationDirectory, "000009_runner_gateway_mtls.down.sql"), "55000")
+
+	// A capability Runner must advance exactly by one. Replaying, jumping, or
+	// changing non-heartbeat state cannot change the persisted claim.
+	expectSQLConstraint(t, ctx, database, "55000", "credential_revocations_heartbeat_sequence_guard", `
+		UPDATE credential_revocations
+		SET heartbeat_seq = 1, claimed_by = 'runner-postgres-m3-tampered',
+			last_heartbeat_at = clock_timestamp(), claim_expires_at = clock_timestamp() + interval '1 minute',
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID)
+	expectSQLConstraint(t, ctx, database, "55000", "credential_revocations_heartbeat_sequence_guard", `
+		UPDATE credential_revocations
+		SET heartbeat_seq = 1,
+			failure_count = 1, failure_code = 'TIMEOUT', failure_detail_sha256 = repeat('1', 64),
+			last_heartbeat_at = clock_timestamp(), claim_expires_at = clock_timestamp() + interval '1 minute',
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID)
+	expectSQLConstraint(t, ctx, database, "55000", "credential_revocations_heartbeat_sequence_guard", `
+		UPDATE credential_revocations
+		SET updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1 AND heartbeat_seq = 0
+	`, revocationID)
+	execSQL(t, ctx, database, `
+		WITH heartbeat_clock AS (SELECT clock_timestamp() + interval '1 millisecond' AS current_time)
+		UPDATE credential_revocations AS revocation
+		SET heartbeat_seq = 1,
+			last_heartbeat_at = heartbeat_clock.current_time,
+			claim_expires_at = heartbeat_clock.current_time + interval '1 minute',
+			updated_at = heartbeat_clock.current_time,
+			version = version + 1
+		FROM heartbeat_clock
+		WHERE revocation.revocation_id = $1
+	`, revocationID)
+	var sequencedHeartbeatAt, sequencedExpiry time.Time
+	if err := database.QueryRow(ctx, `
+		SELECT last_heartbeat_at, claim_expires_at FROM credential_revocations
+		WHERE revocation_id = $1 AND heartbeat_seq = 1
+	`, revocationID).Scan(&sequencedHeartbeatAt, &sequencedExpiry); err != nil ||
+		sequencedExpiry.Sub(sequencedHeartbeatAt) != 30*time.Second {
+		t.Fatalf("read sequenced revocation heartbeat: %v", err)
+	}
+	expectSQLConstraint(t, ctx, database, "55000", "credential_revocations_heartbeat_sequence_guard", `
+		UPDATE credential_revocations
+		SET claim_expires_at = claim_expires_at + interval '1 minute',
+			last_heartbeat_at = last_heartbeat_at + interval '1 second',
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1 AND heartbeat_seq = 1
+	`, revocationID)
+	expectSQLConstraint(t, ctx, database, "55000", "credential_revocations_heartbeat_sequence_guard", `
+		UPDATE credential_revocations
+		SET heartbeat_seq = 3,
+			claim_expires_at = claim_expires_at + interval '1 minute',
+			last_heartbeat_at = last_heartbeat_at + interval '1 second',
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID)
+	var expiryAfterReplay time.Time
+	if err := database.QueryRow(ctx, `SELECT claim_expires_at FROM credential_revocations WHERE revocation_id = $1`, revocationID).
+		Scan(&expiryAfterReplay); err != nil || !expiryAfterReplay.Equal(sequencedExpiry) {
+		t.Fatalf("heartbeat replay changed expiry: before=%s after=%s err=%v", sequencedExpiry, expiryAfterReplay, err)
+	}
+
+	claimTokenSHA256 := credential.SHA256Hex([]byte(claim.Token))
+	failureDetailSHA256 := strings.Repeat("a", 64)
+	credentialReceiptInsert := `
+		INSERT INTO credential_revocation_receipts (
+			revocation_id, claim_epoch, tenant_id, workspace_id, environment_id,
+			runner_id, scope_revision, certificate_sha256, issuer, issuer_revision, claim_token_sha256,
+			heartbeat_seq, outcome, failure_count, failure_code, failure_detail_sha256, receipt_hash
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'vault-m3-integration', 'rev-1', $9,
+			1, 'FAILED', 1, 'TIMEOUT', $10, repeat('9', 64))
+	`
+	expectSQLConstraint(t, ctx, database, "23514", "credential_revocation_receipts_claim_guard",
+		credentialReceiptInsert, revocationID, claim.Epoch, tenantID, workspaceID, environmentID,
+		revocationRunnerID, revocationScopeRevision+1, revocationCertificateSHA256, claimTokenSHA256, failureDetailSHA256)
+	expectSQLConstraint(t, ctx, database, "23514", "credential_revocation_receipts_claim_guard",
+		credentialReceiptInsert, revocationID, claim.Epoch, tenantID, workspaceID,
+		"00000000-0000-4000-8000-000000000099", revocationRunnerID, revocationScopeRevision,
+		revocationCertificateSHA256, claimTokenSHA256, failureDetailSHA256)
+	expectDeferredConstraintAtCommit(t, ctx, database, "credential_revocations_completion_receipt_guard", `
+		UPDATE credential_revocations
+		SET status = 'REVOCATION_PENDING',
+			claimed_by = NULL, claim_token_sha256 = NULL, claimed_at = NULL,
+			claim_expires_at = NULL, last_heartbeat_at = NULL,
+			failure_count = 1, failure_code = 'TIMEOUT', failure_detail_sha256 = $2,
+			available_at = statement_timestamp() - interval '1 second',
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID, failureDetailSHA256)
+	// The immediate trigger accepts the active claim, but the deferred trigger
+	// rejects a receipt whose failure code diverges from the committed parent.
+	expectDeferredConstraintAtCommit(t, ctx, database, "credential_revocation_receipts_final_shape", `
+		INSERT INTO credential_revocation_receipts (
+			revocation_id, claim_epoch, tenant_id, workspace_id, environment_id,
+			runner_id, scope_revision, certificate_sha256, issuer, issuer_revision, claim_token_sha256,
+			heartbeat_seq, outcome, failure_count, failure_code, failure_detail_sha256, receipt_hash
+		) VALUES ($1, $2, $7, $8, $9, $3, $10, $4, 'vault-m3-integration', 'rev-1', $5,
+			1, 'FAILED', 1, 'TIMEOUT', $6, repeat('b', 64));
+		UPDATE credential_revocations
+		SET status = 'REVOCATION_PENDING',
+			claimed_by = NULL, claim_token_sha256 = NULL, claimed_at = NULL,
+			claim_expires_at = NULL, last_heartbeat_at = NULL,
+			failure_count = 1, failure_code = 'RATE_LIMITED', failure_detail_sha256 = repeat('c', 64),
+			available_at = statement_timestamp() - interval '1 second',
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1;
+	`, revocationID, claim.Epoch, revocationRunnerID, revocationCertificateSHA256,
+		claimTokenSHA256, failureDetailSHA256, tenantID, workspaceID, environmentID, revocationScopeRevision)
+
+	execSQL(t, ctx, database, `
+		INSERT INTO credential_revocation_receipts (
+			revocation_id, claim_epoch, tenant_id, workspace_id, environment_id,
+			runner_id, scope_revision, certificate_sha256, issuer, issuer_revision, claim_token_sha256,
+			heartbeat_seq, outcome, failure_count, failure_code, failure_detail_sha256, receipt_hash
+		) VALUES ($1, $2, $7, $8, $9, $3, $10, $4, 'vault-m3-integration', 'rev-1', $5,
+			1, 'FAILED', 1, 'TIMEOUT', $6, repeat('d', 64));
+		UPDATE credential_revocations
+		SET status = 'REVOCATION_PENDING',
+			claimed_by = NULL, claim_token_sha256 = NULL, claimed_at = NULL,
+			claim_expires_at = NULL, last_heartbeat_at = NULL,
+			failure_count = 1, failure_code = 'TIMEOUT', failure_detail_sha256 = $6,
+			available_at = statement_timestamp() - interval '1 second',
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID, claim.Epoch, revocationRunnerID, revocationCertificateSHA256,
+		claimTokenSHA256, failureDetailSHA256, tenantID, workspaceID, environmentID, revocationScopeRevision)
+	var failedStatus string
+	var retainedSequence int64
+	if err := database.QueryRow(ctx, `
+		SELECT status, heartbeat_seq FROM credential_revocations WHERE revocation_id = $1
+	`, revocationID).Scan(&failedStatus, &retainedSequence); err != nil ||
+		failedStatus != string(credential.StatusRevocationPending) || retainedSequence != 1 {
+		t.Fatalf("failed M3 receipt parent = %s/seq-%d, %v", failedStatus, retainedSequence, err)
+	}
+
+	claims, err = repository.ClaimRevocations(ctx, credential.ClaimRevocationsRequest{
+		WorkerID: revocationRunnerID, Limit: 1, LeaseDuration: 30 * time.Second,
+	})
+	if err != nil || len(claims) != 1 || claims[0].Revocation.ID != revocationID {
+		t.Fatalf("reclaim M3 credential revocation = %#v, %v", claims, err)
+	}
+	claim = claims[0].Fence
+	claims[0].Accessor.Destroy()
+	if err := database.QueryRow(ctx, `
+		SELECT heartbeat_seq FROM credential_revocations WHERE revocation_id = $1
+	`, revocationID).Scan(&retainedSequence); err != nil || retainedSequence != 0 {
+		t.Fatalf("new M3 claim heartbeat sequence = %d, %v; want 0", retainedSequence, err)
+	}
+	execSQL(t, ctx, database, `
+		WITH heartbeat_clock AS (SELECT clock_timestamp() + interval '1 millisecond' AS current_time)
+		UPDATE credential_revocations AS revocation
+		SET heartbeat_seq = 1,
+			last_heartbeat_at = heartbeat_clock.current_time,
+			claim_expires_at = heartbeat_clock.current_time + interval '1 minute',
+			updated_at = heartbeat_clock.current_time,
+			version = version + 1
+		FROM heartbeat_clock
+		WHERE revocation.revocation_id = $1
+	`, revocationID)
+	claimTokenSHA256 = credential.SHA256Hex([]byte(claim.Token))
+	expectDeferredConstraintAtCommit(t, ctx, database, "credential_revocations_completion_receipt_guard", `
+		UPDATE credential_revocations
+		SET status = 'REVOKED',
+			completed_claim_epoch = claim_epoch,
+			completed_claim_token_sha256 = claim_token_sha256,
+			completed_claimed_by = claimed_by,
+			claimed_by = NULL, claim_token_sha256 = NULL, claimed_at = NULL,
+			claim_expires_at = NULL, last_heartbeat_at = NULL,
+			accessor_ciphertext = NULL, encryption_key_id = NULL,
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID)
+	execSQL(t, ctx, database, `
+		INSERT INTO credential_revocation_receipts (
+			revocation_id, claim_epoch, tenant_id, workspace_id, environment_id,
+			runner_id, scope_revision, certificate_sha256, issuer, issuer_revision, claim_token_sha256,
+			heartbeat_seq, outcome, receipt_hash
+		) VALUES ($1, $2, $6, $7, $8, $3, $9, $4, 'vault-m3-integration', 'rev-1', $5,
+			1, 'REVOKED', repeat('e', 64));
+		UPDATE credential_revocations
+		SET status = 'REVOKED',
+			completed_claim_epoch = claim_epoch,
+			completed_claim_token_sha256 = claim_token_sha256,
+			completed_claimed_by = claimed_by,
+			claimed_by = NULL, claim_token_sha256 = NULL, claimed_at = NULL,
+			claim_expires_at = NULL, last_heartbeat_at = NULL,
+			accessor_ciphertext = NULL, encryption_key_id = NULL,
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID, claim.Epoch, revocationRunnerID, revocationCertificateSHA256,
+		claimTokenSHA256, tenantID, workspaceID, environmentID, revocationScopeRevision)
+	var revokedStatus string
+	if err := database.QueryRow(ctx, `
+		SELECT status, heartbeat_seq FROM credential_revocations WHERE revocation_id = $1
+	`, revocationID).Scan(&revokedStatus, &retainedSequence); err != nil ||
+		revokedStatus != string(credential.StatusRevoked) || retainedSequence != 1 {
+		t.Fatalf("revoked M3 receipt parent = %s/seq-%d, %v", revokedStatus, retainedSequence, err)
+	}
+	expectSQLConstraint(t, ctx, database, "55000", "credential_revocation_receipts_immutable_guard", `
+		UPDATE credential_revocation_receipts SET receipt_hash = repeat('f', 64) WHERE revocation_id = $1
+	`, revocationID)
+	expectSQLConstraint(t, ctx, database, "55000", "credential_revocation_receipts_immutable_guard", `
+		DELETE FROM credential_revocation_receipts WHERE revocation_id = $1
+	`, revocationID)
+	expectSQLConstraint(t, ctx, database, "55000", "credential_revocation_receipts_immutable_guard", `
+		TRUNCATE credential_revocation_receipts
+	`)
+
+	// runner-result.v2 requires a registered certificate and satisfies both
+	// deferred FINALIZING proof and the terminal receipt guard. v1 rows created
+	// by the existing repository remain valid throughout the same migration.
+	const resultActionID = "94000000-0000-4000-8000-000000000002"
+	resultFence := claimStartedCredentialAction(t, ctx, database, queue, signer,
+		resultActionID, workspaceID, environmentID, serviceID,
+		"payments-m3-result-v2", '2', runnerID)
+	resultExecutionFence := executionlease.LeaseIdentity{
+		ExecutionID: resultFence.ActionID,
+		RunnerID:    resultFence.RunnerID,
+		Token:       resultFence.Token,
+		Epoch:       resultFence.Epoch,
+	}
+	recordNoCredentialForAction(t, ctx, database, resultExecutionFence,
+		"95000000-0000-4000-8000-000000000002")
+	resultHash := strings.Repeat("7", 64)
+	var v1RowsBefore int
+	if err := database.QueryRow(ctx, `
+		SELECT count(*) FROM runner_result_receipts WHERE schema_version = 'runner-result.v1'
+	`).Scan(&v1RowsBefore); err != nil || v1RowsBefore < 1 {
+		t.Fatalf("historical v1 receipt count before rejection = %d, %v", v1RowsBefore, err)
+	}
+	expectSQLConstraintAndRollback(t, ctx, database, "23514", "runner_result_receipts_insert_guard", `
+		UPDATE action_queue
+		SET status = 'FINALIZING', completion_status = 'SUCCEEDED', result_hash = $2,
+			completed_lease_token_sha256 = lease_token_sha256, completed_lease_epoch = lease_epoch,
+			lease_token_sha256 = NULL, lease_expires_at = NULL, updated_at = statement_timestamp()
+		WHERE action_id = $1;
+		INSERT INTO runner_result_receipts (
+			action_id, tenant_id, workspace_id, environment_id, runner_id, lease_epoch, scope_revision,
+			certificate_sha256, receipt_hash, completion_status, schema_version, summary
+		)
+		SELECT action_id, runner_tenant_id, runner_workspace_id, runner_environment_id,
+			runner_id, lease_epoch, scope_revision + 1, $3, result_hash, completion_status,
+			'runner-result.v2', '{"outcome":"SUCCEEDED"}'::jsonb
+		FROM action_queue WHERE action_id = $1
+	`, resultActionID, resultHash, certificateSHA256)
+	expectSQLConstraintAndRollback(t, ctx, database, "23514", "runner_result_receipts_insert_guard", `
+		UPDATE action_queue
+		SET status = 'FINALIZING', completion_status = 'SUCCEEDED', result_hash = $2,
+			completed_lease_token_sha256 = lease_token_sha256, completed_lease_epoch = lease_epoch,
+			lease_token_sha256 = NULL, lease_expires_at = NULL, updated_at = statement_timestamp()
+		WHERE action_id = $1;
+		INSERT INTO runner_result_receipts (
+			action_id, tenant_id, workspace_id, environment_id, runner_id, lease_epoch, scope_revision,
+			certificate_sha256, receipt_hash, completion_status, schema_version, summary
+		)
+		SELECT action_id, runner_tenant_id, runner_workspace_id, runner_environment_id,
+			runner_id, lease_epoch, scope_revision, $3, repeat('8', 64), completion_status,
+			'runner-result.v2', '{"outcome":"SUCCEEDED"}'::jsonb
+		FROM action_queue WHERE action_id = $1
+	`, resultActionID, resultHash, certificateSHA256)
+	expectSQLConstraintAndRollback(t, ctx, database, "23514", "runner_result_receipts_insert_guard", `
+		UPDATE action_queue
+		SET status = 'FINALIZING', completion_status = 'SUCCEEDED', result_hash = $2,
+			completed_lease_token_sha256 = lease_token_sha256, completed_lease_epoch = lease_epoch,
+			lease_token_sha256 = NULL, lease_expires_at = NULL, updated_at = statement_timestamp()
+		WHERE action_id = $1;
+		INSERT INTO runner_result_receipts (
+			action_id, tenant_id, workspace_id, environment_id, runner_id, lease_epoch, scope_revision,
+			certificate_sha256, receipt_hash, completion_status, schema_version, summary
+		)
+		SELECT action_id, runner_tenant_id, runner_workspace_id, runner_environment_id,
+			runner_id, lease_epoch, scope_revision, $3, result_hash, completion_status,
+			'runner-result.v1', '{"outcome":"SUCCEEDED"}'::jsonb
+		FROM action_queue WHERE action_id = $1
+	`, resultActionID, resultHash, certificateSHA256)
+	var v1RowsAfter int
+	if err := database.QueryRow(ctx, `
+		SELECT count(*) FROM runner_result_receipts WHERE schema_version = 'runner-result.v1'
+	`).Scan(&v1RowsAfter); err != nil || v1RowsAfter != v1RowsBefore {
+		t.Fatalf("new v1 receipt changed historical count = %d/%d, %v", v1RowsBefore, v1RowsAfter, err)
+	}
+	expectSQLConstraintAndRollback(t, ctx, database, "23514", "runner_result_receipts_insert_guard", `
+		UPDATE action_queue
+		SET status = 'FINALIZING', completion_status = 'SUCCEEDED', result_hash = $2,
+			completed_lease_token_sha256 = lease_token_sha256, completed_lease_epoch = lease_epoch,
+			lease_token_sha256 = NULL, lease_expires_at = NULL, updated_at = statement_timestamp()
+		WHERE action_id = $1;
+		INSERT INTO runner_result_receipts (
+			action_id, tenant_id, workspace_id, environment_id, runner_id, lease_epoch, scope_revision,
+			certificate_sha256, receipt_hash, completion_status, schema_version, summary
+		)
+		SELECT action_id, runner_tenant_id, runner_workspace_id, runner_environment_id,
+			runner_id, lease_epoch, scope_revision, NULL, result_hash, completion_status,
+			'runner-result.v2', '{"outcome":"SUCCEEDED"}'::jsonb
+		FROM action_queue WHERE action_id = $1
+	`, resultActionID, resultHash)
+	assertActionStatus(t, ctx, database, resultActionID, executionlease.StatusRunning)
+	execSQL(t, ctx, database, `
+		UPDATE action_queue
+		SET status = 'FINALIZING', completion_status = 'SUCCEEDED', result_hash = $2,
+			completed_lease_token_sha256 = lease_token_sha256, completed_lease_epoch = lease_epoch,
+			lease_token_sha256 = NULL, lease_expires_at = NULL, updated_at = statement_timestamp()
+		WHERE action_id = $1;
+		INSERT INTO runner_result_receipts (
+			action_id, tenant_id, workspace_id, environment_id, runner_id, lease_epoch, scope_revision,
+			certificate_sha256, receipt_hash, completion_status, schema_version, summary, received_at
+		)
+		SELECT action_id, runner_tenant_id, runner_workspace_id, runner_environment_id,
+			runner_id, lease_epoch, scope_revision, $3, result_hash, completion_status,
+			'runner-result.v2', '{"outcome":"SUCCEEDED"}'::jsonb, '2000-01-01T00:00:00Z'::timestamptz
+		FROM action_queue WHERE action_id = $1
+	`, resultActionID, resultHash, certificateSHA256)
+	var controlledReceiptTime time.Time
+	if err := database.QueryRow(ctx, `
+		SELECT received_at FROM runner_result_receipts WHERE action_id = $1
+	`, resultActionID).Scan(&controlledReceiptTime); err != nil || controlledReceiptTime.Before(certificateInsertStarted) {
+		t.Fatalf("database-controlled v2 receipt time = %s, started=%s, err=%v",
+			controlledReceiptTime, certificateInsertStarted, err)
+	}
+	execSQL(t, ctx, database, `
+		UPDATE action_queue
+		SET status = 'SUCCEEDED', completed_at = statement_timestamp(), updated_at = statement_timestamp()
+		WHERE action_id = $1
+	`, resultActionID)
+	assertActionStatus(t, ctx, database, resultActionID, executionlease.StatusSucceeded)
+
+	credentialResultHash := strings.Repeat("4", 64)
+	execSQL(t, ctx, database, `
+		UPDATE action_queue
+		SET status = 'FINALIZING', completion_status = 'SUCCEEDED', result_hash = $2,
+			completed_lease_token_sha256 = lease_token_sha256, completed_lease_epoch = lease_epoch,
+			lease_token_sha256 = NULL, lease_expires_at = NULL, updated_at = statement_timestamp()
+		WHERE action_id = $1;
+		INSERT INTO runner_result_receipts (
+			action_id, tenant_id, workspace_id, environment_id, runner_id, lease_epoch, scope_revision,
+			certificate_sha256, receipt_hash, completion_status, schema_version, summary
+		)
+		SELECT action_id, runner_tenant_id, runner_workspace_id, runner_environment_id,
+			runner_id, lease_epoch, scope_revision, $3, result_hash, completion_status,
+			'runner-result.v2', '{"outcome":"SUCCEEDED","code":"M3_REVOCATION_RECEIPT_VERIFIED"}'::jsonb
+		FROM action_queue WHERE action_id = $1
+	`, credentialActionID, credentialResultHash, certificateSHA256)
+	execSQL(t, ctx, database, `
+		UPDATE action_queue
+		SET status = 'SUCCEEDED', completed_at = statement_timestamp(), updated_at = statement_timestamp()
+		WHERE action_id = $1
+	`, credentialActionID)
+	assertActionStatus(t, ctx, database, credentialActionID, executionlease.StatusSucceeded)
+
+	execSQL(t, ctx, database, `
+		UPDATE runner_certificates
+		SET status = 'REVOKED', revocation_reason = 'M3 integration revocation'
+		WHERE certificate_sha256 = $1
+	`, certificateSHA256)
+	var certificateStatus string
+	var certificateRevokedAt time.Time
+	if err := database.QueryRow(ctx, `
+		SELECT status, revoked_at FROM runner_certificates WHERE certificate_sha256 = $1
+	`, certificateSHA256).Scan(&certificateStatus, &certificateRevokedAt); err != nil ||
+		certificateStatus != "REVOKED" || certificateRevokedAt.IsZero() {
+		t.Fatalf("revoked Runner certificate = %s/%s, %v", certificateStatus, certificateRevokedAt, err)
+	}
+	expectSQLConstraint(t, ctx, database, "55000", "runner_certificates_lifecycle_guard", `
+		UPDATE runner_certificates SET status = 'ACTIVE', revoked_at = NULL, revocation_reason = NULL
+		WHERE certificate_sha256 = $1
+	`, certificateSHA256)
+	expectSQLConstraint(t, ctx, database, "55000", "runner_certificates_history_guard", `
+		DELETE FROM runner_certificates WHERE certificate_sha256 = $1
+	`, certificateSHA256)
+	expectSQLState(t, ctx, database, "0A000", `
+		TRUNCATE runner_certificates
+	`)
+	expectSQLConstraint(t, ctx, database, "55000", "runner_certificates_history_guard", `
+		TRUNCATE runner_certificates CASCADE
+	`)
+
+	expectMigrationSQLState(t, ctx, database,
+		filepath.Join(migrationDirectory, "000009_runner_gateway_mtls.down.sql"), "55000")
+}
+
+func exerciseRealRunnerRevocationTransactions(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	queue execution.ActionQueue,
+	credentialRepository *credentialpostgres.Repository,
+	signer action.Signer,
+	runnerID, tenantID, workspaceID, environmentID, serviceID string,
+) {
+	t.Helper()
+	const (
+		decoyEnvironmentID  = "25000000-0000-4000-8000-000000000003"
+		failedActionID      = "94200000-0000-4000-8000-000000000001"
+		failedRevocationID  = "95200000-0000-4000-8000-000000000001"
+		revokedActionID     = "94200000-0000-4000-8000-000000000002"
+		revokedRevocationID = "95200000-0000-4000-8000-000000000002"
+	)
+
+	execSQL(t, ctx, database, `
+		INSERT INTO environments (id, tenant_id, workspace_id, name, kind)
+		VALUES ($1, $2, $3, 'runner-transaction-decoy', 'DEV')
+	`, decoyEnvironmentID, tenantID, workspaceID)
+	execSQL(t, ctx, database, `
+		INSERT INTO runner_scope_bindings (runner_id, tenant_id, workspace_id, environment_id)
+		VALUES ($1, $2, $3, $4)
+	`, runnerID, tenantID, workspaceID, decoyEnvironmentID)
+
+	identity := registerRealRunnerIdentityCertificate(t, ctx, database, runnerID, tenantID)
+	identityRepository, err := runneridentitypostgres.New(database)
+	if err != nil {
+		t.Fatalf("create real Runner identity repository: %v", err)
+	}
+
+	prepareM3ClaimableRevocation(t, ctx, database, queue, credentialRepository, signer,
+		failedActionID, failedRevocationID, workspaceID, environmentID, serviceID,
+		"payments-m3-runner-tx-failed", 'e', runnerID)
+	failedClaim := claimRealRunnerRevocation(t, ctx, database, identityRepository,
+		credentialRepository, identity, failedRevocationID)
+	defer failedClaim.Accessor.Destroy()
+	assertRawRevocationTokenNotPersisted(t, ctx, database, failedClaim.Fence)
+
+	var claimScopeRevision int64
+	if err := database.QueryRow(ctx, `
+		SELECT scope_revision FROM runner_registrations WHERE runner_id = $1
+	`, runnerID).Scan(&claimScopeRevision); err != nil {
+		t.Fatalf("read Runner claim scope revision: %v", err)
+	}
+	execSQL(t, ctx, database, `
+		DELETE FROM runner_scope_bindings
+		WHERE runner_id = $1 AND tenant_id = $2 AND workspace_id = $3 AND environment_id = $4
+	`, runnerID, tenantID, workspaceID, environmentID)
+	var narrowedScopeRevision int64
+	if err := database.QueryRow(ctx, `
+		SELECT scope_revision FROM runner_registrations WHERE runner_id = $1
+	`, runnerID).Scan(&narrowedScopeRevision); err != nil || narrowedScopeRevision <= claimScopeRevision {
+		t.Fatalf("narrowed Runner scope revision = %d after %d, %v", narrowedScopeRevision, claimScopeRevision, err)
+	}
+	terminated := heartbeatRealRunnerRevocation(t, ctx, database, identityRepository,
+		credentialRepository, identity, failedClaim.Fence, 1)
+	if terminated.Directive != credential.RunnerRevocationTerminate || terminated.AcceptedSequence != 1 {
+		t.Fatalf("real Runner heartbeat after exact-scope loss = %#v", terminated)
+	}
+	var sequenceAfterTermination int64
+	if err := database.QueryRow(ctx, `
+		SELECT heartbeat_seq FROM credential_revocations WHERE revocation_id = $1
+	`, failedRevocationID).Scan(&sequenceAfterTermination); err != nil || sequenceAfterTermination != 0 {
+		t.Fatalf("terminated heartbeat persisted sequence = %d, %v", sequenceAfterTermination, err)
+	}
+	execSQL(t, ctx, database, `
+		INSERT INTO runner_scope_bindings (runner_id, tenant_id, workspace_id, environment_id)
+		VALUES ($1, $2, $3, $4)
+	`, runnerID, tenantID, workspaceID, environmentID)
+	var restoredScopeRevision int64
+	if err := database.QueryRow(ctx, `
+		SELECT scope_revision FROM runner_registrations WHERE runner_id = $1
+	`, runnerID).Scan(&restoredScopeRevision); err != nil || restoredScopeRevision <= narrowedScopeRevision {
+		t.Fatalf("restored Runner scope revision = %d after %d, %v", restoredScopeRevision, narrowedScopeRevision, err)
+	}
+
+	firstHeartbeat := heartbeatRealRunnerRevocation(t, ctx, database, identityRepository,
+		credentialRepository, identity, failedClaim.Fence, 1)
+	replayedHeartbeat := heartbeatRealRunnerRevocation(t, ctx, database, identityRepository,
+		credentialRepository, identity, failedClaim.Fence, 1)
+	if firstHeartbeat.Directive != credential.RunnerRevocationContinue ||
+		replayedHeartbeat.Directive != credential.RunnerRevocationContinue ||
+		firstHeartbeat.AcceptedSequence != 1 || replayedHeartbeat.AcceptedSequence != 1 ||
+		!replayedHeartbeat.ClaimExpiresAt.Equal(firstHeartbeat.ClaimExpiresAt) {
+		t.Fatalf("real Runner monotonic/replayed heartbeat = %#v / %#v", firstHeartbeat, replayedHeartbeat)
+	}
+	assertRevokedCertificateCannotAuthenticate(t, ctx, database, identityRepository, identity)
+
+	failedCompletion := completeRealRunnerRevocation(t, ctx, database, identityRepository,
+		credentialRepository, identity, failedClaim.Fence,
+		credential.RunnerRevocationFailed, credential.FailureTimeout)
+	if failedCompletion.Revocation.Status != credential.StatusRevocationPending ||
+		failedCompletion.Receipt.Outcome != credential.RunnerRevocationFailed ||
+		failedCompletion.Receipt.HeartbeatSequence != 1 || failedCompletion.RetryDelay <= 0 {
+		t.Fatalf("real Runner failed revocation completion = %#v", failedCompletion)
+	}
+	assertRealRunnerRevocationReceipt(t, ctx, database, failedCompletion.Receipt, failedClaim.Fence)
+	assertRawRevocationTokenNotPersisted(t, ctx, database, failedClaim.Fence)
+	var failedCiphertext, failedHMAC []byte
+	var failedKeyID *string
+	var failureAuditCount, failureOutboxCount int
+	if err := database.QueryRow(ctx, `
+		SELECT parent.accessor_ciphertext, parent.accessor_hmac, parent.encryption_key_id,
+			(SELECT count(*) FROM audit_records
+			 WHERE resource_id = $1 AND action = 'credential.revocation.failed'),
+			(SELECT count(*) FROM outbox_events
+			 WHERE aggregate_id = $1::uuid AND event_type = 'credential.revocation.failed.v1')
+		FROM credential_revocations AS parent WHERE parent.revocation_id = $1
+	`, failedRevocationID).Scan(
+		&failedCiphertext, &failedHMAC, &failedKeyID, &failureAuditCount, &failureOutboxCount,
+	); err != nil || len(failedCiphertext) == 0 || len(failedHMAC) == 0 || failedKeyID == nil ||
+		failureAuditCount != 1 || failureOutboxCount != 1 {
+		t.Fatalf("failed Runner revocation retained reference/alert = cipher-%d hmac-%d key-%v audit-%d outbox-%d, %v",
+			len(failedCiphertext), len(failedHMAC), failedKeyID, failureAuditCount, failureOutboxCount, err)
+	}
+	// Keep the retryable failure outside this Runner's current exact scope so
+	// the next claim proves paired-scope selection instead of racing retry
+	// backoff wall-clock time.
+	execSQL(t, ctx, database, `
+		DELETE FROM runner_scope_bindings
+		WHERE runner_id = $1 AND tenant_id = $2 AND workspace_id = $3 AND environment_id = $4
+	`, runnerID, tenantID, workspaceID, environmentID)
+
+	prepareM3ClaimableRevocation(t, ctx, database, queue, credentialRepository, signer,
+		revokedActionID, revokedRevocationID, workspaceID, decoyEnvironmentID, serviceID,
+		"payments-m3-runner-tx-revoked", 'f', runnerID)
+	var originalAccessorHMAC []byte
+	if err := database.QueryRow(ctx, `
+		SELECT accessor_hmac FROM credential_revocations WHERE revocation_id = $1
+	`, revokedRevocationID).Scan(&originalAccessorHMAC); err != nil || len(originalAccessorHMAC) == 0 {
+		t.Fatalf("read original Runner revocation accessor HMAC = %d, %v", len(originalAccessorHMAC), err)
+	}
+	revokedClaim := claimRealRunnerRevocation(t, ctx, database, identityRepository,
+		credentialRepository, identity, revokedRevocationID)
+	defer revokedClaim.Accessor.Destroy()
+	heartbeat := heartbeatRealRunnerRevocation(t, ctx, database, identityRepository,
+		credentialRepository, identity, revokedClaim.Fence, 1)
+	if heartbeat.Directive != credential.RunnerRevocationContinue || heartbeat.AcceptedSequence != 1 {
+		t.Fatalf("real Runner revoked-path heartbeat = %#v", heartbeat)
+	}
+	revokedCompletion := completeRealRunnerRevocation(t, ctx, database, identityRepository,
+		credentialRepository, identity, revokedClaim.Fence,
+		credential.RunnerRevocationRevoked, "")
+	if revokedCompletion.Revocation.Status != credential.StatusRevoked ||
+		revokedCompletion.Receipt.Outcome != credential.RunnerRevocationRevoked ||
+		revokedCompletion.RetryDelay != 0 {
+		t.Fatalf("real Runner revoked completion = %#v", revokedCompletion)
+	}
+	assertRealRunnerRevocationReceipt(t, ctx, database, revokedCompletion.Receipt, revokedClaim.Fence)
+	assertRawRevocationTokenNotPersisted(t, ctx, database, revokedClaim.Fence)
+	var revokedCiphertext []byte
+	var retainedAccessorHMAC []byte
+	var revokedKeyID *string
+	if err := database.QueryRow(ctx, `
+		SELECT accessor_ciphertext, accessor_hmac, encryption_key_id
+		FROM credential_revocations WHERE revocation_id = $1
+	`, revokedRevocationID).Scan(&revokedCiphertext, &retainedAccessorHMAC, &revokedKeyID); err != nil ||
+		revokedCiphertext != nil || revokedKeyID != nil || !bytes.Equal(retainedAccessorHMAC, originalAccessorHMAC) {
+		t.Fatalf("revoked Runner reference evidence = cipher-%d hmac-match-%t key-%v, %v",
+			len(revokedCiphertext), bytes.Equal(retainedAccessorHMAC, originalAccessorHMAC), revokedKeyID, err)
+	}
+}
+
+func registerRealRunnerIdentityCertificate(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	runnerID, tenantID string,
+) runneridentity.Identity {
+	t.Helper()
+	now := time.Now().UTC()
+	readAuthority, err := testpki.NewAuthority("runner-postgres-m3-read-root", now)
+	if err != nil {
+		t.Fatalf("create real READ Runner authority: %v", err)
+	}
+	writeAuthority, err := testpki.NewAuthority("runner-postgres-m3-write-root", now)
+	if err != nil {
+		t.Fatalf("create real WRITE Runner authority: %v", err)
+	}
+	spiffeURI, err := url.Parse("spiffe://integration.test/runner/write/" + runnerID)
+	if err != nil {
+		t.Fatalf("parse real Runner SPIFFE URI: %v", err)
+	}
+	client, err := writeAuthority.IssueClient(testpki.ClientOptions{URIs: []*url.URL{spiffeURI}}, now)
+	if err != nil {
+		t.Fatalf("issue real Runner client certificate: %v", err)
+	}
+	verifier, err := runneridentity.NewVerifier(runneridentity.Options{
+		TrustDomain: "integration.test",
+		ReadRoots:   []*x509.Certificate{readAuthority.Certificate},
+		WriteRoots:  []*x509.Certificate{writeAuthority.Certificate},
+		Clock:       func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("create real Runner identity verifier: %v", err)
+	}
+	chains, err := client.Leaf.Verify(x509.VerifyOptions{
+		Roots: writeAuthority.CertPool(), CurrentTime: now,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	})
+	if err != nil {
+		t.Fatalf("verify real Runner client certificate: %v", err)
+	}
+	identity, err := verifier.IdentityFromConnectionState(tls.ConnectionState{
+		Version: tls.VersionTLS13, HandshakeComplete: true,
+		PeerCertificates: []*x509.Certificate{client.Leaf, writeAuthority.Certificate},
+		VerifiedChains:   chains,
+	})
+	if err != nil {
+		t.Fatalf("derive real Runner mTLS identity: %v", err)
+	}
+	evidence := identity.Evidence()
+	execSQL(t, ctx, database, `
+		INSERT INTO runner_certificates (
+			certificate_sha256, runner_id, tenant_id, issuer_key_id, serial_hex, spki_sha256,
+			status, not_before, not_after
+		) VALUES ($1, $2, $3, $4, $5, $6, 'ACTIVE', $7, $8)
+	`, evidence.LeafSHA256(), runnerID, tenantID, evidence.AuthorityKeyIDHex(),
+		evidence.SerialHex(), evidence.SPKISHA256(), evidence.NotBefore(), evidence.NotAfter())
+	return identity
+}
+
+func authenticateRealRunnerTx(
+	t *testing.T,
+	ctx context.Context,
+	repository *runneridentitypostgres.Repository,
+	tx pgx.Tx,
+	identity runneridentity.Identity,
+) (runneridentitypostgres.AuthenticatedRunner, execution.RunnerScope) {
+	t.Helper()
+	authenticated, err := repository.AuthenticateTx(ctx, tx, identity)
+	if err != nil || !authenticated.Valid() || !authenticated.CredentialRevocationCapable() {
+		t.Fatalf("authenticate real revocation-capable Runner = %#v, %v", authenticated, err)
+	}
+	scope, err := authenticated.RunnerScope()
+	if err != nil {
+		t.Fatalf("derive real authenticated Runner scope: %v", err)
+	}
+	return authenticated, scope
+}
+
+func claimRealRunnerRevocation(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	identityRepository *runneridentitypostgres.Repository,
+	credentialRepository *credentialpostgres.Repository,
+	identity runneridentity.Identity,
+	revocationID string,
+) credential.ClaimedRevocation {
+	t.Helper()
+	tx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin real Runner revocation claim: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	authenticated, scope := authenticateRealRunnerTx(t, ctx, identityRepository, tx, identity)
+	ticket, err := credentialRepository.ClaimRevocationRunnerTx(
+		ctx, tx, scope, authenticated.CertificateSHA256())
+	if err != nil || ticket == nil {
+		t.Fatalf("claim real Runner revocation %s = %#v, %v", revocationID, ticket, err)
+	}
+	defer ticket.Discard()
+	if rendered := fmt.Sprintf("%#v", ticket); strings.Contains(rendered, revocationID) ||
+		strings.Contains(rendered, authenticated.CertificateSHA256()) {
+		t.Fatalf("real Runner claim ticket rendered sensitive identity: %q", rendered)
+	}
+	if encoded, marshalErr := json.Marshal(ticket); marshalErr == nil || encoded != nil {
+		t.Fatalf("real Runner claim ticket serialized = %q, %v", encoded, marshalErr)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit real Runner revocation claim: %v", err)
+	}
+	claim, err := credentialRepository.FinalizeRevocationClaimAfterCommit(ctx, ticket)
+	if err != nil || claim.Revocation.ID != revocationID || claim.Fence.RevocationID != revocationID ||
+		claim.Fence.WorkerID != authenticated.RunnerID() || claim.Fence.Token == "" || claim.Accessor == nil ||
+		len(claim.Accessor.Bytes()) == 0 {
+		if claim.Accessor != nil {
+			claim.Accessor.Destroy()
+		}
+		t.Fatalf("finalize committed real Runner revocation claim = %#v, %v", claim.Revocation, err)
+	}
+	return claim
+}
+
+func heartbeatRealRunnerRevocation(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	identityRepository *runneridentitypostgres.Repository,
+	credentialRepository *credentialpostgres.Repository,
+	identity runneridentity.Identity,
+	fence credential.ClaimFence,
+	sequence int64,
+) credential.RunnerRevocationHeartbeatResult {
+	t.Helper()
+	tx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin real Runner revocation heartbeat: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	_, scope := authenticateRealRunnerTx(t, ctx, identityRepository, tx, identity)
+	result, err := credentialRepository.HeartbeatRevocationRunnerTx(ctx, tx, scope, fence, sequence)
+	if err != nil {
+		t.Fatalf("heartbeat real Runner revocation sequence %d: %v", sequence, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit real Runner revocation heartbeat: %v", err)
+	}
+	return result
+}
+
+func completeRealRunnerRevocation(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	identityRepository *runneridentitypostgres.Repository,
+	credentialRepository *credentialpostgres.Repository,
+	identity runneridentity.Identity,
+	fence credential.ClaimFence,
+	outcome credential.RunnerRevocationOutcome,
+	failureCode credential.FailureCode,
+) credential.RunnerRevocationCompletionResult {
+	t.Helper()
+	tx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin real Runner revocation completion: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	authenticated, scope := authenticateRealRunnerTx(t, ctx, identityRepository, tx, identity)
+	result, err := credentialRepository.CompleteRevocationRunnerTx(
+		ctx, tx, scope, fence, outcome, failureCode, authenticated.CertificateSHA256())
+	if err != nil {
+		t.Fatalf("complete real Runner revocation %s: %v", outcome, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit real Runner revocation completion: %v", err)
+	}
+	return result
+}
+
+func assertRevokedCertificateCannotAuthenticate(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	repository *runneridentitypostgres.Repository,
+	identity runneridentity.Identity,
+) {
+	t.Helper()
+	tx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin Runner certificate loss proof: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `
+		UPDATE runner_certificates
+		SET status = 'REVOKED', revocation_reason = 'integration transaction proof'
+		WHERE certificate_sha256 = $1
+	`, identity.Evidence().LeafSHA256()); err != nil {
+		t.Fatalf("temporarily revoke real Runner certificate: %v", err)
+	}
+	if authenticated, err := repository.AuthenticateTx(ctx, tx, identity); !errors.Is(err, runneridentity.ErrAuthenticationFailed) || authenticated.Valid() {
+		t.Fatalf("AuthenticateTx(revoked certificate) = %#v, %v", authenticated, err)
+	}
+}
+
+func assertRealRunnerRevocationReceipt(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	want credential.RunnerRevocationReceipt,
+	fence credential.ClaimFence,
+) {
+	t.Helper()
+	var outcome, claimTokenSHA256, receiptHash, certificateSHA256 string
+	var heartbeatSequence int64
+	if err := database.QueryRow(ctx, `
+		SELECT outcome, claim_token_sha256, receipt_hash, certificate_sha256, heartbeat_seq
+		FROM credential_revocation_receipts
+		WHERE revocation_id = $1 AND claim_epoch = $2
+	`, fence.RevocationID, fence.Epoch).Scan(
+		&outcome, &claimTokenSHA256, &receiptHash, &certificateSHA256, &heartbeatSequence,
+	); err != nil || outcome != string(want.Outcome) || claimTokenSHA256 != credential.SHA256Hex([]byte(fence.Token)) ||
+		receiptHash != want.ReceiptHash || certificateSHA256 != want.CertificateSHA256 ||
+		heartbeatSequence != want.HeartbeatSequence {
+		t.Fatalf("real Runner revocation receipt = %s/%s/%s/%s/seq-%d, want %#v, %v",
+			outcome, claimTokenSHA256, receiptHash, certificateSHA256, heartbeatSequence, want, err)
+	}
+}
+
+func assertRawRevocationTokenNotPersisted(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	fence credential.ClaimFence,
+) {
+	t.Helper()
+	var storedDigest string
+	var parentLeak, receiptLeak, auditLeak, outboxLeak bool
+	if err := database.QueryRow(ctx, `
+		SELECT COALESCE(
+			parent.claim_token_sha256,
+			parent.completed_claim_token_sha256,
+			(SELECT receipt.claim_token_sha256 FROM credential_revocation_receipts AS receipt
+			 WHERE receipt.revocation_id = $1 AND receipt.claim_epoch = $3)
+		),
+			strpos(to_jsonb(parent)::text, $2) > 0,
+			EXISTS (SELECT 1 FROM credential_revocation_receipts AS receipt
+				WHERE receipt.revocation_id = $1 AND strpos(to_jsonb(receipt)::text, $2) > 0),
+			EXISTS (SELECT 1 FROM audit_records AS audit
+				WHERE audit.resource_id = $1::text AND strpos(to_jsonb(audit)::text, $2) > 0),
+			EXISTS (SELECT 1 FROM outbox_events AS event
+				WHERE event.aggregate_id = $1::uuid AND strpos(to_jsonb(event)::text, $2) > 0)
+		FROM credential_revocations AS parent WHERE parent.revocation_id = $1
+	`, fence.RevocationID, fence.Token, fence.Epoch).Scan(
+		&storedDigest, &parentLeak, &receiptLeak, &auditLeak, &outboxLeak,
+	); err != nil || storedDigest != credential.SHA256Hex([]byte(fence.Token)) ||
+		parentLeak || receiptLeak || auditLeak || outboxLeak {
+		t.Fatalf("raw Runner revocation token persistence = digest-match-%t leaks=%t/%t/%t/%t, %v",
+			storedDigest == credential.SHA256Hex([]byte(fence.Token)),
+			parentLeak, receiptLeak, auditLeak, outboxLeak, err)
+	}
+}
+
+func exerciseCredentialSystemRecoveryReceipts(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	queue execution.ActionQueue,
+	repository *credentialpostgres.Repository,
+	signer action.Signer,
+	tenantID, workspaceID, environmentID, serviceID, runnerID string,
+) {
+	t.Helper()
+	const exhaustedDetailHash = "5797f0f8a568d5f215e18706d1e9e08a55101b1ba68ced7926e77a6c253359fe"
+
+	// The system receipt is not an application-write API. Even a row with a
+	// plausible shape is rejected unless it originates inside the parent
+	// transition trigger.
+	expectSQLConstraint(t, ctx, database, "55000", "credential_revocation_system_receipts_insert_guard", `
+		INSERT INTO credential_revocation_system_receipts (
+			revocation_id, claim_epoch, recovery_kind, claimed_by, claim_token_sha256,
+			heartbeat_seq, attempt, retry_cycle_attempt_base, retry_cycle_started_at,
+			claim_expires_at, prior_failure_count, failure_count, failure_code,
+			failure_detail_sha256, parent_version, manual_required_at
+		) VALUES (
+			'95100000-0000-4000-8000-000000000099', 1, 'EXHAUSTED_WITHOUT_ACK',
+			$1, repeat('1', 64), 0, 12, 0, statement_timestamp() - interval '3 hours',
+			statement_timestamp() - interval '1 minute', 0, 1, 'UNKNOWN', $2, 2,
+			statement_timestamp()
+		)
+	`, runnerID, exhaustedDetailHash)
+
+	// Corrupt only the encrypted blob while it is pending. M3 must keep the
+	// canonical REVOKING claim until its database-owned 30-second lease expires,
+	// emit a redacted alert in the same transaction, and never return the raw
+	// claim token or a protected accessor to the caller.
+	const protectedActionID = "94100000-0000-4000-8000-000000000001"
+	const protectedRevocationID = "95100000-0000-4000-8000-000000000001"
+	prepareM3ClaimableRevocation(t, ctx, database, queue, repository, signer,
+		protectedActionID, protectedRevocationID, workspaceID, environmentID, serviceID,
+		"payments-m3-protected-reference", 'd', runnerID)
+	execSQL(t, ctx, database, `
+		UPDATE credential_revocations
+		SET accessor_ciphertext = decode(repeat('00', 29), 'hex'),
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, protectedRevocationID)
+	claims, err := repository.ClaimRevocations(ctx, credential.ClaimRevocationsRequest{
+		WorkerID: runnerID, Limit: 1, LeaseDuration: 30 * time.Second,
+	})
+	for index := range claims {
+		claims[index].Accessor.Destroy()
+	}
+	if err != nil || len(claims) != 0 {
+		t.Fatalf("claim poisoned M3 protected reference = %#v, %v; want retained lease without secret", claims, err)
+	}
+	var poisonStatus, poisonClaimedBy, poisonClaimTokenSHA256 string
+	var poisonAttempt int
+	var poisonClaimedAt, poisonHeartbeatAt, poisonClaimExpiresAt time.Time
+	if err := database.QueryRow(ctx, `
+		SELECT status, claimed_by, claim_token_sha256, attempt,
+			claimed_at, last_heartbeat_at, claim_expires_at
+		FROM credential_revocations WHERE revocation_id = $1
+	`, protectedRevocationID).Scan(
+		&poisonStatus, &poisonClaimedBy, &poisonClaimTokenSHA256, &poisonAttempt,
+		&poisonClaimedAt, &poisonHeartbeatAt, &poisonClaimExpiresAt,
+	); err != nil || poisonStatus != string(credential.StatusRevoking) || poisonClaimedBy != runnerID ||
+		len(poisonClaimTokenSHA256) != 64 || poisonAttempt != 1 ||
+		!poisonClaimedAt.Equal(poisonHeartbeatAt) || poisonClaimExpiresAt.Sub(poisonClaimedAt) != 30*time.Second {
+		t.Fatalf("retained poison claim = %s/%s/%s attempt=%d times=%s/%s/%s err=%v",
+			poisonStatus, poisonClaimedBy, poisonClaimTokenSHA256, poisonAttempt,
+			poisonClaimedAt, poisonHeartbeatAt, poisonClaimExpiresAt, err)
+	}
+	var poisonSystemReceipts, poisonAuditAlerts, poisonOutboxAlerts int
+	var poisonAlertPayload string
+	if err := database.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM credential_revocation_system_receipts WHERE revocation_id = $1),
+			(SELECT count(*) FROM audit_records
+			 WHERE resource_id = $1::text AND action = 'credential.revocation.protected_reference_unavailable'),
+			(SELECT count(*) FROM outbox_events
+			 WHERE aggregate_id = $1 AND event_type = 'credential.revocation.protected_reference_unavailable.v1'),
+			(SELECT payload::text FROM outbox_events
+			 WHERE aggregate_id = $1 AND event_type = 'credential.revocation.protected_reference_unavailable.v1')
+	`, protectedRevocationID).Scan(
+		&poisonSystemReceipts, &poisonAuditAlerts, &poisonOutboxAlerts, &poisonAlertPayload,
+	); err != nil || poisonSystemReceipts != 0 || poisonAuditAlerts != 1 || poisonOutboxAlerts != 1 ||
+		strings.Contains(poisonAlertPayload, "claim_token") || strings.Contains(poisonAlertPayload, "accessor") ||
+		strings.Contains(poisonAlertPayload, "ciphertext") {
+		t.Fatalf("poison alert evidence = receipts=%d audit=%d outbox=%d payload=%q err=%v",
+			poisonSystemReceipts, poisonAuditAlerts, poisonOutboxAlerts, poisonAlertPayload, err)
+	}
+
+	// A live protected-reference error is not external proof of revocation. It
+	// cannot transition the parent or manufacture a system receipt.
+	manualTransition := `
+		UPDATE credential_revocations
+		SET status = 'MANUAL_REQUIRED',
+			claimed_by = NULL, claim_token_sha256 = NULL, claimed_at = NULL,
+			claim_expires_at = NULL, last_heartbeat_at = NULL,
+			failure_count = failure_count + 1, failure_code = $2,
+			failure_detail_sha256 = $3,
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`
+	expectDeferredConstraintAtCommit(t, ctx, database, "credential_revocations_completion_receipt_guard",
+		manualTransition, protectedRevocationID, string(credential.FailureInvalidReference),
+		credential.SHA256Hex([]byte(credential.FailureDetailProtectedRefInvalid)))
+
+	// A nested relay reaches trigger depth two, but a fabricated exhausted row
+	// still cannot match a committed parent transition at the deferred boundary.
+	execSQL(t, ctx, database, `
+		CREATE TABLE m3_system_receipt_relay (id integer PRIMARY KEY);
+		CREATE FUNCTION relay_m3_system_receipt() RETURNS trigger AS $$
+		BEGIN
+			INSERT INTO credential_revocation_system_receipts (
+				revocation_id, claim_epoch, recovery_kind, claimed_by, claim_token_sha256,
+				heartbeat_seq, attempt, retry_cycle_attempt_base, retry_cycle_started_at,
+				claimed_at, last_heartbeat_at, claim_expires_at,
+				prior_failure_count, failure_count, failure_code, failure_detail_sha256,
+				parent_version, manual_required_at
+			)
+			SELECT revocation_id, claim_epoch, 'EXHAUSTED_WITHOUT_ACK', claimed_by,
+				claim_token_sha256, heartbeat_seq, retry_cycle_attempt_base + 12,
+				retry_cycle_attempt_base, clock_timestamp() - interval '3 hours',
+				clock_timestamp() - interval '2 minutes', clock_timestamp() - interval '2 minutes',
+				clock_timestamp() - interval '1 minute', failure_count, failure_count + 1,
+				'UNKNOWN', '`+exhaustedDetailHash+`', version + 1, clock_timestamp()
+			FROM credential_revocations WHERE revocation_id = '`+protectedRevocationID+`'::uuid;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER relay_m3_system_receipt
+		AFTER INSERT ON m3_system_receipt_relay
+		FOR EACH ROW EXECUTE FUNCTION relay_m3_system_receipt();
+	`)
+	expectDeferredConstraintAtCommit(t, ctx, database, "credential_revocation_system_receipts_final_shape", `
+		INSERT INTO m3_system_receipt_relay (id) VALUES (1)
+	`)
+	execSQL(t, ctx, database, `
+		DROP TRIGGER relay_m3_system_receipt ON m3_system_receipt_relay;
+		DROP FUNCTION relay_m3_system_receipt();
+		DROP TABLE m3_system_receipt_relay;
+	`)
+
+	exhaustM3CredentialClaim(t, ctx, database, protectedRevocationID)
+	recovered, err := repository.RecoverExhausted(ctx, credential.RecoverExhaustedRequest{Limit: 10})
+	if err != nil || len(recovered) != 1 || recovered[0].ID != protectedRevocationID {
+		t.Fatalf("recover poisoned M3 credential after exhaustion = %#v, %v", recovered, err)
+	}
+	assertCredentialSystemRecoveryReceipt(t, ctx, database, protectedRevocationID,
+		"EXHAUSTED_WITHOUT_ACK", string(credential.FailureUnknown), exhaustedDetailHash)
+
+	const exhaustedActionID = "94100000-0000-4000-8000-000000000002"
+	const exhaustedRevocationID = "95100000-0000-4000-8000-000000000002"
+	prepareM3ClaimableRevocation(t, ctx, database, queue, repository, signer,
+		exhaustedActionID, exhaustedRevocationID, workspaceID, environmentID, serviceID,
+		"payments-m3-exhausted-recovery", '3', runnerID)
+	claims, err = repository.ClaimRevocations(ctx, credential.ClaimRevocationsRequest{
+		WorkerID: runnerID, Limit: 1, LeaseDuration: 30 * time.Second,
+	})
+	if err != nil || len(claims) != 1 || claims[0].Revocation.ID != exhaustedRevocationID {
+		t.Fatalf("claim M3 exhausted fixture = %#v, %v", claims, err)
+	}
+	claims[0].Accessor.Destroy()
+
+	// A still-live claim cannot masquerade as crash recovery even with the
+	// canonical UNKNOWN detail hash.
+	expectDeferredConstraintAtCommit(t, ctx, database, "credential_revocations_completion_receipt_guard",
+		manualTransition, exhaustedRevocationID, string(credential.FailureUnknown), exhaustedDetailHash)
+	// Privileged fixture setup expires the already-authenticated claim without
+	// exhausting its retry cycle. Expiry alone is not sufficient proof.
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations DISABLE TRIGGER credential_revocations_heartbeat_sequence_guard`)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations DISABLE TRIGGER credential_revocations_state_machine`)
+	execSQL(t, ctx, database, `
+		UPDATE credential_revocations
+		SET claimed_at = statement_timestamp() - interval '3 minutes',
+			last_heartbeat_at = statement_timestamp() - interval '2 minutes',
+			claim_expires_at = statement_timestamp() - interval '1 minute',
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1 AND status = 'REVOKING'
+	`, exhaustedRevocationID)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations ENABLE TRIGGER credential_revocations_state_machine`)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations ENABLE TRIGGER credential_revocations_heartbeat_sequence_guard`)
+	expectDeferredConstraintAtCommit(t, ctx, database, "credential_revocations_completion_receipt_guard",
+		manualTransition, exhaustedRevocationID, string(credential.FailureUnknown), exhaustedDetailHash)
+
+	// Privileged fixture setup now exhausts the retry counter. Production
+	// callers cannot disable these triggers; this only constructs the exact
+	// pre-crash row needed to exercise RecoverExhausted with database time.
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations DISABLE TRIGGER credential_revocations_heartbeat_sequence_guard`)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations DISABLE TRIGGER credential_revocations_state_machine`)
+	execSQL(t, ctx, database, `
+		UPDATE credential_revocations
+		SET attempt = retry_cycle_attempt_base + 12,
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1 AND status = 'REVOKING'
+	`, exhaustedRevocationID)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations ENABLE TRIGGER credential_revocations_state_machine`)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations ENABLE TRIGGER credential_revocations_heartbeat_sequence_guard`)
+
+	// An expired/exhausted row with the wrong detail still has no proof.
+	expectDeferredConstraintAtCommit(t, ctx, database, "credential_revocations_completion_receipt_guard",
+		manualTransition, exhaustedRevocationID, string(credential.FailureUnknown), strings.Repeat("e", 64))
+
+	var revocationCertificateSHA256 string
+	var revocationScopeRevision int64
+	if err := database.QueryRow(ctx, `
+		SELECT certificate.certificate_sha256, registration.scope_revision
+		FROM runner_certificates AS certificate
+		JOIN runner_registrations AS registration USING (runner_id, tenant_id)
+		WHERE certificate.runner_id = $1 AND certificate.status = 'ACTIVE'
+		ORDER BY certificate.certificate_sha256
+		LIMIT 1
+	`, runnerID).Scan(&revocationCertificateSHA256, &revocationScopeRevision); err != nil {
+		t.Fatalf("read active identity for dual revocation proof: %v", err)
+	}
+	// Give the exhausted fixture one final short active window. The Runner child
+	// is accepted during that window; after it expires, the same transaction's
+	// database-verifiable recovery creates the system child. Both are
+	// individually valid, but the deferred XOR guards must reject them together.
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations DISABLE TRIGGER credential_revocations_heartbeat_sequence_guard`)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations DISABLE TRIGGER credential_revocations_state_machine`)
+	execSQL(t, ctx, database, `
+		UPDATE credential_revocations
+		SET claim_expires_at = clock_timestamp() + interval '3 seconds',
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1 AND status = 'REVOKING'
+	`, exhaustedRevocationID)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations ENABLE TRIGGER credential_revocations_state_machine`)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations ENABLE TRIGGER credential_revocations_heartbeat_sequence_guard`)
+	expectDeferredConstraintAtCommit(t, ctx, database, "credential_revocation_receipts_final_shape", `
+		INSERT INTO credential_revocation_receipts (
+			revocation_id, claim_epoch, tenant_id, workspace_id, environment_id,
+			runner_id, scope_revision, certificate_sha256, issuer, issuer_revision, claim_token_sha256,
+			heartbeat_seq, outcome, failure_count, failure_code, failure_detail_sha256, receipt_hash
+		)
+		SELECT revocation_id, claim_epoch, tenant_id, workspace_id, environment_id,
+			claimed_by, $2, $3, issuer, issuer_revision, claim_token_sha256,
+			heartbeat_seq, 'FAILED', failure_count + 1, 'UNKNOWN', $4, repeat('b', 64)
+		FROM credential_revocations WHERE revocation_id = $1;
+		SELECT pg_sleep_until(claim_expires_at + interval '10 milliseconds')
+		FROM credential_revocations WHERE revocation_id = $1;
+		UPDATE credential_revocations
+		SET status = 'MANUAL_REQUIRED',
+			claimed_by = NULL, claim_token_sha256 = NULL, claimed_at = NULL,
+			claim_expires_at = NULL, last_heartbeat_at = NULL,
+			failure_count = failure_count + 1, failure_code = 'UNKNOWN',
+			failure_detail_sha256 = $4,
+			manual_required_at = statement_timestamp(),
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1;
+	`, exhaustedRevocationID, revocationScopeRevision, revocationCertificateSHA256, exhaustedDetailHash)
+
+	recovered, err = repository.RecoverExhausted(ctx, credential.RecoverExhaustedRequest{Limit: 10})
+	if err != nil || len(recovered) != 1 || recovered[0].ID != exhaustedRevocationID {
+		t.Fatalf("recover exhausted M3 credential = %#v, %v", recovered, err)
+	}
+	assertCredentialSystemRecoveryReceipt(t, ctx, database, exhaustedRevocationID,
+		"EXHAUSTED_WITHOUT_ACK", string(credential.FailureUnknown), exhaustedDetailHash)
+
+	for _, revocationID := range []string{protectedRevocationID, exhaustedRevocationID} {
+		expectSQLConstraint(t, ctx, database, "55000", "credential_revocation_system_receipts_immutable_guard", `
+			UPDATE credential_revocation_system_receipts
+			SET failure_detail_sha256 = repeat('0', 64) WHERE revocation_id = $1
+		`, revocationID)
+		expectSQLConstraint(t, ctx, database, "55000", "credential_revocation_system_receipts_immutable_guard", `
+			DELETE FROM credential_revocation_system_receipts WHERE revocation_id = $1
+		`, revocationID)
+	}
+}
+
+func exhaustM3CredentialClaim(t *testing.T, ctx context.Context, database *pgxpool.Pool, revocationID string) {
+	t.Helper()
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations DISABLE TRIGGER credential_revocations_heartbeat_sequence_guard`)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations DISABLE TRIGGER credential_revocations_state_machine`)
+	execSQL(t, ctx, database, `
+		UPDATE credential_revocations
+		SET claimed_at = statement_timestamp() - interval '3 minutes',
+			last_heartbeat_at = statement_timestamp() - interval '2 minutes',
+			claim_expires_at = statement_timestamp() - interval '1 minute',
+			attempt = retry_cycle_attempt_base + 12,
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1 AND status = 'REVOKING'
+	`, revocationID)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations ENABLE TRIGGER credential_revocations_state_machine`)
+	execSQL(t, ctx, database, `ALTER TABLE credential_revocations ENABLE TRIGGER credential_revocations_heartbeat_sequence_guard`)
+}
+
+func prepareM3ClaimableRevocation(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	queue execution.ActionQueue,
+	repository *credentialpostgres.Repository,
+	signer action.Signer,
+	actionID, revocationID, workspaceID, environmentID, serviceID, target string,
+	fill byte,
+	runnerID string,
+) credential.ActionFence {
+	t.Helper()
+	fence := claimStartedCredentialAction(t, ctx, database, queue, signer,
+		actionID, workspaceID, environmentID, serviceID, target, fill, runnerID)
+	prepared, err := repository.Prepare(ctx, credential.PrepareRequest{
+		RevocationID: revocationID, Fence: fence, Issuer: "vault-m3-system-recovery",
+		IssuerRevision: "rev-1", CredentialExpiresAt: time.Now().UTC().Add(5 * time.Minute),
+	})
+	if err != nil || !prepared.Created || prepared.Permit == nil {
+		t.Fatalf("prepare M3 system recovery credential = %#v, %v", prepared, err)
+	}
+	if _, err := repository.AuthorizeChildCreate(ctx, credential.AuthorizeChildCreateRequest{
+		Permit: *prepared.Permit, Fence: fence,
+	}); err != nil {
+		t.Fatalf("authorize M3 system recovery child create: %v", err)
+	}
+	accessor, err := credential.NewSensitiveReference([]byte("m3-system-recovery-" + revocationID))
+	if err != nil {
+		t.Fatalf("create M3 system recovery accessor: %v", err)
+	}
+	if _, err := repository.RecordAnchor(ctx, credential.RecordAnchorRequest{
+		RevocationID: revocationID, Fence: fence, Accessor: accessor,
+	}); err != nil {
+		accessor.Destroy()
+		t.Fatalf("anchor M3 system recovery credential: %v", err)
+	}
+	accessor.Destroy()
+	if _, err := repository.RequestRevocation(ctx, credential.ActionTransitionRequest{
+		RevocationID: revocationID, Fence: fence,
+	}); err != nil {
+		t.Fatalf("request M3 system recovery revocation: %v", err)
+	}
+	return fence
+}
+
+func assertCredentialSystemRecoveryReceipt(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	revocationID, wantKind, wantFailureCode, wantDetailHash string,
+) {
+	t.Helper()
+	var status, failureCode, detailHash, kind string
+	var failureCount, priorFailureCount int
+	if err := database.QueryRow(ctx, `
+		SELECT parent.status, parent.failure_count, parent.failure_code, parent.failure_detail_sha256,
+			receipt.recovery_kind, receipt.prior_failure_count
+		FROM credential_revocations AS parent
+		JOIN credential_revocation_system_receipts AS receipt
+		  ON receipt.revocation_id = parent.revocation_id
+		WHERE parent.revocation_id = $1
+	`, revocationID).Scan(&status, &failureCount, &failureCode, &detailHash, &kind, &priorFailureCount); err != nil ||
+		status != string(credential.StatusManualRequired) || kind != wantKind || failureCode != wantFailureCode ||
+		detailHash != wantDetailHash || failureCount != priorFailureCount+1 {
+		t.Fatalf("system recovery receipt %s = status=%s failures=%d/%d code=%s detail=%s kind=%s err=%v",
+			revocationID, status, priorFailureCount, failureCount, failureCode, detailHash, kind, err)
+	}
 }
 
 func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpool.Pool, tenantID, workspaceID, environmentID, serviceID string) {
@@ -3664,6 +5087,86 @@ func applyMigrationFile(t *testing.T, ctx context.Context, database *pgxpool.Poo
 	}
 }
 
+func exerciseLegacyExecutionLeaseUpgradeGate(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	migration string,
+) {
+	t.Helper()
+	for _, pool := range []string{"READ", "WRITE"} {
+		executionID := "m3-up-active-" + strings.ToLower(pool)
+		insertActiveLegacyExecutionLease(t, ctx, database, executionID, pool)
+		expectMigrationConstraint(t, ctx, database, migration, "55000", "execution_leases_m3_cutover_guard")
+		execSQL(t, ctx, database, `DELETE FROM execution_leases WHERE execution_id = $1`, executionID)
+	}
+}
+
+func exerciseLegacyExecutionLeasePostCutoverGate(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	downMigration string,
+) {
+	t.Helper()
+	for _, pool := range []string{"READ", "WRITE"} {
+		executionID := "m3-post-cutover-" + strings.ToLower(pool)
+		expectSQLConstraint(t, ctx, database, "55000", "execution_leases_m3_cutover_guard", `
+			INSERT INTO execution_leases (
+				execution_id, target_key, runner_pool, production, status, runner_id,
+				lease_token_sha256, lease_epoch, lease_acquired_at, lease_expires_at,
+				last_heartbeat_at, created_at, updated_at
+			) VALUES (
+				$1, $2, $3, false, 'LEASED', 'legacy-runner', repeat('a', 64), 1,
+				statement_timestamp(), statement_timestamp() + interval '5 minutes',
+				statement_timestamp(), statement_timestamp(), statement_timestamp()
+			)
+		`, executionID, "m3/post-cutover/"+strings.ToLower(pool), pool)
+
+		execSQL(t, ctx, database, `
+			INSERT INTO execution_leases (
+				execution_id, target_key, runner_pool, production, status, created_at, updated_at
+			) VALUES ($1, $2, $3, false, 'QUEUED', statement_timestamp(), statement_timestamp())
+		`, executionID, "m3/post-cutover/"+strings.ToLower(pool), pool)
+		expectSQLConstraint(t, ctx, database, "55000", "execution_leases_m3_cutover_guard", `
+			UPDATE execution_leases
+			SET status = 'LEASED', runner_id = 'legacy-runner', lease_token_sha256 = repeat('a', 64),
+				lease_epoch = 1, lease_acquired_at = statement_timestamp(),
+				last_heartbeat_at = statement_timestamp(),
+				lease_expires_at = statement_timestamp() + interval '5 minutes',
+				updated_at = statement_timestamp()
+			WHERE execution_id = $1
+		`, executionID)
+		execSQL(t, ctx, database, `DELETE FROM execution_leases WHERE execution_id = $1`, executionID)
+
+		execSQL(t, ctx, database, `ALTER TABLE execution_leases DISABLE TRIGGER execution_leases_m3_cutover_guard`)
+		insertActiveLegacyExecutionLease(t, ctx, database, executionID, pool)
+		execSQL(t, ctx, database, `ALTER TABLE execution_leases ENABLE TRIGGER execution_leases_m3_cutover_guard`)
+		expectMigrationConstraint(t, ctx, database, downMigration, "55000", "execution_leases_m3_cutover_guard")
+		execSQL(t, ctx, database, `DELETE FROM execution_leases WHERE execution_id = $1`, executionID)
+	}
+}
+
+func insertActiveLegacyExecutionLease(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	executionID, pool string,
+) {
+	t.Helper()
+	execSQL(t, ctx, database, `
+		INSERT INTO execution_leases (
+			execution_id, target_key, runner_pool, production, status, runner_id,
+			lease_token_sha256, lease_epoch, lease_acquired_at, lease_expires_at,
+			last_heartbeat_at, created_at, updated_at
+		) VALUES (
+			$1, $2, $3, false, 'LEASED', 'legacy-runner', repeat('a', 64), 1,
+			statement_timestamp(), statement_timestamp() + interval '5 minutes',
+			statement_timestamp(), statement_timestamp(), statement_timestamp()
+		)
+	`, executionID, "m3/cutover/"+strings.ToLower(pool), pool)
+}
+
 func expectMigrationSQLState(t *testing.T, ctx context.Context, database *pgxpool.Pool, filename, sqlState string) {
 	t.Helper()
 	contents, err := os.ReadFile(filename)
@@ -3682,6 +5185,37 @@ func expectMigrationSQLState(t *testing.T, ctx context.Context, database *pgxpoo
 	var postgresError *pgconn.PgError
 	if !errors.As(execErr, &postgresError) || postgresError.Code != sqlState {
 		t.Fatalf("migration %s error = %v, want SQLSTATE %s", filepath.Base(filename), execErr, sqlState)
+	}
+	if _, err := connection.Exec(ctx, "ROLLBACK"); err != nil {
+		t.Fatalf("rollback rejected migration %s: %v", filepath.Base(filename), err)
+	}
+}
+
+func expectMigrationConstraint(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	filename, sqlState, constraintName string,
+) {
+	t.Helper()
+	contents, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", filename, err)
+	}
+	connection, err := database.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire PostgreSQL connection: %v", err)
+	}
+	defer connection.Release()
+	_, execErr := connection.Exec(ctx, string(contents))
+	if execErr == nil {
+		t.Fatalf("migration %s unexpectedly succeeded", filepath.Base(filename))
+	}
+	var postgresError *pgconn.PgError
+	if !errors.As(execErr, &postgresError) || postgresError.Code != sqlState ||
+		postgresError.ConstraintName != constraintName {
+		t.Fatalf("migration %s error = %v (constraint %q), want SQLSTATE %s constraint %q",
+			filepath.Base(filename), execErr, postgresErrorConstraint(postgresError), sqlState, constraintName)
 	}
 	if _, err := connection.Exec(ctx, "ROLLBACK"); err != nil {
 		t.Fatalf("rollback rejected migration %s: %v", filepath.Base(filename), err)
@@ -3780,6 +5314,44 @@ func expectDeferredConstraintAtCommit(
 		t.Fatalf("deferred commit error = %v (constraint %q), want SQLSTATE 23514 constraint %q",
 			err, postgresErrorConstraint(postgresError), constraintName)
 	}
+}
+
+func expectSQLConstraintAndRollback(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	sqlState, constraintName, query string,
+	arguments ...any,
+) {
+	t.Helper()
+	tx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin rejected-statement transaction: %v", err)
+	}
+	finished := false
+	defer func() {
+		if !finished {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	_, execErr := tx.Exec(ctx, query, arguments...)
+	if execErr == nil {
+		_ = tx.Rollback(ctx)
+		finished = true
+		t.Fatalf("SQL unexpectedly succeeded; want SQLSTATE %s constraint %q", sqlState, constraintName)
+	}
+	var postgresError *pgconn.PgError
+	if !errors.As(execErr, &postgresError) || postgresError.Code != sqlState || postgresError.ConstraintName != constraintName {
+		_ = tx.Rollback(ctx)
+		finished = true
+		t.Fatalf("SQL error = %v (constraint %q), want SQLSTATE %s constraint %q",
+			execErr, postgresErrorConstraint(postgresError), sqlState, constraintName)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		finished = true
+		t.Fatalf("rollback rejected-statement transaction: %v", err)
+	}
+	finished = true
 }
 
 func postgresErrorConstraint(err *pgconn.PgError) string {
