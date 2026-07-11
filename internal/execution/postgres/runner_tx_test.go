@@ -102,6 +102,11 @@ func TestRunnerMutationTxMethodsRejectReadPoolBeforeActionSQL(t *testing.T) {
 		call func() error
 	}{
 		{name: "start", call: func() error { _, err := repository.StartRunnerTx(context.Background(), tx, scope, fence); return err }},
+		{name: "authorized start", call: func() error {
+			_, err := repository.StartRunnerAuthorizedTx(context.Background(), tx, scope, fence,
+				func(context.Context, execution.ClaimedAction) error { return nil })
+			return err
+		}},
 		{name: "heartbeat", call: func() error {
 			_, err := repository.HeartbeatRunnerTx(context.Background(), tx, scope, execution.ActionHeartbeatRequest{Lease: fence, Sequence: 1, Extension: time.Minute})
 			return err
@@ -129,6 +134,19 @@ func TestRunnerMutationTxMethodsRejectReadPoolBeforeActionSQL(t *testing.T) {
 	rollbackRunnerRepositoryTx(t, database, tx)
 }
 
+func TestStartRunnerAuthorizedTxRequiresAuthorizerBeforeActionSQL(t *testing.T) {
+	database, repository := newActionQueueRepository(t)
+	defer database.Close()
+	tx := beginRunnerRepositoryTx(t, database)
+	_, _, _, scope, fence := runnerTxTestState(t)
+
+	got, err := repository.StartRunnerAuthorizedTx(context.Background(), tx, scope, fence, nil)
+	if !errors.Is(err, executionlease.ErrInvalidRequest) || got != (executionlease.Execution{}) {
+		t.Fatalf("StartRunnerAuthorizedTx(nil) = %#v, %v", got, err)
+	}
+	rollbackRunnerRepositoryTx(t, database, tx)
+}
+
 func TestStartRunnerTxLocksActionBeforeRevalidatingCurrentScope(t *testing.T) {
 	database, repository := newActionQueueRepository(t)
 	defer database.Close()
@@ -151,6 +169,176 @@ func TestStartRunnerTxLocksActionBeforeRevalidatingCurrentScope(t *testing.T) {
 	got, err := repository.StartRunnerTx(context.Background(), tx, scope, fence)
 	if err != nil || got.Status != executionlease.StatusRunning {
 		t.Fatalf("StartRunnerTx() = %#v, %v", got, err)
+	}
+	rollbackRunnerRepositoryTx(t, database, tx)
+}
+
+func TestStartRunnerAuthorizedTxAuthorizesRedactedImmutableClaimBeforeRunning(t *testing.T) {
+	database, repository := newActionQueueRepository(t)
+	defer database.Close()
+	tx := beginRunnerRepositoryTx(t, database)
+	now, envelope, envelopeJSON, scope, fence := runnerTxTestState(t)
+	leased := runnerTxExecution(fence.ExecutionID, envelope.WorkspaceID, envelope.Target.EnvironmentID, executionlease.StatusLeased, fence.Epoch, now)
+	running := leased
+	running.Status = executionlease.StatusRunning
+	running.StartedAt = now
+
+	database.ExpectQuery(runnerTxActionLockPattern).WithArgs(fence.ExecutionID).
+		WillReturnRows(actionQueueRowsDetailed(leased, envelopeJSON, envelope.PlanHash, "environment-1",
+			envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64), tokenHash(fence.Token), nil, nil, now, nil))
+	database.ExpectQuery(`(?s)SELECT COALESCE\(lease_expires_at > statement_timestamp\(\), false\).*authorization_expires_at > statement_timestamp\(\).*FROM action_queue`).
+		WithArgs(fence.ExecutionID).WillReturnRows(pgxmock.NewRows([]string{"lease_current", "authorization_current"}).AddRow(true, true))
+	database.ExpectQuery(`(?s)UPDATE action_queue.*status = 'RUNNING'.*runner_tenant_id = \$5.*scope_revision = \$8.*production = false.*RETURNING`).
+		WithArgs(fence.ExecutionID, fence.RunnerID, tokenHash(fence.Token), fence.Epoch,
+			testTenantID, envelope.WorkspaceID, envelope.Target.EnvironmentID, int64(1), executionlease.PoolWrite).
+		WillReturnRows(actionQueueRowsDetailed(running, envelopeJSON, envelope.PlanHash, "environment-1",
+			envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64), tokenHash(fence.Token), nil, nil, now, nil))
+
+	authorized := false
+	got, err := repository.StartRunnerAuthorizedTx(context.Background(), tx, scope, fence,
+		func(_ context.Context, claim execution.ClaimedAction) error {
+			authorized = true
+			if claim.Execution.LeaseToken != "" || claim.Execution.Status != executionlease.StatusLeased || claim.Production || claim.Execution.Production {
+				t.Fatalf("authorization claim execution = %#v", claim.Execution)
+			}
+			if claim.Envelope.ActionID != envelope.ActionID || claim.Envelope.WorkspaceID != envelope.WorkspaceID ||
+				claim.Envelope.Target.EnvironmentID != envelope.Target.EnvironmentID || claim.Envelope.Signature != envelope.Signature ||
+				claim.PlanHash != envelope.PlanHash || claim.EnvironmentRevision != "environment-1" || claim.Envelope.Signature.Value == "" {
+				t.Fatalf("authorization claim = %#v", claim)
+			}
+			claim.Execution.RunnerWorkspaceID = "mutated-workspace"
+			claim.PlanHash = strings.Repeat("f", 64)
+			claim.Envelope.PlanHash = strings.Repeat("e", 64)
+			claim.Envelope.Target.KubernetesDeployment.Name = "mutated-deployment"
+			claim.Envelope.Risk.ReasonCodes[0] = "MUTATED_REASON"
+			return nil
+		})
+	if err != nil || !authorized || got.Status != executionlease.StatusRunning || got.LeaseToken != "" {
+		t.Fatalf("StartRunnerAuthorizedTx() = %#v, %v; authorized=%t", got, err, authorized)
+	}
+	rollbackRunnerRepositoryTx(t, database, tx)
+}
+
+func TestStartRunnerAuthorizedTxDenialDoesNotUpdateLeasedAction(t *testing.T) {
+	database, repository := newActionQueueRepository(t)
+	defer database.Close()
+	tx := beginRunnerRepositoryTx(t, database)
+	now, envelope, envelopeJSON, scope, fence := runnerTxTestState(t)
+	leased := runnerTxExecution(fence.ExecutionID, envelope.WorkspaceID, envelope.Target.EnvironmentID, executionlease.StatusLeased, fence.Epoch, now)
+
+	database.ExpectQuery(runnerTxActionLockPattern).WithArgs(fence.ExecutionID).
+		WillReturnRows(actionQueueRowsDetailed(leased, envelopeJSON, envelope.PlanHash, "environment-1",
+			envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64), tokenHash(fence.Token), nil, nil, now, nil))
+	database.ExpectQuery(`(?s)SELECT COALESCE\(lease_expires_at > statement_timestamp\(\), false\).*authorization_expires_at > statement_timestamp\(\).*FROM action_queue`).
+		WithArgs(fence.ExecutionID).WillReturnRows(pgxmock.NewRows([]string{"lease_current", "authorization_current"}).AddRow(true, true))
+
+	want := errors.New("final authorization denied")
+	called := false
+	got, err := repository.StartRunnerAuthorizedTx(context.Background(), tx, scope, fence,
+		func(context.Context, execution.ClaimedAction) error {
+			called = true
+			return want
+		})
+	if !called || !errors.Is(err, want) || got != (executionlease.Execution{}) {
+		t.Fatalf("StartRunnerAuthorizedTx(denied) = %#v, %v; called=%t", got, err, called)
+	}
+	rollbackRunnerRepositoryTx(t, database, tx)
+}
+
+func TestStartRunnerAuthorizedTxRejectsUnsafeStateBeforeAuthorizer(t *testing.T) {
+	tests := []struct {
+		name         string
+		mutateRow    func(*executionlease.Execution)
+		mutateScope  func(*execution.RunnerScope)
+		mutateFence  func(*executionlease.LeaseIdentity)
+		timeBoundary []bool
+		want         error
+	}{
+		{name: "stale token", mutateFence: func(fence *executionlease.LeaseIdentity) {
+			fence.Token = strings.Repeat("b", 64)
+		}, want: executionlease.ErrStaleLease},
+		{name: "stale scope", mutateScope: func(scope *execution.RunnerScope) {
+			*scope = runnerTxScope(t, "runner-1", 2, 1, "workspace-2", "PROD")
+		}, want: executionlease.ErrStaleLease},
+		{name: "invalid state", mutateRow: func(value *executionlease.Execution) {
+			value.Status = executionlease.StatusQueued
+		}, want: executionlease.ErrInvalidTransition},
+		{name: "cancellation intent", mutateRow: func(value *executionlease.Execution) {
+			value.CancelRequestedAt = time.Date(2026, 7, 11, 9, 0, 0, 0, time.UTC)
+			value.CancelReasonHash = strings.Repeat("e", 64)
+		}, want: executionlease.ErrInvalidTransition},
+		{name: "expired lease", timeBoundary: []bool{false, true}, want: executionlease.ErrStaleLease},
+		{name: "expired authorization", timeBoundary: []bool{true, false}, want: executionlease.ErrStaleLease},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			database, repository := newActionQueueRepository(t)
+			defer database.Close()
+			tx := beginRunnerRepositoryTx(t, database)
+			now, envelope, envelopeJSON, scope, fence := runnerTxTestState(t)
+			leased := runnerTxExecution(fence.ExecutionID, envelope.WorkspaceID, envelope.Target.EnvironmentID, executionlease.StatusLeased, fence.Epoch, now)
+			if test.mutateRow != nil {
+				test.mutateRow(&leased)
+			}
+			if test.mutateScope != nil {
+				test.mutateScope(&scope)
+			}
+			if test.mutateFence != nil {
+				test.mutateFence(&fence)
+			}
+			database.ExpectQuery(runnerTxActionLockPattern).WithArgs(fence.ExecutionID).
+				WillReturnRows(actionQueueRowsDetailed(leased, envelopeJSON, envelope.PlanHash, "environment-1",
+					envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64), tokenHash(testLeaseToken), nil, nil, now, nil))
+			if test.timeBoundary != nil {
+				database.ExpectQuery(`(?s)SELECT COALESCE\(lease_expires_at > statement_timestamp\(\), false\).*authorization_expires_at > statement_timestamp\(\).*FROM action_queue`).
+					WithArgs(fence.ExecutionID).WillReturnRows(pgxmock.NewRows([]string{"lease_current", "authorization_current"}).
+					AddRow(test.timeBoundary[0], test.timeBoundary[1]))
+			}
+
+			called := false
+			got, err := repository.StartRunnerAuthorizedTx(context.Background(), tx, scope, fence,
+				func(context.Context, execution.ClaimedAction) error {
+					called = true
+					return nil
+				})
+			if called || !errors.Is(err, test.want) || got != (executionlease.Execution{}) {
+				t.Fatalf("StartRunnerAuthorizedTx() = %#v, %v; called=%t; want %v", got, err, called, test.want)
+			}
+			rollbackRunnerRepositoryTx(t, database, tx)
+		})
+	}
+}
+
+func TestStartRunnerAuthorizedTxIdempotentRunningRetryReauthorizes(t *testing.T) {
+	database, repository := newActionQueueRepository(t)
+	defer database.Close()
+	tx := beginRunnerRepositoryTx(t, database)
+	now, envelope, envelopeJSON, scope, fence := runnerTxTestState(t)
+	running := runnerTxExecution(fence.ExecutionID, envelope.WorkspaceID, envelope.Target.EnvironmentID, executionlease.StatusRunning, fence.Epoch, now)
+	running.StartedAt = now.Add(-30 * time.Second)
+
+	database.ExpectQuery(runnerTxActionLockPattern).WithArgs(fence.ExecutionID).
+		WillReturnRows(actionQueueRowsDetailed(running, envelopeJSON, envelope.PlanHash, "environment-1",
+			envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64), tokenHash(fence.Token), nil, nil, now, nil))
+	database.ExpectQuery(`(?s)SELECT COALESCE\(lease_expires_at > statement_timestamp\(\), false\).*authorization_expires_at > statement_timestamp\(\).*FROM action_queue`).
+		WithArgs(fence.ExecutionID).WillReturnRows(pgxmock.NewRows([]string{"lease_current", "authorization_current"}).AddRow(true, true))
+	database.ExpectQuery(`(?s)UPDATE action_queue.*status = 'RUNNING'.*status IN \('LEASED', 'RUNNING'\).*RETURNING`).
+		WithArgs(fence.ExecutionID, fence.RunnerID, tokenHash(fence.Token), fence.Epoch,
+			testTenantID, envelope.WorkspaceID, envelope.Target.EnvironmentID, int64(1), executionlease.PoolWrite).
+		WillReturnRows(actionQueueRowsDetailed(running, envelopeJSON, envelope.PlanHash, "environment-1",
+			envelope.WorkspaceID, envelope.Target.EnvironmentID, strings.Repeat("b", 64), tokenHash(fence.Token), nil, nil, now, nil))
+
+	called := 0
+	got, err := repository.StartRunnerAuthorizedTx(context.Background(), tx, scope, fence,
+		func(_ context.Context, claim execution.ClaimedAction) error {
+			called++
+			if claim.Execution.Status != executionlease.StatusRunning || claim.Execution.LeaseToken != "" {
+				t.Fatalf("idempotent authorization claim = %#v", claim.Execution)
+			}
+			return nil
+		})
+	if err != nil || called != 1 || got.Status != executionlease.StatusRunning || !got.StartedAt.Equal(running.StartedAt) {
+		t.Fatalf("StartRunnerAuthorizedTx(idempotent) = %#v, %v; calls=%d", got, err, called)
 	}
 	rollbackRunnerRepositoryTx(t, database, tx)
 }

@@ -146,9 +146,15 @@ func (repository *Repository) ClaimRunnerTx(
 	return record.claimed, nil
 }
 
+// RunnerStartAuthorizer performs the final, side-effect-free policy and target
+// checks while the action row remains locked. The claim is a deep copy with no
+// reusable lease token; retaining or mutating it cannot affect durable state.
+type RunnerStartAuthorizer func(context.Context, execution.ClaimedAction) error
+
 // StartRunnerTx transitions an authenticated, current LEASED action to
-// RUNNING. The action row is locked before the trusted scope snapshot and
-// lease fence are revalidated.
+// RUNNING. It remains for non-Gateway callers that already perform their final
+// authorization in the encompassing transaction. Gateway code must use
+// StartRunnerAuthorizedTx so the final authorization cannot be omitted.
 func (repository *Repository) StartRunnerTx(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -172,8 +178,63 @@ func (repository *Repository) StartRunnerTx(
 	if !record.claimed.Execution.CancelRequestedAt.IsZero() {
 		return executionlease.Execution{}, executionlease.ErrInvalidTransition
 	}
+	return startRunnerTransitionTx(ctx, tx, scope, fence, record)
+}
+
+// StartRunnerAuthorizedTx performs final authorization after locking and
+// validating the current WRITE/non-production action, but before the only
+// LEASED/RUNNING -> RUNNING update. tx remains caller-owned. The authorizer is
+// mandatory and is also rerun for an idempotent RUNNING retry so dynamic gates
+// such as a kill switch cannot be bypassed by replaying start.
+func (repository *Repository) StartRunnerAuthorizedTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	scope execution.RunnerScope,
+	fence executionlease.LeaseIdentity,
+	authorizer RunnerStartAuthorizer,
+) (executionlease.Execution, error) {
+	if err := validateRunnerMutation(ctx, tx, scope, fence); err != nil {
+		return executionlease.Execution{}, err
+	}
+	if authorizer == nil {
+		return executionlease.Execution{}, executionlease.ErrInvalidRequest
+	}
+	record, err := lockRunnerActionTx(ctx, tx, fence.ExecutionID, "authorized start")
+	if err != nil {
+		return executionlease.Execution{}, err
+	}
+	if err := validateRunnerActiveFence(record, scope, fence); err != nil {
+		return executionlease.Execution{}, err
+	}
+	if record.claimed.Execution.Status != executionlease.StatusLeased &&
+		record.claimed.Execution.Status != executionlease.StatusRunning {
+		return executionlease.Execution{}, executionlease.ErrInvalidTransition
+	}
+	if !record.claimed.Execution.CancelRequestedAt.IsZero() {
+		return executionlease.Execution{}, executionlease.ErrInvalidTransition
+	}
+	leaseCurrent, authorizationCurrent, err := heartbeatTimeBoundaries(ctx, tx, fence.ExecutionID)
+	if err != nil {
+		return executionlease.Execution{}, fmt.Errorf("read authenticated Runner start boundaries: %w", err)
+	}
+	if !leaseCurrent || !authorizationCurrent {
+		return executionlease.Execution{}, executionlease.ErrStaleLease
+	}
+	if err := authorizer(ctx, cloneRunnerStartClaim(record.claimed)); err != nil {
+		return executionlease.Execution{}, err
+	}
+	return startRunnerTransitionTx(ctx, tx, scope, fence, record)
+}
+
+func startRunnerTransitionTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	scope execution.RunnerScope,
+	fence executionlease.LeaseIdentity,
+	record storedAction,
+) (executionlease.Execution, error) {
 	digest := tokenHash(fence.Token)
-	record, err = scanStoredAction(tx.QueryRow(ctx, `
+	updated, err := scanStoredAction(tx.QueryRow(ctx, `
 		UPDATE action_queue
 		SET status = 'RUNNING', started_at = COALESCE(started_at, statement_timestamp()),
 			updated_at = CASE WHEN status = 'LEASED' THEN statement_timestamp() ELSE updated_at END
@@ -195,10 +256,10 @@ func (repository *Repository) StartRunnerTx(
 	if err != nil {
 		return executionlease.Execution{}, fmt.Errorf("start authenticated Runner action: %w", err)
 	}
-	if err := validateRunnerActiveFence(record, scope, fence); err != nil {
+	if err := validateRunnerActiveFence(updated, scope, fence); err != nil {
 		return executionlease.Execution{}, err
 	}
-	return redact(record.claimed.Execution), nil
+	return redact(updated.claimed.Execution), nil
 }
 
 // HeartbeatRunnerTx applies one strictly sequenced heartbeat. A replay returns
@@ -657,6 +718,54 @@ func runnerScopeAllows(scope execution.RunnerScope, workspaceID, environmentID s
 		}
 	}
 	return false
+}
+
+func cloneRunnerStartClaim(claimed execution.ClaimedAction) execution.ClaimedAction {
+	cloned := claimed
+	cloned.Execution = redact(claimed.Execution)
+	cloned.Envelope.Risk.ReasonCodes = append([]string(nil), claimed.Envelope.Risk.ReasonCodes...)
+	if claimed.Envelope.Target.KubernetesDeployment != nil {
+		value := *claimed.Envelope.Target.KubernetesDeployment
+		cloned.Envelope.Target.KubernetesDeployment = &value
+	}
+	if claimed.Envelope.Target.GitOpsApplication != nil {
+		value := *claimed.Envelope.Target.GitOpsApplication
+		cloned.Envelope.Target.GitOpsApplication = &value
+	}
+	if claimed.Envelope.Target.AWXHosts != nil {
+		value := *claimed.Envelope.Target.AWXHosts
+		value.HostIDs = append([]int64(nil), claimed.Envelope.Target.AWXHosts.HostIDs...)
+		cloned.Envelope.Target.AWXHosts = &value
+	}
+	if claimed.Envelope.Parameters.KubernetesRolloutRestart != nil {
+		value := *claimed.Envelope.Parameters.KubernetesRolloutRestart
+		cloned.Envelope.Parameters.KubernetesRolloutRestart = &value
+	}
+	if claimed.Envelope.Parameters.KubernetesScale != nil {
+		value := *claimed.Envelope.Parameters.KubernetesScale
+		cloned.Envelope.Parameters.KubernetesScale = &value
+	}
+	if claimed.Envelope.Parameters.GitOpsRevert != nil {
+		value := *claimed.Envelope.Parameters.GitOpsRevert
+		cloned.Envelope.Parameters.GitOpsRevert = &value
+	}
+	if claimed.Envelope.Parameters.AWXServiceRestart != nil {
+		value := *claimed.Envelope.Parameters.AWXServiceRestart
+		cloned.Envelope.Parameters.AWXServiceRestart = &value
+	}
+	if claimed.Envelope.ObservedState.KubernetesDeployment != nil {
+		value := *claimed.Envelope.ObservedState.KubernetesDeployment
+		cloned.Envelope.ObservedState.KubernetesDeployment = &value
+	}
+	if claimed.Envelope.ObservedState.GitOpsApplication != nil {
+		value := *claimed.Envelope.ObservedState.GitOpsApplication
+		cloned.Envelope.ObservedState.GitOpsApplication = &value
+	}
+	if claimed.Envelope.ObservedState.AWXService != nil {
+		value := *claimed.Envelope.ObservedState.AWXService
+		cloned.Envelope.ObservedState.AWXService = &value
+	}
+	return cloned
 }
 
 func runnerV2ReceiptProofExists(ctx context.Context, tx pgx.Tx, record storedAction) (bool, error) {
