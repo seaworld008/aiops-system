@@ -1259,6 +1259,13 @@ func (fixture *vault203Fixture) assertAccessorMissing(t *testing.T, accessor []b
 			}
 			fixture.assertRootAvailable(t)
 			return true
+		case http.StatusForbidden:
+			// A transient authorization response is never accepted as
+			// revocation evidence. Prove the root token is still valid and
+			// continue polling until Vault returns the exact missing-accessor
+			// semantics or the bounded assertion times out.
+			fixture.assertRootAvailable(t)
+			return false
 		default:
 			t.Fatalf("Vault accessor missing check returned status %d; only exact 400 is revocation evidence", response.status)
 			return false
@@ -1293,6 +1300,9 @@ func (fixture *vault203Fixture) assertLeaseMissing(t *testing.T, leaseID []byte)
 			}
 			fixture.assertRootAvailable(t)
 			return true
+		case http.StatusForbidden:
+			fixture.assertRootAvailable(t)
+			return false
 		default:
 			t.Fatalf("Vault lease missing check returned status %d; only exact 400 is revocation evidence", response.status)
 			return false
