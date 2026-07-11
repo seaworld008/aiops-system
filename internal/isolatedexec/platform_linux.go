@@ -3,7 +3,9 @@
 package isolatedexec
 
 import (
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -33,4 +35,40 @@ func validatePlatform(executablePath string) error {
 		}
 	}
 	return nil
+}
+
+func configureProcess(command *exec.Cmd) {
+	if command == nil {
+		return
+	}
+	command.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid:   true,
+		Pdeathsig: syscall.SIGKILL,
+	}
+}
+
+func signalProcessGroup(pid int, signal syscall.Signal) error {
+	if pid <= 1 {
+		return ErrInvalidRequest
+	}
+	err := syscall.Kill(-pid, signal)
+	if errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	return err
+}
+
+func processGroupGone(pid int) (bool, error) {
+	if pid <= 1 {
+		return false, ErrInvalidRequest
+	}
+	err := syscall.Kill(-pid, 0)
+	switch {
+	case err == nil:
+		return false, nil
+	case errors.Is(err, syscall.ESRCH):
+		return true, nil
+	default:
+		return false, err
+	}
 }
