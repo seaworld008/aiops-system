@@ -45,3 +45,33 @@ func TestHypothesisValidateEnforcesRankedEvidenceBackedProposal(t *testing.T) {
 		})
 	}
 }
+
+func TestHypothesisRejectsSensitiveSummaryAndUnknownTextWithoutEcho(t *testing.T) {
+	now := time.Date(2026, 7, 12, 15, 30, 0, 0, time.UTC)
+	proposal := json.RawMessage(`{"summary":"safe proposal"}`)
+	base := domain.Hypothesis{
+		ID: "hypothesis-1", WorkspaceID: "workspace-1", IncidentID: "incident-1", InvestigationID: "investigation-1",
+		Status: domain.HypothesisProposed, Rank: 1, Confidence: 0.8, Summary: "Safe summary",
+		Proposal: proposal, ProposalHash: sha256Hex(proposal), EvidenceIDs: []string{"evidence-1"}, CreatedAt: now,
+	}
+	const canary = "hypothesis-sensitive-canary"
+	for name, mutate := range map[string]func(*domain.Hypothesis){
+		"bearer summary":        func(value *domain.Hypothesis) { value.Summary = "Bearer " + canary },
+		"authorization summary": func(value *domain.Hypothesis) { value.Summary = "Authorization " + canary },
+		"cookie unknown":        func(value *domain.Hypothesis) { value.Unknowns = []string{"Cookie " + canary} },
+		"private key unknown":   func(value *domain.Hypothesis) { value.Unknowns = []string{"BEGIN PRIVATE KEY " + canary} },
+		"raw error unknown":     func(value *domain.Hypothesis) { value.Unknowns = []string{"raw error body " + canary} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			item := base
+			mutate(&item)
+			err := item.Validate()
+			if err == nil {
+				t.Fatal("Validate() error = nil, want sensitive text rejection")
+			}
+			if strings.Contains(err.Error(), canary) {
+				t.Fatalf("Validate() echoed sensitive text: %v", err)
+			}
+		})
+	}
+}

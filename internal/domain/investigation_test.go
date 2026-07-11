@@ -168,9 +168,14 @@ func TestInvestigationAndReadTaskValidateLifecycleShape(t *testing.T) {
 func TestSafeJSONObjectRejectsSensitivePathsNamesAndValuesWithoutEcho(t *testing.T) {
 	const canary = "sensitive-canary-value"
 	unsafe := map[string]json.RawMessage{
-		"error body path": json.RawMessage(`{"error":{"body":"` + canary + `"}}`),
+		"duplicate field hides bearer": json.RawMessage(`{"message":"Bearer ` + canary + `","message":"ok"}`),
+		"error body path":              json.RawMessage(`{"error":{"body":"` + canary + `"}}`),
+		"nested raw error path":        json.RawMessage(`{"error":{"details":{"body":"raw-error-` + canary + `"}}}`),
 		"authorization name value": json.RawMessage(
 			`{"headers":[{"name":"Authorization","value":"` + canary + `"}]}`,
+		),
+		"authorization key value": json.RawMessage(
+			`{"headers":[{"key":"Authorization","value":"` + canary + `"}]}`,
 		),
 		"bearer value":      json.RawMessage(`{"message":"Bearer ` + canary + `"}`),
 		"cookie value":      json.RawMessage(`{"message":"Cookie: session=` + canary + `"}`),

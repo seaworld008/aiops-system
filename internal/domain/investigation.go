@@ -1,9 +1,11 @@
 package domain
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 	"time"
@@ -11,6 +13,7 @@ import (
 
 const MaxInvestigationJSONBytes = 64 * 1024
 const MaxResourceIDBytes = 256
+const maxInvestigationJSONDepth = 32
 
 var (
 	sha256HexPattern      = regexp.MustCompile(`^[a-f0-9]{64}$`)
@@ -345,6 +348,9 @@ func ValidateSafeJSONObject(value json.RawMessage) error {
 	if len(value) == 0 || len(value) > MaxInvestigationJSONBytes || !json.Valid(value) {
 		return fmt.Errorf("JSON must be a valid object of at most %d bytes", MaxInvestigationJSONBytes)
 	}
+	if err := validateStrictJSONTokens(value); err != nil {
+		return err
+	}
 	var object map[string]any
 	if err := json.Unmarshal(value, &object); err != nil || object == nil {
 		return fmt.Errorf("JSON must be an object")
@@ -373,6 +379,10 @@ func ValidSafeMetadata(name, value string) bool {
 		(normalizeSecurityName(name) != "name" || !unsafeSecurityName(value))
 }
 
+func ValidSafeText(value string) bool {
+	return !unsafeSecurityValue(value)
+}
+
 func validateHashedJSONObject(value json.RawMessage, hash string) error {
 	if err := ValidateSafeJSONObject(value); err != nil {
 		return err
@@ -399,7 +409,7 @@ func rejectSensitiveJSON(value any, path []string) error {
 	switch item := value.(type) {
 	case map[string]any:
 		for key, child := range item {
-			if normalizeSecurityName(key) == "name" {
+			if normalized := normalizeSecurityName(key); normalized == "name" || normalized == "key" {
 				if name, ok := child.(string); ok && unsafeSecurityName(name) {
 					return fmt.Errorf("JSON contains forbidden sensitive metadata")
 				}
@@ -407,7 +417,7 @@ func rejectSensitiveJSON(value any, path []string) error {
 		}
 		for key, child := range item {
 			nextPath := append(append([]string(nil), path...), key)
-			if unsafeSecurityName(key) || unsafeSecurityName(strings.Join(nextPath, ".")) {
+			if unsafeSecurityName(key) || unsafeSecurityPath(nextPath) {
 				return fmt.Errorf("JSON contains forbidden sensitive metadata")
 			}
 			if err := rejectSensitiveJSON(child, nextPath); err != nil {
@@ -426,6 +436,95 @@ func rejectSensitiveJSON(value any, path []string) error {
 		}
 	}
 	return nil
+}
+
+func validateStrictJSONTokens(value []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(value))
+	decoder.UseNumber()
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("JSON contains invalid structure")
+	}
+	if err := consumeJSONToken(decoder, token, 1); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return fmt.Errorf("JSON contains invalid trailing data")
+	}
+	return nil
+}
+
+func consumeJSONToken(decoder *json.Decoder, token json.Token, depth int) error {
+	if depth > maxInvestigationJSONDepth {
+		return fmt.Errorf("JSON nesting exceeds limit")
+	}
+	if text, ok := token.(string); ok && unsafeSecurityValue(text) {
+		return fmt.Errorf("JSON contains forbidden sensitive metadata")
+	}
+	delimiter, composite := token.(json.Delim)
+	if !composite {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return fmt.Errorf("JSON contains invalid object")
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("JSON contains invalid object key")
+			}
+			if unsafeSecurityValue(key) {
+				return fmt.Errorf("JSON contains forbidden sensitive metadata")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return fmt.Errorf("JSON contains duplicate object field")
+			}
+			seen[key] = struct{}{}
+			child, err := decoder.Token()
+			if err != nil {
+				return fmt.Errorf("JSON contains invalid object value")
+			}
+			if err := consumeJSONToken(decoder, child, depth+1); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for decoder.More() {
+			child, err := decoder.Token()
+			if err != nil {
+				return fmt.Errorf("JSON contains invalid array value")
+			}
+			if err := consumeJSONToken(decoder, child, depth+1); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("JSON contains invalid delimiter")
+	}
+	if _, err := decoder.Token(); err != nil {
+		return fmt.Errorf("JSON contains unterminated structure")
+	}
+	return nil
+}
+
+func unsafeSecurityPath(path []string) bool {
+	hasErrorContext := false
+	for _, segment := range path {
+		normalized := normalizeSecurityName(segment)
+		if strings.Contains(normalized, "error") || strings.Contains(normalized, "response") {
+			hasErrorContext = true
+			continue
+		}
+		if hasErrorContext && (strings.Contains(normalized, "body") || strings.Contains(normalized, "details") ||
+			strings.Contains(normalized, "message")) {
+			return true
+		}
+	}
+	return unsafeSecurityName(strings.Join(path, "."))
 }
 
 func normalizeSecurityName(value string) string {
@@ -447,8 +546,8 @@ func unsafeSecurityName(value string) bool {
 func unsafeSecurityValue(value string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(value))
 	for _, marker := range []string{
-		"bearer ", "authorization:", "cookie:", "set-cookie", "begin private key", "begin rsa private key",
-		"private-key", "private_key",
+		"bearer ", "authorization", "cookie", "set-cookie", "begin private key", "begin rsa private key",
+		"private key", "private-key", "private_key", "raw error body", "raw_error_body", "raw-error-body",
 	} {
 		if strings.Contains(normalized, marker) {
 			return true

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/investigation"
@@ -174,6 +175,15 @@ func canonicalHypothesisSpecs(specs []investigation.HypothesisSpec) ([]investiga
 			Proposal: bytes.Clone(spec.Proposal), ProposalHash: spec.ProposalHash,
 			Unknowns: append([]string(nil), spec.Unknowns...), EvidenceIDs: append([]string(nil), spec.EvidenceIDs...),
 		}
+		candidate := domain.Hypothesis{
+			ID: "validation", WorkspaceID: "validation", IncidentID: "validation", InvestigationID: "validation",
+			Status: domain.HypothesisProposed, Rank: spec.Rank, Confidence: spec.Confidence, Summary: spec.Summary,
+			Proposal: bytes.Clone(spec.Proposal), ProposalHash: spec.ProposalHash,
+			Unknowns: append([]string(nil), spec.Unknowns...), EvidenceIDs: append([]string(nil), spec.EvidenceIDs...), CreatedAt: time.Unix(1, 0).UTC(),
+		}
+		if err := candidate.Validate(); err != nil {
+			return nil, fmt.Errorf("%w: invalid hypothesis body", investigation.ErrInvalidRequest)
+		}
 	}
 	sort.SliceStable(canonical, func(left, right int) bool { return canonical[left].Rank < canonical[right].Rank })
 	for index := 1; index < len(canonical); index++ {
@@ -194,9 +204,6 @@ func validFinalization(status domain.InvestigationStatus, modelStatus domain.Mod
 			return failureCode == "" && domain.ValidFailureCode(modelFailureCode) && hypothesisCount == 0
 		}
 		return modelStatus == domain.ModelSkipped && failureCode == "" && modelFailureCode == "" && hypothesisCount == 0
-	case domain.InvestigationFailed:
-		return modelStatus == domain.ModelFailed && domain.ValidFailureCode(failureCode) &&
-			domain.ValidFailureCode(modelFailureCode) && hypothesisCount == 0
 	case domain.InvestigationCancelled:
 		return modelStatus == domain.ModelCancelled && domain.ValidFailureCode(failureCode) && modelFailureCode == "" && hypothesisCount == 0
 	default:

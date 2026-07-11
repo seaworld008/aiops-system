@@ -108,6 +108,9 @@ func (repository *Repository) CorrelateSignal(ctx context.Context, request inves
 		if err != nil {
 			return investigation.CorrelateSignalResult{}, err
 		}
+		if _, duplicate := repository.incidents[scoped(request.WorkspaceID, incidentID)]; duplicate {
+			return investigation.CorrelateSignalResult{}, fmt.Errorf("%w: ID factory returned duplicate incident ID", investigation.ErrInvalidRequest)
+		}
 		openedAt := signal.ObservedAt.UTC()
 		updatedAt := laterTime(now, openedAt)
 		incident = domain.NewIncident(incidentID, request.WorkspaceID, openedAt)

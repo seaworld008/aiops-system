@@ -258,6 +258,13 @@ func TestCompleteTaskPersistsEvidenceReceiptAndDefensiveCopies(t *testing.T) {
 		!replay.Replayed || replay.Evidence == nil || replay.Evidence.ID != first.Evidence.ID {
 		t.Fatalf("complete/replay = %#v / %#v", first, replay)
 	}
+	tamperedReplay := request
+	tamperedEvidence := *request.Evidence
+	tamperedEvidence.Payload = []byte(` {"series_count":3} `)
+	tamperedReplay.Evidence = &tamperedEvidence
+	if _, err := repository.CompleteTask(context.Background(), tamperedReplay); !errors.Is(err, investigation.ErrInvalidRequest) {
+		t.Fatalf("CompleteTask(tampered replay) error = %v, want ErrInvalidRequest", err)
+	}
 	storedInvestigation, err := repository.GetInvestigation(context.Background(), "workspace-1", created.Investigation.ID)
 	if err != nil || storedInvestigation.Status != domain.InvestigationRunning {
 		t.Fatalf("GetInvestigation() = %#v, %v; want RUNNING", storedInvestigation, err)
@@ -328,6 +335,12 @@ func TestFinalizeInvestigationPersistsRankedHypothesesAndReleasesActiveSlot(t *t
 	if first.Investigation.Status != domain.InvestigationCompleted || len(first.Hypotheses) != 1 ||
 		first.Hypotheses[0].Rank != 1 || !replay.Replayed || replay.Hypotheses[0].ID != first.Hypotheses[0].ID {
 		t.Fatalf("finalize/replay = %#v / %#v", first, replay)
+	}
+	tamperedFinalize := request
+	tamperedFinalize.Hypotheses = append([]investigation.HypothesisSpec(nil), request.Hypotheses...)
+	tamperedFinalize.Hypotheses[0].Proposal = []byte(` {"summary":"pool saturation"} `)
+	if _, err := repository.FinalizeInvestigation(context.Background(), tamperedFinalize); !errors.Is(err, investigation.ErrInvalidRequest) {
+		t.Fatalf("FinalizeInvestigation(tampered replay) error = %v, want ErrInvalidRequest", err)
 	}
 
 	proposal[2] = 'X'
@@ -446,6 +459,13 @@ func TestFinalizeUsesTaskResultsEvenWhenModelFails(t *testing.T) {
 		t.Fatalf("CompleteTask() error = %v", err)
 	}
 	startModel(t, repository, created.Investigation.ID, "model:start:failure")
+	if _, err := repository.FinalizeInvestigation(context.Background(), investigation.FinalizeInvestigationRequest{
+		WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID,
+		IdempotencyKey: "finalize:model-failure-bypass", Status: domain.InvestigationFailed,
+		ModelStatus: domain.ModelFailed, FailureCode: "internal_failure", ModelFailureCode: "model_unavailable",
+	}); !errors.Is(err, investigation.ErrInvalidRequest) {
+		t.Fatalf("FinalizeInvestigation(FAILED bypass) error = %v, want ErrInvalidRequest", err)
+	}
 
 	result, err := repository.FinalizeInvestigation(context.Background(), investigation.FinalizeInvestigationRequest{
 		WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID,
@@ -1008,6 +1028,38 @@ func TestFinalizeDistinguishesSkippedConfigurationFromCancellation(t *testing.T)
 				t.Fatalf("FinalizeInvestigation(CANCELLED) = %#v, %v", result, err)
 			}
 		})
+	}
+}
+
+func TestCorrelateSignalRejectsDuplicateGeneratedIncidentIDWithoutPartialWrites(t *testing.T) {
+	now := time.Date(2026, 7, 12, 15, 0, 0, 0, time.UTC)
+	repository, err := memory.New(memory.Options{Clock: func() time.Time { return now }, IDFactory: func() string { return "duplicate-incident" }})
+	if err != nil {
+		t.Fatalf("memory.New() error = %v", err)
+	}
+	for _, id := range []string{"signal-first", "signal-second"} {
+		if _, err := repository.RegisterSignal(context.Background(), testSignal("workspace-1", id, "firing", now)); err != nil {
+			t.Fatalf("RegisterSignal(%s) error = %v", id, err)
+		}
+	}
+	firstRequest := investigation.CorrelateSignalRequest{WorkspaceID: "workspace-1", SignalID: "signal-first", CorrelationKey: "first:key", MappingStatus: domain.MappingUnresolved}
+	first, err := repository.CorrelateSignal(context.Background(), firstRequest)
+	if err != nil {
+		t.Fatalf("CorrelateSignal(first) error = %v", err)
+	}
+	_, err = repository.CorrelateSignal(context.Background(), investigation.CorrelateSignalRequest{
+		WorkspaceID: "workspace-1", SignalID: "signal-second", CorrelationKey: "second:key", MappingStatus: domain.MappingUnresolved,
+	})
+	if !errors.Is(err, investigation.ErrInvalidRequest) {
+		t.Fatalf("CorrelateSignal(duplicate ID) error = %v, want ErrInvalidRequest", err)
+	}
+	items, err := repository.ListIncidents(context.Background(), investigation.ListIncidentsRequest{WorkspaceID: "workspace-1"})
+	if err != nil || len(items) != 1 || items[0].ID != first.Incident.ID || items[0].CorrelationKey != "first:key" || items[0].SignalCount != 1 {
+		t.Fatalf("ListIncidents() = %#v, %v; want unchanged first incident", items, err)
+	}
+	replay, err := repository.CorrelateSignal(context.Background(), firstRequest)
+	if err != nil || replay.Incident.SignalCount != 1 {
+		t.Fatalf("CorrelateSignal(first replay) = %#v, %v; want unchanged count", replay, err)
 	}
 }
 

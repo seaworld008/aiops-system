@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
 	"github.com/seaworld008/aiops-system/internal/domain"
 )
 
@@ -214,16 +215,16 @@ func CanonicalTaskSpecs(specs []TaskSpec) ([]TaskSpec, string, error) {
 		if err := json.Unmarshal(spec.Input, &object); err != nil {
 			return nil, "", fmt.Errorf("%w: invalid task input", ErrInvalidRequest)
 		}
-		encoded, err := json.Marshal(object)
-		if err != nil || !bytes.Equal(encoded, spec.Input) {
-			return nil, "", fmt.Errorf("%w: task input is not normalized", ErrInvalidRequest)
-		}
 		if containsTaskTargetMaterial(object) {
 			return nil, "", fmt.Errorf("%w: task input contains connection or credential material", ErrInvalidRequest)
 		}
+		encoded, err := jsoncanonicalizer.Transform(spec.Input)
+		if err != nil {
+			return nil, "", fmt.Errorf("%w: task input cannot be canonicalized", ErrInvalidRequest)
+		}
 		canonical[index] = TaskSpec{
 			Key: spec.Key, ConnectorID: spec.ConnectorID, Operation: spec.Operation,
-			Input: bytes.Clone(spec.Input),
+			Input: bytes.Clone(encoded),
 		}
 	}
 	sort.Slice(canonical, func(left, right int) bool {
@@ -254,7 +255,7 @@ func containsTaskTargetMaterialAt(value any, parentKey string) bool {
 	switch item := value.(type) {
 	case map[string]any:
 		for key, child := range item {
-			if normalizeTaskFieldName(key) == "name" {
+			if normalized := normalizeTaskFieldName(key); normalized == "name" || normalized == "key" {
 				if name, ok := child.(string); ok && forbiddenTaskFieldName(name) {
 					return true
 				}
@@ -275,7 +276,7 @@ func containsTaskTargetMaterialAt(value any, parentKey string) bool {
 			}
 		}
 	case string:
-		if !queryTaskField(parentKey) && unsafeTaskTargetValue(item) {
+		if unsafeTaskTargetValue(item) {
 			return true
 		}
 	}
@@ -297,15 +298,6 @@ func forbiddenTaskFieldName(value string) bool {
 		}
 	}
 	return false
-}
-
-func queryTaskField(value string) bool {
-	switch normalizeTaskFieldName(value) {
-	case "query", "promql", "logql", "expression", "filter", "selector":
-		return true
-	default:
-		return false
-	}
 }
 
 func unsafeTaskTargetValue(value string) bool {

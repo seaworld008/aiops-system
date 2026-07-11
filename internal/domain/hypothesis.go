@@ -49,7 +49,8 @@ func (hypothesis Hypothesis) Validate() error {
 		hypothesis.Confidence < 0 || hypothesis.Confidence > 1 {
 		return fmt.Errorf("hypothesis confidence must be between 0 and 1")
 	}
-	if hypothesis.Summary == "" || hypothesis.Summary != strings.TrimSpace(hypothesis.Summary) || len(hypothesis.Summary) > 4096 {
+	if hypothesis.Summary == "" || hypothesis.Summary != strings.TrimSpace(hypothesis.Summary) ||
+		len(hypothesis.Summary) > 4096 || !ValidSafeText(hypothesis.Summary) {
 		return fmt.Errorf("hypothesis summary is invalid")
 	}
 	if err := validateHashedJSONObject(hypothesis.Proposal, hypothesis.ProposalHash); err != nil {
@@ -59,7 +60,7 @@ func (hypothesis Hypothesis) Validate() error {
 		return fmt.Errorf("hypothesis unknowns exceed limit")
 	}
 	for _, unknown := range hypothesis.Unknowns {
-		if unknown == "" || unknown != strings.TrimSpace(unknown) || len(unknown) > 512 {
+		if unknown == "" || unknown != strings.TrimSpace(unknown) || len(unknown) > 512 || !ValidSafeText(unknown) {
 			return fmt.Errorf("hypothesis unknown is invalid")
 		}
 	}

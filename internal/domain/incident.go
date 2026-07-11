@@ -62,7 +62,13 @@ func NewIncident(id, workspaceID string, now time.Time) Incident {
 }
 
 func (incident Incident) Validate() error {
-	if incident.ID == "" || incident.TenantID == "" || incident.WorkspaceID == "" || incident.Severity == "" || incident.Title == "" {
+	if !ValidResourceID(incident.ID) || !ValidResourceID(incident.TenantID) || !ValidResourceID(incident.WorkspaceID) ||
+		(incident.ServiceID != "" && !ValidResourceID(incident.ServiceID)) ||
+		(incident.EnvironmentID != "" && !ValidResourceID(incident.EnvironmentID)) ||
+		(incident.ConfirmedHypothesisID != "" && !ValidResourceID(incident.ConfirmedHypothesisID)) {
+		return fmt.Errorf("incident resource identifiers are invalid")
+	}
+	if incident.Severity == "" || incident.Title == "" {
 		return fmt.Errorf("incident id, tenant id, workspace id, severity and title are required")
 	}
 	if incident.OpenedAt.IsZero() || incident.UpdatedAt.IsZero() || incident.UpdatedAt.Before(incident.OpenedAt) {

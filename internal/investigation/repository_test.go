@@ -25,20 +25,21 @@ func TestCanonicalTaskSpecsRejectConnectionAndCredentialMaterial(t *testing.T) {
 	}
 
 	for name, input := range map[string]string{
-		"url":            `{"target_url":"https://example.invalid"}`,
-		"endpoint":       `{"endpoint":"internal"}`,
-		"header":         `{"headers":{"x-scope":"value"}}`,
-		"auth":           `{"auth_mode":"bearer"}`,
-		"secret":         `{"secret_ref":"vault/path"}`,
-		"token":          `{"page_token":"opaque"}`,
-		"password":       `{"password":"redacted"}`,
-		"credential":     `{"credential_id":"id"}`,
-		"host and port":  `{"host":"db.internal","port":5432}`,
-		"dsn":            `{"dsn":"postgres://db.internal:5432/app"}`,
-		"name value":     `{"name":"endpoint","value":"https://internal.invalid"}`,
-		"proxy server":   `{"proxy_server":"proxy.internal:8443"}`,
-		"non-object":     `[]`,
-		"non-normalized": `{ "lookback_minutes": 15 }`,
+		"url":           `{"target_url":"https://example.invalid"}`,
+		"endpoint":      `{"endpoint":"internal"}`,
+		"header":        `{"headers":{"x-scope":"value"}}`,
+		"auth":          `{"auth_mode":"bearer"}`,
+		"secret":        `{"secret_ref":"vault/path"}`,
+		"token":         `{"page_token":"opaque"}`,
+		"password":      `{"password":"redacted"}`,
+		"credential":    `{"credential_id":"id"}`,
+		"host and port": `{"host":"db.internal","port":5432}`,
+		"dsn":           `{"dsn":"postgres://db.internal:5432/app"}`,
+		"name value":    `{"name":"endpoint","value":"https://internal.invalid"}`,
+		"key value":     `{"parameters":[{"key":"endpoint","value":"db.internal"}]}`,
+		"query target":  `{"query":"https://169.254.169.254/latest"}`,
+		"proxy server":  `{"proxy_server":"proxy.internal:8443"}`,
+		"non-object":    `[]`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			item := valid
@@ -72,6 +73,27 @@ func TestCanonicalTaskSpecsRejectConnectionAndCredentialMaterial(t *testing.T) {
 	}
 	if _, _, err := investigation.CanonicalTaskSpecs(tooMany); !errors.Is(err, investigation.ErrInvalidRequest) {
 		t.Fatalf("CanonicalTaskSpecs(13) error = %v, want ErrInvalidRequest", err)
+	}
+}
+
+func TestCanonicalTaskSpecsUsesJCSForSemanticReplay(t *testing.T) {
+	first := investigation.TaskSpec{
+		Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query",
+		Input: []byte(` { "threshold": 1, "query": "rate(x[5m]) > 0" } `),
+	}
+	second := first
+	second.Input = []byte(`{"query":"rate(x[5m]) > 0","threshold":1}`)
+	canonicalFirst, hashFirst, err := investigation.CanonicalTaskSpecs([]investigation.TaskSpec{first})
+	if err != nil {
+		t.Fatalf("CanonicalTaskSpecs(first) error = %v", err)
+	}
+	canonicalSecond, hashSecond, err := investigation.CanonicalTaskSpecs([]investigation.TaskSpec{second})
+	if err != nil {
+		t.Fatalf("CanonicalTaskSpecs(second) error = %v", err)
+	}
+	if hashFirst != hashSecond || string(canonicalFirst[0].Input) != string(canonicalSecond[0].Input) ||
+		strings.Contains(string(canonicalFirst[0].Input), `\u003e`) {
+		t.Fatalf("canonical semantic replay mismatch: %q/%q %q/%q", canonicalFirst[0].Input, canonicalSecond[0].Input, hashFirst, hashSecond)
 	}
 }
 

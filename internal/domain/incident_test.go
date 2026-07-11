@@ -183,3 +183,26 @@ func TestIncidentRejectsRootCauseConfirmationForInvalidHypothesis(t *testing.T) 
 		t.Fatalf("invalid hypothesis changed confirmation state: %#v / %#v", incident, hypothesis)
 	}
 }
+
+func TestIncidentValidateRejectsUnsafeOrOversizedResourceIDs(t *testing.T) {
+	now := time.Date(2026, 7, 12, 16, 0, 0, 0, time.UTC)
+	valid := domain.NewIncident("incident-1", "workspace-1", now)
+	for name, mutate := range map[string]func(*domain.Incident){
+		"id control":        func(value *domain.Incident) { value.ID = "incident\x00other" },
+		"tenant oversized":  func(value *domain.Incident) { value.TenantID = strings.Repeat("t", domain.MaxResourceIDBytes+1) },
+		"workspace control": func(value *domain.Incident) { value.WorkspaceID = "workspace\nother" },
+		"service control":   func(value *domain.Incident) { value.ServiceID = "service\x00other" },
+		"environment oversized": func(value *domain.Incident) {
+			value.EnvironmentID = strings.Repeat("e", domain.MaxResourceIDBytes+1)
+		},
+		"confirmed hypothesis control": func(value *domain.Incident) { value.ConfirmedHypothesisID = "hypothesis\nother" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			item := valid
+			mutate(&item)
+			if err := item.Validate(); err == nil {
+				t.Fatal("Validate() error = nil, want resource ID rejection")
+			}
+		})
+	}
+}
