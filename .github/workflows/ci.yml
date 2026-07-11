@@ -91,7 +91,7 @@ jobs:
       - name: Verify image trust boundaries
         shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           test "$(docker image inspect --format '{{.Config.User}}' "${READ_RUNNER_IMAGE}")" = "65532:65532"
           test "$(docker image inspect --format '{{.Config.User}}' "${WRITE_RUNNER_IMAGE}")" = "65532:65532"
           test "$(docker image inspect --format '{{index .Config.Entrypoint 0}}' "${READ_RUNNER_IMAGE}")" = "/usr/local/bin/aiops-read-runner"
@@ -112,6 +112,7 @@ jobs:
           docker export --output=/tmp/write-runner.tar "${write_container}"
           tar -tf /tmp/read-runner.tar > /tmp/read-runner.files
           tar -tf /tmp/write-runner.tar > /tmp/write-runner.files
+          tar --numeric-owner -tvf /tmp/write-runner.tar | grep -E '(^| )(tmp/|usr/local/libexec/|usr/local/libexec/aiops-executor)$'
 
           grep -Fxq 'usr/local/bin/aiops-read-runner' /tmp/read-runner.files
           ! grep -Eq 'aiops-(write-runner|executor)$' /tmp/read-runner.files
