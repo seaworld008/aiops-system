@@ -16,7 +16,7 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 	if err := ctx.Err(); err != nil {
 		return investigation.CreateOrGetInvestigationResult{}, err
 	}
-	if request.WorkspaceID == "" || request.IncidentID == "" || !domain.ValidIdempotencyKey(request.IdempotencyKey) {
+	if !validResourceScope(request.WorkspaceID, request.IncidentID) || !domain.ValidIdempotencyKey(request.IdempotencyKey) {
 		return investigation.CreateOrGetInvestigationResult{}, fmt.Errorf("%w: invalid investigation identity", investigation.ErrInvalidRequest)
 	}
 	canonicalTasks, taskHash, err := investigation.CanonicalTaskSpecs(request.Tasks)
@@ -33,6 +33,9 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
 	idempotencyKey := scoped(request.WorkspaceID, request.IdempotencyKey)
+	if !repository.idempotencyOwnerMatches(idempotencyKey, "create_investigation") {
+		return investigation.CreateOrGetInvestigationResult{}, store.ErrIdempotencyConflict
+	}
 	if record, exists := repository.investigationIdempotency[idempotencyKey]; exists {
 		if record.requestHash != requestHash {
 			return investigation.CreateOrGetInvestigationResult{}, store.ErrIdempotencyConflict
@@ -47,7 +50,11 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 	if activeID := repository.activeInvestigation[incidentKey]; activeID != "" {
 		active, found := repository.investigations[scoped(request.WorkspaceID, activeID)]
 		if found && (active.Status == domain.InvestigationQueued || active.Status == domain.InvestigationRunning) {
+			if active.RequestHash != requestHash {
+				return investigation.CreateOrGetInvestigationResult{}, store.ErrIdempotencyConflict
+			}
 			repository.investigationIdempotency[idempotencyKey] = idempotencyRecord{requestHash: requestHash, resourceID: active.ID}
+			repository.bindIdempotencyOwner(idempotencyKey, "create_investigation")
 			return repository.investigationResult(request.WorkspaceID, active.ID, false)
 		}
 		delete(repository.activeInvestigation, incidentKey)
@@ -109,6 +116,7 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 	repository.taskIDsByInvestigation[scoped(request.WorkspaceID, item.ID)] = append([]string(nil), taskIDs...)
 	repository.activeInvestigation[incidentKey] = item.ID
 	repository.investigationIdempotency[idempotencyKey] = idempotencyRecord{requestHash: requestHash, resourceID: item.ID}
+	repository.bindIdempotencyOwner(idempotencyKey, "create_investigation")
 	return investigation.CreateOrGetInvestigationResult{
 		Investigation: cloneInvestigation(item), Tasks: cloneTasks(createdTasks), Created: true,
 	}, nil
@@ -137,7 +145,7 @@ func (repository *Repository) GetInvestigation(ctx context.Context, workspaceID,
 	if err := ctx.Err(); err != nil {
 		return domain.Investigation{}, err
 	}
-	if workspaceID == "" || investigationID == "" {
+	if !validResourceScope(workspaceID, investigationID) {
 		return domain.Investigation{}, fmt.Errorf("%w: workspace and investigation IDs are required", investigation.ErrInvalidRequest)
 	}
 	repository.mu.RLock()
@@ -153,7 +161,7 @@ func (repository *Repository) ListInvestigations(ctx context.Context, request in
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if request.WorkspaceID == "" {
+	if !domain.ValidResourceID(request.WorkspaceID) || (request.IncidentID != "" && !domain.ValidResourceID(request.IncidentID)) {
 		return nil, fmt.Errorf("%w: workspace ID is required", investigation.ErrInvalidRequest)
 	}
 	statuses := make(map[domain.InvestigationStatus]struct{}, len(request.Statuses))
@@ -195,7 +203,7 @@ func (repository *Repository) GetTask(ctx context.Context, workspaceID, taskID s
 	if err := ctx.Err(); err != nil {
 		return domain.ReadTask{}, err
 	}
-	if workspaceID == "" || taskID == "" {
+	if !validResourceScope(workspaceID, taskID) {
 		return domain.ReadTask{}, fmt.Errorf("%w: workspace and task IDs are required", investigation.ErrInvalidRequest)
 	}
 	repository.mu.RLock()
@@ -211,7 +219,7 @@ func (repository *Repository) ListTasks(ctx context.Context, request investigati
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if request.WorkspaceID == "" || request.InvestigationID == "" {
+	if !validResourceScope(request.WorkspaceID, request.InvestigationID) {
 		return nil, fmt.Errorf("%w: workspace and investigation IDs are required", investigation.ErrInvalidRequest)
 	}
 	statuses := make(map[domain.ReadTaskStatus]struct{}, len(request.Statuses))

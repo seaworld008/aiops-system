@@ -38,19 +38,14 @@ func TestIncidentAllowsOrderedLifecycle(t *testing.T) {
 }
 
 func TestOnlyExplicitHumanFeedbackConfirmsRootCause(t *testing.T) {
-	incident := domain.NewIncident("incident-1", "workspace-1", time.Now())
-	hypothesis := domain.Hypothesis{
-		ID:              "hypothesis-1",
-		WorkspaceID:     "workspace-1",
-		IncidentID:      "incident-1",
-		InvestigationID: "investigation-1",
-		Status:          domain.HypothesisProposed,
-	}
+	now := time.Date(2026, 7, 12, 14, 0, 0, 0, time.UTC)
+	incident := domain.NewIncident("incident-1", "workspace-1", now)
+	hypothesis := validRootCauseHypothesis(now, "hypothesis-1", "workspace-1", "incident-1")
 
-	if err := incident.ConfirmRootCause(&hypothesis, domain.Actor{Type: domain.ActorModel, ID: "model"}); err == nil {
+	if err := incident.ConfirmRootCauseAt(&hypothesis, domain.Actor{Type: domain.ActorModel, ID: "model"}, now); err == nil {
 		t.Fatal("model confirmation error = nil, want rejection")
 	}
-	if err := incident.ConfirmRootCause(&hypothesis, domain.Actor{Type: domain.ActorHuman, ID: "user-1"}); err != nil {
+	if err := incident.ConfirmRootCauseAt(&hypothesis, domain.Actor{Type: domain.ActorHuman, ID: "user-1"}, now); err != nil {
 		t.Fatalf("human confirmation error = %v", err)
 	}
 	if incident.ConfirmedHypothesisID != hypothesis.ID {
@@ -62,14 +57,24 @@ func TestOnlyExplicitHumanFeedbackConfirmsRootCause(t *testing.T) {
 }
 
 func TestIncidentRejectsHypothesisFromAnotherIncidentOrWorkspace(t *testing.T) {
-	incident := domain.NewIncident("incident-1", "workspace-1", time.Now())
+	now := time.Date(2026, 7, 12, 14, 0, 0, 0, time.UTC)
+	incident := domain.NewIncident("incident-1", "workspace-1", now)
 	for _, hypothesis := range []domain.Hypothesis{
-		{ID: "h1", WorkspaceID: "workspace-2", IncidentID: "incident-1", Status: domain.HypothesisProposed},
-		{ID: "h2", WorkspaceID: "workspace-1", IncidentID: "incident-2", Status: domain.HypothesisProposed},
+		validRootCauseHypothesis(now, "h1", "workspace-2", "incident-1"),
+		validRootCauseHypothesis(now, "h2", "workspace-1", "incident-2"),
 	} {
-		if err := incident.ConfirmRootCause(&hypothesis, domain.Actor{Type: domain.ActorHuman, ID: "user-1"}); err == nil {
+		if err := incident.ConfirmRootCauseAt(&hypothesis, domain.Actor{Type: domain.ActorHuman, ID: "user-1"}, now); err == nil {
 			t.Fatalf("ConfirmRootCause(%#v) error = nil, want ownership rejection", hypothesis)
 		}
+	}
+}
+
+func validRootCauseHypothesis(now time.Time, id, workspaceID, incidentID string) domain.Hypothesis {
+	proposal := []byte(`{"summary":"evidence-backed root cause"}`)
+	return domain.Hypothesis{
+		ID: id, WorkspaceID: workspaceID, IncidentID: incidentID, InvestigationID: "investigation-1",
+		Status: domain.HypothesisProposed, Rank: 1, Confidence: 0.8, Summary: "Evidence-backed root cause",
+		Proposal: proposal, ProposalHash: sha256Hex(proposal), EvidenceIDs: []string{"evidence-1"}, CreatedAt: now,
 	}
 }
 
@@ -161,5 +166,20 @@ func TestIncidentExactMappingRequiresServiceAndEnvironment(t *testing.T) {
 	incident.EnvironmentID = "production"
 	if err := incident.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v, want complete EXACT mapping", err)
+	}
+}
+
+func TestIncidentRejectsRootCauseConfirmationForInvalidHypothesis(t *testing.T) {
+	now := time.Date(2026, 7, 12, 14, 30, 0, 0, time.UTC)
+	incident := domain.NewIncident("incident-1", "workspace-1", now)
+	hypothesis := domain.Hypothesis{
+		ID: "hypothesis-1", WorkspaceID: "workspace-1", IncidentID: incident.ID,
+		InvestigationID: "investigation-1", Status: domain.HypothesisProposed,
+	}
+	if err := incident.ConfirmRootCauseAt(&hypothesis, domain.Actor{Type: domain.ActorHuman, ID: "user-1"}, now); err == nil {
+		t.Fatal("ConfirmRootCauseAt() error = nil, want invalid hypothesis rejection")
+	}
+	if incident.ConfirmedHypothesisID != "" || hypothesis.Status != domain.HypothesisProposed {
+		t.Fatalf("invalid hypothesis changed confirmation state: %#v / %#v", incident, hypothesis)
 	}
 }

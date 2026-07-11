@@ -22,6 +22,11 @@ var (
 
 var taskKeyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,63}$`)
 
+var (
+	targetURISchemePattern = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://`)
+	targetHostPortPattern  = regexp.MustCompile(`(?i)^(?:[a-z0-9.-]+|\[[0-9a-f:]+\]):[0-9]{1,5}$`)
+)
+
 type TaskSpec struct {
 	Key         string
 	ConnectorID string
@@ -138,6 +143,17 @@ type FinalizeInvestigationResult struct {
 	Replayed      bool
 }
 
+type StartModelRequest struct {
+	WorkspaceID     string
+	InvestigationID string
+	IdempotencyKey  string
+}
+
+type StartModelResult struct {
+	Investigation domain.Investigation
+	Replayed      bool
+}
+
 type RecordFeedbackRequest struct {
 	WorkspaceID     string
 	IncidentID      string
@@ -171,6 +187,7 @@ type Repository interface {
 	ListHypotheses(context.Context, ListHypothesesRequest) ([]domain.Hypothesis, error)
 
 	CompleteTask(context.Context, CompleteTaskRequest) (CompleteTaskResult, error)
+	StartModel(context.Context, StartModelRequest) (StartModelResult, error)
 	FinalizeInvestigation(context.Context, FinalizeInvestigationRequest) (FinalizeInvestigationResult, error)
 	RecordFeedback(context.Context, RecordFeedbackRequest) (RecordFeedbackResult, error)
 }
@@ -230,25 +247,68 @@ func CanonicalTaskSpecs(specs []TaskSpec) ([]TaskSpec, string, error) {
 }
 
 func containsTaskTargetMaterial(value any) bool {
+	return containsTaskTargetMaterialAt(value, "")
+}
+
+func containsTaskTargetMaterialAt(value any, parentKey string) bool {
 	switch item := value.(type) {
 	case map[string]any:
 		for key, child := range item {
-			normalized := strings.NewReplacer("_", "", "-", "", ".", "", " ", "").Replace(strings.ToLower(key))
-			for _, forbidden := range []string{"url", "endpoint", "header", "auth", "secret", "token", "password", "credential"} {
-				if strings.Contains(normalized, forbidden) {
+			if normalizeTaskFieldName(key) == "name" {
+				if name, ok := child.(string); ok && forbiddenTaskFieldName(name) {
 					return true
 				}
 			}
-			if containsTaskTargetMaterial(child) {
+		}
+		for key, child := range item {
+			if forbiddenTaskFieldName(key) {
+				return true
+			}
+			if containsTaskTargetMaterialAt(child, key) {
 				return true
 			}
 		}
 	case []any:
 		for _, child := range item {
-			if containsTaskTargetMaterial(child) {
+			if containsTaskTargetMaterialAt(child, parentKey) {
 				return true
 			}
 		}
+	case string:
+		if !queryTaskField(parentKey) && unsafeTaskTargetValue(item) {
+			return true
+		}
 	}
 	return false
+}
+
+func normalizeTaskFieldName(value string) string {
+	return strings.NewReplacer("_", "", "-", "", ".", "", " ", "", "/", "").Replace(strings.ToLower(value))
+}
+
+func forbiddenTaskFieldName(value string) bool {
+	normalized := normalizeTaskFieldName(value)
+	for _, forbidden := range []string{
+		"url", "endpoint", "header", "auth", "secret", "token", "password", "credential",
+		"host", "hostname", "port", "dsn", "uri", "address", "socket", "proxy", "server", "target", "cluster",
+	} {
+		if strings.Contains(normalized, forbidden) {
+			return true
+		}
+	}
+	return false
+}
+
+func queryTaskField(value string) bool {
+	switch normalizeTaskFieldName(value) {
+	case "query", "promql", "logql", "expression", "filter", "selector":
+		return true
+	default:
+		return false
+	}
+}
+
+func unsafeTaskTargetValue(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	return targetURISchemePattern.MatchString(trimmed) || targetHostPortPattern.MatchString(trimmed)
 }

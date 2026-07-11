@@ -17,8 +17,8 @@
 | 实体 | 状态与允许方向 |
 | --- | --- |
 | Incident | `OPEN → INVESTIGATING → MITIGATING → RESOLVED → CLOSED`；只有 `OPEN/INVESTIGATING/MITIGATING` 参与 Signal 活动归并。 |
-| Investigation | `QUEUED → RUNNING → COMPLETED/PARTIAL`；确定性内部失败可进入 `FAILED`，取消可进入 `CANCELLED`。同一 Incident 同时最多一个 `QUEUED/RUNNING` Investigation。 |
-| ModelStatus | `PENDING → RUNNING → COMPLETED/FAILED/SKIPPED`。报告生成独立于模型：所有 ReadTask 有 Evidence 时，即使模型 `FAILED/SKIPPED`，Investigation 仍为 `COMPLETED`；任一 Task 失败或取消则为 `PARTIAL`。 |
+| Investigation | `QUEUED → RUNNING → COMPLETED/PARTIAL`；确定性内部失败可进入 `FAILED`，取消可进入 `CANCELLED`。同一 Incident 同时最多一个 `QUEUED/RUNNING` Investigation；`FailureCode` 只允许出现在 `FAILED/CANCELLED`。 |
+| ModelStatus | `PENDING → RUNNING → COMPLETED/FAILED`；显式 `StartModel` 持久化 `PENDING → RUNNING`，`COMPLETED/FAILED` 只能从 `RUNNING` finalize。无模型配置从 `PENDING` 进入 `SKIPPED`；取消从 `PENDING/RUNNING` 进入独立的 `CANCELLED`，不得冒充 `SKIPPED`。报告生成独立于模型：所有 ReadTask 有 Evidence 时，即使模型 `FAILED/SKIPPED`，Investigation 仍为 `COMPLETED`；任一 Task 失败或取消则为 `PARTIAL`。 |
 | ReadTask | `QUEUED → RUNNING → EVIDENCE/FAILED/CANCELLED`；Memory fixture 允许以原子 complete 从 `QUEUED` 写入终态，并同时推进 Investigation 到 `RUNNING`。 |
 | Hypothesis | `PROPOSED → CONFIRMED/REJECTED`；`CONFIRMED` 和 `REJECTED` 只能来自人类 Feedback。 |
 

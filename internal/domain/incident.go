@@ -144,6 +144,9 @@ func (incident *Incident) ConfirmRootCauseAt(hypothesis *Hypothesis, actor Actor
 	if hypothesis == nil || hypothesis.ID == "" || hypothesis.Status != HypothesisProposed {
 		return fmt.Errorf("only a proposed hypothesis can be confirmed")
 	}
+	if err := hypothesis.Validate(); err != nil {
+		return fmt.Errorf("root cause confirmation requires a valid hypothesis")
+	}
 	if hypothesis.WorkspaceID != incident.WorkspaceID || hypothesis.IncidentID != incident.ID {
 		return fmt.Errorf("hypothesis does not belong to this incident")
 	}

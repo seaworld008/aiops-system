@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -305,6 +306,7 @@ func TestFinalizeInvestigationPersistsRankedHypothesesAndReleasesActiveSlot(t *t
 	if err != nil {
 		t.Fatalf("CompleteTask() error = %v", err)
 	}
+	startModel(t, repository, created.Investigation.ID, "model:start:finalize")
 	proposal := []byte(`{"summary":"pool saturation"}`)
 	request := investigation.FinalizeInvestigationRequest{
 		WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID,
@@ -374,6 +376,7 @@ func TestRecordFeedbackRequiresHumanAndIsTheOnlyRootCauseConfirmationPath(t *tes
 	if err != nil {
 		t.Fatalf("CompleteTask() error = %v", err)
 	}
+	startModel(t, repository, created.Investigation.ID, "model:start:feedback")
 	proposal := []byte(`{"summary":"pool saturation"}`)
 	finalized, err := repository.FinalizeInvestigation(context.Background(), investigation.FinalizeInvestigationRequest{
 		WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID,
@@ -442,6 +445,7 @@ func TestFinalizeUsesTaskResultsEvenWhenModelFails(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CompleteTask() error = %v", err)
 	}
+	startModel(t, repository, created.Investigation.ID, "model:start:failure")
 
 	result, err := repository.FinalizeInvestigation(context.Background(), investigation.FinalizeInvestigationRequest{
 		WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID,
@@ -582,6 +586,431 @@ func TestRepositoryRejectsInvalidOrDuplicateFactoryIDsWithoutPartialInvestigatio
 	}
 }
 
+func TestRepositoryRejectsNULScopeKeyCollisionInputs(t *testing.T) {
+	now := time.Date(2026, 7, 12, 9, 0, 0, 0, time.UTC)
+	repository := newRepository(t, now)
+
+	for _, signal := range []domain.Signal{
+		testSignal("a\x00b", "c", "firing", now),
+		testSignal("a", "b\x00c", "firing", now),
+	} {
+		if _, err := repository.RegisterSignal(context.Background(), signal); !errors.Is(err, investigation.ErrInvalidRequest) {
+			t.Fatalf("RegisterSignal(%q/%q) error = %v, want ErrInvalidRequest", signal.WorkspaceID, signal.ID, err)
+		}
+	}
+
+	if _, err := repository.GetIncident(context.Background(), "a\x00b", "c"); !errors.Is(err, investigation.ErrInvalidRequest) {
+		t.Fatalf("GetIncident(NUL workspace) error = %v, want ErrInvalidRequest", err)
+	}
+	if _, err := repository.GetIncident(context.Background(), "a", "b\x00c"); !errors.Is(err, investigation.ErrInvalidRequest) {
+		t.Fatalf("GetIncident(NUL resource) error = %v, want ErrInvalidRequest", err)
+	}
+	if _, err := repository.CorrelateSignal(context.Background(), investigation.CorrelateSignalRequest{
+		WorkspaceID: "a", SignalID: "b\x00c", CorrelationKey: "safe:key", MappingStatus: domain.MappingUnresolved,
+	}); !errors.Is(err, investigation.ErrInvalidRequest) {
+		t.Fatalf("CorrelateSignal(NUL signal) error = %v, want ErrInvalidRequest", err)
+	}
+}
+
+func TestAllRepositoryOperationsRejectUnsafeResourceScopes(t *testing.T) {
+	repository := newRepository(t, time.Date(2026, 7, 12, 9, 30, 0, 0, time.UTC))
+	ctx := context.Background()
+	unsafeWorkspace := "workspace\x00other"
+	validTask := investigation.TaskSpec{
+		Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+	}
+
+	operations := map[string]func() error{
+		"list incidents": func() error {
+			_, err := repository.ListIncidents(ctx, investigation.ListIncidentsRequest{WorkspaceID: unsafeWorkspace})
+			return err
+		},
+		"create investigation": func() error {
+			_, err := repository.CreateOrGetInvestigation(ctx, investigation.CreateOrGetInvestigationRequest{
+				WorkspaceID: unsafeWorkspace, IncidentID: "incident-1", IdempotencyKey: "create:1", Tasks: []investigation.TaskSpec{validTask},
+			})
+			return err
+		},
+		"get investigation": func() error {
+			_, err := repository.GetInvestigation(ctx, unsafeWorkspace, "investigation-1")
+			return err
+		},
+		"list investigations": func() error {
+			_, err := repository.ListInvestigations(ctx, investigation.ListInvestigationsRequest{WorkspaceID: unsafeWorkspace})
+			return err
+		},
+		"get task": func() error {
+			_, err := repository.GetTask(ctx, unsafeWorkspace, "task-1")
+			return err
+		},
+		"list tasks": func() error {
+			_, err := repository.ListTasks(ctx, investigation.ListTasksRequest{WorkspaceID: unsafeWorkspace, InvestigationID: "investigation-1"})
+			return err
+		},
+		"get evidence": func() error {
+			_, err := repository.GetEvidence(ctx, unsafeWorkspace, "evidence-1")
+			return err
+		},
+		"list evidence": func() error {
+			_, err := repository.ListEvidence(ctx, investigation.ListEvidenceRequest{WorkspaceID: unsafeWorkspace, InvestigationID: "investigation-1"})
+			return err
+		},
+		"get hypothesis": func() error {
+			_, err := repository.GetHypothesis(ctx, unsafeWorkspace, "hypothesis-1")
+			return err
+		},
+		"list hypotheses": func() error {
+			_, err := repository.ListHypotheses(ctx, investigation.ListHypothesesRequest{WorkspaceID: unsafeWorkspace, InvestigationID: "investigation-1"})
+			return err
+		},
+		"complete task": func() error {
+			_, err := repository.CompleteTask(ctx, investigation.CompleteTaskRequest{
+				WorkspaceID: unsafeWorkspace, InvestigationID: "investigation-1", TaskID: "task-1", RunnerID: "runner-1",
+				IdempotencyKey: "complete:1", Status: domain.ReadTaskFailed, FailureCode: "collector_failed",
+			})
+			return err
+		},
+		"start model": func() error {
+			_, err := repository.StartModel(ctx, investigation.StartModelRequest{
+				WorkspaceID: unsafeWorkspace, InvestigationID: "investigation-1", IdempotencyKey: "model:start:unsafe",
+			})
+			return err
+		},
+		"finalize": func() error {
+			_, err := repository.FinalizeInvestigation(ctx, investigation.FinalizeInvestigationRequest{
+				WorkspaceID: unsafeWorkspace, InvestigationID: "investigation-1", IdempotencyKey: "finalize:1",
+				Status: domain.InvestigationCancelled, ModelStatus: domain.ModelCancelled, FailureCode: "cancelled",
+			})
+			return err
+		},
+		"feedback": func() error {
+			_, err := repository.RecordFeedback(ctx, investigation.RecordFeedbackRequest{
+				WorkspaceID: unsafeWorkspace, IncidentID: "incident-1", InvestigationID: "investigation-1",
+				HypothesisID: "hypothesis-1", Actor: domain.Actor{Type: domain.ActorHuman, ID: "user-1"},
+				Verdict: domain.FeedbackInconclusive, Details: []byte(`{"reason":"unknown"}`), IdempotencyKey: "feedback:1",
+			})
+			return err
+		},
+	}
+	for name, operation := range operations {
+		t.Run(name, func(t *testing.T) {
+			if err := operation(); !errors.Is(err, investigation.ErrInvalidRequest) {
+				t.Fatalf("operation error = %v, want ErrInvalidRequest", err)
+			}
+		})
+	}
+}
+
+func TestIdempotencyKeyHasOneWorkspaceWideOperationOwner(t *testing.T) {
+	now := time.Date(2026, 7, 12, 11, 0, 0, 0, time.UTC)
+	repository := newRepository(t, now)
+	incident := createIncident(t, repository, "workspace-1", "signal-idempotency-owner", now)
+	const sharedKey = "shared:operation-key"
+	created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: sharedKey,
+		Tasks: []investigation.TaskSpec{{
+			Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateOrGetInvestigation() error = %v", err)
+	}
+
+	operations := map[string]func() error{
+		"complete": func() error {
+			_, err := repository.CompleteTask(context.Background(), investigation.CompleteTaskRequest{
+				WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID, TaskID: created.Tasks[0].ID,
+				RunnerID: "runner-1", IdempotencyKey: sharedKey, Status: domain.ReadTaskFailed, FailureCode: "collector_failed",
+			})
+			return err
+		},
+		"finalize": func() error {
+			_, err := repository.FinalizeInvestigation(context.Background(), investigation.FinalizeInvestigationRequest{
+				WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID, IdempotencyKey: sharedKey,
+				Status: domain.InvestigationCancelled, ModelStatus: domain.ModelCancelled, FailureCode: "cancelled",
+			})
+			return err
+		},
+		"start model": func() error {
+			_, err := repository.StartModel(context.Background(), investigation.StartModelRequest{
+				WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID,
+				IdempotencyKey: sharedKey,
+			})
+			return err
+		},
+		"feedback": func() error {
+			_, err := repository.RecordFeedback(context.Background(), investigation.RecordFeedbackRequest{
+				WorkspaceID: "workspace-1", IncidentID: incident.ID, InvestigationID: created.Investigation.ID,
+				HypothesisID: "hypothesis-1", Actor: domain.Actor{Type: domain.ActorHuman, ID: "user-1"},
+				Verdict: domain.FeedbackInconclusive, Details: []byte(`{"reason":"unknown"}`), IdempotencyKey: sharedKey,
+			})
+			return err
+		},
+	}
+	for name, operation := range operations {
+		t.Run(name, func(t *testing.T) {
+			if err := operation(); !errors.Is(err, store.ErrIdempotencyConflict) {
+				t.Fatalf("operation error = %v, want ErrIdempotencyConflict", err)
+			}
+		})
+	}
+}
+
+func TestRegisterSignalEnforcesInvestigationFixtureBoundary(t *testing.T) {
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	valid := testSignal("workspace-1", "signal-boundary", "firing", now)
+
+	tooManyLabels := make(map[string]string, 65)
+	for index := 0; index < 65; index++ {
+		tooManyLabels[fmt.Sprintf("label_%02d", index)] = "value"
+	}
+	for name, mutate := range map[string]func(*domain.Signal){
+		"short payload hash": func(signal *domain.Signal) { signal.PayloadHash = "short" },
+		"uppercase payload hash": func(signal *domain.Signal) {
+			signal.PayloadHash = strings.Repeat("A", 64)
+		},
+		"too many labels": func(signal *domain.Signal) { signal.Labels = tooManyLabels },
+		"unsafe label key": func(signal *domain.Signal) {
+			signal.Labels = map[string]string{"bad\nkey": "value"}
+		},
+		"unsafe label value": func(signal *domain.Signal) {
+			signal.Labels = map[string]string{"service": "payments\x00other"}
+		},
+		"sensitive label": func(signal *domain.Signal) {
+			signal.Labels = map[string]string{"authorization": "Bearer fixture-canary"}
+		},
+		"oversized signal id": func(signal *domain.Signal) {
+			signal.ID = strings.Repeat("s", domain.MaxResourceIDBytes+1)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			repository := newRepository(t, now)
+			item := valid
+			item.Labels = cloneStringMap(valid.Labels)
+			mutate(&item)
+			if _, err := repository.RegisterSignal(context.Background(), item); !errors.Is(err, investigation.ErrInvalidRequest) {
+				t.Fatalf("RegisterSignal() error = %v, want ErrInvalidRequest", err)
+			}
+		})
+	}
+}
+
+func TestCorrelateSignalValidatesOptionalAndExactMappingResourceIDs(t *testing.T) {
+	now := time.Date(2026, 7, 12, 12, 30, 0, 0, time.UTC)
+	for name, request := range map[string]investigation.CorrelateSignalRequest{
+		"exact unsafe service": {
+			WorkspaceID: "workspace-1", SignalID: "signal-1", CorrelationKey: "payments:prod:exact",
+			MappingStatus: domain.MappingExact, ServiceID: "payments\x00other", EnvironmentID: "prod",
+		},
+		"ambiguous unsafe optional service": {
+			WorkspaceID: "workspace-1", SignalID: "signal-1", CorrelationKey: "payments:prod:ambiguous",
+			MappingStatus: domain.MappingAmbiguous, ServiceID: "payments\nother",
+		},
+		"unresolved oversized optional environment": {
+			WorkspaceID: "workspace-1", SignalID: "signal-1", CorrelationKey: "payments:prod:unresolved",
+			MappingStatus: domain.MappingUnresolved, EnvironmentID: strings.Repeat("e", domain.MaxResourceIDBytes+1),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			repository := newRepository(t, now)
+			if _, err := repository.RegisterSignal(context.Background(), testSignal("workspace-1", "signal-1", "firing", now)); err != nil {
+				t.Fatalf("RegisterSignal() error = %v", err)
+			}
+			if _, err := repository.CorrelateSignal(context.Background(), request); !errors.Is(err, investigation.ErrInvalidRequest) {
+				t.Fatalf("CorrelateSignal() error = %v, want ErrInvalidRequest", err)
+			}
+		})
+	}
+}
+
+func TestActiveInvestigationRejectsDifferentTaskRequestHash(t *testing.T) {
+	now := time.Date(2026, 7, 12, 13, 0, 0, 0, time.UTC)
+	repository := newRepository(t, now)
+	incident := createIncident(t, repository, "workspace-1", "signal-active-hash", now)
+	if _, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:metrics",
+		Tasks: []investigation.TaskSpec{{
+			Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+		}},
+	}); err != nil {
+		t.Fatalf("CreateOrGetInvestigation(first) error = %v", err)
+	}
+
+	_, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:logs",
+		Tasks: []investigation.TaskSpec{{
+			Key: "logs", ConnectorID: "victorialogs-prod", Operation: "search", Input: []byte(`{"lookback_minutes":30}`),
+		}},
+	})
+	if !errors.Is(err, store.ErrIdempotencyConflict) {
+		t.Fatalf("CreateOrGetInvestigation(different active tasks) error = %v, want ErrIdempotencyConflict", err)
+	}
+}
+
+func TestStartModelPersistsPendingToRunningAndReplaysIdempotently(t *testing.T) {
+	now := time.Date(2026, 7, 12, 13, 30, 0, 0, time.UTC)
+	repository := newRepository(t, now)
+	incident := createIncident(t, repository, "workspace-1", "signal-start-model", now)
+	created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:start-model",
+		Tasks: []investigation.TaskSpec{{
+			Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateOrGetInvestigation() error = %v", err)
+	}
+	payload := []byte(`{"series_count":3}`)
+	if _, err := repository.CompleteTask(context.Background(), investigation.CompleteTaskRequest{
+		WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID, TaskID: created.Tasks[0].ID,
+		RunnerID: "runner-1", IdempotencyKey: "complete:start-model", Status: domain.ReadTaskEvidence,
+		Evidence: &investigation.EvidenceInput{Payload: payload, ContentHash: sha256Hex(payload), CollectedAt: now},
+	}); err != nil {
+		t.Fatalf("CompleteTask() error = %v", err)
+	}
+	request := investigation.StartModelRequest{
+		WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID, IdempotencyKey: "model:start:1",
+	}
+	first, err := repository.StartModel(context.Background(), request)
+	if err != nil {
+		t.Fatalf("StartModel(first) error = %v", err)
+	}
+	replay, err := repository.StartModel(context.Background(), request)
+	if err != nil {
+		t.Fatalf("StartModel(replay) error = %v", err)
+	}
+	if first.Investigation.ModelStatus != domain.ModelRunning || !replay.Replayed ||
+		replay.Investigation.ModelStatus != domain.ModelRunning {
+		t.Fatalf("StartModel results = %#v / %#v", first, replay)
+	}
+}
+
+func TestFinalizeRequiresExplicitModelStateTransition(t *testing.T) {
+	now := time.Date(2026, 7, 12, 14, 0, 0, 0, time.UTC)
+	repository := newRepository(t, now)
+	incident := createIncident(t, repository, "workspace-1", "signal-model-transition", now)
+	created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:model-transition",
+		Tasks: []investigation.TaskSpec{{
+			Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateOrGetInvestigation() error = %v", err)
+	}
+	payload := []byte(`{"series_count":3}`)
+	completion, err := repository.CompleteTask(context.Background(), investigation.CompleteTaskRequest{
+		WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID, TaskID: created.Tasks[0].ID,
+		RunnerID: "runner-1", IdempotencyKey: "complete:model-transition", Status: domain.ReadTaskEvidence,
+		Evidence: &investigation.EvidenceInput{Payload: payload, ContentHash: sha256Hex(payload), CollectedAt: now},
+	})
+	if err != nil {
+		t.Fatalf("CompleteTask() error = %v", err)
+	}
+	proposal := []byte(`{"summary":"pool saturation"}`)
+	completedRequest := investigation.FinalizeInvestigationRequest{
+		WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID,
+		IdempotencyKey: "finalize:model-completed", Status: domain.InvestigationCompleted, ModelStatus: domain.ModelCompleted,
+		Hypotheses: []investigation.HypothesisSpec{{
+			Rank: 1, Confidence: 0.8, Summary: "Database pool saturation", Proposal: proposal,
+			ProposalHash: sha256Hex(proposal), EvidenceIDs: []string{completion.Evidence.ID},
+		}},
+	}
+	if _, err := repository.FinalizeInvestigation(context.Background(), completedRequest); !errors.Is(err, investigation.ErrInvalidTransition) {
+		t.Fatalf("FinalizeInvestigation(COMPLETED from PENDING) error = %v, want ErrInvalidTransition", err)
+	}
+	if _, err := repository.StartModel(context.Background(), investigation.StartModelRequest{
+		WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID, IdempotencyKey: "model:start:transition",
+	}); err != nil {
+		t.Fatalf("StartModel() error = %v", err)
+	}
+	if _, err := repository.FinalizeInvestigation(context.Background(), investigation.FinalizeInvestigationRequest{
+		WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID,
+		IdempotencyKey: "finalize:model-skipped", Status: domain.InvestigationCompleted, ModelStatus: domain.ModelSkipped,
+	}); !errors.Is(err, investigation.ErrInvalidTransition) {
+		t.Fatalf("FinalizeInvestigation(SKIPPED from RUNNING) error = %v, want ErrInvalidTransition", err)
+	}
+	result, err := repository.FinalizeInvestigation(context.Background(), completedRequest)
+	if err != nil || result.Investigation.ModelStatus != domain.ModelCompleted {
+		t.Fatalf("FinalizeInvestigation(COMPLETED from RUNNING) = %#v, %v", result, err)
+	}
+}
+
+func TestFinalizeDistinguishesSkippedConfigurationFromCancellation(t *testing.T) {
+	now := time.Date(2026, 7, 12, 14, 30, 0, 0, time.UTC)
+	t.Run("skipped from pending", func(t *testing.T) {
+		repository := newRepository(t, now)
+		incident := createIncident(t, repository, "workspace-1", "signal-model-skipped", now)
+		created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+			WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:model-skipped",
+			Tasks: []investigation.TaskSpec{{
+				Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+			}},
+		})
+		if err != nil {
+			t.Fatalf("CreateOrGetInvestigation() error = %v", err)
+		}
+		payload := []byte(`{"series_count":3}`)
+		if _, err := repository.CompleteTask(context.Background(), investigation.CompleteTaskRequest{
+			WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID, TaskID: created.Tasks[0].ID,
+			RunnerID: "runner-1", IdempotencyKey: "complete:model-skipped", Status: domain.ReadTaskEvidence,
+			Evidence: &investigation.EvidenceInput{Payload: payload, ContentHash: sha256Hex(payload), CollectedAt: now},
+		}); err != nil {
+			t.Fatalf("CompleteTask() error = %v", err)
+		}
+		result, err := repository.FinalizeInvestigation(context.Background(), investigation.FinalizeInvestigationRequest{
+			WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID,
+			IdempotencyKey: "finalize:model-skipped", Status: domain.InvestigationCompleted, ModelStatus: domain.ModelSkipped,
+		})
+		if err != nil || result.Investigation.ModelStatus != domain.ModelSkipped {
+			t.Fatalf("FinalizeInvestigation(SKIPPED) = %#v, %v", result, err)
+		}
+	})
+
+	for _, startRunning := range []bool{false, true} {
+		name := "cancelled from pending"
+		if startRunning {
+			name = "cancelled from running"
+		}
+		t.Run(name, func(t *testing.T) {
+			repository := newRepository(t, now)
+			suffix := "pending"
+			if startRunning {
+				suffix = "running"
+			}
+			incident := createIncident(t, repository, "workspace-1", "signal-model-cancelled-"+suffix, now)
+			created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+				WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:model-cancelled-" + suffix,
+				Tasks: []investigation.TaskSpec{{
+					Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+				}},
+			})
+			if err != nil {
+				t.Fatalf("CreateOrGetInvestigation() error = %v", err)
+			}
+			if startRunning {
+				payload := []byte(`{"series_count":3}`)
+				if _, err := repository.CompleteTask(context.Background(), investigation.CompleteTaskRequest{
+					WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID, TaskID: created.Tasks[0].ID,
+					RunnerID: "runner-1", IdempotencyKey: "complete:model-cancelled", Status: domain.ReadTaskEvidence,
+					Evidence: &investigation.EvidenceInput{Payload: payload, ContentHash: sha256Hex(payload), CollectedAt: now},
+				}); err != nil {
+					t.Fatalf("CompleteTask() error = %v", err)
+				}
+				startModel(t, repository, created.Investigation.ID, "model:start:cancelled")
+			}
+			result, err := repository.FinalizeInvestigation(context.Background(), investigation.FinalizeInvestigationRequest{
+				WorkspaceID: "workspace-1", InvestigationID: created.Investigation.ID,
+				IdempotencyKey: "finalize:model-cancelled-" + suffix,
+				Status:         domain.InvestigationCancelled, ModelStatus: domain.ModelCancelled, FailureCode: "cancelled",
+			})
+			if err != nil || result.Investigation.ModelStatus != domain.ModelCancelled {
+				t.Fatalf("FinalizeInvestigation(CANCELLED) = %#v, %v", result, err)
+			}
+		})
+	}
+}
+
 func newRepository(t *testing.T, now time.Time) *memory.Repository {
 	t.Helper()
 	var mu sync.Mutex
@@ -604,9 +1033,17 @@ func newRepository(t *testing.T, now time.Time) *memory.Repository {
 func testSignal(workspaceID, signalID, status string, observedAt time.Time) domain.Signal {
 	return domain.Signal{
 		ID: signalID, WorkspaceID: workspaceID, IntegrationID: "integration-1", Provider: "alertmanager",
-		ProviderEventID: signalID, PayloadHash: "payload-" + signalID, Fingerprint: "fingerprint-1",
+		ProviderEventID: signalID, PayloadHash: sha256Hex([]byte("payload-" + signalID)), Fingerprint: "fingerprint-1",
 		Status: status, Labels: map[string]string{"service": "payments"}, ObservedAt: observedAt,
 	}
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	result := make(map[string]string, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
 }
 
 func createIncident(t *testing.T, repository *memory.Repository, workspaceID, signalID string, now time.Time) domain.Incident {
@@ -628,4 +1065,13 @@ func createIncident(t *testing.T, repository *memory.Repository, workspaceID, si
 func sha256Hex(value []byte) string {
 	digest := sha256.Sum256(value)
 	return hex.EncodeToString(digest[:])
+}
+
+func startModel(t *testing.T, repository *memory.Repository, investigationID, idempotencyKey string) {
+	t.Helper()
+	if _, err := repository.StartModel(context.Background(), investigation.StartModelRequest{
+		WorkspaceID: "workspace-1", InvestigationID: investigationID, IdempotencyKey: idempotencyKey,
+	}); err != nil {
+		t.Fatalf("StartModel() error = %v", err)
+	}
 }

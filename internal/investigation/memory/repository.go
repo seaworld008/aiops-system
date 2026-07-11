@@ -2,15 +2,12 @@ package memory
 
 import (
 	"fmt"
-	"regexp"
 	"sync"
 	"time"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/investigation"
 )
-
-var generatedIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@-]*$`)
 
 type Options struct {
 	Clock     func() time.Time
@@ -20,24 +17,26 @@ type Options struct {
 type Repository struct {
 	mu sync.RWMutex
 
-	signals                      map[string]domain.Signal
-	incidents                    map[string]domain.Incident
-	activeIncidentByCorrelation  map[string]string
-	signalIncident               map[string]string
-	investigations               map[string]domain.Investigation
-	tasks                        map[string]domain.ReadTask
-	taskIDsByInvestigation       map[string][]string
-	activeInvestigation          map[string]string
-	investigationIdempotency     map[string]idempotencyRecord
-	evidence                     map[string]domain.Evidence
-	evidenceIDsByInvestigation   map[string][]string
-	receipts                     map[string]domain.RunnerEvidenceReceipt
-	taskCompletionIdempotency    map[string]taskCompletionRecord
-	hypotheses                   map[string]domain.Hypothesis
-	hypothesisIDsByInvestigation map[string][]string
-	finalizeIdempotency          map[string]finalizeRecord
-	feedback                     map[string]domain.Feedback
-	feedbackIdempotency          map[string]idempotencyRecord
+	signals                      map[scopeKey]domain.Signal
+	incidents                    map[scopeKey]domain.Incident
+	activeIncidentByCorrelation  map[scopeKey]string
+	signalIncident               map[scopeKey]string
+	investigations               map[scopeKey]domain.Investigation
+	tasks                        map[scopeKey]domain.ReadTask
+	taskIDsByInvestigation       map[scopeKey][]string
+	activeInvestigation          map[scopeKey]string
+	investigationIdempotency     map[scopeKey]idempotencyRecord
+	evidence                     map[scopeKey]domain.Evidence
+	evidenceIDsByInvestigation   map[scopeKey][]string
+	receipts                     map[scopeKey]domain.RunnerEvidenceReceipt
+	taskCompletionIdempotency    map[scopeKey]taskCompletionRecord
+	hypotheses                   map[scopeKey]domain.Hypothesis
+	hypothesisIDsByInvestigation map[scopeKey][]string
+	finalizeIdempotency          map[scopeKey]finalizeRecord
+	feedback                     map[scopeKey]domain.Feedback
+	feedbackIdempotency          map[scopeKey]idempotencyRecord
+	modelStartIdempotency        map[scopeKey]idempotencyRecord
+	idempotencyOwners            map[scopeKey]string
 
 	clock     func() time.Time
 	idFactory func() string
@@ -53,24 +52,26 @@ func New(options Options) (*Repository, error) {
 		return nil, fmt.Errorf("%w: clock returned zero time", investigation.ErrInvalidRequest)
 	}
 	return &Repository{
-		signals:                      make(map[string]domain.Signal),
-		incidents:                    make(map[string]domain.Incident),
-		activeIncidentByCorrelation:  make(map[string]string),
-		signalIncident:               make(map[string]string),
-		investigations:               make(map[string]domain.Investigation),
-		tasks:                        make(map[string]domain.ReadTask),
-		taskIDsByInvestigation:       make(map[string][]string),
-		activeInvestigation:          make(map[string]string),
-		investigationIdempotency:     make(map[string]idempotencyRecord),
-		evidence:                     make(map[string]domain.Evidence),
-		evidenceIDsByInvestigation:   make(map[string][]string),
-		receipts:                     make(map[string]domain.RunnerEvidenceReceipt),
-		taskCompletionIdempotency:    make(map[string]taskCompletionRecord),
-		hypotheses:                   make(map[string]domain.Hypothesis),
-		hypothesisIDsByInvestigation: make(map[string][]string),
-		finalizeIdempotency:          make(map[string]finalizeRecord),
-		feedback:                     make(map[string]domain.Feedback),
-		feedbackIdempotency:          make(map[string]idempotencyRecord),
+		signals:                      make(map[scopeKey]domain.Signal),
+		incidents:                    make(map[scopeKey]domain.Incident),
+		activeIncidentByCorrelation:  make(map[scopeKey]string),
+		signalIncident:               make(map[scopeKey]string),
+		investigations:               make(map[scopeKey]domain.Investigation),
+		tasks:                        make(map[scopeKey]domain.ReadTask),
+		taskIDsByInvestigation:       make(map[scopeKey][]string),
+		activeInvestigation:          make(map[scopeKey]string),
+		investigationIdempotency:     make(map[scopeKey]idempotencyRecord),
+		evidence:                     make(map[scopeKey]domain.Evidence),
+		evidenceIDsByInvestigation:   make(map[scopeKey][]string),
+		receipts:                     make(map[scopeKey]domain.RunnerEvidenceReceipt),
+		taskCompletionIdempotency:    make(map[scopeKey]taskCompletionRecord),
+		hypotheses:                   make(map[scopeKey]domain.Hypothesis),
+		hypothesisIDsByInvestigation: make(map[scopeKey][]string),
+		finalizeIdempotency:          make(map[scopeKey]finalizeRecord),
+		feedback:                     make(map[scopeKey]domain.Feedback),
+		feedbackIdempotency:          make(map[scopeKey]idempotencyRecord),
+		modelStartIdempotency:        make(map[scopeKey]idempotencyRecord),
+		idempotencyOwners:            make(map[scopeKey]string),
 		clock:                        options.Clock,
 		idFactory:                    options.IDFactory,
 	}, nil
@@ -95,12 +96,38 @@ type finalizeRecord struct {
 
 func (repository *Repository) newID() (string, error) {
 	id := repository.idFactory()
-	if len(id) == 0 || len(id) > 256 || !generatedIDPattern.MatchString(id) {
+	if !domain.ValidResourceID(id) {
 		return "", fmt.Errorf("%w: ID factory returned invalid ID", investigation.ErrInvalidRequest)
 	}
 	return id, nil
 }
 
-func scoped(workspaceID, id string) string {
-	return workspaceID + "\x00" + id
+type scopeKey struct {
+	workspaceID string
+	resourceID  string
+}
+
+func scoped(workspaceID, id string) scopeKey {
+	return scopeKey{workspaceID: workspaceID, resourceID: id}
+}
+
+func validResourceScope(workspaceID string, resourceIDs ...string) bool {
+	if !domain.ValidResourceID(workspaceID) {
+		return false
+	}
+	for _, resourceID := range resourceIDs {
+		if !domain.ValidResourceID(resourceID) {
+			return false
+		}
+	}
+	return true
+}
+
+func (repository *Repository) idempotencyOwnerMatches(key scopeKey, operation string) bool {
+	owner, exists := repository.idempotencyOwners[key]
+	return !exists || owner == operation
+}
+
+func (repository *Repository) bindIdempotencyOwner(key scopeKey, operation string) {
+	repository.idempotencyOwners[key] = operation
 }

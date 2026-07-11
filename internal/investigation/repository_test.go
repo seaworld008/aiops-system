@@ -1,6 +1,7 @@
 package investigation_test
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -32,6 +33,10 @@ func TestCanonicalTaskSpecsRejectConnectionAndCredentialMaterial(t *testing.T) {
 		"token":          `{"page_token":"opaque"}`,
 		"password":       `{"password":"redacted"}`,
 		"credential":     `{"credential_id":"id"}`,
+		"host and port":  `{"host":"db.internal","port":5432}`,
+		"dsn":            `{"dsn":"postgres://db.internal:5432/app"}`,
+		"name value":     `{"name":"endpoint","value":"https://internal.invalid"}`,
+		"proxy server":   `{"proxy_server":"proxy.internal:8443"}`,
 		"non-object":     `[]`,
 		"non-normalized": `{ "lookback_minutes": 15 }`,
 	} {
@@ -40,6 +45,20 @@ func TestCanonicalTaskSpecsRejectConnectionAndCredentialMaterial(t *testing.T) {
 			item.Input = []byte(input)
 			if _, _, err := investigation.CanonicalTaskSpecs([]investigation.TaskSpec{item}); !errors.Is(err, investigation.ErrInvalidRequest) {
 				t.Fatalf("CanonicalTaskSpecs() error = %v, want ErrInvalidRequest", err)
+			}
+		})
+	}
+
+	for name, query := range map[string]string{
+		"promql": `rate(http_requests_total{service="payments"}[5m]) > 0`,
+		"logql":  `{app="payments"} |= "timeout: upstream"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			input := []byte(`{"query":` + string(mustJSON(t, query)) + `}`)
+			item := valid
+			item.Input = input
+			if _, _, err := investigation.CanonicalTaskSpecs([]investigation.TaskSpec{item}); err != nil {
+				t.Fatalf("CanonicalTaskSpecs(query) error = %v", err)
 			}
 		})
 	}
@@ -54,4 +73,13 @@ func TestCanonicalTaskSpecsRejectConnectionAndCredentialMaterial(t *testing.T) {
 	if _, _, err := investigation.CanonicalTaskSpecs(tooMany); !errors.Is(err, investigation.ErrInvalidRequest) {
 		t.Fatalf("CanonicalTaskSpecs(13) error = %v, want ErrInvalidRequest", err)
 	}
+}
+
+func mustJSON(t *testing.T, value string) []byte {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	return encoded
 }

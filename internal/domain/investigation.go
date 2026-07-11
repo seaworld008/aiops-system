@@ -10,10 +10,12 @@ import (
 )
 
 const MaxInvestigationJSONBytes = 64 * 1024
+const MaxResourceIDBytes = 256
 
 var (
 	sha256HexPattern      = regexp.MustCompile(`^[a-f0-9]{64}$`)
 	identifierPattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@-]*$`)
+	idempotencyKeyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._:/-]{0,127}$`)
 	lowCardinalityPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]*$`)
 )
 
@@ -36,6 +38,7 @@ const (
 	ModelCompleted ModelStatus = "COMPLETED"
 	ModelFailed    ModelStatus = "FAILED"
 	ModelSkipped   ModelStatus = "SKIPPED"
+	ModelCancelled ModelStatus = "CANCELLED"
 )
 
 type Investigation struct {
@@ -233,13 +236,8 @@ func (evidence Evidence) Validate() error {
 	if err := validateHashedJSONObject(evidence.Payload, evidence.ContentHash); err != nil {
 		return fmt.Errorf("evidence payload: %w", err)
 	}
-	if len(evidence.Attributes) > 32 {
-		return fmt.Errorf("evidence attributes exceed limit")
-	}
-	for key, value := range evidence.Attributes {
-		if !lowCardinalityPattern.MatchString(key) || len(key) > 64 || len(value) > 512 {
-			return fmt.Errorf("evidence attribute is invalid")
-		}
+	if err := ValidateSafeAttributes(evidence.Attributes); err != nil {
+		return err
 	}
 	if evidence.CollectedAt.IsZero() || evidence.CreatedAt.IsZero() || evidence.CollectedAt.After(evidence.CreatedAt) {
 		return fmt.Errorf("evidence timestamps are invalid")
@@ -259,7 +257,7 @@ func (investigation Investigation) Validate() error {
 		return fmt.Errorf("invalid investigation status %q", investigation.Status)
 	}
 	switch investigation.ModelStatus {
-	case ModelPending, ModelRunning, ModelCompleted, ModelFailed, ModelSkipped:
+	case ModelPending, ModelRunning, ModelCompleted, ModelFailed, ModelSkipped, ModelCancelled:
 	default:
 		return fmt.Errorf("invalid model status %q", investigation.ModelStatus)
 	}
@@ -269,8 +267,15 @@ func (investigation Investigation) Validate() error {
 	if !ValidSHA256Hex(investigation.RequestHash) {
 		return fmt.Errorf("investigation request hash is invalid")
 	}
-	if investigation.FailureCode != "" && !ValidFailureCode(investigation.FailureCode) {
-		return fmt.Errorf("investigation failure code is invalid")
+	switch investigation.Status {
+	case InvestigationFailed, InvestigationCancelled:
+		if !ValidFailureCode(investigation.FailureCode) {
+			return fmt.Errorf("failed or cancelled investigation requires a bounded failure code")
+		}
+	default:
+		if investigation.FailureCode != "" {
+			return fmt.Errorf("investigation failure code requires FAILED or CANCELLED status")
+		}
 	}
 	if investigation.ModelStatus == ModelFailed {
 		if !ValidFailureCode(investigation.ModelFailureCode) {
@@ -300,10 +305,13 @@ func (investigation Investigation) Validate() error {
 			(investigation.ModelStatus != ModelCompleted && investigation.ModelStatus != ModelFailed && investigation.ModelStatus != ModelSkipped) {
 			return fmt.Errorf("completed investigation lifecycle is inconsistent")
 		}
-	case InvestigationFailed, InvestigationCancelled:
-		if investigation.CompletedAt.IsZero() ||
-			(investigation.ModelStatus != ModelFailed && investigation.ModelStatus != ModelSkipped) {
+	case InvestigationFailed:
+		if investigation.CompletedAt.IsZero() || investigation.ModelStatus != ModelFailed {
 			return fmt.Errorf("terminal investigation lifecycle is inconsistent")
+		}
+	case InvestigationCancelled:
+		if investigation.CompletedAt.IsZero() || investigation.ModelStatus != ModelCancelled {
+			return fmt.Errorf("cancelled investigation lifecycle is inconsistent")
 		}
 	}
 	return nil
@@ -313,8 +321,12 @@ func ValidSHA256Hex(value string) bool {
 	return sha256HexPattern.MatchString(value)
 }
 
+func ValidResourceID(value string) bool {
+	return validIdentifier(value, MaxResourceIDBytes)
+}
+
 func ValidIdempotencyKey(value string) bool {
-	return validIdentifier(value, 128)
+	return idempotencyKeyPattern.MatchString(value)
 }
 
 func ValidFailureCode(value string) bool {
@@ -337,10 +349,28 @@ func ValidateSafeJSONObject(value json.RawMessage) error {
 	if err := json.Unmarshal(value, &object); err != nil || object == nil {
 		return fmt.Errorf("JSON must be an object")
 	}
-	if err := rejectSensitiveJSONKeys(object); err != nil {
+	if err := rejectSensitiveJSON(object, nil); err != nil {
 		return err
 	}
 	return nil
+}
+
+func ValidateSafeAttributes(attributes map[string]string) error {
+	if len(attributes) > 32 {
+		return fmt.Errorf("evidence attributes exceed limit")
+	}
+	for key, value := range attributes {
+		if !lowCardinalityPattern.MatchString(key) || len(key) > 64 || len(value) > 512 ||
+			!ValidSafeMetadata(key, value) {
+			return fmt.Errorf("evidence attributes contain invalid or sensitive metadata")
+		}
+	}
+	return nil
+}
+
+func ValidSafeMetadata(name, value string) bool {
+	return !unsafeSecurityName(name) && !unsafeSecurityValue(value) &&
+		(normalizeSecurityName(name) != "name" || !unsafeSecurityName(value))
 }
 
 func validateHashedJSONObject(value json.RawMessage, hash string) error {
@@ -365,25 +395,64 @@ func timeWithin(value, notBefore, notAfter time.Time) bool {
 	return value.IsZero() || (!value.Before(notBefore) && !value.After(notAfter))
 }
 
-func rejectSensitiveJSONKeys(value any) error {
+func rejectSensitiveJSON(value any, path []string) error {
 	switch item := value.(type) {
 	case map[string]any:
 		for key, child := range item {
-			normalized := strings.NewReplacer("_", "", "-", "", ".", "", " ", "").Replace(strings.ToLower(key))
-			if strings.Contains(normalized, "credential") || strings.Contains(normalized, "authorization") ||
-				strings.Contains(normalized, "rawerror") || strings.Contains(normalized, "errorbody") {
-				return fmt.Errorf("JSON contains forbidden sensitive field")
+			if normalizeSecurityName(key) == "name" {
+				if name, ok := child.(string); ok && unsafeSecurityName(name) {
+					return fmt.Errorf("JSON contains forbidden sensitive metadata")
+				}
 			}
-			if err := rejectSensitiveJSONKeys(child); err != nil {
+		}
+		for key, child := range item {
+			nextPath := append(append([]string(nil), path...), key)
+			if unsafeSecurityName(key) || unsafeSecurityName(strings.Join(nextPath, ".")) {
+				return fmt.Errorf("JSON contains forbidden sensitive metadata")
+			}
+			if err := rejectSensitiveJSON(child, nextPath); err != nil {
 				return err
 			}
 		}
 	case []any:
 		for _, child := range item {
-			if err := rejectSensitiveJSONKeys(child); err != nil {
+			if err := rejectSensitiveJSON(child, path); err != nil {
 				return err
 			}
 		}
+	case string:
+		if unsafeSecurityValue(item) {
+			return fmt.Errorf("JSON contains forbidden sensitive metadata")
+		}
 	}
 	return nil
+}
+
+func normalizeSecurityName(value string) string {
+	return strings.NewReplacer("_", "", "-", "", ".", "", " ", "", "/", "").Replace(strings.ToLower(value))
+}
+
+func unsafeSecurityName(value string) bool {
+	normalized := normalizeSecurityName(value)
+	for _, marker := range []string{
+		"authorization", "credential", "rawerror", "errorbody", "secret", "token", "password", "cookie", "privatekey",
+	} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func unsafeSecurityValue(value string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	for _, marker := range []string{
+		"bearer ", "authorization:", "cookie:", "set-cookie", "begin private key", "begin rsa private key",
+		"private-key", "private_key",
+	} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
 }

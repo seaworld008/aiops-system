@@ -164,3 +164,119 @@ func TestInvestigationAndReadTaskValidateLifecycleShape(t *testing.T) {
 		t.Fatal("EVIDENCE ReadTask accepted missing EvidenceID")
 	}
 }
+
+func TestSafeJSONObjectRejectsSensitivePathsNamesAndValuesWithoutEcho(t *testing.T) {
+	const canary = "sensitive-canary-value"
+	unsafe := map[string]json.RawMessage{
+		"error body path": json.RawMessage(`{"error":{"body":"` + canary + `"}}`),
+		"authorization name value": json.RawMessage(
+			`{"headers":[{"name":"Authorization","value":"` + canary + `"}]}`,
+		),
+		"bearer value":      json.RawMessage(`{"message":"Bearer ` + canary + `"}`),
+		"cookie value":      json.RawMessage(`{"message":"Cookie: session=` + canary + `"}`),
+		"private key value": json.RawMessage(`{"message":"-----BEGIN PRIVATE KEY-----` + canary + `"}`),
+	}
+	for name, value := range unsafe {
+		t.Run(name, func(t *testing.T) {
+			err := domain.ValidateSafeJSONObject(value)
+			if err == nil {
+				t.Fatal("ValidateSafeJSONObject() error = nil, want sensitive input rejection")
+			}
+			if strings.Contains(err.Error(), canary) {
+				t.Fatalf("error echoed sensitive input: %v", err)
+			}
+		})
+	}
+}
+
+func TestEvidenceAttributesRejectSensitiveNamesAndValues(t *testing.T) {
+	now := time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC)
+	payload := json.RawMessage(`{"series_count":3}`)
+	valid := domain.Evidence{
+		ID: "evidence-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
+		InvestigationID: "investigation-1", TaskID: "task-1", ConnectorID: "prometheus-prod",
+		ContentHash: sha256Hex(payload), Payload: payload, CollectedAt: now, CreatedAt: now,
+	}
+	const canary = "attribute-sensitive-canary"
+	unsafe := []map[string]string{
+		{"authorization": canary},
+		{"credential_ref": canary},
+		{"raw_error_body": canary},
+		{"secret": canary},
+		{"access_token": canary},
+		{"password": canary},
+		{"name": "Authorization", "value": canary},
+		{"message": "Bearer " + canary},
+	}
+	for _, attributes := range unsafe {
+		item := valid
+		item.Attributes = attributes
+		err := item.Validate()
+		if err == nil {
+			t.Fatalf("Evidence.Validate() accepted unsafe attributes %#v", attributes)
+		}
+		if strings.Contains(err.Error(), canary) {
+			t.Fatalf("Evidence.Validate() echoed sensitive attribute: %v", err)
+		}
+	}
+}
+
+func TestIdempotencyKeyUsesDedicatedLowercaseBoundedGrammar(t *testing.T) {
+	for _, valid := range []string{"investigate:incident-1", "task/complete_1", "a.b-c:d/e"} {
+		if !domain.ValidIdempotencyKey(valid) {
+			t.Fatalf("ValidIdempotencyKey(%q) = false, want true", valid)
+		}
+	}
+	for _, invalid := range []string{
+		"Investigate:incident-1", "user@example", "with space", "line\nbreak", "nul\x00byte", strings.Repeat("a", 129),
+	} {
+		if domain.ValidIdempotencyKey(invalid) {
+			t.Fatalf("ValidIdempotencyKey(%q) = true, want false", invalid)
+		}
+	}
+}
+
+func TestInvestigationFailureCodeIsBoundToFailureStates(t *testing.T) {
+	now := time.Date(2026, 7, 12, 11, 30, 0, 0, time.UTC)
+	queued := domain.Investigation{
+		ID: "investigation-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
+		Status: domain.InvestigationQueued, ModelStatus: domain.ModelPending,
+		IdempotencyKey: "investigate:1", RequestHash: strings.Repeat("a", 64),
+		CreatedAt: now, UpdatedAt: now,
+	}
+	queued.FailureCode = "internal_failure"
+	if err := queued.Validate(); err == nil {
+		t.Fatal("QUEUED Investigation accepted FailureCode")
+	}
+
+	failed := queued
+	failed.Status = domain.InvestigationFailed
+	failed.ModelStatus = domain.ModelFailed
+	failed.ModelFailureCode = "model_unavailable"
+	failed.FailureCode = ""
+	failed.CompletedAt = now
+	if err := failed.Validate(); err == nil {
+		t.Fatal("FAILED Investigation accepted empty FailureCode")
+	}
+	failed.FailureCode = "internal_failure"
+	if err := failed.Validate(); err != nil {
+		t.Fatalf("FAILED Investigation valid failure code error = %v", err)
+	}
+}
+
+func TestCancelledInvestigationUsesDistinctModelCancelledStatus(t *testing.T) {
+	now := time.Date(2026, 7, 12, 13, 30, 0, 0, time.UTC)
+	cancelled := domain.Investigation{
+		ID: "investigation-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
+		Status: domain.InvestigationCancelled, ModelStatus: domain.ModelSkipped, FailureCode: "cancelled",
+		IdempotencyKey: "investigate:1", RequestHash: strings.Repeat("a", 64),
+		CreatedAt: now, CompletedAt: now, UpdatedAt: now,
+	}
+	if err := cancelled.Validate(); err == nil {
+		t.Fatal("CANCELLED Investigation accepted SKIPPED model status")
+	}
+	cancelled.ModelStatus = domain.ModelCancelled
+	if err := cancelled.Validate(); err != nil {
+		t.Fatalf("CANCELLED Investigation with ModelCancelled error = %v", err)
+	}
+}
