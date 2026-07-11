@@ -26,36 +26,39 @@ const (
 	testDBRunnerID    = "registered-write-runner-01"
 )
 
-const registrationQueryPattern = `(?s)SELECT runner_id, tenant_id::text, spiffe_uri, runner_pool, enabled,.*FROM runner_registrations.*WHERE spiffe_uri = \$1.*FOR SHARE`
+const registrationLocatorQueryPattern = `^SELECT runner_id, tenant_id::text, scope_revision FROM runner_registrations WHERE spiffe_uri = \$1$`
+const registrationLockQueryPattern = `(?s)SELECT runner_id, tenant_id::text, spiffe_uri, runner_pool, enabled,.*FROM runner_registrations.*WHERE runner_id = \$1 AND tenant_id = \$2::uuid.*FOR SHARE`
+const scopeBindingsQueryPattern = `(?s)SELECT workspace_id::text, environment_id::text.*FROM runner_scope_bindings AS binding.*FOR SHARE OF binding`
 const certificateQueryPattern = `(?s)SELECT runner_id, tenant_id::text, certificate_sha256, spki_sha256, serial_hex, issuer_key_id,.*FROM runner_certificates.*FOR SHARE`
 
 func TestRepositoryAuthenticateRejectsRegistrationMismatchUniformlyAndRollsBack(t *testing.T) {
 	tests := []struct {
-		name         string
-		registration func(identityFixture) []any
-		noRows       bool
+		name            string
+		registration    func(identityFixture) []any
+		noRows          bool
+		rejectAtLocator bool
 	}{
 		{name: "unknown", noRows: true},
 		{name: "invalid runner identifier", registration: func(f identityFixture) []any {
 			row := registrationRow(f, true, string(f.identity.Pool()), f.identity.SPIFFEURI(), 7, 3, false)
 			row[0] = "-invalid-runner"
 			return row
-		}},
+		}, rejectAtLocator: true},
 		{name: "invalid runner identifier character", registration: func(f identityFixture) []any {
 			row := registrationRow(f, true, string(f.identity.Pool()), f.identity.SPIFFEURI(), 7, 3, false)
 			row[0] = "runner with space"
 			return row
-		}},
+		}, rejectAtLocator: true},
 		{name: "oversized runner identifier", registration: func(f identityFixture) []any {
 			row := registrationRow(f, true, string(f.identity.Pool()), f.identity.SPIFFEURI(), 7, 3, false)
 			row[0] = strings.Repeat("r", 257)
 			return row
-		}},
+		}, rejectAtLocator: true},
 		{name: "invalid tenant", registration: func(f identityFixture) []any {
 			row := registrationRow(f, true, string(f.identity.Pool()), f.identity.SPIFFEURI(), 7, 3, false)
 			row[1] = "tenant-name"
 			return row
-		}},
+		}, rejectAtLocator: true},
 		{name: "disabled", registration: func(f identityFixture) []any {
 			return registrationRow(f, false, string(f.identity.Pool()), f.identity.SPIFFEURI(), 7, 3, false)
 		}},
@@ -67,7 +70,7 @@ func TestRepositoryAuthenticateRejectsRegistrationMismatchUniformlyAndRollsBack(
 		}},
 		{name: "invalid revision", registration: func(f identityFixture) []any {
 			return registrationRow(f, true, string(f.identity.Pool()), f.identity.SPIFFEURI(), 0, 3, false)
-		}},
+		}, rejectAtLocator: true},
 		{name: "invalid concurrency", registration: func(f identityFixture) []any {
 			return registrationRow(f, true, string(f.identity.Pool()), f.identity.SPIFFEURI(), 7, 0, false)
 		}},
@@ -85,11 +88,18 @@ func TestRepositoryAuthenticateRejectsRegistrationMismatchUniformlyAndRollsBack(
 				t.Fatalf("New() error = %v", err)
 			}
 			database.ExpectBegin()
-			expectation := database.ExpectQuery(registrationQueryPattern).WithArgs(fixture.identity.SPIFFEURI())
+			expectation := database.ExpectQuery(registrationLocatorQueryPattern).WithArgs(fixture.identity.SPIFFEURI())
 			if test.noRows {
-				expectation.WillReturnRows(pgxmock.NewRows(registrationColumns()))
+				expectation.WillReturnRows(pgxmock.NewRows(registrationLocatorColumns()))
 			} else {
-				expectation.WillReturnRows(pgxmock.NewRows(registrationColumns()).AddRow(test.registration(fixture)...))
+				row := test.registration(fixture)
+				expectation.WillReturnRows(pgxmock.NewRows(registrationLocatorColumns()).AddRow(row[0], row[1], row[5]))
+				if !test.rejectAtLocator {
+					expectDefaultScopeBindings(database)
+					database.ExpectQuery(registrationLockQueryPattern).
+						WithArgs(testDBRunnerID, testTenantID).
+						WillReturnRows(pgxmock.NewRows(registrationColumns()).AddRow(row...))
+				}
 			}
 			database.ExpectRollback()
 
@@ -120,7 +130,7 @@ func TestRepositoryAuthenticateRejectsCredentialRevocationCapabilityOnReadPool(t
 		t.Fatalf("New() error = %v", err)
 	}
 	database.ExpectBegin()
-	expectRegistration(database, fixture, true, 7, 3, true)
+	expectValidIdentityBeforeCertificate(database, fixture, true, 7, 3, true)
 	database.ExpectRollback()
 
 	authenticated, authenticateErr := repository.Authenticate(context.Background(), fixture.identity)
@@ -145,12 +155,8 @@ func TestRepositoryAuthenticateMapsUniqueSPIFFEToCertificateBoundDatabaseRunnerA
 	}
 
 	database.ExpectBegin()
-	expectRegistration(database, fixture, true, int64(7), 3, true)
+	expectValidIdentityBeforeCertificate(database, fixture, true, int64(7), 3, true)
 	expectCertificate(database, fixture, "ACTIVE", fixture.now)
-	database.ExpectQuery(`(?s)SELECT workspace_id::text, environment_id::text.*FROM runner_scope_bindings AS binding.*FOR SHARE OF binding`).
-		WithArgs(testDBRunnerID, testTenantID).
-		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "environment_id"}).
-			AddRow(testWorkspaceID, testEnvironmentID))
 	database.ExpectCommit()
 
 	authenticated, err := repository.Authenticate(context.Background(), fixture.identity)
@@ -208,9 +214,10 @@ func TestRepositoryAuthenticateMapsUniqueSPIFFEToCertificateBoundDatabaseRunnerA
 
 func TestRepositoryAuthenticateRejectsCertificateMismatchUniformlyAndRollsBack(t *testing.T) {
 	tests := []struct {
-		name   string
-		mutate func(row []any, fixture identityFixture)
-		noRows bool
+		name        string
+		mutate      func(row []any, fixture identityFixture)
+		databaseNow func(identityFixture) time.Time
+		noRows      bool
 	}{
 		{name: "unknown", noRows: true},
 		{name: "wrong runner", mutate: func(row []any, _ identityFixture) { row[0] = "other-runner" }},
@@ -226,11 +233,11 @@ func TestRepositoryAuthenticateRejectsCertificateMismatchUniformlyAndRollsBack(t
 		{name: "not after mismatch", mutate: func(row []any, fixture identityFixture) {
 			row[8] = fixture.identity.Evidence().NotAfter().Add(time.Second)
 		}},
-		{name: "expired at database statement", mutate: func(row []any, fixture identityFixture) {
-			row[9] = fixture.identity.Evidence().NotAfter()
+		{name: "expired at post-lock database time", databaseNow: func(fixture identityFixture) time.Time {
+			return fixture.identity.Evidence().NotAfter()
 		}},
-		{name: "not active at database statement", mutate: func(row []any, fixture identityFixture) {
-			row[9] = fixture.identity.Evidence().NotBefore().Add(-time.Second)
+		{name: "not active at post-lock database time", databaseNow: func(fixture identityFixture) time.Time {
+			return fixture.identity.Evidence().NotBefore().Add(-time.Second)
 		}},
 	}
 	for _, test := range tests {
@@ -246,15 +253,23 @@ func TestRepositoryAuthenticateRejectsCertificateMismatchUniformlyAndRollsBack(t
 				t.Fatalf("New() error = %v", err)
 			}
 			database.ExpectBegin()
-			expectRegistration(database, fixture, true, 7, 3, true)
+			expectValidIdentityBeforeCertificate(database, fixture, true, 7, 3, true)
 			expectation := database.ExpectQuery(certificateQueryPattern).
 				WithArgs(fixture.identity.Evidence().LeafSHA256())
 			if test.noRows {
 				expectation.WillReturnRows(pgxmock.NewRows(certificateColumns()))
 			} else {
-				row := certificateRow(fixture, "ACTIVE", fixture.now)
-				test.mutate(row, fixture)
+				row := certificateRow(fixture, "ACTIVE")
+				if test.mutate != nil {
+					test.mutate(row, fixture)
+				}
 				expectation.WillReturnRows(pgxmock.NewRows(certificateColumns()).AddRow(row...))
+				databaseNow := fixture.now
+				if test.databaseNow != nil {
+					databaseNow = test.databaseNow(fixture)
+				}
+				database.ExpectQuery(`SELECT clock_timestamp\(\)`).
+					WillReturnRows(pgxmock.NewRows([]string{"clock_timestamp"}).AddRow(databaseNow))
 			}
 			database.ExpectRollback()
 
@@ -296,9 +311,8 @@ func TestRepositoryAuthenticateRejectsInvalidExactScopeBindingsAndRollsBack(t *t
 				t.Fatalf("New() error = %v", err)
 			}
 			database.ExpectBegin()
-			expectRegistration(database, fixture, true, 7, 3, true)
-			expectCertificate(database, fixture, "ACTIVE", fixture.now)
-			database.ExpectQuery(`(?s)SELECT workspace_id::text, environment_id::text.*FROM runner_scope_bindings AS binding.*FOR SHARE OF binding`).
+			expectRegistrationLocator(database, fixture, testDBRunnerID, testTenantID, 7)
+			database.ExpectQuery(scopeBindingsQueryPattern).
 				WithArgs(testDBRunnerID, testTenantID).
 				WillReturnRows(test.rows)
 			database.ExpectRollback()
@@ -330,12 +344,8 @@ func TestRepositoryAuthenticateTxReusesCallerTransactionAndPreservesLockOrder(t 
 	if err != nil {
 		t.Fatalf("Begin() error = %v", err)
 	}
-	expectRegistration(database, fixture, true, 9, 4, true)
+	expectValidIdentityBeforeCertificate(database, fixture, true, 9, 4, true)
 	expectCertificate(database, fixture, "ACTIVE", fixture.now)
-	database.ExpectQuery(`(?s)SELECT workspace_id::text, environment_id::text.*FROM runner_scope_bindings AS binding.*FOR SHARE OF binding`).
-		WithArgs(testDBRunnerID, testTenantID).
-		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "environment_id"}).
-			AddRow(testWorkspaceID, testEnvironmentID))
 	database.ExpectQuery(`SELECT 1`).WillReturnRows(pgxmock.NewRows([]string{"one"}).AddRow(1))
 	database.ExpectRollback()
 
@@ -349,6 +359,78 @@ func TestRepositoryAuthenticateTxReusesCallerTransactionAndPreservesLockOrder(t 
 	}
 	if err := tx.Rollback(context.Background()); err != nil {
 		t.Fatalf("caller Rollback() error = %v", err)
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet PostgreSQL expectations: %v", err)
+	}
+}
+
+func TestRepositoryAuthenticateTxLocksScopeBeforeRegistrationAndCertificate(t *testing.T) {
+	fixture := newIdentityFixture(t, runneridentity.PoolWrite)
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock.NewPool() error = %v", err)
+	}
+	defer database.Close()
+	repository, err := runnerpostgres.New(database)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	database.ExpectBegin()
+	tx, err := database.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	database.ExpectQuery(registrationLocatorQueryPattern).
+		WithArgs(fixture.identity.SPIFFEURI()).
+		WillReturnRows(pgxmock.NewRows([]string{"runner_id", "tenant_id", "scope_revision"}).
+			AddRow(testDBRunnerID, testTenantID, int64(9)))
+	database.ExpectQuery(scopeBindingsQueryPattern).
+		WithArgs(testDBRunnerID, testTenantID).
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "environment_id"}).
+			AddRow(testWorkspaceID, testEnvironmentID))
+	database.ExpectQuery(registrationLockQueryPattern).
+		WithArgs(testDBRunnerID, testTenantID).
+		WillReturnRows(pgxmock.NewRows(registrationColumns()).
+			AddRow(registrationRow(fixture, true, string(fixture.identity.Pool()), fixture.identity.SPIFFEURI(), 9, 4, true)...))
+	expectCertificate(database, fixture, "ACTIVE", fixture.now)
+	database.ExpectRollback()
+
+	authenticated, authenticateErr := repository.AuthenticateTx(context.Background(), tx, fixture.identity)
+	if authenticateErr != nil || !authenticated.Valid() || authenticated.ScopeRevision() != 9 {
+		t.Fatalf("AuthenticateTx() = %#v, %v", authenticated, authenticateErr)
+	}
+	if err := tx.Rollback(context.Background()); err != nil {
+		t.Fatalf("caller Rollback() error = %v", err)
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet PostgreSQL expectations: %v", err)
+	}
+}
+
+func TestRepositoryAuthenticateRejectsScopeRevisionChangedAfterBindingSnapshot(t *testing.T) {
+	fixture := newIdentityFixture(t, runneridentity.PoolWrite)
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock.NewPool() error = %v", err)
+	}
+	defer database.Close()
+	repository, err := runnerpostgres.New(database)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	database.ExpectBegin()
+	expectRegistrationLocator(database, fixture, testDBRunnerID, testTenantID, 7)
+	expectDefaultScopeBindings(database)
+	database.ExpectQuery(registrationLockQueryPattern).
+		WithArgs(testDBRunnerID, testTenantID).
+		WillReturnRows(pgxmock.NewRows(registrationColumns()).
+			AddRow(registrationRow(fixture, true, string(fixture.identity.Pool()), fixture.identity.SPIFFEURI(), 8, 3, true)...))
+	database.ExpectRollback()
+
+	authenticated, authenticateErr := repository.Authenticate(context.Background(), fixture.identity)
+	if !errors.Is(authenticateErr, runneridentity.ErrAuthenticationFailed) || authenticated.Valid() {
+		t.Fatalf("Authenticate(scope revision drift) = %#v, %v; want rejection", authenticated, authenticateErr)
 	}
 	if err := database.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet PostgreSQL expectations: %v", err)
@@ -371,8 +453,8 @@ func TestRepositoryAuthenticateTxFailureLeavesCallerTransactionUsable(t *testing
 	if err != nil {
 		t.Fatalf("Begin() error = %v", err)
 	}
-	database.ExpectQuery(registrationQueryPattern).WithArgs(fixture.identity.SPIFFEURI()).
-		WillReturnRows(pgxmock.NewRows(registrationColumns()))
+	database.ExpectQuery(registrationLocatorQueryPattern).WithArgs(fixture.identity.SPIFFEURI()).
+		WillReturnRows(pgxmock.NewRows(registrationLocatorColumns()))
 	database.ExpectQuery(`SELECT 1`).WillReturnRows(pgxmock.NewRows([]string{"one"}).AddRow(1))
 	database.ExpectRollback()
 
@@ -438,7 +520,7 @@ func TestRepositoryCertificateQueryFailureIsDiagnosableAndRollsBack(t *testing.T
 		t.Fatalf("New() error = %v", err)
 	}
 	database.ExpectBegin()
-	expectRegistration(database, fixture, true, 7, 3, true)
+	expectValidIdentityBeforeCertificate(database, fixture, true, 7, 3, true)
 	database.ExpectQuery(certificateQueryPattern).WithArgs(fixture.identity.Evidence().LeafSHA256()).
 		WillReturnError(canary)
 	database.ExpectRollback()
@@ -450,6 +532,39 @@ func TestRepositoryCertificateQueryFailureIsDiagnosableAndRollsBack(t *testing.T
 	for _, sensitive := range []string{fixture.identity.SPIFFEURI(), fixture.identity.Evidence().LeafSHA256()} {
 		if strings.Contains(authenticateErr.Error(), sensitive) {
 			t.Fatalf("Authenticate(certificate query failure) leaked Runner identity %q: %v", sensitive, authenticateErr)
+		}
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet PostgreSQL expectations: %v", err)
+	}
+}
+
+func TestRepositoryPostLockClockFailureIsDiagnosableWithoutLeakingIdentity(t *testing.T) {
+	fixture := newIdentityFixture(t, runneridentity.PoolWrite)
+	canary := errors.New("post-lock-clock-canary")
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock.NewPool() error = %v", err)
+	}
+	defer database.Close()
+	repository, err := runnerpostgres.New(database)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	database.ExpectBegin()
+	expectValidIdentityBeforeCertificate(database, fixture, true, 7, 3, true)
+	database.ExpectQuery(certificateQueryPattern).WithArgs(fixture.identity.Evidence().LeafSHA256()).
+		WillReturnRows(pgxmock.NewRows(certificateColumns()).AddRow(certificateRow(fixture, "ACTIVE")...))
+	database.ExpectQuery(`SELECT clock_timestamp\(\)`).WillReturnError(canary)
+	database.ExpectRollback()
+
+	authenticated, authenticateErr := repository.Authenticate(context.Background(), fixture.identity)
+	if authenticated.Valid() || !errors.Is(authenticateErr, runnerpostgres.ErrDatabase) || !errors.Is(authenticateErr, canary) {
+		t.Fatalf("Authenticate(post-lock clock failure) = %#v, %v", authenticated, authenticateErr)
+	}
+	for _, sensitive := range []string{fixture.identity.SPIFFEURI(), fixture.identity.Evidence().LeafSHA256()} {
+		if strings.Contains(authenticateErr.Error(), sensitive) {
+			t.Fatalf("Authenticate(post-lock clock failure) leaked Runner identity %q: %v", sensitive, authenticateErr)
 		}
 	}
 	if err := database.ExpectationsWereMet(); err != nil {
@@ -470,12 +585,8 @@ func TestRepositoryCommitFailureIsDiagnosableAndAttemptsRollback(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 	database.ExpectBegin()
-	expectRegistration(database, fixture, true, 7, 3, true)
+	expectValidIdentityBeforeCertificate(database, fixture, true, 7, 3, true)
 	expectCertificate(database, fixture, "ACTIVE", fixture.now)
-	database.ExpectQuery(`(?s)SELECT workspace_id::text, environment_id::text.*FROM runner_scope_bindings AS binding.*FOR SHARE OF binding`).
-		WithArgs(testDBRunnerID, testTenantID).
-		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "environment_id"}).
-			AddRow(testWorkspaceID, testEnvironmentID))
 	database.ExpectCommit().WillReturnError(canary)
 	database.ExpectRollback()
 
@@ -535,7 +646,7 @@ func newIdentityFixture(t *testing.T, pool runneridentity.Pool) identityFixture 
 	return identityFixture{identity: identity, now: now}
 }
 
-func expectRegistration(
+func expectValidIdentityBeforeCertificate(
 	database pgxmock.PgxPoolIface,
 	fixture identityFixture,
 	enabled bool,
@@ -543,8 +654,10 @@ func expectRegistration(
 	maxConcurrency int,
 	revocationCapable bool,
 ) {
-	database.ExpectQuery(registrationQueryPattern).
-		WithArgs(fixture.identity.SPIFFEURI()).
+	expectRegistrationLocator(database, fixture, testDBRunnerID, testTenantID, revision)
+	expectDefaultScopeBindings(database)
+	database.ExpectQuery(registrationLockQueryPattern).
+		WithArgs(testDBRunnerID, testTenantID).
 		WillReturnRows(pgxmock.NewRows([]string{
 			"runner_id", "tenant_id", "spiffe_uri", "runner_pool", "enabled",
 			"scope_revision", "max_concurrency", "credential_revocation_capable",
@@ -552,6 +665,30 @@ func expectRegistration(
 			testDBRunnerID, testTenantID, fixture.identity.SPIFFEURI(), fixture.identity.Pool(), enabled,
 			revision, maxConcurrency, revocationCapable,
 		))
+}
+
+func expectRegistrationLocator(
+	database pgxmock.PgxPoolIface,
+	fixture identityFixture,
+	runnerID string,
+	tenantID string,
+	revision int64,
+) {
+	database.ExpectQuery(registrationLocatorQueryPattern).
+		WithArgs(fixture.identity.SPIFFEURI()).
+		WillReturnRows(pgxmock.NewRows(registrationLocatorColumns()).
+			AddRow(runnerID, tenantID, revision))
+}
+
+func expectDefaultScopeBindings(database pgxmock.PgxPoolIface) {
+	database.ExpectQuery(scopeBindingsQueryPattern).
+		WithArgs(testDBRunnerID, testTenantID).
+		WillReturnRows(pgxmock.NewRows([]string{"workspace_id", "environment_id"}).
+			AddRow(testWorkspaceID, testEnvironmentID))
+}
+
+func registrationLocatorColumns() []string {
+	return []string{"runner_id", "tenant_id", "scope_revision"}
 }
 
 func registrationColumns() []string {
@@ -577,23 +714,25 @@ func registrationRow(
 }
 
 func expectCertificate(database pgxmock.PgxPoolIface, fixture identityFixture, status string, databaseNow time.Time) {
-	database.ExpectQuery(`(?s)SELECT runner_id, tenant_id::text, certificate_sha256, spki_sha256, serial_hex, issuer_key_id,.*FROM runner_certificates.*FOR SHARE`).
+	database.ExpectQuery(`(?s)SELECT runner_id, tenant_id::text, certificate_sha256, spki_sha256, serial_hex, issuer_key_id,.*status, not_before, not_after.*FROM runner_certificates.*FOR SHARE`).
 		WithArgs(fixture.identity.Evidence().LeafSHA256()).
-		WillReturnRows(pgxmock.NewRows(certificateColumns()).AddRow(certificateRow(fixture, status, databaseNow)...))
+		WillReturnRows(pgxmock.NewRows(certificateColumns()).AddRow(certificateRow(fixture, status)...))
+	database.ExpectQuery(`SELECT clock_timestamp\(\)`).
+		WillReturnRows(pgxmock.NewRows([]string{"clock_timestamp"}).AddRow(databaseNow))
 }
 
 func certificateColumns() []string {
 	return []string{
 		"runner_id", "tenant_id", "certificate_sha256", "spki_sha256", "serial_hex", "issuer_key_id",
-		"status", "not_before", "not_after", "database_now",
+		"status", "not_before", "not_after",
 	}
 }
 
-func certificateRow(fixture identityFixture, status string, databaseNow time.Time) []any {
+func certificateRow(fixture identityFixture, status string) []any {
 	evidence := fixture.identity.Evidence()
 	return []any{
 		testDBRunnerID, testTenantID, evidence.LeafSHA256(), evidence.SPKISHA256(),
-		evidence.SerialHex(), evidence.AuthorityKeyIDHex(), status, evidence.NotBefore(), evidence.NotAfter(), databaseNow,
+		evidence.SerialHex(), evidence.AuthorityKeyIDHex(), status, evidence.NotBefore(), evidence.NotAfter(),
 	}
 }
 
