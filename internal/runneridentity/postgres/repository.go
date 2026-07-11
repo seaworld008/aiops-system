@@ -215,58 +215,23 @@ func (repository *Repository) AuthenticateTx(
 		return AuthenticatedRunner{}, err
 	}
 
-	var runnerID, tenantID, spiffeURI, pool string
-	var enabled, credentialRevocationCapable bool
-	var scopeRevision int64
-	var maxConcurrency int
+	// Scope mutation takes a binding lock before it bumps the registration
+	// revision. Locate the immutable key without locking registration, then use
+	// the observed revision as a fence around the binding snapshot below.
+	var locatedRunnerID, locatedTenantID string
+	var locatedScopeRevision int64
 	err := tx.QueryRow(ctx, `
-		SELECT runner_id, tenant_id::text, spiffe_uri, runner_pool, enabled,
-			scope_revision, max_concurrency, credential_revocation_capable
+		SELECT runner_id, tenant_id::text, scope_revision
 		FROM runner_registrations
 		WHERE spiffe_uri = $1
-		FOR SHARE
-	`, identity.SPIFFEURI()).Scan(
-		&runnerID, &tenantID, &spiffeURI, &pool, &enabled,
-		&scopeRevision, &maxConcurrency, &credentialRevocationCapable,
-	)
+	`, identity.SPIFFEURI()).Scan(&locatedRunnerID, &locatedTenantID, &locatedScopeRevision)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AuthenticatedRunner{}, runneridentity.ErrAuthenticationFailed
 	}
 	if err != nil {
-		return AuthenticatedRunner{}, databaseError("lock Runner registration", err)
+		return AuthenticatedRunner{}, databaseError("locate Runner registration", err)
 	}
-	if !validRunnerIdentifier(runnerID) || !validUUID(tenantID) || spiffeURI != identity.SPIFFEURI() || !enabled ||
-		pool != string(identity.Pool()) || identity.Evidence().RootPool() != identity.Pool() ||
-		scopeRevision <= 0 || maxConcurrency < 1 || maxConcurrency > 1024 ||
-		credentialRevocationCapable && identity.Pool() != runneridentity.PoolWrite {
-		return AuthenticatedRunner{}, runneridentity.ErrAuthenticationFailed
-	}
-
-	evidence := identity.Evidence()
-	var certificateRunnerID, certificateTenantID, certificateSHA256, spkiSHA256 string
-	var serialHex, issuerKeyID, status string
-	var notBefore, notAfter, databaseNow time.Time
-	err = tx.QueryRow(ctx, `
-		SELECT runner_id, tenant_id::text, certificate_sha256, spki_sha256, serial_hex, issuer_key_id,
-			status, not_before, not_after, statement_timestamp() AS database_now
-		FROM runner_certificates
-		WHERE certificate_sha256 = $1
-		FOR SHARE
-	`, evidence.LeafSHA256()).Scan(
-		&certificateRunnerID, &certificateTenantID, &certificateSHA256, &spkiSHA256, &serialHex, &issuerKeyID,
-		&status, &notBefore, &notAfter, &databaseNow,
-	)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return AuthenticatedRunner{}, runneridentity.ErrAuthenticationFailed
-	}
-	if err != nil {
-		return AuthenticatedRunner{}, databaseError("lock Runner certificate", err)
-	}
-	if certificateRunnerID != runnerID || certificateTenantID != tenantID || certificateSHA256 != evidence.LeafSHA256() ||
-		spkiSHA256 != evidence.SPKISHA256() || serialHex != evidence.SerialHex() || issuerKeyID != evidence.AuthorityKeyIDHex() ||
-		status != "ACTIVE" || !validFiniteTime(notBefore) || !validFiniteTime(notAfter) || !validFiniteTime(databaseNow) ||
-		!notBefore.Equal(evidence.NotBefore()) || !notAfter.Equal(evidence.NotAfter()) ||
-		databaseNow.Before(notBefore) || !databaseNow.Before(notAfter) {
+	if !validRunnerIdentifier(locatedRunnerID) || !validUUID(locatedTenantID) || locatedScopeRevision <= 0 {
 		return AuthenticatedRunner{}, runneridentity.ErrAuthenticationFailed
 	}
 
@@ -276,7 +241,7 @@ func (repository *Repository) AuthenticateTx(
 		WHERE binding.runner_id = $1 AND binding.tenant_id = $2::uuid
 		ORDER BY binding.workspace_id, binding.environment_id
 		FOR SHARE OF binding
-	`, runnerID, tenantID)
+	`, locatedRunnerID, locatedTenantID)
 	if err != nil {
 		return AuthenticatedRunner{}, databaseError("lock Runner scope bindings", err)
 	}
@@ -302,6 +267,68 @@ func (repository *Repository) AuthenticateTx(
 		return AuthenticatedRunner{}, databaseError("read Runner scope bindings", err)
 	}
 	if len(bindings) == 0 {
+		return AuthenticatedRunner{}, runneridentity.ErrAuthenticationFailed
+	}
+
+	var runnerID, tenantID, spiffeURI, pool string
+	var enabled, credentialRevocationCapable bool
+	var scopeRevision int64
+	var maxConcurrency int
+	err = tx.QueryRow(ctx, `
+		SELECT runner_id, tenant_id::text, spiffe_uri, runner_pool, enabled,
+			scope_revision, max_concurrency, credential_revocation_capable
+		FROM runner_registrations
+		WHERE runner_id = $1 AND tenant_id = $2::uuid
+		FOR SHARE
+	`, locatedRunnerID, locatedTenantID).Scan(
+		&runnerID, &tenantID, &spiffeURI, &pool, &enabled,
+		&scopeRevision, &maxConcurrency, &credentialRevocationCapable,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AuthenticatedRunner{}, runneridentity.ErrAuthenticationFailed
+	}
+	if err != nil {
+		return AuthenticatedRunner{}, databaseError("lock Runner registration", err)
+	}
+	// A scope change crossing the unlocked lookup/binding read must fail closed;
+	// otherwise this request could return old bindings under a newer revision.
+	if runnerID != locatedRunnerID || tenantID != locatedTenantID || scopeRevision != locatedScopeRevision ||
+		!validRunnerIdentifier(runnerID) || !validUUID(tenantID) || spiffeURI != identity.SPIFFEURI() || !enabled ||
+		pool != string(identity.Pool()) || identity.Evidence().RootPool() != identity.Pool() ||
+		scopeRevision <= 0 || maxConcurrency < 1 || maxConcurrency > 1024 ||
+		credentialRevocationCapable && identity.Pool() != runneridentity.PoolWrite {
+		return AuthenticatedRunner{}, runneridentity.ErrAuthenticationFailed
+	}
+
+	evidence := identity.Evidence()
+	var certificateRunnerID, certificateTenantID, certificateSHA256, spkiSHA256 string
+	var serialHex, issuerKeyID, status string
+	var notBefore, notAfter time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT runner_id, tenant_id::text, certificate_sha256, spki_sha256, serial_hex, issuer_key_id,
+			status, not_before, not_after
+		FROM runner_certificates
+		WHERE certificate_sha256 = $1
+		FOR SHARE
+	`, evidence.LeafSHA256()).Scan(
+		&certificateRunnerID, &certificateTenantID, &certificateSHA256, &spkiSHA256, &serialHex, &issuerKeyID,
+		&status, &notBefore, &notAfter,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AuthenticatedRunner{}, runneridentity.ErrAuthenticationFailed
+	}
+	if err != nil {
+		return AuthenticatedRunner{}, databaseError("lock Runner certificate", err)
+	}
+	var databaseNow time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&databaseNow); err != nil {
+		return AuthenticatedRunner{}, databaseError("read post-lock authentication time", err)
+	}
+	if certificateRunnerID != runnerID || certificateTenantID != tenantID || certificateSHA256 != evidence.LeafSHA256() ||
+		spkiSHA256 != evidence.SPKISHA256() || serialHex != evidence.SerialHex() || issuerKeyID != evidence.AuthorityKeyIDHex() ||
+		status != "ACTIVE" || !validFiniteTime(notBefore) || !validFiniteTime(notAfter) || !validFiniteTime(databaseNow) ||
+		!notBefore.Equal(evidence.NotBefore()) || !notAfter.Equal(evidence.NotAfter()) ||
+		databaseNow.Before(notBefore) || !databaseNow.Before(notAfter) {
 		return AuthenticatedRunner{}, runneridentity.ErrAuthenticationFailed
 	}
 	authenticated := AuthenticatedRunner{state: &authenticatedState{

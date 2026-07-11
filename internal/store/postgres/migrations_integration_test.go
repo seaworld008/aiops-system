@@ -243,6 +243,7 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	// Apply the latest expand migration over the exercised legacy dataset so
 	// the reverse pass only includes migrations that were actually installed.
 	applyMigrationFile(t, ctx, database, filepath.Join(migrationDirectory, "000010_investigation_runtime.up.sql"))
+	applyMigrationFile(t, ctx, database, filepath.Join(migrationDirectory, "000011_investigation_runner_ingress.up.sql"))
 	applyMigrations(t, ctx, database, migrationDirectory, ".down.sql", true)
 	var relationName *string
 	if err := database.QueryRow(ctx, `SELECT to_regclass('public.tenants')::text`).Scan(&relationName); err != nil {
