@@ -3,9 +3,13 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -21,6 +25,15 @@ const (
 	WriteExecutionModeNonProduction WriteExecutionMode = "non-production"
 )
 
+type RunnerGatewayConfig struct {
+	Addr              string
+	ServerCertFile    string
+	ServerKeyFile     string
+	ReadClientCAFile  string
+	WriteClientCAFile string
+	TrustDomain       string
+}
+
 type Config struct {
 	HTTPAddr             string
 	Environment          string
@@ -33,6 +46,7 @@ type Config struct {
 	OIDCMaxSessionAge    time.Duration
 	OIDCRecentAuthWindow time.Duration
 	WriteExecutionMode   WriteExecutionMode
+	RunnerGateway        *RunnerGatewayConfig
 }
 
 func Load() (Config, error) {
@@ -110,6 +124,11 @@ func Load() (Config, error) {
 	if (cfg.OIDCIssuer == "") != (cfg.OIDCClientID == "") {
 		return Config{}, fmt.Errorf("AIOPS_OIDC_ISSUER and AIOPS_OIDC_CLIENT_ID must be configured together")
 	}
+	runnerGateway, err := loadRunnerGatewayConfig(cfg.HTTPAddr, cfg.DatabaseURL)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.RunnerGateway = runnerGateway
 	if cfg.Environment == "production" && len(cfg.WebhookHMACSecrets) == 0 {
 		return Config{}, fmt.Errorf("AIOPS_WEBHOOK_HMAC_SECRETS_JSON is required in production")
 	}
@@ -121,6 +140,100 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func loadRunnerGatewayConfig(publicAddr, databaseURL string) (*RunnerGatewayConfig, error) {
+	values := []string{
+		os.Getenv("AIOPS_RUNNER_GATEWAY_ADDR"),
+		os.Getenv("AIOPS_RUNNER_GATEWAY_SERVER_CERT_FILE"),
+		os.Getenv("AIOPS_RUNNER_GATEWAY_SERVER_KEY_FILE"),
+		os.Getenv("AIOPS_RUNNER_GATEWAY_READ_CLIENT_CA_FILE"),
+		os.Getenv("AIOPS_RUNNER_GATEWAY_WRITE_CLIENT_CA_FILE"),
+		os.Getenv("AIOPS_RUNNER_TRUST_DOMAIN"),
+	}
+	nonEmpty := 0
+	for _, value := range values {
+		if value != "" {
+			nonEmpty++
+		}
+	}
+	if nonEmpty == 0 {
+		return nil, nil
+	}
+	if nonEmpty != len(values) {
+		return nil, fmt.Errorf("Runner Gateway configuration must be all present or all absent")
+	}
+	if databaseURL == "" {
+		return nil, fmt.Errorf("AIOPS_DATABASE_URL is required when Runner Gateway is configured")
+	}
+	configuration := &RunnerGatewayConfig{
+		Addr: values[0], ServerCertFile: values[1], ServerKeyFile: values[2],
+		ReadClientCAFile: values[3], WriteClientCAFile: values[4], TrustDomain: values[5],
+	}
+	if !validListenAddress(configuration.Addr) || configuration.Addr == publicAddr {
+		return nil, fmt.Errorf("AIOPS_RUNNER_GATEWAY_ADDR must be a distinct bounded TCP listen address")
+	}
+	paths := []string{
+		configuration.ServerCertFile, configuration.ServerKeyFile,
+		configuration.ReadClientCAFile, configuration.WriteClientCAFile,
+	}
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if !validAbsoluteConfigPath(path) {
+			return nil, fmt.Errorf("Runner Gateway certificate and key paths must be distinct clean absolute paths")
+		}
+		if _, duplicate := seen[path]; duplicate {
+			return nil, fmt.Errorf("Runner Gateway certificate and key paths must be distinct clean absolute paths")
+		}
+		seen[path] = struct{}{}
+	}
+	if !validTrustDomain(configuration.TrustDomain) {
+		return nil, fmt.Errorf("AIOPS_RUNNER_TRUST_DOMAIN must be a canonical lowercase DNS name")
+	}
+	return configuration, nil
+}
+
+func validListenAddress(value string) bool {
+	if value == "" || len(value) > 512 || strings.TrimSpace(value) != value || containsControl(value) {
+		return false
+	}
+	host, portText, err := net.SplitHostPort(value)
+	if err != nil || portText == "" {
+		return false
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 || strconv.Itoa(port) != portText {
+		return false
+	}
+	return host == "" || net.ParseIP(host) != nil || validTrustDomain(host)
+}
+
+func validAbsoluteConfigPath(value string) bool {
+	return value != "" && len(value) <= 4096 && filepath.IsAbs(value) && filepath.Clean(value) == value &&
+		strings.TrimSpace(value) == value && !containsControl(value)
+}
+
+func validTrustDomain(value string) bool {
+	if value == "" || len(value) > 253 || strings.ToLower(value) != value || strings.HasSuffix(value, ".") ||
+		strings.TrimSpace(value) != value || containsControl(value) || net.ParseIP(value) != nil {
+		return false
+	}
+	labels := strings.Split(value, ".")
+	for _, label := range labels {
+		if len(label) < 1 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, character := range label {
+			if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func containsControl(value string) bool {
+	return strings.IndexFunc(value, unicode.IsControl) >= 0
 }
 
 func valueOrDefault(key, fallback string) string {

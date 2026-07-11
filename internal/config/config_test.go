@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -8,6 +9,7 @@ import (
 )
 
 func TestLoadUsesSafeDefaults(t *testing.T) {
+	clearRunnerGatewayEnvironment(t)
 	t.Setenv("AIOPS_HTTP_ADDR", "")
 	t.Setenv("AIOPS_SHUTDOWN_TIMEOUT", "")
 	t.Setenv("AIOPS_ENVIRONMENT", "")
@@ -34,6 +36,127 @@ func TestLoadUsesSafeDefaults(t *testing.T) {
 	}
 	if cfg.OIDCRecentAuthWindow != 5*time.Minute {
 		t.Fatalf("OIDCRecentAuthWindow = %s, want 5m", cfg.OIDCRecentAuthWindow)
+	}
+	if cfg.RunnerGateway != nil {
+		t.Fatalf("RunnerGateway = %#v, want disabled", cfg.RunnerGateway)
+	}
+}
+
+func TestLoadAcceptsCompleteRunnerGatewayConfiguration(t *testing.T) {
+	clearRunnerGatewayEnvironment(t)
+	root := t.TempDir()
+	values := map[string]string{
+		"AIOPS_RUNNER_GATEWAY_ADDR":                 ":8443",
+		"AIOPS_RUNNER_GATEWAY_SERVER_CERT_FILE":     filepath.Join(root, "server-chain.pem"),
+		"AIOPS_RUNNER_GATEWAY_SERVER_KEY_FILE":      filepath.Join(root, "server-key.pem"),
+		"AIOPS_RUNNER_GATEWAY_READ_CLIENT_CA_FILE":  filepath.Join(root, "read-roots.pem"),
+		"AIOPS_RUNNER_GATEWAY_WRITE_CLIENT_CA_FILE": filepath.Join(root, "write-roots.pem"),
+		"AIOPS_RUNNER_TRUST_DOMAIN":                 "aiops.example.internal",
+	}
+	for key, value := range values {
+		t.Setenv(key, value)
+	}
+	t.Setenv("AIOPS_DATABASE_URL", "postgres://configured")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.RunnerGateway == nil {
+		t.Fatal("RunnerGateway = nil, want enabled configuration")
+	}
+	if cfg.RunnerGateway.Addr != ":8443" || cfg.RunnerGateway.TrustDomain != "aiops.example.internal" ||
+		cfg.RunnerGateway.ServerCertFile != values["AIOPS_RUNNER_GATEWAY_SERVER_CERT_FILE"] ||
+		cfg.RunnerGateway.ServerKeyFile != values["AIOPS_RUNNER_GATEWAY_SERVER_KEY_FILE"] ||
+		cfg.RunnerGateway.ReadClientCAFile != values["AIOPS_RUNNER_GATEWAY_READ_CLIENT_CA_FILE"] ||
+		cfg.RunnerGateway.WriteClientCAFile != values["AIOPS_RUNNER_GATEWAY_WRITE_CLIENT_CA_FILE"] {
+		t.Fatalf("RunnerGateway = %#v", cfg.RunnerGateway)
+	}
+}
+
+func TestLoadRejectsPartialRunnerGatewayConfiguration(t *testing.T) {
+	keys := []string{
+		"AIOPS_RUNNER_GATEWAY_ADDR",
+		"AIOPS_RUNNER_GATEWAY_SERVER_CERT_FILE",
+		"AIOPS_RUNNER_GATEWAY_SERVER_KEY_FILE",
+		"AIOPS_RUNNER_GATEWAY_READ_CLIENT_CA_FILE",
+		"AIOPS_RUNNER_GATEWAY_WRITE_CLIENT_CA_FILE",
+		"AIOPS_RUNNER_TRUST_DOMAIN",
+	}
+	for _, key := range keys {
+		t.Run(key, func(t *testing.T) {
+			clearRunnerGatewayEnvironment(t)
+			t.Setenv(key, "configured")
+			t.Setenv("AIOPS_DATABASE_URL", "postgres://configured")
+			if _, err := config.Load(); err == nil {
+				t.Fatalf("Load() error = nil with only %s, want all-or-none rejection", key)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsRunnerGatewayWithoutPostgreSQL(t *testing.T) {
+	setRunnerGatewayEnvironment(t)
+	t.Setenv("AIOPS_DATABASE_URL", "")
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load() error = nil, want PostgreSQL requirement")
+	}
+}
+
+func TestLoadRejectsInvalidRunnerTrustDomains(t *testing.T) {
+	for _, value := range []string{
+		"AIops.example.internal", "aiops.example.internal.", "*.example.internal", "https://example.internal",
+		"example.internal:443", "127.0.0.1", "-aiops.example", "aiops-.example", "aiops..example",
+		" aiops.example", "aiops.example ", "aiops_example.internal", "",
+	} {
+		t.Run(value, func(t *testing.T) {
+			setRunnerGatewayEnvironment(t)
+			t.Setenv("AIOPS_RUNNER_TRUST_DOMAIN", value)
+			if _, err := config.Load(); err == nil {
+				t.Fatalf("Load() error = nil for trust domain %q", value)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsUnsafeRunnerGatewayPathsAndAddresses(t *testing.T) {
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "relative cert", key: "AIOPS_RUNNER_GATEWAY_SERVER_CERT_FILE", value: "server.pem"},
+		{name: "unclean key", key: "AIOPS_RUNNER_GATEWAY_SERVER_KEY_FILE", value: "/safe/../server.key"},
+		{name: "control in ca", key: "AIOPS_RUNNER_GATEWAY_READ_CLIENT_CA_FILE", value: "/safe/read\n.pem"},
+		{name: "missing port", key: "AIOPS_RUNNER_GATEWAY_ADDR", value: "localhost"},
+		{name: "zero port", key: "AIOPS_RUNNER_GATEWAY_ADDR", value: ":0"},
+		{name: "public collision", key: "AIOPS_RUNNER_GATEWAY_ADDR", value: ":8080"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			setRunnerGatewayEnvironment(t)
+			t.Setenv(test.key, test.value)
+			if _, err := config.Load(); err == nil {
+				t.Fatalf("Load() error = nil for %s=%q", test.key, test.value)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsOverlappingRunnerGatewayFiles(t *testing.T) {
+	for _, pair := range [][2]string{
+		{"AIOPS_RUNNER_GATEWAY_SERVER_CERT_FILE", "AIOPS_RUNNER_GATEWAY_SERVER_KEY_FILE"},
+		{"AIOPS_RUNNER_GATEWAY_READ_CLIENT_CA_FILE", "AIOPS_RUNNER_GATEWAY_WRITE_CLIENT_CA_FILE"},
+	} {
+		t.Run(pair[0]+"="+pair[1], func(t *testing.T) {
+			setRunnerGatewayEnvironment(t)
+			shared := filepath.Join(t.TempDir(), "shared.pem")
+			t.Setenv(pair[0], shared)
+			t.Setenv(pair[1], shared)
+			if _, err := config.Load(); err == nil {
+				t.Fatal("Load() error = nil, want distinct file rejection")
+			}
+		})
 	}
 }
 
@@ -208,6 +331,33 @@ func setOIDCEnvironment(t *testing.T) {
 	t.Helper()
 	t.Setenv("AIOPS_OIDC_ISSUER", "https://keycloak.example.com/realms/aiops")
 	t.Setenv("AIOPS_OIDC_CLIENT_ID", "aiops-control-plane")
+}
+
+func clearRunnerGatewayEnvironment(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"AIOPS_RUNNER_GATEWAY_ADDR",
+		"AIOPS_RUNNER_GATEWAY_SERVER_CERT_FILE",
+		"AIOPS_RUNNER_GATEWAY_SERVER_KEY_FILE",
+		"AIOPS_RUNNER_GATEWAY_READ_CLIENT_CA_FILE",
+		"AIOPS_RUNNER_GATEWAY_WRITE_CLIENT_CA_FILE",
+		"AIOPS_RUNNER_TRUST_DOMAIN",
+	} {
+		t.Setenv(key, "")
+	}
+}
+
+func setRunnerGatewayEnvironment(t *testing.T) {
+	t.Helper()
+	clearRunnerGatewayEnvironment(t)
+	root := t.TempDir()
+	t.Setenv("AIOPS_RUNNER_GATEWAY_ADDR", ":8443")
+	t.Setenv("AIOPS_RUNNER_GATEWAY_SERVER_CERT_FILE", filepath.Join(root, "server-chain.pem"))
+	t.Setenv("AIOPS_RUNNER_GATEWAY_SERVER_KEY_FILE", filepath.Join(root, "server-key.pem"))
+	t.Setenv("AIOPS_RUNNER_GATEWAY_READ_CLIENT_CA_FILE", filepath.Join(root, "read-roots.pem"))
+	t.Setenv("AIOPS_RUNNER_GATEWAY_WRITE_CLIENT_CA_FILE", filepath.Join(root, "write-roots.pem"))
+	t.Setenv("AIOPS_RUNNER_TRUST_DOMAIN", "aiops.example.internal")
+	t.Setenv("AIOPS_DATABASE_URL", "postgres://configured")
 }
 
 func TestLoadRejectsUnknownEnvironment(t *testing.T) {
