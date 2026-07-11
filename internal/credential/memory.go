@@ -26,6 +26,8 @@ type memoryRevocationRecord struct {
 	childCreatePermitSHA256 string
 	childCreateAuthorizedAt time.Time
 	childCreateTTL          time.Duration
+	retryCycleAttemptBase   int
+	retryCycleStartedAt     time.Time
 	claimTokenSHA256        string
 	completedClaimSHA256    string
 	completedClaimEpoch     int64
@@ -37,6 +39,7 @@ type memoryPreparedClaim struct {
 	record   *memoryRevocationRecord
 	token    string
 	accessor *SensitiveReference
+	poison   bool
 }
 
 type MemoryRepository struct {
@@ -82,7 +85,8 @@ func (repository *MemoryRepository) Prepare(ctx context.Context, request Prepare
 	request.CredentialExpiresAt = CanonicalCredentialExpiry(request.CredentialExpiresAt)
 	now := repository.now()
 	if !ValidRevocationID(request.RevocationID) || !validActionFence(request.Fence) ||
-		!ValidOpaqueText(request.Issuer, 256) || request.CredentialExpiresAt.IsZero() || !request.CredentialExpiresAt.After(now) ||
+		!ValidOpaqueText(request.Issuer, 256) || !ValidIdentifier(request.IssuerRevision, 256) ||
+		request.CredentialExpiresAt.IsZero() || !request.CredentialExpiresAt.After(now) ||
 		request.CredentialExpiresAt.After(CanonicalCredentialExpiry(now.Add(MaxCredentialTTL))) {
 		return PrepareResult{}, ErrInvalidRevocationRequest
 	}
@@ -137,7 +141,8 @@ func (repository *MemoryRepository) Prepare(ctx context.Context, request Prepare
 		ID: request.RevocationID, TenantID: metadata.TenantID, WorkspaceID: metadata.WorkspaceID,
 		EnvironmentID: metadata.EnvironmentID, ActionID: metadata.ActionID, TargetKey: metadata.TargetKey,
 		Production: metadata.Production, RunnerID: metadata.RunnerID, ActionLeaseEpoch: metadata.LeaseEpoch,
-		Issuer: request.Issuer, ConnectorID: metadata.ConnectorID, Permission: metadata.Permission, Resource: metadata.Resource,
+		Issuer: request.Issuer, IssuerRevision: request.IssuerRevision, ConnectorID: metadata.ConnectorID,
+		Permission: metadata.Permission, Resource: metadata.Resource,
 		CredentialExpiresAt: request.CredentialExpiresAt, Status: StatusPrepared, AvailableAt: now,
 		CreatedAt: now, UpdatedAt: now, Version: 1,
 	}
@@ -389,9 +394,125 @@ func (repository *MemoryRepository) RecoverPrepared(ctx context.Context, request
 	if len(candidates) > request.Limit {
 		candidates = candidates[:request.Limit]
 	}
-	recovered := make([]Revocation, 0, len(candidates))
+	recovered := make([]Revocation, 0, min(request.Limit, len(candidates)))
 	for _, record := range candidates {
 		record.revocation.Status = StatusNoCredential
+		record.bump(now)
+		recovered = append(recovered, publicMemoryRevocation(record))
+	}
+	return recovered, nil
+}
+
+func (repository *MemoryRepository) RecoverManaged(ctx context.Context, request RecoverManagedRequest) ([]Revocation, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	if request.Limit < 1 || request.Limit > MaxRevocationClaimBatch {
+		return nil, ErrInvalidRevocationRequest
+	}
+	type candidate struct {
+		id        string
+		actionID  string
+		managedAt time.Time
+	}
+	repository.mu.Lock()
+	candidates := make([]candidate, 0, request.Limit)
+	for _, record := range repository.records {
+		if record.revocation.Status != StatusAnchored && record.revocation.Status != StatusActive {
+			continue
+		}
+		managedAt := record.revocation.AnchoredAt
+		if record.revocation.Status == StatusActive {
+			managedAt = record.revocation.ActivatedAt
+		}
+		candidates = append(candidates, candidate{
+			id: record.revocation.ID, actionID: record.revocation.ActionID, managedAt: managedAt,
+		})
+	}
+	repository.mu.Unlock()
+	sort.Slice(candidates, func(i, j int) bool {
+		if !candidates[i].managedAt.Equal(candidates[j].managedAt) {
+			return candidates[i].managedAt.Before(candidates[j].managedAt)
+		}
+		return candidates[i].id < candidates[j].id
+	})
+	recovered := make([]Revocation, 0, min(request.Limit, len(candidates)))
+	for _, item := range candidates {
+		if len(recovered) == request.Limit {
+			break
+		}
+		var transitioned Revocation
+		transitionedNow := false
+		err := repository.withLockedActionInspection(ctx, item.actionID, func(inspection ActionInspection) error {
+			now := repository.now()
+			repository.mu.Lock()
+			defer repository.mu.Unlock()
+			record := repository.records[item.id]
+			if record == nil || (record.revocation.Status != StatusAnchored && record.revocation.Status != StatusActive) {
+				return nil
+			}
+			current := inspectionScopeMatches(record.revocation, inspection.Metadata) &&
+				inspectionFenceCurrent(record, inspection, now, MinPostChildFenceWindow)
+			if record.revocation.Status == StatusAnchored &&
+				!record.revocation.AnchoredAt.Add(ManagedAnchorRecoveryGrace).After(now) {
+				current = false
+			}
+			if current {
+				return nil
+			}
+			if err := applyRequestRevocation(record, now); err != nil {
+				return err
+			}
+			transitioned = publicMemoryRevocation(record)
+			transitionedNow = true
+			return nil
+		})
+		if err != nil {
+			return recovered, err
+		}
+		if transitionedNow {
+			recovered = append(recovered, transitioned)
+		}
+	}
+	return recovered, nil
+}
+
+func (repository *MemoryRepository) RecoverExhausted(ctx context.Context, request RecoverExhaustedRequest) ([]Revocation, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	if request.Limit < 1 || request.Limit > MaxRevocationClaimBatch {
+		return nil, ErrInvalidRevocationRequest
+	}
+	now := repository.now()
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	candidates := make([]*memoryRevocationRecord, 0, request.Limit)
+	for _, record := range repository.records {
+		pending := record.revocation.Status == StatusRevocationPending
+		expiredClaim := record.revocation.Status == StatusRevoking && !record.revocation.ClaimExpiresAt.After(now)
+		if (pending || expiredClaim) && memoryRevocationExhausted(record, now) {
+			candidates = append(candidates, record)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		left, right := candidates[i].revocation, candidates[j].revocation
+		if !left.RevocationRequestedAt.Equal(right.RevocationRequestedAt) {
+			return left.RevocationRequestedAt.Before(right.RevocationRequestedAt)
+		}
+		return left.ID < right.ID
+	})
+	if len(candidates) > request.Limit {
+		candidates = candidates[:request.Limit]
+	}
+	recovered := make([]Revocation, 0, len(candidates))
+	for _, record := range candidates {
+		record.revocation.Status = StatusManualRequired
+		record.revocation.FailureCount++
+		record.revocation.FailureCode = FailureUnknown
+		record.revocation.FailureDetailSHA256 = SHA256Hex([]byte(FailureDetailExhaustedWithoutAck))
+		record.revocation.ManualRequiredAt = now
+		record.clearActiveClaim()
 		record.bump(now)
 		recovered = append(recovered, publicMemoryRevocation(record))
 	}
@@ -429,6 +550,8 @@ func applyRequestRevocation(record *memoryRevocationRecord, now time.Time) error
 		record.revocation.Status = StatusRevocationPending
 		record.revocation.AvailableAt = now
 		record.revocation.RevocationRequestedAt = now
+		record.retryCycleAttemptBase = record.revocation.Attempt
+		record.retryCycleStartedAt = now
 		record.bump(now)
 	case StatusRevocationPending, StatusRevoking, StatusManualRequired, StatusRevoked:
 		return nil
@@ -454,7 +577,7 @@ func (repository *MemoryRepository) ClaimRevocations(ctx context.Context, reques
 	for _, record := range repository.records {
 		pending := record.revocation.Status == StatusRevocationPending && !record.revocation.AvailableAt.After(now)
 		expired := record.revocation.Status == StatusRevoking && !record.revocation.ClaimExpiresAt.After(now)
-		if pending || expired {
+		if (pending || expired) && !memoryRevocationExhausted(record, now) {
 			candidates = append(candidates, record)
 		}
 	}
@@ -482,12 +605,13 @@ func (repository *MemoryRepository) ClaimRevocations(ctx context.Context, reques
 			destroyPreparedClaims(prepared)
 			return nil, fmt.Errorf("generate credential revocation claim token: %w", ErrInvalidRevocationRequest)
 		}
-		accessor, err := repository.protector.Unprotect(referenceContext(record.revocation), record.protected)
-		if err != nil {
-			destroyPreparedClaims(prepared)
-			return nil, ErrReferenceProtection
+		accessor, openErr := repository.protector.Unprotect(referenceContext(record.revocation), record.protected)
+		poison := openErr != nil || !ValidSensitiveReference(accessor)
+		if poison && accessor != nil {
+			accessor.Destroy()
+			accessor = nil
 		}
-		prepared = append(prepared, memoryPreparedClaim{record: record, token: token, accessor: accessor})
+		prepared = append(prepared, memoryPreparedClaim{record: record, token: token, accessor: accessor, poison: poison})
 	}
 
 	claims := make([]ClaimedRevocation, 0, len(prepared))
@@ -502,6 +626,16 @@ func (repository *MemoryRepository) ClaimRevocations(ctx context.Context, reques
 		record.revocation.Attempt++
 		record.claimTokenSHA256 = SHA256Hex([]byte(item.token))
 		record.bump(now)
+		if item.poison {
+			record.revocation.Status = StatusManualRequired
+			record.revocation.FailureCount++
+			record.revocation.FailureCode = FailureInvalidReference
+			record.revocation.FailureDetailSHA256 = SHA256Hex([]byte(FailureDetailProtectedRefInvalid))
+			record.revocation.ManualRequiredAt = now
+			record.clearActiveClaim()
+			record.bump(now)
+			continue
+		}
 		claims = append(claims, ClaimedRevocation{
 			Revocation: publicMemoryRevocation(record),
 			Fence:      ClaimFence{RevocationID: record.revocation.ID, WorkerID: request.WorkerID, Token: item.token, Epoch: record.revocation.ClaimEpoch},
@@ -568,10 +702,16 @@ func (repository *MemoryRepository) CompleteRevocation(ctx context.Context, requ
 }
 
 func (repository *MemoryRepository) RetryRevocation(ctx context.Context, request RetryRevocationRequest) (Revocation, error) {
-	if request.Delay < 0 || request.Delay > MaxRevocationRetryDelay || !validFailure(request.FailureCode, request.FailureDetail) {
+	if request.Delay < MinRevocationRetryDelay || request.Delay > MaxRevocationRetryDelay ||
+		!validFailure(request.FailureCode, request.FailureDetail) {
 		return Revocation{}, ErrInvalidRevocationRequest
 	}
 	return repository.failClaim(ctx, request.Fence, request.FailureCode, request.FailureDetail, func(record *memoryRevocationRecord, now time.Time) {
+		if memoryRevocationExhausted(record, now) {
+			record.revocation.Status = StatusManualRequired
+			record.revocation.ManualRequiredAt = now
+			return
+		}
 		record.revocation.Status = StatusRevocationPending
 		record.revocation.AvailableAt = now.Add(request.Delay)
 	})
@@ -609,6 +749,8 @@ func (repository *MemoryRepository) RequeueManual(ctx context.Context, request R
 	}
 	record.revocation.Status = StatusRevocationPending
 	record.revocation.AvailableAt = now
+	record.retryCycleAttemptBase = record.revocation.Attempt
+	record.retryCycleStartedAt = now
 	record.bump(now)
 	return publicMemoryRevocation(record), nil
 }
@@ -909,11 +1051,17 @@ func matchesMemoryClaim(record *memoryRevocationRecord, fence ClaimFence, digest
 		record.revocation.ClaimEpoch == fence.Epoch && record.claimTokenSHA256 == digest && record.revocation.ClaimExpiresAt.After(now)
 }
 
+func memoryRevocationExhausted(record *memoryRevocationRecord, now time.Time) bool {
+	return record.revocation.Attempt-record.retryCycleAttemptBase >= MaxRevocationAttempts ||
+		record.retryCycleStartedAt.IsZero() || !record.retryCycleStartedAt.Add(MaxRevocationElapsed).After(now)
+}
+
 func samePrepare(existing Revocation, request PrepareRequest, metadata ActionMetadata) bool {
 	return existing.ActionID == metadata.ActionID && existing.TenantID == metadata.TenantID &&
 		existing.WorkspaceID == metadata.WorkspaceID && existing.EnvironmentID == metadata.EnvironmentID &&
 		existing.TargetKey == metadata.TargetKey && existing.Production == metadata.Production && existing.RunnerID == metadata.RunnerID &&
 		existing.ActionLeaseEpoch == metadata.LeaseEpoch && existing.Issuer == request.Issuer &&
+		existing.IssuerRevision == request.IssuerRevision &&
 		existing.ConnectorID == metadata.ConnectorID && existing.Permission == metadata.Permission && existing.Resource == metadata.Resource &&
 		existing.CredentialExpiresAt.Equal(CanonicalCredentialExpiry(request.CredentialExpiresAt))
 }
@@ -947,6 +1095,7 @@ func referenceContext(revocation Revocation) ReferenceContext {
 	return ReferenceContext{
 		RevocationID: revocation.ID, ActionID: revocation.ActionID,
 		ActionEpoch: revocation.ActionLeaseEpoch, Issuer: revocation.Issuer,
+		IssuerRevision: revocation.IssuerRevision,
 	}
 }
 

@@ -27,6 +27,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode"
@@ -118,7 +119,8 @@ func TestVault203IntegrationPostgresDSNRequiresExplicitNumericLoopback(t *testin
 // This test exercises Vault 2.0.3 and PostgreSQL 16 through real HTTP APIs.
 // The raw setup helper is intentionally independent from the production Vault
 // client's private response validators. The production path is exercised only
-// through exported Profile and Client APIs over a TLS 1.3 / HTTP/1.1 proxy.
+// through exported Profile, IssuerClient, and RevocationClient APIs over a TLS
+// 1.3 / HTTP/1.1 proxy.
 // This dev-mode proxy is not evidence for real Vault server PKI, namespaces,
 // HA/failover, audit canaries, or production listener/network-policy gates.
 //
@@ -178,7 +180,10 @@ type vault203Fixture struct {
 	manager            *integrationToken
 	revoker            *integrationToken
 	proxy              *integrationTLSProxy
-	client             *vaultclient.Client
+	issuer             *vaultclient.IssuerClient
+	revocation         *vaultclient.RevocationClient
+	managerSource      *integrationTokenSource
+	revokerSource      *integrationTokenSource
 }
 
 type integrationVaultHTTPClient struct {
@@ -249,6 +254,7 @@ type integrationTLSProxy struct {
 type integrationTokenSource struct {
 	sourceID string
 	token    []byte
+	requests atomic.Int64
 }
 
 func (source *integrationTokenSource) SourceID() string { return source.sourceID }
@@ -257,6 +263,7 @@ func (source *integrationTokenSource) Token(ctx context.Context) (credential.Sen
 	if source == nil || ctx == nil || ctx.Err() != nil || !validIntegrationBearer(source.token) {
 		return credential.SensitiveValue{}, errors.New("integration token source unavailable")
 	}
+	source.requests.Add(1)
 	return credential.NewSensitiveValue(source.token)
 }
 
@@ -422,8 +429,8 @@ func newVault203Fixture(t *testing.T) *vault203Fixture {
 		http.MethodGet + " /v1/" + fixture.kvMount + "/" + fixture.kvSecret:                 {},
 	}
 	fixture.proxy = newIntegrationTLSProxy(t, parsedAddress, allowed)
-	managerSource := &integrationTokenSource{sourceID: "manager-src-" + suffix, token: fixture.manager.token}
-	revokerSource := &integrationTokenSource{sourceID: "revoker-src-" + suffix, token: fixture.revoker.token}
+	fixture.managerSource = &integrationTokenSource{sourceID: "manager-src-" + suffix, token: fixture.manager.token}
+	fixture.revokerSource = &integrationTokenSource{sourceID: "revoker-src-" + suffix, token: fixture.revoker.token}
 	profile, err := vaultclient.NewProfile(vaultclient.ProfileConfig{
 		IssuerID: fixture.profileID, Revision: fixture.profileRevision,
 		Address: fixture.proxy.server.URL, ServerName: "127.0.0.1", CAPEM: fixture.proxy.caPEM,
@@ -438,9 +445,22 @@ func newVault203Fixture(t *testing.T) *vault203Fixture {
 	if err != nil {
 		t.Fatal("could not construct the immutable production Vault profile")
 	}
-	fixture.client, err = vaultclient.NewClient(profile, managerSource, revokerSource)
+	fixture.issuer, err = vaultclient.NewIssuerClient(profile, fixture.managerSource)
 	if err != nil {
-		t.Fatal("could not construct the production Vault client")
+		t.Fatal("could not construct the production Vault issuer client")
+	}
+	fixture.revocation, err = vaultclient.NewRevocationClient(profile, fixture.revokerSource)
+	if err != nil {
+		t.Fatal("could not construct the production Vault revocation client")
+	}
+	type accessorRevoker interface {
+		RevokeAccessor(context.Context, *credential.SensitiveReference) error
+	}
+	if _, exposed := any(fixture.issuer).(accessorRevoker); exposed {
+		t.Fatal("production Vault issuer client exposed revocation capability")
+	}
+	if _, exposed := any(fixture.revocation).(credential.DurableIssuer); exposed {
+		t.Fatal("production Vault revocation client exposed issuance capability")
 	}
 	return fixture
 }
@@ -1511,7 +1531,7 @@ func (fixture *vault203Fixture) assertDatabaseCredentialRejected(
 func (fixture *vault203Fixture) proveProductionClientClosure(t *testing.T) {
 	t.Helper()
 	managerCtx, managerCancel := integrationOperationContext()
-	managerErr := fixture.client.ValidateManager(managerCtx)
+	managerErr := fixture.issuer.ValidateManager(managerCtx)
 	managerCancel()
 	if managerErr != nil {
 		t.Fatal("production Vault client rejected the real entity-free orphan manager")
@@ -1523,7 +1543,7 @@ func (fixture *vault203Fixture) proveProductionClientClosure(t *testing.T) {
 		DatabaseAuthorizedAt: authorizedAt, TTL: 2 * time.Minute, CredentialExpiresAt: deadline,
 	}
 	createCtx, createCancel := integrationOperationContext()
-	child, err := fixture.client.CreateChild(createCtx, createRequest)
+	child, err := fixture.issuer.CreateChild(createCtx, createRequest)
 	createCancel()
 	var accessor []byte
 	defer clear(accessor)
@@ -1545,7 +1565,7 @@ func (fixture *vault203Fixture) proveProductionClientClosure(t *testing.T) {
 	defer child.Token.Destroy()
 	defer child.Accessor.Destroy()
 	inspectCtx, inspectCancel := integrationOperationContext()
-	inspectErr := fixture.client.InspectChild(inspectCtx, child.Accessor, credential.DurableChildInspectionRequest{
+	inspectErr := fixture.issuer.InspectChild(inspectCtx, child.Accessor, credential.DurableChildInspectionRequest{
 		RevocationID: createRequest.RevocationID, ProfileRevision: fixture.profileRevision,
 		CredentialExpiresAt: deadline, ExpectedTTL: 2 * time.Minute,
 	})
@@ -1554,7 +1574,7 @@ func (fixture *vault203Fixture) proveProductionClientClosure(t *testing.T) {
 		t.Fatal("production Vault client rejected its real metadata-bound child during lookup-accessor inspection")
 	}
 	issueCtx, issueCancel := integrationOperationContext()
-	dynamic, err := fixture.client.IssueDynamic(issueCtx, child.Token, credential.DurableDynamicIssueRequest{
+	dynamic, err := fixture.issuer.IssueDynamic(issueCtx, child.Token, credential.DurableDynamicIssueRequest{
 		RevocationID: createRequest.RevocationID, ProfileRevision: fixture.profileRevision,
 		CredentialExpiresAt: deadline,
 	})
@@ -1580,17 +1600,24 @@ func (fixture *vault203Fixture) proveProductionClientClosure(t *testing.T) {
 	}
 	defer issued.destroy()
 	fixture.assertDatabaseCredentialWorks(t, issued)
+	if fixture.revokerSource.requests.Load() != 0 {
+		t.Fatal("production Vault issuer client acquired the revoker TokenSource")
+	}
+	managerRequests := fixture.managerSource.requests.Load()
 	revokeCtx, revokeCancel := integrationOperationContext()
-	revokeErr := fixture.client.RevokeAccessor(revokeCtx, child.Accessor)
+	revokeErr := fixture.revocation.RevokeAccessor(revokeCtx, child.Accessor)
 	revokeCancel()
 	if revokeErr != nil {
 		t.Fatal("production Vault client could not revoke its real child by independent revoker accessor")
 	}
 	confirmCtx, confirmCancel := integrationOperationContext()
-	confirmErr := fixture.client.RevokeAccessor(confirmCtx, child.Accessor)
+	confirmErr := fixture.revocation.RevokeAccessor(confirmCtx, child.Accessor)
 	confirmCancel()
 	if confirmErr != nil {
 		t.Fatal("production Vault client did not idempotently confirm an already revoked accessor")
+	}
+	if fixture.managerSource.requests.Load() != managerRequests || fixture.revokerSource.requests.Load() != 2 {
+		t.Fatal("production Vault revocation client crossed the manager/revoker TokenSource boundary")
 	}
 	fixture.assertAccessorMissing(t, accessor)
 	fixture.assertDatabaseCredentialRejected(t, issued)
@@ -1627,9 +1654,8 @@ func (fixture *vault203Fixture) proveEmptyLeaseRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal("could not construct the real KV empty-lease profile")
 	}
-	kvClient, err := vaultclient.NewClient(kvProfile,
-		&integrationTokenSource{sourceID: "kv-manager-src-" + fixture.suffix, token: fixture.manager.token},
-		&integrationTokenSource{sourceID: "kv-revoker-src-" + fixture.suffix, token: fixture.revoker.token})
+	kvClient, err := vaultclient.NewIssuerClient(kvProfile,
+		&integrationTokenSource{sourceID: "kv-manager-src-" + fixture.suffix, token: fixture.manager.token})
 	if err != nil {
 		t.Fatal("could not construct the real KV empty-lease client")
 	}
@@ -1724,7 +1750,7 @@ func (fixture *vault203Fixture) proveEntityContaminationRejected(t *testing.T) {
 	}
 	defer accessor.Destroy()
 	deadline := credential.CanonicalCredentialExpiry(time.Now().UTC().Add(3 * time.Minute))
-	inspectErr := fixture.client.InspectChild(context.Background(), accessor, credential.DurableChildInspectionRequest{
+	inspectErr := fixture.issuer.InspectChild(context.Background(), accessor, credential.DurableChildInspectionRequest{
 		RevocationID: fixture.revocationID("30000000"), ProfileRevision: fixture.profileRevision,
 		CredentialExpiresAt: deadline, ExpectedTTL: 2 * time.Minute,
 	})

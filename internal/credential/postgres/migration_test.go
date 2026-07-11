@@ -26,6 +26,7 @@ func TestCredentialRevocationMigrationDefinesSecretSafeFencedLifecycle(t *testin
 		"accessor_hmac bytea",
 		"encryption_key_id text",
 		"action_lease_token_sha256 text not null",
+		"issuer_revision text not null",
 		"child_create_permit_sha256 text not null",
 		"child_create_authorized_at timestamptz",
 		"child_create_ttl_seconds integer",
@@ -40,7 +41,9 @@ func TestCredentialRevocationMigrationDefinesSecretSafeFencedLifecycle(t *testin
 		"status = 'revoking' and claimed_by is not null and claim_token_sha256 is not null",
 		"claim_expires_at > last_heartbeat_at",
 		"credential_expires_at > created_at",
-		"status = 'manual_required' and anchored_at is not null and revocation_requested_at is not null and manual_required_at is not null and revoked_at is null",
+		"status = 'manual_required' and anchored_at is not null and revocation_requested_at is not null",
+		"retry_cycle_started_at is not null and manual_required_at is not null and failure_count > 0",
+		"failure_count > 0 and revoked_at is null",
 		"failure_code in ('issuer_unavailable', 'rate_limited', 'timeout', 'authentication_failed', 'permission_denied', 'reference_not_found', 'invalid_reference', 'unknown')",
 		"octet_length(failure_detail_sha256) = 64",
 		"primary key (revocation_id, subject)",
@@ -107,6 +110,12 @@ func TestCredentialRevocationMigrationMakesAADIdentityImmutable(t *testing.T) {
 	if !strings.Contains(normalized, "old.revocation_id is distinct from new.revocation_id") {
 		t.Fatal("up migration permits changing the revocation ID bound into reference AAD")
 	}
+	if !strings.Contains(normalized, "old.issuer_revision is distinct from new.issuer_revision") {
+		t.Fatal("up migration permits changing the issuer revision bound into reference AAD")
+	}
+	if !strings.Contains(normalized, "octet_length(issuer_revision) between 1 and 256") {
+		t.Fatal("up migration does not constrain the issuer revision")
+	}
 }
 
 func TestCredentialRevocationMigrationEnforcesInitialAndUpdatedLifecycleEdges(t *testing.T) {
@@ -127,7 +136,8 @@ func TestCredentialRevocationMigrationEnforcesInitialAndUpdatedLifecycleEdges(t 
 		"old.status = 'anchored' and new.status in ('active', 'revocation_pending')",
 		"old.status = 'active' and new.status = 'revocation_pending'",
 		"old.status = 'revocation_pending' and new.status = 'revoking'",
-		"old.status = 'revoking' and new.status in ('revocation_pending', 'manual_required', 'revoked')",
+		"old.status = 'revoking' and new.status = 'revocation_pending'",
+		"old.status = 'revoking' and new.status in ('manual_required', 'revoked')",
 		"old.status = 'manual_required' and new.status in ('revocation_pending', 'revoked')",
 		"create trigger credential_revocations_state_machine before insert or update on credential_revocations",
 		"errcode = '55000'",
@@ -154,6 +164,31 @@ func TestCredentialRevocationMigrationEnforcesSingleUseChildCreationAuthorizatio
 	} {
 		if !strings.Contains(normalized, fragment) {
 			t.Errorf("up migration missing child-create invariant %q", fragment)
+		}
+	}
+}
+
+func TestCredentialRevocationMigrationEnforcesRecoverableRetryCycles(t *testing.T) {
+	normalized := normalizeMigration(readMigration(t, "000008_credential_revocations.up.sql"))
+	for _, fragment := range []string{
+		"retry_cycle_attempt_base integer not null default 0",
+		"retry_cycle_started_at timestamptz",
+		"retry_cycle_attempt_base >= 0 and retry_cycle_attempt_base <= attempt",
+		"create index credential_revocations_managed_recovery_idx",
+		"where status in ('anchored', 'active')",
+		"create index credential_revocations_exhausted_recovery_idx",
+		"include (attempt, retry_cycle_attempt_base, claim_expires_at)",
+		"old.attempt - old.retry_cycle_attempt_base < 12",
+		"old.retry_cycle_started_at > clock_timestamp() - interval '2 hours'",
+		"old.attempt - old.retry_cycle_attempt_base >= 12",
+		"old.retry_cycle_started_at <= clock_timestamp() - interval '2 hours'",
+		"new.status := 'manual_required'",
+		"new.retry_cycle_attempt_base = old.attempt",
+		"credential revocation retry cycle may only reset after authorization loss or manual repair",
+		"credential revocation may only reclaim an expired non-exhausted claim",
+	} {
+		if !strings.Contains(normalized, fragment) {
+			t.Errorf("up migration missing retry-cycle invariant %q", fragment)
 		}
 	}
 }

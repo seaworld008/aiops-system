@@ -211,6 +211,7 @@ func (broker *DurableBroker) Issue(
 	credentialExpiresAt := CanonicalCredentialExpiry(now.Add(resolved.Profile.CredentialTTL))
 	prepared, err := broker.repository.Prepare(ctx, PrepareRequest{
 		RevocationID: revocationID, Fence: request.Fence, Issuer: resolved.Profile.IssuerID,
+		IssuerRevision:      resolved.Profile.Revision,
 		CredentialExpiresAt: credentialExpiresAt,
 	})
 	if err != nil {
@@ -673,7 +674,8 @@ func validFrozenRevocation(
 		revocation.EnvironmentID != request.Selection.EnvironmentID || revocation.ActionID != request.Fence.ActionID ||
 		revocation.Production != request.Selection.Production ||
 		revocation.RunnerID != request.Fence.RunnerID || revocation.ActionLeaseEpoch != request.Fence.Epoch ||
-		revocation.Issuer != profile.IssuerID || revocation.ConnectorID != request.Selection.ConnectorID ||
+		revocation.Issuer != profile.IssuerID || revocation.IssuerRevision != profile.Revision ||
+		revocation.ConnectorID != request.Selection.ConnectorID ||
 		revocation.Permission != request.Selection.Permission || revocation.Resource != request.Selection.Resource ||
 		revocation.CredentialExpiresAt != expiresAt || revocation.Status != status ||
 		revocation.AccessorPresent != accessorPresent || !ValidIdentifier(revocation.TenantID, 256) ||
@@ -701,6 +703,7 @@ func sameDurableFrozenRevocation(left, right Revocation) bool {
 		left.EnvironmentID == right.EnvironmentID && left.ActionID == right.ActionID && left.TargetKey == right.TargetKey &&
 		left.Production == right.Production && left.RunnerID == right.RunnerID &&
 		left.ActionLeaseEpoch == right.ActionLeaseEpoch && left.Issuer == right.Issuer &&
+		left.IssuerRevision == right.IssuerRevision &&
 		left.ConnectorID == right.ConnectorID && left.Permission == right.Permission && left.Resource == right.Resource &&
 		left.CredentialExpiresAt == right.CredentialExpiresAt && left.CreatedAt == right.CreatedAt
 }

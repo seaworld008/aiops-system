@@ -17,7 +17,16 @@ const (
 	MinRevocationClaimLease           = time.Second
 	MaxRevocationClaimLease           = 30 * time.Second
 	MaxRevocationClaimBatch           = 100
-	MaxRevocationRetryDelay           = 24 * time.Hour
+	RevocationClaimLease              = 30 * time.Second
+	RevocationHeartbeatInterval       = 10 * time.Second
+	RevocationRemoteTimeout           = 20 * time.Second
+	MinRevocationRetryDelay           = 5 * time.Second
+	MaxRevocationRetryDelay           = 15 * time.Minute
+	MaxRevocationAttempts             = 12
+	MaxRevocationElapsed              = 2 * time.Hour
+	ManagedAnchorRecoveryGrace        = 2 * time.Minute
+	FailureDetailExhaustedWithoutAck  = "credential.revocation.exhausted_without_ack.v1"
+	FailureDetailProtectedRefInvalid  = "credential.revocation.protected_reference_invalid.v1"
 	MaxCredentialTTL                  = 15 * time.Minute
 	MinPrepareFenceWindow             = time.Second
 	MinPostChildFenceWindow           = time.Second
@@ -176,6 +185,9 @@ type PrepareRequest struct {
 	RevocationID string
 	Fence        ActionFence
 	Issuer       string
+	// IssuerRevision freezes the exact non-secret revocation profile revision
+	// selected by the trusted server registry for this action lease epoch.
+	IssuerRevision string
 	// CredentialExpiresAt is the absolute child-credential deadline persisted
 	// before issuance. A caller must cap the issuer TTL to the remaining time
 	// before this instant; it must never start a fresh MaxCredentialTTL window.
@@ -279,6 +291,14 @@ type RecoverPreparedRequest struct {
 	Limit int
 }
 
+type RecoverManagedRequest struct {
+	Limit int
+}
+
+type RecoverExhaustedRequest struct {
+	Limit int
+}
+
 type ClaimFence struct {
 	RevocationID string `json:"revocation_id"`
 	WorkerID     string `json:"worker_id"`
@@ -366,6 +386,7 @@ type Revocation struct {
 	RunnerID         string `json:"runner_id"`
 	ActionLeaseEpoch int64  `json:"action_lease_epoch"`
 	Issuer           string `json:"issuer"`
+	IssuerRevision   string `json:"issuer_revision"`
 	ConnectorID      string `json:"connector_id"`
 	Permission       string `json:"permission"`
 	Resource         string `json:"resource"`
@@ -435,6 +456,8 @@ type Repository interface {
 	Activate(context.Context, ActionTransitionRequest) (Revocation, error)
 	RecordNoCredential(context.Context, ActionTransitionRequest) (Revocation, error)
 	RecoverPrepared(context.Context, RecoverPreparedRequest) ([]Revocation, error)
+	RecoverManaged(context.Context, RecoverManagedRequest) ([]Revocation, error)
+	RecoverExhausted(context.Context, RecoverExhaustedRequest) ([]Revocation, error)
 	RequestRevocation(context.Context, ActionTransitionRequest) (Revocation, error)
 	ClaimRevocations(context.Context, ClaimRevocationsRequest) ([]ClaimedRevocation, error)
 	Heartbeat(context.Context, HeartbeatRequest) (Revocation, error)

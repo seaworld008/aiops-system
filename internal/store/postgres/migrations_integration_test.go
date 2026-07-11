@@ -282,12 +282,12 @@ func exerciseRealCredentialRevocations(
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
 			child_create_permit_sha256
 		) VALUES (
 			'92000000-0000-4000-8000-000000000099', $1, $2, $3,
 			$4, $5, false, $6, $7, $8,
-			'vault-production', $9, $10, $11, statement_timestamp() + interval '5 minutes', repeat('a', 64)
+			'vault-production', 'rev-1', $9, $10, $11, statement_timestamp() + interval '5 minutes', repeat('a', 64)
 		)
 	`, otherTenantID, otherWorkspaceID, environmentID, actionFence.ActionID, submission.TargetKey,
 		actionFence.RunnerID, actionFence.Epoch, credential.SHA256Hex([]byte(actionFence.Token)),
@@ -329,7 +329,7 @@ func exerciseRealCredentialRevocations(
 		go func() {
 			<-prepareStart
 			result, prepareErr := repository.Prepare(prepareContext, credential.PrepareRequest{
-				RevocationID: candidateID, Fence: actionFence, Issuer: "vault-production",
+				RevocationID: candidateID, Fence: actionFence, Issuer: "vault-production", IssuerRevision: "rev-1",
 				CredentialExpiresAt: credentialExpiry,
 			})
 			prepareResults <- prepareCallResult{result: result, err: prepareErr}
@@ -414,22 +414,29 @@ func exerciseRealCredentialRevocations(
 			authorizationWinners, authorizationReplays, childAuthorization)
 	}
 	idempotent, err := repository.Prepare(ctx, credential.PrepareRequest{
-		RevocationID: revocationID, Fence: actionFence, Issuer: "vault-production",
+		RevocationID: revocationID, Fence: actionFence, Issuer: "vault-production", IssuerRevision: "rev-1",
 		CredentialExpiresAt: credentialExpiry,
 	})
-	if err != nil || idempotent.Created || idempotent.Permit != nil || idempotent.Revocation.ID != revocationID {
+	if err != nil || idempotent.Created || idempotent.Permit != nil || idempotent.Revocation.ID != revocationID ||
+		idempotent.Revocation.IssuerRevision != "rev-1" {
 		t.Fatalf("real credential Prepare(idempotent) = %#v, %v", idempotent, err)
+	}
+	if _, err := repository.Prepare(ctx, credential.PrepareRequest{
+		RevocationID: revocationID, Fence: actionFence, Issuer: "vault-production", IssuerRevision: "rev-2",
+		CredentialExpiresAt: credentialExpiry,
+	}); !errors.Is(err, credential.ErrIdempotencyConflict) {
+		t.Fatalf("real credential Prepare(changed issuer revision) error = %v", err)
 	}
 	canonicalReplay, err := repository.Prepare(ctx, credential.PrepareRequest{
 		RevocationID: "92000000-0000-4000-8000-000000000004", Fence: actionFence,
-		Issuer: "vault-production", CredentialExpiresAt: credentialExpiry,
+		Issuer: "vault-production", IssuerRevision: "rev-1", CredentialExpiresAt: credentialExpiry,
 	})
 	if err != nil || canonicalReplay.Created || canonicalReplay.Revocation.ID != revocationID {
 		t.Fatalf("real credential Prepare(canonical replay) = %#v, %v", canonicalReplay, err)
 	}
 	conflicting := credential.PrepareRequest{
 		RevocationID: "92000000-0000-4000-8000-000000000005", Fence: actionFence,
-		Issuer: "different-issuer", CredentialExpiresAt: credentialExpiry,
+		Issuer: "different-issuer", IssuerRevision: "rev-1", CredentialExpiresAt: credentialExpiry,
 	}
 	if _, err := repository.Prepare(ctx, conflicting); !errors.Is(err, credential.ErrIdempotencyConflict) {
 		t.Fatalf("real credential Prepare(conflicting semantics) error = %v", err)
@@ -478,7 +485,7 @@ func exerciseRealCredentialRevocations(
 		go func() {
 			<-crossStart
 			result, prepareErr := repository.Prepare(crossContext, credential.PrepareRequest{
-				RevocationID: crossCandidateID, Fence: crossFence, Issuer: "vault-production",
+				RevocationID: crossCandidateID, Fence: crossFence, Issuer: "vault-production", IssuerRevision: "rev-1",
 				CredentialExpiresAt: time.Now().UTC().Add(5 * time.Minute),
 			})
 			crossResults <- prepareCallResult{result: result, err: prepareErr}
@@ -609,7 +616,7 @@ func exerciseRealCredentialRevocations(
 	defer cancelDelayedPrepare()
 	delayedPrepareStartedAt := time.Now()
 	delayedPrepare, delayedPrepareErr := repository.Prepare(delayedPrepareContext, credential.PrepareRequest{
-		RevocationID: delayedPrepareID, Fence: crossLoserFence, Issuer: "vault-production",
+		RevocationID: delayedPrepareID, Fence: crossLoserFence, Issuer: "vault-production", IssuerRevision: "rev-1",
 		CredentialExpiresAt: time.Now().UTC().Add(5 * time.Minute),
 	})
 	delayedPrepareElapsed := time.Since(delayedPrepareStartedAt)
@@ -639,12 +646,12 @@ func exerciseRealCredentialRevocations(
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
 			child_create_permit_sha256, available_at, created_at, updated_at
 		)
 		SELECT $2, action.runner_tenant_id, action.runner_workspace_id, action.runner_environment_id,
 			action.action_id, action.target_key, action.production, action.runner_id, action.lease_epoch,
-			action.lease_token_sha256, 'vault-production',
+			action.lease_token_sha256, 'vault-production', 'rev-1',
 			action.envelope #>> '{credential_scope,connector_id}',
 			action.envelope #>> '{credential_scope,permission}',
 			action.envelope #>> '{credential_scope,resource}',
@@ -745,7 +752,7 @@ func exerciseRealCredentialRevocations(
 	}
 	const authorizationRaceRevocationID = "92000000-0000-4000-8000-000000000017"
 	racePrepared, err := repository.Prepare(ctx, credential.PrepareRequest{
-		RevocationID: authorizationRaceRevocationID, Fence: raceFence, Issuer: "vault-production",
+		RevocationID: authorizationRaceRevocationID, Fence: raceFence, Issuer: "vault-production", IssuerRevision: "rev-1",
 		CredentialExpiresAt: time.Now().UTC().Add(5 * time.Minute),
 	})
 	if err != nil || !racePrepared.Created || racePrepared.Permit == nil {
@@ -868,12 +875,12 @@ func exerciseRealCredentialRevocations(
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
 			child_create_permit_sha256, status
 		)
 		SELECT '92000000-0000-4000-8000-000000000007', tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch + 7000, action_lease_token_sha256,
-			issuer, connector_id, scope_permission, scope_resource, statement_timestamp() + interval '5 minutes',
+			issuer, issuer_revision, connector_id, scope_permission, scope_resource, statement_timestamp() + interval '5 minutes',
 			repeat('7', 64), 'NO_CREDENTIAL'
 		FROM credential_revocations WHERE revocation_id = $1
 	`, revocationID)
@@ -884,15 +891,20 @@ func exerciseRealCredentialRevocations(
 		WHERE revocation_id = $1
 	`, revocationID)
 	expectSQLState(t, ctx, database, "55000", `
+		UPDATE credential_revocations
+		SET issuer_revision = 'rev-2', updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID)
+	expectSQLState(t, ctx, database, "55000", `
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
 			child_create_permit_sha256, child_create_authorized_at, child_create_ttl_seconds
 		)
 		SELECT '92000000-0000-4000-8000-000000000015', tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch + 7015, action_lease_token_sha256,
-			issuer, connector_id, scope_permission, scope_resource, statement_timestamp() + interval '5 minutes',
+			issuer, issuer_revision, connector_id, scope_permission, scope_resource, statement_timestamp() + interval '5 minutes',
 			repeat('f', 64), statement_timestamp(), 30
 		FROM credential_revocations WHERE revocation_id = $1
 	`, revocationID)
@@ -901,14 +913,14 @@ func exerciseRealCredentialRevocations(
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
 			child_create_permit_sha256,
 			available_at, created_at, updated_at
 		)
 		SELECT '92000000-0000-4000-8000-000000000014', source.tenant_id, source.workspace_id, source.environment_id,
 			source.action_id, source.target_key, source.production, source.runner_id,
 			source.action_lease_epoch + 7004, source.action_lease_token_sha256,
-			source.issuer, source.connector_id, source.scope_permission, source.scope_resource,
+			source.issuer, source.issuer_revision, source.connector_id, source.scope_permission, source.scope_resource,
 			clock.current_time + interval '15 minutes' + interval '1 microsecond', repeat('e', 64),
 			clock.current_time, clock.current_time, clock.current_time
 		FROM credential_revocations AS source CROSS JOIN clock
@@ -919,12 +931,12 @@ func exerciseRealCredentialRevocations(
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
 			child_create_permit_sha256
 		)
 		SELECT $2, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch + 7001, action_lease_token_sha256,
-			issuer, connector_id, scope_permission, scope_resource, statement_timestamp() + interval '5 minutes', repeat('8', 64)
+			issuer, issuer_revision, connector_id, scope_permission, scope_resource, statement_timestamp() + interval '5 minutes', repeat('8', 64)
 		FROM credential_revocations WHERE revocation_id = $1
 	`, revocationID, noCredentialRevocationID)
 	expectSQLState(t, ctx, database, "23514", `
@@ -955,13 +967,13 @@ func exerciseRealCredentialRevocations(
 		INSERT INTO credential_revocations (
 			revocation_id, tenant_id, workspace_id, environment_id,
 			action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-			issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+			issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
 			child_create_permit_sha256, available_at, created_at, updated_at
 		)
 		SELECT $2, source.tenant_id, source.workspace_id, source.environment_id,
 			source.action_id, source.target_key, source.production, source.runner_id,
 			source.action_lease_epoch + 7018, source.action_lease_token_sha256,
-			source.issuer, source.connector_id, source.scope_permission, source.scope_resource,
+			source.issuer, source.issuer_revision, source.connector_id, source.scope_permission, source.scope_resource,
 			clock.current_time + interval '60 seconds', repeat('d', 64),
 			clock.current_time, clock.current_time, clock.current_time
 		FROM credential_revocations AS source CROSS JOIN clock WHERE source.revocation_id = $1;
@@ -988,14 +1000,14 @@ func exerciseRealCredentialRevocations(
 			INSERT INTO credential_revocations (
 				revocation_id, tenant_id, workspace_id, environment_id,
 				action_id, target_key, production, runner_id, action_lease_epoch, action_lease_token_sha256,
-				issuer, connector_id, scope_permission, scope_resource, credential_expires_at,
+				issuer, issuer_revision, connector_id, scope_permission, scope_resource, credential_expires_at,
 				child_create_permit_sha256,
 				available_at, created_at, updated_at
 			)
 			SELECT $2, source.tenant_id, source.workspace_id, source.environment_id,
 				source.action_id, source.target_key, source.production, source.runner_id,
 				source.action_lease_epoch + $3, source.action_lease_token_sha256,
-				source.issuer, source.connector_id, source.scope_permission, source.scope_resource,
+				source.issuer, source.issuer_revision, source.connector_id, source.scope_permission, source.scope_resource,
 				clock.current_time - make_interval(secs => $4::double precision) +
 					make_interval(secs => $5::double precision),
 				$6,
@@ -1142,7 +1154,7 @@ func exerciseRealCredentialRevocations(
 	}
 	const nackRevocationID = "92000000-0000-4000-8000-000000000003"
 	nackPrepared, err := repository.Prepare(ctx, credential.PrepareRequest{
-		RevocationID: nackRevocationID, Fence: nackFence, Issuer: "vault-production",
+		RevocationID: nackRevocationID, Fence: nackFence, Issuer: "vault-production", IssuerRevision: "rev-1",
 		CredentialExpiresAt: now.Add(5 * time.Minute),
 	})
 	if err != nil || !nackPrepared.Created {
@@ -1165,7 +1177,7 @@ func exerciseRealCredentialRevocations(
 		t.Fatalf("authorize credential after Start: %v", err)
 	}
 	if _, err := repository.Prepare(ctx, credential.PrepareRequest{
-		RevocationID: nackRevocationID, Fence: actionFence, Issuer: "vault-production",
+		RevocationID: nackRevocationID, Fence: actionFence, Issuer: "vault-production", IssuerRevision: "rev-1",
 		CredentialExpiresAt: credentialExpiry,
 	}); !errors.Is(err, credential.ErrIdempotencyConflict) {
 		t.Fatalf("replay with candidate ID occupied by another action error = %v", err)
@@ -1266,7 +1278,7 @@ func exerciseRealCredentialRevocations(
 	}
 	const batchRevocationID = "92000000-0000-4000-8000-000000000006"
 	batchPrepared, err := repository.Prepare(ctx, credential.PrepareRequest{
-		RevocationID: batchRevocationID, Fence: batchFence, Issuer: "vault-production",
+		RevocationID: batchRevocationID, Fence: batchFence, Issuer: "vault-production", IssuerRevision: "rev-1",
 		CredentialExpiresAt: credentialExpiry,
 	})
 	if err != nil || !batchPrepared.Created {
@@ -1291,12 +1303,6 @@ func exerciseRealCredentialRevocations(
 		RevocationID: batchRevocationID, Fence: batchFence,
 	}); err != nil {
 		t.Fatalf("request credential batch rollback revocation: %v", err)
-	}
-	var batchCiphertext []byte
-	if err := database.QueryRow(ctx, `
-		SELECT accessor_ciphertext FROM credential_revocations WHERE revocation_id = $1
-	`, batchRevocationID).Scan(&batchCiphertext); err != nil {
-		t.Fatalf("read batch rollback protected accessor: %v", err)
 	}
 	if _, err := repository.RequestRevocation(ctx, credential.ActionTransitionRequest{RevocationID: revocationID, Fence: actionFence}); err != nil {
 		t.Fatalf("real credential RequestRevocation: %v", err)
@@ -1341,8 +1347,8 @@ func exerciseRealCredentialRevocations(
 		t.Fatalf("rebuilt repository Get = %#v, %v", persisted, err)
 	}
 
-	// Corrupt the second legal pending candidate's AEAD body without changing
-	// its schema shape. Claim must decrypt the whole batch before mutating rows.
+	// Corrupt one legal pending candidate's AEAD body without changing its
+	// schema shape. Claim must quarantine it without starving valid work.
 	execSQL(t, ctx, database, `
 		UPDATE credential_revocations
 		SET available_at = statement_timestamp() - interval '2 minutes',
@@ -1355,45 +1361,42 @@ func exerciseRealCredentialRevocations(
 			accessor_ciphertext,
 			octet_length(accessor_ciphertext) - 1,
 			(get_byte(accessor_ciphertext, octet_length(accessor_ciphertext) - 1) + 1) % 256
-		), updated_at = statement_timestamp(), version = version + 1
-		WHERE revocation_id = $1
-	`, batchRevocationID)
-	claimState := func(id string) string {
-		var state string
-		if err := database.QueryRow(ctx, `
-			SELECT jsonb_build_object(
-				'status', status, 'claim_epoch', claim_epoch, 'attempt', attempt,
-				'version', version, 'updated_at', updated_at,
-				'claimed_by', claimed_by, 'claim_token_sha256', claim_token_sha256,
-				'claimed_at', claimed_at, 'claim_expires_at', claim_expires_at,
-				'last_heartbeat_at', last_heartbeat_at
-			)::text
-			FROM credential_revocations WHERE revocation_id = $1
-		`, id).Scan(&state); err != nil {
-			t.Fatalf("read credential claim state %s: %v", id, err)
-		}
-		return state
-	}
-	beforeValidClaim := claimState(revocationID)
-	beforeInvalidClaim := claimState(batchRevocationID)
-	failedBatch, err := rebuilt.ClaimRevocations(ctx, credential.ClaimRevocationsRequest{
-		WorkerID: "credential-batch-rollback-revoker", Limit: 2, LeaseDuration: 30 * time.Second,
-	})
-	if !errors.Is(err, credential.ErrReferenceProtection) || len(failedBatch) != 0 {
-		t.Fatalf("real credential ClaimRevocations(corrupt batch) = %#v, %v", failedBatch, err)
-	}
-	if after := claimState(revocationID); after != beforeValidClaim {
-		t.Fatalf("valid claim candidate mutated after batch decrypt failure: before=%s after=%s", beforeValidClaim, after)
-	}
-	if after := claimState(batchRevocationID); after != beforeInvalidClaim {
-		t.Fatalf("invalid claim candidate mutated after batch decrypt failure: before=%s after=%s", beforeInvalidClaim, after)
-	}
-	execSQL(t, ctx, database, `
-		UPDATE credential_revocations
-		SET accessor_ciphertext = $2, available_at = statement_timestamp() + interval '1 day',
+		), available_at = statement_timestamp() - interval '3 minutes',
 			updated_at = statement_timestamp(), version = version + 1
 		WHERE revocation_id = $1
-	`, batchRevocationID, batchCiphertext)
+	`, batchRevocationID)
+	isolatedBatch, err := rebuilt.ClaimRevocations(ctx, credential.ClaimRevocationsRequest{
+		WorkerID: "credential-batch-rollback-revoker", Limit: 2, LeaseDuration: 30 * time.Second,
+	})
+	if err != nil || len(isolatedBatch) != 1 || isolatedBatch[0].Revocation.ID != revocationID ||
+		isolatedBatch[0].Accessor == nil || string(isolatedBatch[0].Accessor.Bytes()) != string(accessorValue) {
+		t.Fatalf("real credential ClaimRevocations(poison isolation) = %#v, %v", isolatedBatch, err)
+	}
+	var poisonStatus, poisonFailureCode string
+	var poisonClaimedBy, poisonClaimToken *string
+	var poisonCiphertextPresent bool
+	if err := database.QueryRow(ctx, `
+		SELECT status, failure_code, claimed_by, claim_token_sha256, accessor_ciphertext IS NOT NULL
+		FROM credential_revocations WHERE revocation_id = $1
+	`, batchRevocationID).Scan(
+		&poisonStatus, &poisonFailureCode, &poisonClaimedBy, &poisonClaimToken, &poisonCiphertextPresent,
+	); err != nil {
+		t.Fatalf("read quarantined credential reference: %v", err)
+	}
+	if poisonStatus != string(credential.StatusManualRequired) || poisonFailureCode != string(credential.FailureInvalidReference) ||
+		poisonClaimedBy != nil || poisonClaimToken != nil || !poisonCiphertextPresent {
+		t.Fatalf("invalid poison quarantine: status=%s failure=%s worker=%v token=%v ciphertext=%v",
+			poisonStatus, poisonFailureCode, poisonClaimedBy, poisonClaimToken, poisonCiphertextPresent)
+	}
+	isolatedBatch[0].Accessor.Destroy()
+	execSQL(t, ctx, database, `
+		UPDATE credential_revocations
+		SET claimed_at = statement_timestamp() - interval '3 minutes',
+			last_heartbeat_at = statement_timestamp() - interval '2 minutes',
+			claim_expires_at = statement_timestamp() - interval '1 minute',
+			updated_at = statement_timestamp(), version = version + 1
+		WHERE revocation_id = $1
+	`, revocationID)
 
 	type claimResult struct {
 		claims []credential.ClaimedRevocation

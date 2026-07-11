@@ -97,36 +97,51 @@ type TokenSource interface {
 	Token(context.Context) (credential.SensitiveValue, error)
 }
 
-type Client struct {
+type clientCore struct {
 	profile *Profile
+}
+
+type IssuerClient struct {
+	clientCore
 	manager TokenSource
+}
+
+type RevocationClient struct {
+	clientCore
 	revoker TokenSource
 }
 
-var _ credential.DurableIssuer = (*Client)(nil)
+var _ credential.DurableIssuer = (*IssuerClient)(nil)
 
-func NewClient(profile *Profile, manager, revoker TokenSource) (*Client, error) {
-	if profile == nil || profile.rootCAs == nil || nilTokenSource(manager) || nilTokenSource(revoker) {
+func NewIssuerClient(profile *Profile, manager TokenSource) (*IssuerClient, error) {
+	if !validClientInputs(profile, manager) {
 		return nil, ErrInvalidClient
 	}
-	managerID, revokerID := manager.SourceID(), revoker.SourceID()
-	if !validProfileID(managerID) || !validProfileID(revokerID) || managerID == revokerID {
-		return nil, ErrInvalidClient
-	}
-	return &Client{profile: profile, manager: manager, revoker: revoker}, nil
+	return &IssuerClient{clientCore: clientCore{profile: profile}, manager: manager}, nil
 }
 
-func (client *Client) String() string {
-	if client == nil || client.profile == nil {
-		return "VaultClient{Invalid:true Security:[REDACTED]}"
+func NewRevocationClient(profile *Profile, revoker TokenSource) (*RevocationClient, error) {
+	if !validClientInputs(profile, revoker) {
+		return nil, ErrInvalidClient
 	}
-	return fmt.Sprintf("VaultClient{IssuerID:%q Revision:%q Security:[REDACTED]}",
+	return &RevocationClient{clientCore: clientCore{profile: profile}, revoker: revoker}, nil
+}
+
+func validClientInputs(profile *Profile, source TokenSource) bool {
+	return profile != nil && profile.rootCAs != nil && !nilTokenSource(source) && validProfileID(source.SourceID())
+}
+
+func (client *IssuerClient) String() string {
+	if client == nil || client.profile == nil {
+		return "VaultIssuerClient{Invalid:true Security:[REDACTED]}"
+	}
+	return fmt.Sprintf("VaultIssuerClient{IssuerID:%q Revision:%q Security:[REDACTED]}",
 		client.profile.issuerID, client.profile.revision)
 }
 
-func (client *Client) GoString() string { return client.String() }
+func (client *IssuerClient) GoString() string { return client.String() }
 
-func (client *Client) MarshalJSON() ([]byte, error) {
+func (client *IssuerClient) MarshalJSON() ([]byte, error) {
 	if client == nil || client.profile == nil {
 		return []byte(`{"redacted":true,"invalid":true}`), nil
 	}
@@ -137,7 +152,28 @@ func (client *Client) MarshalJSON() ([]byte, error) {
 	}{client.profile.issuerID, client.profile.revision, true})
 }
 
-func (client *Client) ValidateManager(ctx context.Context) error {
+func (client *RevocationClient) String() string {
+	if client == nil || client.profile == nil {
+		return "VaultRevocationClient{Invalid:true Security:[REDACTED]}"
+	}
+	return fmt.Sprintf("VaultRevocationClient{IssuerID:%q Revision:%q Security:[REDACTED]}",
+		client.profile.issuerID, client.profile.revision)
+}
+
+func (client *RevocationClient) GoString() string { return client.String() }
+
+func (client *RevocationClient) MarshalJSON() ([]byte, error) {
+	if client == nil || client.profile == nil {
+		return []byte(`{"redacted":true,"invalid":true}`), nil
+	}
+	return json.Marshal(struct {
+		IssuerID string `json:"issuer_id"`
+		Revision string `json:"revision"`
+		Redacted bool   `json:"redacted"`
+	}{client.profile.issuerID, client.profile.revision, true})
+}
+
+func (client *IssuerClient) ValidateManager(ctx context.Context) error {
 	if client == nil || client.profile == nil || ctx == nil {
 		return ErrInvalidClient
 	}
@@ -177,7 +213,7 @@ func (client *Client) ValidateManager(ctx context.Context) error {
 	return nil
 }
 
-func (client *Client) InspectChild(
+func (client *IssuerClient) InspectChild(
 	ctx context.Context,
 	accessor *credential.SensitiveReference,
 	request credential.DurableChildInspectionRequest,
@@ -232,7 +268,7 @@ func (client *Client) InspectChild(
 	return nil
 }
 
-func (client *Client) IssueDynamic(
+func (client *IssuerClient) IssueDynamic(
 	ctx context.Context,
 	childToken credential.SensitiveValue,
 	request credential.DurableDynamicIssueRequest,
@@ -276,7 +312,7 @@ func (client *Client) IssueDynamic(
 	return credential.DurableDynamicSecret{Secret: secret, ExpiresAt: expiresAt}, nil
 }
 
-func (client *Client) RevokeAccessor(ctx context.Context, accessor *credential.SensitiveReference) error {
+func (client *RevocationClient) RevokeAccessor(ctx context.Context, accessor *credential.SensitiveReference) error {
 	if client == nil || client.profile == nil || ctx == nil || accessor == nil {
 		return ErrInvalidClient
 	}
@@ -327,7 +363,7 @@ func accessorJSONBody(accessor []byte) []byte {
 	return body
 }
 
-func (client *Client) CreateChild(
+func (client *IssuerClient) CreateChild(
 	ctx context.Context,
 	request credential.DurableChildCreateRequest,
 ) (credential.DurableChild, error) {
@@ -528,7 +564,7 @@ func validCreateEnvelope(response vaultEnvelope, requestedTTL time.Duration) boo
 		isJSONObject(response.Auth) && response.MountType == "token"
 }
 
-func (client *Client) validChildAuth(auth childAuthResponse, request credential.DurableChildCreateRequest) bool {
+func (client *IssuerClient) validChildAuth(auth childAuthResponse, request credential.DurableChildCreateRequest) bool {
 	return validBearer(auth.ClientToken) && validBearer(auth.Accessor) &&
 		subtle.ConstantTimeCompare(auth.ClientToken, auth.Accessor) == 0 &&
 		exactStringSet(auth.Policies, []string{client.profile.childPolicy}) &&
@@ -580,7 +616,7 @@ func validRevokeEnvelope(response vaultEnvelope) bool {
 		isJSONNull(response.Auth) && response.MountType == "token" && warningsValid
 }
 
-func (client *Client) validSecretData(data []byte) bool {
+func (client *IssuerClient) validSecretData(data []byte) bool {
 	var fields map[string]json.RawMessage
 	if err := decodeStrictJSON(data, &fields); err != nil || len(fields) != len(client.profile.secretFields) {
 		destroyRawMessageMap(fields)
@@ -714,7 +750,7 @@ type requestSpec struct {
 	ambiguous         bool
 }
 
-func (client *Client) request(ctx context.Context, spec requestSpec) ([]byte, error) {
+func (client *clientCore) request(ctx context.Context, spec requestSpec) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, &ClientError{Operation: spec.operation, Class: ErrorTimeout, Ambiguous: false, cause: err}
 	}
@@ -868,7 +904,7 @@ var tokenLookupRequiredFields = []string{
 	"type", "renewable", "issue_time",
 }
 
-func (client *Client) validManagerLookup(data tokenLookupData, token []byte) bool {
+func (client *IssuerClient) validManagerLookup(data tokenLookupData, token []byte) bool {
 	issueTime, issueErr := time.Parse(time.RFC3339Nano, data.IssueTime)
 	expireTime, expireErr := time.Parse(time.RFC3339Nano, data.ExpireTime)
 	return subtle.ConstantTimeCompare(data.ID, token) == 1 &&
@@ -887,7 +923,7 @@ func validChildInspectionRequest(profile *Profile, request credential.DurableChi
 		canonicalTime(request.CredentialExpiresAt)
 }
 
-func (client *Client) validChildLookup(
+func (client *IssuerClient) validChildLookup(
 	data tokenLookupData,
 	accessor []byte,
 	request credential.DurableChildInspectionRequest,

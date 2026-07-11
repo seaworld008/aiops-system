@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -31,6 +32,52 @@ const (
 	managerTokenCanary = "hvs.manager-token-canary"
 	revokerTokenCanary = "hvs.revoker-token-canary"
 )
+
+func TestVaultClientsExposeDisjointCapabilitiesAndTokenSources(t *testing.T) {
+	t.Parallel()
+
+	issuerType := reflect.TypeOf((*IssuerClient)(nil))
+	revocationType := reflect.TypeOf((*RevocationClient)(nil))
+	if got, want := exportedMethodNames(issuerType), []string{
+		"CreateChild", "GoString", "InspectChild", "IssueDynamic", "MarshalJSON", "String", "ValidateManager",
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("IssuerClient methods = %v, want %v", got, want)
+	}
+	if got, want := exportedMethodNames(revocationType), []string{
+		"GoString", "MarshalJSON", "RevokeAccessor", "String",
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("RevocationClient methods = %v, want %v", got, want)
+	}
+	if !issuerType.Implements(reflect.TypeOf((*credential.DurableIssuer)(nil)).Elem()) {
+		t.Fatal("IssuerClient does not implement credential.DurableIssuer")
+	}
+	if got := tokenSourceFields(reflect.TypeOf(IssuerClient{})); !reflect.DeepEqual(got, []string{"manager"}) {
+		t.Fatalf("IssuerClient TokenSource fields = %v, want manager only", got)
+	}
+	if got := tokenSourceFields(reflect.TypeOf(RevocationClient{})); !reflect.DeepEqual(got, []string{"revoker"}) {
+		t.Fatalf("RevocationClient TokenSource fields = %v, want revoker only", got)
+	}
+}
+
+func exportedMethodNames(clientType reflect.Type) []string {
+	methods := make([]string, 0, clientType.NumMethod())
+	for index := 0; index < clientType.NumMethod(); index++ {
+		methods = append(methods, clientType.Method(index).Name)
+	}
+	return methods
+}
+
+func tokenSourceFields(clientType reflect.Type) []string {
+	tokenSourceType := reflect.TypeOf((*TokenSource)(nil)).Elem()
+	var fields []string
+	for index := 0; index < clientType.NumField(); index++ {
+		field := clientType.Field(index)
+		if field.Type.Implements(tokenSourceType) {
+			fields = append(fields, field.Name)
+		}
+	}
+	return fields
+}
 
 func TestClientValidateManagerUsesOneShotTLS13HTTP1(t *testing.T) {
 	t.Parallel()
@@ -67,7 +114,7 @@ func TestClientValidateManagerUsesOneShotTLS13HTTP1(t *testing.T) {
 	}
 }
 
-func TestNewClientRejectsMissingOrSharedTokenSources(t *testing.T) {
+func TestNewClientsRejectInvalidTokenSourcesIndependently(t *testing.T) {
 	t.Parallel()
 
 	server := newVaultTLSServer(t, http.HandlerFunc(writeValidManagerResponse))
@@ -75,20 +122,17 @@ func TestNewClientRejectsMissingOrSharedTokenSources(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewProfile() error = %v", err)
 	}
-	manager := &staticTokenSource{id: "manager-source", value: []byte(managerTokenCanary)}
-	tests := map[string]struct {
-		manager TokenSource
-		revoker TokenSource
-	}{
-		"nil manager":       {manager: nil, revoker: &staticTokenSource{id: "revoker-source"}},
-		"typed nil manager": {manager: (*staticTokenSource)(nil), revoker: &staticTokenSource{id: "revoker-source"}},
-		"empty manager ID":  {manager: &staticTokenSource{}, revoker: &staticTokenSource{id: "revoker-source"}},
-		"empty revoker ID":  {manager: manager, revoker: &staticTokenSource{}},
-		"shared source ID":  {manager: manager, revoker: &staticTokenSource{id: "manager-source"}},
+	tests := map[string]TokenSource{
+		"nil":       nil,
+		"typed nil": (*staticTokenSource)(nil),
+		"empty ID":  &staticTokenSource{},
 	}
-	for name, test := range tests {
-		if _, err := NewClient(profile, test.manager, test.revoker); !errors.Is(err, ErrInvalidClient) {
-			t.Errorf("NewClient(%s) error = %v, want ErrInvalidClient", name, err)
+	for name, source := range tests {
+		if _, err := NewIssuerClient(profile, source); !errors.Is(err, ErrInvalidClient) {
+			t.Errorf("NewIssuerClient(%s) error = %v, want ErrInvalidClient", name, err)
+		}
+		if _, err := NewRevocationClient(profile, source); !errors.Is(err, ErrInvalidClient) {
+			t.Errorf("NewRevocationClient(%s) error = %v, want ErrInvalidClient", name, err)
 		}
 	}
 }
@@ -106,9 +150,9 @@ func TestClientDestroysTokenReturnedAlongsideSourceError(t *testing.T) {
 		t.Fatalf("NewSensitiveValue() error = %v", err)
 	}
 	source := &failingTokenSource{id: "issuer-manager-source", value: value}
-	client, err := NewClient(profile, source, &staticTokenSource{id: "revoker-source", value: []byte(revokerTokenCanary)})
+	client, err := NewIssuerClient(profile, source)
 	if err != nil {
-		t.Fatalf("NewClient() error = %v", err)
+		t.Fatalf("NewIssuerClient() error = %v", err)
 	}
 
 	err = client.ValidateManager(context.Background())
@@ -282,12 +326,10 @@ func TestClientRejectsWrongExplicitCAWithoutDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewProfile() error = %v", err)
 	}
-	client, err := NewClient(profile,
-		&staticTokenSource{id: "issuer-manager-source", value: []byte(managerTokenCanary)},
-		&staticTokenSource{id: "revoker-source", value: []byte(revokerTokenCanary)},
-	)
+	client, err := NewIssuerClient(profile,
+		&staticTokenSource{id: "issuer-manager-source", value: []byte(managerTokenCanary)})
 	if err != nil {
-		t.Fatalf("NewClient() error = %v", err)
+		t.Fatalf("NewIssuerClient() error = %v", err)
 	}
 
 	err = client.ValidateManager(context.Background())
@@ -1134,7 +1176,7 @@ func TestClientRevokeAccessorUsesIndependentRevokerSource(t *testing.T) {
 		}
 		writer.WriteHeader(http.StatusNoContent)
 	}))
-	client := newTestClient(t, server)
+	client := newTestRevocationClient(t, server)
 
 	if err := client.RevokeAccessor(context.Background(), accessor); err != nil {
 		t.Fatalf("RevokeAccessor() error = %v", err)
@@ -1158,7 +1200,7 @@ func TestClientRevokeAccessorKeepsHTTP400Retryable(t *testing.T) {
 		writer.WriteHeader(http.StatusBadRequest)
 		_, _ = io.WriteString(writer, "child-accessor-canary hvs.revoker-token-canary upstream-error-canary")
 	}))
-	client := newTestClient(t, server)
+	client := newTestRevocationClient(t, server)
 
 	err = client.RevokeAccessor(context.Background(), accessor)
 	var failure *ClientError
@@ -1184,7 +1226,7 @@ func TestClientRevokeAccessorAcceptsExactAlreadyAbsentWarning(t *testing.T) {
 		writer.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(writer, `{"request_id":"request-revoke-absent","lease_id":"","renewable":false,"lease_duration":0,"data":null,"wrap_info":null,"warnings":["No token found with this accessor"],"auth":null,"mount_type":"token"}`)
 	}))
-	client := newTestClient(t, server)
+	client := newTestRevocationClient(t, server)
 	if err := client.RevokeAccessor(context.Background(), accessor); err != nil {
 		t.Fatalf("RevokeAccessor(already absent) error = %v", err)
 	}
@@ -1233,18 +1275,30 @@ func (source *staticTokenSource) Token(ctx context.Context) (credential.Sensitiv
 	return credential.NewSensitiveValue(source.value)
 }
 
-func newTestClient(t *testing.T, server *httptest.Server) *Client {
+func newTestClient(t *testing.T, server *httptest.Server) *IssuerClient {
 	t.Helper()
 	profile, err := NewProfile(profileConfigForServer(t, server))
 	if err != nil {
 		t.Fatalf("NewProfile() error = %v", err)
 	}
-	client, err := NewClient(profile,
-		&staticTokenSource{id: "issuer-manager-source", value: []byte(managerTokenCanary)},
-		&staticTokenSource{id: "revoker-source", value: []byte(revokerTokenCanary)},
-	)
+	client, err := NewIssuerClient(profile,
+		&staticTokenSource{id: "issuer-manager-source", value: []byte(managerTokenCanary)})
 	if err != nil {
-		t.Fatalf("NewClient() error = %v", err)
+		t.Fatalf("NewIssuerClient() error = %v", err)
+	}
+	return client
+}
+
+func newTestRevocationClient(t *testing.T, server *httptest.Server) *RevocationClient {
+	t.Helper()
+	profile, err := NewProfile(profileConfigForServer(t, server))
+	if err != nil {
+		t.Fatalf("NewProfile() error = %v", err)
+	}
+	client, err := NewRevocationClient(profile,
+		&staticTokenSource{id: "revoker-source", value: []byte(revokerTokenCanary)})
+	if err != nil {
+		t.Fatalf("NewRevocationClient() error = %v", err)
 	}
 	return client
 }
