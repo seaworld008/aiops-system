@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"regexp"
@@ -22,6 +23,8 @@ const (
 	minimumActionLease = time.Second
 	maximumActionLease = 30 * time.Minute
 )
+
+var ErrCredentialCleanupPending = errors.New("action credential cleanup is not terminal")
 
 // ActionSubmission is the immutable, verified action record atomically bound
 // to its execution lease. PlanHash is duplicated deliberately so queue
@@ -204,9 +207,17 @@ type ActionQueue interface {
 	Get(context.Context, string) (executionlease.Execution, error)
 }
 
+// CredentialFinalizationGate is called while the in-memory queue lock is held.
+// Implementations must not call back into the queue. The lock order is action
+// queue first, credential repository second, matching durable repositories.
+type CredentialFinalizationGate interface {
+	InspectCleanup(context.Context, string, int64) (present bool, terminal bool, err error)
+}
+
 type MemoryActionQueueOptions struct {
-	Clock       func() time.Time
-	TokenSource func() (string, error)
+	Clock                      func() time.Time
+	TokenSource                func() (string, error)
+	CredentialFinalizationGate CredentialFinalizationGate
 }
 
 type memoryActionRecord struct {
@@ -224,12 +235,13 @@ type memoryActionRecord struct {
 // and immutable metadata are protected by the same mutex, making Submit and
 // Claim atomic at the queue boundary.
 type MemoryActionQueue struct {
-	mu          sync.Mutex
-	records     map[string]memoryActionRecord
-	idempotency map[string]string
-	order       []string
-	clock       func() time.Time
-	tokenSource func() (string, error)
+	mu                         sync.Mutex
+	records                    map[string]memoryActionRecord
+	idempotency                map[string]string
+	order                      []string
+	clock                      func() time.Time
+	tokenSource                func() (string, error)
+	credentialFinalizationGate CredentialFinalizationGate
 }
 
 var _ ActionQueue = (*MemoryActionQueue)(nil)
@@ -247,6 +259,7 @@ func NewMemoryActionQueue(options MemoryActionQueueOptions) (*MemoryActionQueue,
 	return &MemoryActionQueue{
 		records: make(map[string]memoryActionRecord), idempotency: make(map[string]string),
 		clock: options.Clock, tokenSource: options.TokenSource,
+		credentialFinalizationGate: options.CredentialFinalizationGate,
 	}, nil
 }
 
@@ -312,13 +325,16 @@ func (queue *MemoryActionQueue) Claim(ctx context.Context, request ActionClaimRe
 
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	queue.expireLocked(now)
+	queue.expireLocked(ctx, now)
 	if queue.runnerActive(request.Scope.runnerID) >= request.Scope.maxConcurrency {
 		return ClaimedAction{}, executionlease.ErrNoLeaseAvailable
 	}
 	for _, executionID := range queue.order {
 		record := queue.records[executionID]
 		if record.execution.Status != executionlease.StatusQueued || record.execution.Pool != request.Scope.pool {
+			continue
+		}
+		if record.execution.Pool == executionlease.PoolWrite && record.execution.Production {
 			continue
 		}
 		if record.notBefore.After(now) {
@@ -331,9 +347,6 @@ func (queue *MemoryActionQueue) Claim(ctx context.Context, request ActionClaimRe
 			continue
 		}
 		if queue.targetActive(record.execution.TargetKey, record.execution.ExecutionID) {
-			continue
-		}
-		if record.execution.Pool == executionlease.PoolWrite && record.execution.Production && queue.productionWriteActive(record.execution.ExecutionID) {
 			continue
 		}
 		if record.execution.LeaseEpoch == math.MaxInt64 {
@@ -553,6 +566,11 @@ func (queue *MemoryActionQueue) Finalize(ctx context.Context, fence executionlea
 		record.execution.CompletionStatus != record.receipt.CompletionStatus {
 		return executionlease.Execution{}, executionlease.ErrInvalidTransition
 	}
+	if releasesTargetLock(record.execution.CompletionStatus) {
+		if err := queue.requireCredentialTerminal(ctx, record, false); err != nil {
+			return executionlease.Execution{}, err
+		}
+	}
 	record.execution.Status = record.execution.CompletionStatus
 	record.execution.CompletedAt = now
 	record.execution.UpdatedAt = now
@@ -598,6 +616,9 @@ func (queue *MemoryActionQueue) Reject(ctx context.Context, request ActionReject
 	if record.execution.Status != executionlease.StatusLeased {
 		return executionlease.Execution{}, executionlease.ErrInvalidTransition
 	}
+	if err := queue.requireCredentialTerminal(ctx, record, true); err != nil {
+		return executionlease.Execution{}, err
+	}
 	record.execution.Status = executionlease.StatusFailed
 	record.execution.CompletionStatus = executionlease.StatusFailed
 	record.execution.ResultHash = reasonHash
@@ -639,6 +660,9 @@ func (queue *MemoryActionQueue) Nack(ctx context.Context, request ActionNackRequ
 	if record.execution.Status != executionlease.StatusLeased {
 		return executionlease.Execution{}, executionlease.ErrInvalidTransition
 	}
+	if err := queue.requireCredentialTerminal(ctx, record, true); err != nil {
+		return executionlease.Execution{}, err
+	}
 	record.execution.Status = executionlease.StatusQueued
 	record.execution.RunnerID = ""
 	record.execution.RunnerTenantID = ""
@@ -675,7 +699,7 @@ func (queue *MemoryActionQueue) Reconcile(ctx context.Context, request execution
 	}
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	queue.expireLocked(now)
+	queue.expireLocked(ctx, now)
 	record, exists := queue.records[request.ExecutionID]
 	if !exists {
 		return executionlease.Execution{}, executionlease.ErrNotFound
@@ -690,6 +714,9 @@ func (queue *MemoryActionQueue) Reconcile(ctx context.Context, request execution
 	}
 	if record.execution.Status != executionlease.StatusUncertain {
 		return executionlease.Execution{}, executionlease.ErrInvalidTransition
+	}
+	if err := queue.requireCredentialTerminal(ctx, record, false); err != nil {
+		return executionlease.Execution{}, err
 	}
 	for executionID, existing := range queue.records {
 		if executionID != request.ExecutionID && existing.execution.ReconciliationID == request.ReconciliationID {
@@ -719,7 +746,7 @@ func (queue *MemoryActionQueue) Cancel(ctx context.Context, executionID string) 
 	}
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	queue.expireLocked(now)
+	queue.expireLocked(ctx, now)
 	record, exists := queue.records[executionID]
 	if !exists {
 		return executionlease.Execution{}, executionlease.ErrNotFound
@@ -738,6 +765,11 @@ func (queue *MemoryActionQueue) Cancel(ctx context.Context, executionID string) 
 			queue.records[executionID] = record
 		}
 		return redactActionExecution(record.execution), nil
+	}
+	if record.execution.Status == executionlease.StatusLeased {
+		if err := queue.requireCredentialTerminal(ctx, record, true); err != nil {
+			return executionlease.Execution{}, err
+		}
 	}
 	record.execution.Status = executionlease.StatusCancelled
 	record.execution.RunnerID = ""
@@ -761,7 +793,7 @@ func (queue *MemoryActionQueue) SweepExpired(ctx context.Context) error {
 		return err
 	}
 	queue.mu.Lock()
-	queue.expireLocked(now)
+	queue.expireLocked(ctx, now)
 	queue.mu.Unlock()
 	return nil
 }
@@ -779,7 +811,7 @@ func (queue *MemoryActionQueue) Get(ctx context.Context, executionID string) (ex
 	}
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	queue.expireLocked(now)
+	queue.expireLocked(ctx, now)
 	record, exists := queue.records[executionID]
 	if !exists {
 		return executionlease.Execution{}, executionlease.ErrNotFound
@@ -787,11 +819,15 @@ func (queue *MemoryActionQueue) Get(ctx context.Context, executionID string) (ex
 	return redactActionExecution(record.execution), nil
 }
 
-func (queue *MemoryActionQueue) expireLocked(now time.Time) {
+func (queue *MemoryActionQueue) expireLocked(ctx context.Context, now time.Time) {
 	for executionID, record := range queue.records {
 		if record.execution.Status == executionlease.StatusFinalizing {
 			if record.receipt == nil || record.submission.Envelope.ExpiresAt.After(now) ||
 				record.execution.CompletionStatus != record.receipt.CompletionStatus {
+				continue
+			}
+			if releasesTargetLock(record.execution.CompletionStatus) &&
+				queue.requireCredentialTerminal(ctx, record, false) != nil {
 				continue
 			}
 			record.execution.Status = record.execution.CompletionStatus
@@ -805,6 +841,9 @@ func (queue *MemoryActionQueue) expireLocked(now time.Time) {
 		}
 		switch record.execution.Status {
 		case executionlease.StatusLeased:
+			if queue.requireCredentialTerminal(ctx, record, true) != nil {
+				continue
+			}
 			record.execution.Status = executionlease.StatusQueued
 			record.execution.RunnerID = ""
 			record.execution.RunnerTenantID = ""
@@ -832,6 +871,31 @@ func (queue *MemoryActionQueue) expireLocked(now time.Time) {
 		record.execution.UpdatedAt = now
 		queue.records[executionID] = record
 	}
+}
+
+func releasesTargetLock(status executionlease.Status) bool {
+	return status == executionlease.StatusSucceeded || status == executionlease.StatusFailed ||
+		status == executionlease.StatusCancelled || status == executionlease.StatusQueued
+}
+
+func (queue *MemoryActionQueue) requireCredentialTerminal(
+	ctx context.Context,
+	record memoryActionRecord,
+	allowMissing bool,
+) error {
+	if record.execution.Pool != executionlease.PoolWrite {
+		return nil
+	}
+	if queue.credentialFinalizationGate == nil {
+		return ErrCredentialCleanupPending
+	}
+	present, terminal, err := queue.credentialFinalizationGate.InspectCleanup(
+		ctx, record.execution.ExecutionID, record.execution.LeaseEpoch,
+	)
+	if err != nil || present && !terminal || !present && !allowMissing {
+		return ErrCredentialCleanupPending
+	}
+	return nil
 }
 
 func expiredRunningResultHash() string {
@@ -1008,16 +1072,6 @@ func claimedAction(record memoryActionRecord) ClaimedAction {
 func (queue *MemoryActionQueue) targetActive(targetKey, excludingID string) bool {
 	for executionID, record := range queue.records {
 		if executionID != excludingID && record.execution.TargetKey == targetKey && actionLeaseActive(record.execution.Status) {
-			return true
-		}
-	}
-	return false
-}
-
-func (queue *MemoryActionQueue) productionWriteActive(excludingID string) bool {
-	for executionID, record := range queue.records {
-		if executionID != excludingID && record.execution.Pool == executionlease.PoolWrite &&
-			record.execution.Production && actionLeaseActive(record.execution.Status) {
 			return true
 		}
 	}

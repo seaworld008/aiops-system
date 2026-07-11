@@ -332,8 +332,17 @@ func (service *Service) RunNext(ctx context.Context) (result executionlease.Exec
 		return executionlease.Execution{}, err
 	}
 	leased := claimed.Execution
-	leaseFence := leased.Fence()
 	envelope := claimed.Envelope
+	// A Claim response is not trusted merely because it came from the queue.
+	// Fail closed before parsing or verifying its envelope, and do not Reject or
+	// Nack it here: either operation would release a target fence selected by
+	// unverified metadata. Expiry recovery owns that decision.
+	if leased.ExecutionID != envelope.ActionID || leased.TargetKey != claimed.TargetKey ||
+		leased.Pool != executionlease.PoolWrite || leased.Production != claimed.Production ||
+		claimed.PlanHash != envelope.PlanHash || leased.Production {
+		return redactActionExecution(leased), ErrJobConflict
+	}
+	leaseFence := leased.Fence()
 	now, err := service.now()
 	if err != nil {
 		return service.nackClaim(ctx, claimed, "CLOCK_TEMPORARILY_UNAVAILABLE", err)

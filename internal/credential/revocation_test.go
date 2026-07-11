@@ -45,7 +45,7 @@ func TestMemoryRevocationLifecycleIsRedactedAndCompletionIsFenced(t *testing.T) 
 		t.Fatalf("Prepare() error = %v", err)
 	}
 	if !prepared.Created || prepared.Revocation.Status != StatusPrepared || prepared.Revocation.WorkspaceID != testWorkspaceID ||
-		prepared.Revocation.EnvironmentID != testEnvironment || prepared.Revocation.TargetKey != "cluster-a/payments" || !prepared.Revocation.Production ||
+		prepared.Revocation.EnvironmentID != testEnvironment || prepared.Revocation.TargetKey != "cluster-a/payments" || prepared.Revocation.Production ||
 		prepared.Revocation.ConnectorID != "kubernetes-prod" || prepared.Revocation.Permission != "PATCH_DEPLOYMENT_RESTART" {
 		t.Fatalf("prepared derived metadata = %#v", prepared)
 	}
@@ -205,6 +205,24 @@ func TestMemoryPrepareRequiresBoundedIssuerRevision(t *testing.T) {
 		if !errors.Is(err, ErrInvalidRevocationRequest) {
 			t.Fatalf("Prepare(issuer revision %q) error = %v, want ErrInvalidRevocationRequest", revision, err)
 		}
+	}
+}
+
+func TestMemoryPrepareRejectsProductionActionMetadata(t *testing.T) {
+	now := time.Date(2026, 7, 10, 11, 10, 0, 0, time.UTC)
+	fence := ActionFence{ActionID: testActionID, RunnerID: "runner-write-1", Token: "action-token", Epoch: 2}
+	metadata := activeActionMetadata(now, fence)
+	metadata.Production = true
+	repository := newTestMemoryRepository(t,
+		&fakeActionFenceSource{fence: fence, metadata: metadata},
+		func() time.Time { return now }, sequenceTokens("unused"))
+
+	result, err := repository.Prepare(context.Background(), PrepareRequest{
+		RevocationID: testRevocationID, Fence: fence, Issuer: "vault-non-production",
+		IssuerRevision: "rev-1", CredentialExpiresAt: now.Add(time.Minute),
+	})
+	if !errors.Is(err, ErrInvalidRevocationRequest) || result != (PrepareResult{}) {
+		t.Fatalf("Prepare(production action) = %#v, %v, want ErrInvalidRevocationRequest", result, err)
 	}
 }
 
@@ -1491,7 +1509,7 @@ func newTestMemoryRepository(t *testing.T, source ActionFenceSource, clock func(
 func activeActionMetadata(now time.Time, fence ActionFence) ActionMetadata {
 	return ActionMetadata{
 		ActionID: fence.ActionID, TenantID: testTenantID, WorkspaceID: testWorkspaceID, EnvironmentID: testEnvironment,
-		TargetKey: "cluster-a/payments", Production: true, RunnerID: fence.RunnerID, LeaseEpoch: fence.Epoch,
+		TargetKey: "cluster-a/payments", Production: false, RunnerID: fence.RunnerID, LeaseEpoch: fence.Epoch,
 		Status: ActionStatusRunning, LeaseExpiresAt: now.Add(time.Minute), AuthorizationExpiresAt: now.Add(15 * time.Minute),
 		RunnerEnabled: true, RunnerPool: "WRITE", ScopeRevision: 7, RunnerScopeRevision: 7, ExactScopeAuthorized: true,
 		ConnectorID: "kubernetes-prod",
