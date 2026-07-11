@@ -11,6 +11,7 @@ require (
 	github.com/google/cel-go v0.29.2
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/pashagolub/pgxmock/v4 v4.9.0
+	golang.org/x/sys v0.42.0
 )
 
 require (

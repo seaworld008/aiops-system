@@ -62,7 +62,7 @@ jobs:
       - run: git diff --check
       - run: go test -race -shuffle=on -count=1 ./...
       - run: go vet ./...
-      - run: go build ./cmd/control-plane ./cmd/worker ./cmd/runner
+      - run: go build ./cmd/control-plane ./cmd/worker ./cmd/read-runner ./cmd/write-runner ./cmd/executor
 
   vulnerability-scan:
     runs-on: ubuntu-latest
@@ -76,3 +76,91 @@ jobs:
       - run: go mod download
       - name: Scan reachable Go vulnerabilities
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+  runner-images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GO_BUILD_IMAGE: docker.io/library/golang:1.26.5-bookworm
+      READ_RUNNER_IMAGE: aiops-read-runner:ci
+      WRITE_RUNNER_IMAGE: aiops-write-runner:ci
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build split Runner images
+        run: make runner-images
+      - name: Verify image trust boundaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test "$(docker image inspect --format '{{.Config.User}}' "${READ_RUNNER_IMAGE}")" = "65532:65532"
+          test "$(docker image inspect --format '{{.Config.User}}' "${WRITE_RUNNER_IMAGE}")" = "65532:65532"
+          test "$(docker image inspect --format '{{index .Config.Entrypoint 0}}' "${READ_RUNNER_IMAGE}")" = "/usr/local/bin/aiops-read-runner"
+          test "$(docker image inspect --format '{{index .Config.Entrypoint 0}}' "${WRITE_RUNNER_IMAGE}")" = "/usr/local/bin/aiops-write-runner"
+          docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${WRITE_RUNNER_IMAGE}" |
+            grep -Fxq 'AIOPS_WRITE_EXECUTION_MODE=disabled'
+
+          read_container="$(docker create "${READ_RUNNER_IMAGE}")"
+          write_container="$(docker create "${WRITE_RUNNER_IMAGE}")"
+          probe_container=""
+          cleanup() {
+            if [ -n "${probe_container}" ]; then docker rm -f "${probe_container}" >/dev/null 2>&1 || true; fi
+            docker rm -f "${read_container}" "${write_container}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker export --output=/tmp/read-runner.tar "${read_container}"
+          docker export --output=/tmp/write-runner.tar "${write_container}"
+          tar -tf /tmp/read-runner.tar > /tmp/read-runner.files
+          tar -tf /tmp/write-runner.tar > /tmp/write-runner.files
+          tar --numeric-owner -tvf /tmp/write-runner.tar | grep -E '(^| )(usr/local/libexec/|usr/local/libexec/aiops-executor)$'
+
+          grep -Fxq 'usr/local/bin/aiops-read-runner' /tmp/read-runner.files
+          ! grep -Eq 'aiops-(write-runner|executor)$' /tmp/read-runner.files
+          grep -Fxq 'usr/local/bin/aiops-write-runner' /tmp/write-runner.files
+          grep -Fxq 'usr/local/libexec/aiops-executor' /tmp/write-runner.files
+          ! grep -Eq 'aiops-read-runner$' /tmp/write-runner.files
+          ! grep -Eq '^tmp/?$' /tmp/write-runner.files
+          ! grep -Eq '(^|/)(ba|da|z|a|k)?sh$|(^|/)busybox$' /tmp/read-runner.files /tmp/write-runner.files
+          test "$(tar --numeric-owner -tvf /tmp/write-runner.tar | awk '$6 == "usr/local/libexec/" {print $1, $2}')" = "drwxr-xr-x 0/0"
+          test "$(tar --numeric-owner -tvf /tmp/write-runner.tar | awk '$6 == "usr/local/libexec/aiops-executor" {print $1, $2}')" = "-r-xr-xr-x 0/0"
+
+          probe_container="$(docker run --detach --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=65532,gid=65532 \
+            --env AIOPS_WRITE_EXECUTION_MODE=non-production "${WRITE_RUNNER_IMAGE}")"
+          sleep 1
+          if [ "$(docker inspect --format '{{.State.Running}}' "${probe_container}")" != "true" ]; then
+            docker logs "${probe_container}" >&2
+            docker inspect --format 'exit={{.State.ExitCode}} error={{.State.Error}}' "${probe_container}" >&2
+            exit 1
+          fi
+          docker stop --time 5 "${probe_container}" >/dev/null
+          docker rm "${probe_container}" >/dev/null
+          probe_container=""
+
+          probe_container="$(docker run --detach --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --env AIOPS_WRITE_EXECUTION_MODE=non-production "${WRITE_RUNNER_IMAGE}")"
+          sleep 1
+          test "$(docker inspect --format '{{.State.Running}}' "${probe_container}")" = "false"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "${probe_container}")" != "0"
+          docker rm "${probe_container}" >/dev/null
+          probe_container=""
+
+          probe_container="$(docker run --detach --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=32m,mode=0750,uid=65532,gid=65532 \
+            --env AIOPS_WRITE_EXECUTION_MODE=non-production "${WRITE_RUNNER_IMAGE}")"
+          sleep 1
+          test "$(docker inspect --format '{{.State.Running}}' "${probe_container}")" = "false"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "${probe_container}")" != "0"
+          docker rm "${probe_container}" >/dev/null
+          probe_container=""
+
+          if docker run --rm --env AIOPS_WRITE_EXECUTION_MODE=production "${WRITE_RUNNER_IMAGE}"; then
+            echo "production write mode unexpectedly started" >&2
+            exit 1
+          fi

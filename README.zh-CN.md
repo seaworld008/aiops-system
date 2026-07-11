@@ -9,7 +9,7 @@
 [English](README.md) · **简体中文**
 
 > [!IMPORTANT]
-> 项目目前处于积极开发的 pre-alpha 阶段。只读调查基础可用于开发和评估；在试点计划的全部安全、质量门槛通过前，生产写自动化始终保持关闭。
+> 项目目前处于积极开发的 pre-alpha 阶段。只读调查基础可用于开发和评估；生产写不存在可配置启用路径，在试点计划的全部安全、质量门槛通过前始终保持关闭。
 
 ## 为什么需要这个项目
 
@@ -30,8 +30,8 @@ AIOps System 坚持四条原则：
 | 只读证据 | 已实现 | Prometheus、VictoriaLogs、Kubernetes、AWX、Argo CD、GitLab、Jenkins、GitHub Actions 有界客户端 |
 | 调查引擎 | 基础已实现 | 有界并行取证、`PARTIAL` 降级、混合模型路由、证据关联假设 |
 | 身份与策略 | 基础已实现 | Keycloak OIDC、Workspace/Environment RBAC、签名 ActionEnvelope、CEL 三阶段裁决 |
-| 执行安全 | 基础已实现 | 类型化动作、Runner 作用域领取、目标锁、生产并发围栏、心跳、取消和对账 |
-| 生产自动化 | **关闭** | 仍需持久化凭据吊销重试、隔离执行器、真实集成、非生产演练与 Go/No-Go 审查 |
+| 执行安全 | 基础已实现 | 精确 Runner scope、持久凭据吊销、TLS 1.3 mTLS Gateway、READ/WRITE 拆分镜像、固定可终止 Executor、目标锁、心跳、取消和对账 |
+| 生产自动化 | **关闭** | 仍需固定真实适配器、外部 sandbox/网络门禁、非生产演练与正式 Go/No-Go 审查 |
 | Web / ChatOps | 规划中 | React 控制台与飞书流程尚未交付 |
 
 “基础已实现”表示核心契约和可测试实现已经存在，不代表对应连接器或写操作可无人值守地用于生产。
@@ -50,7 +50,7 @@ flowchart LR
 
     TW --> GW["出站 Runner Gateway"]
     GW --> RR["只读 Runner"]
-    GW --> WR["隔离变更 Runner"]
+    GW --> WR["拆分 WRITE Runner + 固定 Executor"]
     RR --> OBS["指标 / 日志 / K8s / AWX / CI / Argo"]
     WR --> MUT["类型化 K8s / GitOps / AWX 动作"]
 
@@ -59,7 +59,7 @@ flowchart LR
     VAULT --> WR
 ```
 
-首版面向单企业自托管和多 Workspace。PostgreSQL 是领域事实源，Temporal 只负责持久编排；Runner 采用仅出站的 HTTPS + mTLS 通信模型。
+首版面向单企业自托管和多 Workspace。PostgreSQL 是领域事实源，Temporal 只负责持久编排；Runner 只通过独立的 TLS 1.3 mTLS Gateway 出站通信。
 
 ## 安全模型
 
@@ -71,10 +71,10 @@ flowchart LR
 2. 签名有效且计划哈希不可变；
 3. 计划、凭据、执行三个阶段的当前策略均允许；
 4. 非申请人的审批绑定精确计划和目标实时状态；
-5. 仅签发单目标、短时凭据；
+5. 仅签发单目标、短时凭据，使用前持久 anchor，执行后持久吊销；
 6. 全局、环境、连接器和动作 Kill Switch 全部允许；
 7. 目标锁和试点期生产全局并发限制生效；
-8. 执行后验证完成；若结果为 `UNCERTAIN`，持续占用锁直到人工对账。
+8. 固定隔离 Executor 必须终止并回收后才能 release；执行后验证未完成或结果为 `UNCERTAIN` 时，持续占用锁直到人工对账。
 
 完整契约见[架构蓝图](docs/architecture/implementation-blueprint-v3.md)。
 
@@ -112,12 +112,22 @@ AIOPS_TEST_POSTGRES_DSN='postgres://aiops:password@127.0.0.1:5432/aiops_test?ssl
   go test -count=1 ./internal/store/postgres ./internal/execution/postgres
 ```
 
+安装 Docker/BuildKit 后，可构建物理拆分的 Runner 镜像：
+
+```bash
+make runner-images
+```
+
+WRITE 镜像默认是 `disabled`；M4 的 `non-production` 只执行 Linux 隔离能力探测，仍不领取任何任务。详见[隔离 Runner 运行门禁](docs/operations/isolated-runner-runtime.md)。
+
 ## 文档
 
 - [文档索引](docs/README.md)
 - [架构概览](docs/architecture/overview.md)
 - [2026 V3 实施蓝图](docs/architecture/implementation-blueprint-v3.md)
 - [中小企业内部试点计划](docs/plans/2026-07-10-sme-internal-aiops-pilot.md)
+- [M4 隔离执行器设计](docs/plans/2026-07-11-isolated-executor-m4.md)
+- [隔离 Runner 镜像与 Linux 运行门禁](docs/operations/isolated-runner-runtime.md)
 - [路线图与发布门禁](docs/roadmap.md)
 - [历史设计归档](docs/archive/README.md)
 

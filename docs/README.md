@@ -10,8 +10,11 @@ This directory separates current architecture, executable delivery plans, and su
 ## Delivery and operations
 
 - [SME internal pilot implementation plan](plans/2026-07-10-sme-internal-aiops-pilot.md) — phased implementation and acceptance plan.
+- [Runner Gateway M3](plans/2026-07-11-runner-gateway-m3.md) — mTLS identity, strict protocol, and fail-closed start boundary.
+- [Isolated executor M4](plans/2026-07-11-isolated-executor-m4.md) — split trust domains, READY/GO protocol, and termination semantics.
 - [Roadmap and release gates](roadmap.md) — current delivery status and the conditions for enabling production writes.
 - [Runner Gateway security-file staging](operations/runner-gateway-identity-files.md) — secure Kubernetes staging and rotation runbook for mTLS and credential-protection material.
+- [Isolated Runner runtime gates](operations/isolated-runner-runtime.md) — split image build, Linux capability checks, and external sandbox gates.
 
 ## Historical material
 

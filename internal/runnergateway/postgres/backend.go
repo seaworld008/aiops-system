@@ -388,6 +388,7 @@ func (backend *Backend) StartJob(
 		ScopeRevision: runnergateway.DecimalInt64(transaction.scope.ScopeRevision()), StartedAt: started.StartedAt.UTC(),
 		CredentialPrepare: runnergateway.CredentialPrepare{
 			RevocationID: prepared.Revocation.ID, ChildCreatePermit: prepared.Permit.Token,
+			IssuerID: authorization.IssuerID, IssuerRevision: authorization.IssuerRevision,
 			CredentialExpiresAt: prepared.Revocation.CredentialExpiresAt.UTC(),
 		},
 	}

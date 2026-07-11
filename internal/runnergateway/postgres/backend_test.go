@@ -340,7 +340,8 @@ func TestStartIsAtomicAndNeverReissuesPreparedPermit(t *testing.T) {
 	}
 	response, err := backend.StartJob(context.Background(), identity, testJobID, testToken,
 		runnergateway.JobStartRequest{LeaseEpoch: 4})
-	if err != nil || response.Status != "RUNNING" || response.CredentialPrepare.ChildCreatePermit != testToken {
+	if err != nil || response.Status != "RUNNING" || response.CredentialPrepare.ChildCreatePermit != testToken ||
+		response.CredentialPrepare.IssuerID != "vault-non-production" || response.CredentialPrepare.IssuerRevision != "rev-1" {
 		t.Fatalf("StartJob() = %#v, %v", response, err)
 	}
 	if returnedPermit == nil || returnedPermit.Token != "" {

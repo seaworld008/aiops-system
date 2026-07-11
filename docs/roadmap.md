@@ -11,10 +11,15 @@ This roadmap is deliberately gate-driven. Calendar progress never enables produc
 | Read-only connectors | Implemented foundation | Run contract and failure tests against pilot environments |
 | Investigation and model routing | Implemented foundation | Build a replay set of at least 100 historical incidents |
 | Identity, RBAC, policy, and signed plans | Implemented foundation | Complete real Keycloak/Vault integration and adversarial tests |
-| Fenced action execution | Secure queue, mTLS Gateway, and durable revocation foundation implemented | Validate PostgreSQL 16 in CI; add isolated executors and non-production adapters |
+| Fenced action execution | Secure queue, durable revocation, mTLS Gateway, split Runner images, and killable Executor foundation implemented | Add only fixed non-production adapters after external sandbox/network gates |
 | Temporal orchestration | Planned | Replay-safe investigation, approval, and execution workflows |
 | Web console and Feishu | Planned | Investigation, approval, execution, and audit user journeys |
 | Production pilot | Blocked by gates | Non-production drills plus formal Go/No-Go review |
+
+M4 does not enable action claims: the control plane still has no write `StartAuthorizer`, the
+WRITE Runner only performs a Linux capability probe in `non-production`, and the Executor rejects
+all mutation handlers before READY. Only M6 may wire fixed non-production adapters; no milestone in
+the current plan adds a production mode.
 
 ## Pilot sequence
 
@@ -41,6 +46,9 @@ Production mutation feature flags remain off until all of the following are true
 - PostgreSQL-backed action claims are atomic across replicas;
 - failed dynamic-credential revocation has a durable, alerted retry path;
 - timed-out executors are isolated and cannot overlap a reconciled execution;
+- READ and WRITE images, identities, queues, Vault roles, and network policies are demonstrably separate;
+- each write job is constrained by cgroup v2, reviewed seccomp/LSM policy, a read-only root, and an
+  allowlisted egress policy in the target environment;
 - 100 negative action tests show zero policy or scope bypass;
 - each action type completes at least 20 non-production drills with at least 95% verification success;
 - the pilot completes at least 30 supervised production actions without an unauthorized action or AI-caused Sev1/Sev2.

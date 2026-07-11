@@ -9,7 +9,7 @@ Evidence-first operations intelligence with policy-governed automation.
 **English** · [简体中文](README.zh-CN.md)
 
 > [!IMPORTANT]
-> AIOps System is in active pre-alpha development. Read-only investigation foundations are usable for development and evaluation. Production write automation is disabled by design until every safety and quality gate in the pilot plan has passed.
+> AIOps System is in active pre-alpha development. Read-only investigation foundations are usable for development and evaluation. Production write automation has no configurable enablement path and remains disabled until every safety and quality gate in the pilot plan has passed.
 
 ## Why this project exists
 
@@ -30,8 +30,8 @@ AIOps System is designed around four rules:
 | Read-only evidence | Implemented | Bounded clients for Prometheus, VictoriaLogs, Kubernetes, AWX, Argo CD, GitLab, Jenkins, and GitHub Actions |
 | Investigation | Implemented foundation | Bounded parallel evidence collection, partial-result semantics, hybrid model routing, evidence-linked hypotheses |
 | Identity and policy | Implemented foundation | Keycloak OIDC, workspace/environment RBAC, signed ActionEnvelope, three-stage CEL decisions |
-| Execution safety | Implemented foundation | Typed actions, scoped runner claims, target locks, production concurrency fencing, heartbeat, cancellation, reconciliation |
-| Production automation | **Disabled** | Requires persistent credential-revocation retry, isolated executors, real integrations, non-production drills, and Go/No-Go approval |
+| Execution safety | Implemented foundation | Exact runner scopes, durable credential revocation, TLS 1.3 mTLS Gateway, split READ/WRITE images, fixed killable executor, target locks, heartbeat, cancellation, and reconciliation |
+| Production automation | **Disabled** | Requires fixed real adapters, external sandbox/network gates, non-production drills, and formal Go/No-Go approval |
 | Web console / ChatOps | Planned | React console and Feishu workflows are not yet shipped |
 
 “Implemented foundation” means the contracts and testable core exist; it does **not** mean a connector or mutation path is ready for unattended production use.
@@ -50,7 +50,7 @@ flowchart LR
 
     TW --> GW["Outbound Runner Gateway"]
     GW --> RR["Read-only runners"]
-    GW --> WR["Isolated change runners"]
+    GW --> WR["Split write runners + fixed executor"]
     RR --> OBS["Metrics / logs / K8s / AWX / CI / Argo"]
     WR --> MUT["Typed K8s / GitOps / AWX actions"]
 
@@ -59,7 +59,7 @@ flowchart LR
     VAULT --> WR
 ```
 
-The first release targets a single self-hosted organization with multiple workspaces. PostgreSQL is the domain source of truth; Temporal is used only for durable orchestration. Runner communication is outbound-only and designed for HTTPS + mTLS.
+The first release targets a single self-hosted organization with multiple workspaces. PostgreSQL is the domain source of truth; Temporal is used only for durable orchestration. Runner communication is outbound-only through a dedicated TLS 1.3 mTLS Gateway.
 
 ## Safety model
 
@@ -71,10 +71,10 @@ Before a write starts, the system must verify:
 2. a valid signature and immutable plan hash;
 3. current policy at plan, credential, and execution stages;
 4. non-self approval bound to the exact plan and live target state;
-5. a single-target, short-lived credential;
+5. a single-target, short-lived credential anchored before use and durably revoked after execution;
 6. all global, environment, connector, and action kill switches;
 7. target locking and the pilot-wide production concurrency limit;
-8. post-action verification, or an `UNCERTAIN` state that retains the lock until reconciliation.
+8. a fixed isolated executor that must be killed and reaped before release, followed by post-action verification or an `UNCERTAIN` state that retains the lock until reconciliation.
 
 See the [security model and implementation blueprint](docs/architecture/implementation-blueprint-v3.md) for the complete contract.
 
@@ -112,19 +112,30 @@ AIOPS_TEST_POSTGRES_DSN='postgres://aiops:password@127.0.0.1:5432/aiops_test?ssl
   go test -count=1 ./internal/store/postgres ./internal/execution/postgres
 ```
 
+With Docker/BuildKit available, build the physically separate Runner images with:
+
+```bash
+make runner-images
+```
+
+The WRITE image defaults to `disabled`; M4 only performs a Linux isolation capability probe in `non-production` mode and still claims no jobs. See the [isolated Runner runtime gates](docs/operations/isolated-runner-runtime.md).
+
 ## Documentation
 
 - [Documentation index](docs/README.md)
 - [Architecture overview](docs/architecture/overview.md)
 - [2026 V3 implementation blueprint](docs/architecture/implementation-blueprint-v3.md)
 - [SME internal pilot plan](docs/plans/2026-07-10-sme-internal-aiops-pilot.md)
+- [M4 isolated executor design](docs/plans/2026-07-11-isolated-executor-m4.md)
+- [Isolated Runner image and Linux runtime gates](docs/operations/isolated-runner-runtime.md)
 - [Roadmap and release gates](docs/roadmap.md)
 - [Historical designs](docs/archive/README.md)
 
 ## Repository layout
 
 ```text
-cmd/                       control-plane, worker, and runner entry points
+cmd/                       control-plane, worker, separate READ/WRITE runners, fixed executor
+build/package/             separate minimal READ and WRITE Runner image definitions
 internal/                  domain, policy, connectors, investigation, execution
 migrations/                ordered PostgreSQL schema migrations
 docs/architecture/         current architecture and trust contracts

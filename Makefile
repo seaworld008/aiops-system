@@ -1,4 +1,8 @@
-.PHONY: test test-race test-integration vet build check format run
+.PHONY: test test-race test-integration vet build runner-images check format run
+
+GO_BUILD_IMAGE ?= docker.io/library/golang:1.26.5-bookworm
+READ_RUNNER_IMAGE ?= aiops-read-runner:dev
+WRITE_RUNNER_IMAGE ?= aiops-write-runner:dev
 
 test:
 	go test ./...
@@ -14,7 +18,11 @@ vet:
 	go vet ./...
 
 build:
-	go build ./cmd/control-plane ./cmd/worker ./cmd/runner
+	go build ./cmd/control-plane ./cmd/worker ./cmd/read-runner ./cmd/write-runner ./cmd/executor
+
+runner-images:
+	docker build --build-arg GO_BUILD_IMAGE="$(GO_BUILD_IMAGE)" --file build/package/read-runner/Dockerfile --tag "$(READ_RUNNER_IMAGE)" .
+	docker build --build-arg GO_BUILD_IMAGE="$(GO_BUILD_IMAGE)" --file build/package/write-runner/Dockerfile --tag "$(WRITE_RUNNER_IMAGE)" .
 
 check: test-race vet build
 
