@@ -220,11 +220,13 @@ func (*CredentialPreparation) UnmarshalJSON([]byte) error               { return
 
 // ExecutionGrant is a server-authorized, credential-state-bound capability
 // required to cross the GO barrier. It has no public constructor.
-type ExecutionGrant struct {
-	mu       sync.Mutex
-	state    *credentialPreparationState
-	consumed bool
+type executionGrantState struct {
+	mu         sync.Mutex
+	credential *credentialPreparationState
+	consumed   bool
 }
+
+type ExecutionGrant struct{ state *executionGrantState }
 
 func (grant *ExecutionGrant) String() string   { return "ExecutionGrant{Security:[REDACTED]}" }
 func (grant *ExecutionGrant) GoString() string { return grant.String() }
@@ -349,6 +351,9 @@ func (lease *RevocationLease) Destroy() {
 	if lease.state == nil {
 		return
 	}
+	lease.state.runtimeMu.Lock()
+	lease.state.terminationRequested = true
+	lease.state.runtimeMu.Unlock()
 	if lease.state.token != nil {
 		lease.state.token.Destroy()
 	}

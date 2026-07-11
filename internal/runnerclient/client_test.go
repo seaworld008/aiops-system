@@ -362,6 +362,7 @@ func TestClientRunsSegmentedJobProtocolWithPrivateBearerHandles(t *testing.T) {
 	if _, cancel, err := started.Grant.BindExecutor(context.Background(), mismatched); !errors.Is(err, runnerclient.ErrInvalidResponse) || cancel != nil {
 		t.Fatalf("BindExecutor(cross-job) = cancel=%#v, error=%v", cancel, err)
 	}
+	copiedGrant := *started.Grant
 	grantContext, grantCancel, err := started.Grant.BindExecutor(context.Background(), executorBinding)
 	if err != nil || grantContext == nil || grantCancel == nil {
 		t.Fatalf("BindExecutor(ACTIVE) = %#v, %#v, %v", grantContext, grantCancel, err)
@@ -369,6 +370,9 @@ func TestClientRunsSegmentedJobProtocolWithPrivateBearerHandles(t *testing.T) {
 	grantCancel()
 	if _, replayCancel, err := started.Grant.BindExecutor(context.Background(), executorBinding); !errors.Is(err, runnerclient.ErrInvalidResponse) || replayCancel != nil {
 		t.Fatalf("BindExecutor(replay) = cancel=%#v, error=%v", replayCancel, err)
+	}
+	if _, copiedCancel, err := copiedGrant.BindExecutor(context.Background(), executorBinding); !errors.Is(err, runnerclient.ErrInvalidResponse) || copiedCancel != nil {
+		t.Fatalf("BindExecutor(copied replay) = cancel=%#v, error=%v", copiedCancel, err)
 	}
 	heartbeat, err := client.HeartbeatJob(context.Background(), lease, 1)
 	if err != nil || heartbeat.Directive != "CONTINUE" || heartbeat.AcceptedSequence.Int64() != 1 {

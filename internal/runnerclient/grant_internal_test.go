@@ -36,7 +36,7 @@ func TestExecutionLeaseTerminateIsStickyAndCancelsGrantContext(t *testing.T) {
 }
 
 func TestExecutionGrantCanBeConsumedExactlyOnceUnderConcurrency(t *testing.T) {
-	grant := &ExecutionGrant{}
+	grant := &ExecutionGrant{state: &executionGrantState{}}
 	var successes atomic.Int64
 	var wait sync.WaitGroup
 	for range 64 {

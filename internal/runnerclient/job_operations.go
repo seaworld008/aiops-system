@@ -48,7 +48,7 @@ func (client *Client) StartJob(ctx context.Context, lease *JobLease) (JobStart, 
 	return JobStart{
 		JobID: response.JobID, Status: response.Status, LeaseEpoch: response.LeaseEpoch.Int64(),
 		ScopeRevision: response.ScopeRevision.Int64(), StartedAt: response.StartedAt.UTC(), Credential: preparation,
-		Grant: &ExecutionGrant{state: preparation.state},
+		Grant: &ExecutionGrant{state: &executionGrantState{credential: preparation.state}},
 	}, nil
 }
 
