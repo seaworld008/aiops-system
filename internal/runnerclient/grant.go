@@ -105,13 +105,29 @@ func (grant *ExecutionGrant) BindExecutor(
 	parent context.Context,
 	executor ExecutorBinding,
 ) (context.Context, context.CancelFunc, error) {
-	if parent == nil || grant == nil || grant.state == nil || grant.state.lease == nil ||
-		grant.state.currentPhase() != credentialPhaseActive || !validExecutorGrant(grant.state, executor, time.Now().UTC()) {
+	if parent == nil || parent.Err() != nil || grant == nil || grant.state == nil || grant.state.lease == nil ||
+		!grant.consumeIfValid(func() bool {
+			return grant.state.currentPhase() == credentialPhaseActive &&
+				validExecutorGrant(grant.state, executor, time.Now().UTC())
+		}) {
 		return nil, nil, ErrInvalidResponse
 	}
 	ctx, cancel := context.WithCancel(parent)
 	go monitorExecutionLease(ctx, cancel, grant.state)
 	return ctx, cancel, nil
+}
+
+func (grant *ExecutionGrant) consumeIfValid(valid func() bool) bool {
+	if grant == nil || valid == nil {
+		return false
+	}
+	grant.mu.Lock()
+	defer grant.mu.Unlock()
+	if grant.consumed || !valid() {
+		return false
+	}
+	grant.consumed = true
+	return true
 }
 
 func validExecutorGrant(state *credentialPreparationState, executor ExecutorBinding, now time.Time) bool {

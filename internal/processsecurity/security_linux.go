@@ -3,7 +3,11 @@
 package processsecurity
 
 import (
+	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
 	"syscall"
 )
 
@@ -37,10 +41,38 @@ func Harden() error {
 		return ErrHardeningFailed
 	}
 	noNewPrivileges, err := prctlGet(prGetNoNewPrivs)
-	if err != nil || noNewPrivileges != 1 {
+	if err != nil || noNewPrivileges != 1 || !allThreadsNoNewPrivileges() {
 		return ErrHardeningFailed
 	}
 	return nil
+}
+
+func allThreadsNoNewPrivileges() bool {
+	for range 2 {
+		entries, err := os.ReadDir("/proc/self/task")
+		if err != nil || len(entries) == 0 || len(entries) > 1<<20 {
+			return false
+		}
+		checked := 0
+		for _, entry := range entries {
+			if _, err := strconv.Atoi(entry.Name()); err != nil {
+				return false
+			}
+			status, err := os.ReadFile(filepath.Join("/proc/self/task", entry.Name(), "status"))
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil || len(status) == 0 || len(status) > 1<<20 ||
+				!bytes.Contains(status, []byte("\nNoNewPrivs:\t1\n")) {
+				return false
+			}
+			checked++
+		}
+		if checked == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func prctlSet(option, value uintptr) error {

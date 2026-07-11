@@ -121,6 +121,9 @@ func TestClientRejectsTrustFilesWithExtendedAccessMetadata(t *testing.T) {
 
 func TestClientRejectsNonStrictCertificateAndPrivateKeyPEM(t *testing.T) {
 	for name, mutate := range map[string]func(t *testing.T, fixture *gatewayFixture){
+		"root malformed DER": func(t *testing.T, fixture *gatewayFixture) {
+			writePEMFile(t, fixture.options.RootCAFile, "CERTIFICATE", []byte("malformed-der"), 0o600)
+		},
 		"root leading garbage": func(t *testing.T, fixture *gatewayFixture) {
 			contents, err := os.ReadFile(fixture.options.RootCAFile)
 			if err != nil {
@@ -364,6 +367,9 @@ func TestClientRunsSegmentedJobProtocolWithPrivateBearerHandles(t *testing.T) {
 		t.Fatalf("BindExecutor(ACTIVE) = %#v, %#v, %v", grantContext, grantCancel, err)
 	}
 	grantCancel()
+	if _, replayCancel, err := started.Grant.BindExecutor(context.Background(), executorBinding); !errors.Is(err, runnerclient.ErrInvalidResponse) || replayCancel != nil {
+		t.Fatalf("BindExecutor(replay) = cancel=%#v, error=%v", replayCancel, err)
+	}
 	heartbeat, err := client.HeartbeatJob(context.Background(), lease, 1)
 	if err != nil || heartbeat.Directive != "CONTINUE" || heartbeat.AcceptedSequence.Int64() != 1 {
 		t.Fatalf("HeartbeatJob() = %#v, %v", heartbeat, err)
@@ -398,7 +404,7 @@ func TestClientRunsRevocationProtocolWithoutRenderingClaimSecrets(t *testing.T) 
 			}
 			writeJSON(t, writer, http.StatusOK, map[string]any{
 				"schema_version": "runner-revocation-lease-response.v1", "revocation_id": revocation,
-				"claim_token": claimToken, "claim_epoch": "2", "claim_expires_at": now.Add(30 * time.Second),
+				"claim_token": claimToken, "claim_epoch": "2", "claim_expires_at": now.Add(20 * time.Second),
 				"heartbeat_after_seconds": 10, "tenant_id": tenantID, "workspace_id": workspaceID,
 				"environment_id": environment, "issuer_id": "vault-staging", "issuer_revision": "revision-7",
 				"revoke_accessor_b64u": base64.RawURLEncoding.EncodeToString(accessorBytes),
@@ -466,6 +472,9 @@ func TestClientRunsRevocationProtocolWithoutRenderingClaimSecrets(t *testing.T) 
 	}
 	if heartbeat, err := client.HeartbeatRevocation(context.Background(), claim, 1); err != nil || heartbeat.Directive != "CONTINUE" {
 		t.Fatalf("HeartbeatRevocation() = %#v, %v", heartbeat, err)
+	}
+	if !claim.ClaimExpiresAt().Equal(now.Add(30*time.Second)) || claim.TerminationRequested() {
+		t.Fatalf("revocation runtime state = expiry %s terminate=%t", claim.ClaimExpiresAt(), claim.TerminationRequested())
 	}
 	if completed, err := client.CompleteRevocation(
 		context.Background(), claim, credential.RunnerRevocationRevoked, "",

@@ -84,6 +84,7 @@ func TestLinuxSupervisorMapsEveryPostGOAmbiguityToUncertainAfterReap(t *testing.
 		{name: "ignores context and TERM", mode: "ignore-term", timeout: 100 * time.Millisecond},
 		{name: "floods stdout and stderr", mode: "flood-output", timeout: 10 * time.Second, wantOverflow: true},
 		{name: "forks descendant", mode: "fork-descendant", timeout: 100 * time.Millisecond},
+		{name: "leader exits before descendant", mode: "leader-exit-with-descendant", timeout: 10 * time.Second},
 		{name: "hangs after result", mode: "post-result-hang", timeout: 10 * time.Second},
 	}
 	for _, test := range tests {

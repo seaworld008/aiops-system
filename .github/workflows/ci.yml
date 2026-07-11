@@ -112,19 +112,20 @@ jobs:
           docker export --output=/tmp/write-runner.tar "${write_container}"
           tar -tf /tmp/read-runner.tar > /tmp/read-runner.files
           tar -tf /tmp/write-runner.tar > /tmp/write-runner.files
-          tar --numeric-owner -tvf /tmp/write-runner.tar | grep -E '(^| )(tmp/|usr/local/libexec/|usr/local/libexec/aiops-executor)$'
+          tar --numeric-owner -tvf /tmp/write-runner.tar | grep -E '(^| )(usr/local/libexec/|usr/local/libexec/aiops-executor)$'
 
           grep -Fxq 'usr/local/bin/aiops-read-runner' /tmp/read-runner.files
           ! grep -Eq 'aiops-(write-runner|executor)$' /tmp/read-runner.files
           grep -Fxq 'usr/local/bin/aiops-write-runner' /tmp/write-runner.files
           grep -Fxq 'usr/local/libexec/aiops-executor' /tmp/write-runner.files
           ! grep -Eq 'aiops-read-runner$' /tmp/write-runner.files
+          ! grep -Eq '^tmp/?$' /tmp/write-runner.files
           ! grep -Eq '(^|/)(ba|da|z|a|k)?sh$|(^|/)busybox$' /tmp/read-runner.files /tmp/write-runner.files
-          test "$(tar --numeric-owner -tvf /tmp/write-runner.tar | awk '$6 == "tmp/" {print $1, $2}')" = "drwx------ 65532/65532"
           test "$(tar --numeric-owner -tvf /tmp/write-runner.tar | awk '$6 == "usr/local/libexec/" {print $1, $2}')" = "drwxr-xr-x 0/0"
           test "$(tar --numeric-owner -tvf /tmp/write-runner.tar | awk '$6 == "usr/local/libexec/aiops-executor" {print $1, $2}')" = "-r-xr-xr-x 0/0"
 
           probe_container="$(docker run --detach --read-only \
+            --security-opt no-new-privileges:true \
             --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=65532,gid=65532 \
             --env AIOPS_WRITE_EXECUTION_MODE=non-production "${WRITE_RUNNER_IMAGE}")"
           sleep 1

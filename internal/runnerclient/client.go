@@ -385,7 +385,7 @@ func parseRootPool(contents []byte) (*x509.CertPool, error) {
 			return nil, ErrInvalidConfiguration
 		}
 		certificate, err := x509.ParseCertificate(block.Bytes)
-		digest := sha256.Sum256(certificate.Raw)
+		digest := sha256.Sum256(block.Bytes)
 		_, duplicate := seen[digest]
 		if err != nil || duplicate || !certificate.IsCA || !certificate.BasicConstraintsValid ||
 			certificate.KeyUsage&x509.KeyUsageCertSign == 0 || certificate.CheckSignatureFrom(certificate) != nil {

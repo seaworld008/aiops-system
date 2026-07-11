@@ -78,6 +78,14 @@ func (handler *fixtureHandler) Execute(
 	switch handler.mode {
 	case "success", "post-result-hang", "result-then-delay-exit":
 		return succeeded(), nil
+	case "leader-exit-with-descendant":
+		child := exec.Command(os.Args[0], "descendant")
+		child.Stdout = os.Stdout
+		child.Stderr = os.Stderr
+		if err := child.Start(); err != nil {
+			return failed("DESCENDANT_START_FAILED"), nil
+		}
+		return succeeded(), nil
 	case "handler-error":
 		return execution.ExecutorResult{}, errors.New("handler-error-canary")
 	case "invalid-result":

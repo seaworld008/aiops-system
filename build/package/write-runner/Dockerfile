@@ -26,14 +26,12 @@ RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
       -o /out/aiops-write-runner ./cmd/write-runner && \
     GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
     go build -trimpath -buildvcs=false -ldflags="-s -w" \
-      -o /out/aiops-executor ./cmd/executor && \
-    install -d -m 0700 -o 65532 -g 65532 /out/runtime-tmp
+      -o /out/aiops-executor ./cmd/executor
 
 FROM scratch
 
 COPY --from=build --chmod=0555 /out/aiops-write-runner /usr/local/bin/aiops-write-runner
 COPY --from=build --chmod=0555 /out/aiops-executor /usr/local/libexec/aiops-executor
-COPY --from=build --chown=65532:65532 --chmod=0700 /out/runtime-tmp /tmp
 
 ENV AIOPS_WRITE_EXECUTION_MODE=disabled
 USER 65532:65532

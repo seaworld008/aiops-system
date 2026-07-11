@@ -172,9 +172,10 @@ func (process *childProcess) signalGroup(signal syscall.Signal) error {
 	}
 	select {
 	case <-process.exitDone:
-		// The stable handle proves the original leader has exited. Without a
-		// per-job cgroup, no later raw PGID signal is allowed.
-		return nil
+		// The original group leader is deliberately not reaped until every
+		// descendant is gone, so its numeric PID/PGID cannot be reused. It is
+		// therefore safe to finish terminating the reserved original group.
+		return signalProcessGroup(process.pid, signal)
 	default:
 	}
 	group, err := syscall.Getpgid(process.pid)

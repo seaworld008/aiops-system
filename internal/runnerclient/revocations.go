@@ -60,8 +60,9 @@ func (client *Client) LeaseRevocation(ctx context.Context) (*RevocationLease, er
 	token := newBearer(wire.ClaimToken.take())
 	return &RevocationLease{state: &revocationLeaseState{
 		owner: client, revocationID: wire.RevocationID, claimEpoch: wire.ClaimEpoch.Int64(),
-		claimExpiresAt: wire.ClaimExpiresAt.UTC(), heartbeatAfterSeconds: wire.HeartbeatAfterSeconds,
-		tenantID: wire.TenantID, workspaceID: wire.WorkspaceID, environmentID: wire.EnvironmentID,
+		runtimeClaimExpiresAt: wire.ClaimExpiresAt.UTC(),
+		heartbeatAfterSeconds: wire.HeartbeatAfterSeconds,
+		tenantID:              wire.TenantID, workspaceID: wire.WorkspaceID, environmentID: wire.EnvironmentID,
 		issuerID: wire.IssuerID, issuerRevision: wire.IssuerRevision, revokeAccessor: accessor, token: token,
 	}}, nil
 }
@@ -97,7 +98,33 @@ func (client *Client) HeartbeatRevocation(
 		response.ClaimExpiresAt.IsZero() || response.ClaimExpiresAt.After(client.certificateNotAfter) || response.HeartbeatAfterSeconds != 10 {
 		return runnergateway.RevocationHeartbeatResponse{}, ErrInvalidResponse
 	}
+	if !lease.state.updateHeartbeat(response.Directive, response.ClaimExpiresAt.UTC()) {
+		return runnergateway.RevocationHeartbeatResponse{}, ErrInvalidResponse
+	}
 	return response, nil
+}
+
+func (state *revocationLeaseState) updateHeartbeat(directive string, expiresAt time.Time) bool {
+	if state == nil || expiresAt.IsZero() {
+		return false
+	}
+	state.runtimeMu.Lock()
+	defer state.runtimeMu.Unlock()
+	if state.terminationRequested {
+		return directive == "TERMINATE"
+	}
+	switch directive {
+	case "TERMINATE":
+		state.terminationRequested = true
+	case "CONTINUE":
+		if !expiresAt.After(time.Now().UTC()) {
+			return false
+		}
+		state.runtimeClaimExpiresAt = expiresAt
+	default:
+		return false
+	}
+	return true
 }
 
 func (client *Client) CompleteRevocation(

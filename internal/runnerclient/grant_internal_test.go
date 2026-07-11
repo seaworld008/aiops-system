@@ -2,6 +2,8 @@ package runnerclient
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -30,5 +32,24 @@ func TestExecutionLeaseTerminateIsStickyAndCancelsGrantContext(t *testing.T) {
 	}
 	if binding.updateHeartbeat("CONTINUE", time.Now().UTC().Add(2*time.Minute)) {
 		t.Fatal("CONTINUE cleared a sticky TERMINATE")
+	}
+}
+
+func TestExecutionGrantCanBeConsumedExactlyOnceUnderConcurrency(t *testing.T) {
+	grant := &ExecutionGrant{}
+	var successes atomic.Int64
+	var wait sync.WaitGroup
+	for range 64 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if grant.consumeIfValid(func() bool { return true }) {
+				successes.Add(1)
+			}
+		}()
+	}
+	wait.Wait()
+	if successes.Load() != 1 {
+		t.Fatalf("successful grant consumptions = %d, want 1", successes.Load())
 	}
 }

@@ -220,7 +220,11 @@ func (*CredentialPreparation) UnmarshalJSON([]byte) error               { return
 
 // ExecutionGrant is a server-authorized, credential-state-bound capability
 // required to cross the GO barrier. It has no public constructor.
-type ExecutionGrant struct{ state *credentialPreparationState }
+type ExecutionGrant struct {
+	mu       sync.Mutex
+	state    *credentialPreparationState
+	consumed bool
+}
 
 func (grant *ExecutionGrant) String() string   { return "ExecutionGrant{Security:[REDACTED]}" }
 func (grant *ExecutionGrant) GoString() string { return grant.String() }
@@ -231,10 +235,12 @@ func (*ExecutionGrant) MarshalJSON() ([]byte, error) { return marshalRedacted() 
 func (*ExecutionGrant) UnmarshalJSON([]byte) error   { return ErrInvalidResponse }
 
 type revocationLeaseState struct {
+	runtimeMu             sync.Mutex
 	owner                 *Client
 	revocationID          string
 	claimEpoch            int64
-	claimExpiresAt        time.Time
+	runtimeClaimExpiresAt time.Time
+	terminationRequested  bool
 	heartbeatAfterSeconds int
 	tenantID              string
 	workspaceID           string
@@ -268,7 +274,18 @@ func (lease *RevocationLease) ClaimExpiresAt() time.Time {
 	if lease == nil || lease.state == nil {
 		return time.Time{}
 	}
-	return lease.state.claimExpiresAt
+	lease.state.runtimeMu.Lock()
+	defer lease.state.runtimeMu.Unlock()
+	return lease.state.runtimeClaimExpiresAt
+}
+
+func (lease *RevocationLease) TerminationRequested() bool {
+	if lease == nil || lease.state == nil {
+		return true
+	}
+	lease.state.runtimeMu.Lock()
+	defer lease.state.runtimeMu.Unlock()
+	return lease.state.terminationRequested
 }
 
 func (lease *RevocationLease) HeartbeatAfterSeconds() int {
