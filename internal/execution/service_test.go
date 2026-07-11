@@ -448,11 +448,19 @@ func TestRunNextHeartbeatsTheRunningFenceUntilTypedExecutionCompletes(t *testing
 	fixture := newRunnerFixture(t, now, envelope, keys, ExecutorResult{
 		Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed, Changed: true,
 	})
-	fixture.service.heartbeatInterval = 5 * time.Millisecond
-	heartbeatObserved := make(chan struct{}, 1)
+	fixture.service.heartbeatInterval = 2 * time.Second
+	fixture.service.finalizeTimeout = 5 * time.Second
+	heartbeatSequences := make(chan int64, 4)
+	heartbeatSequenceEnabled := make(chan struct{})
+	executorEntered := make(chan struct{}, 1)
 	releaseExecutor := make(chan struct{})
-	fixture.leases.heartbeatObserved = heartbeatObserved
+	fixture.leases.heartbeatSequences = heartbeatSequences
+	fixture.leases.heartbeatSequenceGate = heartbeatSequenceEnabled
+	fixture.executors.entered = executorEntered
 	fixture.executors.release = releaseExecutor
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseExecutor) }) }
+	t.Cleanup(release)
 	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
 		t.Fatalf("Submit() error = %v", err)
 	}
@@ -466,15 +474,16 @@ func TestRunNextHeartbeatsTheRunningFenceUntilTypedExecutionCompletes(t *testing
 		execution, err := fixture.service.RunNext(context.Background())
 		completed <- runResult{execution: execution, err: err}
 	}()
-	select {
-	case <-heartbeatObserved:
-	case <-time.After(time.Second):
-		t.Fatal("running execution did not heartbeat its fenced lease")
+	awaitTestSignal(t, executorEntered, "the typed executor to enter before periodic heartbeat")
+	close(heartbeatSequenceEnabled)
+	sequence := awaitTestValue(t, heartbeatSequences, "a periodic heartbeat after executor entry")
+	if sequence < 3 {
+		t.Fatalf("heartbeat after executor entry used sequence %d, want at least 3", sequence)
 	}
-	close(releaseExecutor)
-	result := <-completed
+	release()
+	result := awaitTestValue(t, completed, "RunNext to complete after executor release")
 	if result.err != nil || result.execution.Status != executionlease.StatusSucceeded {
-		t.Fatalf("RunNext() = %#v, %v", result.execution, result.err)
+		t.Fatalf("RunNext() = %#v, %v; events=%v", result.execution, result.err, fixture.events.snapshot())
 	}
 	if !contains(fixture.events.snapshot(), "lease:heartbeat") {
 		t.Fatalf("heartbeat was not recorded: %v", fixture.events.snapshot())
@@ -489,7 +498,8 @@ func TestRunNextInitialHeartbeatFailureRecordsNoCredentialBeforeIssuerOrExecutor
 	fixture := newRunnerFixture(t, now, envelope, keys, ExecutorResult{
 		Outcome: ExecutorSucceeded, Code: "ROLLOUT_VERIFIED", Verification: VerificationPassed, Changed: true,
 	})
-	fixture.service.heartbeatInterval = 5 * time.Millisecond
+	fixture.service.heartbeatInterval = 2 * time.Second
+	fixture.service.finalizeTimeout = 5 * time.Second
 	fixture.leases.heartbeatErr = errors.New("heartbeat transport failed")
 	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
 		t.Fatalf("Submit() error = %v", err)
@@ -505,6 +515,26 @@ func TestRunNextInitialHeartbeatFailureRecordsNoCredentialBeforeIssuerOrExecutor
 	if fixture.credentials.issueCalls != 0 || fixture.credentials.recordNoCredentialCalls != 1 || len(fixture.executors.calls) != 0 {
 		t.Fatalf("initial heartbeat failure crossed issuance boundary: issue=%d no-credential=%d executors=%v",
 			fixture.credentials.issueCalls, fixture.credentials.recordNoCredentialCalls, fixture.executors.calls)
+	}
+}
+
+func TestServiceDurableIssuerCanonicalizesChildExpiryAcrossPlatformClockPrecision(t *testing.T) {
+	t.Parallel()
+
+	authorizedAt := time.Date(2026, 7, 11, 6, 40, 0, 123, time.UTC)
+	issuer := &serviceDurableIssuer{}
+	child, err := issuer.CreateChild(context.Background(), credential.DurableChildCreateRequest{
+		DatabaseAuthorizedAt: authorizedAt,
+		TTL:                  time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("CreateChild() error = %v", err)
+	}
+	defer child.Token.Destroy()
+	defer child.Accessor.Destroy()
+	want := credential.CanonicalCredentialExpiry(authorizedAt.Add(time.Minute))
+	if child.ExpiresAt != want || child.ExpiresAt != credential.CanonicalCredentialExpiry(child.ExpiresAt) {
+		t.Fatalf("CreateChild() expiry = %s, want canonical %s", child.ExpiresAt, want)
 	}
 }
 
@@ -1012,7 +1042,8 @@ func TestRunNextInitialHeartbeatScopeChangePreventsIssuerAndExecutor(t *testing.
 	fixture.service.dependencies.RunnerRegistrations = &sequenceRunnerRegistrationRepository{
 		registrations: []RunnerRegistration{base, base, changed},
 	}
-	fixture.service.heartbeatInterval = 5 * time.Millisecond
+	fixture.service.heartbeatInterval = 2 * time.Second
+	fixture.service.finalizeTimeout = 5 * time.Second
 	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
 		t.Fatalf("Submit() error = %v", err)
 	}
@@ -1041,15 +1072,9 @@ func TestRunNextBoundsInitialHeartbeatRegistryResolutionBeforeIssuer(t *testing.
 	fixture.service.dependencies.RunnerRegistrations = &blockingHeartbeatRunnerRegistrationRepository{
 		registration: registration, heartbeatResolveEntered: heartbeatResolveEntered,
 	}
-	fixture.service.heartbeatInterval = 5 * time.Millisecond
-	executorRelease := make(chan struct{})
-	defer func() {
-		select {
-		case <-executorRelease:
-		default:
-			close(executorRelease)
-		}
-	}()
+	// This test intentionally verifies the heartbeat RPC timeout. The registry
+	// fake first signals entry, then waits for the bounded context to expire.
+	fixture.service.heartbeatInterval = 100 * time.Millisecond
 	if _, err := fixture.service.Submit(context.Background(), envelope); err != nil {
 		t.Fatalf("Submit() error = %v", err)
 	}
@@ -1062,19 +1087,10 @@ func TestRunNextBoundsInitialHeartbeatRegistryResolutionBeforeIssuer(t *testing.
 		execution, err := fixture.service.RunNext(context.Background())
 		runDone <- runResult{execution: execution, err: err}
 	}()
-	select {
-	case <-heartbeatResolveEntered:
-	case <-time.After(time.Second):
-		t.Fatal("heartbeat registry resolve did not block")
-	}
-	close(executorRelease)
-	select {
-	case result := <-runDone:
-		if !errors.Is(result.err, ErrExecutionUncertain) || result.execution.Status != executionlease.StatusRunning {
-			t.Fatalf("RunNext() = %#v, %v; blocked initial heartbeat must fail closed", result.execution, result.err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("RunNext() did not finish after executor success")
+	awaitTestSignal(t, heartbeatResolveEntered, "heartbeat registry resolution to block")
+	result := awaitTestValue(t, runDone, "RunNext to fail closed after heartbeat timeout")
+	if !errors.Is(result.err, ErrExecutionUncertain) || result.execution.Status != executionlease.StatusRunning {
+		t.Fatalf("RunNext() = %#v, %v; blocked initial heartbeat must fail closed", result.execution, result.err)
 	}
 	if fixture.credentials.issueCalls != 0 || fixture.credentials.recordNoCredentialCalls != 1 || len(fixture.executors.calls) != 0 {
 		t.Fatalf("blocked initial heartbeat crossed issuance boundary: issue=%d no-credential=%d executors=%v",
@@ -1580,18 +1596,20 @@ func (repository fakeRunnerRegistrationRepository) Resolve(ctx context.Context, 
 
 type recordingActionQueue struct {
 	ActionQueue
-	memory            *MemoryActionQueue
-	events            *eventLog
-	actionSource      *serviceActionFenceSource
-	startErr          error
-	heartbeatErr      error
-	heartbeatErrAfter int
-	heartbeatErrGate  <-chan struct{}
-	heartbeatCalls    int
-	heartbeatFailed   chan<- struct{}
-	completeErr       error
-	finalizeErr       error
-	heartbeatObserved chan<- struct{}
+	memory                *MemoryActionQueue
+	events                *eventLog
+	actionSource          *serviceActionFenceSource
+	startErr              error
+	heartbeatErr          error
+	heartbeatErrAfter     int
+	heartbeatErrGate      <-chan struct{}
+	heartbeatCalls        int
+	heartbeatFailed       chan<- struct{}
+	heartbeatSequences    chan<- int64
+	heartbeatSequenceGate <-chan struct{}
+	completeErr           error
+	finalizeErr           error
+	heartbeatObserved     chan<- struct{}
 }
 
 type forcedClaimActionQueue struct {
@@ -1661,6 +1679,20 @@ func (repository *recordingActionQueue) Finalize(ctx context.Context, lease exec
 func (repository *recordingActionQueue) Heartbeat(ctx context.Context, request ActionHeartbeatRequest) (ActionHeartbeatResult, error) {
 	repository.events.add("lease:heartbeat")
 	repository.heartbeatCalls++
+	notifySequence := repository.heartbeatSequences != nil
+	if notifySequence && repository.heartbeatSequenceGate != nil {
+		select {
+		case <-repository.heartbeatSequenceGate:
+		default:
+			notifySequence = false
+		}
+	}
+	if notifySequence {
+		select {
+		case repository.heartbeatSequences <- request.Sequence:
+		default:
+		}
+	}
 	if repository.heartbeatObserved != nil {
 		select {
 		case repository.heartbeatObserved <- struct{}{}:
@@ -1889,7 +1921,8 @@ func (issuer *serviceDurableIssuer) CreateChild(
 		return credential.DurableChild{}, err
 	}
 	return credential.DurableChild{
-		Token: token, Accessor: accessor, ExpiresAt: request.DatabaseAuthorizedAt.Add(request.TTL),
+		Token: token, Accessor: accessor,
+		ExpiresAt: credential.CanonicalCredentialExpiry(request.DatabaseAuthorizedAt.Add(request.TTL)),
 	}, ctx.Err()
 }
 
