@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -25,10 +27,16 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		slog.Error("control plane stopped", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	cfg, err := config.Load()
 	if err != nil {
-		slog.Error("load configuration", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("load configuration: %w", err)
 	}
 
 	var repository signalservice.Repository
@@ -45,11 +53,10 @@ func main() {
 		}
 		cancel()
 		if err != nil {
-			slog.Error("connect PostgreSQL", "error", err)
 			if databasePool != nil {
 				databasePool.Close()
 			}
-			os.Exit(1)
+			return fmt.Errorf("connect PostgreSQL: %w", err)
 		}
 		defer databasePool.Close()
 		repository = postgresstore.New(databasePool)
@@ -59,6 +66,7 @@ func main() {
 			return databasePool.Ping(pingCtx)
 		}
 	}
+
 	signalIngestor := signalservice.NewService(repository, time.Now)
 	webhookVerifier := webhook.NewHMACVerifier(func(integrationID, provider string) ([]byte, error) {
 		if secret := cfg.WebhookHMACSecrets[integrationID+"/"+provider]; secret != "" {
@@ -69,40 +77,40 @@ func main() {
 		}
 		return nil, webhook.ErrSecretUnavailable
 	})
+
 	var authenticator *authn.Authenticator
 	if cfg.OIDCIssuer != "" {
 		discoveryCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		keycloakVerifier, verifierErr := authn.NewKeycloakVerifier(discoveryCtx, cfg.OIDCIssuer, cfg.OIDCClientID)
 		cancel()
 		if verifierErr != nil {
-			slog.Error("configure Keycloak OIDC", "error", verifierErr)
-			os.Exit(1)
+			return fmt.Errorf("configure Keycloak OIDC: %w", verifierErr)
 		}
-		authenticator, err = authn.NewAuthenticator(keycloakVerifier, authn.Options{MaxSessionAge: cfg.OIDCMaxSessionAge}, time.Now)
+		authenticator, err = authn.NewAuthenticator(
+			keycloakVerifier, authn.Options{MaxSessionAge: cfg.OIDCMaxSessionAge}, time.Now,
+		)
 		if err != nil {
-			slog.Error("configure OIDC authentication", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("configure OIDC authentication: %w", err)
 		}
 	}
+
 	var credentialRevocations httpapi.CredentialRevocationManager
 	if databasePool != nil {
 		authorizer, authorizerErr := authz.NewAuthorizer(cfg.OIDCRecentAuthWindow, time.Now)
 		if authorizerErr != nil {
-			slog.Error("configure credential revocation authorization", "error", authorizerErr)
-			os.Exit(1)
+			return fmt.Errorf("configure credential revocation authorization: %w", authorizerErr)
 		}
 		managementStore, managementErr := credentialpostgres.NewManagement(databasePool)
 		if managementErr != nil {
-			slog.Error("configure credential revocation management store", "error", managementErr)
-			os.Exit(1)
+			return fmt.Errorf("configure credential revocation management store: %w", managementErr)
 		}
 		credentialRevocations, err = credentialadmin.New(managementStore, authorizer)
 		if err != nil {
-			slog.Error("configure credential revocation management", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("configure credential revocation management: %w", err)
 		}
 	}
-	server := &http.Server{
+
+	publicServer := &http.Server{
 		Addr: cfg.HTTPAddr,
 		Handler: httpapi.NewRouter(httpapi.Dependencies{
 			Version:               buildinfo.Version,
@@ -115,21 +123,66 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	gatewayRuntime, err := newRunnerGatewayRuntime(cfg.RunnerGateway, cfg.WriteExecutionMode, databasePool)
+	if err != nil {
+		return err
+	}
+	if gatewayRuntime != nil {
+		defer gatewayRuntime.Destroy()
+	}
+
+	publicListener, err := net.Listen("tcp", cfg.HTTPAddr)
+	if err != nil {
+		return fmt.Errorf("listen on public API address: %w", err)
+	}
+	defer publicListener.Close()
+	var gatewayListener net.Listener
+	if gatewayRuntime != nil {
+		gatewayListener, err = net.Listen("tcp", cfg.RunnerGateway.Addr)
+		if err != nil {
+			return fmt.Errorf("listen on Runner Gateway address: %w", err)
+		}
+		defer gatewayListener.Close()
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
-	go func() {
-		slog.Info("control plane listening", "addr", cfg.HTTPAddr, "environment", cfg.Environment)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("serve HTTP", "error", err)
-			stop()
+	serveErrors := make(chan error, 2)
+	serve := func(component string, function func() error) {
+		if serveErr := function(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) &&
+			!errors.Is(serveErr, net.ErrClosed) {
+			serveErrors <- fmt.Errorf("serve %s: %w", component, serveErr)
 		}
-	}()
+	}
 
-	<-ctx.Done()
+	slog.Info("control plane listening", "addr", cfg.HTTPAddr, "environment", cfg.Environment)
+	go serve("public API", func() error { return publicServer.Serve(publicListener) })
+	if gatewayRuntime != nil {
+		slog.Info("Runner Gateway listening", "addr", cfg.RunnerGateway.Addr, "write_execution_mode", cfg.WriteExecutionMode)
+		go serve("Runner Gateway", func() error { return gatewayRuntime.Serve(gatewayListener) })
+	}
+
+	var serveFailure error
+	select {
+	case <-ctx.Done():
+	case serveFailure = <-serveErrors:
+		stop()
+	}
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		slog.Error("shutdown HTTP server", "error", err)
+	shutdownCount := 1
+	if gatewayRuntime != nil {
+		shutdownCount++
 	}
+	shutdownErrors := make(chan error, shutdownCount)
+	go func() { shutdownErrors <- publicServer.Shutdown(shutdownCtx) }()
+	if gatewayRuntime != nil {
+		go func() { shutdownErrors <- gatewayRuntime.Shutdown(shutdownCtx) }()
+	}
+	var shutdownFailure error
+	for range shutdownCount {
+		shutdownFailure = errors.Join(shutdownFailure, <-shutdownErrors)
+	}
+	return errors.Join(serveFailure, shutdownFailure)
 }
