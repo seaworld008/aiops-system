@@ -51,11 +51,14 @@ func TestLinuxCapabilityGateRequiresOwnedImmutableRegularSingleLinkExecutor(t *t
 	}
 
 	xattrExecutable := filepath.Join(t.TempDir(), "executor-xattr")
-	if err := os.WriteFile(xattrExecutable, []byte("fixture"), 0o500); err != nil {
+	if err := os.WriteFile(xattrExecutable, []byte("fixture"), 0o700); err != nil {
 		t.Fatalf("write xattr executor fixture: %v", err)
 	}
 	if err := unix.Setxattr(xattrExecutable, "user.aiops-executor-test", []byte("present"), 0); err != nil {
 		t.Fatalf("set executor xattr: %v", err)
+	}
+	if err := os.Chmod(xattrExecutable, 0o500); err != nil {
+		t.Fatalf("chmod xattr executor fixture: %v", err)
 	}
 	if supervisor, err := newSupervisor(xattrExecutable, defaultSettings()); supervisor != nil || !errors.Is(err, ErrInvalidConfiguration) {
 		t.Fatalf("newSupervisor(xattr) = %#v, %v", supervisor, err)
