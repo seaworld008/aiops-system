@@ -28,7 +28,7 @@ AIOps System 坚持四条原则：
 | --- | --- | --- |
 | 信号接入 | 已实现 | Alertmanager/夜莺作用域验签、幂等与去重基础 |
 | 只读证据 | 已实现 | Prometheus、VictoriaLogs、Kubernetes、AWX、Argo CD、GitLab、Jenkins、GitHub Actions 有界客户端 |
-| 调查引擎 | 基础已实现 | 持久调查事实、严格 mTLS READ Task Gateway、原子 connector/target/egress/executor Bundle、固定 READ executor/Activity、恢复优先 Temporal v2、immutable Snapshot、角色隔离的 Temporal Starter/Control Worker 与 fail-closed 子进程 containment 底座；child 仍不能报告 READY，尚无 live Runner/Outbox 装配，非配置化 Admission 在 M5C2-4c 与外部 Go/No-Go 前保持关闭 |
+| 调查引擎 | 基础已实现 | 持久调查事实、严格 mTLS READ Task Gateway、原子 connector/target/egress/executor Bundle、固定 READ executor/Activity、恢复优先 Temporal v2、immutable Snapshot、角色隔离的 Temporal Starter/Control Worker、可监测 fatal/stop 的子进程 containment 与 sealed 预装配 child 生命周期仲裁器；固定 factory 仍阻止 READY，尚无 live Runner/Outbox 装配，非配置化 Admission 在 M5C2-4c 与外部 Go/No-Go 前保持关闭 |
 | 身份与策略 | 基础已实现 | Keycloak OIDC、Workspace/Environment RBAC、签名 ActionEnvelope、CEL 三阶段裁决 |
 | 执行安全 | 基础已实现 | 精确 Runner scope、持久凭据吊销、TLS 1.3 mTLS Gateway、READ/WRITE 拆分镜像、固定可终止 Executor、目标锁、心跳、取消和对账 |
 | 生产自动化 | **关闭** | 仍需固定真实适配器、外部 sandbox/网络门禁、非生产演练与正式 Go/No-Go 审查 |
