@@ -9,12 +9,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -83,8 +85,8 @@ func acceptControlWorkerChild() (*ChildStatus, error) {
 	if err != nil || pid <= 1 || group != pid || os.Getppid() <= 0 {
 		return nil, errInvalidChildInvocation
 	}
-	deathSignal, err := unix.PrctlRetInt(unix.PR_GET_PDEATHSIG, 0, 0, 0, 0)
-	if err != nil || deathSignal != int(syscall.SIGKILL) {
+	deathSignal, err := currentParentDeathSignal()
+	if err != nil || deathSignal != syscall.SIGKILL {
 		return nil, errInvalidChildInvocation
 	}
 	descriptor := int(controlWorkerStatusFD)
@@ -106,6 +108,25 @@ func acceptControlWorkerChild() (*ChildStatus, error) {
 		return nil, errInvalidStatusChannel
 	}
 	return newChildStatus(file), nil
+}
+
+func currentParentDeathSignal() (syscall.Signal, error) {
+	// PR_GET_PDEATHSIG returns zero from prctl and writes the signal through an
+	// int pointer. PrctlRetInt is therefore incorrect for this option and would
+	// turn every valid Linux child into EFAULT.
+	var signal int32
+	err := unix.Prctl(
+		unix.PR_GET_PDEATHSIG,
+		uintptr(unsafe.Pointer(&signal)),
+		0,
+		0,
+		0,
+	)
+	runtime.KeepAlive(&signal)
+	if err != nil {
+		return 0, err
+	}
+	return syscall.Signal(signal), nil
 }
 
 func runControlWorkerSupervisor(ctx context.Context, settings supervisorSettings) error {

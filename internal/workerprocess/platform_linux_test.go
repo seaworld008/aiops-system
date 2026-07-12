@@ -74,6 +74,12 @@ func TestProductionCommandBoundaryIsFixed(t *testing.T) {
 	}
 }
 
+func TestCurrentParentDeathSignalUsesPointerResult(t *testing.T) {
+	if _, err := currentParentDeathSignal(); err != nil {
+		t.Fatalf("currentParentDeathSignal() error = %v", err)
+	}
+}
+
 func TestSupervisorGracefulContextStopUsesTERMAndReaps(t *testing.T) {
 	base := filepath.Join(t.TempDir(), "graceful")
 	supervisor := newTestSupervisor("ready-exit-on-term", base)
