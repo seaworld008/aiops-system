@@ -136,6 +136,8 @@ func TestRepositoryPostgres16PersistsAuthenticatedLifecycleAndCompletionReplay(t
 		t.Fatalf("CompleteRunnerAuthorizedTx(real PostgreSQL) = %#v, %v", completed, err)
 	}
 	verifyCommittedReadTaskCompletion(t, fixture.database, claim, bearerToken, completed)
+	verifyCommittedRecoveryWithoutCompletionBody(t, ctx, fixture.database, claim.Descriptor(), completed)
+	verifyRecoveryRejectsCrossTenantAndPlanMismatch(t, ctx, fixture.database, claim.Descriptor())
 
 	replayed, err := repositoryRunnerTransaction(ctx, fixture, func(
 		tx pgx.Tx,
@@ -172,7 +174,112 @@ func TestRepositoryPostgres16PersistsAuthenticatedLifecycleAndCompletionReplay(t
 	verifyConcurrentSingleWinnerClaim(t, ctx, fixture)
 	verifyOldEpochAndTokenRejected(t, ctx, fixture)
 	verifyScopeRevisionDriftTerminatesAndTerminalHistoryIsImmutable(t, ctx, fixture)
+	if _, err := fixture.database.Exec(ctx, `
+		UPDATE runner_registrations
+		SET enabled = false
+		WHERE tenant_id = $1::uuid AND runner_id = $2
+	`, integrationTenantID, integrationRunnerID); err != nil {
+		t.Fatalf("disable historical completing READ Runner: %v", err)
+	}
+	verifyCommittedRecoveryWithoutCompletionBody(t, ctx, fixture.database, claim.Descriptor(), completed)
 	verifyUnsafeRunnerIngressDownIsAtomic(t, ctx, fixture)
+}
+
+func verifyCommittedRecoveryWithoutCompletionBody(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	descriptor readtask.Descriptor,
+	completed readtask.CompletionResult,
+) {
+	t.Helper()
+	reader, err := readtaskpostgres.NewRecoveryRepository(database)
+	if err != nil {
+		t.Fatalf("construct DB-only READ result recovery: %v", err)
+	}
+	request := readtask.RecoveryRequest{
+		TenantID: descriptor.TenantID, WorkspaceID: descriptor.WorkspaceID,
+		IncidentID: descriptor.IncidentID, InvestigationID: descriptor.InvestigationID,
+		TaskID: descriptor.TaskID, Position: descriptor.Position, PlanBinding: descriptor.PlanBinding,
+	}
+	before := recoveryFactCounts(t, ctx, database, descriptor)
+	recovered, err := reader.Recover(ctx, request)
+	if err != nil || recovered.State != readtask.RecoveryCommitted ||
+		recovered.TaskStatus != domain.ReadTaskEvidence || recovered.TaskID != descriptor.TaskID ||
+		recovered.EvidenceID != completed.EvidenceID ||
+		recovered.ContentHash != completed.Projection.ContentHash() ||
+		recovered.ReceiptID != completed.ReceiptID ||
+		recovered.ReceiptHash != completed.Projection.ReceiptHash() {
+		t.Fatalf("Recover(committed result without body) = %#v, %v", recovered, err)
+	}
+	after := recoveryFactCounts(t, ctx, database, descriptor)
+	if before != after {
+		t.Fatalf("read-only recovery changed persisted counts: before=%v after=%v", before, after)
+	}
+}
+
+func recoveryFactCounts(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	descriptor readtask.Descriptor,
+) [3]int {
+	t.Helper()
+	var counts [3]int
+	err := database.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM investigation_task_attempts
+			 WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid
+			   AND investigation_id = $3::uuid AND task_id = $4::uuid),
+			(SELECT count(*) FROM runner_evidence_receipts
+			 WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid
+			   AND investigation_id = $3::uuid AND task_id = $4::uuid),
+			(SELECT count(*) FROM evidence
+			 WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid
+			   AND investigation_id = $3::uuid AND task_id = $4::uuid)
+	`, descriptor.TenantID, descriptor.WorkspaceID, descriptor.InvestigationID, descriptor.TaskID).Scan(
+		&counts[0], &counts[1], &counts[2],
+	)
+	if err != nil {
+		t.Fatalf("read recovery fact counts: %v", err)
+	}
+	return counts
+}
+
+func verifyRecoveryRejectsCrossTenantAndPlanMismatch(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	descriptor readtask.Descriptor,
+) {
+	t.Helper()
+	reader, err := readtaskpostgres.NewRecoveryRepository(database)
+	if err != nil {
+		t.Fatalf("construct scoped DB-only READ result recovery: %v", err)
+	}
+	baseline := readtask.RecoveryRequest{
+		TenantID: descriptor.TenantID, WorkspaceID: descriptor.WorkspaceID,
+		IncidentID: descriptor.IncidentID, InvestigationID: descriptor.InvestigationID,
+		TaskID: descriptor.TaskID, Position: descriptor.Position, PlanBinding: descriptor.PlanBinding,
+	}
+	before := recoveryFactCounts(t, ctx, database, descriptor)
+
+	crossTenant := baseline
+	crossTenant.TenantID = "11000000-0000-4000-8000-000000000002"
+	if result, err := reader.Recover(ctx, crossTenant); !errors.Is(err, readtask.ErrIntegrity) || result.State != "" {
+		t.Fatalf("Recover(cross-tenant comparison) = %#v, %v; want integrity rejection", result, err)
+	}
+
+	wrongPlan := baseline
+	wrongPlan.PlanBinding.ManifestDigest = strings.Repeat("f", 64)
+	if result, err := reader.Recover(ctx, wrongPlan); !errors.Is(err, readtask.ErrNotFound) || result.State != "" {
+		t.Fatalf("Recover(wrong Plan binding) = %#v, %v; want not found", result, err)
+	}
+
+	after := recoveryFactCounts(t, ctx, database, descriptor)
+	if before != after {
+		t.Fatalf("rejected recovery changed persisted counts: before=%v after=%v", before, after)
+	}
 }
 
 func verifyPostCutoverRejectsUnboundWriters(
