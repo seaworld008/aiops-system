@@ -115,16 +115,18 @@ func currentParentDeathSignal() (syscall.Signal, error) {
 	// int pointer. PrctlRetInt is therefore incorrect for this option and would
 	// turn every valid Linux child into EFAULT.
 	var signal int32
-	err := unix.Prctl(
-		unix.PR_GET_PDEATHSIG,
+	_, _, errno := syscall.Syscall6(
+		unix.SYS_PRCTL,
+		uintptr(unix.PR_GET_PDEATHSIG),
 		uintptr(unsafe.Pointer(&signal)),
+		0,
 		0,
 		0,
 		0,
 	)
 	runtime.KeepAlive(&signal)
-	if err != nil {
-		return 0, err
+	if errno != 0 {
+		return 0, errno
 	}
 	return syscall.Signal(signal), nil
 }

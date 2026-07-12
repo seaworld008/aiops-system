@@ -78,6 +78,7 @@ var expectedProcessBoundaryCalls = map[processBoundaryKey]int{
 	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "startControlWorker"}:        1,
 	{file: "internal/workerprocess/protocol.go", source: "workerprocess", symbol: "writeStatusByte"}:                 2,
 	{file: "internal/workerprocess/platform_linux.go", source: "os/exec", symbol: "Command"}:                         1,
+	{file: "internal/workerprocess/platform_linux.go", source: "syscall", symbol: "Syscall6"}:                        1,
 }
 
 var expectedWorkerProcessExports = map[string]int{
@@ -127,6 +128,7 @@ func TestProcessBoundaryScannerRejectsAliasesAndAlternateExec(t *testing.T) {
 import (
 	worker "github.com/seaworld008/aiops-system/internal/workerprocess"
 	"os/exec"
+	sys "syscall"
 )
 
 func bypass(status *worker.ChildStatus) {
@@ -136,6 +138,7 @@ func bypass(status *worker.ChildStatus) {
 	worker.ReportControlWorkerReady(status)
 	worker.ExitControlWorkerFatal(status)
 	exec.CommandContext(nil, "sh")
+	_ = sys.RawSyscall
 }
 `)
 	writeProcessBoundaryFixture(t, root, "internal/workerprocess/platform_linux.go", `package workerprocess
@@ -164,6 +167,7 @@ func NewSupervisorWithEnv() {}
 		"references os/exec.Command as a value",
 		"references unqualified newControlWorkerSupervisor as a value",
 		"uses unreviewed os/exec selector CommandContext",
+		"references unreviewed raw syscall syscall.RawSyscall as a value",
 		"exports unreviewed func:NewSupervisorWithEnv",
 	} {
 		if !strings.Contains(violations, expected) {
@@ -360,6 +364,9 @@ func scanProcessBoundary(repositoryRoot string) (processBoundaryScan, error) {
 								"production file %s uses unreviewed os.StartProcess", relative))
 						}
 					case "syscall", "golang.org/x/sys/unix":
+						if inWorkerBoundary && isRawProcessSyscall(syntax.Sel.Name) {
+							scanRawProcessSyscall(&scan, relative, importPath, syntax, parent)
+						}
 						if syntax.Sel.Name == "ForkExec" || syntax.Sel.Name == "Exec" || syntax.Sel.Name == "StartProcess" {
 							scan.violations = append(scan.violations, fmt.Sprintf(
 								"production file %s uses unreviewed process primitive %s.%s",
@@ -372,6 +379,32 @@ func scanProcessBoundary(repositoryRoot string) (processBoundaryScan, error) {
 		return nil
 	})
 	return scan, err
+}
+
+func isRawProcessSyscall(symbol string) bool {
+	return strings.HasPrefix(symbol, "Syscall") || strings.HasPrefix(symbol, "RawSyscall")
+}
+
+func scanRawProcessSyscall(
+	scan *processBoundaryScan,
+	relative string,
+	importPath string,
+	syntax *ast.SelectorExpr,
+	parent ast.Node,
+) {
+	key := processBoundaryKey{file: relative, source: importPath, symbol: syntax.Sel.Name}
+	if !isDirectProcessBoundaryCall(parent, syntax) {
+		scan.violations = append(scan.violations, fmt.Sprintf(
+			"production file %s references unreviewed raw syscall %s.%s as a value",
+			relative, importPath, syntax.Sel.Name))
+		return
+	}
+	scan.calls[key]++
+	if _, expected := expectedProcessBoundaryCalls[key]; !expected {
+		scan.violations = append(scan.violations, fmt.Sprintf(
+			"production file %s invokes unreviewed raw syscall %s.%s",
+			relative, importPath, syntax.Sel.Name))
+	}
 }
 
 func inspectProcessBoundary(root ast.Node, visit func(ast.Node, ast.Node)) {
