@@ -211,6 +211,116 @@ func TestStartRunnerAuthorizedTxRechecksLeaseAfterAllLockWaits(t *testing.T) {
 	rollbackReadTaskTx(t, database, tx)
 }
 
+func TestStartRunnerAuthorizedTxRechecksRunningReplayLeaseAfterAuthorizer(t *testing.T) {
+	database, repository := newReadTaskRepository(t)
+	tx := beginReadTaskTx(t, database)
+	base := testNow()
+	certificate := readtask.CertificateBinding{SHA256: testCertificateHash, NotAfter: base.Add(time.Minute)}
+	descriptor, input := testDescriptorAndInput()
+	fence, err := readtask.NewFence(testTaskID, testRunnerID, []byte(testLeaseToken), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fence.Destroy()
+	running := testAttempt(base, certificate, readtask.AttemptRunning)
+	running.StartedAt = base.Add(time.Second)
+	running.UpdatedAt = running.StartedAt
+
+	expectTaskLock(database, descriptor, input, "RUNNING", "RUNNING")
+	database.ExpectQuery(`(?s)SELECT .*FROM investigation_task_attempts AS attempt.*FOR UPDATE OF attempt`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1)).
+		WillReturnRows(attemptRows(running))
+	database.ExpectQuery(`(?s)SELECT status.*FROM investigations.*FOR NO KEY UPDATE`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID).
+		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("RUNNING"))
+	expectDatabaseClock(database, running.LeaseExpiresAt.Add(-time.Nanosecond))
+	expectDatabaseClock(database, running.LeaseExpiresAt)
+	authorizerCalled := false
+
+	got, err := repository.StartRunnerAuthorizedTx(
+		context.Background(), tx, testRunnerScope(t, executionlease.PoolRead), certificate,
+		readtask.Start{Fence: fence}, func(context.Context, readtask.Descriptor) error {
+			authorizerCalled = true
+			return nil
+		},
+	)
+	if !errors.Is(err, readtask.ErrStaleFence) || got != (readtask.Attempt{}) || !authorizerCalled {
+		t.Fatalf("StartRunnerAuthorizedTx(replay expired during authorizer) = %#v, %v; authorizer=%t", got, err, authorizerCalled)
+	}
+	rollbackReadTaskTx(t, database, tx)
+}
+
+func TestRunnerMutationEntrypointsClassifyCorruptLockedProjectionAsIntegrity(t *testing.T) {
+	for _, test := range []struct {
+		name                string
+		status              readtask.AttemptStatus
+		taskStatus          string
+		investigationStatus string
+		call                func(context.Context, *Repository, pgx.Tx, execution.RunnerScope, readtask.CertificateBinding, readtask.Fence) error
+	}{
+		{
+			name: "start", status: readtask.AttemptLeased, taskStatus: "QUEUED", investigationStatus: "QUEUED",
+			call: func(ctx context.Context, repository *Repository, tx pgx.Tx, scope execution.RunnerScope, certificate readtask.CertificateBinding, fence readtask.Fence) error {
+				_, err := repository.StartRunnerAuthorizedTx(ctx, tx, scope, certificate, readtask.Start{Fence: fence},
+					func(context.Context, readtask.Descriptor) error { return nil })
+				return err
+			},
+		},
+		{
+			name: "heartbeat", status: readtask.AttemptRunning, taskStatus: "RUNNING", investigationStatus: "RUNNING",
+			call: func(ctx context.Context, repository *Repository, tx pgx.Tx, scope execution.RunnerScope, certificate readtask.CertificateBinding, fence readtask.Fence) error {
+				_, err := repository.HeartbeatRunnerTx(ctx, tx, scope, certificate,
+					readtask.Heartbeat{Fence: fence, Sequence: 1}, 30*time.Second)
+				return err
+			},
+		},
+		{
+			name: "release", status: readtask.AttemptLeased, taskStatus: "QUEUED", investigationStatus: "QUEUED",
+			call: func(ctx context.Context, repository *Repository, tx pgx.Tx, scope execution.RunnerScope, certificate readtask.CertificateBinding, fence readtask.Fence) error {
+				_, err := repository.ReleaseRunnerTx(ctx, tx, scope, certificate,
+					readtask.Release{Fence: fence, ReasonCode: readtask.ReleaseConnectorNotReady})
+				return err
+			},
+		},
+		{
+			name: "complete", status: readtask.AttemptRunning, taskStatus: "RUNNING", investigationStatus: "RUNNING",
+			call: func(ctx context.Context, repository *Repository, tx pgx.Tx, scope execution.RunnerScope, certificate readtask.CertificateBinding, fence readtask.Fence) error {
+				_, err := repository.CompleteRunnerAuthorizedTx(ctx, tx, scope, certificate, readtask.Completion{
+					Fence: fence, Outcome: readtask.CompletionFailed, FailureCode: readtask.FailureTimeout,
+				}, func(context.Context, readtask.Descriptor, readtask.EvidenceCompletion) error { return nil })
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database, repository := newReadTaskRepository(t)
+			tx := beginReadTaskTx(t, database)
+			base := testNow()
+			certificate := readtask.CertificateBinding{SHA256: testCertificateHash, NotAfter: base.Add(time.Minute)}
+			descriptor, input := testDescriptorAndInput()
+			attempt := testAttempt(base, certificate, test.status)
+			if test.status == readtask.AttemptRunning {
+				attempt.StartedAt = base
+			}
+			attempt.TokenSHA256 = "corrupt-persisted-token-hash"
+			expectTaskLock(database, descriptor, input, test.taskStatus, test.investigationStatus)
+			database.ExpectQuery(`(?s)SELECT .*FROM investigation_task_attempts AS attempt.*FOR UPDATE OF attempt`).
+				WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1)).
+				WillReturnRows(attemptRows(attempt))
+			fence, err := readtask.NewFence(testTaskID, testRunnerID, []byte(testLeaseToken), 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = test.call(context.Background(), repository, tx, testRunnerScope(t, executionlease.PoolRead), certificate, fence)
+			fence.Destroy()
+			if !errors.Is(err, readtask.ErrIntegrity) || errors.Is(err, readtask.ErrStaleFence) {
+				t.Fatalf("%s corrupt projection error = %v, want ErrIntegrity only", test.name, err)
+			}
+			rollbackReadTaskTx(t, database, tx)
+		})
+	}
+}
+
 func TestHeartbeatRunnerTxUsesStrictSequenceAndServerLeaseExtension(t *testing.T) {
 	database, repository := newReadTaskRepository(t)
 	tx := beginReadTaskTx(t, database)
@@ -375,7 +485,7 @@ func TestReleaseRunnerTxOnlyTerminatesPreStartAttempt(t *testing.T) {
 	rollbackReadTaskTx(t, database, tx)
 }
 
-func TestCompleteRunnerTxAtomicallyPersistsEvidenceTaskAttemptAndV2Receipt(t *testing.T) {
+func TestCompleteRunnerAuthorizedTxAtomicallyPersistsEvidenceTaskAttemptAndV2Receipt(t *testing.T) {
 	database, repository := newReadTaskRepository(t)
 	tx := beginReadTaskTx(t, database)
 	now := testNow().Add(2 * time.Second)
@@ -438,17 +548,30 @@ func TestCompleteRunnerTxAtomicallyPersistsEvidenceTaskAttemptAndV2Receipt(t *te
 		).
 		WillReturnRows(pgxmock.NewRows([]string{"received_at"}).AddRow(now.Add(time.Millisecond)))
 
-	result, err := repository.CompleteRunnerTx(
+	authorizerCalled := false
+	result, err := repository.CompleteRunnerAuthorizedTx(
 		context.Background(), tx, testRunnerScope(t, executionlease.PoolRead), certificate, completion,
+		func(_ context.Context, gotDescriptor readtask.Descriptor, gotEvidence readtask.EvidenceCompletion) error {
+			authorizerCalled = true
+			if gotDescriptor.TaskID != descriptor.TaskID || len(gotEvidence.Items) != 1 ||
+				string(gotEvidence.Items[0]) != `{"status":"healthy","value":1}` {
+				t.Fatalf("completion authorizer received %#v / %#v", gotDescriptor, gotEvidence)
+			}
+			// The trusted contract receives detached data and cannot rewrite the
+			// projection that will be persisted.
+			gotDescriptor.Input[0] = '['
+			gotEvidence.Items[0][0] = '['
+			return nil
+		},
 	)
-	if err != nil || result.Replayed || result.EvidenceID != testEvidenceID || result.ReceiptID != testReceiptID ||
+	if err != nil || !authorizerCalled || result.Replayed || result.EvidenceID != testEvidenceID || result.ReceiptID != testReceiptID ||
 		result.Attempt.Status != readtask.AttemptCompleted || result.Projection.ReceiptHash() != projection.ReceiptHash() {
-		t.Fatalf("CompleteRunnerTx() = %#v, %v", result, err)
+		t.Fatalf("CompleteRunnerAuthorizedTx() = %#v, %v; authorizer=%t", result, err, authorizerCalled)
 	}
 	rollbackReadTaskTx(t, database, tx)
 }
 
-func TestCompleteRunnerTxReplaysOriginalReceiptWithoutAnotherWrite(t *testing.T) {
+func TestCompleteRunnerAuthorizedTxReplaysOriginalReceiptWithoutMutablePolicy(t *testing.T) {
 	database, repository := newReadTaskRepository(t)
 	tx := beginReadTaskTx(t, database)
 	base := testNow()
@@ -494,13 +617,79 @@ func TestCompleteRunnerTxReplaysOriginalReceiptWithoutAnotherWrite(t *testing.T)
 		WillReturnRows(pgxmock.NewRows([]string{"id", "evidence_id", "received_at"}).
 			AddRow(testReceiptID, testEvidenceID, base.Add(3*time.Second)))
 
-	result, err := repository.CompleteRunnerTx(
+	result, err := repository.CompleteRunnerAuthorizedTx(
 		context.Background(), tx, testRunnerScope(t, executionlease.PoolRead), certificate, completion,
+		func(context.Context, readtask.Descriptor, readtask.EvidenceCompletion) error {
+			t.Fatal("committed replay re-ran mutable completion policy")
+			return errors.New("policy changed")
+		},
 	)
 	if err != nil || !result.Replayed || result.EvidenceID != testEvidenceID || result.ReceiptID != testReceiptID {
-		t.Fatalf("CompleteRunnerTx(replay) = %#v, %v", result, err)
+		t.Fatalf("CompleteRunnerAuthorizedTx(replay) = %#v, %v", result, err)
 	}
 	rollbackReadTaskTx(t, database, tx)
+}
+
+func TestCompleteRunnerAuthorizedTxRejectsTypedOutputBeforeAnyEvidenceWrite(t *testing.T) {
+	database, repository := newReadTaskRepository(t)
+	tx := beginReadTaskTx(t, database)
+	now := testNow().Add(2 * time.Second)
+	certificate := readtask.CertificateBinding{SHA256: testCertificateHash, NotAfter: now.Add(time.Minute)}
+	descriptor, input := testDescriptorAndInput()
+	fence, err := readtask.NewFence(testTaskID, testRunnerID, []byte(testLeaseToken), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fence.Destroy()
+	running := testAttempt(now.Add(-2*time.Second), certificate, readtask.AttemptRunning)
+	running.StartedAt = now.Add(-time.Second)
+	running.UpdatedAt = running.StartedAt
+	running.LeaseExpiresAt = now.Add(30 * time.Second)
+	completion := readtask.Completion{
+		Fence: fence, Outcome: readtask.CompletionEvidence,
+		Evidence: &readtask.EvidenceCompletion{
+			CollectedAt: now.Add(-500 * time.Millisecond),
+			Items:       []json.RawMessage{json.RawMessage(`{"unexpected_shape":true}`)},
+		},
+	}
+
+	expectTaskLock(database, descriptor, input, "RUNNING", "RUNNING")
+	database.ExpectQuery(`(?s)SELECT .*FROM investigation_task_attempts AS attempt.*FOR UPDATE OF attempt`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1)).
+		WillReturnRows(attemptRows(running))
+	database.ExpectQuery(`(?s)SELECT status.*FROM investigations.*FOR NO KEY UPDATE`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID).
+		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("RUNNING"))
+	expectDatabaseClock(database, now)
+
+	result, err := repository.CompleteRunnerAuthorizedTx(
+		context.Background(), tx, testRunnerScope(t, executionlease.PoolRead), certificate, completion,
+		func(_ context.Context, gotDescriptor readtask.Descriptor, gotEvidence readtask.EvidenceCompletion) error {
+			if gotDescriptor.ConnectorID != descriptor.ConnectorID || len(gotEvidence.Items) != 1 {
+				t.Fatalf("typed output authorizer received %#v / %#v", gotDescriptor, gotEvidence)
+			}
+			return errors.New("connector schema detail canary")
+		},
+	)
+	if !errors.Is(err, readtask.ErrProjectionRejected) || err.Error() != readtask.ErrProjectionRejected.Error() ||
+		result.Attempt.TaskID != "" || result.EvidenceID != "" || result.ReceiptID != "" {
+		t.Fatalf("CompleteRunnerAuthorizedTx(rejected output) = %#v, %v", result, err)
+	}
+	rollbackReadTaskTx(t, database, tx)
+}
+
+func TestCompleteRunnerAuthorizedTxRejectsMissingTypedContractBeforeDatabaseAccess(t *testing.T) {
+	database, repository := newReadTaskRepository(t)
+	result, err := repository.CompleteRunnerAuthorizedTx(
+		context.Background(), nil, execution.RunnerScope{}, readtask.CertificateBinding{}, readtask.Completion{}, nil,
+	)
+	if !errors.Is(err, readtask.ErrInvalidRequest) || result.Attempt.TaskID != "" ||
+		result.EvidenceID != "" || result.ReceiptID != "" || result.Replayed {
+		t.Fatalf("CompleteRunnerAuthorizedTx(nil authorizer) = %#v, %v", result, err)
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("missing contract accessed database: %v", err)
+	}
 }
 
 func TestProjectRunnerCompletionClassifiesChangedCommittedReplayByHash(t *testing.T) {

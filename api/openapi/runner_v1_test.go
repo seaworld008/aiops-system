@@ -21,6 +21,7 @@ func TestRunnerV1Contract(t *testing.T) {
 	if err := json.Unmarshal(raw, &document); err != nil {
 		t.Fatalf("runner OpenAPI is not strict JSON: %v", err)
 	}
+	assertLocalReferencesResolve(t, document)
 	if bytes.Contains(raw, []byte(`"writeOnly"`)) {
 		t.Fatal("response-only Runner secret/token fields must not be marked writeOnly")
 	}
@@ -48,6 +49,11 @@ func TestRunnerV1Contract(t *testing.T) {
 		"/runner/v1/revocations:lease",
 		"/runner/v1/revocations/{revocation_id}:heartbeat",
 		"/runner/v1/revocations/{revocation_id}:complete",
+		"/runner/v1/read-tasks/{task_id}:claim",
+		"/runner/v1/read-tasks/{task_id}:start",
+		"/runner/v1/read-tasks/{task_id}:heartbeat",
+		"/runner/v1/read-tasks/{task_id}:release",
+		"/runner/v1/read-tasks/{task_id}:complete",
 	}
 	got := make([]string, 0, len(paths))
 	for path := range paths {
@@ -66,7 +72,7 @@ func TestRunnerV1Contract(t *testing.T) {
 
 	components := object(t, document["components"], "components")
 	securitySchemes := object(t, components["securitySchemes"], "components.securitySchemes")
-	for _, name := range []string{"mutualTLS", "jobLease", "revocationLease"} {
+	for _, name := range []string{"mutualTLS", "jobLease", "revocationLease", "readTaskLease"} {
 		if _, ok := securitySchemes[name]; !ok {
 			t.Errorf("missing security scheme %s", name)
 		}
@@ -74,7 +80,7 @@ func TestRunnerV1Contract(t *testing.T) {
 	if object(t, securitySchemes["mutualTLS"], "mutualTLS")["type"] != "mutualTLS" {
 		t.Error("mutualTLS scheme is not OpenAPI mutualTLS")
 	}
-	for _, name := range []string{"jobLease", "revocationLease"} {
+	for _, name := range []string{"jobLease", "revocationLease", "readTaskLease"} {
 		scheme := object(t, securitySchemes[name], name)
 		if scheme["type"] != "apiKey" || scheme["in"] != "header" || scheme["name"] != "Authorization" {
 			t.Errorf("%s = %#v, want Authorization header apiKey", name, scheme)
@@ -89,6 +95,12 @@ func TestRunnerV1Contract(t *testing.T) {
 		"JobHeartbeatResponse", "JobReleaseRequest", "JobCompleteRequest", "JobCompletionResponse",
 		"RevocationLeaseRequest", "RevocationLeaseResponse", "RevocationHeartbeatRequest",
 		"RevocationHeartbeatResponse", "RevocationCompleteRequest", "RevocationCompletionResponse",
+		"ReadTaskDescriptor", "ReadTaskClaimRequest", "ReadTaskClaimResponse", "ReadTaskStartRequest",
+		"ReadTaskStartResponse", "ReadTaskHeartbeatRequest", "ReadTaskHeartbeatResponse",
+		"ReadTaskReleaseRequest", "ReadTaskReleaseResponse", "ReadTaskEvidenceCompletion",
+		"ReadTaskCompleteRequest", "ReadTaskEvidenceCompleteRequest", "ReadTaskFailedCompleteRequest",
+		"ReadTaskCancelledCompleteRequest", "ReadTaskCompleteResponse", "ReadTaskFailureCode",
+		"ReadTaskLeaseToken", "RunnerResourceID",
 	} {
 		schema, ok := schemas[name]
 		if !ok {
@@ -106,8 +118,9 @@ func TestRunnerV1Contract(t *testing.T) {
 	assertTypedActionEnvelope(t, schemas)
 	assertExecutorResultUnion(t, schemas)
 	assertCompletionResponseBoundary(t, components, schemas)
-	if countMapKey(document, "lease_token") != 1 || countMapKey(document, "claim_token") != 1 {
-		t.Errorf("raw lease/claim token schema locations = %d/%d, want 1/1",
+	assertReadTaskContract(t, components, paths, schemas)
+	if countMapKey(document, "lease_token") != 2 || countMapKey(document, "claim_token") != 1 {
+		t.Errorf("raw lease/claim token schema locations = %d/%d, want 2/1",
 			countMapKey(document, "lease_token"), countMapKey(document, "claim_token"))
 	}
 	if countMapKey(document, "result_hash") != 0 {
@@ -212,6 +225,10 @@ func assertRunnerWirePrimitives(t *testing.T, components, paths, schemas map[str
 	if object(t, jobIDParameter["schema"], "JobID.schema")["$ref"] != "#/components/schemas/RunnerJobID" {
 		t.Error("job path parameter is not constrained to RunnerJobID")
 	}
+	readTaskIDParameter := object(t, parameters["ReadTaskID"], "components.parameters.ReadTaskID")
+	if object(t, readTaskIDParameter["schema"], "ReadTaskID.schema")["$ref"] != "#/components/schemas/UUID" {
+		t.Error("read task path parameter is not constrained to UUID")
+	}
 	for schemaName, propertyName := range map[string]string{
 		"JobDescriptor": "id", "ActionEnvelopeV1": "action_id",
 		"CredentialChildAuthorizationResponse": "job_id", "CredentialStateResponse": "job_id",
@@ -248,6 +265,227 @@ func assertRunnerWirePrimitives(t *testing.T, components, paths, schemas map[str
 	}
 }
 
+func assertReadTaskContract(t *testing.T, components, paths, schemas map[string]any) {
+	t.Helper()
+
+	readTaskLease := object(t, object(t, components["securitySchemes"], "securitySchemes")["readTaskLease"], "readTaskLease")
+	if readTaskLease["type"] != "apiKey" || readTaskLease["in"] != "header" || readTaskLease["name"] != "Authorization" ||
+		!strings.Contains(fmt.Sprint(readTaskLease["description"]), "AIOPS-Read-Task-Lease") {
+		t.Errorf("readTaskLease = %#v, want dedicated Authorization scheme", readTaskLease)
+	}
+	readChallenge := object(t, object(t, components["headers"], "headers")["ReadTaskLeaseChallenge"], "ReadTaskLeaseChallenge")
+	if object(t, readChallenge["schema"], "ReadTaskLeaseChallenge.schema")["const"] != `AIOPS-Read-Task-Lease realm="runner-gateway"` {
+		t.Errorf("READ lease challenge = %#v", readChallenge)
+	}
+	read401 := object(t, object(t, components["responses"], "responses")["ReadTaskLeaseAuthenticationFailed"], "ReadTaskLeaseAuthenticationFailed")
+	if object(t, object(t, read401["headers"], "ReadTaskLeaseAuthenticationFailed.headers")["WWW-Authenticate"], "READ WWW-Authenticate")["$ref"] != "#/components/headers/ReadTaskLeaseChallenge" {
+		t.Error("READ 401 does not return the dedicated lease challenge")
+	}
+
+	token := object(t, schemas["ReadTaskLeaseToken"], "ReadTaskLeaseToken")
+	if token["minLength"] != float64(43) || token["maxLength"] != float64(43) || token["pattern"] != "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$" ||
+		token["readOnly"] != true || token["x-sensitive"] != true || token["x-log-redact"] != true {
+		t.Errorf("ReadTaskLeaseToken = %#v, want exact redacted 32-byte base64url token", token)
+	}
+	claim := object(t, schemas["ReadTaskClaimResponse"], "ReadTaskClaimResponse")
+	claimProperties := object(t, claim["properties"], "ReadTaskClaimResponse.properties")
+	if object(t, claimProperties["lease_token"], "ReadTaskClaimResponse.lease_token")["$ref"] != "#/components/schemas/ReadTaskLeaseToken" {
+		t.Error("READ raw token is not confined to ReadTaskClaimResponse")
+	}
+	for _, schemaName := range []string{"ReadTaskClaimResponse", "ReadTaskHeartbeatResponse"} {
+		response := object(t, schemas[schemaName], schemaName)
+		properties := object(t, response["properties"], schemaName+".properties")
+		heartbeatAfter := object(t, properties["heartbeat_after_seconds"], schemaName+".heartbeat_after_seconds")
+		if heartbeatAfter["const"] != float64(10) {
+			t.Errorf("%s heartbeat interval = %#v, want const 10", schemaName, heartbeatAfter)
+		}
+	}
+	for _, requestName := range []string{
+		"ReadTaskClaimRequest", "ReadTaskStartRequest", "ReadTaskHeartbeatRequest", "ReadTaskReleaseRequest",
+		"ReadTaskEvidenceCompleteRequest", "ReadTaskFailedCompleteRequest", "ReadTaskCancelledCompleteRequest",
+	} {
+		if countMapKey(schemas[requestName], "lease_token") != 0 {
+			t.Errorf("%s accepts a raw lease token in JSON", requestName)
+		}
+	}
+
+	descriptor := object(t, schemas["ReadTaskDescriptor"], "ReadTaskDescriptor")
+	descriptorProperties := object(t, descriptor["properties"], "ReadTaskDescriptor.properties")
+	descriptorInput := object(t, descriptorProperties["input"], "ReadTaskDescriptor.input")
+	if descriptorInput["x-aiops-max-json-depth"] != float64(32) || descriptorInput["x-aiops-trusted-registry-validation"] != true {
+		t.Errorf("ReadTaskDescriptor input boundary = %#v", descriptorInput)
+	}
+	inputHash := object(t, descriptorProperties["input_hash"], "ReadTaskDescriptor.input_hash")
+	if inputHash["x-aiops-hash-input"] != "exact-jcs-bytes" ||
+		!strings.Contains(fmt.Sprint(inputHash["description"]), "exact JCS-canonical input bytes") {
+		t.Errorf("ReadTaskDescriptor input hash contract = %#v", inputHash)
+	}
+	for _, forbidden := range []string{
+		"tenant_id", "workspace_id", "environment_id", "incident_id", "investigation_id", "runner_id",
+		"scope_revision", "certificate_sha256", "target", "url", "headers", "credential",
+	} {
+		if descriptorProperties[forbidden] != nil {
+			t.Errorf("ReadTaskDescriptor exposes server-owned field %q", forbidden)
+		}
+	}
+
+	complete := object(t, schemas["ReadTaskCompleteRequest"], "ReadTaskCompleteRequest")
+	variants, ok := complete["oneOf"].([]any)
+	if !ok || len(variants) != 3 {
+		t.Fatalf("ReadTaskCompleteRequest.oneOf = %#v, want three outcome variants", complete["oneOf"])
+	}
+	wantOutcomes := map[string]string{
+		"ReadTaskEvidenceCompleteRequest":  "EVIDENCE",
+		"ReadTaskFailedCompleteRequest":    "FAILED",
+		"ReadTaskCancelledCompleteRequest": "CANCELLED",
+	}
+	for name, outcome := range wantOutcomes {
+		variant := object(t, schemas[name], name)
+		properties := object(t, variant["properties"], name+".properties")
+		if object(t, properties["outcome"], name+".outcome")["const"] != outcome {
+			t.Errorf("%s outcome is not %s", name, outcome)
+		}
+		if outcome == "EVIDENCE" {
+			if properties["evidence"] == nil || properties["failure_code"] != nil {
+				t.Errorf("%s does not require evidence exclusively", name)
+			}
+		} else if properties["failure_code"] == nil || properties["evidence"] != nil {
+			t.Errorf("%s does not require failure_code exclusively", name)
+		}
+	}
+	failedProperties := object(t, object(t, schemas["ReadTaskFailedCompleteRequest"], "ReadTaskFailedCompleteRequest")["properties"], "failed properties")
+	if object(t, failedProperties["failure_code"], "failed failure_code")["$ref"] != "#/components/schemas/ReadTaskFailureCode" {
+		t.Error("FAILED completion does not use the closed failure code schema")
+	}
+	failedEnum, ok := object(t, schemas["ReadTaskFailureCode"], "ReadTaskFailureCode")["enum"].([]any)
+	if !ok || len(failedEnum) != 8 {
+		t.Fatalf("ReadTaskFailureCode enum = %#v", failedEnum)
+	}
+	for _, code := range failedEnum {
+		if code == "cancelled" {
+			t.Errorf("ReadTaskFailureCode includes cancelled: %#v", failedEnum)
+		}
+	}
+	cancelled := object(t, schemas["ReadTaskCancelledCompleteRequest"], "ReadTaskCancelledCompleteRequest")
+	cancelledProperties := object(t, cancelled["properties"], "cancelled properties")
+	if object(t, cancelledProperties["failure_code"], "cancelled failure_code")["const"] != "cancelled" {
+		t.Error("CANCELLED completion does not require the cancelled failure code")
+	}
+
+	evidence := object(t, schemas["ReadTaskEvidenceCompletion"], "ReadTaskEvidenceCompletion")
+	evidenceProperties := object(t, evidence["properties"], "ReadTaskEvidenceCompletion.properties")
+	items := object(t, evidenceProperties["items"], "ReadTaskEvidenceCompletion.items")
+	if items["type"] != "array" || items["maxItems"] != float64(256) || items["x-aiops-max-total-json-bytes"] != float64(65536) ||
+		items["x-aiops-max-json-depth"] != float64(16) {
+		t.Errorf("ReadTask evidence bounds = %#v", items)
+	}
+	itemSchema := object(t, items["items"], "ReadTaskEvidenceCompletion.items.items")
+	if itemSchema["type"] != "object" || itemSchema["x-aiops-trusted-registry-validation"] != true {
+		t.Errorf("ReadTask evidence item boundary = %#v", itemSchema)
+	}
+
+	completeResponse := object(t, schemas["ReadTaskCompleteResponse"], "ReadTaskCompleteResponse")
+	conditions, ok := completeResponse["allOf"].([]any)
+	if !ok || len(conditions) != 1 {
+		t.Fatalf("ReadTaskCompleteResponse.allOf = %#v, want EVIDENCE correlation", completeResponse["allOf"])
+	}
+	condition := object(t, conditions[0], "ReadTaskCompleteResponse condition")
+	thenSchema := object(t, condition["then"], "ReadTaskCompleteResponse.then")
+	elseSchema := object(t, condition["else"], "ReadTaskCompleteResponse.else")
+	thenRequired, thenOK := thenSchema["required"].([]any)
+	forbidden := object(t, elseSchema["not"], "ReadTaskCompleteResponse.else.not")
+	forbiddenAlternatives, elseOK := forbidden["anyOf"].([]any)
+	if !thenOK || !elseOK || len(forbiddenAlternatives) != 2 || strings.Join(anyStrings(t, thenRequired), ",") != "evidence_id,content_hash" {
+		t.Error("ReadTaskCompleteResponse does not make evidence fields EVIDENCE-only")
+	} else {
+		for index, name := range []string{"evidence_id", "content_hash"} {
+			required, ok := object(t, forbiddenAlternatives[index], "ReadTaskCompleteResponse.else.not.anyOf")["required"].([]any)
+			if !ok || len(required) != 1 || required[0] != name {
+				t.Errorf("ReadTaskCompleteResponse permits %s outside EVIDENCE", name)
+			}
+		}
+	}
+
+	completeOperation := object(t, object(t, paths["/runner/v1/read-tasks/{task_id}:complete"], "read complete path")["post"], "read complete")
+	if object(t, completeOperation["responses"], "read complete responses")["422"] == nil {
+		t.Error("READ completion does not declare result rejection as 422")
+	}
+	claimOperation := object(t, object(t, paths["/runner/v1/read-tasks/{task_id}:claim"], "read claim path")["post"], "read claim")
+	if object(t, claimOperation["responses"], "read claim responses")["429"] != nil {
+		t.Error("READ claim advertises rate limiting that its runtime cannot emit")
+	}
+	for path, contract := range map[string]struct {
+		response string
+		codes    []string
+	}{
+		"/runner/v1/read-tasks/{task_id}:start": {
+			"ReadTaskStateConflict", []string{"runner_stale_lease", "runner_state_conflict"},
+		},
+		"/runner/v1/read-tasks/{task_id}:heartbeat": {
+			"ReadTaskHeartbeatConflict", []string{"runner_stale_lease", "runner_state_conflict", "runner_heartbeat_sequence_conflict"},
+		},
+		"/runner/v1/read-tasks/{task_id}:release": {
+			"ReadTaskStateConflict", []string{"runner_stale_lease", "runner_state_conflict"},
+		},
+		"/runner/v1/read-tasks/{task_id}:complete": {
+			"ReadTaskResultConflict", []string{"runner_stale_lease", "runner_state_conflict", "runner_result_conflict"},
+		},
+	} {
+		operation := object(t, object(t, paths[path], path)["post"], path+".post")
+		response := object(t, object(t, operation["responses"], path+".responses")["409"], path+".409")
+		wantReference := "#/components/responses/" + contract.response
+		if response["$ref"] != wantReference {
+			t.Errorf("%s 409 response = %#v, want %s", path, response, wantReference)
+			continue
+		}
+		responseContract := object(t, object(t, components["responses"], "components.responses")[contract.response], contract.response)
+		rawProblems, ok := responseContract["x-aiops-problems"].([]any)
+		if !ok || len(rawProblems) != len(contract.codes) {
+			t.Errorf("%s problem catalog = %#v, want %v", contract.response, responseContract["x-aiops-problems"], contract.codes)
+			continue
+		}
+		for index, rawProblem := range rawProblems {
+			if code := object(t, rawProblem, contract.response+" problem")["code"]; code != contract.codes[index] {
+				t.Errorf("%s problem[%d] = %#v, want %s", contract.response, index, code, contract.codes[index])
+			}
+		}
+	}
+	for path, responseName := range map[string]string{
+		"/runner/v1/read-tasks/{task_id}:claim":     "ReadTaskClaimsUnavailable",
+		"/runner/v1/read-tasks/{task_id}:start":     "ReadTaskClaimsUnavailable",
+		"/runner/v1/read-tasks/{task_id}:heartbeat": "ReadTaskDependencyUnavailable",
+		"/runner/v1/read-tasks/{task_id}:release":   "ReadTaskDependencyUnavailable",
+		"/runner/v1/read-tasks/{task_id}:complete":  "ReadTaskClaimsUnavailable",
+	} {
+		operation := object(t, object(t, paths[path], path)["post"], path+".post")
+		response := object(t, object(t, operation["responses"], path+".responses")["503"], path+".503")
+		wantReference := "#/components/responses/" + responseName
+		if response["$ref"] != wantReference {
+			t.Errorf("%s 503 response = %#v, want %s", path, response, wantReference)
+		}
+	}
+	responses := object(t, components["responses"], "components.responses")
+	claimsProblems := object(t, responses["ReadTaskClaimsUnavailable"], "ReadTaskClaimsUnavailable")["x-aiops-problems"].([]any)
+	dependencyProblems := object(t, responses["ReadTaskDependencyUnavailable"], "ReadTaskDependencyUnavailable")["x-aiops-problems"].([]any)
+	if len(claimsProblems) != 2 || len(dependencyProblems) != 1 ||
+		object(t, dependencyProblems[0], "ReadTaskDependencyUnavailable problem")["code"] != "runner_dependency_unavailable" {
+		t.Errorf("READ 503 catalogs are not endpoint-exact: claims=%#v dependency=%#v", claimsProblems, dependencyProblems)
+	}
+}
+
+func anyStrings(t *testing.T, values []any) []string {
+	t.Helper()
+	result := make([]string, len(values))
+	for index, value := range values {
+		stringValue, ok := value.(string)
+		if !ok {
+			t.Fatalf("value[%d] = %#v, want string", index, value)
+		}
+		result[index] = stringValue
+	}
+	return result
+}
+
 func assertOperationContracts(t *testing.T, document, paths map[string]any) {
 	t.Helper()
 	wantMethod := map[string]string{
@@ -261,12 +499,17 @@ func assertOperationContracts(t *testing.T, document, paths map[string]any) {
 		"/runner/v1/revocations:lease":                     "post",
 		"/runner/v1/revocations/{revocation_id}:heartbeat": "post",
 		"/runner/v1/revocations/{revocation_id}:complete":  "post",
+		"/runner/v1/read-tasks/{task_id}:claim":            "post",
+		"/runner/v1/read-tasks/{task_id}:start":            "post",
+		"/runner/v1/read-tasks/{task_id}:heartbeat":        "post",
+		"/runner/v1/read-tasks/{task_id}:release":          "post",
+		"/runner/v1/read-tasks/{task_id}:complete":         "post",
 	}
 	for path, method := range wantMethod {
 		pathItem := object(t, paths[path], path)
 		operation := object(t, pathItem[method], path+"."+method)
 		wantLimit := float64(65536)
-		if strings.HasSuffix(path, ":lease") {
+		if strings.HasSuffix(path, ":lease") || strings.HasSuffix(path, ":claim") {
 			wantLimit = 262144
 		}
 		if operation["x-aiops-max-response-body-bytes"] != wantLimit {
@@ -289,9 +532,30 @@ func assertOperationContracts(t *testing.T, document, paths map[string]any) {
 				t.Errorf("%s capability boundary = pool %#v, capability %#v", path, operation["x-aiops-required-pool"], operation["x-aiops-required-capability"])
 			}
 		}
+		if strings.Contains(path, "/read-tasks/") {
+			if operation["x-aiops-required-pool"] != "READ" {
+				t.Errorf("%s pool boundary = %#v, want READ", path, operation["x-aiops-required-pool"])
+			}
+			if strings.HasSuffix(path, ":claim") {
+				security, ok := operation["security"].([]any)
+				if !ok || len(security) != 1 {
+					t.Errorf("%s security = %#v, want mutualTLS only", path, operation["security"])
+				} else {
+					entry := object(t, security[0], path+" security")
+					if len(entry) != 1 || entry["mutualTLS"] == nil {
+						t.Errorf("%s security = %#v, want mutualTLS only", path, entry)
+					}
+				}
+				if operation["x-aiops-authorization-header"] != "forbidden" {
+					t.Errorf("%s does not forbid Authorization", path)
+				}
+			} else {
+				assertANDSecurity(t, operation, "readTaskLease", path)
+			}
+		}
 		if path == "/runner/v1/jobs:lease" {
 			if operation["x-aiops-200-required-pool"] != "WRITE" ||
-				operation["x-aiops-read-behavior"] != "204-no-job-without-queue-dispatch" {
+				operation["x-aiops-read-behavior"] != "always-204-use-read-task-claim" {
 				t.Errorf("%s mixed-pool boundary = %#v/%#v", path,
 					operation["x-aiops-200-required-pool"], operation["x-aiops-read-behavior"])
 			}
@@ -416,6 +680,7 @@ func assertProblemContracts(t *testing.T, document, components map[string]any) {
 			"urn:aiops:problem:runner:credential-anchor-conflict|runner_credential_anchor_conflict",
 			"urn:aiops:problem:runner:result-conflict|runner_result_conflict",
 		},
+		"Problem422":  {"urn:aiops:problem:runner:result-rejected|runner_result_rejected"},
 		"Problem413":  {"urn:aiops:problem:runner:payload-too-large|runner_payload_too_large"},
 		"Problem415":  {"urn:aiops:problem:runner:unsupported-media-type|runner_unsupported_media_type"},
 		"RateLimited": {"urn:aiops:problem:runner:rate-limited|runner_rate_limited"},
@@ -483,6 +748,40 @@ func resolveObject(t *testing.T, document map[string]any, value any, name string
 	return current
 }
 
+func assertLocalReferencesResolve(t *testing.T, document map[string]any) {
+	t.Helper()
+	var walk func(any, string)
+	walk = func(value any, path string) {
+		switch typed := value.(type) {
+		case map[string]any:
+			if reference, ok := typed["$ref"].(string); ok && strings.HasPrefix(reference, "#/") {
+				var current any = document
+				for _, encodedPart := range strings.Split(strings.TrimPrefix(reference, "#/"), "/") {
+					part := strings.ReplaceAll(strings.ReplaceAll(encodedPart, "~1", "/"), "~0", "~")
+					objectValue, objectOK := current.(map[string]any)
+					if !objectOK {
+						t.Errorf("%s local reference %q crosses a non-object", path, reference)
+						break
+					}
+					current, ok = objectValue[part]
+					if !ok {
+						t.Errorf("%s local reference %q does not resolve", path, reference)
+						break
+					}
+				}
+			}
+			for key, child := range typed {
+				walk(child, path+"."+key)
+			}
+		case []any:
+			for index, child := range typed {
+				walk(child, path+"["+strconv.Itoa(index)+"]")
+			}
+		}
+	}
+	walk(document, "runner-v1")
+}
+
 func countMapKey(value any, target string) int {
 	count := 0
 	switch typed := value.(type) {
@@ -506,7 +805,12 @@ func assertClosedObjects(t *testing.T, value any, path string) {
 	switch typed := value.(type) {
 	case map[string]any:
 		if typed["type"] == "object" && typed["additionalProperties"] != false {
-			t.Errorf("%s permits unknown fields", path)
+			trustedRegistryBoundary := typed["x-aiops-trusted-registry-validation"] == true &&
+				(path == "components.schemas.ReadTaskDescriptor.properties.input" ||
+					path == "components.schemas.ReadTaskEvidenceCompletion.properties.items.items")
+			if !trustedRegistryBoundary {
+				t.Errorf("%s permits unknown fields", path)
+			}
 		}
 		for key, child := range typed {
 			assertClosedObjects(t, child, path+"."+key)

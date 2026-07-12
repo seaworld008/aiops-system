@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/pashagolub/pgxmock/v4"
 	"github.com/seaworld008/aiops-system/internal/config"
+	"github.com/seaworld008/aiops-system/internal/readtask"
 	"github.com/seaworld008/aiops-system/internal/runneridentity/testpki"
 )
 
@@ -62,6 +65,34 @@ func TestNewRunnerGatewayRuntimeTreatsAbsentConfigurationAsDisabled(t *testing.T
 	runtime, err := newRunnerGatewayRuntime(nil, config.WriteExecutionModeDisabled, nil)
 	if err != nil || runtime != nil {
 		t.Fatalf("newRunnerGatewayRuntime(nil) = %#v, %v", runtime, err)
+	}
+}
+
+func TestReadTaskGatewayContractsRemainFailClosedUntilTypedRegistry(t *testing.T) {
+	if err := disabledReadTaskStart(context.Background(), readtask.Descriptor{}); !errors.Is(err, readtask.ErrClaimsDisabled) {
+		t.Fatalf("disabledReadTaskStart() error = %v", err)
+	}
+	if err := disabledReadTaskCompletion(
+		context.Background(), readtask.Descriptor{}, readtask.EvidenceCompletion{},
+	); !errors.Is(err, readtask.ErrClaimsDisabled) {
+		t.Fatalf("disabledReadTaskCompletion() error = %v", err)
+	}
+}
+
+func TestReadTaskLeaseEntropyReturnsOwned32ByteSecret(t *testing.T) {
+	first, err := readTaskLeaseEntropy()
+	if err != nil || len(first) != 32 {
+		t.Fatalf("readTaskLeaseEntropy() = %d bytes, %v", len(first), err)
+	}
+	defer clear(first)
+	second, err := readTaskLeaseEntropy()
+	if err != nil || len(second) != 32 {
+		t.Fatalf("readTaskLeaseEntropy(second) = %d bytes, %v", len(second), err)
+	}
+	defer clear(second)
+	first[0] ^= 0xff
+	if &first[0] == &second[0] {
+		t.Fatal("readTaskLeaseEntropy() aliased caller-owned buffers")
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
 	"github.com/seaworld008/aiops-system/internal/domain"
 )
 
@@ -31,6 +32,7 @@ var (
 	ErrCompletionConflict = errors.New("read task completion conflict")
 	ErrProjectionRejected = errors.New("read task completion projection rejected")
 	ErrPersistence        = errors.New("read task persistence failed")
+	ErrIntegrity          = errors.New("read task integrity validation failed")
 	ErrSensitiveDestroyed = errors.New("read task sensitive value is destroyed")
 )
 
@@ -72,6 +74,13 @@ func (descriptor Descriptor) Validate() error {
 		len(descriptor.ConnectorID) > 128 || !lowCardinalityPattern.MatchString(descriptor.ConnectorID) ||
 		len(descriptor.Operation) > 64 || !lowCardinalityPattern.MatchString(descriptor.Operation) ||
 		!validSHA256(descriptor.InputHash) || domain.ValidateSafeJSONObject(descriptor.Input) != nil {
+		return ErrInvalidRequest
+	}
+	canonicalInput, err := jsoncanonicalizer.Transform(descriptor.Input)
+	if canonicalInput != nil {
+		defer clear(canonicalInput)
+	}
+	if err != nil || !bytes.Equal(canonicalInput, descriptor.Input) {
 		return ErrInvalidRequest
 	}
 	digest := sha256.Sum256(descriptor.Input)

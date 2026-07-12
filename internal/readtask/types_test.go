@@ -94,6 +94,10 @@ func TestDescriptorAttemptAndFenceRejectUntrustedPersistentFacts(t *testing.T) {
 	for name, mutate := range map[string]func(*readtask.Descriptor){
 		"non persistent UUID": func(value *readtask.Descriptor) { value.TaskID = "TASK-1" },
 		"input hash mismatch": func(value *readtask.Descriptor) { value.InputHash = fmt.Sprintf("%x", sha256.Sum256([]byte("other"))) },
+		"non canonical input with matching raw hash": func(value *readtask.Descriptor) {
+			value.Input = json.RawMessage(`{"window_seconds":300,"query":"health"}`)
+			value.InputHash = fmt.Sprintf("%x", sha256.Sum256(value.Input))
+		},
 		"sensitive input": func(value *readtask.Descriptor) {
 			value.Input = json.RawMessage(`{"authorization":"Bearer raw-secret"}`)
 			digest := sha256.Sum256(value.Input)

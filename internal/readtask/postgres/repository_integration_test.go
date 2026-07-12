@@ -126,11 +126,11 @@ func TestRepositoryPostgres16PersistsAuthenticatedLifecycleAndCompletionReplay(t
 		scope execution.RunnerScope,
 		certificate readtask.CertificateBinding,
 	) (readtask.CompletionResult, error) {
-		return fixture.tasks.CompleteRunnerTx(ctx, tx, scope, certificate, completion)
+		return fixture.tasks.CompleteRunnerAuthorizedTx(ctx, tx, scope, certificate, completion, trustedReadTaskCompletionAuthorizer)
 	})
 	if err != nil || completed.Replayed || completed.Attempt.Status != readtask.AttemptCompleted ||
 		completed.EvidenceID != integrationEvidenceID || completed.ReceiptID != integrationReceiptID {
-		t.Fatalf("CompleteRunnerTx(real PostgreSQL) = %#v, %v", completed, err)
+		t.Fatalf("CompleteRunnerAuthorizedTx(real PostgreSQL) = %#v, %v", completed, err)
 	}
 	verifyCommittedReadTaskCompletion(t, fixture.database, claim, bearerToken, completed)
 
@@ -139,13 +139,13 @@ func TestRepositoryPostgres16PersistsAuthenticatedLifecycleAndCompletionReplay(t
 		scope execution.RunnerScope,
 		certificate readtask.CertificateBinding,
 	) (readtask.CompletionResult, error) {
-		return fixture.tasks.CompleteRunnerTx(ctx, tx, scope, certificate, completion)
+		return fixture.tasks.CompleteRunnerAuthorizedTx(ctx, tx, scope, certificate, completion, trustedReadTaskCompletionAuthorizer)
 	})
 	if err != nil || !replayed.Replayed || replayed.EvidenceID != completed.EvidenceID ||
 		replayed.ReceiptID != completed.ReceiptID ||
 		replayed.Projection.RequestHash() != completed.Projection.RequestHash() ||
 		replayed.Projection.ReceiptHash() != completed.Projection.ReceiptHash() {
-		t.Fatalf("CompleteRunnerTx(replay) = %#v, %v", replayed, err)
+		t.Fatalf("CompleteRunnerAuthorizedTx(replay) = %#v, %v", replayed, err)
 	}
 
 	changed := completion
@@ -160,10 +160,10 @@ func TestRepositoryPostgres16PersistsAuthenticatedLifecycleAndCompletionReplay(t
 		scope execution.RunnerScope,
 		certificate readtask.CertificateBinding,
 	) (readtask.CompletionResult, error) {
-		return fixture.tasks.CompleteRunnerTx(ctx, tx, scope, certificate, changed)
+		return fixture.tasks.CompleteRunnerAuthorizedTx(ctx, tx, scope, certificate, changed, trustedReadTaskCompletionAuthorizer)
 	})
 	if !errors.Is(err, readtask.ErrCompletionConflict) {
-		t.Fatalf("CompleteRunnerTx(changed replay) error = %v, want ErrCompletionConflict", err)
+		t.Fatalf("CompleteRunnerAuthorizedTx(changed replay) error = %v, want ErrCompletionConflict", err)
 	}
 	verifySingleCompletionProjection(t, fixture.database)
 	verifyConcurrentSingleWinnerClaim(t, ctx, fixture)
@@ -456,9 +456,9 @@ func verifyOldEpochAndTokenRejected(
 		scope execution.RunnerScope,
 		certificate readtask.CertificateBinding,
 	) (readtask.CompletionResult, error) {
-		return fixture.tasks.CompleteRunnerTx(ctx, tx, scope, certificate, readtask.Completion{
+		return fixture.tasks.CompleteRunnerAuthorizedTx(ctx, tx, scope, certificate, readtask.Completion{
 			Fence: oldClaim.Fence(), Outcome: readtask.CompletionFailed, FailureCode: readtask.FailureUnknown,
-		})
+		}, trustedReadTaskCompletionAuthorizer)
 	})
 	if !errors.Is(err, readtask.ErrProjectionRejected) {
 		t.Fatalf("complete released epoch error = %v, want ErrProjectionRejected", err)
@@ -488,9 +488,9 @@ func verifyOldEpochAndTokenRejected(
 		scope execution.RunnerScope,
 		certificate readtask.CertificateBinding,
 	) (readtask.CompletionResult, error) {
-		return fixture.tasks.CompleteRunnerTx(ctx, tx, scope, certificate, readtask.Completion{
+		return fixture.tasks.CompleteRunnerAuthorizedTx(ctx, tx, scope, certificate, readtask.Completion{
 			Fence: forgedFence, Outcome: readtask.CompletionFailed, FailureCode: readtask.FailureUnknown,
-		})
+		}, trustedReadTaskCompletionAuthorizer)
 	})
 	if !errors.Is(err, readtask.ErrStaleFence) {
 		t.Fatalf("complete current epoch with old token error = %v, want ErrStaleFence", err)
@@ -557,6 +557,10 @@ func waitForReadTaskRetryWindow(
 }
 
 func trustedReadTaskAuthorizer(context.Context, readtask.Descriptor) error { return nil }
+
+func trustedReadTaskCompletionAuthorizer(context.Context, readtask.Descriptor, readtask.EvidenceCompletion) error {
+	return nil
+}
 
 type repositoryIntegrationFixture struct {
 	database   *pgxpool.Pool

@@ -113,7 +113,7 @@ func (repository *Repository) ClaimRunnerTx(
 		return readtask.Claim{}, err
 	}
 	if task.descriptor.Validate() != nil {
-		return readtask.Claim{}, persistenceError("validate READ task projection", errors.New("invalid persisted task"))
+		return readtask.Claim{}, integrityError("validate READ task projection", errors.New("invalid persisted task"))
 	}
 	if !runnerScopeAllows(scope, task.descriptor.WorkspaceID, task.descriptor.EnvironmentID) {
 		return readtask.Claim{}, readtask.ErrNotFound
@@ -183,7 +183,7 @@ func (repository *Repository) ClaimRunnerTx(
 	}
 	tokenBytes, err := encodeLeaseToken(rawToken)
 	if err != nil {
-		return readtask.Claim{}, persistenceError("generate READ task lease token", err)
+		return readtask.Claim{}, integrityError("generate READ task lease token", err)
 	}
 	defer clear(tokenBytes)
 	digest := sha256.Sum256(tokenBytes)
@@ -232,14 +232,14 @@ func (repository *Repository) ClaimRunnerTx(
 	}
 	attempt.UpdatedAt = updatedAt
 	if !validFiniteTime(updatedAt) || attempt.ValidateAgainst(task.descriptor) != nil {
-		return readtask.Claim{}, persistenceError("validate persisted READ task attempt", errors.New("invalid persisted attempt"))
+		return readtask.Claim{}, integrityError("validate persisted READ task attempt", errors.New("invalid persisted attempt"))
 	}
 	if !attemptIdentityCurrent(scope, certificate, task.descriptor, attempt) {
-		return readtask.Claim{}, persistenceError("bind persisted READ task identity", errors.New("identity snapshot mismatch"))
+		return readtask.Claim{}, integrityError("bind persisted READ task identity", errors.New("identity snapshot mismatch"))
 	}
 	claim, err := readtask.NewClaim(task.descriptor, attempt, tokenBytes)
 	if err != nil {
-		return readtask.Claim{}, persistenceError("bind READ task claim", err)
+		return readtask.Claim{}, integrityError("bind READ task claim", err)
 	}
 	return claim, nil
 }
@@ -303,6 +303,9 @@ func (repository *Repository) startRunnerTx(
 	if err != nil {
 		return readtask.Attempt{}, persistenceError("lock READ task attempt for start", err)
 	}
+	if err := validateLockedTaskAttemptProjection("validate locked READ task start", task.descriptor, attempt); err != nil {
+		return readtask.Attempt{}, err
+	}
 	if !attemptIdentityCurrent(scope, certificate, task.descriptor, attempt) ||
 		!fenceMatchesAttempt(start.Fence, attempt) {
 		return readtask.Attempt{}, readtask.ErrStaleFence
@@ -338,6 +341,13 @@ func (repository *Repository) startRunnerTx(
 		return readtask.Attempt{}, err
 	}
 	if attempt.Status == readtask.AttemptRunning {
+		postAuthorizationNow, clockErr := databaseClock(ctx, tx)
+		if clockErr != nil {
+			return readtask.Attempt{}, clockErr
+		}
+		if !postAuthorizationNow.Before(attempt.LeaseExpiresAt) {
+			return readtask.Attempt{}, readtask.ErrStaleFence
+		}
 		return attempt, nil
 	}
 	if start.ValidateAgainst(task.descriptor, attempt) != nil || attempt.Status != readtask.AttemptLeased {
@@ -361,8 +371,11 @@ func (repository *Repository) startRunnerTx(
 	if err != nil {
 		return readtask.Attempt{}, persistenceError("start READ task attempt", err)
 	}
+	if err := validateLockedTaskAttemptProjection("validate started READ task attempt", task.descriptor, attempt); err != nil {
+		return readtask.Attempt{}, err
+	}
 	if !attemptIdentityCurrent(scope, certificate, task.descriptor, attempt) || attempt.Status != readtask.AttemptRunning {
-		return readtask.Attempt{}, persistenceError("validate started READ task attempt", errors.New("invalid attempt projection"))
+		return readtask.Attempt{}, integrityError("validate started READ task attempt", errors.New("invalid attempt projection"))
 	}
 	if task.taskStatus == "QUEUED" {
 		updated, updateErr := tx.Exec(ctx, `
@@ -427,6 +440,9 @@ func (repository *Repository) HeartbeatRunnerTx(
 	}
 	if err != nil {
 		return readtask.HeartbeatResult{}, persistenceError("lock READ task attempt for heartbeat", err)
+	}
+	if err := validateLockedTaskAttemptProjection("validate locked READ task heartbeat", task.descriptor, attempt); err != nil {
+		return readtask.HeartbeatResult{}, err
 	}
 	if !fenceMatchesAttempt(heartbeat.Fence, attempt) {
 		return readtask.HeartbeatResult{}, readtask.ErrStaleFence
@@ -523,8 +539,11 @@ func (repository *Repository) HeartbeatRunnerTx(
 	if err != nil {
 		return readtask.HeartbeatResult{}, persistenceError("heartbeat READ task attempt", err)
 	}
+	if err := validateLockedTaskAttemptProjection("validate READ task heartbeat", task.descriptor, attempt); err != nil {
+		return readtask.HeartbeatResult{}, err
+	}
 	if !attemptIdentityCurrent(scope, certificate, task.descriptor, attempt) {
-		return readtask.HeartbeatResult{}, persistenceError("validate READ task heartbeat", errors.New("invalid attempt projection"))
+		return readtask.HeartbeatResult{}, integrityError("validate READ task heartbeat", errors.New("invalid attempt projection"))
 	}
 	return heartbeatResult(task.descriptor, attempt, readtask.HeartbeatContinue)
 }
@@ -539,7 +558,7 @@ func heartbeatResult(
 		Directive: directive, LeaseExpiresAt: attempt.LeaseExpiresAt,
 	}
 	if result.ValidateAgainst(descriptor) != nil {
-		return readtask.HeartbeatResult{}, persistenceError("validate READ task heartbeat result", errors.New("invalid heartbeat projection"))
+		return readtask.HeartbeatResult{}, integrityError("validate READ task heartbeat result", errors.New("invalid heartbeat projection"))
 	}
 	return result, nil
 }
@@ -573,6 +592,9 @@ func (repository *Repository) ReleaseRunnerTx(
 	if err != nil {
 		return readtask.Attempt{}, persistenceError("lock READ task attempt for release", err)
 	}
+	if err := validateLockedTaskAttemptProjection("validate locked READ task release", task.descriptor, attempt); err != nil {
+		return readtask.Attempt{}, err
+	}
 	databaseNow, err := databaseClock(ctx, tx)
 	if err != nil {
 		return readtask.Attempt{}, err
@@ -604,23 +626,39 @@ func (repository *Repository) ReleaseRunnerTx(
 	if err != nil {
 		return readtask.Attempt{}, persistenceError("release READ task attempt", err)
 	}
-	if attempt.Status != readtask.AttemptReleased || attempt.ValidateAgainst(task.descriptor) != nil {
-		return readtask.Attempt{}, persistenceError("validate released READ task attempt", errors.New("invalid attempt projection"))
+	if err := validateLockedTaskAttemptProjection("validate released READ task attempt", task.descriptor, attempt); err != nil {
+		return readtask.Attempt{}, err
+	}
+	if attempt.Status != readtask.AttemptReleased {
+		return readtask.Attempt{}, integrityError("validate released READ task attempt", errors.New("invalid attempt projection"))
 	}
 	return attempt, nil
 }
 
-// CompleteRunnerTx projects bounded Runner output and atomically persists the
-// Evidence (when present), terminal Task, COMPLETED attempt, and immutable v2
-// receipt. The same attempt/body replays the original IDs; any other body is a
-// completion conflict.
-func (repository *Repository) CompleteRunnerTx(
+// CompletionAuthorizer is the trusted connector-specific output-schema
+// boundary. It receives detached, secret-free values only: the lease Fence is
+// deliberately excluded so a connector contract can never observe a bearer.
+// The callback must be side-effect-free.
+type CompletionAuthorizer func(context.Context, readtask.Descriptor, readtask.EvidenceCompletion) error
+
+// CompleteRunnerAuthorizedTx projects bounded Runner output and atomically
+// persists the Evidence (when present), terminal Task, COMPLETED attempt, and
+// immutable v2 receipt. A non-nil connector-specific output authorizer is
+// mandatory even for failure-only completions so callers cannot accidentally
+// construct a completion path that skips the typed contract. The same
+// attempt/body replays the original IDs without re-running mutable admission
+// policy; any other body is a completion conflict.
+func (repository *Repository) CompleteRunnerAuthorizedTx(
 	ctx context.Context,
 	tx pgx.Tx,
 	scope execution.RunnerScope,
 	certificate readtask.CertificateBinding,
 	completion readtask.Completion,
+	authorizer CompletionAuthorizer,
 ) (readtask.CompletionResult, error) {
+	if authorizer == nil {
+		return readtask.CompletionResult{}, readtask.ErrInvalidRequest
+	}
 	if err := validateRunnerRequest(ctx, tx, scope, certificate); err != nil {
 		return readtask.CompletionResult{}, err
 	}
@@ -640,6 +678,9 @@ func (repository *Repository) CompleteRunnerTx(
 	}
 	if err != nil {
 		return readtask.CompletionResult{}, persistenceError("lock READ task attempt for completion", err)
+	}
+	if err := validateLockedTaskAttemptProjection("validate locked READ task completion", task.descriptor, attempt); err != nil {
+		return readtask.CompletionResult{}, err
 	}
 	if !attemptIdentityCurrent(scope, certificate, task.descriptor, attempt) ||
 		!fenceMatchesAttempt(completion.Fence, attempt) {
@@ -670,27 +711,44 @@ func (repository *Repository) CompleteRunnerTx(
 	if !databaseNow.Before(attempt.LeaseExpiresAt) {
 		return readtask.CompletionResult{}, readtask.ErrStaleFence
 	}
+	if completion.Outcome == readtask.CompletionEvidence {
+		descriptorCopy := task.descriptor
+		descriptorCopy.Input = bytes.Clone(task.descriptor.Input)
+		evidenceCopy := cloneEvidenceCompletion(completion.Evidence)
+		if evidenceCopy == nil {
+			return readtask.CompletionResult{}, readtask.ErrProjectionRejected
+		}
+		if err := authorizer(ctx, descriptorCopy, *evidenceCopy); err != nil {
+			if contextErr := ctx.Err(); contextErr != nil {
+				return readtask.CompletionResult{}, contextErr
+			}
+			if errors.Is(err, readtask.ErrClaimsDisabled) {
+				return readtask.CompletionResult{}, readtask.ErrClaimsDisabled
+			}
+			return readtask.CompletionResult{}, readtask.ErrProjectionRejected
+		}
+	}
 
 	evidenceID := ""
 	if projection.Outcome() == readtask.CompletionEvidence {
 		evidenceID = repository.idSource()
 		if !uuidPattern.MatchString(evidenceID) {
-			return readtask.CompletionResult{}, persistenceError("allocate Evidence ID", errors.New("invalid ID source"))
+			return readtask.CompletionResult{}, integrityError("allocate Evidence ID", errors.New("invalid ID source"))
 		}
 		querySummary, marshalErr := json.Marshal(map[string]any{
 			"operation": task.descriptor.Operation,
 		})
 		if marshalErr != nil {
-			return readtask.CompletionResult{}, persistenceError("encode Evidence query summary", marshalErr)
+			return readtask.CompletionResult{}, integrityError("encode Evidence query summary", marshalErr)
 		}
 		attributes := projection.Attributes()
 		redactedSummary, marshalErr := json.Marshal(attributes)
 		if marshalErr != nil {
-			return readtask.CompletionResult{}, persistenceError("encode Evidence redacted summary", marshalErr)
+			return readtask.CompletionResult{}, integrityError("encode Evidence redacted summary", marshalErr)
 		}
 		attributesJSON, marshalErr := json.Marshal(attributes)
 		if marshalErr != nil {
-			return readtask.CompletionResult{}, persistenceError("encode Evidence attributes", marshalErr)
+			return readtask.CompletionResult{}, integrityError("encode Evidence attributes", marshalErr)
 		}
 		truncated := attributes["truncated"] == "true"
 		var createdAt time.Time
@@ -714,7 +772,7 @@ func (repository *Repository) CompleteRunnerTx(
 			return readtask.CompletionResult{}, persistenceError("persist authenticated READ Evidence", err)
 		}
 		if !validFiniteTime(createdAt) {
-			return readtask.CompletionResult{}, persistenceError("validate Evidence receipt time", errors.New("invalid database time"))
+			return readtask.CompletionResult{}, integrityError("validate Evidence receipt time", errors.New("invalid database time"))
 		}
 	}
 
@@ -738,14 +796,17 @@ func (repository *Repository) CompleteRunnerTx(
 	if err != nil {
 		return readtask.CompletionResult{}, persistenceError("complete READ task attempt", err)
 	}
+	if err := validateLockedTaskAttemptProjection("validate completed READ task attempt", task.descriptor, attempt); err != nil {
+		return readtask.CompletionResult{}, err
+	}
 	if attempt.Status != readtask.AttemptCompleted || attempt.RequestHash != projection.RequestHash() ||
 		attempt.ReceiptHash != projection.ReceiptHash() {
-		return readtask.CompletionResult{}, persistenceError("validate completed READ task attempt", errors.New("invalid attempt projection"))
+		return readtask.CompletionResult{}, integrityError("validate completed READ task attempt", errors.New("invalid attempt projection"))
 	}
 
 	receiptID := repository.idSource()
 	if !uuidPattern.MatchString(receiptID) {
-		return readtask.CompletionResult{}, persistenceError("allocate READ receipt ID", errors.New("invalid ID source"))
+		return readtask.CompletionResult{}, integrityError("allocate READ receipt ID", errors.New("invalid ID source"))
 	}
 	var evidenceArgument, contentHashArgument, failureArgument any
 	if projection.Outcome() == readtask.CompletionEvidence {
@@ -775,15 +836,29 @@ func (repository *Repository) CompleteRunnerTx(
 	}
 	projection, err = projection.WithReceivedAt(receivedAt, task.descriptor, attempt)
 	if err != nil {
-		return readtask.CompletionResult{}, persistenceError("bind READ receipt database time", err)
+		return readtask.CompletionResult{}, integrityError("bind READ receipt database time", err)
 	}
 	result := readtask.CompletionResult{
 		Attempt: attempt, Projection: projection, EvidenceID: evidenceID, ReceiptID: receiptID,
 	}
 	if result.ValidateAgainst(task.descriptor) != nil {
-		return readtask.CompletionResult{}, persistenceError("validate READ completion result", errors.New("invalid completion projection"))
+		return readtask.CompletionResult{}, integrityError("validate READ completion result", errors.New("invalid completion projection"))
 	}
 	return result, nil
+}
+
+func cloneEvidenceCompletion(source *readtask.EvidenceCompletion) *readtask.EvidenceCompletion {
+	if source == nil {
+		return nil
+	}
+	cloned := &readtask.EvidenceCompletion{CollectedAt: source.CollectedAt}
+	if source.Items != nil {
+		cloned.Items = make([]json.RawMessage, len(source.Items))
+		for index := range source.Items {
+			cloned.Items[index] = bytes.Clone(source.Items[index])
+		}
+	}
+	return cloned
 }
 
 func projectRunnerCompletion(
@@ -875,13 +950,13 @@ func loadCompletionReplay(
 	}
 	projection, err = projection.WithReceivedAt(receivedAt, descriptor, attempt)
 	if err != nil {
-		return readtask.CompletionResult{}, persistenceError("bind READ replay database time", err)
+		return readtask.CompletionResult{}, integrityError("bind READ replay database time", err)
 	}
 	result := readtask.CompletionResult{
 		Attempt: attempt, Projection: projection, EvidenceID: evidenceID, ReceiptID: receiptID, Replayed: true,
 	}
 	if result.ValidateAgainst(descriptor) != nil {
-		return readtask.CompletionResult{}, persistenceError("validate READ completion replay", errors.New("invalid replay projection"))
+		return readtask.CompletionResult{}, integrityError("validate READ completion replay", errors.New("invalid replay projection"))
 	}
 	return result, nil
 }
@@ -966,10 +1041,21 @@ func attemptIdentityCurrent(
 	descriptor readtask.Descriptor,
 	attempt readtask.Attempt,
 ) bool {
-	return attempt.ValidateAgainst(descriptor) == nil && attempt.RunnerID == scope.RunnerID() &&
+	return attempt.RunnerID == scope.RunnerID() &&
 		attempt.ScopeRevision == scope.ScopeRevision() && attempt.Certificate.SHA256 == certificate.SHA256 &&
 		attempt.Certificate.NotAfter.Equal(certificate.NotAfter) &&
 		runnerScopeAllows(scope, descriptor.WorkspaceID, descriptor.EnvironmentID)
+}
+
+func validateLockedTaskAttemptProjection(
+	operation string,
+	descriptor readtask.Descriptor,
+	attempt readtask.Attempt,
+) error {
+	if descriptor.Validate() != nil || attempt.ValidateAgainst(descriptor) != nil {
+		return integrityError(operation, errors.New("invalid persisted task attempt"))
+	}
+	return nil
 }
 
 func fenceMatchesAttempt(fence readtask.Fence, attempt readtask.Attempt) bool {
@@ -1019,7 +1105,7 @@ func databaseClock(ctx context.Context, tx pgx.Tx) (time.Time, error) {
 		return time.Time{}, persistenceError("read PostgreSQL clock", err)
 	}
 	if !validFiniteTime(now) {
-		return time.Time{}, persistenceError("validate PostgreSQL clock", errors.New("invalid database time"))
+		return time.Time{}, integrityError("validate PostgreSQL clock", errors.New("invalid database time"))
 	}
 	return now.UTC(), nil
 }
@@ -1067,6 +1153,10 @@ func persistenceError(operation string, err error) error {
 	return databaseOperationError{operation: operation, cause: err}
 }
 
+func integrityError(operation string, err error) error {
+	return repositoryIntegrityError{operation: operation, cause: err}
+}
+
 type databaseOperationError struct {
 	operation string
 	cause     error
@@ -1077,4 +1167,16 @@ func (failure databaseOperationError) Error() string {
 }
 func (failure databaseOperationError) Unwrap() []error {
 	return []error{readtask.ErrPersistence, failure.cause}
+}
+
+type repositoryIntegrityError struct {
+	operation string
+	cause     error
+}
+
+func (failure repositoryIntegrityError) Error() string {
+	return failure.operation + ": " + readtask.ErrIntegrity.Error()
+}
+func (failure repositoryIntegrityError) Unwrap() []error {
+	return []error{readtask.ErrIntegrity, failure.cause}
 }

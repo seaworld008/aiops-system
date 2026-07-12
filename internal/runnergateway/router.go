@@ -14,6 +14,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/seaworld008/aiops-system/internal/ids"
+	"github.com/seaworld008/aiops-system/internal/readtask"
 	"github.com/seaworld008/aiops-system/internal/runneridentity"
 )
 
@@ -47,6 +48,25 @@ const (
 )
 
 func NewRouter(verifier IdentityVerifier, backend Backend) (http.Handler, error) {
+	return newRouter(verifier, backend, nil)
+}
+
+// NewRouterWithReadTasks adds the READ-only investigation task protocol to
+// the existing TLS-only Runner listener. READ routes share the mature outer
+// mTLS/request-shape boundaries but retain a distinct backend, DTO set, paths,
+// and lease scheme from WRITE jobs.
+func NewRouterWithReadTasks(
+	verifier IdentityVerifier,
+	backend Backend,
+	readBackend ReadTaskBackend,
+) (http.Handler, error) {
+	if nilInterface(readBackend) {
+		return nil, fmt.Errorf("READ Task Gateway backend is required")
+	}
+	return newRouter(verifier, backend, readBackend)
+}
+
+func newRouter(verifier IdentityVerifier, backend Backend, readBackend ReadTaskBackend) (http.Handler, error) {
 	if nilInterface(verifier) || nilInterface(backend) {
 		return nil, fmt.Errorf("Runner Gateway verifier and backend are required")
 	}
@@ -240,6 +260,9 @@ func NewRouter(verifier IdentityVerifier, backend Backend) (http.Handler, error)
 			backendResponseBinding{identity: identity, revocationID: resourceID, epoch: input.ClaimEpoch,
 				revocationOutcome: input.Outcome})
 	}))
+	if !nilInterface(readBackend) {
+		registerReadTaskRoutes(router, readBackend)
+	}
 	return router, nil
 }
 
@@ -364,11 +387,19 @@ func (response *bufferedResponse) Write(value []byte) (int, error) {
 
 func (response *bufferedResponse) reset() {
 	response.header = make(http.Header)
+	clear(response.body.Bytes())
 	response.body.Reset()
 	response.status = 0
 }
 
 func (response *bufferedResponse) commit(writer http.ResponseWriter) {
+	body := response.body.Bytes()
+	if len(body) != 0 {
+		defer func() {
+			clear(body)
+			response.body.Reset()
+		}()
+	}
 	for name, values := range response.header {
 		for _, value := range values {
 			writer.Header().Add(name, value)
@@ -379,8 +410,8 @@ func (response *bufferedResponse) commit(writer http.ResponseWriter) {
 		status = http.StatusOK
 	}
 	writer.WriteHeader(status)
-	if response.body.Len() != 0 {
-		_, _ = writer.Write(response.body.Bytes())
+	if len(body) != 0 {
+		_, _ = writer.Write(body)
 	}
 }
 
@@ -595,6 +626,35 @@ func requestFieldPresence(encoded []byte, target any) error {
 				return errors.New("external operation reference hash is empty or null")
 			}
 		}
+	case *ReadTaskCompleteRequest:
+		_, schemaPresent := object["schema_version"]
+		_, epochPresent := object["lease_epoch"]
+		_, outcomePresent := object["outcome"]
+		_, evidencePresent := object["evidence"]
+		_, failurePresent := object["failure_code"]
+		if !schemaPresent || !epochPresent || !outcomePresent {
+			return errors.New("READ completion required fields are missing")
+		}
+		switch request.Outcome {
+		case readtask.CompletionEvidence:
+			if !evidencePresent || failurePresent {
+				return errors.New("READ Evidence completion fields do not match outcome")
+			}
+			var evidence map[string]json.RawMessage
+			if err := json.Unmarshal(object["evidence"], &evidence); err != nil {
+				return err
+			}
+			if _, present := evidence["collected_at"]; !present {
+				return errors.New("READ Evidence collected_at field is required")
+			}
+			if _, present := evidence["items"]; !present {
+				return errors.New("READ Evidence items field is required")
+			}
+		case readtask.CompletionFailed, readtask.CompletionCancelled:
+			if evidencePresent || !failurePresent {
+				return errors.New("READ failure completion fields do not match outcome")
+			}
+		}
 	}
 	return nil
 }
@@ -741,7 +801,9 @@ func writeProtocolProblem(writer http.ResponseWriter, request *http.Request, val
 	writer.Header().Set("Content-Type", "application/problem+json")
 	if value.status == http.StatusUnauthorized {
 		challenge := "AIOPS-Job-Lease realm=\"runner-gateway\""
-		if strings.Contains(request.URL.Path, "/revocations/") {
+		if strings.Contains(request.URL.Path, "/read-tasks/") {
+			challenge = "AIOPS-Read-Task-Lease realm=\"runner-gateway\""
+		} else if strings.Contains(request.URL.Path, "/revocations/") {
 			challenge = "AIOPS-Revocation-Lease realm=\"runner-gateway\""
 		}
 		writer.Header().Set("WWW-Authenticate", challenge)

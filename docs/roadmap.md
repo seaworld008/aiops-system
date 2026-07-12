@@ -9,7 +9,7 @@ This roadmap is deliberately gate-driven. Calendar progress never enables produc
 | Repository and domain foundation | Implemented | Keep migrations and domain contracts backward compatible |
 | Scoped signal ingestion | Implemented foundation | Validate against real Alertmanager and Nightingale endpoints |
 | Read-only connectors | Implemented foundation | Run contract and failure tests against pilot environments |
-| Investigation and model routing | Implemented foundation | Build a replay set of at least 100 historical incidents |
+| Investigation and model routing | Persistent runtime and authenticated READ Task Gateway foundation implemented; claims remain closed pending typed connector registry | Connect replay-safe Temporal/Outbox dispatch, then build a replay set of at least 100 historical incidents |
 | Identity, RBAC, policy, and signed plans | Implemented foundation | Complete real Keycloak/Vault integration and adversarial tests |
 | Fenced action execution | Secure queue, durable revocation, mTLS Gateway, split Runner images, and killable Executor foundation implemented | Add only fixed non-production adapters after external sandbox/network gates |
 | Temporal orchestration | Planned | Replay-safe investigation, approval, and execution workflows |
