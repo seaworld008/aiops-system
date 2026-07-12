@@ -17,8 +17,6 @@ import (
 	"github.com/seaworld008/aiops-system/internal/store"
 )
 
-const maxOutboxBatch = 100
-
 type DB interface {
 	Begin(context.Context) (pgx.Tx, error)
 	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
@@ -237,24 +235,24 @@ func (repository *Store) CreateIncident(ctx context.Context, incident domain.Inc
 	return nil
 }
 
-func (repository *Store) ClaimOutbox(ctx context.Context, consumerID string, limit int, lease time.Duration) ([]domain.OutboxEvent, error) {
-	if consumerID == "" || limit <= 0 || limit > maxOutboxBatch || lease <= 0 || lease > 15*time.Minute {
-		return nil, fmt.Errorf("invalid outbox claim parameters")
+func (repository *Store) ClaimOutbox(ctx context.Context, request store.ClaimOutboxRequest) ([]domain.OutboxEvent, error) {
+	if err := request.Validate(); err != nil {
+		return nil, err
 	}
-	claimToken := ids.NewUUID()
 	rows, err := repository.database.Query(ctx, `
 		WITH candidates AS (
 			SELECT id
 			FROM outbox_events
-			WHERE delivered_at IS NULL
+			WHERE event_type = $1
+			  AND delivered_at IS NULL
 			  AND available_at <= statement_timestamp()
 			  AND (claim_expires_at IS NULL OR claim_expires_at <= statement_timestamp())
 			ORDER BY available_at, created_at, id
 			FOR UPDATE SKIP LOCKED
-			LIMIT $1
+			LIMIT $2
 		)
 		UPDATE outbox_events AS event
-		SET claimed_at = statement_timestamp(), claimed_by = $2, claim_token = $3,
+		SET claimed_at = statement_timestamp(), claimed_by = $3, claim_token = gen_random_uuid(),
 			claim_expires_at = statement_timestamp() + make_interval(secs => $4::double precision),
 			attempts = event.attempts + 1
 		FROM candidates
@@ -264,13 +262,13 @@ func (repository *Store) ClaimOutbox(ctx context.Context, consumerID string, lim
 			event.event_type, event.payload, event.created_at, event.available_at,
 			event.claimed_at, event.claimed_by, event.claim_token::text,
 			event.claim_expires_at, event.attempts, COALESCE(event.last_error_code, '')
-	`, limit, consumerID, claimToken, lease.Seconds())
+	`, request.EventType, request.Limit, request.ConsumerID, request.Lease.Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("claim outbox events: %w", err)
 	}
 	defer rows.Close()
 
-	events := make([]domain.OutboxEvent, 0, limit)
+	events := make([]domain.OutboxEvent, 0, request.Limit)
 	for rows.Next() {
 		var event domain.OutboxEvent
 		if err := rows.Scan(
@@ -281,6 +279,9 @@ func (repository *Store) ClaimOutbox(ctx context.Context, consumerID string, lim
 		); err != nil {
 			return nil, fmt.Errorf("scan claimed outbox event: %w", err)
 		}
+		if event.Type != request.EventType {
+			return nil, fmt.Errorf("claimed outbox event type is invalid")
+		}
 		events = append(events, event)
 	}
 	if err := rows.Err(); err != nil {
@@ -289,15 +290,18 @@ func (repository *Store) ClaimOutbox(ctx context.Context, consumerID string, lim
 	return events, nil
 }
 
-func (repository *Store) AckOutbox(ctx context.Context, id, claimToken string) error {
+func (repository *Store) AckOutbox(ctx context.Context, id, expectedEventType, claimToken string) error {
+	if !store.ValidOutboxEventType(expectedEventType) {
+		return store.ErrInvalidOutboxClaim
+	}
 	result, err := repository.database.Exec(ctx, `
 		UPDATE outbox_events
 		SET delivered_at = statement_timestamp(), delivered_claim_token = claim_token,
 			claimed_at = NULL, claimed_by = NULL,
 			claim_token = NULL, claim_expires_at = NULL, last_error_code = NULL
-		WHERE id = $1 AND claim_token = $2 AND delivered_at IS NULL
+		WHERE id = $1 AND event_type = $2 AND claim_token = $3 AND delivered_at IS NULL
 		  AND claim_expires_at > statement_timestamp()
-	`, id, claimToken)
+	`, id, expectedEventType, claimToken)
 	if err != nil {
 		return fmt.Errorf("ack outbox event: %w", err)
 	}
@@ -306,9 +310,9 @@ func (repository *Store) AckOutbox(ctx context.Context, id, claimToken string) e
 	}
 	var delivered bool
 	err = repository.database.QueryRow(ctx, `
-		SELECT delivered_at IS NOT NULL AND delivered_claim_token = $2
-		FROM outbox_events WHERE id = $1
-	`, id, claimToken).Scan(&delivered)
+		SELECT delivered_at IS NOT NULL AND delivered_claim_token = $3
+		FROM outbox_events WHERE id = $1 AND event_type = $2
+	`, id, expectedEventType, claimToken).Scan(&delivered)
 	if err == nil && delivered {
 		return nil
 	}
@@ -318,17 +322,17 @@ func (repository *Store) AckOutbox(ctx context.Context, id, claimToken string) e
 	return store.ErrStaleClaim
 }
 
-func (repository *Store) RetryOutbox(ctx context.Context, id, claimToken string, availableAt time.Time, failureCode string) error {
-	if availableAt.IsZero() || !store.ValidFailureCode(failureCode) {
+func (repository *Store) RetryOutbox(ctx context.Context, id, expectedEventType, claimToken string, availableAt time.Time, failureCode string) error {
+	if !store.ValidOutboxEventType(expectedEventType) || availableAt.IsZero() || !store.ValidFailureCode(failureCode) {
 		return fmt.Errorf("invalid outbox retry parameters")
 	}
 	result, err := repository.database.Exec(ctx, `
 		UPDATE outbox_events
-		SET available_at = $3, claimed_at = NULL, claimed_by = NULL,
-			claim_token = NULL, claim_expires_at = NULL, last_error_code = $4
-		WHERE id = $1 AND claim_token = $2 AND delivered_at IS NULL
+		SET available_at = $4, claimed_at = NULL, claimed_by = NULL,
+			claim_token = NULL, claim_expires_at = NULL, last_error_code = $5
+		WHERE id = $1 AND event_type = $2 AND claim_token = $3 AND delivered_at IS NULL
 		  AND claim_expires_at > statement_timestamp()
-	`, id, claimToken, availableAt.UTC(), failureCode)
+	`, id, expectedEventType, claimToken, availableAt.UTC(), failureCode)
 	if err != nil {
 		return fmt.Errorf("retry outbox event: %w", err)
 	}

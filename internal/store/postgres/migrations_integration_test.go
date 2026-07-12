@@ -186,11 +186,15 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	}
 	execSQL(t, ctx, database, `DROP TRIGGER reject_test_outbox_insert ON outbox_events; DROP FUNCTION reject_test_outbox()`)
 
-	firstClaim, err := repository.ClaimOutbox(ctx, "dispatcher-1", 1, time.Minute)
+	firstClaim, err := repository.ClaimOutbox(ctx, store.ClaimOutboxRequest{
+		EventType: "signal.ingested.v1", ConsumerID: "dispatcher-1", Limit: 1, Lease: time.Minute,
+	})
 	if err != nil || len(firstClaim) != 1 {
 		t.Fatalf("real ClaimOutbox(first) = (%#v, %v)", firstClaim, err)
 	}
-	secondClaim, err := repository.ClaimOutbox(ctx, "dispatcher-2", 1, time.Minute)
+	secondClaim, err := repository.ClaimOutbox(ctx, store.ClaimOutboxRequest{
+		EventType: "incident.created.v1", ConsumerID: "dispatcher-2", Limit: 1, Lease: time.Minute,
+	})
 	if err != nil || len(secondClaim) != 1 || secondClaim[0].ID == firstClaim[0].ID {
 		t.Fatalf("real ClaimOutbox(second) = (%#v, %v)", secondClaim, err)
 	}
@@ -200,26 +204,28 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 			claim_expires_at = statement_timestamp() - interval '1 minute'
 		WHERE id = $1
 	`, firstClaim[0].ID)
-	if err := repository.AckOutbox(ctx, firstClaim[0].ID, firstClaim[0].ClaimToken); !errors.Is(err, store.ErrStaleClaim) {
+	if err := repository.AckOutbox(ctx, firstClaim[0].ID, "signal.ingested.v1", firstClaim[0].ClaimToken); !errors.Is(err, store.ErrStaleClaim) {
 		t.Fatalf("real AckOutbox(expired) error = %v", err)
 	}
-	reclaimed, err := repository.ClaimOutbox(ctx, "dispatcher-3", 1, time.Minute)
+	reclaimed, err := repository.ClaimOutbox(ctx, store.ClaimOutboxRequest{
+		EventType: "signal.ingested.v1", ConsumerID: "dispatcher-3", Limit: 1, Lease: time.Minute,
+	})
 	if err != nil || len(reclaimed) != 1 || reclaimed[0].ID != firstClaim[0].ID || reclaimed[0].ClaimToken == firstClaim[0].ClaimToken {
 		t.Fatalf("real ClaimOutbox(reclaimed) = (%#v, %v)", reclaimed, err)
 	}
-	if err := repository.AckOutbox(ctx, reclaimed[0].ID, firstClaim[0].ClaimToken); !errors.Is(err, store.ErrStaleClaim) {
+	if err := repository.AckOutbox(ctx, reclaimed[0].ID, "signal.ingested.v1", firstClaim[0].ClaimToken); !errors.Is(err, store.ErrStaleClaim) {
 		t.Fatalf("real AckOutbox(old token) error = %v", err)
 	}
-	if err := repository.AckOutbox(ctx, reclaimed[0].ID, reclaimed[0].ClaimToken); err != nil {
+	if err := repository.AckOutbox(ctx, reclaimed[0].ID, "signal.ingested.v1", reclaimed[0].ClaimToken); err != nil {
 		t.Fatalf("real AckOutbox(current token) error = %v", err)
 	}
-	if err := repository.AckOutbox(ctx, reclaimed[0].ID, reclaimed[0].ClaimToken); err != nil {
+	if err := repository.AckOutbox(ctx, reclaimed[0].ID, "signal.ingested.v1", reclaimed[0].ClaimToken); err != nil {
 		t.Fatalf("real AckOutbox(idempotent retry) error = %v", err)
 	}
-	if err := repository.AckOutbox(ctx, reclaimed[0].ID, "00000000-0000-0000-0000-000000000099"); !errors.Is(err, store.ErrStaleClaim) {
+	if err := repository.AckOutbox(ctx, reclaimed[0].ID, "signal.ingested.v1", "00000000-0000-0000-0000-000000000099"); !errors.Is(err, store.ErrStaleClaim) {
 		t.Fatalf("real AckOutbox(wrong delivered token) error = %v", err)
 	}
-	if err := repository.AckOutbox(ctx, secondClaim[0].ID, secondClaim[0].ClaimToken); err != nil {
+	if err := repository.AckOutbox(ctx, secondClaim[0].ID, "incident.created.v1", secondClaim[0].ClaimToken); err != nil {
 		t.Fatalf("real AckOutbox(second) error = %v", err)
 	}
 
@@ -244,6 +250,30 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	// the reverse pass only includes migrations that were actually installed.
 	applyMigrationFile(t, ctx, database, filepath.Join(migrationDirectory, "000010_investigation_runtime.up.sql"))
 	applyMigrationFile(t, ctx, database, filepath.Join(migrationDirectory, "000011_investigation_runner_ingress.up.sql"))
+	outboxRoutingUp := filepath.Join(migrationDirectory, "000012_outbox_event_routing.up.sql")
+	outboxRoutingDown := filepath.Join(migrationDirectory, "000012_outbox_event_routing.down.sql")
+	applyMigrationFile(t, ctx, database, outboxRoutingUp)
+	exerciseRealOutboxEventRouting(t, ctx, database, repository, tenant1, workspace1)
+	var routingIndex, legacyDispatchIndex *string
+	applyMigrationFile(t, ctx, database, outboxRoutingDown)
+	if err := database.QueryRow(ctx, `
+		SELECT to_regclass('public.outbox_event_routing_idx')::text,
+		       to_regclass('public.outbox_dispatch_idx')::text
+	`).Scan(&routingIndex, &legacyDispatchIndex); err != nil {
+		t.Fatalf("check outbox routing down migration: %v", err)
+	}
+	if routingIndex != nil || legacyDispatchIndex == nil {
+		t.Fatalf("outbox routing down indexes = new:%v legacy:%v", routingIndex, legacyDispatchIndex)
+	}
+	var routingFixtureCount int
+	if err := database.QueryRow(ctx, `
+		SELECT count(*) FROM outbox_events WHERE claimed_by LIKE 'routing-dispatcher-%'
+		   OR aggregate_id::text LIKE '83000000-0000-4000-8000-%'
+		   OR aggregate_id::text LIKE '84000000-0000-4000-8000-%'
+	`).Scan(&routingFixtureCount); err != nil || routingFixtureCount != 7 {
+		t.Fatalf("outbox routing down retained rows = %d, error = %v", routingFixtureCount, err)
+	}
+	applyMigrationFile(t, ctx, database, outboxRoutingUp)
 	applyMigrations(t, ctx, database, migrationDirectory, ".down.sql", true)
 	var relationName *string
 	if err := database.QueryRow(ctx, `SELECT to_regclass('public.tenants')::text`).Scan(&relationName); err != nil {
@@ -251,6 +281,101 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	}
 	if relationName != nil {
 		t.Fatalf("tenants table remains after down migration: %s", *relationName)
+	}
+}
+
+func exerciseRealOutboxEventRouting(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	repository *postgresstore.Store,
+	tenantID, workspaceID string,
+) {
+	t.Helper()
+	for index := 1; index <= 3; index++ {
+		outboxID := fmt.Sprintf("82000000-0000-4000-8000-%012d", index)
+		aggregateID := fmt.Sprintf("83000000-0000-4000-8000-%012d", index)
+		execSQL(t, ctx, database, `
+			INSERT INTO outbox_events (
+				id, tenant_id, workspace_id, aggregate_type, aggregate_id, aggregate_version,
+				event_type, payload, created_at, available_at
+			) VALUES ($1, $2, $3, 'INCIDENT', $4, 1, 'incident.created.v1',
+				jsonb_build_object('incident_id', $4::text),
+				statement_timestamp() - interval '10 minutes', statement_timestamp() - interval '10 minutes')
+		`, outboxID, tenantID, workspaceID, aggregateID)
+		credentialOutboxID := fmt.Sprintf("85000000-0000-4000-8000-%012d", index)
+		credentialAggregateID := fmt.Sprintf("84000000-0000-4000-8000-%012d", index)
+		execSQL(t, ctx, database, `
+			INSERT INTO outbox_events (
+				id, tenant_id, workspace_id, aggregate_type, aggregate_id, aggregate_version,
+				event_type, payload, created_at, available_at
+			) VALUES ($1, $2, $3, 'CREDENTIAL_REVOCATION', $4, 1,
+				'credential.revocation.requested.v1', jsonb_build_object('revocation_id', $4::text),
+				statement_timestamp() - interval '20 minutes', statement_timestamp() - interval '20 minutes')
+		`, credentialOutboxID, tenantID, workspaceID, credentialAggregateID)
+	}
+	const (
+		signalOutboxID = "82000000-0000-4000-8000-000000000004"
+		signalID       = "83000000-0000-4000-8000-000000000004"
+	)
+	execSQL(t, ctx, database, `
+		INSERT INTO outbox_events (
+			id, tenant_id, workspace_id, aggregate_type, aggregate_id, aggregate_version,
+			event_type, payload, created_at, available_at
+		) VALUES ($1, $2, $3, 'SIGNAL', $4, 1, 'signal.ingested.v1',
+			jsonb_build_object('signal_id', $4::text), statement_timestamp(), statement_timestamp())
+	`, signalOutboxID, tenantID, workspaceID, signalID)
+
+	signals, err := repository.ClaimOutbox(ctx, store.ClaimOutboxRequest{
+		EventType: "signal.ingested.v1", ConsumerID: "routing-dispatcher-signal", Limit: 1, Lease: time.Minute,
+	})
+	if err != nil || len(signals) != 1 || signals[0].ID != signalOutboxID || signals[0].Type != "signal.ingested.v1" {
+		t.Fatalf("real exact signal ClaimOutbox() = (%#v, %v)", signals, err)
+	}
+	incidents, err := repository.ClaimOutbox(ctx, store.ClaimOutboxRequest{
+		EventType: "incident.created.v1", ConsumerID: "routing-dispatcher-incident", Limit: 1, Lease: time.Minute,
+	})
+	if err != nil || len(incidents) != 1 || incidents[0].Type != "incident.created.v1" {
+		t.Fatalf("real independent incident ClaimOutbox() = (%#v, %v)", incidents, err)
+	}
+	credentials, err := repository.ClaimOutbox(ctx, store.ClaimOutboxRequest{
+		EventType: "credential.revocation.requested.v1", ConsumerID: "routing-dispatcher-credential", Limit: 3, Lease: time.Minute,
+	})
+	if err != nil || len(credentials) != 3 {
+		t.Fatalf("real independent credential ClaimOutbox() = (%#v, %v)", credentials, err)
+	}
+	credentialTokens := make(map[string]struct{}, len(credentials))
+	for _, event := range credentials {
+		if event.ClaimToken == "" {
+			t.Fatal("real credential ClaimOutbox() returned an empty per-event fence")
+		}
+		credentialTokens[event.ClaimToken] = struct{}{}
+	}
+	if len(credentialTokens) != len(credentials) {
+		t.Fatalf("real credential ClaimOutbox() reused a batch fence: %#v", credentials)
+	}
+	if err := repository.AckOutbox(ctx, signals[0].ID, "incident.created.v1", signals[0].ClaimToken); !errors.Is(err, store.ErrStaleClaim) {
+		t.Fatalf("real AckOutbox(wrong type) error = %v", err)
+	}
+	if err := repository.RetryOutbox(
+		ctx, signals[0].ID, "incident.created.v1", signals[0].ClaimToken,
+		time.Now().UTC().Add(time.Minute), "wrong_handler",
+	); !errors.Is(err, store.ErrStaleClaim) {
+		t.Fatalf("real RetryOutbox(wrong type) error = %v", err)
+	}
+	if err := repository.AckOutbox(ctx, signals[0].ID, "signal.ingested.v1", signals[0].ClaimToken); err != nil {
+		t.Fatalf("real AckOutbox(signal) error = %v", err)
+	}
+	if err := repository.AckOutbox(ctx, incidents[0].ID, "incident.created.v1", incidents[0].ClaimToken); err != nil {
+		t.Fatalf("real AckOutbox(incident) error = %v", err)
+	}
+	for _, event := range credentials {
+		if event.Type != "credential.revocation.requested.v1" {
+			t.Fatalf("real credential dispatcher claimed %q", event.Type)
+		}
+		if err := repository.AckOutbox(ctx, event.ID, "credential.revocation.requested.v1", event.ClaimToken); err != nil {
+			t.Fatalf("real AckOutbox(credential) error = %v", err)
+		}
 	}
 }
 

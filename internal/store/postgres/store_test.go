@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -230,7 +231,7 @@ func TestCreateIncidentRollsBackWhenOutboxInsertFails(t *testing.T) {
 	}
 }
 
-func TestOutboxClaimReturnsFencingTokenAndAckUsesIt(t *testing.T) {
+func TestOutboxClaimReturnsIndependentFencingTokensAndAckUsesThem(t *testing.T) {
 	database, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("NewPool() error = %v", err)
@@ -238,8 +239,8 @@ func TestOutboxClaimReturnsFencingTokenAndAckUsesIt(t *testing.T) {
 	defer database.Close()
 	now := time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)
 	payload, _ := json.Marshal(map[string]string{"incident_id": incidentID})
-	database.ExpectQuery("WITH candidates").
-		WithArgs(1, "dispatcher-1", pgxmock.AnyArg(), float64(60)).
+	database.ExpectQuery(`(?s)WITH candidates AS \(.*WHERE event_type = \$1.*ORDER BY available_at, created_at, id.*FOR UPDATE SKIP LOCKED.*LIMIT \$2.*claim_token = gen_random_uuid\(\)`).
+		WithArgs("incident.created.v1", 2, "dispatcher-1", float64(60)).
 		WillReturnRows(pgxmock.NewRows([]string{
 			"id", "tenant_id", "workspace_id", "aggregate_type", "aggregate_id", "aggregate_version",
 			"event_type", "payload", "created_at", "available_at", "claimed_at", "claimed_by",
@@ -248,18 +249,101 @@ func TestOutboxClaimReturnsFencingTokenAndAckUsesIt(t *testing.T) {
 			"66666666-6666-4666-8666-666666666666", tenantID, workspaceID, "INCIDENT", incidentID, int64(1),
 			"incident.created.v1", payload, now, now, now, "dispatcher-1",
 			"77777777-7777-4777-8777-777777777777", now.Add(time.Minute), 1, "",
+		).AddRow(
+			"88888888-8888-4888-8888-888888888888", tenantID, workspaceID, "INCIDENT", incidentID, int64(1),
+			"incident.created.v1", payload, now, now, now, "dispatcher-1",
+			"99999999-9999-4999-8999-999999999999", now.Add(time.Minute), 1, "",
 		))
 	database.ExpectExec("UPDATE outbox_events").
-		WithArgs("66666666-6666-4666-8666-666666666666", "77777777-7777-4777-8777-777777777777").
+		WithArgs("66666666-6666-4666-8666-666666666666", "incident.created.v1", "77777777-7777-4777-8777-777777777777").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	database.ExpectExec("UPDATE outbox_events").
+		WithArgs("88888888-8888-4888-8888-888888888888", "incident.created.v1", "99999999-9999-4999-8999-999999999999").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 
 	repository := postgresstore.New(database)
-	events, err := repository.ClaimOutbox(context.Background(), "dispatcher-1", 1, time.Minute)
-	if err != nil || len(events) != 1 || events[0].ClaimToken == "" || events[0].ClaimedBy != "dispatcher-1" {
+	events, err := repository.ClaimOutbox(context.Background(), store.ClaimOutboxRequest{
+		EventType: "incident.created.v1", ConsumerID: "dispatcher-1", Limit: 2, Lease: time.Minute,
+	})
+	if err != nil || len(events) != 2 || events[0].ClaimToken == "" || events[1].ClaimToken == "" ||
+		events[0].ClaimToken == events[1].ClaimToken || events[0].ClaimedBy != "dispatcher-1" {
 		t.Fatalf("ClaimOutbox() = (%#v, %v)", events, err)
 	}
-	if err := repository.AckOutbox(context.Background(), events[0].ID, events[0].ClaimToken); err != nil {
-		t.Fatalf("AckOutbox() error = %v", err)
+	for _, event := range events {
+		if err := repository.AckOutbox(context.Background(), event.ID, "incident.created.v1", event.ClaimToken); err != nil {
+			t.Fatalf("AckOutbox(%s) error = %v", event.ID, err)
+		}
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("database expectations: %v", err)
+	}
+}
+
+func TestOutboxClaimRejectsInvalidExactTypeAndBoundsBeforeSQL(t *testing.T) {
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer database.Close()
+	repository := postgresstore.New(database)
+	tests := []struct {
+		name, eventType, consumerID string
+		limit                       int
+		lease                       time.Duration
+	}{
+		{name: "empty type", eventType: "", consumerID: "worker-1", limit: 1, lease: time.Minute},
+		{name: "wildcard", eventType: "signal.*", consumerID: "worker-1", limit: 1, lease: time.Minute},
+		{name: "prefix", eventType: "signal.ingested", consumerID: "worker-1", limit: 1, lease: time.Minute},
+		{name: "oversized type", eventType: strings.Repeat("a", 126) + ".v1", consumerID: "worker-1", limit: 1, lease: time.Minute},
+		{name: "empty consumer", eventType: "signal.ingested.v1", consumerID: "", limit: 1, lease: time.Minute},
+		{name: "oversized consumer", eventType: "signal.ingested.v1", consumerID: strings.Repeat("w", 129), limit: 1, lease: time.Minute},
+		{name: "zero limit", eventType: "signal.ingested.v1", consumerID: "worker-1", limit: 0, lease: time.Minute},
+		{name: "oversized limit", eventType: "signal.ingested.v1", consumerID: "worker-1", limit: 101, lease: time.Minute},
+		{name: "subsecond lease", eventType: "signal.ingested.v1", consumerID: "worker-1", limit: 1, lease: time.Second - 1},
+		{name: "oversized lease", eventType: "signal.ingested.v1", consumerID: "worker-1", limit: 1, lease: 15*time.Minute + 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := repository.ClaimOutbox(context.Background(), store.ClaimOutboxRequest{
+				EventType: test.eventType, ConsumerID: test.consumerID, Limit: test.limit, Lease: test.lease,
+			}); err == nil {
+				t.Fatal("ClaimOutbox() error = nil, want validation failure")
+			}
+		})
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("invalid requests reached PostgreSQL: %v", err)
+	}
+}
+
+func TestOutboxClaimFailsClosedWhenReturnedTypeDoesNotMatch(t *testing.T) {
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer database.Close()
+	now := time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)
+	const canary = "payload-token-canary"
+	database.ExpectQuery("WITH candidates").
+		WithArgs("signal.ingested.v1", 1, "dispatcher-1", float64(60)).
+		WillReturnRows(pgxmock.NewRows([]string{
+			"id", "tenant_id", "workspace_id", "aggregate_type", "aggregate_id", "aggregate_version",
+			"event_type", "payload", "created_at", "available_at", "claimed_at", "claimed_by",
+			"claim_token", "claim_expires_at", "attempts", "last_error_code",
+		}).AddRow(
+			"66666666-6666-4666-8666-666666666666", tenantID, workspaceID, "INCIDENT", incidentID, int64(1),
+			"incident.created.v1", []byte(`{"value":"`+canary+`"}`), now, now, now, "dispatcher-1",
+			canary, now.Add(time.Minute), 1, "",
+		))
+
+	events, err := postgresstore.New(database).ClaimOutbox(context.Background(), store.ClaimOutboxRequest{
+		EventType: "signal.ingested.v1", ConsumerID: "dispatcher-1", Limit: 1, Lease: time.Minute,
+	})
+	if err == nil || len(events) != 0 {
+		t.Fatalf("ClaimOutbox(mismatched scan) = (%#v, %v), want fail closed", events, err)
+	}
+	if strings.Contains(err.Error(), canary) {
+		t.Fatalf("ClaimOutbox() error leaked scanned payload/token: %v", err)
 	}
 	if err := database.ExpectationsWereMet(); err != nil {
 		t.Fatalf("database expectations: %v", err)
@@ -275,6 +359,7 @@ func TestOutboxRetryRejectsStaleToken(t *testing.T) {
 	database.ExpectExec("UPDATE outbox_events").
 		WithArgs(
 			"66666666-6666-4666-8666-666666666666",
+			"incident.created.v1",
 			"77777777-7777-4777-8777-777777777777",
 			pgxmock.AnyArg(),
 			"temporal_unavailable",
@@ -284,11 +369,46 @@ func TestOutboxRetryRejectsStaleToken(t *testing.T) {
 	err = postgresstore.New(database).RetryOutbox(
 		context.Background(),
 		"66666666-6666-4666-8666-666666666666",
+		"incident.created.v1",
 		"77777777-7777-4777-8777-777777777777",
 		time.Now().Add(time.Minute),
 		"temporal_unavailable",
 	)
 	if !errors.Is(err, store.ErrStaleClaim) {
+		t.Fatalf("RetryOutbox() error = %v, want ErrStaleClaim", err)
+	}
+	if err := database.ExpectationsWereMet(); err != nil {
+		t.Fatalf("database expectations: %v", err)
+	}
+}
+
+func TestOutboxAckAndRetryPredicatesBindExpectedEventType(t *testing.T) {
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("NewPool() error = %v", err)
+	}
+	defer database.Close()
+	const (
+		id    = "66666666-6666-4666-8666-666666666666"
+		token = "77777777-7777-4777-8777-777777777777"
+	)
+	database.ExpectExec(`(?s)UPDATE outbox_events.*WHERE id = \$1 AND event_type = \$2 AND claim_token = \$3`).
+		WithArgs(id, "signal.ingested.v1", token).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	database.ExpectQuery(`(?s)SELECT delivered_at IS NOT NULL AND delivered_claim_token = \$3.*WHERE id = \$1 AND event_type = \$2`).
+		WithArgs(id, "signal.ingested.v1", token).
+		WillReturnRows(pgxmock.NewRows([]string{"delivered"}))
+	repository := postgresstore.New(database)
+	if err := repository.AckOutbox(context.Background(), id, "signal.ingested.v1", token); !errors.Is(err, store.ErrStaleClaim) {
+		t.Fatalf("AckOutbox() error = %v, want ErrStaleClaim", err)
+	}
+
+	database.ExpectExec(`(?s)UPDATE outbox_events.*WHERE id = \$1 AND event_type = \$2 AND claim_token = \$3`).
+		WithArgs(id, "signal.ingested.v1", token, pgxmock.AnyArg(), "workflow_start_failed").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	if err := repository.RetryOutbox(
+		context.Background(), id, "signal.ingested.v1", token, time.Now().Add(time.Minute), "workflow_start_failed",
+	); !errors.Is(err, store.ErrStaleClaim) {
 		t.Fatalf("RetryOutbox() error = %v, want ErrStaleClaim", err)
 	}
 	if err := database.ExpectationsWereMet(); err != nil {
@@ -304,12 +424,12 @@ func TestOutboxAckIsIdempotentAfterUncertainResponse(t *testing.T) {
 	defer database.Close()
 	id := "66666666-6666-4666-8666-666666666666"
 	token := "77777777-7777-4777-8777-777777777777"
-	database.ExpectExec("UPDATE outbox_events").WithArgs(id, token).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	database.ExpectExec("UPDATE outbox_events").WithArgs(id, "incident.created.v1", token).WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 	database.ExpectQuery("SELECT delivered_at IS NOT NULL AND delivered_claim_token").
-		WithArgs(id, token).
+		WithArgs(id, "incident.created.v1", token).
 		WillReturnRows(pgxmock.NewRows([]string{"delivered"}).AddRow(true))
 
-	if err := postgresstore.New(database).AckOutbox(context.Background(), id, token); err != nil {
+	if err := postgresstore.New(database).AckOutbox(context.Background(), id, "incident.created.v1", token); err != nil {
 		t.Fatalf("AckOutbox() error = %v", err)
 	}
 	if err := database.ExpectationsWereMet(); err != nil {
