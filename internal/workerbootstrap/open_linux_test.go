@@ -77,7 +77,7 @@ func TestOpenPublicSourceBuildsReadOnlySealedMemfd(t *testing.T) {
 	if !bytes.Equal(contents, secondContents) {
 		t.Fatal("same source produced a non-deterministic envelope")
 	}
-	if written, writeErr := unix.Pwrite(fd, []byte("x"), 0); written != 0 || writeErr == nil {
+	if written, writeErr := unix.Pwrite(fd, []byte("x"), 0); written > 0 || writeErr == nil {
 		t.Fatalf("Pwrite(sealed read-only memfd) = %d, %v; want rejection", written, writeErr)
 	}
 	if truncateErr := unix.Ftruncate(fd, summary.EnvelopeSize+1); truncateErr == nil {
