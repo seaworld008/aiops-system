@@ -42,7 +42,7 @@ M5C2-2 没有迁移、HTTP route 或 live assembly。部署本变更不会打开
 - 使用真实 PostgreSQL 16 验证完成后无需 completion body、bearer 或 enabled Runner 即可恢复同一 Evidence ID/hash，并验证 Attempt/Receipt/Evidence 行数完全不变；
 - 使用 Temporal testsuite 验证严格 DTO、错误分类、panic 恢复和 History canary 不泄漏。
 
-M5C2-4b 的预定编排是：对一次逻辑 Task 发起有限次数的 Runner Activity；若完成调用出现超时或结果未知，则调用 DB-only Recovery Activity。只有恢复返回可验证 `COMMITTED` 才向 Workflow 投影终态；返回 `PENDING` 时不得把未知远端结果伪装为失败或重新提交同一正文。
+M5C2-4b 已按该边界完成编排：对一次逻辑 Task 最多发起三个单次尝试的 Runner Activity round；每次之后都调用 DB-only Recovery Activity。只有恢复返回可验证 `COMMITTED` 或 `CONTROL_CANCELLED` 才向 Workflow 投影终态；返回 `PENDING` 时不得把未知远端结果伪装为失败或重新提交同一正文。完整协议见 [Temporal READ orchestration](temporal-read-orchestration.md)。
 
 ## 回滚与未开放能力
 

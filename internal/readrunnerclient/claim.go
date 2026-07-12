@@ -12,7 +12,10 @@ import (
 // Claim requests one exact scheduler-owned task. A 204 response means the
 // task is not currently claimable and returns (nil, nil).
 func (client *Client) Claim(ctx context.Context, expected ExpectedTask) (*Lease, error) {
-	if client == nil || client.httpClient == nil || !validContext(ctx) || !validExpectedTask(expected) {
+	if !client.Ready() {
+		return nil, ErrInvalidConfiguration
+	}
+	if !validContext(ctx) || !validExpectedTask(expected) {
 		return nil, ErrInvalidExpectedTask
 	}
 	body, err := json.Marshal(claimRequestWire{SchemaVersion: "runner-read-task-claim-request.v1"})

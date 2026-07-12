@@ -245,7 +245,7 @@ func (client *Client) beginLeaseOperation(
 	start *StartCapability,
 	phase leasePhase,
 ) (*leaseState, error) {
-	if client == nil || client.httpClient == nil || lease == nil || lease.self != lease ||
+	if !client.usableForExistingLease() || lease == nil || lease.self != lease ||
 		lease.seal != trustedLeaseSeal || lease.state == nil {
 		return nil, ErrInvalidLease
 	}
@@ -254,7 +254,7 @@ func (client *Client) beginLeaseOperation(
 	defer state.mu.Unlock()
 	if state.owner != client || state.token == nil || state.phase != phase || state.busy ||
 		state.taskID == "" || state.leaseEpoch <= 0 || state.scopeRevision <= 0 ||
-		!state.leaseExpiresAt.After(time.Now().UTC()) {
+		!state.leaseExpiresAt.After(time.Now().UTC()) || state.leaseExpiresAt.After(client.certificateNotAfter) {
 		return nil, ErrInvalidLease
 	}
 	if start != nil && (start.self != start || start.seal != trustedStartSeal || start.lease != state ||

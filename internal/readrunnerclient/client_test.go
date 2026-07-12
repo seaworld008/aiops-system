@@ -58,6 +58,21 @@ func TestClientRejectsWriteCNFallbackAndAmbiguousReadCertificateSANs(t *testing.
 	}
 }
 
+func TestClientRejectsCertificateWithoutEnoughLifetimeForANewClaim(t *testing.T) {
+	readURI, err := url.Parse("spiffe://aiops.test/runner/read/replacement-read-runner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := newGatewayFixture(t, runneridentity.PoolRead, func(http.ResponseWriter, *http.Request) {})
+	replaceFixtureClientCertificate(t, fixture, testpki.ClientOptions{
+		URIs: []*url.URL{readURI}, NotAfter: time.Now().UTC().Add(requestTimeoutForTest),
+	})
+	client, err := readrunnerclient.New(fixture.options)
+	if client != nil || !errors.Is(err, readrunnerclient.ErrInvalidConfiguration) {
+		t.Fatalf("New(short-lived certificate) = %#v, %v; want invalid configuration", client, err)
+	}
+}
+
 func TestClientRejectsUnsafeEndpointAndTrustFileConfigurations(t *testing.T) {
 	for name, mutate := range map[string]func(*testing.T, *gatewayFixture){
 		"HTTP base URL": func(_ *testing.T, fixture *gatewayFixture) {

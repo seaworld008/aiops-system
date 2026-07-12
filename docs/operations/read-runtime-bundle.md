@@ -112,7 +112,9 @@ Incident/Investigation/Task ID、position 和完整 PlanBinding。客户端把 G
 预算；JSON 拒绝未知、重复、大小写别名和尾随文档。RFC 9457 的 title/detail 仅用于有界验证后即
 丢弃，客户端只保留低敏 type/status/code/instance；调用方 context value 与 `httptrace` 也会被剥离，
 不能观察 Authorization。Claim、Start 和 CONTINUE heartbeat 还必须保有至少 20 秒的本地 lease
-窗口，避免收到成功响应时已经来不及续租。
+窗口，避免收到成功响应时已经来不及续租。客户端使用 self/seal 拒绝零值与按值复制；新 Claim 还要求
+客户端证书至少覆盖一次最坏 Gateway 往返、最小可用 lease 窗口和时钟偏差。该 Claim 预算不会错误
+阻断已经领取且仍处于证书/lease 有效期内的 Start、Heartbeat、Release 或 Complete。
 
 ## 部署与回滚
 
@@ -120,9 +122,10 @@ M5C2-4a 没有迁移、配置、Temporal 注册或 live READ Runner 装配。部
 关闭态 Admission 与 disabled callbacks；未 ACK Outbox 不移动，READ Task 不会被新领或由旧 lease
 推进。回滚二进制即可，不需要数据回填。
 
-后续 M5C2-4b/4c 必须在同一个 assembly factory 中加载 connector、target、egress、plan 与 Bundle，
-核对 Worker/Gateway/READ Runner 的相同 Bundle digest，安装 Temporal runtime v2、结果恢复、
-Outbox supervisor 和真实 READ activity，并完成本地 Signal→Evidence E2E。即使这些代码完成，企业
+M5C2-4b 已安装尚未进程装配的 Temporal runtime v2、结果恢复注册和真实 READ Activity。后续 C2-4c
+必须在同一个 assembly factory 中加载 connector、target、egress、plan 与 Bundle，核对
+Worker/Gateway/READ Runner 的相同 Bundle digest，安装 Outbox supervisor 并完成本地
+Signal→Evidence E2E。即使这些代码完成，企业
 PKI、Bearer provider、NetworkPolicy/egress enforcement、源侧 DLP、Temporal replay 与无混版部署
 证据缺一项时，生产配置仍只能使用关闭态 Admission。
 

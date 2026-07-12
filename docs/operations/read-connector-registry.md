@@ -8,7 +8,7 @@ HTTP headers, arbitrary command material, or network client.
 This milestone does **not** wire the registry into the live Control Plane.
 M5C2-4a now installs a sealed closed Admission while the existing disabled
 start/completion callbacks remain installed. The Admission also prevents an old
-lease from advancing during a rolling upgrade. Only M5C2-4b/4c may replace those callbacks atomically, after
+lease from advancing during a rolling upgrade. Only M5C2-4c may replace those callbacks atomically, after
 the READ Runner, Temporal dispatch, target/egress manifests, and component/profile
 digest checks are ready together; assembly does not itself authorize claims.
 
@@ -88,7 +88,7 @@ the suffix from the fixed HTTPS endpoint identity, explicit CA, credential-role
 reference and network-policy reference (but not rotating Secret bytes).
 M5C2-3b additionally resolves that policy through content-addressed
 `read-egress-policy.v1` admission and a fixed one-shot executor. Claims remain
-disabled until M5C2-4b/4c assembly and separate Go/No-Go evidence pass. Target/policy
+disabled until M5C2-4c assembly and separate Go/No-Go evidence pass. Target/policy
 manifests and their secrets must never enter
 Task input, claim responses, Evidence, Temporal History, logs, or audit events.
 
