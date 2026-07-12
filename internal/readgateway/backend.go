@@ -64,6 +64,11 @@ type ResponseBinding interface {
 // It never receives a lease Fence or certificate material.
 type StartAuthorizer = readtaskpostgres.StartAuthorizer
 
+// HeartbeatAuthorizer re-proves the trusted runtime contract on every
+// heartbeat, including idempotent sequence replays. It receives no Fence or
+// certificate material and cannot be supplied by a Runner request.
+type HeartbeatAuthorizer = readtaskpostgres.HeartbeatAuthorizer
+
 // CompletionAuthorizer validates connector-specific typed Evidence while the
 // task remains locked. Its fence-free input prevents lease-token exposure.
 type CompletionAuthorizer = readtaskpostgres.CompletionAuthorizer
@@ -77,6 +82,7 @@ type Dependencies struct {
 	Tasks                *readtaskpostgres.Repository
 	Admission            *Admission
 	StartAuthorizer      StartAuthorizer
+	HeartbeatAuthorizer  HeartbeatAuthorizer
 	CompletionAuthorizer CompletionAuthorizer
 }
 
@@ -84,7 +90,7 @@ type operations struct {
 	authenticateTx func(context.Context, pgx.Tx, runneridentity.Identity) (authenticatedRunner, error)
 	claimTx        func(context.Context, pgx.Tx, execution.RunnerScope, readtask.CertificateBinding, string, time.Duration) (readtask.Claim, error)
 	startTx        func(context.Context, pgx.Tx, execution.RunnerScope, readtask.CertificateBinding, readtask.Start, StartAuthorizer) (readtask.Attempt, error)
-	heartbeatTx    func(context.Context, pgx.Tx, execution.RunnerScope, readtask.CertificateBinding, readtask.Heartbeat, time.Duration) (readtask.HeartbeatResult, error)
+	heartbeatTx    func(context.Context, pgx.Tx, execution.RunnerScope, readtask.CertificateBinding, readtask.Heartbeat, time.Duration, HeartbeatAuthorizer) (readtask.HeartbeatResult, error)
 	releaseTx      func(context.Context, pgx.Tx, execution.RunnerScope, readtask.CertificateBinding, readtask.Release) (readtask.Attempt, error)
 	completeTx     func(context.Context, pgx.Tx, execution.RunnerScope, readtask.CertificateBinding, readtask.Completion, CompletionAuthorizer) (readtask.CompletionResult, error)
 }
@@ -94,6 +100,7 @@ type Backend struct {
 	database             DB
 	admission            *Admission
 	startAuthorizer      StartAuthorizer
+	heartbeatAuthorizer  HeartbeatAuthorizer
 	completionAuthorizer CompletionAuthorizer
 	operations           operations
 }
@@ -104,7 +111,8 @@ type Backend struct {
 func New(dependencies Dependencies) (*Backend, error) {
 	if nilInterface(dependencies.Database) || dependencies.Identities == nil || dependencies.Tasks == nil ||
 		!dependencies.Admission.valid() ||
-		dependencies.StartAuthorizer == nil || dependencies.CompletionAuthorizer == nil {
+		dependencies.StartAuthorizer == nil || dependencies.HeartbeatAuthorizer == nil ||
+		dependencies.CompletionAuthorizer == nil {
 		return nil, ErrInvalidConfiguration
 	}
 	identities := dependencies.Identities
@@ -112,6 +120,7 @@ func New(dependencies Dependencies) (*Backend, error) {
 	backend := &Backend{
 		database: dependencies.Database, admission: dependencies.Admission,
 		startAuthorizer:      dependencies.StartAuthorizer,
+		heartbeatAuthorizer:  dependencies.HeartbeatAuthorizer,
 		completionAuthorizer: dependencies.CompletionAuthorizer,
 	}
 	backend.operations = operations{
@@ -124,7 +133,7 @@ func New(dependencies Dependencies) (*Backend, error) {
 		},
 		claimTx:     tasks.ClaimRunnerTx,
 		startTx:     tasks.StartRunnerAuthorizedTx,
-		heartbeatTx: tasks.HeartbeatRunnerTx,
+		heartbeatTx: tasks.HeartbeatRunnerAuthorizedTx,
 		releaseTx:   tasks.ReleaseRunnerTx,
 		completeTx:  tasks.CompleteRunnerAuthorizedTx,
 	}
@@ -286,8 +295,9 @@ func (backend *Backend) Start(
 	return attempt, transaction.binding, nil
 }
 
-// Heartbeat applies the Gateway-owned extension; a Runner can submit only its
-// fenced sequence, never an arbitrary lease duration.
+// Heartbeat applies the Gateway-owned extension and reruns the trusted runtime
+// authorizer while the task is locked. A Runner can submit only its fenced
+// sequence, never an arbitrary lease duration or replacement authorizer.
 func (backend *Backend) Heartbeat(
 	ctx context.Context,
 	identity runneridentity.Identity,
@@ -301,11 +311,12 @@ func (backend *Backend) Heartbeat(
 		return readtask.HeartbeatResult{}, nil, err
 	}
 	defer transaction.rollback(ctx)
-	if backend.operations.heartbeatTx == nil {
+	if backend.operations.heartbeatTx == nil || backend.heartbeatAuthorizer == nil {
 		return readtask.HeartbeatResult{}, nil, ErrUnavailable
 	}
 	result, err := backend.operations.heartbeatTx(
 		ctx, transaction.tx, transaction.scope, transaction.certificate, heartbeat, heartbeatLeaseExtension,
+		backend.heartbeatAuthorizer,
 	)
 	if err != nil {
 		return readtask.HeartbeatResult{}, nil, mapTaskError(err)

@@ -210,6 +210,13 @@ func (bundle *Bundle) AuthorizeStart(ctx context.Context, descriptor readtask.De
 	return bundleContextError(ctx)
 }
 
+// AuthorizeHeartbeat re-proves the same complete runtime and typed connector
+// contract as Start. Heartbeat callers must invoke it for every sequence,
+// including replays, so a runtime-policy drift cannot extend an active lease.
+func (bundle *Bundle) AuthorizeHeartbeat(ctx context.Context, descriptor readtask.Descriptor) error {
+	return bundle.AuthorizeStart(ctx, descriptor)
+}
+
 // AuthorizeCompletion performs the same full binding proof before the
 // connector applies its typed, bounded evidence validator.
 func (bundle *Bundle) AuthorizeCompletion(
