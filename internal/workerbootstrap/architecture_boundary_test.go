@@ -1,6 +1,7 @@
 package workerbootstrap_test
 
 import (
+	"context"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/seaworld008/aiops-system/internal/readassembly"
 	"github.com/seaworld008/aiops-system/internal/workerbootstrap"
 )
 
@@ -60,9 +62,17 @@ func TestPublicSourceAPIExposesNoPathDescriptorOrContents(t *testing.T) {
 			t.Fatal("StartChild exposes a callback that could retain the public-source descriptor")
 		}
 	}
+	buildSnapshot, ok := reflect.TypeOf((*workerbootstrap.InheritedSource)(nil)).MethodByName("BuildSnapshot")
+	contextType := reflect.TypeOf((*context.Context)(nil)).Elem()
+	snapshotType := reflect.TypeOf((*readassembly.Snapshot)(nil))
+	if !ok || buildSnapshot.Type.NumIn() != 2 || buildSnapshot.Type.In(1) != contextType ||
+		buildSnapshot.Type.NumOut() != 2 || buildSnapshot.Type.Out(0) != snapshotType ||
+		buildSnapshot.Type.Out(1) != reflect.TypeOf((*error)(nil)).Elem() {
+		t.Fatalf("BuildSnapshot signature = %#v; want context-only semantic assembly", buildSnapshot.Type)
+	}
 }
 
-func TestPublicSourceProductionBoundaryRemainsUnassembledAndNonConfigurable(t *testing.T) {
+func TestPublicSourceProductionBoundarySemanticAssemblyIsNonConfigurable(t *testing.T) {
 	_, currentFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("cannot locate architecture test")
@@ -228,7 +238,8 @@ func TestPublicSourceProductionBoundaryRemainsUnassembledAndNonConfigurable(t *t
 		"func:WriteProductionSourceToLoaderFD": 2, "func:ReceiveProductionSource": 2,
 		"method:Summary": 2, "method:Close": 2, "method:String": 2, "method:GoString": 2,
 		"method:Format": 2, "method:MarshalJSON": 2, "method:UnmarshalJSON": 2,
-		"method:StartChild": 2,
+		"method:StartChild":    2,
+		"method:BuildSnapshot": 1,
 	}
 	if !reflect.DeepEqual(exports, wantExports) {
 		t.Errorf("workerbootstrap exports = %#v, want %#v", exports, wantExports)

@@ -877,6 +877,10 @@ func runControlWorkerTestChild(raw string) int {
 	if err != nil || status == nil {
 		return 90
 	}
+	// These process-containment helpers inject a non-production source. Mark
+	// the semantic gate as proven so they can exercise only the post-assembly
+	// READY/FATAL protocol under test.
+	status.snapshotBuilt = true
 	writeChildMarker(base+".pid", strconv.Itoa(os.Getpid()))
 	switch scenario {
 	case "ready-exit-on-term":

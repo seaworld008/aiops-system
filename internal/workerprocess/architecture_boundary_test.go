@@ -15,19 +15,21 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/seaworld008/aiops-system/internal/readassembly"
 	"github.com/seaworld008/aiops-system/internal/workerprocess"
 )
 
 const workerProcessImport = "github.com/seaworld008/aiops-system/internal/workerprocess"
 
 var (
-	_ func() *workerprocess.ControlWorkerSupervisor      = workerprocess.NewControlWorkerSupervisor
-	_ func([]string) bool                                = workerprocess.IsControlWorkerChild
-	_ func([]string) (*workerprocess.ChildStatus, error) = workerprocess.AcceptControlWorkerChild
-	_ func(*workerprocess.ChildStatus) error             = workerprocess.ReportControlWorkerReady
-	_ func(*workerprocess.ChildStatus)                   = workerprocess.ExitControlWorkerFatal
-	_ func(*workerprocess.ChildStatus) error             = workerprocess.CloseControlWorkerChild
-	_ interface{ Run(context.Context) error }            = (*workerprocess.ControlWorkerSupervisor)(nil)
+	_ func() *workerprocess.ControlWorkerSupervisor                                     = workerprocess.NewControlWorkerSupervisor
+	_ func([]string) bool                                                               = workerprocess.IsControlWorkerChild
+	_ func([]string) (*workerprocess.ChildStatus, error)                                = workerprocess.AcceptControlWorkerChild
+	_ func(context.Context, *workerprocess.ChildStatus) (*readassembly.Snapshot, error) = workerprocess.BuildControlWorkerSnapshot
+	_ func(*workerprocess.ChildStatus) error                                            = workerprocess.ReportControlWorkerReady
+	_ func(*workerprocess.ChildStatus)                                                  = workerprocess.ExitControlWorkerFatal
+	_ func(*workerprocess.ChildStatus) error                                            = workerprocess.CloseControlWorkerChild
+	_ interface{ Run(context.Context) error }                                           = (*workerprocess.ControlWorkerSupervisor)(nil)
 )
 
 type processBoundaryKey struct {
@@ -55,6 +57,7 @@ var guardedWorkerProcessAPI = map[string]struct{}{
 	"NewControlWorkerSupervisor":        {},
 	"IsControlWorkerChild":              {},
 	"AcceptControlWorkerChild":          {},
+	"BuildControlWorkerSnapshot":        {},
 	"ReportControlWorkerReady":          {},
 	"ExitControlWorkerFatal":            {},
 	"CloseControlWorkerChild":           {},
@@ -84,6 +87,7 @@ var expectedProcessBoundaryCalls = map[processBoundaryKey]int{
 	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "RunControlWorkerSourceLoaderChild"}:                             1,
 	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "ReportControlWorkerReady"}:                             1,
 	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "ExitControlWorkerFatal"}:                               1,
+	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "BuildControlWorkerSnapshot"}:                           1,
 	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "CloseControlWorkerChild"}:                              2,
 	{file: "internal/workerprocess/supervisor.go", source: "workerprocess", symbol: "defaultSupervisorSettings"}:                       1,
 	{file: "internal/workerprocess/supervisor.go", source: "workerprocess", symbol: "newControlWorkerSupervisor"}:                      1,
@@ -107,6 +111,7 @@ var expectedWorkerProcessExports = map[string]int{
 	"func:NewControlWorkerSupervisor":        1,
 	"func:IsControlWorkerChild":              1,
 	"func:AcceptControlWorkerChild":          1,
+	"func:BuildControlWorkerSnapshot":        1,
 	"func:ReportControlWorkerReady":          1,
 	"func:ExitControlWorkerFatal":            1,
 	"func:CloseControlWorkerChild":           1,
@@ -198,6 +203,105 @@ func TestControlWorkerProcessAssemblyCallsitesAreClosed(t *testing.T) {
 	for _, violation := range validateProcessBoundary(scan) {
 		t.Error(violation)
 	}
+}
+
+func TestSemanticSnapshotReadyProofHasOneProductionWrite(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate process-boundary architecture test")
+	}
+	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "../.."))
+	writes, err := scanSnapshotProofWrites(repositoryRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{"internal/workerprocess/protocol.go": 1}
+	if !sameProcessStringCounts(writes, want) {
+		t.Fatalf("snapshotBuilt production writes = %#v, want %#v", writes, want)
+	}
+
+	fixtureRoot := t.TempDir()
+	writeProcessBoundaryFixture(t, fixtureRoot, "internal/workerprocess/bypass.go", `package workerprocess
+
+func bypassSnapshotProof(status *ChildStatus) {
+	status.snapshotBuilt = true
+	_ = ChildStatus{nil, nil, nil, 0, true, nil, nil}
+}
+`)
+	fixtureWrites, err := scanSnapshotProofWrites(fixtureRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sameProcessStringCounts(fixtureWrites, want) || fixtureWrites["internal/workerprocess/bypass.go"] < 2 {
+		t.Fatalf("snapshot proof scanner accepted bypass: %#v", fixtureWrites)
+	}
+}
+
+func scanSnapshotProofWrites(repositoryRoot string) (map[string]int, error) {
+	writes := make(map[string]int)
+	err := filepath.WalkDir(repositoryRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" || entry.Name() == "vendor" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		relative, err := filepath.Rel(repositoryRoot, path)
+		if err != nil {
+			return err
+		}
+		parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			return err
+		}
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			switch typed := node.(type) {
+			case *ast.AssignStmt:
+				for _, expression := range typed.Lhs {
+					selector, ok := expression.(*ast.SelectorExpr)
+					if ok && selector.Sel.Name == "snapshotBuilt" {
+						writes[relative]++
+					}
+				}
+			case *ast.KeyValueExpr:
+				if identifier, ok := typed.Key.(*ast.Ident); ok && identifier.Name == "snapshotBuilt" {
+					writes[relative]++
+				}
+			case *ast.CompositeLit:
+				identifier, ok := typed.Type.(*ast.Ident)
+				if !ok || identifier.Name != "ChildStatus" || len(typed.Elts) == 0 {
+					return true
+				}
+				for _, element := range typed.Elts {
+					if _, keyed := element.(*ast.KeyValueExpr); !keyed {
+						writes[relative]++
+						break
+					}
+				}
+			}
+			return true
+		})
+		return nil
+	})
+	return writes, err
+}
+
+func sameProcessStringCounts(left, right map[string]int) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, value := range right {
+		if left[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func TestProcessBoundaryScannerRejectsAliasesAndAlternateExec(t *testing.T) {

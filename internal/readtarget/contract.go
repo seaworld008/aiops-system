@@ -81,16 +81,22 @@ func BuildTargetRef(base string, definition Definition) (string, error) {
 }
 
 func buildContract(definition Definition, now time.Time) (builtContract, error) {
+	return buildContractWithRoots(definition, now, loadRoots)
+}
+
+type rootLoader func(string, time.Time) (*x509.CertPool, []string, error)
+
+func buildContractWithRoots(definition Definition, now time.Time, roots rootLoader) (builtContract, error) {
 	if !validScope(definition.Scope) || !validKind(definition.Kind) ||
 		!validContentReference(definition.CredentialRoleRef) ||
-		!validContentReference(definition.NetworkPolicyRef) {
+		!validContentReference(definition.NetworkPolicyRef) || roots == nil {
 		return builtContract{}, ErrInvalidDefinition
 	}
 	origin, err := canonicalOrigin(definition.Endpoint.Origin, definition.Endpoint.ServerName)
 	if err != nil {
 		return builtContract{}, ErrInvalidDefinition
 	}
-	roots, hashes, err := loadRoots(definition.Endpoint.CABundleFile, now)
+	pool, hashes, err := roots(definition.Endpoint.CABundleFile, now)
 	if err != nil {
 		return builtContract{}, ErrInvalidDefinition
 	}
@@ -109,7 +115,7 @@ func buildContract(definition Definition, now time.Time) (builtContract, error) 
 	return builtContract{
 		digest: digest, kind: definition.Kind, origin: *origin,
 		serverName: definition.Endpoint.ServerName, credentialRoleRef: definition.CredentialRoleRef,
-		networkPolicyRef: definition.NetworkPolicyRef, rootCAs: roots, scope: definition.Scope,
+		networkPolicyRef: definition.NetworkPolicyRef, rootCAs: pool, scope: definition.Scope,
 	}, nil
 }
 

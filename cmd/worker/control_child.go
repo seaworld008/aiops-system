@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"sync"
 
+	"github.com/seaworld008/aiops-system/internal/readassembly"
 	"github.com/seaworld008/aiops-system/internal/workerprocess"
 )
 
@@ -269,9 +270,12 @@ func (status *processControlChildStatus) Fatal() {
 	workerprocess.ExitControlWorkerFatal(status.status)
 }
 
-func newControlChildRuntime() (controlChildRuntime, error) {
-	// The child has accepted the independently validated public-source FD4,
-	// but semantic Snapshot/PostgreSQL/Temporal assembly remains unavailable.
+func newControlChildRuntime(snapshot *readassembly.Snapshot) (controlChildRuntime, error) {
+	// C2-4c2b1b1 proves the exact FD4 manifests compile to the reviewed semantic
+	// Snapshot. Secret-ready/PostgreSQL/Temporal assembly remains unavailable.
+	if snapshot == nil || !snapshot.Ready() {
+		return nil, errControlWorkerAssemblyUnavailable
+	}
 	return nil, errControlWorkerAssemblyUnavailable
 }
 
@@ -285,16 +289,19 @@ func runControlWorkerChildRuntime(ctx context.Context, status *workerprocess.Chi
 		}
 		return errControlWorkerChildRejected
 	}
-	runtime, err := newControlChildRuntime()
-	if err != nil || nilControlChildDependency(runtime) {
-		if status != nil {
-			_ = workerprocess.CloseControlWorkerChild(status)
-		}
+	if status == nil {
 		return errControlWorkerAssemblyUnavailable
 	}
-	if status == nil {
-		_ = stopControlChildRuntime(runtime)
-		return errControlWorkerChildRejected
+	snapshot, buildErr := workerprocess.BuildControlWorkerSnapshot(ctx, status)
+	var runtime controlChildRuntime
+	var assemblyErr error
+	if buildErr == nil && snapshot != nil && snapshot.Ready() {
+		runtime, assemblyErr = newControlChildRuntime(snapshot)
+	}
+	if buildErr != nil || snapshot == nil || !snapshot.Ready() || assemblyErr != nil ||
+		nilControlChildDependency(runtime) {
+		_ = workerprocess.CloseControlWorkerChild(status)
+		return errControlWorkerAssemblyUnavailable
 	}
 	return newControlChild(runtime, &processControlChildStatus{status: status}).Run(ctx)
 }

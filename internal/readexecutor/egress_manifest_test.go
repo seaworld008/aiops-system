@@ -1,6 +1,7 @@
 package readexecutor
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,51 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestCompileEgressManifestBuildsDetachedRegistryWithinWireBudget(t *testing.T) {
+	definition := validEgressPolicyDefinition()
+	ref, err := BuildEgressPolicyRef("metrics-egress", definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition.PolicyRef = ref
+	valid, err := json.Marshal(egressManifestDocument{
+		SchemaVersion: EgressRegistrySchemaVersion, Policies: []EgressPolicyDefinition{definition},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := append(bytes.Repeat([]byte{' '}, (1<<20)-len(valid)), valid...)
+	original := append([]byte(nil), encoded...)
+
+	registry, err := CompileEgressManifest(encoded)
+	if err != nil {
+		t.Fatalf("CompileEgressManifest() error = %v", err)
+	}
+	if registry == nil || !registry.Ready() || registry.Digest() == "" {
+		t.Fatalf("CompileEgressManifest() registry = %#v", registry)
+	}
+	digest := registry.Digest()
+	if !bytes.Equal(encoded, original) {
+		t.Fatal("CompileEgressManifest() modified the caller-owned buffer")
+	}
+	clear(encoded)
+	if !registry.Ready() || registry.Digest() != digest {
+		t.Fatal("caller buffer mutation changed the compiled registry")
+	}
+
+	for name, contents := range map[string][]byte{
+		"empty":      nil,
+		"over limit": append(bytes.Repeat([]byte{' '}, (1<<20)+1-len(valid)), valid...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			compiled, compileErr := CompileEgressManifest(contents)
+			if compiled != nil || !errors.Is(compileErr, ErrEgressManifestJSON) {
+				t.Fatalf("CompileEgressManifest() = %#v, %v; want nil, ErrEgressManifestJSON", compiled, compileErr)
+			}
+		})
+	}
+}
 
 func TestEgressRegistryManifestLoadsOneImmutableStableSnapshot(t *testing.T) {
 	first := validEgressPolicyDefinition()

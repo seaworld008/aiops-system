@@ -41,6 +41,40 @@ func TestLoadFileBuildsDetachedRegistryFromStrictManifest(t *testing.T) {
 	}
 }
 
+func TestCompileManifestBuildsDetachedRegistryWithinWireBudget(t *testing.T) {
+	valid := validManifestBytes(t)
+	encoded := append(bytes.Repeat([]byte{' '}, (1<<20)-len(valid)), valid...)
+	original := append([]byte(nil), encoded...)
+
+	registry, err := readconnector.CompileManifest(encoded)
+	if err != nil {
+		t.Fatalf("CompileManifest() error = %v", err)
+	}
+	if registry == nil || !registry.Ready() || registry.Digest() == "" {
+		t.Fatalf("CompileManifest() registry = %#v", registry)
+	}
+	digest := registry.Digest()
+	if !bytes.Equal(encoded, original) {
+		t.Fatal("CompileManifest() modified the caller-owned buffer")
+	}
+	clear(encoded)
+	if !registry.Ready() || registry.Digest() != digest {
+		t.Fatal("caller buffer mutation changed the compiled registry")
+	}
+
+	for name, contents := range map[string][]byte{
+		"empty":      nil,
+		"over limit": append(bytes.Repeat([]byte{' '}, (1<<20)+1-len(valid)), valid...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			compiled, compileErr := readconnector.CompileManifest(contents)
+			if compiled != nil || !errors.Is(compileErr, readconnector.ErrManifestJSON) {
+				t.Fatalf("CompileManifest() = %#v, %v; want nil, ErrManifestJSON", compiled, compileErr)
+			}
+		})
+	}
+}
+
 func TestLoadFileRejectsUnsafePathsAndFileMetadata(t *testing.T) {
 	valid := validManifestBytes(t)
 	safePath := writeManifestFile(t, valid, 0o600)

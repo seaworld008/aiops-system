@@ -1,10 +1,13 @@
 package workerprocess
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
 	"sync"
+
+	"github.com/seaworld008/aiops-system/internal/readassembly"
 )
 
 const (
@@ -59,12 +62,13 @@ func AcceptControlWorkerChild(args []string) (*ChildStatus, error) {
 // ChildStatus is the write-only status capability inherited from the parent.
 // It never carries application data or error text.
 type ChildStatus struct {
-	mu     sync.Mutex
-	file   *os.File
-	source io.Closer
-	state  childStatusState
-	seal   *childStatusMarker
-	self   *ChildStatus
+	mu            sync.Mutex
+	file          *os.File
+	source        io.Closer
+	state         childStatusState
+	snapshotBuilt bool
+	seal          *childStatusMarker
+	self          *ChildStatus
 }
 
 type childStatusMarker struct{ value byte }
@@ -93,6 +97,50 @@ func (status *ChildStatus) structurallyValid() bool {
 	return status != nil && status.self == status && status.seal == sealedChildStatusMarker
 }
 
+type controlWorkerSnapshotSource interface {
+	BuildSnapshot(context.Context) (*readassembly.Snapshot, error)
+}
+
+// BuildControlWorkerSnapshot compiles the already accepted FD4 source exactly
+// once while the child status capability is still pre-READY. It exposes no
+// source material and cannot select a path, descriptor, or expected digest.
+func BuildControlWorkerSnapshot(
+	ctx context.Context,
+	status *ChildStatus,
+) (*readassembly.Snapshot, error) {
+	if !status.structurallyValid() || ctx == nil {
+		return nil, errInvalidChildInvocation
+	}
+	status.mu.Lock()
+	defer status.mu.Unlock()
+	if status.state != childStatusOpen || status.snapshotBuilt || status.file == nil || status.source == nil {
+		return nil, errInvalidChildInvocation
+	}
+	builder, ok := status.source.(controlWorkerSnapshotSource)
+	if !ok || builder == nil {
+		return nil, errInvalidChildInvocation
+	}
+	snapshot, err := invokeSnapshotBuild(ctx, builder)
+	if err != nil || snapshot == nil || !snapshot.Ready() {
+		return nil, errInvalidChildInvocation
+	}
+	status.snapshotBuilt = true
+	return snapshot, nil
+}
+
+func invokeSnapshotBuild(
+	ctx context.Context,
+	builder controlWorkerSnapshotSource,
+) (snapshot *readassembly.Snapshot, returnedErr error) {
+	defer func() {
+		if recover() != nil {
+			snapshot = nil
+			returnedErr = errInvalidChildInvocation
+		}
+	}()
+	return builder.BuildSnapshot(ctx)
+}
+
 // ReportControlWorkerReady reports exactly one successful worker start.
 func ReportControlWorkerReady(status *ChildStatus) error {
 	if !status.structurallyValid() {
@@ -100,7 +148,7 @@ func ReportControlWorkerReady(status *ChildStatus) error {
 	}
 	status.mu.Lock()
 	defer status.mu.Unlock()
-	if status.state != childStatusOpen || status.file == nil || status.source == nil {
+	if status.state != childStatusOpen || !status.snapshotBuilt || status.file == nil || status.source == nil {
 		return errStatusAlreadyReported
 	}
 	if err := writeStatusByte(status.file, controlWorkerReadyByte); err != nil {

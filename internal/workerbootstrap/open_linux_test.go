@@ -4,6 +4,7 @@ package workerbootstrap
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -22,6 +23,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seaworld008/aiops-system/internal/investigationplan"
+	"github.com/seaworld008/aiops-system/internal/readconnector"
+	"github.com/seaworld008/aiops-system/internal/readexecutor"
+	"github.com/seaworld008/aiops-system/internal/readruntime"
+	"github.com/seaworld008/aiops-system/internal/readtarget"
 	"github.com/seaworld008/aiops-system/internal/securemanifest"
 	"golang.org/x/sys/unix"
 )
@@ -313,13 +319,110 @@ func newLinuxBootstrapFixture(t *testing.T) *linuxBootstrapFixture {
 	temporalControl := newTestClientCertificate(t, "temporal-control", now, temporalRoot, temporalRootKey)
 	targetRootPEM := certificatePEM(targetRoot.Raw)
 	targetRootHash := sha256Hex(targetRootPEM)
+	targetRootPath := filepath.Join(rootPath, targetRootsDirectory, targetRootHash+certificateFileSuffix)
+	writeOwnerOnlyFile(t, targetRootPath, targetRootPEM)
 
-	targetManifest := []byte(`{"schema_version":"read-target-manifest.v1","targets":[{"scope":{"tenant_id":"00000000-0000-4000-8000-000000000001","workspace_id":"00000000-0000-4000-8000-000000000002","environment_id":"00000000-0000-4000-8000-000000000003"},"target_ref":"target-a","kind":"PROMETHEUS","endpoint":{"origin":"https://metrics.aiops.internal","server_name":"metrics.aiops.internal","ca_bundle_file":"` + filepath.Join(rootPath, targetRootsDirectory, targetRootHash+certificateFileSuffix) + `"},"credential_role_ref":"read-a","network_policy_ref":"egress-a"}]}`)
+	const (
+		tenantID      = "00000000-0000-4000-8000-000000000001"
+		workspaceID   = "00000000-0000-4000-8000-000000000002"
+		environmentID = "00000000-0000-4000-8000-000000000003"
+		serviceID     = "00000000-0000-4000-8000-000000000004"
+		integrationID = "00000000-0000-4000-8000-000000000005"
+	)
+	targetScope := readtarget.Scope{
+		TenantID: tenantID, WorkspaceID: workspaceID, EnvironmentID: environmentID,
+	}
+	egressDefinition := readexecutor.EgressPolicyDefinition{
+		Scope: targetScope, Hostname: "metrics.aiops.internal", Port: 8443,
+		AllowedPrefixes: []string{"10.42.9.0/24"},
+	}
+	egressRef, err := readexecutor.BuildEgressPolicyRef("metrics-egress", egressDefinition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	egressDefinition.PolicyRef = egressRef
+	targetDefinition := readtarget.Definition{
+		Scope: targetScope, Kind: readconnector.KindPrometheus,
+		Endpoint: readtarget.Endpoint{
+			Origin: "https://metrics.aiops.internal:8443", ServerName: "metrics.aiops.internal",
+			CABundleFile: targetRootPath,
+		},
+		CredentialRoleRef: "metrics-reader-v1-" + strings.Repeat("a", 64), NetworkPolicyRef: egressRef,
+	}
+	targetRef, err := readtarget.BuildTargetRef("metrics", targetDefinition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetDefinition.TargetRef = targetRef
+	connectorDefinition := readconnector.Definition{
+		Scope: readconnector.Scope{
+			TenantID: tenantID, WorkspaceID: workspaceID, EnvironmentID: environmentID, ServiceID: serviceID,
+		},
+		TargetRef: targetRef,
+		PrometheusRangeQuery: &readconnector.PrometheusRangeQueryV1{
+			Expression: "up", StepSeconds: 30, MaxLookbackMinutes: 60, MaxItems: 100, MaxSamples: 121,
+		},
+	}
+	connectorID, err := readconnector.BuildConnectorID("metrics", connectorDefinition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connectorDefinition.ConnectorID = connectorID
+	connectorRegistry, err := readconnector.New([]readconnector.Definition{connectorDefinition})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planDefinition := investigationplan.Definition{
+		RegistryDigest: connectorRegistry.Digest(),
+		Profiles: []investigationplan.ProfileDefinition{{
+			Scope: investigationplan.Scope{
+				TenantID: tenantID, WorkspaceID: workspaceID, EnvironmentID: environmentID, ServiceID: serviceID,
+			},
+			Match: investigationplan.MatchDefinition{
+				IntegrationID: integrationID, Provider: "alertmanager",
+				Labels: []investigationplan.LabelMatch{{Key: "service", Value: "payments"}},
+			},
+			Tasks: []investigationplan.TaskDefinition{{
+				Key: "metrics", ConnectorID: connectorID, Operation: readconnector.OperationPrometheusRangeQuery,
+				Input: json.RawMessage(`{"lookback_minutes":15}`),
+			}},
+		}},
+	}
+	mustMarshal := func(value any) []byte {
+		encoded, marshalErr := json.Marshal(value)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		return encoded
+	}
+	connectorManifest := mustMarshal(struct {
+		SchemaVersion string                     `json:"schema_version"`
+		Definitions   []readconnector.Definition `json:"definitions"`
+	}{SchemaVersion: "read-connector-registry.v1", Definitions: []readconnector.Definition{connectorDefinition}})
+	planManifest := mustMarshal(struct {
+		SchemaVersion  string                                `json:"schema_version"`
+		RegistryDigest string                                `json:"registry_digest"`
+		Profiles       []investigationplan.ProfileDefinition `json:"profiles"`
+	}{
+		SchemaVersion: investigationplan.ManifestSchemaVersion, RegistryDigest: planDefinition.RegistryDigest,
+		Profiles: planDefinition.Profiles,
+	})
+	targetManifest := mustMarshal(struct {
+		SchemaVersion string                  `json:"schema_version"`
+		Targets       []readtarget.Definition `json:"targets"`
+	}{SchemaVersion: readtarget.ManifestSchemaVersion, Targets: []readtarget.Definition{targetDefinition}})
+	egressManifest := mustMarshal(struct {
+		SchemaVersion string                                `json:"schema_version"`
+		Policies      []readexecutor.EgressPolicyDefinition `json:"policies"`
+	}{
+		SchemaVersion: readexecutor.EgressRegistrySchemaVersion,
+		Policies:      []readexecutor.EgressPolicyDefinition{egressDefinition},
+	})
 	artifacts := map[string][]byte{
-		connectorManifestFilename:          []byte(`{"schema_version":"read-connector-registry.v1","definitions":[]}`),
-		planManifestFilename:               []byte(`{"schema_version":"investigation-plan-manifest.v1","registry_digest":"` + strings.Repeat("2", 64) + `","profiles":[]}`),
+		connectorManifestFilename:          connectorManifest,
+		planManifestFilename:               planManifest,
 		targetManifestFilename:             targetManifest,
-		egressManifestFilename:             []byte(`{"schema_version":"read-egress-registry.v1","policies":[]}`),
+		egressManifestFilename:             egressManifest,
 		postgresRootCAFilename:             certificatePEM(postgresRoot.Raw),
 		postgresClientCertificateFilename:  certificateChainPEM(postgresCertificate.Raw, postgresRoot.Raw),
 		temporalRootCAFilename:             certificatePEM(temporalRoot.Raw),
@@ -329,15 +432,45 @@ func newLinuxBootstrapFixture(t *testing.T) *linuxBootstrapFixture {
 	for name, contents := range artifacts {
 		writeOwnerOnlyFile(t, filepath.Join(rootPath, name), contents)
 	}
-	writeOwnerOnlyFile(t, filepath.Join(rootPath, targetRootsDirectory, targetRootHash+certificateFileSuffix), targetRootPEM)
+
+	loadedConnectors, err := readconnector.LoadFile(filepath.Join(rootPath, connectorManifestFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := investigationplan.NewScopeAuthority()
+	planner, err := investigationplan.LoadFile(
+		context.Background(), authority, filepath.Join(rootPath, planManifestFilename), loadedConnectors,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, err := readtarget.LoadFile(filepath.Join(rootPath, targetManifestFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	egress, err := readexecutor.LoadEgressRegistryFile(filepath.Join(rootPath, egressManifestFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := readexecutor.NewProfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := readruntime.NewBundle(loadedConnectors, targets, egress, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeSummary := bundle.Summary()
 
 	document := publicDocument{
 		SchemaVersion: PublicSourceSchemaVersion,
 		ExpectedSnapshot: publicSnapshotDocument{
-			SchemaVersion: readAssemblySnapshotSchemaVersion, PlanManifestDigest: strings.Repeat("1", 64),
-			ConnectorRegistryDigest: strings.Repeat("2", 64), TargetRegistryDigest: strings.Repeat("3", 64),
-			EgressRegistryDigest: strings.Repeat("4", 64), ExecutorProfileDigest: strings.Repeat("5", 64),
-			BundleDigest: strings.Repeat("6", 64),
+			SchemaVersion: readAssemblySnapshotSchemaVersion, PlanManifestDigest: planner.ManifestDigest(),
+			ConnectorRegistryDigest: runtimeSummary.ConnectorRegistryDigest,
+			TargetRegistryDigest:    runtimeSummary.TargetRegistryDigest,
+			EgressRegistryDigest:    runtimeSummary.EgressRegistryDigest,
+			ExecutorProfileDigest:   runtimeSummary.ExecutorProfileDigest,
+			BundleDigest:            runtimeSummary.BundleDigest,
 		},
 		Postgres: publicPostgresDocument{
 			Host: "postgres.aiops.internal", Port: 5432, Database: "aiops", User: "aiops_worker",
