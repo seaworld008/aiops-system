@@ -31,6 +31,9 @@ func TestBundleAtomicallyAuthorizesBindsAndPreparesExactRuntime(t *testing.T) {
 	if err := bundle.AuthorizeStart(context.Background(), descriptor); err != nil {
 		t.Fatalf("AuthorizeStart() error = %v", err)
 	}
+	if err := bundle.AuthorizeHeartbeat(context.Background(), descriptor); err != nil {
+		t.Fatalf("AuthorizeHeartbeat() error = %v", err)
+	}
 	collectedAt := time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC)
 	evidence := readtask.EvidenceCompletion{CollectedAt: collectedAt, Items: []json.RawMessage{
 		json.RawMessage(fmt.Sprintf(`{"metric":{"job":"api"},"values":[[%d,"1"]]}`, collectedAt.Add(-time.Minute).Unix())),
@@ -158,6 +161,9 @@ func TestBundleAuthorizersRejectEveryPersistedRuntimeDriftBeforeTypedAdmission(t
 			if err := bundle.AuthorizeStart(context.Background(), descriptor); err == nil {
 				t.Fatal("AuthorizeStart() accepted drift")
 			}
+			if err := bundle.AuthorizeHeartbeat(context.Background(), descriptor); err == nil {
+				t.Fatal("AuthorizeHeartbeat() accepted drift")
+			}
 			if err := bundle.AuthorizeCompletion(context.Background(), descriptor, readtask.EvidenceCompletion{}); err == nil {
 				t.Fatal("AuthorizeCompletion() accepted drift")
 			}
@@ -172,11 +178,17 @@ func TestBundleAuthorizersRejectEveryPersistedRuntimeDriftBeforeTypedAdmission(t
 	if err := bundle.AuthorizeStart(cancelled, baseline); !errors.Is(err, context.Canceled) {
 		t.Fatalf("AuthorizeStart(cancelled) error = %v", err)
 	}
+	if err := bundle.AuthorizeHeartbeat(cancelled, baseline); !errors.Is(err, context.Canceled) {
+		t.Fatalf("AuthorizeHeartbeat(cancelled) error = %v", err)
+	}
 	if prepared, err := bundle.Prepare(nil, baseline, 1, 1); prepared != nil || !errors.Is(err, readruntime.ErrBundleRejected) {
 		t.Fatalf("Prepare(nil context) = %#v, %v", prepared, err)
 	}
 	if err := bundle.AuthorizeStart(panicContext{}, baseline); !errors.Is(err, readruntime.ErrBundleRejected) {
 		t.Fatalf("AuthorizeStart(panicking context) error = %v", err)
+	}
+	if err := bundle.AuthorizeHeartbeat(panicContext{}, baseline); !errors.Is(err, readruntime.ErrBundleRejected) {
+		t.Fatalf("AuthorizeHeartbeat(panicking context) error = %v", err)
 	}
 }
 

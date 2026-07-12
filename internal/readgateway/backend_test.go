@@ -138,10 +138,14 @@ func TestClaimAuthenticatesAndMutatesInOneTransaction(t *testing.T) {
 	}
 }
 
-func TestClosedAdmissionBlocksEveryLeaseProgressionBeforeDatabase(t *testing.T) {
+func TestClosedAdmissionBlocksEveryLeaseProgressionBeforeReadTaskTransaction(t *testing.T) {
 	events := make([]string, 0, 1)
 	backend := &Backend{
 		database: &recordingDB{events: &events, err: errors.New("database must not be reached")},
+		heartbeatAuthorizer: func(context.Context, readtask.Descriptor) error {
+			t.Fatal("closed admission invoked heartbeat authorizer")
+			return nil
+		},
 		operations: operations{
 			authenticateTx: func(context.Context, pgx.Tx, runneridentity.Identity) (authenticatedRunner, error) {
 				t.Fatal("closed admission authenticated a request")
@@ -155,7 +159,7 @@ func TestClosedAdmissionBlocksEveryLeaseProgressionBeforeDatabase(t *testing.T) 
 				t.Fatal("closed admission started an existing lease")
 				return readtask.Attempt{}, nil
 			},
-			heartbeatTx: func(context.Context, pgx.Tx, execution.RunnerScope, readtask.CertificateBinding, readtask.Heartbeat, time.Duration) (readtask.HeartbeatResult, error) {
+			heartbeatTx: func(context.Context, pgx.Tx, execution.RunnerScope, readtask.CertificateBinding, readtask.Heartbeat, time.Duration, HeartbeatAuthorizer) (readtask.HeartbeatResult, error) {
 				t.Fatal("closed admission extended an existing lease")
 				return readtask.HeartbeatResult{}, nil
 			},
@@ -235,6 +239,7 @@ func TestNewBindsOnlyAuthorizedRepositoryEntrypoints(t *testing.T) {
 	dependencies := Dependencies{
 		Database: database, Identities: identities, Tasks: tasks, Admission: openAdmissionForTest(),
 		StartAuthorizer:      func(context.Context, readtask.Descriptor) error { return nil },
+		HeartbeatAuthorizer:  func(context.Context, readtask.Descriptor) error { return nil },
 		CompletionAuthorizer: func(context.Context, readtask.Descriptor, readtask.EvidenceCompletion) error { return nil },
 	}
 	backend, err := New(dependencies)
@@ -250,6 +255,11 @@ func TestNewBindsOnlyAuthorizedRepositoryEntrypoints(t *testing.T) {
 	withoutStart.StartAuthorizer = nil
 	if candidate, candidateErr := New(withoutStart); candidate != nil || !errors.Is(candidateErr, ErrInvalidConfiguration) {
 		t.Fatalf("New(without StartAuthorizer) = %#v, %v", candidate, candidateErr)
+	}
+	withoutHeartbeat := dependencies
+	withoutHeartbeat.HeartbeatAuthorizer = nil
+	if candidate, candidateErr := New(withoutHeartbeat); candidate != nil || !errors.Is(candidateErr, ErrInvalidConfiguration) {
+		t.Fatalf("New(without HeartbeatAuthorizer) = %#v, %v", candidate, candidateErr)
 	}
 	withoutCompletion := dependencies
 	withoutCompletion.CompletionAuthorizer = nil
@@ -313,11 +323,16 @@ func TestStartUsesTrustedAuthorizerInAuthenticatedTransaction(t *testing.T) {
 }
 
 func TestHeartbeatUsesGatewayLeaseExtensionInAuthenticatedTransaction(t *testing.T) {
-	events := make([]string, 0, 4)
+	events := make([]string, 0, 5)
 	tx := &recordingTx{events: &events}
 	principal := newTestPrincipal(t, runneridentity.PoolRead)
+	authorizer := func(context.Context, readtask.Descriptor) error {
+		events = append(events, "authorize-heartbeat")
+		return nil
+	}
 	backend := &Backend{
 		database: &recordingDB{events: &events, tx: tx}, admission: openAdmissionForTest(),
+		heartbeatAuthorizer: authorizer,
 		operations: operations{
 			authenticateTx: func(context.Context, pgx.Tx, runneridentity.Identity) (authenticatedRunner, error) {
 				events = append(events, "authenticate")
@@ -330,6 +345,7 @@ func TestHeartbeatUsesGatewayLeaseExtensionInAuthenticatedTransaction(t *testing
 				certificate readtask.CertificateBinding,
 				_ readtask.Heartbeat,
 				extension time.Duration,
+				gotAuthorizer HeartbeatAuthorizer,
 			) (readtask.HeartbeatResult, error) {
 				events = append(events, "heartbeat")
 				if gotTx != tx {
@@ -339,6 +355,12 @@ func TestHeartbeatUsesGatewayLeaseExtensionInAuthenticatedTransaction(t *testing
 				if extension != heartbeatLeaseExtension {
 					t.Fatalf("Heartbeat extension = %s", extension)
 				}
+				if gotAuthorizer == nil {
+					t.Fatal("Heartbeat 未收到可信 authorizer")
+				}
+				if err := gotAuthorizer(context.Background(), readtask.Descriptor{}); err != nil {
+					t.Fatalf("heartbeat authorizer error = %v", err)
+				}
 				return readtask.HeartbeatResult{}, nil
 			},
 		},
@@ -347,7 +369,7 @@ func TestHeartbeatUsesGatewayLeaseExtensionInAuthenticatedTransaction(t *testing
 	if _, _, err := backend.Heartbeat(context.Background(), runneridentity.Identity{}, readtask.Heartbeat{}); err != nil {
 		t.Fatalf("Heartbeat() error = %v", err)
 	}
-	if want := []string{"begin", "authenticate", "heartbeat", "commit"}; !reflect.DeepEqual(events, want) {
+	if want := []string{"begin", "authenticate", "heartbeat", "authorize-heartbeat", "commit"}; !reflect.DeepEqual(events, want) {
 		t.Fatalf("事件顺序 = %v，期望 %v", events, want)
 	}
 }

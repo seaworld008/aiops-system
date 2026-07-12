@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -317,8 +318,9 @@ func TestRunnerMutationEntrypointsClassifyCorruptLockedProjectionAsIntegrity(t *
 		{
 			name: "heartbeat", status: readtask.AttemptRunning, taskStatus: "RUNNING", investigationStatus: "RUNNING",
 			call: func(ctx context.Context, repository *Repository, tx pgx.Tx, scope execution.RunnerScope, certificate readtask.CertificateBinding, fence readtask.Fence) error {
-				_, err := repository.HeartbeatRunnerTx(ctx, tx, scope, certificate,
-					readtask.Heartbeat{Fence: fence, Sequence: 1}, 30*time.Second)
+				_, err := repository.HeartbeatRunnerAuthorizedTx(ctx, tx, scope, certificate,
+					readtask.Heartbeat{Fence: fence, Sequence: 1}, 30*time.Second,
+					func(context.Context, readtask.Descriptor) error { return nil })
 				return err
 			},
 		},
@@ -369,7 +371,7 @@ func TestRunnerMutationEntrypointsClassifyCorruptLockedProjectionAsIntegrity(t *
 	}
 }
 
-func TestHeartbeatRunnerTxUsesStrictSequenceAndServerLeaseExtension(t *testing.T) {
+func TestHeartbeatRunnerAuthorizedTxUsesStrictSequenceAndServerLeaseExtension(t *testing.T) {
 	database, repository := newReadTaskRepository(t)
 	tx := beginReadTaskTx(t, database)
 	now := testNow()
@@ -400,60 +402,40 @@ func TestHeartbeatRunnerTxUsesStrictSequenceAndServerLeaseExtension(t *testing.T
 		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1), int64(1), float64(30)).
 		WillReturnRows(attemptRows(updated))
 
-	result, err := repository.HeartbeatRunnerTx(
+	result, err := repository.HeartbeatRunnerAuthorizedTx(
 		context.Background(), tx, testRunnerScope(t, executionlease.PoolRead), certificate,
 		readtask.Heartbeat{Fence: fence, Sequence: 1}, 30*time.Second,
+		func(context.Context, readtask.Descriptor) error { return nil },
 	)
 	if err != nil || result.Directive != readtask.HeartbeatContinue || result.AcceptedSequence != 1 ||
 		result.Attempt.HeartbeatSequence != 1 {
-		t.Fatalf("HeartbeatRunnerTx() = %#v, %v", result, err)
+		t.Fatalf("HeartbeatRunnerAuthorizedTx() = %#v, %v", result, err)
 	}
 	rollbackReadTaskTx(t, database, tx)
 }
 
-func TestHeartbeatRunnerTxSameSequencePersistsTerminationAfterTrustDrift(t *testing.T) {
+func TestHeartbeatRunnerAuthorizedTxRejectsNilPolicyBeforeDatabaseReads(t *testing.T) {
 	database, repository := newReadTaskRepository(t)
 	tx := beginReadTaskTx(t, database)
-	base := testNow()
-	certificate := readtask.CertificateBinding{SHA256: testCertificateHash, NotAfter: base.Add(time.Minute)}
-	descriptor, input := testDescriptorAndInput()
+	now := testNow()
+	certificate := readtask.CertificateBinding{SHA256: testCertificateHash, NotAfter: now.Add(time.Minute)}
 	fence, err := readtask.NewFence(testTaskID, testRunnerID, []byte(testLeaseToken), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer fence.Destroy()
-	running := testAttempt(base, certificate, readtask.AttemptRunning)
-	running.StartedAt = base
-	running.HeartbeatSequence = 4
-	cancelled := running
-	cancelled.Status = readtask.AttemptCancelled
-	cancelled.TerminalAt = base.Add(time.Second)
-	cancelled.UpdatedAt = cancelled.TerminalAt
 
-	expectTaskLock(database, descriptor, input, "RUNNING", "RUNNING")
-	database.ExpectQuery(`(?s)SELECT .*FROM investigation_task_attempts AS attempt.*FOR UPDATE OF attempt`).
-		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1)).
-		WillReturnRows(attemptRows(running))
-	database.ExpectQuery(`(?s)SELECT status.*FROM investigations.*FOR NO KEY UPDATE`).
-		WithArgs(testTenantID, testWorkspaceID, testInvestigationID).
-		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("RUNNING"))
-	expectDatabaseClock(database, base.Add(time.Second))
-	database.ExpectQuery(`(?s)UPDATE investigation_task_attempts.*SET status = 'CANCELLED'.*status = 'RUNNING'.*RETURNING`).
-		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1)).
-		WillReturnRows(attemptRows(cancelled))
-
-	result, err := repository.HeartbeatRunnerTx(
-		context.Background(), tx, testRunnerScopeRevision(t, executionlease.PoolRead, 8), certificate,
-		readtask.Heartbeat{Fence: fence, Sequence: 4}, 30*time.Second,
+	result, err := repository.HeartbeatRunnerAuthorizedTx(
+		context.Background(), tx, testRunnerScope(t, executionlease.PoolRead), certificate,
+		readtask.Heartbeat{Fence: fence, Sequence: 1}, 30*time.Second, nil,
 	)
-	if err != nil || result.Directive != readtask.HeartbeatTerminate || result.AcceptedSequence != 4 ||
-		result.Attempt.Status != readtask.AttemptCancelled {
-		t.Fatalf("HeartbeatRunnerTx(same sequence after trust drift) = %#v, %v", result, err)
+	if result != (readtask.HeartbeatResult{}) || !errors.Is(err, readtask.ErrInvalidRequest) {
+		t.Fatalf("HeartbeatRunnerAuthorizedTx(nil policy) = %#v, %v", result, err)
 	}
 	rollbackReadTaskTx(t, database, tx)
 }
 
-func TestHeartbeatRunnerTxNextSequenceAtomicallyTerminatesAfterTrustDrift(t *testing.T) {
+func TestHeartbeatRunnerAuthorizedTxAtomicallyTerminatesAfterRuntimePolicyDrift(t *testing.T) {
 	database, repository := newReadTaskRepository(t)
 	tx := beginReadTaskTx(t, database)
 	base := testNow()
@@ -486,13 +468,228 @@ func TestHeartbeatRunnerTxNextSequenceAtomicallyTerminatesAfterTrustDrift(t *tes
 		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1), int64(5)).
 		WillReturnRows(attemptRows(cancelled))
 
-	result, err := repository.HeartbeatRunnerTx(
+	authorizerCalled := false
+	result, err := repository.HeartbeatRunnerAuthorizedTx(
+		context.Background(), tx, testRunnerScope(t, executionlease.PoolRead), certificate,
+		readtask.Heartbeat{Fence: fence, Sequence: 5}, 30*time.Second,
+		func(_ context.Context, candidate readtask.Descriptor) error {
+			authorizerCalled = true
+			if candidate.TaskID != descriptor.TaskID || !bytes.Equal(candidate.Input, descriptor.Input) {
+				t.Fatalf("Heartbeat authorizer descriptor = %#v", candidate)
+			}
+			candidate.Input[0] ^= 0xff
+			return readtask.ErrProjectionRejected
+		},
+	)
+	if err != nil || !authorizerCalled || result.Directive != readtask.HeartbeatTerminate ||
+		result.AcceptedSequence != 5 || result.Attempt.Status != readtask.AttemptCancelled {
+		t.Fatalf("HeartbeatRunnerAuthorizedTx(policy drift) = %#v, %v; authorizer=%t", result, err, authorizerCalled)
+	}
+	rollbackReadTaskTx(t, database, tx)
+}
+
+func TestHeartbeatRunnerAuthorizedTxSameSequencePolicyPanicTerminatesWithoutRenewal(t *testing.T) {
+	database, repository := newReadTaskRepository(t)
+	tx := beginReadTaskTx(t, database)
+	base := testNow()
+	certificate := readtask.CertificateBinding{SHA256: testCertificateHash, NotAfter: base.Add(time.Minute)}
+	descriptor, input := testDescriptorAndInput()
+	fence, err := readtask.NewFence(testTaskID, testRunnerID, []byte(testLeaseToken), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fence.Destroy()
+	running := testAttempt(base, certificate, readtask.AttemptRunning)
+	running.StartedAt = base
+	running.HeartbeatSequence = 4
+	cancelled := running
+	cancelled.Status = readtask.AttemptCancelled
+	cancelled.TerminalAt = base.Add(time.Second)
+	cancelled.UpdatedAt = cancelled.TerminalAt
+
+	expectTaskLock(database, descriptor, input, "RUNNING", "RUNNING")
+	database.ExpectQuery(`(?s)SELECT .*FROM investigation_task_attempts AS attempt.*FOR UPDATE OF attempt`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1)).
+		WillReturnRows(attemptRows(running))
+	database.ExpectQuery(`(?s)SELECT status.*FROM investigations.*FOR NO KEY UPDATE`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID).
+		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("RUNNING"))
+	expectDatabaseClock(database, base.Add(time.Second))
+	database.ExpectQuery(`(?s)UPDATE investigation_task_attempts.*SET status = 'CANCELLED'.*status = 'RUNNING'.*RETURNING`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1)).
+		WillReturnRows(attemptRows(cancelled))
+
+	result, err := repository.HeartbeatRunnerAuthorizedTx(
+		context.Background(), tx, testRunnerScope(t, executionlease.PoolRead), certificate,
+		readtask.Heartbeat{Fence: fence, Sequence: 4}, 30*time.Second,
+		func(context.Context, readtask.Descriptor) error { panic("policy panic") },
+	)
+	if err != nil || result.Directive != readtask.HeartbeatTerminate || result.AcceptedSequence != 4 ||
+		result.Attempt.Status != readtask.AttemptCancelled || !result.Attempt.LeaseExpiresAt.Equal(running.LeaseExpiresAt) {
+		t.Fatalf("HeartbeatRunnerAuthorizedTx(replayed policy panic) = %#v, %v", result, err)
+	}
+	rollbackReadTaskTx(t, database, tx)
+}
+
+func TestHeartbeatRunnerAuthorizedTxCannotRenewLeaseThatExpiresDuringPolicyCheck(t *testing.T) {
+	database, repository := newReadTaskRepository(t)
+	tx := beginReadTaskTx(t, database)
+	base := testNow()
+	certificate := readtask.CertificateBinding{SHA256: testCertificateHash, NotAfter: base.Add(time.Minute)}
+	descriptor, input := testDescriptorAndInput()
+	fence, err := readtask.NewFence(testTaskID, testRunnerID, []byte(testLeaseToken), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fence.Destroy()
+	running := testAttempt(base, certificate, readtask.AttemptRunning)
+	running.StartedAt = base
+	running.HeartbeatSequence = 4
+
+	expectTaskLock(database, descriptor, input, "RUNNING", "RUNNING")
+	database.ExpectQuery(`(?s)SELECT .*FROM investigation_task_attempts AS attempt.*FOR UPDATE OF attempt`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1)).
+		WillReturnRows(attemptRows(running))
+	database.ExpectQuery(`(?s)SELECT status.*FROM investigations.*FOR NO KEY UPDATE`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID).
+		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("RUNNING"))
+	expectDatabaseClock(database, running.LeaseExpiresAt)
+	authorizerCalled := false
+
+	result, err := repository.HeartbeatRunnerAuthorizedTx(
+		context.Background(), tx, testRunnerScope(t, executionlease.PoolRead), certificate,
+		readtask.Heartbeat{Fence: fence, Sequence: 5}, 30*time.Second,
+		func(context.Context, readtask.Descriptor) error {
+			authorizerCalled = true
+			return nil
+		},
+	)
+	if result != (readtask.HeartbeatResult{}) || !authorizerCalled || !errors.Is(err, readtask.ErrStaleFence) {
+		t.Fatalf("HeartbeatRunnerAuthorizedTx(policy check crossed expiry) = %#v, %v; authorizer=%t",
+			result, err, authorizerCalled)
+	}
+	rollbackReadTaskTx(t, database, tx)
+}
+
+func TestHeartbeatRunnerAuthorizedTxPolicyDriftCannotAcceptSequenceJump(t *testing.T) {
+	database, repository := newReadTaskRepository(t)
+	tx := beginReadTaskTx(t, database)
+	base := testNow()
+	certificate := readtask.CertificateBinding{SHA256: testCertificateHash, NotAfter: base.Add(time.Minute)}
+	descriptor, input := testDescriptorAndInput()
+	fence, err := readtask.NewFence(testTaskID, testRunnerID, []byte(testLeaseToken), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fence.Destroy()
+	running := testAttempt(base, certificate, readtask.AttemptRunning)
+	running.StartedAt = base
+	running.HeartbeatSequence = 4
+
+	expectTaskLock(database, descriptor, input, "RUNNING", "RUNNING")
+	database.ExpectQuery(`(?s)SELECT .*FROM investigation_task_attempts AS attempt.*FOR UPDATE OF attempt`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1)).
+		WillReturnRows(attemptRows(running))
+	database.ExpectQuery(`(?s)SELECT status.*FROM investigations.*FOR NO KEY UPDATE`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID).
+		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("RUNNING"))
+	expectDatabaseClock(database, base.Add(time.Second))
+
+	result, err := repository.HeartbeatRunnerAuthorizedTx(
+		context.Background(), tx, testRunnerScope(t, executionlease.PoolRead), certificate,
+		readtask.Heartbeat{Fence: fence, Sequence: 6}, 30*time.Second,
+		func(context.Context, readtask.Descriptor) error { return errors.New("runtime drift") },
+	)
+	if result != (readtask.HeartbeatResult{}) || !errors.Is(err, readtask.ErrHeartbeatConflict) {
+		t.Fatalf("HeartbeatRunnerAuthorizedTx(policy drift with sequence jump) = %#v, %v", result, err)
+	}
+	rollbackReadTaskTx(t, database, tx)
+}
+
+func TestHeartbeatRunnerAuthorizedTxSameSequencePersistsTerminationAfterTrustDrift(t *testing.T) {
+	database, repository := newReadTaskRepository(t)
+	tx := beginReadTaskTx(t, database)
+	base := testNow()
+	certificate := readtask.CertificateBinding{SHA256: testCertificateHash, NotAfter: base.Add(time.Minute)}
+	descriptor, input := testDescriptorAndInput()
+	fence, err := readtask.NewFence(testTaskID, testRunnerID, []byte(testLeaseToken), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fence.Destroy()
+	running := testAttempt(base, certificate, readtask.AttemptRunning)
+	running.StartedAt = base
+	running.HeartbeatSequence = 4
+	cancelled := running
+	cancelled.Status = readtask.AttemptCancelled
+	cancelled.TerminalAt = base.Add(time.Second)
+	cancelled.UpdatedAt = cancelled.TerminalAt
+
+	expectTaskLock(database, descriptor, input, "RUNNING", "RUNNING")
+	database.ExpectQuery(`(?s)SELECT .*FROM investigation_task_attempts AS attempt.*FOR UPDATE OF attempt`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1)).
+		WillReturnRows(attemptRows(running))
+	database.ExpectQuery(`(?s)SELECT status.*FROM investigations.*FOR NO KEY UPDATE`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID).
+		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("RUNNING"))
+	expectDatabaseClock(database, base.Add(time.Second))
+	database.ExpectQuery(`(?s)UPDATE investigation_task_attempts.*SET status = 'CANCELLED'.*status = 'RUNNING'.*RETURNING`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1)).
+		WillReturnRows(attemptRows(cancelled))
+
+	result, err := repository.HeartbeatRunnerAuthorizedTx(
+		context.Background(), tx, testRunnerScopeRevision(t, executionlease.PoolRead, 8), certificate,
+		readtask.Heartbeat{Fence: fence, Sequence: 4}, 30*time.Second,
+		func(context.Context, readtask.Descriptor) error { return nil },
+	)
+	if err != nil || result.Directive != readtask.HeartbeatTerminate || result.AcceptedSequence != 4 ||
+		result.Attempt.Status != readtask.AttemptCancelled {
+		t.Fatalf("HeartbeatRunnerAuthorizedTx(same sequence after trust drift) = %#v, %v", result, err)
+	}
+	rollbackReadTaskTx(t, database, tx)
+}
+
+func TestHeartbeatRunnerAuthorizedTxNextSequenceAtomicallyTerminatesAfterTrustDrift(t *testing.T) {
+	database, repository := newReadTaskRepository(t)
+	tx := beginReadTaskTx(t, database)
+	base := testNow()
+	certificate := readtask.CertificateBinding{SHA256: testCertificateHash, NotAfter: base.Add(time.Minute)}
+	descriptor, input := testDescriptorAndInput()
+	fence, err := readtask.NewFence(testTaskID, testRunnerID, []byte(testLeaseToken), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fence.Destroy()
+	running := testAttempt(base, certificate, readtask.AttemptRunning)
+	running.StartedAt = base
+	running.HeartbeatSequence = 4
+	cancelled := running
+	cancelled.Status = readtask.AttemptCancelled
+	cancelled.HeartbeatSequence = 5
+	cancelled.LastHeartbeatAt = base.Add(time.Second)
+	cancelled.TerminalAt = cancelled.LastHeartbeatAt
+	cancelled.UpdatedAt = cancelled.TerminalAt
+
+	expectTaskLock(database, descriptor, input, "RUNNING", "RUNNING")
+	database.ExpectQuery(`(?s)SELECT .*FROM investigation_task_attempts AS attempt.*FOR UPDATE OF attempt`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1)).
+		WillReturnRows(attemptRows(running))
+	database.ExpectQuery(`(?s)SELECT status.*FROM investigations.*FOR NO KEY UPDATE`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID).
+		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("RUNNING"))
+	expectDatabaseClock(database, base.Add(time.Second))
+	database.ExpectQuery(`(?s)UPDATE investigation_task_attempts.*heartbeat_seq = \$6.*status = 'CANCELLED'.*heartbeat_seq \+ 1 = \$6.*RETURNING`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1), int64(5)).
+		WillReturnRows(attemptRows(cancelled))
+
+	result, err := repository.HeartbeatRunnerAuthorizedTx(
 		context.Background(), tx, testRunnerScopeRevision(t, executionlease.PoolRead, 8), certificate,
 		readtask.Heartbeat{Fence: fence, Sequence: 5}, 30*time.Second,
+		func(context.Context, readtask.Descriptor) error { return nil },
 	)
 	if err != nil || result.Directive != readtask.HeartbeatTerminate || result.AcceptedSequence != 5 ||
 		result.Attempt.Status != readtask.AttemptCancelled {
-		t.Fatalf("HeartbeatRunnerTx(next sequence after trust drift) = %#v, %v", result, err)
+		t.Fatalf("HeartbeatRunnerAuthorizedTx(next sequence after trust drift) = %#v, %v", result, err)
 	}
 	rollbackReadTaskTx(t, database, tx)
 }

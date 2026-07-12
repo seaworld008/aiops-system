@@ -72,6 +72,9 @@ func TestReadTaskGatewayContractsRemainFailClosedDuringRuntimeAssembly(t *testin
 	if err := disabledReadTaskStart(context.Background(), readtask.Descriptor{}); !errors.Is(err, readtask.ErrClaimsDisabled) {
 		t.Fatalf("disabledReadTaskStart() error = %v", err)
 	}
+	if err := disabledReadTaskHeartbeat(context.Background(), readtask.Descriptor{}); !errors.Is(err, readtask.ErrClaimsDisabled) {
+		t.Fatalf("disabledReadTaskHeartbeat() error = %v", err)
+	}
 	if err := disabledReadTaskCompletion(
 		context.Background(), readtask.Descriptor{}, readtask.EvidenceCompletion{},
 	); !errors.Is(err, readtask.ErrClaimsDisabled) {

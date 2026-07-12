@@ -45,6 +45,8 @@ const (
 	integrationClaimTaskID     = "99000000-0000-4000-8000-000000000002"
 	integrationFenceTaskID     = "99000000-0000-4000-8000-000000000003"
 	integrationDriftTaskID     = "99000000-0000-4000-8000-000000000004"
+	integrationPolicyTaskID    = "99000000-0000-4000-8000-000000000005"
+	integrationPanicTaskID     = "99000000-0000-4000-8000-000000000006"
 	integrationEvidenceID      = "a1000000-0000-4000-8000-000000000001"
 	integrationReceiptID       = "b1000000-0000-4000-8000-000000000001"
 	integrationRunnerID        = "read-runner-repository-integration"
@@ -104,13 +106,14 @@ func TestRepositoryPostgres16PersistsAuthenticatedLifecycleAndCompletionReplay(t
 		scope execution.RunnerScope,
 		certificate readtask.CertificateBinding,
 	) (readtask.HeartbeatResult, error) {
-		return fixture.tasks.HeartbeatRunnerTx(
+		return fixture.tasks.HeartbeatRunnerAuthorizedTx(
 			ctx, tx, scope, certificate,
 			readtask.Heartbeat{Fence: claim.Fence(), Sequence: 1}, 30*time.Second,
+			func(context.Context, readtask.Descriptor) error { return nil },
 		)
 	})
 	if err != nil || heartbeat.Directive != readtask.HeartbeatContinue || heartbeat.AcceptedSequence != 1 {
-		t.Fatalf("HeartbeatRunnerTx(real PostgreSQL) = %#v, %v", heartbeat, err)
+		t.Fatalf("HeartbeatRunnerAuthorizedTx(real PostgreSQL) = %#v, %v", heartbeat, err)
 	}
 
 	collectedAt := time.Now().UTC().Truncate(time.Microsecond)
@@ -173,6 +176,7 @@ func TestRepositoryPostgres16PersistsAuthenticatedLifecycleAndCompletionReplay(t
 	verifySingleCompletionProjection(t, fixture.database)
 	verifyConcurrentSingleWinnerClaim(t, ctx, fixture)
 	verifyOldEpochAndTokenRejected(t, ctx, fixture)
+	verifyHeartbeatPolicyTerminationPersists(t, ctx, fixture)
 	verifyScopeRevisionDriftTerminatesAndTerminalHistoryIsImmutable(t, ctx, fixture)
 	if _, err := fixture.database.Exec(ctx, `
 		UPDATE runner_registrations
@@ -183,6 +187,135 @@ func TestRepositoryPostgres16PersistsAuthenticatedLifecycleAndCompletionReplay(t
 	}
 	verifyCommittedRecoveryWithoutCompletionBody(t, ctx, fixture.database, claim.Descriptor(), completed)
 	verifyUnsafeRunnerIngressDownIsAtomic(t, ctx, fixture)
+}
+
+func verifyHeartbeatPolicyTerminationPersists(
+	t *testing.T,
+	ctx context.Context,
+	fixture *repositoryIntegrationFixture,
+) {
+	t.Helper()
+	for _, test := range []struct {
+		name       string
+		taskID     string
+		replay     bool
+		canary     string
+		authorizer func(context.Context, readtask.Descriptor) error
+	}{
+		{
+			name: "next sequence rejection", taskID: integrationPolicyTaskID,
+			canary: "READ-HEARTBEAT-POLICY-ERROR-CANARY",
+			authorizer: func(context.Context, readtask.Descriptor) error {
+				return errors.New("READ-HEARTBEAT-POLICY-ERROR-CANARY")
+			},
+		},
+		{
+			name: "same sequence panic", taskID: integrationPanicTaskID, replay: true,
+			canary: "READ-HEARTBEAT-POLICY-PANIC-CANARY",
+			authorizer: func(context.Context, readtask.Descriptor) error {
+				panic("READ-HEARTBEAT-POLICY-PANIC-CANARY")
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			claim, err := repositoryRunnerTransaction(ctx, fixture, func(
+				tx pgx.Tx,
+				scope execution.RunnerScope,
+				certificate readtask.CertificateBinding,
+			) (readtask.Claim, error) {
+				return fixture.tasks.ClaimRunnerTx(ctx, tx, scope, certificate, test.taskID, 30*time.Second)
+			})
+			if err != nil {
+				t.Fatalf("claim heartbeat-policy task: %v", err)
+			}
+			defer claim.Destroy()
+
+			started, err := repositoryRunnerTransaction(ctx, fixture, func(
+				tx pgx.Tx,
+				scope execution.RunnerScope,
+				certificate readtask.CertificateBinding,
+			) (readtask.Attempt, error) {
+				return fixture.tasks.StartRunnerAuthorizedTx(
+					ctx, tx, scope, certificate, readtask.Start{Fence: claim.Fence()}, trustedReadTaskAuthorizer,
+				)
+			})
+			if err != nil || started.Status != readtask.AttemptRunning {
+				t.Fatalf("start heartbeat-policy task = %#v, %v", started, err)
+			}
+
+			leaseBeforeRejection := started.LeaseExpiresAt
+			lastHeartbeatBeforeRejection := started.LastHeartbeatAt
+			if test.replay {
+				continued, continueErr := repositoryRunnerTransaction(ctx, fixture, func(
+					tx pgx.Tx,
+					scope execution.RunnerScope,
+					certificate readtask.CertificateBinding,
+				) (readtask.HeartbeatResult, error) {
+					return fixture.tasks.HeartbeatRunnerAuthorizedTx(
+						ctx, tx, scope, certificate,
+						readtask.Heartbeat{Fence: claim.Fence(), Sequence: 1}, 30*time.Second,
+						trustedReadTaskAuthorizer,
+					)
+				})
+				if continueErr != nil || continued.Directive != readtask.HeartbeatContinue {
+					t.Fatalf("prime heartbeat replay = %#v, %v", continued, continueErr)
+				}
+				leaseBeforeRejection = continued.Attempt.LeaseExpiresAt
+				lastHeartbeatBeforeRejection = continued.Attempt.LastHeartbeatAt
+			}
+
+			terminated, err := repositoryRunnerTransaction(ctx, fixture, func(
+				tx pgx.Tx,
+				scope execution.RunnerScope,
+				certificate readtask.CertificateBinding,
+			) (readtask.HeartbeatResult, error) {
+				return fixture.tasks.HeartbeatRunnerAuthorizedTx(
+					ctx, tx, scope, certificate,
+					readtask.Heartbeat{Fence: claim.Fence(), Sequence: 1}, 30*time.Second,
+					test.authorizer,
+				)
+			})
+			if err != nil || terminated.Directive != readtask.HeartbeatTerminate ||
+				terminated.AcceptedSequence != 1 || terminated.Attempt.Status != readtask.AttemptCancelled ||
+				!terminated.Attempt.LeaseExpiresAt.Equal(leaseBeforeRejection) {
+				t.Fatalf("heartbeat policy termination = %#v, %v", terminated, err)
+			}
+			if strings.Contains(fmt.Sprintf("%#v %v", terminated, err), test.canary) {
+				t.Fatal("heartbeat policy termination exposed callback canary")
+			}
+			if test.replay && !terminated.Attempt.LastHeartbeatAt.Equal(lastHeartbeatBeforeRejection) {
+				t.Fatalf("same-sequence rejection changed last heartbeat: before=%s after=%s",
+					lastHeartbeatBeforeRejection, terminated.Attempt.LastHeartbeatAt)
+			}
+			if !test.replay && !terminated.Attempt.LastHeartbeatAt.After(lastHeartbeatBeforeRejection) {
+				t.Fatalf("next-sequence rejection did not advance accepted heartbeat: before=%s after=%s",
+					lastHeartbeatBeforeRejection, terminated.Attempt.LastHeartbeatAt)
+			}
+
+			var status, attemptDocument string
+			var heartbeatSequence int64
+			var lastHeartbeatAt, leaseExpiresAt, terminalAt, updatedAt time.Time
+			if err := fixture.database.QueryRow(ctx, `
+				SELECT status, heartbeat_seq, last_heartbeat_at, lease_expires_at,
+				       terminal_at, updated_at, to_jsonb(attempt)::text
+				FROM investigation_task_attempts AS attempt
+				WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid
+				  AND investigation_id = $3::uuid AND task_id = $4::uuid AND lease_epoch = 1
+			`, integrationTenantID, integrationWorkspaceID, integrationInvestigationID, test.taskID).Scan(
+				&status, &heartbeatSequence, &lastHeartbeatAt, &leaseExpiresAt,
+				&terminalAt, &updatedAt, &attemptDocument,
+			); err != nil {
+				t.Fatalf("inspect committed heartbeat policy termination: %v", err)
+			}
+			if status != "CANCELLED" || heartbeatSequence != 1 ||
+				!lastHeartbeatAt.Equal(terminated.Attempt.LastHeartbeatAt) ||
+				!leaseExpiresAt.Equal(leaseBeforeRejection) || !terminalAt.Equal(terminated.Attempt.TerminalAt) ||
+				!updatedAt.Equal(terminalAt) || strings.Contains(attemptDocument, test.canary) {
+				t.Fatalf("committed heartbeat policy termination = status:%q sequence:%d last:%s lease:%s terminal:%s updated:%s document:%s",
+					status, heartbeatSequence, lastHeartbeatAt, leaseExpiresAt, terminalAt, updatedAt, attemptDocument)
+			}
+		})
+	}
 }
 
 func verifyCommittedRecoveryWithoutCompletionBody(
@@ -465,8 +598,9 @@ func verifyScopeRevisionDriftTerminatesAndTerminalHistoryIsImmutable(
 		scope execution.RunnerScope,
 		certificate readtask.CertificateBinding,
 	) (readtask.HeartbeatResult, error) {
-		return fixture.tasks.HeartbeatRunnerTx(ctx, tx, scope, certificate,
-			readtask.Heartbeat{Fence: claim.Fence(), Sequence: 1}, 30*time.Second)
+		return fixture.tasks.HeartbeatRunnerAuthorizedTx(ctx, tx, scope, certificate,
+			readtask.Heartbeat{Fence: claim.Fence(), Sequence: 1}, 30*time.Second,
+			func(context.Context, readtask.Descriptor) error { return nil })
 	})
 	if err != nil || terminated.Directive != readtask.HeartbeatTerminate ||
 		terminated.AcceptedSequence != 1 || terminated.Attempt.Status != readtask.AttemptCancelled {
@@ -1120,6 +1254,7 @@ func seedRuntimeInvestigation(t *testing.T, database *pgxpool.Pool) {
 	connectorID := "prometheus-staging-v1-" + connectorDigest
 	taskIDs := []string{
 		integrationLifecycleTaskID, integrationClaimTaskID, integrationFenceTaskID, integrationDriftTaskID,
+		integrationPolicyTaskID, integrationPanicTaskID,
 	}
 	taskSpecs := make([]investigation.TaskSpec, len(taskIDs))
 	for index := range taskIDs {

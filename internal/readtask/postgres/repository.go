@@ -404,16 +404,41 @@ func (repository *Repository) startRunnerTx(
 	return attempt, nil
 }
 
-// HeartbeatRunnerTx accepts exactly one next sequence and lets PostgreSQL pick
-// the effective lease time. Replays of the last accepted sequence never
-// extend the lease.
-func (repository *Repository) HeartbeatRunnerTx(
+// HeartbeatAuthorizer re-proves the complete immutable runtime contract while
+// the Task, Attempt, and parent Investigation remain locked. The detached
+// descriptor contains no lease bearer or certificate material.
+type HeartbeatAuthorizer func(context.Context, readtask.Descriptor) error
+
+// HeartbeatRunnerAuthorizedTx accepts exactly one next sequence and lets
+// PostgreSQL pick the effective lease time. Every valid next sequence and
+// replay of the last accepted sequence reruns the trusted runtime authorizer.
+// For either legal sequence shape, a rejected or panicking authorizer
+// atomically cancels a still-current attempt and returns TERMINATE without
+// extending the lease. Expired attempts stay stale, and malformed sequence
+// jumps remain conflicts; neither can be revived.
+func (repository *Repository) HeartbeatRunnerAuthorizedTx(
 	ctx context.Context,
 	tx pgx.Tx,
 	scope execution.RunnerScope,
 	certificate readtask.CertificateBinding,
 	heartbeat readtask.Heartbeat,
 	extension time.Duration,
+	authorizer HeartbeatAuthorizer,
+) (readtask.HeartbeatResult, error) {
+	if authorizer == nil {
+		return readtask.HeartbeatResult{}, readtask.ErrInvalidRequest
+	}
+	return repository.heartbeatRunnerTx(ctx, tx, scope, certificate, heartbeat, extension, authorizer)
+}
+
+func (repository *Repository) heartbeatRunnerTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	scope execution.RunnerScope,
+	certificate readtask.CertificateBinding,
+	heartbeat readtask.Heartbeat,
+	extension time.Duration,
+	authorizer HeartbeatAuthorizer,
 ) (readtask.HeartbeatResult, error) {
 	if err := validateRunnerRequest(ctx, tx, scope, certificate); err != nil {
 		return readtask.HeartbeatResult{}, err
@@ -445,6 +470,9 @@ func (repository *Repository) HeartbeatRunnerTx(
 	if err != nil {
 		return readtask.HeartbeatResult{}, err
 	}
+	descriptor := task.descriptor
+	descriptor.Input = bytes.Clone(task.descriptor.Input)
+	runtimeCurrent := authorizeHeartbeatRuntime(ctx, authorizer, descriptor)
 	databaseNow, err := databaseClock(ctx, tx)
 	if err != nil {
 		return readtask.HeartbeatResult{}, err
@@ -452,7 +480,7 @@ func (repository *Repository) HeartbeatRunnerTx(
 
 	identityCurrent := attemptIdentityCurrent(scope, certificate, task.descriptor, attempt)
 	leaseCurrent := databaseNow.Before(attempt.LeaseExpiresAt)
-	shouldTerminate := !identityCurrent || task.taskStatus != "RUNNING" || parentStatus != "RUNNING"
+	shouldTerminate := !identityCurrent || !runtimeCurrent || task.taskStatus != "RUNNING" || parentStatus != "RUNNING"
 	if heartbeat.Sequence == attempt.HeartbeatSequence {
 		if !leaseCurrent && attempt.Status == readtask.AttemptRunning {
 			return readtask.HeartbeatResult{}, readtask.ErrStaleFence
@@ -540,6 +568,19 @@ func (repository *Repository) HeartbeatRunnerTx(
 		return readtask.HeartbeatResult{}, integrityError("validate READ task heartbeat", errors.New("invalid attempt projection"))
 	}
 	return heartbeatResult(task.descriptor, attempt, readtask.HeartbeatContinue)
+}
+
+func authorizeHeartbeatRuntime(
+	ctx context.Context,
+	authorizer HeartbeatAuthorizer,
+	descriptor readtask.Descriptor,
+) (authorized bool) {
+	defer func() {
+		if recover() != nil {
+			authorized = false
+		}
+	}()
+	return authorizer != nil && authorizer(ctx, descriptor) == nil
 }
 
 func heartbeatResult(

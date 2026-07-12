@@ -7,7 +7,7 @@ HTTP headers, arbitrary command material, or network client.
 
 This milestone does **not** wire the registry into the live Control Plane.
 M5C2-4a now installs a sealed closed Admission while the existing disabled
-start/completion callbacks remain installed. The Admission also prevents an old
+start/heartbeat/completion callbacks remain installed. The Admission also prevents an old
 lease from advancing during a rolling upgrade. Only M5C2-4c may replace those callbacks atomically, after
 the READ Runner, Temporal dispatch, target/egress manifests, and component/profile
 digest checks are ready together; assembly does not itself authorize claims.
@@ -106,12 +106,17 @@ credentials. C2-4c must make Gateway and READ Runner prove the same registry,
 target, egress and executor profile digests before any later claim decision.
 A mismatch is a startup failure, not a partial registry fallback.
 
-The current READ heartbeat revalidates Runner identity/scope but does not yet
-re-run connector admission. Removing a definition while an attempt is already
-`RUNNING` can therefore allow reads until that short lease expires, although
-typed completion will reject its Evidence. Before claims are enabled, the
-assembly path must bind the attempt's contract/target digest into heartbeat
-authorization, or atomically cancel and drain all affected attempts; mixed
+READ heartbeat now revalidates Runner identity/scope and requires a trusted
+server-side `HeartbeatAuthorizer` inside the same locked transaction. Every
+valid next sequence and same-sequence replay must re-prove the full Bundle and
+connector admission. For either legal sequence shape, rejection or panic
+atomically cancels a still-current attempt and returns `TERMINATE` without
+extending its lease; expired attempts stay stale and malformed jumps remain
+conflicts, so neither can be revived. The production assembly must install
+`Bundle.AuthorizeHeartbeat` before any future claim Go/No-Go; the current
+closed Admission still rejects the request before the authorizer or READ task
+mutation transaction is reached. The outer mTLS identity middleware continues
+its per-request PostgreSQL registration/certificate/scope revalidation. Mixed
 registry versions remain forbidden.
 
 Prometheus v1 accepts matrix samples only; native histograms fail the task.

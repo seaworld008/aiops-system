@@ -97,6 +97,7 @@ func newRunnerGatewayRuntime(
 		// assembly alone must not let a new or pre-existing lease progress.
 		Admission:            readgateway.NewClosedAdmission(),
 		StartAuthorizer:      disabledReadTaskStart,
+		HeartbeatAuthorizer:  disabledReadTaskHeartbeat,
 		CompletionAuthorizer: disabledReadTaskCompletion,
 	})
 	if err != nil {
@@ -123,6 +124,10 @@ func readTaskLeaseEntropy() ([]byte, error) {
 }
 
 func disabledReadTaskStart(context.Context, readtask.Descriptor) error {
+	return readtask.ErrClaimsDisabled
+}
+
+func disabledReadTaskHeartbeat(context.Context, readtask.Descriptor) error {
 	return readtask.ErrClaimsDisabled
 }
 

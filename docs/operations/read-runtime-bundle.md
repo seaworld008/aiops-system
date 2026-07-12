@@ -1,7 +1,7 @@
 # READ Runtime Bundle 与关闭态 Admission
 
 日期：2026-07-11
-阶段：M5C2-4a（进程装配前的不可变运行时与 READ-only 客户端；READ claims 关闭）
+阶段：M5C2-4a / M5C2-4c0（不可变运行时与 heartbeat 重授权；READ claims 关闭）
 
 ## 目的与硬边界
 
@@ -14,13 +14,19 @@ M5C2-4a 先消除两个不能留到 live assembly 才处理的信任缺口：
 
 本阶段因此新增单一、不可复制的关闭态 READ Admission，以及不可变 `read-runtime-bundle.v1`。
 Control Plane 只能构造关闭态 Admission；没有公开 open 构造器，也没有环境变量或配置值可以
-开启 READ claim。关闭态在开始数据库事务或调用任何 authorizer 之前拒绝 Claim、Start、Heartbeat
-和 Complete，只保留 GO 前 Release，使旧 lease 也不能借由安装真实 callback 继续推进。
+开启 READ claim。关闭态在开始 READ task mutation 事务或调用任何 authorizer 之前拒绝 Claim、
+Start、Heartbeat 和 Complete，只保留 GO 前 Release，使旧 lease 也不能借由安装真实 callback
+继续推进。mTLS listener 外层仍会访问 PostgreSQL 重新验证 Runner registration、证书与 scope；
+Admission 不绕过这项每请求身份复验。
 
 本阶段还提供独立 `internal/readrunnerclient`。它只包含 READ pool 的 mTLS transport 与 READ Task
 操作，不导入 WRITE action、execution、credential、revocation、隔离执行器或 mutation adapter。
 该客户端尚未由 `cmd/read-runner` 使用；Worker、Outbox dispatcher、Temporal runtime v2 和真实
 Bearer provider 也仍未装配。因此 M5C2-4a 不是开放 claim 的 Go/No-Go 证据。
+
+M5C2-4c0 进一步把 heartbeat 改为强制 server-owned authorizer：Task、Attempt 与 Investigation
+保持锁定时，对每个合法 next sequence 和 same-sequence replay 重验完整 Bundle。它只补齐安全
+续租边界，不新增配置、迁移、open Admission、Worker/Runner 装配或 claim 开关。
 
 ## Egress manifest 与 registry
 
@@ -82,10 +88,12 @@ read-runtime-bundle.v1
   executor_profile_digest
 ```
 
-`AuthorizeStart` 与 `AuthorizeCompletion` 不只调用 connector validator。两者都会先用 Bundle 中的
+`AuthorizeStart`、`AuthorizeHeartbeat` 与 `AuthorizeCompletion` 不只调用 connector validator。三者都会先用 Bundle 中的
 exact connector/target/policy/profile 重建三个 component digest 和 aggregate RuntimeDigest，并比较
 持久 Descriptor 的 Plan RegistryDigest 与全部 RuntimeBinding；随后才执行 typed start/evidence
-admission。Runner 侧 `Prepare` 也只能由 Bundle 内部解析 execution、target 与 policy，并返回绑定
+admission。每个合法 next sequence 和相同 sequence replay 都必须重跑 `AuthorizeHeartbeat`；对这两种
+合法序号形态，漂移或 panic 会使 Gateway 在锁内终止有效 attempt，不能续租；过期 lease 仍是 stale，
+跳号仍是 conflict。Runner 侧 `Prepare` 也只能由 Bundle 内部解析 execution、target 与 policy，并返回绑定
 当前 Bundle 实例和 Bundle digest 的不可复制、一次性 capability；`Execute` 不再接受裸
 `readexecutor.Prepared`，因此另一套自洽 runtime 图也不能交换执行材料。调用方不能提交 URL、
 TargetRef、policy、query 或摘要。
