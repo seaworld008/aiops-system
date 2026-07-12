@@ -55,7 +55,9 @@ func TestTemporalDevServerReadRunnerActivitySanitizesRemoteFailure(t *testing.T)
 
 	input := validActivityInput()
 	input.OutboxEventID = uuid.NewString()
-	queue, err := investigationworkflow.RunnerTaskQueue(input.EnvironmentID, input.BundleDigest)
+	queue, err := investigationworkflow.RunnerTaskQueue(
+		input.EnvironmentID, input.ManifestDigest, input.RegistryDigest, input.BundleDigest,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,6 +72,8 @@ func TestTemporalDevServerReadRunnerActivitySanitizesRemoteFailure(t *testing.T)
 		},
 		gatewayHeartbeatInterval,
 		"default",
+		input.ManifestDigest,
+		input.RegistryDigest,
 	)
 	if err != nil {
 		t.Fatalf("newActivities() error = %v", err)
@@ -125,7 +129,9 @@ func temporalReadRunnerActivityContractWorkflow(
 	ctx workflow.Context,
 	input investigationworkflow.ReadTaskActivityInputV1,
 ) (investigationworkflow.ReadTaskActivityOutputV1, error) {
-	queue, err := investigationworkflow.RunnerTaskQueue(input.EnvironmentID, input.BundleDigest)
+	queue, err := investigationworkflow.RunnerTaskQueue(
+		input.EnvironmentID, input.ManifestDigest, input.RegistryDigest, input.BundleDigest,
+	)
 	if err != nil {
 		return investigationworkflow.ReadTaskActivityOutputV1{}, err
 	}

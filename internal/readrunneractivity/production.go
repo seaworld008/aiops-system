@@ -2,7 +2,10 @@ package readrunneractivity
 
 import (
 	"context"
+	"crypto/subtle"
+	"strings"
 
+	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/investigationworkflow"
 	"github.com/seaworld008/aiops-system/internal/readexecutor"
 	"github.com/seaworld008/aiops-system/internal/readrunnerclient"
@@ -11,22 +14,35 @@ import (
 	"go.temporal.io/sdk/activity"
 )
 
-// NewActivities accepts only the concrete, sealed READ Gateway client and
-// immutable runtime Bundle. Tests use the private constructor; production has
-// no fake, anonymous, or credential-free fallback.
+// NewActivities accepts only the concrete, sealed READ Gateway client,
+// immutable runtime Bundle, and exact reviewed Plan manifest digest. The
+// connector registry identity is derived from the Bundle, never from a task.
+// Tests use the private constructor; production has no fake, anonymous,
+// unpinned, or credential-free fallback.
 func NewActivities(
 	client *readrunnerclient.Client,
 	bundle *readruntime.Bundle,
+	planManifestDigest string,
 	credentials readexecutor.BearerSource,
 	namespace string,
 ) (*Activities, error) {
+	runtimeSummary := readruntime.Summary{}
+	if bundle != nil {
+		runtimeSummary = bundle.Summary()
+	}
 	if client == nil || !client.Ready() || bundle == nil || !bundle.Ready() || credentials == nil ||
-		!investigationworkflow.ValidTemporalNamespace(namespace) {
+		!investigationworkflow.ValidTemporalNamespace(namespace) || !domain.ValidSHA256Hex(planManifestDigest) ||
+		runtimeSummary.Validate() != nil {
 		return nil, ErrActivityRejected
+	}
+	registryDigest := runtimeSummary.ConnectorRegistryDigest
+	runtime := &planBoundRuntime{
+		inner: &bundleRuntime{bundle: bundle}, planManifestDigest: strings.Clone(planManifestDigest),
+		connectorRegistryDigest: strings.Clone(registryDigest),
 	}
 	return newActivities(
 		&clientGateway{client: client},
-		&bundleRuntime{bundle: bundle},
+		runtime,
 		credentials,
 		activityRuntime{
 			info:      activity.GetInfo,
@@ -35,6 +51,8 @@ func NewActivities(
 		},
 		gatewayHeartbeatInterval,
 		namespace,
+		planManifestDigest,
+		registryDigest,
 	)
 }
 
@@ -141,6 +159,40 @@ func (lease *clientLease) Destroy() {
 	if lease != nil && lease.lease != nil {
 		lease.lease.Destroy()
 	}
+}
+
+type planBoundRuntime struct {
+	inner                   runtimeProtocol
+	planManifestDigest      string
+	connectorRegistryDigest string
+}
+
+func (runtime *planBoundRuntime) BundleDigest() string {
+	if runtime == nil || nilInterface(runtime.inner) {
+		return ""
+	}
+	return runtime.inner.BundleDigest()
+}
+
+func (runtime *planBoundRuntime) Prepare(
+	ctx context.Context,
+	descriptor readtask.Descriptor,
+	epoch int64,
+	scopeRevision int64,
+) (preparedSession, error) {
+	if runtime == nil || nilInterface(runtime.inner) {
+		return nil, ErrActivityRejected
+	}
+	if descriptor.PlanBinding.Validate() != nil || !domain.ValidSHA256Hex(runtime.planManifestDigest) ||
+		!domain.ValidSHA256Hex(runtime.connectorRegistryDigest) ||
+		subtle.ConstantTimeCompare(
+			[]byte(descriptor.PlanBinding.ManifestDigest), []byte(runtime.planManifestDigest),
+		) != 1 || subtle.ConstantTimeCompare(
+		[]byte(descriptor.PlanBinding.RegistryDigest), []byte(runtime.connectorRegistryDigest),
+	) != 1 {
+		return nil, ErrActivityRejected
+	}
+	return runtime.inner.Prepare(ctx, descriptor, epoch, scopeRevision)
 }
 
 type bundleRuntime struct{ bundle *readruntime.Bundle }

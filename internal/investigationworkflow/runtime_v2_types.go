@@ -1,6 +1,7 @@
 package investigationworkflow
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,7 +36,8 @@ const (
 	ReadTaskRecoveryWait                 = 35 * time.Second
 
 	controlTaskQueuePrefixV2      = "aiops-investigation-read-v2"
-	runnerTaskQueuePrefixV1       = "aiops-investigation-read-task-v1"
+	runnerTaskQueuePrefixV2       = "aiops-investigation-read-task-v2"
+	runnerTaskQueueHashDomainV2   = "aiops.investigation.read-task-queue.v2\x00"
 	maximumTemporalTaskQueueBytes = 255
 )
 
@@ -494,11 +496,20 @@ func ControlTaskQueue(manifestDigest, registryDigest, bundleDigest string) (stri
 	return queue, nil
 }
 
-func RunnerTaskQueue(environmentID, bundleDigest string) (string, error) {
-	if !workflowUUID.MatchString(environmentID) || !domain.ValidSHA256Hex(bundleDigest) {
+func RunnerTaskQueue(
+	environmentID string,
+	manifestDigest string,
+	registryDigest string,
+	bundleDigest string,
+) (string, error) {
+	if !workflowUUID.MatchString(environmentID) || !domain.ValidSHA256Hex(manifestDigest) ||
+		!domain.ValidSHA256Hex(registryDigest) || !domain.ValidSHA256Hex(bundleDigest) {
 		return "", ErrInvalidRuntimeV2Input
 	}
-	queue := fmt.Sprintf("%s-%s-%s", runnerTaskQueuePrefixV1, environmentID, bundleDigest)
+	identity := sha256.Sum256([]byte(
+		runnerTaskQueueHashDomainV2 + manifestDigest + "\x00" + registryDigest + "\x00" + bundleDigest,
+	))
+	queue := fmt.Sprintf("%s-%s-%x", runnerTaskQueuePrefixV2, environmentID, identity)
 	if len(queue) > maximumTemporalTaskQueueBytes {
 		return "", ErrInvalidRuntimeV2Input
 	}

@@ -1,7 +1,7 @@
 # READ Runtime Bundle 与关闭态 Admission
 
 日期：2026-07-11
-阶段：M5C2-4a / M5C2-4c0（不可变运行时与 heartbeat 重授权；READ claims 关闭）
+阶段：M5C2-4a / M5C2-4c0 / M5C2-4c1a（不可变运行时、heartbeat 重授权与原子装配快照；READ claims 关闭）
 
 ## 目的与硬边界
 
@@ -27,6 +27,12 @@ Bearer provider 也仍未装配。因此 M5C2-4a 不是开放 claim 的 Go/No-Go
 M5C2-4c0 进一步把 heartbeat 改为强制 server-owned authorizer：Task、Attempt 与 Investigation
 保持锁定时，对每个合法 next sequence 和 same-sequence replay 重验完整 Bundle。它只补齐安全
 续租边界，不新增配置、迁移、open Admission、Worker/Runner 装配或 claim 开关。
+
+M5C2-4c1a 新增 `internal/readassembly.Snapshot`，把 Plan、同一 Connector 实例、Target、Egress 与
+固定 Executor Profile 作为一个经过部署摘要钉住的语义快照发布。Snapshot 不导出 Planner、
+ScopeAuthority、Registry 或 Bundle 原始 getter；Control Plane/Worker 只能使用窄的 plan resolve、
+task/runtime binding、start/heartbeat/completion authorizer 门面，以及直接构造 Runtime v2/READ Runner
+Activities 的高层工厂，不能取得私有组件后把不同快照重新混装。
 
 ## Egress manifest 与 registry
 
@@ -97,6 +103,46 @@ admission。每个合法 next sequence 和相同 sequence replay 都必须重跑
 当前 Bundle 实例和 Bundle digest 的不可复制、一次性 capability；`Execute` 不再接受裸
 `readexecutor.Prepared`，因此另一套自洽 runtime 图也不能交换执行材料。调用方不能提交 URL、
 TargetRef、policy、query 或摘要。
+
+## 原子装配 Snapshot
+
+`readassembly.LoadFiles` 要求四个 owner-only、clean absolute 且彼此不同的文件路径：Connector、
+Investigation Plan、Target 与 Egress。调用方还必须提供完整 `read-assembly-snapshot.v1` 预期摘要：
+
+```text
+plan_manifest_digest
+connector_registry_digest
+target_registry_digest
+egress_registry_digest
+executor_profile_digest
+bundle_digest
+```
+
+预期摘要缺失、非规范、内部 Bundle 摘要不自洽或与任一已加载组件不符时，进程启动失败；不存在
+“摘要为空则接受当前文件”、inline fallback、reload 或 global current。Plan 与 Bundle 必须共享同一
+Connector 实例，ScopeAuthority 只能在 loader 内创建。所有局部组件、依赖图及摘要验证完成后才发布
+sealed/self Snapshot；任一失败或 panic 都返回 nil 和固定低敏错误，只有 caller context 的取消/超时
+保留可分类语义。这里仅接受精确的 Go canonical `context.Canceled` / `context.DeadlineExceeded`；包装、
+自定义或 panic context 全部折叠，不能把路径或 Secret 文本带出。最终 Summary 从验证成功的实际
+Planner/Bundle 重新生成并复制字符串，不持有调用方 Expected digest 的 backing storage。
+
+`Bind` 与三类 Runner authorizer 除验证 RuntimeBinding 外，还强制 PlanBinding 的 Manifest/Registry
+摘要等于本 Snapshot，阻止另一套自洽 Plan 复用相同 runtime 图。Snapshot 的两个 Activities 工厂只把
+私有 authority/planner 或 Bundle 直接交给既有 sealed production constructor；复制、零值、依赖缺失或
+namespace 非法都拒绝，API 仍不提供 Prepare/Execute/registry 原始能力。READ Runner Activity 还会在
+任何 Temporal heartbeat 或 Gateway Claim 前常量时间核对 Snapshot 的 Plan Manifest/Connector Registry；
+production runtime 在 `Bundle.Prepare` 前再对 lease Descriptor 重复核对。因此即使 Runner task queue 的
+路由被绕过，旧 Plan 或外部 Plan 的任务也不能进入 Claim/Prepare/Execute。正常路由使用 v2 Runner queue：
+Environment 加 Plan/Registry/Bundle 的 domain-separated deployment SHA-256；相同 Bundle 的两代 Plan
+因此不会竞争同一队列并随机消耗单次 Activity attempt。
+
+这里的“原子”是经过完整预期摘要钉住后的语义原子发布，不是跨多个文件的 wall-clock 文件系统
+事务。每个文件（包括 Target 引用的 CA bundle）仍由 secure manifest loader 独立取得稳定快照；部署
+更新途中若读到混合版本，要么所有摘要完全等价，要么拒绝启动。生产 rollout 仍必须使用不可变版本
+目录与新进程，禁止热替换。
+
+Snapshot Ready 只证明本地只读图完整，不能作为 READ Admission、Outbox dispatcher 或生产写的
+开启信号。本子阶段不新增配置、迁移、`cmd/*` 装配、Bearer provider 或 claim 开关。
 
 ## 独立 READ Runner client
 

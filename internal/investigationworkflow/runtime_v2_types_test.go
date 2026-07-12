@@ -22,18 +22,62 @@ func TestRuntimeV2QueuesBindFullImmutableIdentity(t *testing.T) {
 		len(control) > 255 {
 		t.Fatalf("ControlTaskQueue() = %q, %v", control, err)
 	}
-	runner, err := investigationworkflow.RunnerTaskQueue(runtimeV2Environment, input.BundleDigest)
-	if err != nil || !strings.Contains(runner, runtimeV2Environment) ||
-		!strings.Contains(runner, input.BundleDigest) || strings.Contains(runner, input.ManifestDigest) ||
+	runner, err := investigationworkflow.RunnerTaskQueue(
+		runtimeV2Environment, input.ManifestDigest, input.RegistryDigest, input.BundleDigest,
+	)
+	const expectedRunnerQueue = "aiops-investigation-read-task-v2-60606060-6060-4060-8060-606060606060-" +
+		"01b6dff296a64c11cbe12e3adb7090a808c7ff98f600357b7dd22d6811a88a5c"
+	if err != nil || runner != expectedRunnerQueue || !strings.Contains(runner, runtimeV2Environment) ||
+		strings.Contains(runner, input.BundleDigest) || strings.Contains(runner, input.ManifestDigest) ||
 		strings.Contains(runner, input.RegistryDigest) || len(runner) > 255 ||
-		!strings.HasPrefix(runner, "aiops-investigation-read-task-v1-") {
+		!strings.HasPrefix(runner, "aiops-investigation-read-task-v2-") {
 		t.Fatalf("RunnerTaskQueue() = %q, %v", runner, err)
+	}
+	for name, mutate := range map[string]func(*investigationworkflow.WorkflowInputV2){
+		"Plan":     func(value *investigationworkflow.WorkflowInputV2) { value.ManifestDigest = strings.Repeat("a", 64) },
+		"Registry": func(value *investigationworkflow.WorkflowInputV2) { value.RegistryDigest = strings.Repeat("b", 64) },
+		"Bundle":   func(value *investigationworkflow.WorkflowInputV2) { value.BundleDigest = strings.Repeat("c", 64) },
+	} {
+		t.Run("foreign "+name, func(t *testing.T) {
+			foreign := input
+			mutate(&foreign)
+			foreignQueue, err := investigationworkflow.RunnerTaskQueue(
+				runtimeV2Environment, foreign.ManifestDigest, foreign.RegistryDigest, foreign.BundleDigest,
+			)
+			if err != nil || foreignQueue == runner {
+				t.Fatalf("RunnerTaskQueue(foreign %s) = %q, %v", name, foreignQueue, err)
+			}
+		})
+	}
+	foreignEnvironmentQueue, err := investigationworkflow.RunnerTaskQueue(
+		"61616161-6161-4161-8161-616161616161",
+		input.ManifestDigest,
+		input.RegistryDigest,
+		input.BundleDigest,
+	)
+	if err != nil || foreignEnvironmentQueue == runner {
+		t.Fatalf("RunnerTaskQueue(foreign Environment) = %q, %v", foreignEnvironmentQueue, err)
 	}
 	if _, err := investigationworkflow.ControlTaskQueue(input.ManifestDigest, input.RegistryDigest, ""); !errors.Is(err, investigationworkflow.ErrInvalidRuntimeV2Input) {
 		t.Fatalf("ControlTaskQueue(missing Bundle) error = %v", err)
 	}
-	if _, err := investigationworkflow.RunnerTaskQueue(runtimeV2Environment, strings.Repeat("A", 64)); !errors.Is(err, investigationworkflow.ErrInvalidRuntimeV2Input) {
-		t.Fatalf("RunnerTaskQueue(uppercase Bundle) error = %v", err)
+	invalidQueues := map[string]struct {
+		environment string
+		manifest    string
+		registry    string
+		bundle      string
+	}{
+		"environment": {environment: "foreign", manifest: input.ManifestDigest, registry: input.RegistryDigest, bundle: input.BundleDigest},
+		"Plan":        {environment: runtimeV2Environment, manifest: strings.Repeat("A", 64), registry: input.RegistryDigest, bundle: input.BundleDigest},
+		"Registry":    {environment: runtimeV2Environment, manifest: input.ManifestDigest, registry: strings.Repeat("A", 64), bundle: input.BundleDigest},
+		"Bundle":      {environment: runtimeV2Environment, manifest: input.ManifestDigest, registry: input.RegistryDigest, bundle: strings.Repeat("A", 64)},
+	}
+	for name, invalid := range invalidQueues {
+		if _, err := investigationworkflow.RunnerTaskQueue(
+			invalid.environment, invalid.manifest, invalid.registry, invalid.bundle,
+		); !errors.Is(err, investigationworkflow.ErrInvalidRuntimeV2Input) {
+			t.Fatalf("RunnerTaskQueue(invalid %s) error = %v", name, err)
+		}
 	}
 }
 

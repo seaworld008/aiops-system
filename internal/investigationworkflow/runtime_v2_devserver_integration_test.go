@@ -56,7 +56,9 @@ func TestTemporalDevServerReadWorkflowV2HistoryAllowlistAndReplay(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	runnerQueue, err := investigationworkflow.RunnerTaskQueue(activityEnvironmentID, input.BundleDigest)
+	runnerQueue, err := investigationworkflow.RunnerTaskQueue(
+		activityEnvironmentID, input.ManifestDigest, input.RegistryDigest, input.BundleDigest,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
