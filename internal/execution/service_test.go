@@ -550,6 +550,11 @@ func TestRunNextHeartbeatLossDuringIssuanceNeverStartsExecutor(t *testing.T) {
 	// a loaded race-enabled CI runner.
 	fixture.service.heartbeatInterval = 2 * time.Second
 	fixture.service.finalizeTimeout = 5 * time.Second
+	// This case verifies the durable pending-cleanup handoff. The shared fixture
+	// normally completes revocation synchronously, which makes the assertion
+	// depend on whether the cancellation deadline beats the fake revocation
+	// worker on a loaded CI host.
+	fixture.credentials.terminalOnRequest = false
 	fixture.leases.heartbeatErr = errors.New("heartbeat lease lost")
 	fixture.leases.heartbeatErrAfter = 2
 	heartbeatFailureEnabled := make(chan struct{})

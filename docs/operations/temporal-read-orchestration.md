@@ -1,14 +1,54 @@
 # Temporal READ investigation orchestration
 
-阶段：M5C2-4b / M5C2-4c1a / M5C2-4c1b（版本化只读编排、Plan-bound Runner 路由与角色隔离的
-Temporal 控制边界；尚未进行进程装配，READ claims 关闭）
+阶段：M5C2-4b / M5C2-4c1a / M5C2-4c1b / M5C2-4c2a（版本化只读编排、Plan-bound Runner
+路由、角色隔离的 Temporal 控制边界与 fail-closed 子进程 containment；真实 Worker/Outbox/Runner
+尚未装配，READ claims 关闭）
 
 本阶段把既有 investigation preparation、持久 READ Task、mTLS Gateway、结果恢复和 atomic
 runtime Bundle 连接成可 replay 的 Temporal v2 协议，并由不可互换的 Starter/Control Client、严格
-converter、sealed Starter/Control Worker 和 Snapshot 高层工厂封闭控制侧装配边界，但不修改 `cmd/*`、
-配置、Outbox dispatcher、Gateway Admission、迁移或业务 HTTP API。Control Plane 仍安装关闭态
+converter、sealed Starter/Control Worker 和 Snapshot 高层工厂封闭控制侧装配边界。C2-4c2a 只把
+`cmd/worker` 变成固定 self-reexec 父监督器；它不装配 Temporal、PostgreSQL 或 Outbox，隐藏 child 会在
+READY 前固定失败。该切片不修改配置、Outbox dispatcher、Gateway Admission、迁移或业务 HTTP API。Control Plane 仍安装关闭态
 Admission，生产代码仍没有打开 READ claims 的构造器；WRITE claims 与 production write 也继续不存在
 启用路径。
+
+## C2-4c2a 进程级 containment
+
+C2-4c2a 只建立“父进程能否确定性终止并回收失控 Worker 子进程”的底座，不宣称 live Worker 或
+fatal/normal-stop overlap 门禁已经完成：
+
+- 外部 `cmd/worker` 仍只接受零参数。父进程在 Linux 固定执行 `/proc/self/exe` 和唯一隐藏 child 参数，
+  不接受 executable、argv、shell、环境变量或超时覆盖；child 必须持有父进程通过匿名 pipe 继承的状态
+  FD，直接伪造隐藏参数会 fail closed。
+- child 使用独立进程组和 `Pdeathsig=SIGKILL`，无 stdin、空环境和固定工作目录；stdout/stderr 仅进入
+  有界丢弃 sink，任何内容或退出文本都不能进入父进程错误、日志或审计。child 接受状态 FD 后立即设置
+  `CLOEXEC`，后续意外 exec 不能继承状态写能力。
+- 状态协议在启动期只允许单字节 `READY` 或 `FATAL`，READY 后只允许最多一次 `FATAL`。Supervisor 与
+  状态 FD capability 都带 self/seal 校验，值复制不能产生第二次 Run 或重复状态写权限。未知、重复、
+  额外字节、READY 前 EOF、通知丢失或输出洪泛全部按协议破坏处理。
+- 启动最长 30 秒；启动失败按 `SIGTERM → 2 秒 → SIGKILL → Wait` 收敛。正常关闭按
+  `SIGTERM → 45 秒 → SIGKILL → Wait` 收敛，45 秒覆盖 SDK 固定 35 秒 stop budget；加上两段 5 秒
+  containment/reap 确认及最多 100 毫秒退出分类后，最坏启动、正常关闭和异常路径预算分别为 42、55
+  和不超过 13 秒。
+- `FATAL` 表示 Temporal SDK 已取得自动 Stop 所有权；父进程一旦从状态协议观测到它，就不再发送 TERM，
+  而是最多等待 2 秒让 child 自行退出，随后直接 `SIGKILL → Wait`。但 context cancel 与尚在 pipe/monitor
+  中传递的 FATAL 仍可能竞争；本切片只保证该竞争被限制在可 KILL/Wait 的 child 内，不能据此声称
+  SDK Stop/auto-Stop overlap 已消失。C2-4c2b 仍须用确定性 overlap shim 验证 containment，READ claims
+  在该证据完成前继续关闭。
+- 每个 child 只有一个 goroutine 调用一次 `Wait`；stdout/stderr pipe 的 `WaitDelay` 固定为 500 毫秒，
+  防止遗留 FD 无限阻塞 Wait。leader Wait 完成后还必须以 `kill(-pgid, 0)` 得到 `ESRCH` 才能确认原
+  进程组消失；Run 不能复用，所有异常只返回固定低敏错误。
+- 当前 containment 单元是直接 child 及其原进程组，不是 cgroup：若未来受信代码新增 `setsid/setpgid` 或
+  产生脱离进程组的后代，该后代不受 `kill(-pgid)` 或直接 child 的 `Pdeathsig` 约束。C2-4c2b 必须继续
+  禁止任意子进程，并把专属 cgroup/PID namespace 作为 READ claim 前的部署门禁；本切片不把进程组测试
+  冒充 cgroup 隔离证据。
+- 本子阶段的 hidden child 在验证状态 FD 后立即关闭并以固定错误退出，从不发送 READY。两个 Temporal v2
+  Dial 仍保持零生产调用，Outbox dispatcher 未安装，READ Admission 继续关闭。
+
+下一切片必须在 child 内完成 Snapshot、PostgreSQL、Starter/Control 两套独立凭据和 Control Worker 的
+真实装配；只有 Worker `Start` 成功后才能发送 READY。正常退出顺序必须是 dispatcher → Worker Stop →
+Control client → Starter client → PostgreSQL，fatal/panic 路径则不得执行这些进程内 cleanup，而由父进程
+强制 containment。
 
 ## 角色隔离的 Temporal 控制边界
 
