@@ -616,6 +616,21 @@ func newRepositoryWriteFixture(
 	authorizer investigation.TaskSpecAuthorizer,
 ) repositoryWriteFixture {
 	t.Helper()
+	var next atomic.Uint64
+	return newRepositoryWriteFixtureWithIDFactory(t, authorizer, func() string {
+		return fmt.Sprintf("90000000-0000-4000-8000-%012x", next.Add(1))
+	})
+}
+
+func newRepositoryWriteFixtureWithIDFactory(
+	t *testing.T,
+	authorizer investigation.TaskSpecAuthorizer,
+	idFactory func() string,
+) repositoryWriteFixture {
+	t.Helper()
+	if idFactory == nil {
+		t.Fatal("repository write fixture requires an ID factory")
+	}
 	harness := newPostgresHarness(t)
 	harness.applyMigrations(t, ".up.sql", false, nil)
 	base := time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond)
@@ -636,12 +651,9 @@ func newRepositoryWriteFixture(
 	if authorizer == nil {
 		authorizer = func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error { return nil }
 	}
-	var next atomic.Uint64
 	repository, err := investigationpostgres.New(harness.extendedPool(t), investigationpostgres.Options{
-		TaskRuntimeBinder: testTaskRuntimeBinder,
-		IDFactory: func() string {
-			return fmt.Sprintf("90000000-0000-4000-8000-%012x", next.Add(1))
-		},
+		TaskRuntimeBinder:  testTaskRuntimeBinder,
+		IDFactory:          idFactory,
 		TaskSpecAuthorizer: authorizer,
 	})
 	if err != nil {

@@ -13,7 +13,7 @@ import (
 )
 
 func TestPostgresConcurrentHumanConfirmCommitsOneRootCause(t *testing.T) {
-	fixture := newRuntimeFixture(t)
+	fixture := newLatestRuntimeFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	prepareEvidenceTaskForFeedbackConcurrency(t, ctx, fixture)

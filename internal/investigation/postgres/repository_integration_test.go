@@ -53,7 +53,7 @@ func TestInvestigationLifecycleUpdateDoesNotReverseLockIncident(t *testing.T) {
 }
 
 func TestPostgresRepositoryLifecyclePersistsImmutableReplayAndHumanFeedback(t *testing.T) {
-	fixture := newRuntimeFixture(t)
+	fixture := newLatestRuntimeFixture(t)
 	ctx := context.Background()
 	payload := []byte(`{"series_count":3}`)
 	taskCompletedAt := fixture.base.Add(10 * time.Second)

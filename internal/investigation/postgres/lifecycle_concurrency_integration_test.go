@@ -11,7 +11,7 @@ import (
 )
 
 func TestPostgresConcurrentFinalizeAndFailCommitExactlyOneTerminalOutcome(t *testing.T) {
-	fixture := newRuntimeFixture(t)
+	fixture := newLatestRuntimeFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	repository := newTerminalLifecycleRepository(t, fixture)

@@ -13,7 +13,7 @@ import (
 )
 
 func TestPostgresFailQueuedInvestigationCancelsTasksAndOwnsReplayKey(t *testing.T) {
-	fixture := newRuntimeFixture(t)
+	fixture := newLatestRuntimeFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	repository := newTerminalLifecycleRepository(t, fixture)
@@ -61,7 +61,7 @@ func TestPostgresFailQueuedInvestigationCancelsTasksAndOwnsReplayKey(t *testing.
 }
 
 func TestPostgresFinalizeModelFailedRejectsWrongDerivedStatusWithoutPartialWrite(t *testing.T) {
-	fixture := newRuntimeFixture(t)
+	fixture := newLatestRuntimeFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	repository := newTerminalLifecycleRepository(t, fixture)
@@ -123,7 +123,7 @@ func TestPostgresFinalizeModelFailedRejectsWrongDerivedStatusWithoutPartialWrite
 }
 
 func TestPostgresFinalizeSkippedPersistsPartialWithoutHypotheses(t *testing.T) {
-	fixture := newRuntimeFixture(t)
+	fixture := newLatestRuntimeFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	repository := newTerminalLifecycleRepository(t, fixture)
