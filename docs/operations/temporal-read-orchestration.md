@@ -1,6 +1,6 @@
 # Temporal READ investigation orchestration
 
-阶段：M5C2-4b / M5C2-4c1a / M5C2-4c1b / M5C2-4c2a / M5C2-4c2b0（版本化只读编排、
+阶段：M5C2-4b / M5C2-4c1a / M5C2-4c1b / M5C2-4c2a / M5C2-4c2b0 / M5C2-4c2b1a（版本化只读编排、
 Plan-bound Runner 路由、角色隔离的 Temporal 控制边界、fail-closed 子进程 containment 与预装配
 进程逃逸静态门禁；真实 Worker/Outbox/Runner 尚未装配，READ claims 关闭）
 
@@ -12,6 +12,8 @@ READY 前固定失败。该切片不修改配置、Outbox dispatcher、Gateway A
 Admission，生产代码仍没有打开 READ claims 的构造器；WRITE claims 与 production write 也继续不存在
 启用路径。C2-4c2b0 让父监督器在 TERM grace 内继续处理晚到 FATAL，并把“受信 child 代码不得创建
 或逃逸到另一进程组/namespace”固化为仓库静态门禁；它仍不安装任何 live 依赖或打开 Admission。
+C2-4c2b1a 只新增固定根 public-source snapshot 与 sealed memfd capability；架构门禁要求它保持零生产
+consumer，因此 `cmd/worker`、父子 FD 表、秘密管道、Snapshot/Temporal/PostgreSQL 装配均未改变。
 
 ## C2-4c2a 进程级 containment
 
@@ -91,6 +93,37 @@ C2-4c2b 后续装配切片必须在 child 内完成 Snapshot、PostgreSQL、Star
 真实装配；只有 Worker `Start` 成功后才能发送 READY。正常退出顺序必须是 dispatcher → Worker Stop →
 Control client → Starter client → PostgreSQL，fatal/panic 路径则不得执行这些进程内 cleanup，而由父进程
 强制 containment。
+
+## C2-4c2b1a 固定根 public-source capability
+
+`internal/workerbootstrap.OpenProductionSource` 没有参数，也不读取环境变量；唯一生产根固定为
+`/run/aiops/control-worker/v1`。Linux loader 从 `/` 开始逐级 `openat + O_NOFOLLOW`，要求祖先只由 root
+或当前 euid 拥有且不可被 group/world 写，最终 `v1` 与 `target-roots` 必须为当前 euid 的 `0700`。固定
+工件必须是当前 euid 的 `0400` regular file、`nlink=1`，不得带 POSIX ACL、`user.*` 或其他扩权 xattr；
+每个 FD 以前后 stat、两次有界 `pread` 和字节比较取得稳定快照，最后重新走完整目录链并核对 inode。
+
+`bootstrap.json` 使用严格 `control-worker-public-source.v1`，只允许：调用方声明的 `expected_snapshot`
+六摘要、PostgreSQL/Temporal 非秘密 endpoint、九个固定工件的 raw SHA-256，以及排序唯一的 target CA
+内容摘要。四份 manifest、PostgreSQL root/client certificate、Temporal root/starter/control certificate
+与 target manifest 实际引用的全部 `target-roots/<sha256>.pem` 必须形成无遗漏、无额外项的闭包；客户端
+证书只允许当前有效的 P-256 ClientAuth 链，三张 leaf/public key 必须不同，证书文件不得包含 private key。
+原始工件累计最多 5 MiB，JSON/frame 最多 8 MiB，避免大量 target root 在最终大小检查前造成放大分配。
+
+成功后 loader 只发布不可复制、不可 JSON 序列化、固定脱敏的 `PublicSourceCapability`：内容被装入
+domain-separated digest frame，再写入 `MFD_CLOEXEC|MFD_ALLOW_SEALING` memfd，施加
+`F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`，并重新以 `O_RDONLY|CLOEXEC` 打开；最终验证
+tmpfs regular inode、`nlink=0`、owner/mode/size、完整 seals 和只读 access mode。非 Linux 固定失败。
+
+这里的 `Source` 是关键边界：`expected_snapshot` 是部署方声明，不是已经验证的 Snapshot proof；b1a
+只证明受信来源、完整闭包与不可变传输，不调用四个既有语义 loader，也不构造 `readassembly.Snapshot`。
+仓库 AST 门禁要求当前生产代码对该包保持零 import/consumer。C2-4c2b1b 只有从同一 envelope 构造真实
+Snapshot 并精确比较完整 Summary 后，才可继续读取一次性秘密；任一语义错误都必须在 Dial/READY 前
+失败。Starter/Control/PostgreSQL 的证书不同也不等于企业 PKI profile、Temporal RBAC 或数据库授权已经
+隔离；这些仍是外部 Go/No-Go 门禁。
+
+当前 capability 不进入 `cmd/worker.ExtraFiles`，不读取密码、private key 或 DSN，不创建 PostgreSQL pool，
+不执行任何 Temporal Dial，不安装 Outbox，也不发送 READY。下一切片才审查固定 FD4、child 对 frame/
+seals/角色的重复验证，以及 Starter/Control 私钥和 PostgreSQL secret 的独立一次性匿名 pipe。
 
 ## 角色隔离的 Temporal 控制边界
 
