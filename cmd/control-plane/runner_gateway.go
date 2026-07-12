@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"net"
 
@@ -9,6 +10,10 @@ import (
 	"github.com/seaworld008/aiops-system/internal/credential"
 	credentialpostgres "github.com/seaworld008/aiops-system/internal/credential/postgres"
 	executionpostgres "github.com/seaworld008/aiops-system/internal/execution/postgres"
+	"github.com/seaworld008/aiops-system/internal/ids"
+	"github.com/seaworld008/aiops-system/internal/readgateway"
+	"github.com/seaworld008/aiops-system/internal/readtask"
+	readtaskpostgres "github.com/seaworld008/aiops-system/internal/readtask/postgres"
 	"github.com/seaworld008/aiops-system/internal/runnergateway"
 	runnergatewaypostgres "github.com/seaworld008/aiops-system/internal/runnergateway/postgres"
 	"github.com/seaworld008/aiops-system/internal/runneridentity"
@@ -70,14 +75,34 @@ func newRunnerGatewayRuntime(
 	backend, err := runnergatewaypostgres.New(runnergatewaypostgres.Dependencies{
 		Database: database, Identities: identities, Executions: executions, Credentials: credentials,
 		WriteExecutionMode: mode,
-		// M3 deliberately has no final policy/target authorizer. New job claims
-		// remain fail-closed until M4 supplies the isolated execution path.
+		// WRITE deliberately has no final policy/target authorizer. New job
+		// claims remain fail-closed until M6 supplies fixed non-production
+		// adapters; no production-write mode exists.
 		StartAuthorizer: nil,
 	})
 	if err != nil {
 		return fail("configure Runner Gateway PostgreSQL backend", err)
 	}
-	handler, err := runnergateway.NewRouter(verifier, backend)
+	readTasks, err := readtaskpostgres.New(database, readtaskpostgres.Options{
+		TokenSource: readTaskLeaseEntropy,
+		IDSource:    ids.NewUUID,
+	})
+	if err != nil {
+		return fail("configure READ task repository", err)
+	}
+	readBackend, err := readgateway.New(readgateway.Dependencies{
+		Database: database, Identities: identities, Tasks: readTasks,
+		// M5B2 exposes the authenticated protocol but does not pretend an
+		// empty validator is a connector contract. M5C replaces these closed
+		// callbacks with the immutable typed registry and enables claims.
+		ClaimsEnabled:        false,
+		StartAuthorizer:      disabledReadTaskStart,
+		CompletionAuthorizer: disabledReadTaskCompletion,
+	})
+	if err != nil {
+		return fail("configure READ Task Gateway backend", err)
+	}
+	handler, err := runnergateway.NewRouterWithReadTasks(verifier, backend, readBackend)
 	if err != nil {
 		return fail("configure Runner Gateway protocol", err)
 	}
@@ -86,6 +111,23 @@ func newRunnerGatewayRuntime(
 		return fail("configure Runner Gateway TLS server", err)
 	}
 	return &runnerGatewayRuntime{server: server, protector: protector}, nil
+}
+
+func readTaskLeaseEntropy() ([]byte, error) {
+	value := make([]byte, 32)
+	if _, err := rand.Read(value); err != nil {
+		clear(value)
+		return nil, fmt.Errorf("generate READ task lease entropy: %w", err)
+	}
+	return value, nil
+}
+
+func disabledReadTaskStart(context.Context, readtask.Descriptor) error {
+	return readtask.ErrClaimsDisabled
+}
+
+func disabledReadTaskCompletion(context.Context, readtask.Descriptor, readtask.EvidenceCompletion) error {
+	return readtask.ErrClaimsDisabled
 }
 
 func (runtime *runnerGatewayRuntime) Serve(listener net.Listener) error {

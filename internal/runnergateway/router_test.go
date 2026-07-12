@@ -311,6 +311,65 @@ func TestRecoveryDiscardsPartialSuccessBeforeWritingAProblem(t *testing.T) {
 	}
 }
 
+func TestBufferedResponseClearsDiscardedAndCommittedBodyStorage(t *testing.T) {
+	t.Parallel()
+	for _, commit := range []bool{false, true} {
+		response := newBufferedResponse()
+		secret := []byte("READ-LEASE-TOKEN-CANARY")
+		if _, err := response.Write(secret); err != nil {
+			t.Fatal(err)
+		}
+		backing := response.body.Bytes()
+		if commit {
+			response.commit(httptest.NewRecorder())
+		} else {
+			response.reset()
+		}
+		for index, value := range backing {
+			if value != 0 {
+				t.Fatalf("commit=%t retained sensitive byte at %d", commit, index)
+			}
+		}
+	}
+}
+
+func TestBufferedResponseClearsBodyWhenDownstreamWriterPanics(t *testing.T) {
+	t.Parallel()
+	for _, panicAtHeader := range []bool{false, true} {
+		response := newBufferedResponse()
+		if _, err := response.Write([]byte("READ-LEASE-TOKEN-PANIC-CANARY")); err != nil {
+			t.Fatal(err)
+		}
+		backing := response.body.Bytes()
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("downstream writer did not panic")
+				}
+			}()
+			response.commit(&panicResponseWriter{header: make(http.Header), panicAtHeader: panicAtHeader})
+		}()
+		for index, value := range backing {
+			if value != 0 {
+				t.Fatalf("WriteHeader panic=%t retained sensitive byte at %d", panicAtHeader, index)
+			}
+		}
+	}
+}
+
+type panicResponseWriter struct {
+	header        http.Header
+	panicAtHeader bool
+}
+
+func (writer *panicResponseWriter) Header() http.Header { return writer.header }
+func (writer *panicResponseWriter) WriteHeader(int) {
+	if writer.panicAtHeader {
+		panic("downstream header panic")
+	}
+}
+func (*panicResponseWriter) Write([]byte) (int, error) { panic("downstream write panic") }
+
 func TestSafeRequestIDContainsRandomSourcePanics(t *testing.T) {
 	t.Parallel()
 	got := safeRequestID(func() string { panic("entropy unavailable") })
