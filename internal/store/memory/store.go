@@ -97,6 +97,7 @@ func (repository *Store) CreateSignal(ctx context.Context, signal domain.Signal)
 	payload, _ := json.Marshal(map[string]string{"signal_id": signal.ID})
 	repository.outbox = append(repository.outbox, domain.OutboxEvent{
 		ID:               ids.NewUUID(),
+		TenantID:         signal.WorkspaceID,
 		WorkspaceID:      signal.WorkspaceID,
 		AggregateType:    "SIGNAL",
 		AggregateID:      signal.ID,
@@ -132,6 +133,7 @@ func (repository *Store) CreateIncident(_ context.Context, incident domain.Incid
 	payload, _ := json.Marshal(map[string]string{"incident_id": incident.ID})
 	repository.outbox = append(repository.outbox, domain.OutboxEvent{
 		ID:               ids.NewUUID(),
+		TenantID:         incident.WorkspaceID,
 		WorkspaceID:      incident.WorkspaceID,
 		AggregateType:    "INCIDENT",
 		AggregateID:      incident.ID,
@@ -154,40 +156,51 @@ func (repository *Store) PendingOutbox() []domain.OutboxEvent {
 	return events
 }
 
-func (repository *Store) ClaimOutbox(_ context.Context, consumerID string, limit int, lease time.Duration) ([]domain.OutboxEvent, error) {
-	if consumerID == "" || limit <= 0 || lease <= 0 {
-		return nil, fmt.Errorf("consumer id, positive outbox claim limit and lease are required")
+func (repository *Store) ClaimOutbox(_ context.Context, request store.ClaimOutboxRequest) ([]domain.OutboxEvent, error) {
+	if err := request.Validate(); err != nil {
+		return nil, err
 	}
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
 
 	now := repository.now().UTC()
-	claimed := make([]domain.OutboxEvent, 0, limit)
+	claimed := make([]domain.OutboxEvent, 0, request.Limit)
 	for index := range repository.outbox {
 		event := &repository.outbox[index]
-		if !event.DeliveredAt.IsZero() || event.AvailableAt.After(now) || (event.ClaimToken != "" && event.ClaimExpiresAt.After(now)) {
+		if event.Type != request.EventType || !event.DeliveredAt.IsZero() || event.AvailableAt.After(now) ||
+			(event.ClaimToken != "" && event.ClaimExpiresAt.After(now)) {
 			continue
 		}
 		event.ClaimedAt = now
-		event.ClaimedBy = consumerID
+		event.ClaimedBy = request.ConsumerID
 		event.ClaimToken = ids.NewUUID()
-		event.ClaimExpiresAt = now.Add(lease)
+		event.ClaimExpiresAt = now.Add(request.Lease)
 		event.Attempts++
-		claimed = append(claimed, cloneOutboxEvent(*event))
-		if len(claimed) == limit {
+		claimedEvent := cloneOutboxEvent(*event)
+		if claimedEvent.Type != request.EventType {
+			return nil, fmt.Errorf("claimed outbox event type is invalid")
+		}
+		claimed = append(claimed, claimedEvent)
+		if len(claimed) == request.Limit {
 			break
 		}
 	}
 	return claimed, nil
 }
 
-func (repository *Store) AckOutbox(_ context.Context, id, claimToken string) error {
+func (repository *Store) AckOutbox(_ context.Context, id, expectedEventType, claimToken string) error {
+	if !store.ValidOutboxEventType(expectedEventType) {
+		return store.ErrInvalidOutboxClaim
+	}
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
 	for index := range repository.outbox {
 		event := &repository.outbox[index]
 		if event.ID != id {
 			continue
+		}
+		if event.Type != expectedEventType {
+			return store.ErrStaleClaim
 		}
 		if !event.DeliveredAt.IsZero() {
 			if event.DeliveredClaimToken == claimToken {
@@ -210,8 +223,8 @@ func (repository *Store) AckOutbox(_ context.Context, id, claimToken string) err
 	return store.ErrStaleClaim
 }
 
-func (repository *Store) RetryOutbox(_ context.Context, id, claimToken string, availableAt time.Time, failureCode string) error {
-	if availableAt.IsZero() {
+func (repository *Store) RetryOutbox(_ context.Context, id, expectedEventType, claimToken string, availableAt time.Time, failureCode string) error {
+	if !store.ValidOutboxEventType(expectedEventType) || availableAt.IsZero() {
 		return fmt.Errorf("outbox retry availability is required")
 	}
 	if !store.ValidFailureCode(failureCode) {
@@ -223,6 +236,9 @@ func (repository *Store) RetryOutbox(_ context.Context, id, claimToken string, a
 		event := &repository.outbox[index]
 		if event.ID != id {
 			continue
+		}
+		if event.Type != expectedEventType {
+			return store.ErrStaleClaim
 		}
 		if event.ClaimToken == "" || event.ClaimToken != claimToken || !event.DeliveredAt.IsZero() ||
 			!event.ClaimExpiresAt.After(repository.now().UTC()) {
