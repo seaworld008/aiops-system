@@ -130,8 +130,8 @@ dispatcher 或常驻 Worker；运行与回滚细节见
   live dispatcher 或进程配置。
 - 无 `cmd/*`、环境变量、Control Plane 或 Worker assembly 变更；Signal dispatcher 仍未
   安装，Outbox 继续停在未 ACK 的安全等待点。
-- READ target/egress manifest、runtime binding 与固定 HTTP executor 已完成本地契约验证，但尚未
-  进程装配；M5C2-4 的 digest/PKI/network/E2E 门禁前，READ claims 与遗留 lease
-  start/completion 继续关闭。
+- READ target/egress manifest、runtime Bundle 与固定 HTTP executor 已完成本地契约验证，但尚未
+  进程装配；M5C2-4b/4c 的 digest/PKI/network/E2E 门禁前，关闭态 Admission 会同时阻断 READ claims
+  与遗留 lease start/heartbeat/completion。
 - 本功能只生成 READ 调查规划，未连接 ActionPlan、策略、审批、WRITE Runner 或 Executor；
   `AIOPS_WRITE_EXECUTION_MODE` 和生产写路线图门禁均不变，生产写仍不可配置启用。

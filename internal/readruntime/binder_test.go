@@ -190,6 +190,7 @@ type binderFixture struct {
 	connectorID      string
 	targets          *readtarget.Registry
 	connectors       *readconnector.Registry
+	egress           *readexecutor.EgressRegistry
 	profile          *readexecutor.Profile
 }
 
@@ -214,7 +215,21 @@ func newBinderFixture(t *testing.T, kind readconnector.Kind) binderFixture {
 			ServerName: "observability.staging.example.internal", CABundleFile: caPath,
 		},
 		CredentialRoleRef: "observability-reader-v1-" + strings.Repeat("a", 64),
-		NetworkPolicyRef:  "observability-egress-v1-" + strings.Repeat("b", 64),
+	}
+	egressDefinition := readexecutor.EgressPolicyDefinition{
+		Scope:    readtarget.Scope{TenantID: tenantID, WorkspaceID: workspaceID, EnvironmentID: environmentID},
+		Hostname: "observability.staging.example.internal", Port: 9443,
+		AllowedPrefixes: []string{"10.42.9.0/24"},
+	}
+	egressRef, err := readexecutor.BuildEgressPolicyRef("observability-egress", egressDefinition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	egressDefinition.PolicyRef = egressRef
+	targetDefinition.NetworkPolicyRef = egressRef
+	egress, err := readexecutor.NewEgressRegistry([]readexecutor.EgressPolicyDefinition{egressDefinition})
+	if err != nil {
+		t.Fatal(err)
 	}
 	targetRef, err := readtarget.BuildTargetRef("observability-staging", targetDefinition)
 	if err != nil {
@@ -295,7 +310,7 @@ func newBinderFixture(t *testing.T, kind readconnector.Kind) binderFixture {
 			ProfileDigest: strings.Repeat("d", 64), TasksHash: tasksHash,
 		},
 		targetDefinition: targetDefinition, targetRef: targetRef, connectorID: connectorID,
-		targets: targets, connectors: connectors, profile: profile,
+		targets: targets, connectors: connectors, egress: egress, profile: profile,
 	}
 }
 

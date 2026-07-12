@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/seaworld008/aiops-system/internal/readrunnerclient"
 	"github.com/seaworld008/aiops-system/internal/readtask"
 )
 
@@ -33,32 +34,46 @@ type ExecutionStart struct {
 	leaseEpoch    int64
 	scopeRevision int64
 	startedAt     time.Time
+	authority     *readrunnerclient.StartCapability
+	testOnly      bool
 	seal          *executionStartSeal
 	self          *ExecutionStart
 }
 
-func NewExecutionStart(
-	taskID string,
-	leaseEpoch int64,
-	scopeRevision int64,
-	startedAt time.Time,
-) (*ExecutionStart, error) {
+// NewExecutionStart accepts only the opaque proof returned by the dedicated
+// READ Runner client after an authenticated Gateway :start response. Raw task,
+// epoch, scope, and time values are deliberately not a public constructor.
+func NewExecutionStart(authority *readrunnerclient.StartCapability) (*ExecutionStart, error) {
+	if authority == nil {
+		return nil, ErrStartRejected
+	}
+	taskID := authority.TaskID()
+	leaseEpoch := authority.LeaseEpoch()
+	scopeRevision := authority.ScopeRevision()
+	startedAt := authority.StartedAt()
 	if !persistentTaskIDPattern.MatchString(taskID) || leaseEpoch <= 0 || scopeRevision <= 0 ||
 		!validExecutionTime(startedAt) || startedAt.Location() != time.UTC {
 		return nil, ErrStartRejected
 	}
 	created := &ExecutionStart{
 		taskID: taskID, leaseEpoch: leaseEpoch, scopeRevision: scopeRevision,
-		startedAt: stripMonotonic(startedAt), seal: trustedExecutionStartSeal,
+		startedAt: stripMonotonic(startedAt), authority: authority, seal: trustedExecutionStartSeal,
 	}
 	created.self = created
 	return created, nil
 }
 
 func (start *ExecutionStart) ready() bool {
-	return start != nil && start.self == start && start.seal == trustedExecutionStartSeal &&
-		persistentTaskIDPattern.MatchString(start.taskID) && start.leaseEpoch > 0 && start.scopeRevision > 0 &&
-		validExecutionTime(start.startedAt) && start.startedAt.Location() == time.UTC
+	if start == nil || start.self != start || start.seal != trustedExecutionStartSeal ||
+		!persistentTaskIDPattern.MatchString(start.taskID) || start.leaseEpoch <= 0 || start.scopeRevision <= 0 ||
+		!validExecutionTime(start.startedAt) || start.startedAt.Location() != time.UTC {
+		return false
+	}
+	if start.authority == nil {
+		return start.testOnly
+	}
+	return start.authority.TaskID() == start.taskID && start.authority.LeaseEpoch() == start.leaseEpoch &&
+		start.authority.ScopeRevision() == start.scopeRevision && start.authority.StartedAt().Equal(start.startedAt)
 }
 
 func (ExecutionStart) String() string   { return "<aiops-read-execution-start>" }
@@ -84,6 +99,7 @@ type preparedState struct{ status atomic.Uint32 }
 // fields remain private so target, query and policy material cannot be logged.
 type Prepared struct {
 	taskID string
+	owner  *Executor
 	seal   *preparedSeal
 	self   *Prepared
 	state  *preparedState
@@ -94,7 +110,8 @@ type Prepared struct {
 
 func (prepared *Prepared) ready() bool {
 	return prepared != nil && prepared.self == prepared && prepared.seal == trustedPreparedSeal &&
-		prepared.state != nil && prepared.state.status.Load() == preparedReady &&
+		prepared.owner != nil && prepared.owner.Ready() && prepared.state != nil &&
+		prepared.state.status.Load() == preparedReady &&
 		persistentTaskIDPattern.MatchString(prepared.taskID)
 }
 
@@ -196,12 +213,11 @@ func (result Result) Evidence() (readtask.EvidenceCompletion, bool) {
 	return *cloneEvidence(*result.evidence), true
 }
 
-func (result Result) Completion(start *ExecutionStart, fence readtask.Fence) (readtask.Completion, error) {
-	if !result.boundTo(start) || !fence.Valid() || fence.TaskID() != result.taskID ||
-		fence.Epoch() != result.leaseEpoch {
-		return readtask.Completion{}, ErrExecutionRejected
+func (result Result) Completion(start *ExecutionStart) (readrunnerclient.Completion, error) {
+	if !result.boundTo(start) {
+		return readrunnerclient.Completion{}, ErrExecutionRejected
 	}
-	completion := readtask.Completion{Fence: fence, Outcome: result.outcome, FailureCode: result.failureCode}
+	completion := readrunnerclient.Completion{Outcome: result.outcome, FailureCode: result.failureCode}
 	if result.outcome == readtask.CompletionEvidence {
 		completion.Evidence = cloneEvidence(*result.evidence)
 	}

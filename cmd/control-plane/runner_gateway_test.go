@@ -68,7 +68,7 @@ func TestNewRunnerGatewayRuntimeTreatsAbsentConfigurationAsDisabled(t *testing.T
 	}
 }
 
-func TestReadTaskGatewayContractsRemainFailClosedUntilTypedRegistry(t *testing.T) {
+func TestReadTaskGatewayContractsRemainFailClosedDuringRuntimeAssembly(t *testing.T) {
 	if err := disabledReadTaskStart(context.Background(), readtask.Descriptor{}); !errors.Is(err, readtask.ErrClaimsDisabled) {
 		t.Fatalf("disabledReadTaskStart() error = %v", err)
 	}

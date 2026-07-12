@@ -92,10 +92,10 @@ func newRunnerGatewayRuntime(
 	}
 	readBackend, err := readgateway.New(readgateway.Dependencies{
 		Database: database, Identities: identities, Tasks: readTasks,
-		// M5B2 exposes the authenticated protocol but does not pretend an
-		// empty validator is a connector contract. M5C replaces these closed
-		// callbacks with the immutable typed registry and enables claims.
-		ClaimsEnabled:        false,
+		// The protocol remains closed as one indivisible admission state. A
+		// later runtime bundle may replace these placeholder authorizers, but
+		// assembly alone must not let a new or pre-existing lease progress.
+		Admission:            readgateway.NewClosedAdmission(),
 		StartAuthorizer:      disabledReadTaskStart,
 		CompletionAuthorizer: disabledReadTaskCompletion,
 	})

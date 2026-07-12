@@ -18,6 +18,7 @@ This directory separates current architecture, executable delivery plans, and su
 - [Isolated Runner runtime gates](operations/isolated-runner-runtime.md) — split image build, Linux capability checks, and external sandbox gates.
 - [READ connector registry](operations/read-connector-registry.md) — immutable typed connector contracts consumed by target/runtime admission.
 - [READ target and fixed executor runtime](operations/read-target-runtime.md) — content-addressed target/egress policy, fixed Prometheus/VictoriaLogs transport, and the still-unassembled claim boundary.
+- [READ runtime bundle and closed admission](operations/read-runtime-bundle.md) — atomic connector/target/egress/executor digest graph, READ-only client capabilities, and the non-configurable closed claim gate.
 - [Investigation plan manifest](operations/investigation-plan-manifest.md) — trusted Signal scope, exact profile matching, four-digest binding, and fail-closed rollout boundary.
 - [Temporal investigation preparation](operations/temporal-investigation-preparation.md) — digest-bound Workflow/Activity, History allowlist, replay, and unassembled rollout boundary.
 - [Investigation runtime binding](operations/investigation-runtime-binding.md) — persistent Plan/Task/Attempt/Receipt runtime fences and migration gates.

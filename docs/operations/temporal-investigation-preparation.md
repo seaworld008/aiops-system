@@ -238,8 +238,8 @@ rules described above.
 
 This PR has no migration, public HTTP API, environment configuration, or process
 assembly change. Immutable READ target/egress admission, runtime binding, and
-the fixed HTTP executor now exist as unassembled contracts. M5C2-4 is the only
-milestone allowed to atomically install the dispatcher, Worker, READ Runner and
+the fixed HTTP executor and M5C2-4a runtime Bundle now exist as unassembled contracts. M5C2-4b/4c are the only
+milestones allowed to add runtime v2 and atomically install the dispatcher, Worker, READ Runner and
 Gateway callbacks; assembly still may not enable READ claims until all digest,
 PKI, network, replay and local E2E gates pass. It may not enable WRITE claims or
 add a `production` execution mode.

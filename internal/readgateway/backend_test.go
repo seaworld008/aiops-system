@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -97,7 +98,7 @@ func TestClaimAuthenticatesAndMutatesInOneTransaction(t *testing.T) {
 	tx := &recordingTx{events: &events}
 	principal := newTestPrincipal(t, runneridentity.PoolRead)
 	backend := &Backend{
-		database: &recordingDB{events: &events, tx: tx}, claimsEnabled: true,
+		database: &recordingDB{events: &events, tx: tx}, admission: openAdmissionForTest(),
 		operations: operations{
 			authenticateTx: func(context.Context, pgx.Tx, runneridentity.Identity) (authenticatedRunner, error) {
 				events = append(events, "authenticate")
@@ -137,6 +138,86 @@ func TestClaimAuthenticatesAndMutatesInOneTransaction(t *testing.T) {
 	}
 }
 
+func TestClosedAdmissionBlocksEveryLeaseProgressionBeforeDatabase(t *testing.T) {
+	events := make([]string, 0, 1)
+	backend := &Backend{
+		database: &recordingDB{events: &events, err: errors.New("database must not be reached")},
+		operations: operations{
+			authenticateTx: func(context.Context, pgx.Tx, runneridentity.Identity) (authenticatedRunner, error) {
+				t.Fatal("closed admission authenticated a request")
+				return nil, nil
+			},
+			claimTx: func(context.Context, pgx.Tx, execution.RunnerScope, readtask.CertificateBinding, string, time.Duration) (readtask.Claim, error) {
+				t.Fatal("closed admission claimed a task")
+				return readtask.Claim{}, nil
+			},
+			startTx: func(context.Context, pgx.Tx, execution.RunnerScope, readtask.CertificateBinding, readtask.Start, StartAuthorizer) (readtask.Attempt, error) {
+				t.Fatal("closed admission started an existing lease")
+				return readtask.Attempt{}, nil
+			},
+			heartbeatTx: func(context.Context, pgx.Tx, execution.RunnerScope, readtask.CertificateBinding, readtask.Heartbeat, time.Duration) (readtask.HeartbeatResult, error) {
+				t.Fatal("closed admission extended an existing lease")
+				return readtask.HeartbeatResult{}, nil
+			},
+			completeTx: func(context.Context, pgx.Tx, execution.RunnerScope, readtask.CertificateBinding, readtask.Completion, CompletionAuthorizer) (readtask.CompletionResult, error) {
+				t.Fatal("closed admission completed an existing lease")
+				return readtask.CompletionResult{}, nil
+			},
+		},
+	}
+
+	operations := []struct {
+		name string
+		run  func() error
+	}{
+		{"claim", func() error {
+			_, _, err := backend.Claim(context.Background(), runneridentity.Identity{}, testTaskID)
+			return err
+		}},
+		{"start", func() error {
+			_, _, err := backend.Start(context.Background(), runneridentity.Identity{}, readtask.Start{})
+			return err
+		}},
+		{"heartbeat", func() error {
+			_, _, err := backend.Heartbeat(context.Background(), runneridentity.Identity{}, readtask.Heartbeat{})
+			return err
+		}},
+		{"complete", func() error {
+			_, _, err := backend.Complete(context.Background(), runneridentity.Identity{}, readtask.Completion{})
+			return err
+		}},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			if err := operation.run(); !errors.Is(err, readtask.ErrClaimsDisabled) {
+				t.Fatalf("closed %s error = %v, want ErrClaimsDisabled", operation.name, err)
+			}
+		})
+	}
+	if len(events) != 0 {
+		t.Fatalf("closed admission reached the database: %v", events)
+	}
+}
+
+func TestClosedAdmissionCannotBeCopiedDecodedOrOpenedByCallers(t *testing.T) {
+	closed := NewClosedAdmission()
+	if closed == nil || !closed.valid() || closed.allowsLeaseProgression() {
+		t.Fatalf("NewClosedAdmission() = %#v", closed)
+	}
+	copy := *closed
+	if copy.valid() || copy.allowsLeaseProgression() {
+		t.Fatal("copied admission became a valid lease progression gate")
+	}
+	encoded, err := json.Marshal(closed)
+	if err != nil || string(encoded) != `{"redacted":true}` {
+		t.Fatalf("json.Marshal(Admission) = %s, %v", encoded, err)
+	}
+	var decoded Admission
+	if err := json.Unmarshal(encoded, &decoded); !errors.Is(err, ErrInvalidConfiguration) || decoded.valid() {
+		t.Fatalf("json.Unmarshal(Admission) = %#v, %v", decoded, err)
+	}
+}
+
 func TestNewBindsOnlyAuthorizedRepositoryEntrypoints(t *testing.T) {
 	events := make([]string, 0)
 	database := &recordingDB{events: &events, tx: &recordingTx{events: &events}}
@@ -152,7 +233,7 @@ func TestNewBindsOnlyAuthorizedRepositoryEntrypoints(t *testing.T) {
 		t.Fatalf("readtaskpostgres.New() error = %v", err)
 	}
 	dependencies := Dependencies{
-		Database: database, Identities: identities, Tasks: tasks, ClaimsEnabled: true,
+		Database: database, Identities: identities, Tasks: tasks, Admission: openAdmissionForTest(),
 		StartAuthorizer:      func(context.Context, readtask.Descriptor) error { return nil },
 		CompletionAuthorizer: func(context.Context, readtask.Descriptor, readtask.EvidenceCompletion) error { return nil },
 	}
@@ -175,6 +256,11 @@ func TestNewBindsOnlyAuthorizedRepositoryEntrypoints(t *testing.T) {
 	if candidate, candidateErr := New(withoutCompletion); candidate != nil || !errors.Is(candidateErr, ErrInvalidConfiguration) {
 		t.Fatalf("New(without CompletionAuthorizer) = %#v, %v", candidate, candidateErr)
 	}
+	withoutAdmission := dependencies
+	withoutAdmission.Admission = nil
+	if candidate, candidateErr := New(withoutAdmission); candidate != nil || !errors.Is(candidateErr, ErrInvalidConfiguration) {
+		t.Fatalf("New(without Admission) = %#v, %v", candidate, candidateErr)
+	}
 }
 
 func TestStartUsesTrustedAuthorizerInAuthenticatedTransaction(t *testing.T) {
@@ -187,6 +273,7 @@ func TestStartUsesTrustedAuthorizerInAuthenticatedTransaction(t *testing.T) {
 	}
 	backend := &Backend{
 		database:        &recordingDB{events: &events, tx: tx},
+		admission:       openAdmissionForTest(),
 		startAuthorizer: authorizer,
 		operations: operations{
 			authenticateTx: func(context.Context, pgx.Tx, runneridentity.Identity) (authenticatedRunner, error) {
@@ -230,7 +317,7 @@ func TestHeartbeatUsesGatewayLeaseExtensionInAuthenticatedTransaction(t *testing
 	tx := &recordingTx{events: &events}
 	principal := newTestPrincipal(t, runneridentity.PoolRead)
 	backend := &Backend{
-		database: &recordingDB{events: &events, tx: tx}, claimsEnabled: true,
+		database: &recordingDB{events: &events, tx: tx}, admission: openAdmissionForTest(),
 		operations: operations{
 			authenticateTx: func(context.Context, pgx.Tx, runneridentity.Identity) (authenticatedRunner, error) {
 				events = append(events, "authenticate")
@@ -311,6 +398,7 @@ func TestCompleteUsesTrustedTypedOutputAuthorizerInAuthenticatedTransaction(t *t
 	}
 	backend := &Backend{
 		database:             &recordingDB{events: &events, tx: tx},
+		admission:            openAdmissionForTest(),
 		completionAuthorizer: authorizer,
 		operations: operations{
 			authenticateTx: func(context.Context, pgx.Tx, runneridentity.Identity) (authenticatedRunner, error) {
@@ -355,7 +443,7 @@ func TestWriteIdentityRollsBackBeforeReadTaskOperation(t *testing.T) {
 	principal := newTestPrincipal(t, runneridentity.PoolWrite)
 	called := false
 	backend := &Backend{
-		database: &recordingDB{events: &events, tx: tx},
+		database: &recordingDB{events: &events, tx: tx}, admission: openAdmissionForTest(),
 		operations: operations{
 			authenticateTx: func(context.Context, pgx.Tx, runneridentity.Identity) (authenticatedRunner, error) {
 				events = append(events, "authenticate")
@@ -381,7 +469,7 @@ func TestAuthenticationFailureRollsBackAndDoesNotLeakCause(t *testing.T) {
 	events := make([]string, 0, 3)
 	tx := &recordingTx{events: &events}
 	backend := &Backend{
-		database: &recordingDB{events: &events, tx: tx},
+		database: &recordingDB{events: &events, tx: tx}, admission: openAdmissionForTest(),
 		operations: operations{
 			authenticateTx: func(context.Context, pgx.Tx, runneridentity.Identity) (authenticatedRunner, error) {
 				events = append(events, "authenticate")
@@ -404,7 +492,7 @@ func TestTaskErrorRollsBackAndPreservesBoundedDomainError(t *testing.T) {
 	tx := &recordingTx{events: &events}
 	principal := newTestPrincipal(t, runneridentity.PoolRead)
 	backend := &Backend{
-		database: &recordingDB{events: &events, tx: tx}, claimsEnabled: true,
+		database: &recordingDB{events: &events, tx: tx}, admission: openAdmissionForTest(),
 		operations: operations{
 			authenticateTx: func(context.Context, pgx.Tx, runneridentity.Identity) (authenticatedRunner, error) {
 				events = append(events, "authenticate")
@@ -449,8 +537,8 @@ func TestClaimFailsClosedWhenContractsAreNotEnabled(t *testing.T) {
 	if claim.Valid() || !errors.Is(err, readtask.ErrClaimsDisabled) || called {
 		t.Fatalf("Claim(disabled) = %v, %v; operation called=%t", claim, err, called)
 	}
-	if want := []string{"begin", "authenticate", "rollback"}; !reflect.DeepEqual(events, want) {
-		t.Fatalf("事件顺序 = %v，期望 %v", events, want)
+	if len(events) != 0 {
+		t.Fatalf("disabled claim reached the database: %v", events)
 	}
 }
 
@@ -459,7 +547,7 @@ func TestClaimRejectsInvalidRepositoryProjectionBeforeCommit(t *testing.T) {
 	tx := &recordingTx{events: &events}
 	principal := newTestPrincipal(t, runneridentity.PoolRead)
 	backend := &Backend{
-		database: &recordingDB{events: &events, tx: tx}, claimsEnabled: true,
+		database: &recordingDB{events: &events, tx: tx}, admission: openAdmissionForTest(),
 		operations: operations{
 			authenticateTx: func(context.Context, pgx.Tx, runneridentity.Identity) (authenticatedRunner, error) {
 				events = append(events, "authenticate")
@@ -511,7 +599,7 @@ func TestClaimCommitFailureRollsBackAndDestroysBearer(t *testing.T) {
 	principal := newTestPrincipal(t, runneridentity.PoolRead)
 	claim := newTestClaim(t)
 	backend := &Backend{
-		database: &recordingDB{events: &events, tx: tx}, claimsEnabled: true,
+		database: &recordingDB{events: &events, tx: tx}, admission: openAdmissionForTest(),
 		operations: operations{
 			authenticateTx: func(context.Context, pgx.Tx, runneridentity.Identity) (authenticatedRunner, error) {
 				events = append(events, "authenticate")
@@ -550,6 +638,12 @@ func newTestPrincipal(t *testing.T, pool runneridentity.Pool) testPrincipal {
 	return testPrincipal{
 		pool: pool, scope: scope, certificate: testCertificate, notAfter: testCertificateNotAfter,
 	}
+}
+
+func openAdmissionForTest() *Admission {
+	admission := &Admission{seal: trustedAdmissionSeal}
+	admission.self = admission
+	return admission
 }
 
 func assertDerivedIdentity(t *testing.T, scope execution.RunnerScope, certificate readtask.CertificateBinding) {

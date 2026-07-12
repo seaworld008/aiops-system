@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -84,37 +83,17 @@ func TestExecutorPostsPinnedFormsOverRealTLS13HTTP11(t *testing.T) {
 			if err := fixture.execution.ValidateEvidence(evidence); err != nil {
 				t.Fatalf("connector rejected executor Evidence: %v", err)
 			}
-			fence, fenceErr := readtask.NewFence(
-				fixture.descriptor.TaskID, "read-runner-test",
-				[]byte(base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, 32))), 11,
-			)
-			if fenceErr != nil {
-				t.Fatalf("NewFence() error = %v", fenceErr)
-			}
-			t.Cleanup(func() { fence.Destroy() })
-			completion, completionErr := result.Completion(start, fence)
+			completion, completionErr := result.Completion(start)
 			if completionErr != nil || completion.Outcome != readtask.CompletionEvidence || completion.Evidence == nil {
 				t.Fatalf("Result.Completion() = %#v, %v", completion, completionErr)
 			}
-			wrongStart, startErr := NewExecutionStart(fixture.descriptor.TaskID, 11, 8, executorTestCollectedAt)
+			wrongStart, startErr := newExecutionStartForTest(fixture.descriptor.TaskID, 11, 8, executorTestCollectedAt)
 			if startErr != nil {
 				t.Fatal(startErr)
 			}
-			if swapped, swapErr := result.Completion(wrongStart, fence); !errors.Is(swapErr, ErrExecutionRejected) ||
+			if swapped, swapErr := result.Completion(wrongStart); !errors.Is(swapErr, ErrExecutionRejected) ||
 				swapped.Outcome != "" {
 				t.Fatalf("Result.Completion(cross-scope start) = %#v, %v", swapped, swapErr)
-			}
-			otherFence, otherFenceErr := readtask.NewFence(
-				"70000000-0000-4000-8000-000000000099", "read-runner-test",
-				[]byte(base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x6b}, 32))), 11,
-			)
-			if otherFenceErr != nil {
-				t.Fatal(otherFenceErr)
-			}
-			t.Cleanup(func() { otherFence.Destroy() })
-			if swapped, swapErr := result.Completion(start, otherFence); !errors.Is(swapErr, ErrExecutionRejected) ||
-				swapped.Outcome != "" {
-				t.Fatalf("Result.Completion(cross-task fence) = %#v, %v", swapped, swapErr)
 			}
 			if sourceCalls.Load() != 1 || upstreamHits.Load() != 1 || fixture.dialCalls.Load() != 1 {
 				t.Fatalf("calls source/upstream/dial = %d/%d/%d; want 1/1/1",
@@ -522,7 +501,7 @@ func TestCancelledExecuteConsumesPreparedWithoutCrossingCredentialBoundary(t *te
 func TestStartFenceMismatchConsumesPreparedBeforeCredentialAcquisition(t *testing.T) {
 	fixture := newExecutorFixture(t, readconnector.KindPrometheus, nil, executorServerOptions{})
 	prepared, _ := fixture.prepare(t, fixture.executor)
-	wrongStart, err := NewExecutionStart(fixture.descriptor.TaskID, 12, 7, executorTestCollectedAt)
+	wrongStart, err := newExecutionStartForTest(fixture.descriptor.TaskID, 12, 7, executorTestCollectedAt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -534,6 +513,21 @@ func TestStartFenceMismatchConsumesPreparedBeforeCredentialAcquisition(t *testin
 		sourceCalls.Load() != 0 || fixture.dialCalls.Load() != 0 {
 		t.Fatalf("Execute(stale start fence) = %s, %v; ready/source/dial=%t/%d/%d",
 			result, executeErr, prepared.ready(), sourceCalls.Load(), fixture.dialCalls.Load())
+	}
+}
+
+func TestPreparedCapabilityRejectsDifferentExecutorWithoutConsumption(t *testing.T) {
+	fixture := newExecutorFixture(t, readconnector.KindPrometheus, nil, executorServerOptions{})
+	prepared, start := fixture.prepare(t, fixture.executor)
+	other := fixture.executorWith(t, fixture.lookup, fixture.dial)
+	var sourceCalls atomic.Int64
+	result, err := other.Execute(
+		context.Background(), prepared, start, successfulBearerSource(t, &sourceCalls),
+	)
+	if !errors.Is(err, ErrExecutionRejected) || result.Valid() || !prepared.ready() ||
+		sourceCalls.Load() != 0 || fixture.dialCalls.Load() != 0 {
+		t.Fatalf("Execute(cross-executor prepared) = %s, %v; ready/source/dial=%t/%d/%d",
+			result, err, prepared.ready(), sourceCalls.Load(), fixture.dialCalls.Load())
 	}
 }
 
@@ -976,7 +970,7 @@ func (fixture *executorFixture) prepare(t *testing.T, executor *Executor) (*Prep
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
-	start, err := NewExecutionStart(fixture.descriptor.TaskID, 11, 7, executorTestCollectedAt)
+	start, err := newExecutionStartForTest(fixture.descriptor.TaskID, 11, 7, executorTestCollectedAt)
 	if err != nil {
 		t.Fatalf("NewExecutionStart() error = %v", err)
 	}

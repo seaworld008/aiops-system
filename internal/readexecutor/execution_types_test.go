@@ -11,10 +11,31 @@ import (
 	"github.com/seaworld008/aiops-system/internal/readtask"
 )
 
+func newExecutionStartForTest(
+	taskID string,
+	leaseEpoch int64,
+	scopeRevision int64,
+	startedAt time.Time,
+) (*ExecutionStart, error) {
+	if !persistentTaskIDPattern.MatchString(taskID) || leaseEpoch <= 0 || scopeRevision <= 0 ||
+		!validExecutionTime(startedAt) || startedAt.Location() != time.UTC {
+		return nil, ErrStartRejected
+	}
+	created := &ExecutionStart{
+		taskID: taskID, leaseEpoch: leaseEpoch, scopeRevision: scopeRevision,
+		startedAt: stripMonotonic(startedAt), testOnly: true, seal: trustedExecutionStartSeal,
+	}
+	created.self = created
+	return created, nil
+}
+
 func TestExecutionStartAndResultAreOpaqueDetachedCapabilities(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 7, 12, 12, 0, 0, 123456000, time.UTC)
-	start, err := NewExecutionStart("70000000-0000-4000-8000-000000000007", 2, 3, now)
+	if start, err := NewExecutionStart(nil); start != nil || !errors.Is(err, ErrStartRejected) {
+		t.Fatalf("NewExecutionStart(nil) = %#v, %v", start, err)
+	}
+	start, err := newExecutionStartForTest("70000000-0000-4000-8000-000000000007", 2, 3, now)
 	if err != nil || !start.ready() {
 		t.Fatalf("NewExecutionStart() = %#v, %v", start, err)
 	}
@@ -33,7 +54,7 @@ func TestExecutionStartAndResultAreOpaqueDetachedCapabilities(t *testing.T) {
 		{"70000000-0000-4000-8000-000000000007", 2, 0, now},
 		{"70000000-0000-4000-8000-000000000007", 2, 3, time.Time{}},
 	} {
-		if candidate, err := NewExecutionStart(invalid.taskID, invalid.epoch, invalid.scope, invalid.at); candidate != nil ||
+		if candidate, err := newExecutionStartForTest(invalid.taskID, invalid.epoch, invalid.scope, invalid.at); candidate != nil ||
 			!errors.Is(err, ErrStartRejected) {
 			t.Fatalf("NewExecutionStart(invalid) = %#v, %v", candidate, err)
 		}
