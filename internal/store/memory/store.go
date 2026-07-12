@@ -133,7 +133,7 @@ func (repository *Store) CreateIncident(_ context.Context, incident domain.Incid
 	payload, _ := json.Marshal(map[string]string{"incident_id": incident.ID})
 	repository.outbox = append(repository.outbox, domain.OutboxEvent{
 		ID:               ids.NewUUID(),
-		TenantID:         incident.WorkspaceID,
+		TenantID:         incident.TenantID,
 		WorkspaceID:      incident.WorkspaceID,
 		AggregateType:    "INCIDENT",
 		AggregateID:      incident.ID,

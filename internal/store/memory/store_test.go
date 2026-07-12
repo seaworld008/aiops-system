@@ -63,7 +63,7 @@ func TestCreateSignalRejectsIntegrationScopeMismatch(t *testing.T) {
 
 func TestCreateIncidentAlsoAppendsOutboxEvent(t *testing.T) {
 	repository := memory.New()
-	incident := domain.NewIncident("incident-1", "workspace-1", time.Now())
+	incident := domain.NewIncidentForTenant("incident-1", "tenant-1", "workspace-1", time.Now())
 
 	if err := repository.CreateIncident(context.Background(), incident); err != nil {
 		t.Fatalf("CreateIncident() error = %v", err)
@@ -73,7 +73,8 @@ func TestCreateIncidentAlsoAppendsOutboxEvent(t *testing.T) {
 	if len(events) != 1 {
 		t.Fatalf("len(PendingOutbox()) = %d, want 1", len(events))
 	}
-	if events[0].TenantID != incident.WorkspaceID || events[0].AggregateID != incident.ID ||
+	if events[0].TenantID != incident.TenantID || events[0].WorkspaceID != incident.WorkspaceID ||
+		events[0].AggregateID != incident.ID ||
 		events[0].Type != "incident.created.v1" || events[0].AggregateVersion != 1 {
 		t.Fatalf("outbox event = %#v, want incident.created.v1 for %s", events[0], incident.ID)
 	}
