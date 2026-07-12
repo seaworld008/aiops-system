@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/investigationworkflow"
 	"github.com/seaworld008/aiops-system/internal/readexecutor"
 	"github.com/seaworld008/aiops-system/internal/readrunnerclient"
@@ -504,7 +505,7 @@ func TestActivityInfoAndInputAreStrictlyBoundBeforeClaim(t *testing.T) {
 			candidateInfo.RetryPolicy = &retry
 			mutate(&candidateInfo, &candidateInput)
 			gateway := &fakeGateway{}
-			activities := newTestActivitiesWithInfo(t, gateway, &fakeRuntime{}, time.Millisecond, candidateInfo, nil)
+			activities := newTestActivitiesWithInfo(t, input, gateway, &fakeRuntime{}, time.Millisecond, candidateInfo, nil)
 			output, err := activities.execute(context.Background(), candidateInput)
 			if !errors.Is(err, ErrActivityRejected) || output != (investigationworkflow.ReadTaskActivityOutputV1{}) {
 				t.Fatalf("execute() = %#v, %v", output, err)
@@ -531,19 +532,92 @@ func TestBundleDigestMismatchFailsBeforeClaim(t *testing.T) {
 	}
 }
 
+func TestPlanningSnapshotMismatchFailsBeforeClaim(t *testing.T) {
+	pinned := validActivityInput()
+	gateway := &fakeGateway{}
+	runtime := &fakeRuntime{}
+	activities := newTestActivities(t, pinned, gateway, runtime, time.Millisecond, nil)
+
+	foreign := pinned
+	foreign.ManifestDigest = stringOf('f', 64)
+	output, err := activities.execute(context.Background(), foreign)
+	if !errors.Is(err, ErrActivityRejected) || output != (investigationworkflow.ReadTaskActivityOutputV1{}) {
+		t.Fatalf("execute(foreign Plan) = %#v, %v", output, err)
+	}
+	if gateway.claims != 0 || runtime.prepareCalls != 0 {
+		t.Fatalf("foreign Plan reached network/runtime: claims=%d prepare=%d", gateway.claims, runtime.prepareCalls)
+	}
+
+	foreign = pinned
+	foreign.RegistryDigest = stringOf('f', 64)
+	output, err = activities.execute(context.Background(), foreign)
+	if !errors.Is(err, ErrActivityRejected) || output != (investigationworkflow.ReadTaskActivityOutputV1{}) {
+		t.Fatalf("execute(foreign Registry) = %#v, %v", output, err)
+	}
+	if gateway.claims != 0 || runtime.prepareCalls != 0 {
+		t.Fatalf("foreign Registry reached network/runtime: claims=%d prepare=%d", gateway.claims, runtime.prepareCalls)
+	}
+}
+
+func TestPlanBoundRuntimeRejectsForeignDescriptorBeforeInnerPrepare(t *testing.T) {
+	input := validActivityInput()
+	binding := domain.InvestigationPlanBinding{
+		SchemaVersion: domain.InvestigationPlanBindingSchemaVersion, ManifestDigest: input.ManifestDigest,
+		RegistryDigest: input.RegistryDigest, ProfileDigest: input.ProfileDigest, TasksHash: input.TasksHash,
+	}
+	tests := map[string]func(*domain.InvestigationPlanBinding){
+		"foreign Plan":     func(value *domain.InvestigationPlanBinding) { value.ManifestDigest = stringOf('f', 64) },
+		"foreign Registry": func(value *domain.InvestigationPlanBinding) { value.RegistryDigest = stringOf('f', 64) },
+		"invalid binding":  func(value *domain.InvestigationPlanBinding) { value.SchemaVersion = "" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			inner := &fakeRuntime{}
+			runtime := &planBoundRuntime{
+				inner: inner, planManifestDigest: input.ManifestDigest,
+				connectorRegistryDigest: input.RegistryDigest,
+			}
+			foreign := binding
+			mutate(&foreign)
+			prepared, err := runtime.Prepare(
+				context.Background(), readtask.Descriptor{PlanBinding: foreign}, 1, 1,
+			)
+			if prepared != nil || !errors.Is(err, ErrActivityRejected) {
+				t.Fatalf("Prepare(foreign descriptor) = %#v, %v", prepared, err)
+			}
+			if inner.prepareCalls != 0 {
+				t.Fatalf("foreign descriptor reached inner runtime %d times", inner.prepareCalls)
+			}
+		})
+	}
+
+	inner := &fakeRuntime{}
+	runtime := &planBoundRuntime{
+		inner: inner, planManifestDigest: input.ManifestDigest,
+		connectorRegistryDigest: input.RegistryDigest,
+	}
+	prepared, err := runtime.Prepare(context.Background(), readtask.Descriptor{PlanBinding: binding}, 1, 1)
+	if err != nil || prepared == nil || inner.prepareCalls != 1 {
+		t.Fatalf("Prepare(pinned descriptor) = %#v, %v; calls=%d", prepared, err, inner.prepareCalls)
+	}
+}
+
 func TestNewActivitiesHasNoCredentialFreeOrUnsealedFallback(t *testing.T) {
 	bearer := readexecutor.BearerSource(func(context.Context, string, func([]byte)) readtask.FailureCode { return "" })
-	if activities, err := NewActivities(nil, nil, bearer, "default"); activities != nil || !errors.Is(err, ErrActivityRejected) {
+	if activities, err := NewActivities(nil, nil, stringOf('a', 64), bearer, "default"); activities != nil || !errors.Is(err, ErrActivityRejected) {
 		t.Fatalf("NewActivities(nil) = %#v, %v", activities, err)
 	}
-	if activities, err := NewActivities(&readrunnerclient.Client{}, &readruntime.Bundle{}, bearer, "default"); activities != nil || !errors.Is(err, ErrActivityRejected) {
+	if activities, err := NewActivities(&readrunnerclient.Client{}, &readruntime.Bundle{}, stringOf('a', 64), bearer, "default"); activities != nil || !errors.Is(err, ErrActivityRejected) {
 		t.Fatalf("NewActivities(zero values) = %#v, %v", activities, err)
 	}
-	if activities, err := NewActivities(&readrunnerclient.Client{}, &readruntime.Bundle{}, nil, "default"); activities != nil || !errors.Is(err, ErrActivityRejected) {
+	if activities, err := NewActivities(&readrunnerclient.Client{}, &readruntime.Bundle{}, stringOf('a', 64), nil, "default"); activities != nil || !errors.Is(err, ErrActivityRejected) {
 		t.Fatalf("NewActivities(nil bearer) = %#v, %v", activities, err)
 	}
-	if activities, err := NewActivities(&readrunnerclient.Client{}, &readruntime.Bundle{}, bearer, ""); activities != nil || !errors.Is(err, ErrActivityRejected) {
+	if activities, err := NewActivities(&readrunnerclient.Client{}, &readruntime.Bundle{}, stringOf('a', 64), bearer, ""); activities != nil || !errors.Is(err, ErrActivityRejected) {
 		t.Fatalf("NewActivities(empty namespace) = %#v, %v", activities, err)
+	}
+	if activities, err := NewActivities(&readrunnerclient.Client{}, &readruntime.Bundle{}, "", bearer, "default"); activities != nil || !errors.Is(err, ErrActivityRejected) {
+		t.Fatalf("NewActivities(empty Plan digest) = %#v, %v", activities, err)
 	}
 }
 
@@ -587,7 +661,9 @@ func makeBytes(value byte, count int) []byte {
 
 func validInfo(t *testing.T, input investigationworkflow.ReadTaskActivityInputV1) activity.Info {
 	t.Helper()
-	queue, err := investigationworkflow.RunnerTaskQueue(input.EnvironmentID, input.BundleDigest)
+	queue, err := investigationworkflow.RunnerTaskQueue(
+		input.EnvironmentID, input.ManifestDigest, input.RegistryDigest, input.BundleDigest,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -619,11 +695,12 @@ func newTestActivities(
 	heartbeat func(context.Context),
 ) *Activities {
 	t.Helper()
-	return newTestActivitiesWithInfo(t, gateway, runtime, interval, validInfo(t, input), heartbeat)
+	return newTestActivitiesWithInfo(t, input, gateway, runtime, interval, validInfo(t, input), heartbeat)
 }
 
 func newTestActivitiesWithInfo(
 	t *testing.T,
+	pinned investigationworkflow.ReadTaskActivityInputV1,
 	gateway gatewayProtocol,
 	runtime runtimeProtocol,
 	interval time.Duration,
@@ -640,6 +717,8 @@ func newTestActivitiesWithInfo(
 		activityRuntime{info: func(context.Context) activity.Info { return info }, heartbeat: heartbeat, interval: interval},
 		interval,
 		"default",
+		pinned.ManifestDigest,
+		pinned.RegistryDigest,
 	)
 	if err != nil {
 		t.Fatalf("newActivities() error = %v", err)

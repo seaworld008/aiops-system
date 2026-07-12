@@ -115,7 +115,9 @@ func orchestrateReadTaskV2(
 				"READ_TASK_INPUT_INVALID", ErrInvalidRuntimeV2Input.Error(),
 			)
 		}
-		queue, err := RunnerTaskQueue(input.EnvironmentID, input.BundleDigest)
+		queue, err := RunnerTaskQueue(
+			input.EnvironmentID, input.ManifestDigest, input.RegistryDigest, input.BundleDigest,
+		)
 		if err != nil {
 			return TerminalReadTaskV2{}, runtimeV2NonRetryableError(
 				"READ_TASK_INPUT_INVALID", ErrInvalidRuntimeV2Input.Error(),

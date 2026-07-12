@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
@@ -43,14 +44,16 @@ type activityRuntime struct {
 // Activities is a sealed READ Activity set. Registration is package-owned so
 // callers cannot accidentally register an alias or a WRITE-shaped method.
 type Activities struct {
-	gateway     gatewayProtocol
-	runtime     runtimeProtocol
-	credentials readexecutor.BearerSource
-	temporal    activityRuntime
-	gatewayBeat time.Duration
-	namespace   string
-	seal        *activitiesSeal
-	self        *Activities
+	gateway                 gatewayProtocol
+	runtime                 runtimeProtocol
+	credentials             readexecutor.BearerSource
+	temporal                activityRuntime
+	gatewayBeat             time.Duration
+	namespace               string
+	planManifestDigest      string
+	connectorRegistryDigest string
+	seal                    *activitiesSeal
+	self                    *Activities
 }
 
 func (activities *Activities) ready() bool {
@@ -59,7 +62,9 @@ func (activities *Activities) ready() bool {
 		activities.temporal.info != nil && activities.temporal.heartbeat != nil &&
 		activities.temporal.interval > 0 && activities.temporal.interval <= temporalHeartbeatInterval &&
 		activities.gatewayBeat > 0 && activities.gatewayBeat <= gatewayHeartbeatInterval &&
-		investigationworkflow.ValidTemporalNamespace(activities.namespace)
+		investigationworkflow.ValidTemporalNamespace(activities.namespace) &&
+		domain.ValidSHA256Hex(activities.planManifestDigest) &&
+		domain.ValidSHA256Hex(activities.connectorRegistryDigest)
 }
 
 func (Activities) String() string   { return "<aiops-read-runner-activities>" }
@@ -77,17 +82,20 @@ func newActivities(
 	temporal activityRuntime,
 	gatewayBeat time.Duration,
 	namespace string,
+	planManifestDigest string,
+	connectorRegistryDigest string,
 ) (*Activities, error) {
 	if nilInterface(gateway) || nilInterface(runtime) || credentials == nil || temporal.info == nil ||
 		temporal.heartbeat == nil || temporal.interval <= 0 || temporal.interval > temporalHeartbeatInterval ||
 		gatewayBeat <= 0 || gatewayBeat > gatewayHeartbeatInterval ||
-		!investigationworkflow.ValidTemporalNamespace(namespace) {
+		!investigationworkflow.ValidTemporalNamespace(namespace) || !domain.ValidSHA256Hex(planManifestDigest) ||
+		!domain.ValidSHA256Hex(connectorRegistryDigest) {
 		return nil, ErrActivityRejected
 	}
 	created := &Activities{
 		gateway: gateway, runtime: runtime, credentials: credentials, temporal: temporal, gatewayBeat: gatewayBeat,
-		namespace: namespace,
-		seal:      trustedActivitiesSeal,
+		namespace: namespace, planManifestDigest: strings.Clone(planManifestDigest),
+		connectorRegistryDigest: strings.Clone(connectorRegistryDigest), seal: trustedActivitiesSeal,
 	}
 	created.self = created
 	return created, nil
@@ -98,6 +106,9 @@ func (activities *Activities) execute(
 	input investigationworkflow.ReadTaskActivityInputV1,
 ) (output investigationworkflow.ReadTaskActivityOutputV1, returnedErr error) {
 	if !activities.ready() || !validContext(ctx) || !validInput(input) {
+		return investigationworkflow.ReadTaskActivityOutputV1{}, ErrActivityRejected
+	}
+	if !activities.acceptsPlan(input.ManifestDigest, input.RegistryDigest) {
 		return investigationworkflow.ReadTaskActivityOutputV1{}, ErrActivityRejected
 	}
 	defer func() {
@@ -177,6 +188,28 @@ func (activities *Activities) execute(
 		return recoveryOutput(input), nil
 	}
 	return activities.executeStarted(operationContext, input, lease, prepared, start)
+}
+
+func (activities *Activities) acceptsPlan(manifestDigest, registryDigest string) bool {
+	return activities.ready() && domain.ValidSHA256Hex(manifestDigest) && domain.ValidSHA256Hex(registryDigest) &&
+		subtle.ConstantTimeCompare([]byte(activities.planManifestDigest), []byte(manifestDigest)) == 1 &&
+		subtle.ConstantTimeCompare([]byte(activities.connectorRegistryDigest), []byte(registryDigest)) == 1
+}
+
+// AcceptsPlanningIdentity reports whether this sealed Activity set is bound
+// to one reviewed Plan/Connector/Bundle identity. It reveals no runtime
+// component and is intended for process-assembly integrity checks.
+func (activities *Activities) AcceptsPlanningIdentity(
+	manifestDigest string,
+	registryDigest string,
+	bundleDigest string,
+) bool {
+	if !activities.acceptsPlan(manifestDigest, registryDigest) || !domain.ValidSHA256Hex(bundleDigest) {
+		return false
+	}
+	actual, err := safeBundleDigest(activities.runtime)
+	return err == nil && domain.ValidSHA256Hex(actual) &&
+		subtle.ConstantTimeCompare([]byte(actual), []byte(bundleDigest)) == 1
 }
 
 func (activities *Activities) executeStarted(
@@ -265,7 +298,9 @@ func validActivityInfo(
 	input investigationworkflow.ReadTaskActivityInputV1,
 	namespace string,
 ) bool {
-	queue, err := investigationworkflow.RunnerTaskQueue(input.EnvironmentID, input.BundleDigest)
+	queue, err := investigationworkflow.RunnerTaskQueue(
+		input.EnvironmentID, input.ManifestDigest, input.RegistryDigest, input.BundleDigest,
+	)
 	if err != nil {
 		return false
 	}
