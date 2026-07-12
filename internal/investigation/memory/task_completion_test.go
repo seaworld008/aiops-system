@@ -17,12 +17,13 @@ func TestCompleteTaskPersistsEvidenceReceiptAndDefensiveCopies(t *testing.T) {
 	now := time.Date(2026, 7, 11, 15, 0, 0, 0, time.UTC)
 	repository := newRepository(t, now)
 	incident := createIncident(t, repository, "workspace-1", "signal-complete", now)
-	created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+	created, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:complete",
 		Tasks: []investigation.TaskSpec{{
-			Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+			Key: "metrics", ConnectorID: "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
 		}},
-	})
+	}))
+
 	if err != nil {
 		t.Fatalf("CreateOrGetInvestigation() error = %v", err)
 	}
@@ -84,12 +85,13 @@ func TestCompleteTaskRejectsEvidenceCollectedBeyondTrustedCommitBoundWithoutPart
 	now := time.Date(2026, 7, 12, 21, 15, 0, 0, time.UTC)
 	repository := newRepository(t, now)
 	incident := createIncident(t, repository, "workspace-1", "signal-future-evidence", now)
-	created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+	created, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:future-evidence",
 		Tasks: []investigation.TaskSpec{{
-			Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+			Key: "metrics", ConnectorID: "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
 		}},
-	})
+	}))
+
 	if err != nil {
 		t.Fatalf("CreateOrGetInvestigation() error = %v", err)
 	}
@@ -120,13 +122,14 @@ func TestConcurrentTaskCompletionCannotChangeListEvidenceOrder(t *testing.T) {
 	tasks := make([]investigation.TaskSpec, 8)
 	for index := range tasks {
 		tasks[index] = investigation.TaskSpec{
-			Key: fmt.Sprintf("task-%02d", index), ConnectorID: "prometheus-prod", Operation: "range_query",
+			Key: fmt.Sprintf("task-%02d", index), ConnectorID: "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Operation: "range_query",
 			Input: []byte(`{"lookback_minutes":15}`),
 		}
 	}
-	created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+	created, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:concurrent-evidence-order", Tasks: tasks,
-	})
+	}))
+
 	if err != nil {
 		t.Fatalf("CreateOrGetInvestigation() error = %v", err)
 	}

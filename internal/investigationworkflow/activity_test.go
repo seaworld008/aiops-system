@@ -94,6 +94,7 @@ func TestPreparationActivityTenantBoundSnapshotPreventsMiswiredRepositoryWrites(
 		IDFactory:          func() string { return "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee" },
 		TenantResolver:     func(string) (string, error) { return "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", nil },
 		TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error { return nil },
+		TaskRuntimeBinder:  activityTaskRuntimeBinder,
 	})
 	if err != nil {
 		t.Fatalf("memory.New(miswired tenant) error = %v", err)
@@ -404,6 +405,7 @@ func newActivityFixtureWithCanary(t *testing.T, status, canary string) activityF
 			return workflowTenantID, nil
 		},
 		TaskSpecAuthorizer: registry.AuthorizeTaskSpec,
+		TaskRuntimeBinder:  activityTaskRuntimeBinder,
 	})
 	if err != nil {
 		t.Fatalf("memory.New() error = %v", err)
@@ -436,6 +438,26 @@ func newActivityFixtureWithCanary(t *testing.T, status, canary string) activityF
 			AggregateVersion: 1, ManifestDigest: planner.ManifestDigest(), RegistryDigest: registry.Digest(),
 		},
 	}
+}
+
+func activityTaskRuntimeBinder(
+	_ context.Context,
+	_ investigation.TaskSpecScope,
+	_ domain.InvestigationPlanBinding,
+	spec investigation.TaskSpec,
+) (investigation.TaskRuntimeComponents, error) {
+	if len(spec.ConnectorID) < 64 {
+		return investigation.TaskRuntimeComponents{}, errors.New("connector is not content addressed")
+	}
+	connectorDigest := spec.ConnectorID[len(spec.ConnectorID)-64:]
+	if !domain.ValidSHA256Hex(connectorDigest) {
+		return investigation.TaskRuntimeComponents{}, errors.New("connector digest is invalid")
+	}
+	return investigation.TaskRuntimeComponents{
+		ConnectorDigest: connectorDigest,
+		TargetDigest:    strings.Repeat("d", 64),
+		ExecutorDigest:  strings.Repeat("e", 64),
+	}, nil
 }
 
 func activityRegistry(t *testing.T) (*readconnector.Registry, string) {

@@ -20,40 +20,44 @@ const (
 	MaxEvidenceJSONDepth    = 16
 	MaxEvidencePayloadBytes = 64 << 10
 
-	completionRequestSchemaV2 = "read-task-completion-request.v2"
-	completionReceiptHashV2   = "read-task-completion-receipt.v2"
-	runnerEvidenceSchemaV2    = "runner-evidence.v2"
+	CompletionRequestHashVersionV3 = "read-task-completion-request.v3"
+	CompletionReceiptHashVersionV3 = "read-task-completion-receipt.v3"
+	RunnerEvidenceSchemaVersionV3  = "runner-evidence.v3"
 )
 
 // Receipt is the secret-free, server-derived completion binding. ReceivedAt
 // is database evidence and intentionally excluded from ReceiptHash.
 type Receipt struct {
-	SchemaVersion     string
-	TenantID          string
-	WorkspaceID       string
-	EnvironmentID     string
-	ServiceID         string
-	IncidentID        string
-	InvestigationID   string
-	TaskID            string
-	RunnerID          string
-	ScopeRevision     int64
-	CertificateSHA256 string
-	LeaseEpoch        int64
-	ConnectorID       string
-	Operation         string
-	Outcome           CompletionOutcome
-	ContentHash       string
-	FailureCode       FailureCode
-	IdempotencyKey    string
-	RequestHash       string
-	ReceiptHash       string
-	ReceivedAt        time.Time
+	SchemaVersion      string
+	TenantID           string
+	WorkspaceID        string
+	EnvironmentID      string
+	ServiceID          string
+	IncidentID         string
+	InvestigationID    string
+	TaskID             string
+	RunnerID           string
+	ScopeRevision      int64
+	CertificateSHA256  string
+	LeaseEpoch         int64
+	ConnectorID        string
+	Operation          string
+	Outcome            CompletionOutcome
+	ContentHash        string
+	FailureCode        FailureCode
+	IdempotencyKey     string
+	PlanBinding        domain.InvestigationPlanBinding
+	RuntimeBinding     domain.ReadTaskRuntimeBinding
+	RequestHash        string
+	ReceiptHash        string
+	RequestHashVersion string
+	ReceiptHashVersion string
+	ReceivedAt         time.Time
 }
 
 func (receipt Receipt) ValidateAgainst(descriptor Descriptor, attempt Attempt) error {
 	if descriptor.Validate() != nil || attempt.ValidateAgainst(descriptor) != nil ||
-		receipt.SchemaVersion != runnerEvidenceSchemaV2 || receipt.TenantID != descriptor.TenantID ||
+		receipt.SchemaVersion != RunnerEvidenceSchemaVersionV3 || receipt.TenantID != descriptor.TenantID ||
 		receipt.WorkspaceID != descriptor.WorkspaceID || receipt.EnvironmentID != descriptor.EnvironmentID ||
 		receipt.ServiceID != descriptor.ServiceID ||
 		receipt.IncidentID != descriptor.IncidentID || receipt.InvestigationID != descriptor.InvestigationID ||
@@ -61,6 +65,9 @@ func (receipt Receipt) ValidateAgainst(descriptor Descriptor, attempt Attempt) e
 		receipt.ScopeRevision != attempt.ScopeRevision || receipt.CertificateSHA256 != attempt.Certificate.SHA256 ||
 		receipt.LeaseEpoch != attempt.Epoch || receipt.ConnectorID != descriptor.ConnectorID ||
 		receipt.Operation != descriptor.Operation || receipt.IdempotencyKey != derivedIdempotencyKey(descriptor.TaskID, attempt.Epoch) ||
+		!receipt.PlanBinding.Equal(descriptor.PlanBinding) || !receipt.RuntimeBinding.Equal(descriptor.RuntimeBinding) ||
+		receipt.RequestHashVersion != CompletionRequestHashVersionV3 ||
+		receipt.ReceiptHashVersion != CompletionReceiptHashVersionV3 ||
 		!validSHA256(receipt.RequestHash) || !validSHA256(receipt.ReceiptHash) ||
 		!validReceivedAtForAttempt(receipt.ReceivedAt, attempt) {
 		return ErrInvalidRequest
@@ -238,7 +245,7 @@ func ProjectCompletion(
 	}
 	projection.requestHash = requestHash
 	projection.receipt = Receipt{
-		SchemaVersion: runnerEvidenceSchemaV2,
+		SchemaVersion: RunnerEvidenceSchemaVersionV3,
 		TenantID:      descriptor.TenantID, WorkspaceID: descriptor.WorkspaceID, EnvironmentID: descriptor.EnvironmentID,
 		ServiceID:  descriptor.ServiceID,
 		IncidentID: descriptor.IncidentID, InvestigationID: descriptor.InvestigationID, TaskID: descriptor.TaskID,
@@ -246,7 +253,10 @@ func ProjectCompletion(
 		CertificateSHA256: attempt.Certificate.SHA256, LeaseEpoch: attempt.Epoch,
 		ConnectorID: descriptor.ConnectorID, Operation: descriptor.Operation, Outcome: projection.outcome,
 		ContentHash: projection.contentHash, FailureCode: projection.failureCode,
-		IdempotencyKey: projection.idempotencyKey, RequestHash: requestHash, ReceivedAt: receivedAt,
+		IdempotencyKey: projection.idempotencyKey, PlanBinding: descriptor.PlanBinding,
+		RuntimeBinding: descriptor.RuntimeBinding, RequestHash: requestHash,
+		RequestHashVersion: CompletionRequestHashVersionV3,
+		ReceiptHashVersion: CompletionReceiptHashVersionV3, ReceivedAt: receivedAt,
 	}
 	receiptHash, err := completionReceiptHash(projection.receipt)
 	if err != nil {
@@ -318,57 +328,63 @@ func completionRequestHash(
 	contentHash string,
 	failureCode FailureCode,
 ) (string, error) {
-	return canonicalHash(completionRequestSchemaV2, struct {
-		TaskID            string            `json:"task_id"`
-		TaskKey           string            `json:"task_key"`
-		TaskPosition      int               `json:"task_position"`
-		InputHash         string            `json:"input_hash"`
-		TenantID          string            `json:"tenant_id"`
-		WorkspaceID       string            `json:"workspace_id"`
-		EnvironmentID     string            `json:"environment_id"`
-		ServiceID         string            `json:"service_id"`
-		IncidentID        string            `json:"incident_id"`
-		InvestigationID   string            `json:"investigation_id"`
-		RunnerID          string            `json:"runner_id"`
-		ScopeRevision     string            `json:"scope_revision"`
-		CertificateSHA256 string            `json:"certificate_sha256"`
-		LeaseEpoch        string            `json:"lease_epoch"`
-		ConnectorID       string            `json:"connector_id"`
-		Operation         string            `json:"operation"`
-		Outcome           CompletionOutcome `json:"outcome"`
-		ContentHash       string            `json:"content_hash,omitempty"`
-		FailureCode       FailureCode       `json:"failure_code,omitempty"`
+	return canonicalHash(CompletionRequestHashVersionV3, struct {
+		TaskID            string                          `json:"task_id"`
+		TaskKey           string                          `json:"task_key"`
+		TaskPosition      int                             `json:"task_position"`
+		InputHash         string                          `json:"input_hash"`
+		TenantID          string                          `json:"tenant_id"`
+		WorkspaceID       string                          `json:"workspace_id"`
+		EnvironmentID     string                          `json:"environment_id"`
+		ServiceID         string                          `json:"service_id"`
+		IncidentID        string                          `json:"incident_id"`
+		InvestigationID   string                          `json:"investigation_id"`
+		RunnerID          string                          `json:"runner_id"`
+		ScopeRevision     string                          `json:"scope_revision"`
+		CertificateSHA256 string                          `json:"certificate_sha256"`
+		LeaseEpoch        string                          `json:"lease_epoch"`
+		ConnectorID       string                          `json:"connector_id"`
+		Operation         string                          `json:"operation"`
+		PlanBinding       domain.InvestigationPlanBinding `json:"plan_binding"`
+		RuntimeBinding    domain.ReadTaskRuntimeBinding   `json:"runtime_binding"`
+		Outcome           CompletionOutcome               `json:"outcome"`
+		ContentHash       string                          `json:"content_hash,omitempty"`
+		FailureCode       FailureCode                     `json:"failure_code,omitempty"`
 	}{
 		descriptor.TaskID, descriptor.TaskKey, descriptor.Position, descriptor.InputHash,
 		descriptor.TenantID, descriptor.WorkspaceID, descriptor.EnvironmentID, descriptor.ServiceID, descriptor.IncidentID,
 		descriptor.InvestigationID, attempt.RunnerID, strconv.FormatInt(attempt.ScopeRevision, 10),
 		attempt.Certificate.SHA256, strconv.FormatInt(attempt.Epoch, 10), descriptor.ConnectorID,
-		descriptor.Operation, outcome, contentHash, failureCode,
+		descriptor.Operation, descriptor.PlanBinding, descriptor.RuntimeBinding, outcome, contentHash, failureCode,
 	})
 }
 
 type receiptWire struct {
-	SchemaVersion     string            `json:"schema_version"`
-	TenantID          string            `json:"tenant_id"`
-	WorkspaceID       string            `json:"workspace_id"`
-	EnvironmentID     string            `json:"environment_id"`
-	ServiceID         string            `json:"service_id"`
-	IncidentID        string            `json:"incident_id"`
-	InvestigationID   string            `json:"investigation_id"`
-	TaskID            string            `json:"task_id"`
-	RunnerID          string            `json:"runner_id"`
-	ScopeRevision     string            `json:"scope_revision"`
-	CertificateSHA256 string            `json:"certificate_sha256"`
-	LeaseEpoch        string            `json:"lease_epoch"`
-	ConnectorID       string            `json:"connector_id"`
-	Operation         string            `json:"operation"`
-	Outcome           CompletionOutcome `json:"outcome"`
-	ContentHash       string            `json:"content_hash,omitempty"`
-	FailureCode       FailureCode       `json:"failure_code,omitempty"`
-	IdempotencyKey    string            `json:"idempotency_key"`
-	RequestHash       string            `json:"request_hash"`
-	ReceiptHash       string            `json:"receipt_hash,omitempty"`
-	ReceivedAt        *time.Time        `json:"received_at,omitempty"`
+	SchemaVersion      string                          `json:"schema_version"`
+	TenantID           string                          `json:"tenant_id"`
+	WorkspaceID        string                          `json:"workspace_id"`
+	EnvironmentID      string                          `json:"environment_id"`
+	ServiceID          string                          `json:"service_id"`
+	IncidentID         string                          `json:"incident_id"`
+	InvestigationID    string                          `json:"investigation_id"`
+	TaskID             string                          `json:"task_id"`
+	RunnerID           string                          `json:"runner_id"`
+	ScopeRevision      string                          `json:"scope_revision"`
+	CertificateSHA256  string                          `json:"certificate_sha256"`
+	LeaseEpoch         string                          `json:"lease_epoch"`
+	ConnectorID        string                          `json:"connector_id"`
+	Operation          string                          `json:"operation"`
+	Outcome            CompletionOutcome               `json:"outcome"`
+	ContentHash        string                          `json:"content_hash,omitempty"`
+	FailureCode        FailureCode                     `json:"failure_code,omitempty"`
+	IdempotencyKey     string                          `json:"idempotency_key"`
+	PlanBinding        domain.InvestigationPlanBinding `json:"plan_binding"`
+	RuntimeBinding     domain.ReadTaskRuntimeBinding   `json:"runtime_binding"`
+	RequestHash        string                          `json:"request_hash"`
+	RequestHashVersion string                          `json:"request_hash_version"`
+	ReceiptHashVersion string                          `json:"receipt_hash_version"`
+	ReceiptHash        string                          `json:"receipt_hash,omitempty"`
+	ReceivedAt         *time.Time                      `json:"received_at,omitempty"`
 }
 
 func receiptHashWire(receipt Receipt) receiptWire {
@@ -380,7 +396,10 @@ func receiptHashWire(receipt Receipt) receiptWire {
 		LeaseEpoch: strconv.FormatInt(receipt.LeaseEpoch, 10), ConnectorID: receipt.ConnectorID,
 		Operation: receipt.Operation, Outcome: receipt.Outcome, ContentHash: receipt.ContentHash,
 		FailureCode: receipt.FailureCode, IdempotencyKey: receipt.IdempotencyKey,
-		RequestHash: receipt.RequestHash, ReceiptHash: receipt.ReceiptHash, ReceivedAt: &receipt.ReceivedAt,
+		PlanBinding: receipt.PlanBinding, RuntimeBinding: receipt.RuntimeBinding,
+		RequestHash: receipt.RequestHash, RequestHashVersion: receipt.RequestHashVersion,
+		ReceiptHashVersion: receipt.ReceiptHashVersion,
+		ReceiptHash:        receipt.ReceiptHash, ReceivedAt: &receipt.ReceivedAt,
 	}
 }
 
@@ -388,7 +407,7 @@ func completionReceiptHash(receipt Receipt) (string, error) {
 	wire := receiptHashWire(receipt)
 	wire.ReceiptHash = ""
 	wire.ReceivedAt = nil
-	return canonicalHash(completionReceiptHashV2, wire)
+	return canonicalHash(CompletionReceiptHashVersionV3, wire)
 }
 
 func canonicalHash(schema string, value any) (string, error) {

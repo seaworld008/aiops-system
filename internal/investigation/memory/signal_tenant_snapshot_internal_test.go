@@ -15,7 +15,8 @@ import (
 func TestSignalReadersFailClosedWhenTenantSnapshotIsMissing(t *testing.T) {
 	now := time.Date(2026, 7, 12, 5, 0, 0, 0, time.UTC)
 	repository, err := New(Options{
-		Clock: func() time.Time { return now }, IDFactory: func() string { return "77777777-7777-4777-8777-777777777777" },
+		TaskRuntimeBinder: testTaskRuntimeBinder,
+		Clock:             func() time.Time { return now }, IDFactory: func() string { return "77777777-7777-4777-8777-777777777777" },
 		TenantResolver:     func(string) (string, error) { return "11111111-1111-4111-8111-111111111111", nil },
 		TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error { return nil },
 	})
@@ -48,7 +49,8 @@ func TestConcurrentFirstSignalRegistrationDoubleChecksAtomicTenantSnapshot(t *te
 	entered := make(chan struct{}, 2)
 	release := make(chan struct{})
 	repository, err := New(Options{
-		Clock: func() time.Time { return now }, IDFactory: func() string { return "77777777-7777-4777-8777-777777777777" },
+		TaskRuntimeBinder: testTaskRuntimeBinder,
+		Clock:             func() time.Time { return now }, IDFactory: func() string { return "77777777-7777-4777-8777-777777777777" },
 		TenantResolver: func(string) (string, error) {
 			entered <- struct{}{}
 			<-release

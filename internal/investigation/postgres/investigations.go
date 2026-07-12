@@ -168,8 +168,24 @@ func (repository *Repository) createOrBindInvestigation(
 	); err != nil {
 		return result, err
 	}
+	runtimeComponents, err := investigation.ResolveTaskRuntimeComponents(
+		ctx, repository.taskRuntimeBinder, scope, request.PlanBinding, canonicalTasks,
+	)
+	if err != nil {
+		return result, err
+	}
 	if activeFound {
-		if active.RequestHash != requestHash {
+		if active.RequestHashVersion != domain.InvestigationCreateRequestVersionV2 ||
+			active.RequestHash != requestHash || !active.PlanBinding.Equal(request.PlanBinding) {
+			return result, store.ErrIdempotencyConflict
+		}
+		activeTasks, loadErr := loadInvestigationTasks(
+			ctx, tx, tenantID, request.WorkspaceID, active.ID, false,
+		)
+		if loadErr != nil {
+			return result, loadErr
+		}
+		if !runtimeBindingsMatch(active, activeTasks, scope, canonicalTasks, runtimeComponents) {
 			return result, store.ErrIdempotencyConflict
 		}
 		if err := bindCreateInvestigationIdempotency(
@@ -202,9 +218,15 @@ func (repository *Repository) createOrBindInvestigation(
 	}
 	createdTasks := make([]domain.ReadTask, 0, len(canonicalTasks))
 	for index, spec := range canonicalTasks {
+		runtimeBinding, bindingErr := investigation.BuildReadTaskRuntimeBinding(
+			scope, request.PlanBinding, spec, index+1, runtimeComponents[index], created.CreatedAt,
+		)
+		if bindingErr != nil {
+			return result, bindingErr
+		}
 		task, insertErr := insertRuntimeTask(
 			ctx, tx, tenantID, request.WorkspaceID, request.IncidentID,
-			created.ID, taskIDs[index], index+1, spec, created.CreatedAt,
+			created.ID, taskIDs[index], index+1, spec, runtimeBinding, created.CreatedAt,
 		)
 		if insertErr != nil {
 			return result, mapCreateInsertError("insert runtime investigation task", insertErr)
@@ -347,9 +369,12 @@ func validatePersistedCreateSemantics(
 	tasks []domain.ReadTask,
 	expectedRequestHash string,
 ) error {
+	if item.RequestHashVersion != domain.InvestigationCreateRequestVersionV2 || item.PlanBinding.Validate() != nil {
+		return fmt.Errorf("read investigation creation semantics: %w", errDatabaseOperation)
+	}
 	specs := make([]investigation.TaskSpec, len(tasks))
 	for index, task := range tasks {
-		if task.Position != index+1 {
+		if task.Position != index+1 || task.RuntimeBinding.Validate() != nil {
 			return fmt.Errorf("read investigation creation tasks: %w", errDatabaseOperation)
 		}
 		specs[index] = investigation.TaskSpec{
@@ -368,12 +393,40 @@ func validatePersistedCreateSemantics(
 		}
 	}
 	requestHash, err := investigation.CreateOrGetInvestigationRequestHash(
-		investigation.CreateOrGetInvestigationRequest{IncidentID: item.IncidentID}, taskHash,
+		investigation.CreateOrGetInvestigationRequest{IncidentID: item.IncidentID, PlanBinding: item.PlanBinding}, taskHash,
 	)
 	if err != nil || requestHash != item.RequestHash || requestHash != expectedRequestHash {
 		return fmt.Errorf("read investigation creation semantics: %w", errDatabaseOperation)
 	}
 	return nil
+}
+
+func runtimeBindingsMatch(
+	item domain.Investigation,
+	tasks []domain.ReadTask,
+	scope investigation.TaskSpecScope,
+	specs []investigation.TaskSpec,
+	components []investigation.TaskRuntimeComponents,
+) bool {
+	if item.RequestHashVersion != domain.InvestigationCreateRequestVersionV2 ||
+		item.PlanBinding.Validate() != nil || len(tasks) != len(specs) || len(components) != len(specs) {
+		return false
+	}
+	for index := range tasks {
+		task := tasks[index]
+		spec := specs[index]
+		if task.Position != index+1 || task.Key != spec.Key || task.ConnectorID != spec.ConnectorID ||
+			task.Operation != spec.Operation || string(task.Input) != string(spec.Input) || task.RuntimeBinding.IsZero() {
+			return false
+		}
+		expected, err := investigation.BuildReadTaskRuntimeBinding(
+			scope, item.PlanBinding, spec, index+1, components[index], task.RuntimeBinding.BoundAt,
+		)
+		if err != nil || !task.RuntimeBinding.Equal(expected) {
+			return false
+		}
+	}
+	return true
 }
 
 func loadInvestigationTasks(
@@ -452,19 +505,25 @@ func insertRuntimeInvestigation(
 			id, tenant_id, workspace_id, incident_id, status,
 			window_start, window_end, tool_schema_version, created_at,
 			model_status, idempotency_key, request_hash, request_hash_version,
+			plan_schema_version, plan_manifest_digest, plan_registry_digest,
+			plan_profile_digest, plan_tasks_hash,
 			updated_at, service_id_snapshot, environment_id_snapshot,
 			mapping_status_snapshot, runtime_schema_version
 		)
 		SELECT $1, $2, $3, $4, 'QUEUED',
 			$6, $7, $9, boundary.committed_at,
 			'PENDING', $5, $10, $11,
-			boundary.committed_at, $12, $13, $14, $15
+			$12, $13, $14, $15, $16,
+			boundary.committed_at, $17, $18, $19, $20
 		FROM boundary
 		RETURNING `+investigationProjection,
 		investigationID, tenantID, request.WorkspaceID, request.IncidentID, request.IdempotencyKey,
 		incident.OpenedAt, incident.LastSignalAt, incident.UpdatedAt, investigationTaskSchemaVersion,
-		requestHash, requestVersionCreateInvestigation, nullableInvestigationUUID(incident.ServiceID),
-		nullableInvestigationUUID(incident.EnvironmentID), incident.MappingStatus, runtimeSchemaVersion,
+		requestHash, requestVersionCreateInvestigation,
+		request.PlanBinding.SchemaVersion, request.PlanBinding.ManifestDigest, request.PlanBinding.RegistryDigest,
+		request.PlanBinding.ProfileDigest, request.PlanBinding.TasksHash,
+		nullableInvestigationUUID(incident.ServiceID), nullableInvestigationUUID(incident.EnvironmentID),
+		incident.MappingStatus, runtimeSchemaVersion,
 	))
 }
 
@@ -474,6 +533,7 @@ func insertRuntimeTask(
 	tenantID, workspaceID, incidentID, investigationID, taskID string,
 	position int,
 	spec investigation.TaskSpec,
+	runtimeBinding domain.ReadTaskRuntimeBinding,
 	createdAt time.Time,
 ) (domain.ReadTask, error) {
 	return scanTask(tx.QueryRow(ctx, `
@@ -481,17 +541,22 @@ func insertRuntimeTask(
 			id, tenant_id, workspace_id, investigation_id,
 			tool_name, tool_version, input_hash, status,
 			incident_id, task_key, position, input_document,
-			created_at, updated_at, runtime_schema_version
+			created_at, updated_at, runtime_schema_version,
+			read_runtime_schema_version, connector_digest, target_digest,
+			executor_digest, runtime_digest, runtime_bound_at
 		) VALUES (
 			$1, $2, $3, $4,
 			$5, $6, $7, 'QUEUED',
 			$8, $9, $10, $11,
-			$12, $12, $13
+			$12, $12, $13,
+			$14, $15, $16, $17, $18, $19
 		)
 		RETURNING `+taskProjection,
 		taskID, tenantID, workspaceID, investigationID,
 		spec.ConnectorID, spec.Operation, investigationInputHash(spec.Input),
 		incidentID, spec.Key, position, []byte(spec.Input), createdAt.UTC(), runtimeSchemaVersion,
+		runtimeBinding.SchemaVersion, runtimeBinding.ConnectorDigest, runtimeBinding.TargetDigest,
+		runtimeBinding.ExecutorDigest, runtimeBinding.RuntimeDigest, runtimeBinding.BoundAt,
 	))
 }
 

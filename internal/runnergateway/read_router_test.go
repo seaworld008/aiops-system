@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/seaworld008/aiops-system/internal/domain"
+	"github.com/seaworld008/aiops-system/internal/investigation"
 	"github.com/seaworld008/aiops-system/internal/readgateway"
 	"github.com/seaworld008/aiops-system/internal/readtask"
 	"github.com/seaworld008/aiops-system/internal/runneridentity"
@@ -47,9 +49,23 @@ func TestReadTaskRouterSupportsBoundClaimStartHeartbeatReleaseAndComplete(t *tes
 	var claimResponse ReadTaskClaimResponse
 	decodeReadTaskResponse(t, response, &claimResponse)
 	if claimResponse.LeaseToken != fixture.token || claimResponse.Task.ID != testReadTaskID ||
+		claimResponse.SchemaVersion != "runner-read-task-claim-response.v2" ||
 		claimResponse.Task.InputHash != fixture.descriptor.InputHash || claimResponse.LeaseEpoch.Int64() != 7 ||
 		claimResponse.ScopeRevision.Int64() != 1 || claimResponse.HeartbeatAfterSeconds != 10 {
 		t.Fatalf("claim response detached from persisted task: %#v", claimResponse)
+	}
+	if claimResponse.Task.PlanBinding.SchemaVersion != fixture.descriptor.PlanBinding.SchemaVersion ||
+		claimResponse.Task.PlanBinding.ManifestDigest != fixture.descriptor.PlanBinding.ManifestDigest ||
+		claimResponse.Task.PlanBinding.RegistryDigest != fixture.descriptor.PlanBinding.RegistryDigest ||
+		claimResponse.Task.PlanBinding.ProfileDigest != fixture.descriptor.PlanBinding.ProfileDigest ||
+		claimResponse.Task.PlanBinding.TasksHash != fixture.descriptor.PlanBinding.TasksHash ||
+		claimResponse.Task.RuntimeBinding.SchemaVersion != fixture.descriptor.RuntimeBinding.SchemaVersion ||
+		claimResponse.Task.RuntimeBinding.ConnectorDigest != fixture.descriptor.RuntimeBinding.ConnectorDigest ||
+		claimResponse.Task.RuntimeBinding.TargetDigest != fixture.descriptor.RuntimeBinding.TargetDigest ||
+		claimResponse.Task.RuntimeBinding.ExecutorDigest != fixture.descriptor.RuntimeBinding.ExecutorDigest ||
+		claimResponse.Task.RuntimeBinding.RuntimeDigest != fixture.descriptor.RuntimeBinding.RuntimeDigest ||
+		!claimResponse.Task.RuntimeBinding.BoundAt.Equal(fixture.descriptor.RuntimeBinding.BoundAt) {
+		t.Fatalf("claim response changed immutable plan/runtime bindings: %#v", claimResponse.Task)
 	}
 	inputDigest := sha256.Sum256(claimResponse.Task.Input)
 	if !bytes.Equal(claimResponse.Task.Input, fixture.descriptor.Input) ||
@@ -107,6 +123,7 @@ func TestReadTaskRouterSupportsBoundClaimStartHeartbeatReleaseAndComplete(t *tes
 	var completeResponse ReadTaskCompleteResponse
 	decodeReadTaskResponse(t, response, &completeResponse)
 	if completeResponse.TaskID != testReadTaskID || completeResponse.AttemptStatus != "COMPLETED" ||
+		completeResponse.SchemaVersion != "runner-read-task-complete-response.v2" ||
 		completeResponse.TaskStatus != "EVIDENCE" || completeResponse.LeaseEpoch.Int64() != 7 ||
 		completeResponse.EvidenceID != fixture.completion.EvidenceID || completeResponse.ReceiptID != fixture.completion.ReceiptID ||
 		completeResponse.ContentHash != fixture.completion.Projection.ContentHash() ||
@@ -671,10 +688,24 @@ func TestReadTaskRouterFailsClosedOnBackendResponseBindingTampering(t *testing.T
 			},
 		},
 		{
+			name: "start partial plan binding", suffix: ":start",
+			body: `{"schema_version":"runner-read-task-start-request.v1","lease_epoch":"7"}`,
+			mutate: func(_ *testing.T, _ *readTaskFixture, backend *fakeReadTaskBackend) {
+				backend.start.PlanBinding = domain.InvestigationPlanBinding{}
+			},
+		},
+		{
 			name: "heartbeat sequence", suffix: ":heartbeat",
 			body: `{"schema_version":"runner-read-task-heartbeat-request.v1","lease_epoch":"7","sequence":"1"}`,
 			mutate: func(_ *testing.T, _ *readTaskFixture, backend *fakeReadTaskBackend) {
 				backend.heartbeat.AcceptedSequence = 2
+			},
+		},
+		{
+			name: "heartbeat partial runtime binding", suffix: ":heartbeat",
+			body: `{"schema_version":"runner-read-task-heartbeat-request.v1","lease_epoch":"7","sequence":"1"}`,
+			mutate: func(_ *testing.T, _ *readTaskFixture, backend *fakeReadTaskBackend) {
+				backend.heartbeat.Attempt.RuntimeBinding = domain.ReadTaskRuntimeBinding{}
 			},
 		},
 		{
@@ -689,6 +720,34 @@ func TestReadTaskRouterFailsClosedOnBackendResponseBindingTampering(t *testing.T
 			body: `{"schema_version":"runner-read-task-complete-request.v1","lease_epoch":"7","outcome":"EVIDENCE","evidence":{"collected_at":"2039-01-01T00:00:00Z","items":[]}}`,
 			mutate: func(_ *testing.T, _ *readTaskFixture, backend *fakeReadTaskBackend) {
 				backend.completion.Attempt.Epoch = 8
+			},
+		},
+		{
+			name: "completion plan snapshot drift", suffix: ":complete",
+			body: `{"schema_version":"runner-read-task-complete-request.v1","lease_epoch":"7","outcome":"EVIDENCE","evidence":{"collected_at":"2039-01-01T00:00:00Z","items":[]}}`,
+			mutate: func(_ *testing.T, _ *readTaskFixture, backend *fakeReadTaskBackend) {
+				backend.completion.Attempt.PlanBinding.ManifestDigest = hex.EncodeToString(bytes.Repeat([]byte{0xa1}, 32))
+			},
+		},
+		{
+			name: "completion runtime snapshot drift", suffix: ":complete",
+			body: `{"schema_version":"runner-read-task-complete-request.v1","lease_epoch":"7","outcome":"EVIDENCE","evidence":{"collected_at":"2039-01-01T00:00:00Z","items":[]}}`,
+			mutate: func(_ *testing.T, _ *readTaskFixture, backend *fakeReadTaskBackend) {
+				backend.completion.Attempt.RuntimeBinding.RuntimeDigest = hex.EncodeToString(bytes.Repeat([]byte{0xa2}, 32))
+			},
+		},
+		{
+			name: "completion request hash version drift", suffix: ":complete",
+			body: `{"schema_version":"runner-read-task-complete-request.v1","lease_epoch":"7","outcome":"EVIDENCE","evidence":{"collected_at":"2039-01-01T00:00:00Z","items":[]}}`,
+			mutate: func(_ *testing.T, _ *readTaskFixture, backend *fakeReadTaskBackend) {
+				backend.completion.Attempt.RequestHashVersion = "read-task-completion-request.v2"
+			},
+		},
+		{
+			name: "completion receipt hash version drift", suffix: ":complete",
+			body: `{"schema_version":"runner-read-task-complete-request.v1","lease_epoch":"7","outcome":"EVIDENCE","evidence":{"collected_at":"2039-01-01T00:00:00Z","items":[]}}`,
+			mutate: func(_ *testing.T, _ *readTaskFixture, backend *fakeReadTaskBackend) {
+				backend.completion.Attempt.ReceiptHashVersion = "read-task-completion-receipt.v2"
 			},
 		},
 	}
@@ -711,6 +770,126 @@ func TestReadTaskRouterFailsClosedOnBackendResponseBindingTampering(t *testing.T
 			assertProblemCode(t, response, http.StatusInternalServerError, "runner_internal_error")
 		})
 	}
+}
+
+func TestReadTaskClaimBindingRejectsPartialAndDriftedPlanRuntimeSnapshots(t *testing.T) {
+	t.Parallel()
+	identity := testIdentity(t)
+	fixture := newReadTaskFixture(t, identity)
+	defer fixture.claim.Destroy()
+	response, err := readTaskClaimResponse(fixture.claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*ReadTaskDescriptor, *readtask.Descriptor, *readtask.Attempt)
+	}{
+		{
+			name: "partial plan response",
+			mutate: func(task *ReadTaskDescriptor, _ *readtask.Descriptor, _ *readtask.Attempt) {
+				task.PlanBinding = ReadTaskPlanBinding{}
+			},
+		},
+		{
+			name: "partial runtime response",
+			mutate: func(task *ReadTaskDescriptor, _ *readtask.Descriptor, _ *readtask.Attempt) {
+				task.RuntimeBinding = ReadTaskRuntimeBinding{}
+			},
+		},
+		{
+			name: "plan response drift",
+			mutate: func(task *ReadTaskDescriptor, _ *readtask.Descriptor, _ *readtask.Attempt) {
+				task.PlanBinding.RegistryDigest = hex.EncodeToString(bytes.Repeat([]byte{0xb1}, 32))
+			},
+		},
+		{
+			name: "runtime response drift",
+			mutate: func(task *ReadTaskDescriptor, _ *readtask.Descriptor, _ *readtask.Attempt) {
+				task.RuntimeBinding.BoundAt = task.RuntimeBinding.BoundAt.Add(time.Microsecond)
+			},
+		},
+		{
+			name: "attempt plan snapshot drift",
+			mutate: func(_ *ReadTaskDescriptor, _ *readtask.Descriptor, attempt *readtask.Attempt) {
+				attempt.PlanBinding.TasksHash = hex.EncodeToString(bytes.Repeat([]byte{0xb2}, 32))
+			},
+		},
+		{
+			name: "attempt runtime snapshot drift",
+			mutate: func(_ *ReadTaskDescriptor, _ *readtask.Descriptor, attempt *readtask.Attempt) {
+				attempt.RuntimeBinding.ExecutorDigest = hex.EncodeToString(bytes.Repeat([]byte{0xb3}, 32))
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			task := response.Task
+			descriptor := fixture.descriptor
+			attempt := fixture.leased
+			test.mutate(&task, &descriptor, &attempt)
+			if validReadTaskClaimSnapshotBinding(task, descriptor, attempt) {
+				t.Fatal("partial or drifted plan/runtime snapshot was accepted")
+			}
+		})
+	}
+}
+
+func TestReadTaskBindingComparisonChecksEveryPublishedField(t *testing.T) {
+	t.Parallel()
+	identity := testIdentity(t)
+	fixture := newReadTaskFixture(t, identity)
+	defer fixture.claim.Destroy()
+
+	plan := fixture.descriptor.PlanBinding
+	planMutations := []struct {
+		name   string
+		mutate func(*domain.InvestigationPlanBinding)
+	}{
+		{"schema version", func(value *domain.InvestigationPlanBinding) { value.SchemaVersion += ".drift" }},
+		{"manifest digest", func(value *domain.InvestigationPlanBinding) { value.ManifestDigest = readTaskDriftDigest(0xc1) }},
+		{"registry digest", func(value *domain.InvestigationPlanBinding) { value.RegistryDigest = readTaskDriftDigest(0xc2) }},
+		{"profile digest", func(value *domain.InvestigationPlanBinding) { value.ProfileDigest = readTaskDriftDigest(0xc3) }},
+		{"tasks hash", func(value *domain.InvestigationPlanBinding) { value.TasksHash = readTaskDriftDigest(0xc4) }},
+	}
+	for _, test := range planMutations {
+		t.Run("plan "+test.name, func(t *testing.T) {
+			drifted := plan
+			test.mutate(&drifted)
+			if readTaskPlanBindingsEqual(plan, drifted) ||
+				readTaskWirePlanBindingEqual(readTaskPlanBinding(plan), drifted) {
+				t.Fatal("plan binding field drift was accepted")
+			}
+		})
+	}
+
+	runtimeBinding := fixture.descriptor.RuntimeBinding
+	runtimeMutations := []struct {
+		name   string
+		mutate func(*domain.ReadTaskRuntimeBinding)
+	}{
+		{"schema version", func(value *domain.ReadTaskRuntimeBinding) { value.SchemaVersion += ".drift" }},
+		{"connector digest", func(value *domain.ReadTaskRuntimeBinding) { value.ConnectorDigest = readTaskDriftDigest(0xd1) }},
+		{"target digest", func(value *domain.ReadTaskRuntimeBinding) { value.TargetDigest = readTaskDriftDigest(0xd2) }},
+		{"executor digest", func(value *domain.ReadTaskRuntimeBinding) { value.ExecutorDigest = readTaskDriftDigest(0xd3) }},
+		{"runtime digest", func(value *domain.ReadTaskRuntimeBinding) { value.RuntimeDigest = readTaskDriftDigest(0xd4) }},
+		{"bound at", func(value *domain.ReadTaskRuntimeBinding) { value.BoundAt = value.BoundAt.Add(time.Microsecond) }},
+	}
+	for _, test := range runtimeMutations {
+		t.Run("runtime "+test.name, func(t *testing.T) {
+			drifted := runtimeBinding
+			test.mutate(&drifted)
+			if readTaskRuntimeBindingsEqual(runtimeBinding, drifted) ||
+				readTaskWireRuntimeBindingEqual(readTaskRuntimeBinding(runtimeBinding), drifted) {
+				t.Fatal("runtime binding field drift was accepted")
+			}
+		})
+	}
+}
+
+func readTaskDriftDigest(seed byte) string {
+	return hex.EncodeToString(bytes.Repeat([]byte{seed}, 32))
 }
 
 type fakeReadTaskBackend struct {
@@ -840,13 +1019,55 @@ func newReadTaskFixture(t *testing.T, identity runneridentity.Identity) *readTas
 	tokenDigest := sha256.Sum256([]byte(token))
 	input := json.RawMessage(`{"query":"up > 0 & error_ratio < 1"}`)
 	inputDigest := sha256.Sum256(input)
+	planBinding := domain.InvestigationPlanBinding{
+		SchemaVersion:  domain.InvestigationPlanBindingSchemaVersion,
+		ManifestDigest: hex.EncodeToString(bytes.Repeat([]byte{0x11}, 32)),
+		RegistryDigest: hex.EncodeToString(bytes.Repeat([]byte{0x22}, 32)),
+		ProfileDigest:  hex.EncodeToString(bytes.Repeat([]byte{0x33}, 32)),
+		TasksHash:      hex.EncodeToString(bytes.Repeat([]byte{0x44}, 32)),
+	}
+	runtimeBinding := domain.ReadTaskRuntimeBinding{
+		SchemaVersion:   domain.ReadTaskRuntimeBindingSchemaVersion,
+		ConnectorDigest: hex.EncodeToString(bytes.Repeat([]byte{0x55}, 32)),
+		TargetDigest:    hex.EncodeToString(bytes.Repeat([]byte{0x66}, 32)),
+		ExecutorDigest:  hex.EncodeToString(bytes.Repeat([]byte{0x77}, 32)),
+		RuntimeDigest:   hex.EncodeToString(bytes.Repeat([]byte{0x88}, 32)),
+		BoundAt:         time.Date(2040, 1, 2, 2, 4, 5, 0, time.UTC),
+	}
 	descriptor := readtask.Descriptor{
 		TenantID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", WorkspaceID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
 		EnvironmentID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", IncidentID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
 		ServiceID:       "c1000000-0000-4000-8000-000000000001",
 		InvestigationID: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", TaskID: testReadTaskID,
-		TaskKey: "metrics", Position: 1, ConnectorID: "prometheus-read", Operation: "query-range",
+		TaskKey: "metrics", Position: 1,
+		ConnectorID: "prometheus-read-v1-" + runtimeBinding.ConnectorDigest, Operation: "query-range",
 		Input: input, InputHash: hex.EncodeToString(inputDigest[:]),
+		PlanBinding: planBinding, RuntimeBinding: runtimeBinding,
+	}
+	runtimeDigest, err := investigation.ReadTaskRuntimeDigest(
+		investigation.TaskSpecScope{
+			TenantID: descriptor.TenantID, WorkspaceID: descriptor.WorkspaceID,
+			EnvironmentID: descriptor.EnvironmentID, ServiceID: descriptor.ServiceID,
+			MappingStatus: domain.MappingExact,
+		},
+		descriptor.PlanBinding,
+		investigation.TaskSpec{
+			Key: descriptor.TaskKey, ConnectorID: descriptor.ConnectorID,
+			Operation: descriptor.Operation, Input: append([]byte(nil), descriptor.Input...),
+		}, descriptor.Position,
+		investigation.TaskRuntimeComponents{
+			ConnectorDigest: descriptor.RuntimeBinding.ConnectorDigest,
+			TargetDigest:    descriptor.RuntimeBinding.TargetDigest,
+			ExecutorDigest:  descriptor.RuntimeBinding.ExecutorDigest,
+		},
+	)
+	if err != nil {
+		t.Fatalf("fixture runtime digest: %v", err)
+	}
+	descriptor.RuntimeBinding.RuntimeDigest = runtimeDigest
+	runtimeBinding = descriptor.RuntimeBinding
+	if err := descriptor.Validate(); err != nil {
+		t.Fatalf("fixture descriptor: %v", err)
 	}
 	certificate := readtask.CertificateBinding{
 		SHA256: identity.Evidence().LeafSHA256(), NotAfter: identity.Evidence().NotAfter().UTC(),
@@ -860,6 +1081,10 @@ func newReadTaskFixture(t *testing.T, identity runneridentity.Identity) *readTas
 		TaskID: descriptor.TaskID, RunnerID: identity.Instance(), ScopeRevision: 1, Certificate: certificate,
 		TokenSHA256: hex.EncodeToString(tokenDigest[:]), Epoch: 7, Status: readtask.AttemptLeased,
 		LeaseAcquiredAt: acquiredAt, LeaseExpiresAt: leaseExpiresAt, LastHeartbeatAt: acquiredAt, UpdatedAt: acquiredAt,
+		PlanBinding: planBinding, RuntimeBinding: runtimeBinding,
+	}
+	if err := leased.ValidateAgainst(descriptor); err != nil {
+		t.Fatalf("fixture leased attempt: %v", err)
 	}
 	claim, err := readtask.NewClaim(descriptor, leased, []byte(token))
 	if err != nil {
@@ -902,6 +1127,8 @@ func newReadTaskFixture(t *testing.T, identity runneridentity.Identity) *readTas
 	completed.UpdatedAt = receivedAt
 	completed.RequestHash = projection.RequestHash()
 	completed.ReceiptHash = projection.ReceiptHash()
+	completed.RequestHashVersion = readtask.CompletionRequestHashVersionV3
+	completed.ReceiptHashVersion = readtask.CompletionReceiptHashVersionV3
 	if err := projection.ValidateAgainst(descriptor, completed); err != nil {
 		t.Fatal(err)
 	}
@@ -946,6 +1173,8 @@ func completionResultForOutcome(
 	completed.UpdatedAt = receivedAt
 	completed.RequestHash = projection.RequestHash()
 	completed.ReceiptHash = projection.ReceiptHash()
+	completed.RequestHashVersion = readtask.CompletionRequestHashVersionV3
+	completed.ReceiptHashVersion = readtask.CompletionReceiptHashVersionV3
 	result := readtask.CompletionResult{
 		Attempt: completed, Projection: projection,
 		ReceiptID: "99999999-9999-4999-8999-999999999999",

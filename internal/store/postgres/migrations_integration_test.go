@@ -274,6 +274,7 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 		t.Fatalf("outbox routing down retained rows = %d, error = %v", routingFixtureCount, err)
 	}
 	applyMigrationFile(t, ctx, database, outboxRoutingUp)
+	applyMigrationFile(t, ctx, database, filepath.Join(migrationDirectory, "000013_investigation_runtime_binding.up.sql"))
 	applyMigrations(t, ctx, database, migrationDirectory, ".down.sql", true)
 	var relationName *string
 	if err := database.QueryRow(ctx, `SELECT to_regclass('public.tenants')::text`).Scan(&relationName); err != nil {

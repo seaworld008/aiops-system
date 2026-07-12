@@ -16,12 +16,13 @@ func TestFinalizeReplayIsImmutableFirstResponseSnapshotAfterFeedback(t *testing.
 	now := time.Date(2026, 7, 12, 23, 0, 0, 0, time.UTC)
 	repository := newRepository(t, now)
 	incident := createIncident(t, repository, "workspace-1", "signal-snapshot", now)
-	created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+	created, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:snapshot",
 		Tasks: []investigation.TaskSpec{{
-			Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+			Key: "metrics", ConnectorID: "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
 		}},
-	})
+	}))
+
 	if err != nil {
 		t.Fatalf("CreateOrGetInvestigation() error = %v", err)
 	}
@@ -113,7 +114,8 @@ func TestListEvidenceUsesCollectedCreatedAndIDOrder(t *testing.T) {
 	}
 	nextID := 0
 	repository, err := memory.New(memory.Options{
-		Clock: func() time.Time { return now }, TenantResolver: testTenantResolver, TaskSpecAuthorizer: testTaskSpecAuthorizer,
+		TaskRuntimeBinder: testTaskRuntimeBinder,
+		Clock:             func() time.Time { return now }, TenantResolver: testTenantResolver, TaskSpecAuthorizer: testTaskSpecAuthorizer,
 		IDFactory: func() string {
 			id := ids[nextID]
 			nextID++
@@ -124,14 +126,15 @@ func TestListEvidenceUsesCollectedCreatedAndIDOrder(t *testing.T) {
 		t.Fatalf("memory.New() error = %v", err)
 	}
 	incident := createIncident(t, repository, "workspace-1", "signal-evidence-order", now)
-	created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+	created, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:evidence-order",
 		Tasks: []investigation.TaskSpec{
-			{Key: "a", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`)},
-			{Key: "b", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`)},
-			{Key: "c", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`)},
+			{Key: "a", ConnectorID: "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`)},
+			{Key: "b", ConnectorID: "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`)},
+			{Key: "c", ConnectorID: "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`)},
 		},
-	})
+	}))
+
 	if err != nil {
 		t.Fatalf("CreateOrGetInvestigation() error = %v", err)
 	}

@@ -4063,6 +4063,74 @@
           }
         ]
       },
+      "ReadTaskPlanBinding": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "manifest_digest",
+          "registry_digest",
+          "profile_digest",
+          "tasks_hash"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "investigation-plan-manifest.v1",
+            "minLength": 30,
+            "maxLength": 30
+          },
+          "manifest_digest": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          },
+          "registry_digest": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          },
+          "profile_digest": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          },
+          "tasks_hash": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          }
+        },
+        "description": "Secret-safe immutable investigation plan identity selected and persisted by the server."
+      },
+      "ReadTaskRuntimeBinding": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema_version",
+          "connector_digest",
+          "target_digest",
+          "executor_digest",
+          "runtime_digest",
+          "bound_at"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "const": "read-task-runtime-binding.v1",
+            "minLength": 28,
+            "maxLength": 28
+          },
+          "connector_digest": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          },
+          "target_digest": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          },
+          "executor_digest": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          },
+          "runtime_digest": {
+            "$ref": "#/components/schemas/SHA256Hex"
+          },
+          "bound_at": {
+            "$ref": "#/components/schemas/RFC3339Timestamp"
+          }
+        },
+        "description": "Secret-safe immutable READ execution identity; digests bind trusted connector, target, executor and aggregate runtime manifests without exposing endpoints or credentials."
+      },
       "ReadTaskDescriptor": {
         "type": "object",
         "additionalProperties": false,
@@ -4073,7 +4141,9 @@
           "connector_id",
           "operation",
           "input",
-          "input_hash"
+          "input_hash",
+          "plan_binding",
+          "runtime_binding"
         ],
         "properties": {
           "id": {
@@ -4092,9 +4162,10 @@
           },
           "connector_id": {
             "type": "string",
-            "minLength": 1,
+            "minLength": 69,
             "maxLength": 128,
-            "pattern": "^[a-z0-9][a-z0-9_.-]*$"
+            "pattern": "^[a-z0-9][a-z0-9_.-]{0,59}-v1-[a-f0-9]{64}$",
+            "x-aiops-digest-suffix-field": "runtime_binding.connector_digest"
           },
           "operation": {
             "type": "string",
@@ -4115,6 +4186,12 @@
             "$ref": "#/components/schemas/SHA256Hex",
             "description": "SHA-256 of the exact JCS-canonical input bytes returned in this descriptor.",
             "x-aiops-hash-input": "exact-jcs-bytes"
+          },
+          "plan_binding": {
+            "$ref": "#/components/schemas/ReadTaskPlanBinding"
+          },
+          "runtime_binding": {
+            "$ref": "#/components/schemas/ReadTaskRuntimeBinding"
           }
         }
       },
@@ -4146,7 +4223,7 @@
         "properties": {
           "schema_version": {
             "type": "string",
-            "const": "runner-read-task-claim-response.v1"
+            "const": "runner-read-task-claim-response.v2"
           },
           "task": {
             "$ref": "#/components/schemas/ReadTaskDescriptor"
@@ -4490,7 +4567,7 @@
         "properties": {
           "schema_version": {
             "type": "string",
-            "const": "runner-read-task-complete-response.v1"
+            "const": "runner-read-task-complete-response.v2"
           },
           "task_id": {
             "$ref": "#/components/schemas/UUID"

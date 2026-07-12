@@ -14,6 +14,7 @@ import (
 
 const (
 	createInvestigationRequestSemanticsV1   = "investigation.create.v1"
+	createInvestigationRequestSemanticsV2   = "investigation.create.v2"
 	completeTaskRequestSemanticsV1          = "investigation.complete-task.v1"
 	finalizeInvestigationRequestSemanticsV1 = "investigation.finalize.v1"
 	recordFeedbackRequestSemanticsV1        = "investigation.feedback.v1"
@@ -24,6 +25,24 @@ const (
 // CreateOrGetInvestigationRequestHash returns the stable semantic hash for a
 // create operation after its task specifications have been canonicalized.
 func CreateOrGetInvestigationRequestHash(request CreateOrGetInvestigationRequest, taskSpecsHash string) (string, error) {
+	if !domain.ValidSHA256Hex(taskSpecsHash) || request.PlanBinding.Validate() != nil ||
+		request.PlanBinding.TasksHash != taskSpecsHash {
+		return "", fmt.Errorf("%w: invalid canonical task specification hash", ErrInvalidRequest)
+	}
+	return semanticRequestHash(createInvestigationRequestSemanticsV2, struct {
+		IncidentID    string                          `json:"incident_id"`
+		TaskSpecsHash string                          `json:"task_specs_hash"`
+		PlanBinding   domain.InvestigationPlanBinding `json:"plan_binding"`
+	}{IncidentID: request.IncidentID, TaskSpecsHash: taskSpecsHash, PlanBinding: request.PlanBinding})
+}
+
+// LegacyCreateOrGetInvestigationRequestHash reproduces the immutable v1 hash
+// solely for verification of historical unbound records. New create paths must
+// use CreateOrGetInvestigationRequestHash and a complete plan binding.
+func LegacyCreateOrGetInvestigationRequestHash(
+	request CreateOrGetInvestigationRequest,
+	taskSpecsHash string,
+) (string, error) {
 	if !domain.ValidSHA256Hex(taskSpecsHash) {
 		return "", fmt.Errorf("%w: invalid canonical task specification hash", ErrInvalidRequest)
 	}

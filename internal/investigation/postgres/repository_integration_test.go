@@ -74,7 +74,7 @@ func TestPostgresRepositoryLifecyclePersistsImmutableReplayAndHumanFeedback(t *t
 			collected_at, redacted_summary, content_hash, trust_level, truncated, created_at,
 			incident_id, task_id, payload_document, attributes, runtime_schema_version
 		) VALUES (
-			$1, $2, $3, $4, 'prometheus-staging', '{}', $5, $6::jsonb, $7,
+			$1, $2, $3, $4, 'prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', '{}', $5, $6::jsonb, $7,
 			'AUTHENTICATED_READ_RUNNER', false, $8, $9, $10, $11, $12::jsonb,
 			'investigation-runtime.v1'
 		)
@@ -109,6 +109,7 @@ func TestPostgresRepositoryLifecyclePersistsImmutableReplayAndHumanFeedback(t *t
 	generatedIDs := []string{testHypothesisID, testFeedbackID}
 	generatedIndex := 0
 	repository, err := investigationpostgres.New(fixture.harness.extendedPool(t), investigationpostgres.Options{
+		TaskRuntimeBinder: testTaskRuntimeBinder,
 		IDFactory: func() string {
 			if generatedIndex >= len(generatedIDs) {
 				t.Fatalf("unexpected persistent ID request %d", generatedIndex+1)

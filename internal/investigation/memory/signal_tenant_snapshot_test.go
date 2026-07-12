@@ -18,7 +18,8 @@ func TestSignalTenantSnapshotIsResolvedOnceAtFirstRegistration(t *testing.T) {
 	resolverCalls := 0
 	failResolver := false
 	repository, err := memory.New(memory.Options{
-		Clock: func() time.Time { return now }, IDFactory: func() string { return "77777777-7777-4777-8777-777777777777" },
+		TaskRuntimeBinder: testTaskRuntimeBinder,
+		Clock:             func() time.Time { return now }, IDFactory: func() string { return "77777777-7777-4777-8777-777777777777" },
 		TenantResolver: func(string) (string, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -67,7 +68,8 @@ func TestSignalTenantSnapshotIsResolvedOnceAtFirstRegistration(t *testing.T) {
 func TestSignalRegistrationResolverFailureLeavesNoFact(t *testing.T) {
 	now := time.Date(2026, 7, 12, 3, 0, 0, 0, time.UTC)
 	repository, err := memory.New(memory.Options{
-		Clock: func() time.Time { return now }, IDFactory: func() string { return "77777777-7777-4777-8777-777777777777" },
+		TaskRuntimeBinder: testTaskRuntimeBinder,
+		Clock:             func() time.Time { return now }, IDFactory: func() string { return "77777777-7777-4777-8777-777777777777" },
 		TenantResolver:     func(string) (string, error) { return "", errors.New("resolver unavailable") },
 		TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error { return nil },
 	})

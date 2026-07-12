@@ -166,7 +166,8 @@ func newTerminalLifecycleRepository(
 ) *investigationpostgres.Repository {
 	t.Helper()
 	repository, err := investigationpostgres.New(fixture.harness.extendedPool(t), investigationpostgres.Options{
-		IDFactory: func() string { return "89000000-0000-4000-8000-000000000001" },
+		TaskRuntimeBinder: testTaskRuntimeBinder,
+		IDFactory:         func() string { return "89000000-0000-4000-8000-000000000001" },
 		TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error {
 			return nil
 		},

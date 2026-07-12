@@ -19,6 +19,7 @@ import (
 
 	"github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
 	"github.com/seaworld008/aiops-system/internal/domain"
+	"github.com/seaworld008/aiops-system/internal/investigation"
 )
 
 var (
@@ -59,6 +60,8 @@ type Descriptor struct {
 	Operation       string
 	Input           json.RawMessage
 	InputHash       string
+	PlanBinding     domain.InvestigationPlanBinding
+	RuntimeBinding  domain.ReadTaskRuntimeBinding
 }
 
 func (descriptor Descriptor) Validate() error {
@@ -74,7 +77,9 @@ func (descriptor Descriptor) Validate() error {
 		descriptor.Position < 1 || descriptor.Position > 12 ||
 		len(descriptor.ConnectorID) > 128 || !lowCardinalityPattern.MatchString(descriptor.ConnectorID) ||
 		len(descriptor.Operation) > 64 || !lowCardinalityPattern.MatchString(descriptor.Operation) ||
-		!validSHA256(descriptor.InputHash) || domain.ValidateSafeJSONObject(descriptor.Input) != nil {
+		!validSHA256(descriptor.InputHash) || domain.ValidateSafeJSONObject(descriptor.Input) != nil ||
+		descriptor.PlanBinding.Validate() != nil || descriptor.RuntimeBinding.Validate() != nil ||
+		!domain.ConnectorDigestMatchesID(descriptor.ConnectorID, descriptor.RuntimeBinding.ConnectorDigest) {
 		return ErrInvalidRequest
 	}
 	canonicalInput, err := jsoncanonicalizer.Transform(descriptor.Input)
@@ -86,6 +91,27 @@ func (descriptor Descriptor) Validate() error {
 	}
 	digest := sha256.Sum256(descriptor.Input)
 	if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(digest[:])), []byte(descriptor.InputHash)) != 1 {
+		return ErrInvalidRequest
+	}
+	runtimeDigest, err := investigation.ReadTaskRuntimeDigest(
+		investigation.TaskSpecScope{
+			TenantID: descriptor.TenantID, WorkspaceID: descriptor.WorkspaceID,
+			EnvironmentID: descriptor.EnvironmentID, ServiceID: descriptor.ServiceID,
+			MappingStatus: domain.MappingExact,
+		},
+		descriptor.PlanBinding,
+		investigation.TaskSpec{
+			Key: descriptor.TaskKey, ConnectorID: descriptor.ConnectorID,
+			Operation: descriptor.Operation, Input: bytes.Clone(descriptor.Input),
+		},
+		descriptor.Position,
+		investigation.TaskRuntimeComponents{
+			ConnectorDigest: descriptor.RuntimeBinding.ConnectorDigest,
+			TargetDigest:    descriptor.RuntimeBinding.TargetDigest,
+			ExecutorDigest:  descriptor.RuntimeBinding.ExecutorDigest,
+		},
+	)
+	if err != nil || subtle.ConstantTimeCompare([]byte(runtimeDigest), []byte(descriptor.RuntimeBinding.RuntimeDigest)) != 1 {
 		return ErrInvalidRequest
 	}
 	return nil
@@ -125,26 +151,31 @@ const (
 // Attempt is a secret-free durable lease snapshot. Only TokenSHA256 may be
 // persisted; the raw bearer exists solely in Claim/Fence.
 type Attempt struct {
-	TaskID            string
-	RunnerID          string
-	ScopeRevision     int64
-	Certificate       CertificateBinding
-	TokenSHA256       string
-	Epoch             int64
-	Status            AttemptStatus
-	HeartbeatSequence int64
-	LeaseAcquiredAt   time.Time
-	LeaseExpiresAt    time.Time
-	LastHeartbeatAt   time.Time
-	StartedAt         time.Time
-	TerminalAt        time.Time
-	RequestHash       string
-	ReceiptHash       string
-	UpdatedAt         time.Time
+	TaskID             string
+	RunnerID           string
+	ScopeRevision      int64
+	Certificate        CertificateBinding
+	TokenSHA256        string
+	Epoch              int64
+	Status             AttemptStatus
+	HeartbeatSequence  int64
+	LeaseAcquiredAt    time.Time
+	LeaseExpiresAt     time.Time
+	LastHeartbeatAt    time.Time
+	StartedAt          time.Time
+	TerminalAt         time.Time
+	PlanBinding        domain.InvestigationPlanBinding
+	RuntimeBinding     domain.ReadTaskRuntimeBinding
+	RequestHash        string
+	ReceiptHash        string
+	RequestHashVersion string
+	ReceiptHashVersion string
+	UpdatedAt          time.Time
 }
 
 func (attempt Attempt) ValidateAgainst(descriptor Descriptor) error {
 	if descriptor.Validate() != nil || attempt.TaskID != descriptor.TaskID || !validRunnerID(attempt.RunnerID) ||
+		!attempt.PlanBinding.Equal(descriptor.PlanBinding) || !attempt.RuntimeBinding.Equal(descriptor.RuntimeBinding) ||
 		attempt.ScopeRevision <= 0 || attempt.Certificate.Validate() != nil || !validSHA256(attempt.TokenSHA256) ||
 		attempt.Epoch <= 0 || attempt.HeartbeatSequence < 0 || !validTime(attempt.LeaseAcquiredAt) ||
 		!validTime(attempt.LastHeartbeatAt) || !validTime(attempt.LeaseExpiresAt) || !validTime(attempt.UpdatedAt) ||
@@ -173,7 +204,9 @@ func (attempt Attempt) ValidateAgainst(descriptor Descriptor) error {
 		}
 	case AttemptCompleted:
 		if attempt.StartedAt.IsZero() || attempt.TerminalAt.IsZero() || !attempt.TerminalAt.Before(attempt.LeaseExpiresAt) ||
-			!validSHA256(attempt.RequestHash) || !validSHA256(attempt.ReceiptHash) {
+			!validSHA256(attempt.RequestHash) || !validSHA256(attempt.ReceiptHash) ||
+			attempt.RequestHashVersion != CompletionRequestHashVersionV3 ||
+			attempt.ReceiptHashVersion != CompletionReceiptHashVersionV3 {
 			return ErrInvalidRequest
 		}
 	case AttemptReleased:
@@ -185,7 +218,8 @@ func (attempt Attempt) ValidateAgainst(descriptor Descriptor) error {
 			return ErrInvalidRequest
 		}
 	}
-	if attempt.Status != AttemptCompleted && (attempt.RequestHash != "" || attempt.ReceiptHash != "") {
+	if attempt.Status != AttemptCompleted && (attempt.RequestHash != "" || attempt.ReceiptHash != "" ||
+		attempt.RequestHashVersion != "" || attempt.ReceiptHashVersion != "") {
 		return ErrInvalidRequest
 	}
 	return nil

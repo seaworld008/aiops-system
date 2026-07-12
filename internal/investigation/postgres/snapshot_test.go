@@ -169,7 +169,8 @@ func snapshotInvestigation() domain.Investigation {
 		IncidentID: "50000000-0000-4000-8000-000000000001",
 		Status:     domain.InvestigationRunning, ModelStatus: domain.ModelRunning,
 		IdempotencyKey: "investigate:snapshot", RequestHash: strings.Repeat("a", 64),
-		CreatedAt: createdAt, StartedAt: createdAt.Add(time.Minute), UpdatedAt: createdAt.Add(time.Minute),
+		RequestHashVersion: domain.InvestigationCreateRequestVersionV1,
+		CreatedAt:          createdAt, StartedAt: createdAt.Add(time.Minute), UpdatedAt: createdAt.Add(time.Minute),
 	}
 }
 

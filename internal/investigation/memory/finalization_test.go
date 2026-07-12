@@ -14,12 +14,13 @@ func TestFinalizeInvestigationPersistsRankedHypothesesAndReleasesActiveSlot(t *t
 	now := time.Date(2026, 7, 11, 16, 0, 0, 0, time.UTC)
 	repository := newRepository(t, now)
 	incident := createIncident(t, repository, "workspace-1", "signal-finalize", now)
-	created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+	created, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:finalize",
 		Tasks: []investigation.TaskSpec{{
-			Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+			Key: "metrics", ConnectorID: "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
 		}},
-	})
+	}))
+
 	if err != nil {
 		t.Fatalf("CreateOrGetInvestigation() error = %v", err)
 	}
@@ -75,12 +76,13 @@ func TestFinalizeInvestigationPersistsRankedHypothesesAndReleasesActiveSlot(t *t
 		t.Fatalf("stored hypothesis mutated through aliases: %#v", stored)
 	}
 
-	second, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+	second, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:after-terminal",
 		Tasks: []investigation.TaskSpec{{
-			Key: "logs", ConnectorID: "victorialogs-prod", Operation: "search", Input: []byte(`{"lookback_minutes":30}`),
+			Key: "logs", ConnectorID: "victorialogs-prod-v1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Operation: "search", Input: []byte(`{"lookback_minutes":30}`),
 		}},
-	})
+	}))
+
 	if err != nil || !second.Created || second.Investigation.ID == created.Investigation.ID {
 		t.Fatalf("CreateOrGetInvestigation(after terminal) = %#v, %v; want a new investigation", second, err)
 	}
@@ -90,12 +92,13 @@ func TestFinalizeUsesTaskResultsEvenWhenModelFails(t *testing.T) {
 	now := time.Date(2026, 7, 11, 18, 0, 0, 0, time.UTC)
 	repository := newRepository(t, now)
 	incident := createIncident(t, repository, "workspace-1", "signal-model-failure", now)
-	created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+	created, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:model-failure",
 		Tasks: []investigation.TaskSpec{{
-			Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+			Key: "metrics", ConnectorID: "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
 		}},
-	})
+	}))
+
 	if err != nil {
 		t.Fatalf("CreateOrGetInvestigation() error = %v", err)
 	}
@@ -134,12 +137,13 @@ func TestFinalizeRequiresExplicitModelStateTransition(t *testing.T) {
 	now := time.Date(2026, 7, 12, 14, 0, 0, 0, time.UTC)
 	repository := newRepository(t, now)
 	incident := createIncident(t, repository, "workspace-1", "signal-model-transition", now)
-	created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+	created, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:model-transition",
 		Tasks: []investigation.TaskSpec{{
-			Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+			Key: "metrics", ConnectorID: "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
 		}},
-	})
+	}))
+
 	if err != nil {
 		t.Fatalf("CreateOrGetInvestigation() error = %v", err)
 	}
@@ -186,12 +190,13 @@ func TestFinalizeDistinguishesSkippedConfigurationFromCancellation(t *testing.T)
 	t.Run("skipped from pending", func(t *testing.T) {
 		repository := newRepository(t, now)
 		incident := createIncident(t, repository, "workspace-1", "signal-model-skipped", now)
-		created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+		created, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 			WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:model-skipped",
 			Tasks: []investigation.TaskSpec{{
-				Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+				Key: "metrics", ConnectorID: "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
 			}},
-		})
+		}))
+
 		if err != nil {
 			t.Fatalf("CreateOrGetInvestigation() error = %v", err)
 		}
@@ -224,12 +229,13 @@ func TestFinalizeDistinguishesSkippedConfigurationFromCancellation(t *testing.T)
 				suffix = "running"
 			}
 			incident := createIncident(t, repository, "workspace-1", "signal-model-cancelled-"+suffix, now)
-			created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+			created, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 				WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:model-cancelled-" + suffix,
 				Tasks: []investigation.TaskSpec{{
-					Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+					Key: "metrics", ConnectorID: "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
 				}},
-			})
+			}))
+
 			if err != nil {
 				t.Fatalf("CreateOrGetInvestigation() error = %v", err)
 			}
@@ -261,12 +267,13 @@ func TestFinalizeCancellationAtomicallyCancelsQueuedTasksAndReleasesActiveSlot(t
 	repository := newRepository(t, now)
 	incident := createIncident(t, repository, "workspace-1", "signal-cancel-queued", now)
 	taskSpecs := []investigation.TaskSpec{
-		{Key: "logs", ConnectorID: "victorialogs-prod", Operation: "search", Input: []byte(`{"lookback_minutes":30}`)},
-		{Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`)},
+		{Key: "logs", ConnectorID: "victorialogs-prod-v1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Operation: "search", Input: []byte(`{"lookback_minutes":30}`)},
+		{Key: "metrics", ConnectorID: "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`)},
 	}
-	created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+	created, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:cancel-queued", Tasks: taskSpecs,
-	})
+	}))
+
 	if err != nil {
 		t.Fatalf("CreateOrGetInvestigation() error = %v", err)
 	}
@@ -289,9 +296,10 @@ func TestFinalizeCancellationAtomicallyCancelsQueuedTasksAndReleasesActiveSlot(t
 			t.Fatalf("cancelled queued task = %#v, want atomic pre-start cancellation", task)
 		}
 	}
-	second, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+	second, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:after-cancel", Tasks: taskSpecs,
-	})
+	}))
+
 	if err != nil || !second.Created || second.Investigation.ID == created.Investigation.ID {
 		t.Fatalf("CreateOrGetInvestigation(after cancel) = %#v, %v; want new active investigation", second, err)
 	}
@@ -301,14 +309,15 @@ func TestFinalizeCancellationPreservesTerminalTasksAndCancelsQueuedRemainder(t *
 	now := time.Date(2026, 7, 12, 20, 15, 0, 0, time.UTC)
 	repository := newRepository(t, now)
 	incident := createIncident(t, repository, "workspace-1", "signal-cancel-mixed", now)
-	created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+	created, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:cancel-mixed",
 		Tasks: []investigation.TaskSpec{
-			{Key: "logs", ConnectorID: "victorialogs-prod", Operation: "search", Input: []byte(`{"lookback_minutes":30}`)},
-			{Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`)},
-			{Key: "traces", ConnectorID: "tempo-prod", Operation: "search", Input: []byte(`{"lookback_minutes":20}`)},
+			{Key: "logs", ConnectorID: "victorialogs-prod-v1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Operation: "search", Input: []byte(`{"lookback_minutes":30}`)},
+			{Key: "metrics", ConnectorID: "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`)},
+			{Key: "traces", ConnectorID: "tempo-prod-v1-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", Operation: "search", Input: []byte(`{"lookback_minutes":20}`)},
 		},
-	})
+	}))
+
 	if err != nil {
 		t.Fatalf("CreateOrGetInvestigation() error = %v", err)
 	}

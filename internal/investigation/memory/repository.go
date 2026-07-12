@@ -14,6 +14,7 @@ type Options struct {
 	IDFactory          func() string
 	TenantResolver     func(workspaceID string) (string, error)
 	TaskSpecAuthorizer investigation.TaskSpecAuthorizer
+	TaskRuntimeBinder  investigation.TaskRuntimeBinder
 }
 
 type Repository struct {
@@ -46,12 +47,14 @@ type Repository struct {
 	idFactory          func() string
 	tenantResolver     func(workspaceID string) (string, error)
 	taskSpecAuthorizer investigation.TaskSpecAuthorizer
+	taskRuntimeBinder  investigation.TaskRuntimeBinder
 }
 
 var _ investigation.Repository = (*Repository)(nil)
 
 func New(options Options) (*Repository, error) {
-	if options.Clock == nil || options.IDFactory == nil || options.TenantResolver == nil || options.TaskSpecAuthorizer == nil {
+	if options.Clock == nil || options.IDFactory == nil || options.TenantResolver == nil ||
+		options.TaskSpecAuthorizer == nil || options.TaskRuntimeBinder == nil {
 		return nil, fmt.Errorf("%w: trusted repository dependencies are required", investigation.ErrInvalidRequest)
 	}
 	if options.Clock().IsZero() {
@@ -84,6 +87,7 @@ func New(options Options) (*Repository, error) {
 		idFactory:                    options.IDFactory,
 		tenantResolver:               options.TenantResolver,
 		taskSpecAuthorizer:           options.TaskSpecAuthorizer,
+		taskRuntimeBinder:            options.TaskRuntimeBinder,
 	}, nil
 }
 

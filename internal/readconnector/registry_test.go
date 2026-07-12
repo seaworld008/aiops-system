@@ -386,12 +386,12 @@ func TestRegistryTaskAndStartAuthorizationFailClosedOnEveryScopeAndSchemaDrift(t
 	validDescriptor := validDescriptor(t, prometheusID, readconnector.OperationPrometheusRangeQuery, validSpec.Input)
 	unknown := validDescriptor
 	unknown.ConnectorID = "prometheus-staging-unknown-v1"
-	if err := registry.AuthorizeStart(context.Background(), unknown); !errors.Is(err, readtask.ErrClaimsDisabled) {
-		t.Fatalf("AuthorizeStart(unknown) error = %v", err)
+	if err := registry.AuthorizeStart(context.Background(), unknown); !errors.Is(err, readtask.ErrIntegrity) {
+		t.Fatalf("AuthorizeStart(non-content-addressed) error = %v", err)
 	}
 	wrongService := validDescriptor
 	wrongService.ServiceID = "40000000-0000-4000-8000-000000000099"
-	if err := registry.AuthorizeStart(context.Background(), wrongService); !errors.Is(err, readtask.ErrClaimsDisabled) {
+	if err := registry.AuthorizeStart(context.Background(), wrongService); !errors.Is(err, readtask.ErrIntegrity) {
 		t.Fatalf("AuthorizeStart(wrong service) error = %v", err)
 	}
 	corrupt := validDescriptor
@@ -492,6 +492,13 @@ func validTaskScope() investigation.TaskSpecScope {
 
 func validDescriptor(t *testing.T, connectorID, operation string, input json.RawMessage) readtask.Descriptor {
 	t.Helper()
+	if len(connectorID) < 64 {
+		t.Fatalf("test ConnectorID %q has no SHA-256 content-address suffix", connectorID)
+	}
+	connectorDigest := connectorID[len(connectorID)-64:]
+	if !domain.ValidSHA256Hex(connectorDigest) {
+		t.Fatalf("test ConnectorID %q has an invalid SHA-256 content-address suffix", connectorID)
+	}
 	digest := sha256.Sum256(input)
 	descriptor := readtask.Descriptor{
 		TenantID: tenantID, WorkspaceID: workspaceID, EnvironmentID: environmentID,
@@ -500,7 +507,35 @@ func validDescriptor(t *testing.T, connectorID, operation string, input json.Raw
 		TaskID: "70000000-0000-4000-8000-000000000007", TaskKey: "metrics", Position: 1,
 		ConnectorID: connectorID, Operation: operation, Input: append(json.RawMessage(nil), input...),
 		InputHash: hex.EncodeToString(digest[:]),
+		PlanBinding: domain.InvestigationPlanBinding{
+			SchemaVersion:  domain.InvestigationPlanBindingSchemaVersion,
+			ManifestDigest: strings.Repeat("1", 64), RegistryDigest: strings.Repeat("2", 64),
+			ProfileDigest: strings.Repeat("3", 64), TasksHash: strings.Repeat("4", 64),
+		},
+		RuntimeBinding: domain.ReadTaskRuntimeBinding{
+			SchemaVersion:   domain.ReadTaskRuntimeBindingSchemaVersion,
+			ConnectorDigest: connectorDigest, TargetDigest: strings.Repeat("5", 64),
+			ExecutorDigest: strings.Repeat("6", 64), RuntimeDigest: strings.Repeat("7", 64),
+			BoundAt: time.Date(2026, 7, 12, 8, 9, 10, 123456000, time.UTC),
+		},
 	}
+	runtimeDigest, err := investigation.ReadTaskRuntimeDigest(
+		validTaskScope(),
+		descriptor.PlanBinding,
+		investigation.TaskSpec{
+			Key: descriptor.TaskKey, ConnectorID: descriptor.ConnectorID,
+			Operation: descriptor.Operation, Input: append(json.RawMessage(nil), descriptor.Input...),
+		}, descriptor.Position,
+		investigation.TaskRuntimeComponents{
+			ConnectorDigest: descriptor.RuntimeBinding.ConnectorDigest,
+			TargetDigest:    descriptor.RuntimeBinding.TargetDigest,
+			ExecutorDigest:  descriptor.RuntimeBinding.ExecutorDigest,
+		},
+	)
+	if err != nil {
+		t.Fatalf("build Descriptor runtime digest: %v", err)
+	}
+	descriptor.RuntimeBinding.RuntimeDigest = runtimeDigest
 	if err := descriptor.Validate(); err != nil {
 		t.Fatalf("valid test Descriptor.Validate() error = %v", err)
 	}

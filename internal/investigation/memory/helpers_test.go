@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,6 +25,7 @@ func newRepository(t *testing.T, now time.Time) *memory.Repository {
 		Clock:              func() time.Time { return now },
 		TenantResolver:     testTenantResolver,
 		TaskSpecAuthorizer: testTaskSpecAuthorizer,
+		TaskRuntimeBinder:  testTaskRuntimeBinder,
 		IDFactory: func() string {
 			mu.Lock()
 			defer mu.Unlock()
@@ -37,9 +39,51 @@ func newRepository(t *testing.T, now time.Time) *memory.Repository {
 	return repository
 }
 
+func boundCreateRequest(t *testing.T, request investigation.CreateOrGetInvestigationRequest) investigation.CreateOrGetInvestigationRequest {
+	t.Helper()
+	if !request.PlanBinding.IsZero() {
+		return request
+	}
+	_, tasksHash, err := investigation.CanonicalTaskSpecs(request.Tasks)
+	if err != nil {
+		// Keep structurally invalid task requests structurally complete at the
+		// plan boundary; the repository must still reject the task body first.
+		tasksHash = strings.Repeat("0", 64)
+	}
+	request.PlanBinding = domain.InvestigationPlanBinding{
+		SchemaVersion:  domain.InvestigationPlanBindingSchemaVersion,
+		ManifestDigest: strings.Repeat("1", 64),
+		RegistryDigest: strings.Repeat("2", 64),
+		ProfileDigest:  strings.Repeat("3", 64),
+		TasksHash:      tasksHash,
+	}
+	return request
+}
+
+func testTaskRuntimeBinder(
+	_ context.Context,
+	_ investigation.TaskSpecScope,
+	_ domain.InvestigationPlanBinding,
+	spec investigation.TaskSpec,
+) (investigation.TaskRuntimeComponents, error) {
+	separator := strings.LastIndex(spec.ConnectorID, "-v1-")
+	if separator < 1 || separator+4 >= len(spec.ConnectorID) {
+		return investigation.TaskRuntimeComponents{}, fmt.Errorf("connector is not content addressed")
+	}
+	connectorDigest := spec.ConnectorID[separator+4:]
+	if !domain.ValidSHA256Hex(connectorDigest) {
+		return investigation.TaskRuntimeComponents{}, fmt.Errorf("connector digest is invalid")
+	}
+	return investigation.TaskRuntimeComponents{
+		ConnectorDigest: connectorDigest,
+		TargetDigest:    strings.Repeat("d", 64),
+		ExecutorDigest:  strings.Repeat("e", 64),
+	}, nil
+}
+
 func testTaskSpecAuthorizer(_ context.Context, _ investigation.TaskSpecScope, spec investigation.TaskSpec) error {
-	allowed := spec.ConnectorID == "prometheus-prod" && spec.Operation == "range_query" ||
-		(spec.ConnectorID == "victorialogs-prod" || spec.ConnectorID == "tempo-prod") && spec.Operation == "search"
+	allowed := spec.ConnectorID == "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" && spec.Operation == "range_query" ||
+		(spec.ConnectorID == "victorialogs-prod-v1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" || spec.ConnectorID == "tempo-prod-v1-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc") && spec.Operation == "search"
 	if !allowed {
 		return fmt.Errorf("unsupported task specification")
 	}

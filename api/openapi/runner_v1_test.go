@@ -95,7 +95,7 @@ func TestRunnerV1Contract(t *testing.T) {
 		"JobHeartbeatResponse", "JobReleaseRequest", "JobCompleteRequest", "JobCompletionResponse",
 		"RevocationLeaseRequest", "RevocationLeaseResponse", "RevocationHeartbeatRequest",
 		"RevocationHeartbeatResponse", "RevocationCompleteRequest", "RevocationCompletionResponse",
-		"ReadTaskDescriptor", "ReadTaskClaimRequest", "ReadTaskClaimResponse", "ReadTaskStartRequest",
+		"ReadTaskPlanBinding", "ReadTaskRuntimeBinding", "ReadTaskDescriptor", "ReadTaskClaimRequest", "ReadTaskClaimResponse", "ReadTaskStartRequest",
 		"ReadTaskStartResponse", "ReadTaskHeartbeatRequest", "ReadTaskHeartbeatResponse",
 		"ReadTaskReleaseRequest", "ReadTaskReleaseResponse", "ReadTaskEvidenceCompletion",
 		"ReadTaskCompleteRequest", "ReadTaskEvidenceCompleteRequest", "ReadTaskFailedCompleteRequest",
@@ -289,6 +289,9 @@ func assertReadTaskContract(t *testing.T, components, paths, schemas map[string]
 	}
 	claim := object(t, schemas["ReadTaskClaimResponse"], "ReadTaskClaimResponse")
 	claimProperties := object(t, claim["properties"], "ReadTaskClaimResponse.properties")
+	if object(t, claimProperties["schema_version"], "ReadTaskClaimResponse.schema_version")["const"] != "runner-read-task-claim-response.v2" {
+		t.Error("READ claim response is not the digest-bound v2 contract")
+	}
 	if object(t, claimProperties["lease_token"], "ReadTaskClaimResponse.lease_token")["$ref"] != "#/components/schemas/ReadTaskLeaseToken" {
 		t.Error("READ raw token is not confined to ReadTaskClaimResponse")
 	}
@@ -307,10 +310,55 @@ func assertReadTaskContract(t *testing.T, components, paths, schemas map[string]
 		if countMapKey(schemas[requestName], "lease_token") != 0 {
 			t.Errorf("%s accepts a raw lease token in JSON", requestName)
 		}
+		for _, forbidden := range []string{
+			"plan_binding", "runtime_binding", "manifest_digest", "registry_digest", "profile_digest", "tasks_hash",
+			"connector_digest", "target_digest", "executor_digest", "runtime_digest", "bound_at",
+		} {
+			if countMapKey(schemas[requestName], forbidden) != 0 {
+				t.Errorf("%s lets the Runner supply trusted binding field %q", requestName, forbidden)
+			}
+		}
+	}
+	for requestName, version := range map[string]string{
+		"ReadTaskClaimRequest":             "runner-read-task-claim-request.v1",
+		"ReadTaskStartRequest":             "runner-read-task-start-request.v1",
+		"ReadTaskHeartbeatRequest":         "runner-read-task-heartbeat-request.v1",
+		"ReadTaskReleaseRequest":           "runner-read-task-release-request.v1",
+		"ReadTaskEvidenceCompleteRequest":  "runner-read-task-complete-request.v1",
+		"ReadTaskFailedCompleteRequest":    "runner-read-task-complete-request.v1",
+		"ReadTaskCancelledCompleteRequest": "runner-read-task-complete-request.v1",
+	} {
+		properties := object(t, object(t, schemas[requestName], requestName)["properties"], requestName+".properties")
+		if object(t, properties["schema_version"], requestName+".schema_version")["const"] != version {
+			t.Errorf("%s request version changed; requests must remain %s", requestName, version)
+		}
 	}
 
 	descriptor := object(t, schemas["ReadTaskDescriptor"], "ReadTaskDescriptor")
 	descriptorProperties := object(t, descriptor["properties"], "ReadTaskDescriptor.properties")
+	if object(t, descriptorProperties["plan_binding"], "ReadTaskDescriptor.plan_binding")["$ref"] != "#/components/schemas/ReadTaskPlanBinding" ||
+		object(t, descriptorProperties["runtime_binding"], "ReadTaskDescriptor.runtime_binding")["$ref"] != "#/components/schemas/ReadTaskRuntimeBinding" {
+		t.Error("ReadTaskDescriptor does not require nested plan/runtime bindings")
+	}
+	descriptorRequired, ok := descriptor["required"].([]any)
+	if !ok {
+		t.Fatalf("ReadTaskDescriptor.required = %#v", descriptor["required"])
+	}
+	requiredFields := strings.Join(anyStrings(t, descriptorRequired), ",")
+	if !strings.Contains(requiredFields, "plan_binding") || !strings.Contains(requiredFields, "runtime_binding") {
+		t.Errorf("ReadTaskDescriptor.required = %s, want both bindings", requiredFields)
+	}
+	connectorID := object(t, descriptorProperties["connector_id"], "ReadTaskDescriptor.connector_id")
+	if connectorID["pattern"] != "^[a-z0-9][a-z0-9_.-]{0,59}-v1-[a-f0-9]{64}$" ||
+		connectorID["x-aiops-digest-suffix-field"] != "runtime_binding.connector_digest" {
+		t.Errorf("ReadTaskDescriptor connector content address = %#v", connectorID)
+	}
+	assertReadTaskBindingSchema(t, schemas, "ReadTaskPlanBinding", "investigation-plan-manifest.v1", []string{
+		"schema_version", "manifest_digest", "registry_digest", "profile_digest", "tasks_hash",
+	})
+	assertReadTaskBindingSchema(t, schemas, "ReadTaskRuntimeBinding", "read-task-runtime-binding.v1", []string{
+		"schema_version", "connector_digest", "target_digest", "executor_digest", "runtime_digest", "bound_at",
+	})
 	descriptorInput := object(t, descriptorProperties["input"], "ReadTaskDescriptor.input")
 	if descriptorInput["x-aiops-max-json-depth"] != float64(32) || descriptorInput["x-aiops-trusted-registry-validation"] != true {
 		t.Errorf("ReadTaskDescriptor input boundary = %#v", descriptorInput)
@@ -385,6 +433,18 @@ func assertReadTaskContract(t *testing.T, components, paths, schemas map[string]
 	}
 
 	completeResponse := object(t, schemas["ReadTaskCompleteResponse"], "ReadTaskCompleteResponse")
+	completeResponseProperties := object(t, completeResponse["properties"], "ReadTaskCompleteResponse.properties")
+	if object(t, completeResponseProperties["schema_version"], "ReadTaskCompleteResponse.schema_version")["const"] != "runner-read-task-complete-response.v2" {
+		t.Error("READ complete response is not the digest-bound v2 contract")
+	}
+	for _, forbidden := range []string{
+		"plan_binding", "runtime_binding", "manifest_digest", "registry_digest", "profile_digest", "tasks_hash",
+		"connector_digest", "target_digest", "executor_digest", "runtime_digest", "bound_at",
+	} {
+		if countMapKey(completeResponse, forbidden) != 0 {
+			t.Errorf("ReadTaskCompleteResponse exposes internal binding field %q instead of only correlation IDs/hashes", forbidden)
+		}
+	}
 	conditions, ok := completeResponse["allOf"].([]any)
 	if !ok || len(conditions) != 1 {
 		t.Fatalf("ReadTaskCompleteResponse.allOf = %#v, want EVIDENCE correlation", completeResponse["allOf"])
@@ -470,6 +530,46 @@ func assertReadTaskContract(t *testing.T, components, paths, schemas map[string]
 	if len(claimsProblems) != 2 || len(dependencyProblems) != 1 ||
 		object(t, dependencyProblems[0], "ReadTaskDependencyUnavailable problem")["code"] != "runner_dependency_unavailable" {
 		t.Errorf("READ 503 catalogs are not endpoint-exact: claims=%#v dependency=%#v", claimsProblems, dependencyProblems)
+	}
+}
+
+func assertReadTaskBindingSchema(t *testing.T, schemas map[string]any, name, version string, fields []string) {
+	t.Helper()
+	schema := object(t, schemas[name], name)
+	properties := object(t, schema["properties"], name+".properties")
+	required, ok := schema["required"].([]any)
+	if !ok {
+		t.Fatalf("%s.required = %#v", name, schema["required"])
+	}
+	gotRequired := anyStrings(t, required)
+	if strings.Join(gotRequired, ",") != strings.Join(fields, ",") || len(properties) != len(fields) {
+		t.Errorf("%s fields = required %v properties %v, want exactly %v", name, gotRequired, properties, fields)
+	}
+	for _, field := range fields {
+		property := object(t, properties[field], name+"."+field)
+		if field == "bound_at" {
+			if property["$ref"] != "#/components/schemas/RFC3339Timestamp" {
+				t.Errorf("%s.%s = %#v, want timestamp", name, field, property)
+			}
+			continue
+		}
+		if field == "schema_version" {
+			if property["type"] != "string" || property["const"] != version ||
+				property["minLength"] != float64(len(version)) || property["maxLength"] != float64(len(version)) {
+				t.Errorf("%s.%s is not a bounded schema identifier: %#v", name, field, property)
+			}
+			continue
+		}
+		if property["$ref"] != "#/components/schemas/SHA256Hex" {
+			t.Errorf("%s.%s = %#v, want SHA256Hex", name, field, property)
+		}
+	}
+	for _, forbidden := range []string{
+		"tenant_id", "workspace_id", "environment_id", "runner_id", "target", "target_ref", "url", "headers", "credential", "secret",
+	} {
+		if properties[forbidden] != nil {
+			t.Errorf("%s exposes secret/server-owned field %q", name, forbidden)
+		}
 	}
 }
 

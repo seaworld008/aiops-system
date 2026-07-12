@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/execution"
 	"github.com/seaworld008/aiops-system/internal/executionlease"
 	"github.com/seaworld008/aiops-system/internal/readtask"
@@ -203,12 +204,8 @@ func (repository *Repository) ClaimRunnerTx(
 		return readtask.Claim{}, readtask.ErrNoClaimAvailable
 	}
 
-	attempt := readtask.Attempt{
-		TaskID: taskID, RunnerID: scope.RunnerID(), ScopeRevision: scope.ScopeRevision(),
-		Certificate: certificate, TokenSHA256: tokenHash, Epoch: maxEpoch + 1, Status: readtask.AttemptLeased,
-	}
-	var updatedAt time.Time
-	err = tx.QueryRow(ctx, `
+	desiredEpoch := maxEpoch + 1
+	attempt, err := scanAttempt(tx.QueryRow(ctx, `
 		INSERT INTO investigation_task_attempts (
 			tenant_id, workspace_id, environment_id, investigation_id, task_id,
 			lease_epoch, lease_token_sha256, runner_id, scope_revision,
@@ -218,20 +215,17 @@ func (repository *Repository) ClaimRunnerTx(
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0,
 			$12, $12, $12, 'LEASED', $12
 		)
-		RETURNING lease_acquired_at, last_heartbeat_at, lease_expires_at, certificate_not_after, updated_at
-	`, scope.TenantID(), task.descriptor.WorkspaceID, task.descriptor.EnvironmentID,
-		task.descriptor.InvestigationID, taskID, attempt.Epoch, tokenHash, scope.RunnerID(),
-		scope.ScopeRevision(), certificate.SHA256, certificate.NotAfter, expiresAt).Scan(
-		&attempt.LeaseAcquiredAt, &attempt.LastHeartbeatAt, &attempt.LeaseExpiresAt, &attempt.Certificate.NotAfter, &updatedAt,
-	)
+		RETURNING `+attemptProjection,
+		scope.TenantID(), task.descriptor.WorkspaceID, task.descriptor.EnvironmentID,
+		task.descriptor.InvestigationID, taskID, desiredEpoch, tokenHash, scope.RunnerID(),
+		scope.ScopeRevision(), certificate.SHA256, certificate.NotAfter, expiresAt))
 	if staleLeaseTransition(err) {
 		return readtask.Claim{}, readtask.ErrNoClaimAvailable
 	}
 	if err != nil {
 		return readtask.Claim{}, persistenceError("persist READ task attempt", err)
 	}
-	attempt.UpdatedAt = updatedAt
-	if !validFiniteTime(updatedAt) || attempt.ValidateAgainst(task.descriptor) != nil {
+	if !validFiniteTime(attempt.UpdatedAt) || attempt.ValidateAgainst(task.descriptor) != nil {
 		return readtask.Claim{}, integrityError("validate persisted READ task attempt", errors.New("invalid persisted attempt"))
 	}
 	if !attemptIdentityCurrent(scope, certificate, task.descriptor, attempt) {
@@ -643,7 +637,7 @@ type CompletionAuthorizer func(context.Context, readtask.Descriptor, readtask.Ev
 
 // CompleteRunnerAuthorizedTx projects bounded Runner output and atomically
 // persists the Evidence (when present), terminal Task, COMPLETED attempt, and
-// immutable v2 receipt. A non-nil connector-specific output authorizer is
+// immutable v3 receipt. A non-nil connector-specific output authorizer is
 // mandatory even for failure-only completions so callers cannot accidentally
 // construct a completion path that skips the typed contract. The same
 // attempt/body replays the original IDs without re-running mutable admission
@@ -700,7 +694,9 @@ func (repository *Repository) CompleteRunnerAuthorizedTx(
 		return readtask.CompletionResult{}, readtask.ErrProjectionRejected
 	}
 	if attempt.Status == readtask.AttemptCompleted {
-		if attempt.RequestHash != projection.RequestHash() || attempt.ReceiptHash != projection.ReceiptHash() {
+		if attempt.RequestHash != projection.RequestHash() || attempt.ReceiptHash != projection.ReceiptHash() ||
+			attempt.RequestHashVersion != readtask.CompletionRequestHashVersionV3 ||
+			attempt.ReceiptHashVersion != readtask.CompletionReceiptHashVersionV3 {
 			return readtask.CompletionResult{}, readtask.ErrCompletionConflict
 		}
 		return loadCompletionReplay(ctx, tx, task.descriptor, attempt, projection)
@@ -781,12 +777,14 @@ func (repository *Repository) CompleteRunnerAuthorizedTx(
 	}
 	attempt, err = scanAttempt(tx.QueryRow(ctx, `
 		UPDATE investigation_task_attempts
-		SET status = 'COMPLETED', request_hash = $6, receipt_hash = $7
+		SET status = 'COMPLETED', request_hash = $6, receipt_hash = $7,
+			request_hash_version = $8, receipt_hash_version = $9
 		WHERE tenant_id = $1 AND workspace_id = $2 AND investigation_id = $3 AND task_id = $4
 		  AND lease_epoch = $5 AND status = 'RUNNING' AND lease_expires_at > clock_timestamp()
 		RETURNING `+attemptProjection,
 		scope.TenantID(), task.descriptor.WorkspaceID, task.descriptor.InvestigationID,
-		task.descriptor.TaskID, completion.Fence.Epoch(), projection.RequestHash(), projection.ReceiptHash()))
+		task.descriptor.TaskID, completion.Fence.Epoch(), projection.RequestHash(), projection.ReceiptHash(),
+		readtask.CompletionRequestHashVersionV3, readtask.CompletionReceiptHashVersionV3))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return readtask.CompletionResult{}, readtask.ErrStaleFence
 	}
@@ -800,7 +798,9 @@ func (repository *Repository) CompleteRunnerAuthorizedTx(
 		return readtask.CompletionResult{}, err
 	}
 	if attempt.Status != readtask.AttemptCompleted || attempt.RequestHash != projection.RequestHash() ||
-		attempt.ReceiptHash != projection.ReceiptHash() {
+		attempt.ReceiptHash != projection.ReceiptHash() ||
+		attempt.RequestHashVersion != readtask.CompletionRequestHashVersionV3 ||
+		attempt.ReceiptHashVersion != readtask.CompletionReceiptHashVersionV3 {
 		return readtask.CompletionResult{}, integrityError("validate completed READ task attempt", errors.New("invalid attempt projection"))
 	}
 
@@ -821,10 +821,13 @@ func (repository *Repository) CompleteRunnerAuthorizedTx(
 			id, tenant_id, workspace_id, environment_id, investigation_id, task_id,
 			runner_id, scope_revision, certificate_sha256, connector_id,
 			evidence_id, content_hash, failure_code, idempotency_key,
-			request_hash, receipt_hash, schema_version, received_at, lease_epoch
+			request_hash, receipt_hash, request_hash_version, receipt_hash_version,
+			schema_version, received_at, lease_epoch
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-			$11, $12, $13, $14, $15, $16, 'runner-evidence.v2', clock_timestamp(), $17
+			$11, $12, $13, $14, $15, $16,
+			'read-task-completion-request.v3', 'read-task-completion-receipt.v3',
+			'runner-evidence.v3', clock_timestamp(), $17
 		)
 		RETURNING received_at
 	`, receiptID, scope.TenantID(), task.descriptor.WorkspaceID, task.descriptor.EnvironmentID,
@@ -876,6 +879,8 @@ func projectRunnerCompletion(
 		projectionAttempt.TerminalAt = time.Time{}
 		projectionAttempt.RequestHash = ""
 		projectionAttempt.ReceiptHash = ""
+		projectionAttempt.RequestHashVersion = ""
+		projectionAttempt.ReceiptHashVersion = ""
 	}
 	return readtask.ProjectCompletion(descriptor, projectionAttempt, completion, receivedAt)
 }
@@ -936,10 +941,28 @@ func loadCompletionReplay(
 		  AND receipt.investigation_id = $3 AND receipt.task_id = $4
 		  AND receipt.runner_id = $5 AND receipt.lease_epoch = $6
 		  AND receipt.request_hash = $7 AND receipt.receipt_hash = $8
-		  AND receipt.schema_version = 'runner-evidence.v2'
+		  AND receipt.schema_version = 'runner-evidence.v3'
+		  AND receipt.request_hash_version = 'read-task-completion-request.v3'
+		  AND receipt.receipt_hash_version = 'read-task-completion-receipt.v3'
+		  AND receipt.plan_schema_version = $9
+		  AND receipt.plan_manifest_digest = $10
+		  AND receipt.plan_registry_digest = $11
+		  AND receipt.plan_profile_digest = $12
+		  AND receipt.plan_tasks_hash = $13
+		  AND receipt.read_runtime_schema_version = $14
+		  AND receipt.connector_digest = $15
+		  AND receipt.target_digest = $16
+		  AND receipt.executor_digest = $17
+		  AND receipt.runtime_digest = $18
+		  AND receipt.runtime_bound_at = $19
 		FOR SHARE OF receipt
 	`, descriptor.TenantID, descriptor.WorkspaceID, descriptor.InvestigationID, descriptor.TaskID,
-		attempt.RunnerID, attempt.Epoch, attempt.RequestHash, attempt.ReceiptHash).Scan(
+		attempt.RunnerID, attempt.Epoch, attempt.RequestHash, attempt.ReceiptHash,
+		descriptor.PlanBinding.SchemaVersion, descriptor.PlanBinding.ManifestDigest,
+		descriptor.PlanBinding.RegistryDigest, descriptor.PlanBinding.ProfileDigest, descriptor.PlanBinding.TasksHash,
+		descriptor.RuntimeBinding.SchemaVersion, descriptor.RuntimeBinding.ConnectorDigest,
+		descriptor.RuntimeBinding.TargetDigest, descriptor.RuntimeBinding.ExecutorDigest,
+		descriptor.RuntimeBinding.RuntimeDigest, descriptor.RuntimeBinding.BoundAt).Scan(
 		&receiptID, &evidenceID, &receivedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -982,7 +1005,11 @@ func lockParentStatus(ctx context.Context, tx pgx.Tx, descriptor readtask.Descri
 const attemptProjection = `
 	task_id::text, runner_id, scope_revision, certificate_sha256, certificate_not_after,
 	lease_token_sha256, lease_epoch, status, heartbeat_seq, lease_acquired_at,
-	last_heartbeat_at, lease_expires_at, started_at, terminal_at, request_hash, receipt_hash, updated_at
+	last_heartbeat_at, lease_expires_at, started_at, terminal_at, request_hash, receipt_hash,
+	request_hash_version, receipt_hash_version,
+	plan_schema_version, plan_manifest_digest, plan_registry_digest, plan_profile_digest, plan_tasks_hash,
+	read_runtime_schema_version, connector_digest, target_digest, executor_digest, runtime_digest, runtime_bound_at,
+	updated_at
 `
 
 func lockAttempt(
@@ -1005,11 +1032,19 @@ func scanAttempt(row pgx.Row) (readtask.Attempt, error) {
 	var status string
 	var startedAt, terminalAt pgtype.Timestamptz
 	var requestHash, receiptHash pgtype.Text
+	var requestHashVersion, receiptHashVersion pgtype.Text
+	var planSchema, planManifest, planRegistry, planProfile, planTasks pgtype.Text
+	var runtimeSchema, connectorDigest, targetDigest, executorDigest, runtimeDigest pgtype.Text
+	var runtimeBoundAt pgtype.Timestamptz
 	err := row.Scan(
 		&attempt.TaskID, &attempt.RunnerID, &attempt.ScopeRevision, &attempt.Certificate.SHA256,
 		&attempt.Certificate.NotAfter, &attempt.TokenSHA256, &attempt.Epoch, &status,
 		&attempt.HeartbeatSequence, &attempt.LeaseAcquiredAt, &attempt.LastHeartbeatAt,
-		&attempt.LeaseExpiresAt, &startedAt, &terminalAt, &requestHash, &receiptHash, &attempt.UpdatedAt,
+		&attempt.LeaseExpiresAt, &startedAt, &terminalAt, &requestHash, &receiptHash,
+		&requestHashVersion, &receiptHashVersion,
+		&planSchema, &planManifest, &planRegistry, &planProfile, &planTasks,
+		&runtimeSchema, &connectorDigest, &targetDigest, &executorDigest, &runtimeDigest, &runtimeBoundAt,
+		&attempt.UpdatedAt,
 	)
 	if err != nil {
 		return readtask.Attempt{}, err
@@ -1026,6 +1061,48 @@ func scanAttempt(row pgx.Row) (readtask.Attempt, error) {
 	}
 	if receiptHash.Valid {
 		attempt.ReceiptHash = receiptHash.String
+	}
+	if requestHashVersion.Valid != receiptHashVersion.Valid ||
+		requestHashVersion.Valid && (!requestHash.Valid || !receiptHash.Valid) {
+		return readtask.Attempt{}, errors.New("incomplete persisted READ attempt hash versions")
+	}
+	if requestHashVersion.Valid {
+		attempt.RequestHashVersion = requestHashVersion.String
+		attempt.ReceiptHashVersion = receiptHashVersion.String
+	}
+	planFields := []pgtype.Text{planSchema, planManifest, planRegistry, planProfile, planTasks}
+	runtimeFields := []pgtype.Text{runtimeSchema, connectorDigest, targetDigest, executorDigest, runtimeDigest}
+	planPresent := planFields[0].Valid
+	runtimePresent := runtimeFields[0].Valid
+	for _, field := range planFields[1:] {
+		if field.Valid != planPresent {
+			return readtask.Attempt{}, errors.New("partial persisted READ attempt plan binding")
+		}
+	}
+	for _, field := range runtimeFields[1:] {
+		if field.Valid != runtimePresent {
+			return readtask.Attempt{}, errors.New("partial persisted READ attempt runtime binding")
+		}
+	}
+	if planPresent != runtimePresent || runtimeBoundAt.Valid != runtimePresent {
+		return readtask.Attempt{}, errors.New("incomplete persisted READ attempt binding")
+	}
+	if planPresent {
+		attempt.PlanBinding = domain.InvestigationPlanBinding{
+			SchemaVersion: planSchema.String, ManifestDigest: planManifest.String,
+			RegistryDigest: planRegistry.String, ProfileDigest: planProfile.String, TasksHash: planTasks.String,
+		}
+		attempt.RuntimeBinding = domain.ReadTaskRuntimeBinding{
+			SchemaVersion: runtimeSchema.String, ConnectorDigest: connectorDigest.String,
+			TargetDigest: targetDigest.String, ExecutorDigest: executorDigest.String,
+			RuntimeDigest: runtimeDigest.String, BoundAt: runtimeBoundAt.Time.UTC(),
+		}
+	}
+	if requestHash.Valid != receiptHash.Valid {
+		return readtask.Attempt{}, errors.New("incomplete persisted READ attempt completion hashes")
+	}
+	if requestHash.Valid && planPresent && !requestHashVersion.Valid {
+		return readtask.Attempt{}, errors.New("bound persisted READ attempt lacks hash versions")
 	}
 	attempt.Certificate.NotAfter = attempt.Certificate.NotAfter.UTC()
 	attempt.LeaseAcquiredAt = attempt.LeaseAcquiredAt.UTC()
@@ -1071,7 +1148,13 @@ func lockTask(ctx context.Context, tx pgx.Tx, tenantID, taskID string) (storedTa
 			COALESCE(investigation.service_id_snapshot::text, ''),
 			task.incident_id::text, task.investigation_id::text, task.id::text,
 			task.task_key, task.position, task.tool_name, task.tool_version,
-			task.input_document, task.input_hash, task.status, investigation.status
+			task.input_document, task.input_hash,
+			investigation.plan_schema_version, investigation.plan_manifest_digest,
+			investigation.plan_registry_digest, investigation.plan_profile_digest,
+			investigation.plan_tasks_hash,
+			task.read_runtime_schema_version, task.connector_digest, task.target_digest,
+			task.executor_digest, task.runtime_digest, task.runtime_bound_at,
+			task.status, investigation.status
 		FROM tool_invocations AS task
 		JOIN investigations AS investigation
 		  ON investigation.tenant_id = task.tenant_id
@@ -1079,13 +1162,22 @@ func lockTask(ctx context.Context, tx pgx.Tx, tenantID, taskID string) (storedTa
 		 AND investigation.id = task.investigation_id
 		WHERE task.tenant_id = $1 AND task.id = $2
 		  AND task.runtime_schema_version = 'investigation-runtime.v1'
+		  AND task.read_runtime_schema_version = 'read-task-runtime-binding.v1'
 		  AND investigation.runtime_schema_version = 'investigation-runtime.v1'
+		  AND investigation.request_hash_version = 'investigation.create.v2'
+		  AND investigation.plan_schema_version = 'investigation-plan-manifest.v1'
 		FOR NO KEY UPDATE OF task
 	`, tenantID, taskID).Scan(
 		&task.descriptor.TenantID, &task.descriptor.WorkspaceID, &task.descriptor.EnvironmentID,
 		&task.descriptor.ServiceID, &task.descriptor.IncidentID, &task.descriptor.InvestigationID, &task.descriptor.TaskID,
 		&task.descriptor.TaskKey, &task.descriptor.Position, &task.descriptor.ConnectorID,
 		&task.descriptor.Operation, &task.descriptor.Input, &task.descriptor.InputHash,
+		&task.descriptor.PlanBinding.SchemaVersion, &task.descriptor.PlanBinding.ManifestDigest,
+		&task.descriptor.PlanBinding.RegistryDigest, &task.descriptor.PlanBinding.ProfileDigest,
+		&task.descriptor.PlanBinding.TasksHash,
+		&task.descriptor.RuntimeBinding.SchemaVersion, &task.descriptor.RuntimeBinding.ConnectorDigest,
+		&task.descriptor.RuntimeBinding.TargetDigest, &task.descriptor.RuntimeBinding.ExecutorDigest,
+		&task.descriptor.RuntimeBinding.RuntimeDigest, &task.descriptor.RuntimeBinding.BoundAt,
 		&task.taskStatus, &task.investigationStatus,
 	)
 	if err != nil {
@@ -1094,6 +1186,7 @@ func lockTask(ctx context.Context, tx pgx.Tx, tenantID, taskID string) (storedTa
 	if task.descriptor.EnvironmentID == "" || task.descriptor.ServiceID == "" {
 		return storedTask{}, pgx.ErrNoRows
 	}
+	task.descriptor.RuntimeBinding.BoundAt = task.descriptor.RuntimeBinding.BoundAt.UTC()
 	return task, nil
 }
 

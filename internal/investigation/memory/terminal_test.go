@@ -15,7 +15,8 @@ func TestFinalizeCancellationPreservesRunningTaskStartTime(t *testing.T) {
 	createdAt := time.Date(2026, 7, 12, 20, 30, 0, 0, time.UTC)
 	commitAt := createdAt.Add(time.Minute)
 	repository, err := New(Options{
-		Clock: func() time.Time { return commitAt }, IDFactory: func() string { return "unused" },
+		TaskRuntimeBinder: testTaskRuntimeBinder,
+		Clock:             func() time.Time { return commitAt }, IDFactory: func() string { return "unused" },
 		TenantResolver:     func(string) (string, error) { return "tenant-1", nil },
 		TaskSpecAuthorizer: allowTaskSpecForTest,
 	})
@@ -29,11 +30,12 @@ func TestFinalizeCancellationPreservesRunningTaskStartTime(t *testing.T) {
 		ID: "investigation-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
 		Status: domain.InvestigationRunning, ModelStatus: domain.ModelRunning,
 		IdempotencyKey: "investigate:running", RequestHash: fmt.Sprintf("%x", requestDigest),
-		CreatedAt: createdAt, StartedAt: createdAt, UpdatedAt: createdAt,
+		RequestHashVersion: domain.InvestigationCreateRequestVersionV1,
+		CreatedAt:          createdAt, StartedAt: createdAt, UpdatedAt: createdAt,
 	}
 	task := domain.ReadTask{
 		ID: "task-1", WorkspaceID: item.WorkspaceID, IncidentID: item.IncidentID, InvestigationID: item.ID,
-		Key: "metrics", Position: 1, ConnectorID: "prometheus-prod", Operation: "range_query",
+		Key: "metrics", Position: 1, ConnectorID: "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Operation: "range_query",
 		Input: input, InputHash: fmt.Sprintf("%x", inputDigest), Status: domain.ReadTaskRunning,
 		CreatedAt: createdAt, StartedAt: createdAt, UpdatedAt: createdAt,
 	}
@@ -64,7 +66,8 @@ func TestCompleteTaskReadsCommitClockAfterLockedPreparation(t *testing.T) {
 	commitAt := createdAt.Add(time.Minute)
 	clockNow := createdAt
 	repository, err := New(Options{
-		Clock: func() time.Time { return clockNow },
+		TaskRuntimeBinder: testTaskRuntimeBinder,
+		Clock:             func() time.Time { return clockNow },
 		IDFactory: func() string {
 			clockNow = commitAt
 			return "receipt-1"
@@ -82,11 +85,12 @@ func TestCompleteTaskReadsCommitClockAfterLockedPreparation(t *testing.T) {
 		ID: "investigation-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
 		Status: domain.InvestigationQueued, ModelStatus: domain.ModelPending,
 		IdempotencyKey: "investigate:clock-order", RequestHash: fmt.Sprintf("%x", requestDigest),
-		CreatedAt: createdAt, UpdatedAt: createdAt,
+		RequestHashVersion: domain.InvestigationCreateRequestVersionV1,
+		CreatedAt:          createdAt, UpdatedAt: createdAt,
 	}
 	task := domain.ReadTask{
 		ID: "task-1", WorkspaceID: item.WorkspaceID, IncidentID: item.IncidentID, InvestigationID: item.ID,
-		Key: "metrics", Position: 1, ConnectorID: "prometheus-prod", Operation: "range_query",
+		Key: "metrics", Position: 1, ConnectorID: "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Operation: "range_query",
 		Input: input, InputHash: fmt.Sprintf("%x", inputDigest), Status: domain.ReadTaskQueued,
 		CreatedAt: createdAt, UpdatedAt: createdAt,
 	}

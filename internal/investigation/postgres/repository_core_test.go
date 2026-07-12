@@ -52,13 +52,26 @@ func TestNewFailsClosedWithoutEveryTrustedDependency(t *testing.T) {
 	factory := func() string { return "11111111-1111-4111-8111-111111111111" }
 	for name, operation := range map[string]func() (*Repository, error){
 		"database": func() (*Repository, error) {
-			return New(nil, Options{IDFactory: factory, TaskSpecAuthorizer: authorizer})
+			return New(nil, Options{
+				TaskRuntimeBinder:  testTaskRuntimeBinder,
+				IDFactory:          factory,
+				TaskSpecAuthorizer: authorizer,
+			})
 		},
 		"ID factory": func() (*Repository, error) {
-			return New(database, Options{TaskSpecAuthorizer: authorizer})
+			return New(database, Options{
+				TaskRuntimeBinder:  testTaskRuntimeBinder,
+				TaskSpecAuthorizer: authorizer,
+			})
 		},
 		"task authorizer": func() (*Repository, error) {
-			return New(database, Options{IDFactory: factory})
+			return New(database, Options{
+				TaskRuntimeBinder: testTaskRuntimeBinder,
+				IDFactory:         factory,
+			})
+		},
+		"task runtime binder": func() (*Repository, error) {
+			return New(database, Options{IDFactory: factory, TaskSpecAuthorizer: authorizer})
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -101,6 +114,7 @@ func TestInvalidPersistentReadIDsAreRejectedBeforeBegin(t *testing.T) {
 	}
 	defer database.Close()
 	repository, err := New(database, Options{
+		TaskRuntimeBinder:  testTaskRuntimeBinder,
 		IDFactory:          func() string { return "11111111-1111-4111-8111-111111111111" },
 		TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error { return nil },
 	})

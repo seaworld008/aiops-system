@@ -31,7 +31,8 @@ func TestPostgresInvestigationWritesRejectInvalidUUIDsBeforeSQL(t *testing.T) {
 	defer database.Close()
 	authorizerCalls := 0
 	repository, err := investigationpostgres.New(database, investigationpostgres.Options{
-		IDFactory: func() string { return "90000000-0000-4000-8000-000000000001" },
+		TaskRuntimeBinder: testTaskRuntimeBinder,
+		IDFactory:         func() string { return "90000000-0000-4000-8000-000000000001" },
 		TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error {
 			authorizerCalls++
 			return nil
@@ -46,13 +47,13 @@ func TestPostgresInvestigationWritesRejectInvalidUUIDsBeforeSQL(t *testing.T) {
 	}); !errors.Is(err, investigation.ErrInvalidRequest) {
 		t.Fatalf("CorrelateSignal(invalid UUID) error = %v, want ErrInvalidRequest", err)
 	}
-	if _, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+	if _, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: testWorkspaceID, IncidentID: "not-a-uuid", IdempotencyKey: "investigate:invalid",
 		Tasks: []investigation.TaskSpec{{
-			Key: "metrics", ConnectorID: "prometheus-staging", Operation: "range_query",
+			Key: "metrics", ConnectorID: "prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", Operation: "range_query",
 			Input: []byte(`{"lookback_minutes":15}`),
 		}},
-	}); !errors.Is(err, investigation.ErrInvalidRequest) {
+	})); !errors.Is(err, investigation.ErrInvalidRequest) {
 		t.Fatalf("CreateOrGetInvestigation(invalid UUID) error = %v, want ErrInvalidRequest", err)
 	}
 	if authorizerCalls != 0 {
@@ -340,11 +341,11 @@ func TestPostgresCreateInvestigationReplaysBeforeAuthorizationAndBindsActiveHash
 	request := investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: testWorkspaceID, IncidentID: incident.ID, IdempotencyKey: "investigate:postgres-create",
 		Tasks: []investigation.TaskSpec{
-			{Key: "metrics", ConnectorID: "prometheus-staging", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`)},
-			{Key: "logs", ConnectorID: "victorialogs-staging", Operation: "search", Input: []byte(`{"lookback_minutes":30}`)},
+			{Key: "metrics", ConnectorID: "prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`)},
+			{Key: "logs", ConnectorID: "victorialogs-staging-v1-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Operation: "search", Input: []byte(`{"lookback_minutes":30}`)},
 		},
 	}
-	first, err := fixture.repository.CreateOrGetInvestigation(context.Background(), request)
+	first, err := fixture.repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, request))
 	if err != nil {
 		t.Fatalf("CreateOrGetInvestigation(first) error = %v", err)
 	}
@@ -357,7 +358,7 @@ func TestPostgresCreateInvestigationReplaysBeforeAuthorizationAndBindsActiveHash
 	}
 
 	authorized.Store(false)
-	replay, err := fixture.repository.CreateOrGetInvestigation(context.Background(), request)
+	replay, err := fixture.repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, request))
 	if err != nil || replay.Created || replay.Investigation.ID != first.Investigation.ID {
 		t.Fatalf("CreateOrGetInvestigation(replay after revocation) = %#v, %v", replay, err)
 	}
@@ -366,14 +367,14 @@ func TestPostgresCreateInvestigationReplaysBeforeAuthorizationAndBindsActiveHash
 	}
 	conflict := request
 	conflict.Tasks = []investigation.TaskSpec{{
-		Key: "metrics", ConnectorID: "prometheus-staging", Operation: "range_query", Input: []byte(`{"lookback_minutes":16}`),
+		Key: "metrics", ConnectorID: "prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", Operation: "range_query", Input: []byte(`{"lookback_minutes":16}`),
 	}}
-	if _, err := fixture.repository.CreateOrGetInvestigation(context.Background(), conflict); !errors.Is(err, store.ErrIdempotencyConflict) {
+	if _, err := fixture.repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, conflict)); !errors.Is(err, store.ErrIdempotencyConflict) {
 		t.Fatalf("CreateOrGetInvestigation(conflicting replay) error = %v, want ErrIdempotencyConflict", err)
 	}
 	newKey := request
 	newKey.IdempotencyKey = "investigate:postgres-create:binding"
-	if _, err := fixture.repository.CreateOrGetInvestigation(context.Background(), newKey); !errors.Is(err, investigation.ErrInvalidRequest) ||
+	if _, err := fixture.repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, newKey)); !errors.Is(err, investigation.ErrInvalidRequest) ||
 		strings.Contains(fmt.Sprint(err), "revoked-task-authorizer-canary") {
 		t.Fatalf("CreateOrGetInvestigation(unauthorized binding) error = %v", err)
 	}
@@ -381,7 +382,7 @@ func TestPostgresCreateInvestigationReplaysBeforeAuthorizationAndBindsActiveHash
 		t.Fatalf("authorizer calls after rejected active binding = %d, want 3", authorizerCalls.Load())
 	}
 	authorized.Store(true)
-	bound, err := fixture.repository.CreateOrGetInvestigation(context.Background(), newKey)
+	bound, err := fixture.repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, newKey))
 	if err != nil || bound.Created || bound.Investigation.ID != first.Investigation.ID {
 		t.Fatalf("CreateOrGetInvestigation(active binding) = %#v, %v", bound, err)
 	}
@@ -458,13 +459,14 @@ func TestPostgresCreateInvestigationRejectsUntrustedIncidentScopeWithoutPartialW
 				t.Fatalf("CorrelateSignal() error = %v", err)
 			}
 			idempotencyKey := "investigate:postgres-scope:" + strings.ReplaceAll(name, " ", "-")
-			_, err = fixture.repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+			_, err = fixture.repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 				WorkspaceID: testWorkspaceID, IncidentID: correlated.Incident.ID, IdempotencyKey: idempotencyKey,
 				Tasks: []investigation.TaskSpec{{
-					Key: "metrics", ConnectorID: "prometheus-staging", Operation: "range_query",
+					Key: "metrics", ConnectorID: "prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", Operation: "range_query",
 					Input: []byte(`{"lookback_minutes":15}`),
 				}},
-			})
+			}))
+
 			if !errors.Is(err, investigation.ErrInvalidRequest) {
 				t.Fatalf("CreateOrGetInvestigation() error = %v, want ErrInvalidRequest", err)
 			}
@@ -508,8 +510,8 @@ func TestPostgresCreateInvestigationSameKeyConcurrentlyCommitsOneFixedResult(t *
 	request := investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: testWorkspaceID, IncidentID: incident.ID, IdempotencyKey: "investigate:postgres-concurrent",
 		Tasks: []investigation.TaskSpec{
-			{Key: "metrics", ConnectorID: "prometheus-staging", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`)},
-			{Key: "logs", ConnectorID: "victorialogs-staging", Operation: "search", Input: []byte(`{"lookback_minutes":30}`)},
+			{Key: "metrics", ConnectorID: "prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`)},
+			{Key: "logs", ConnectorID: "victorialogs-staging-v1-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", Operation: "search", Input: []byte(`{"lookback_minutes":30}`)},
 		},
 	}
 	const goroutines = 16
@@ -524,7 +526,7 @@ func TestPostgresCreateInvestigationSameKeyConcurrentlyCommitsOneFixedResult(t *
 		go func() {
 			defer group.Done()
 			<-start
-			result, err := fixture.repository.CreateOrGetInvestigation(ctx, request)
+			result, err := fixture.repository.CreateOrGetInvestigation(ctx, boundCreateRequest(t, request))
 			results <- result
 			errorsCh <- err
 		}()
@@ -636,6 +638,7 @@ func newRepositoryWriteFixture(
 	}
 	var next atomic.Uint64
 	repository, err := investigationpostgres.New(harness.extendedPool(t), investigationpostgres.Options{
+		TaskRuntimeBinder: testTaskRuntimeBinder,
 		IDFactory: func() string {
 			return fmt.Sprintf("90000000-0000-4000-8000-%012x", next.Add(1))
 		},
