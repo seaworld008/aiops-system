@@ -73,7 +73,8 @@ func TestProjectCompletionBuildsCanonicalServerOwnedEvidenceAndHashes(t *testing
 	var receiptDocument map[string]any
 	if err := json.Unmarshal(receiptJSON, &receiptDocument); err != nil ||
 		receiptDocument["schema_version"] != "runner-evidence.v2" || receiptDocument["lease_epoch"] != "7" ||
-		receiptDocument["scope_revision"] != "3" || bytes.Contains(receiptJSON, []byte(testToken)) {
+		receiptDocument["scope_revision"] != "3" || receiptDocument["service_id"] != descriptor.ServiceID ||
+		bytes.Contains(receiptJSON, []byte(testToken)) {
 		t.Fatalf("safe receipt wire = %s, %v", receiptJSON, err)
 	}
 	terminal := attempt
@@ -88,6 +89,16 @@ func TestProjectCompletionBuildsCanonicalServerOwnedEvidenceAndHashes(t *testing
 	}
 	if err := completionResult.ValidateAgainst(descriptor); err != nil {
 		t.Fatalf("CompletionResult.ValidateAgainst() error = %v", err)
+	}
+	changedService := descriptor
+	changedService.ServiceID = "c2000000-0000-4000-8000-000000000002"
+	if err := projected.ValidateAgainst(changedService, attempt); err == nil {
+		t.Fatal("ProjectedCompletion accepted a different trusted service binding")
+	}
+	changedServiceProjection, err := readtask.ProjectCompletion(changedService, attempt, completion, now)
+	if err != nil || changedServiceProjection.RequestHash() == projected.RequestHash() ||
+		changedServiceProjection.ReceiptHash() == projected.ReceiptHash() {
+		t.Fatalf("service binding did not change completion hashes: %#v, %v", changedServiceProjection.Receipt(), err)
 	}
 	for _, value := range []any{projected, completionResult} {
 		encoded, marshalErr := json.Marshal(value)

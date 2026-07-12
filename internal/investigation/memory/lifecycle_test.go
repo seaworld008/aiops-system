@@ -137,7 +137,7 @@ func TestCreateInvestigationRequiresTrustedTaskSpecAuthorizationWithoutPartialWr
 	repository, err := memory.New(memory.Options{
 		Clock: func() time.Time { return now }, TenantResolver: testTenantResolver,
 		IDFactory: func() string { nextID++; return fmt.Sprintf("authorized-create-%d", nextID) },
-		TaskSpecAuthorizer: func(_ context.Context, _ string, spec investigation.TaskSpec) error {
+		TaskSpecAuthorizer: func(_ context.Context, _ investigation.TaskSpecScope, spec investigation.TaskSpec) error {
 			if spec.ConnectorID != "prometheus-prod" || spec.Operation != "range_query" {
 				return errors.New("task-authorizer-canary")
 			}
@@ -175,14 +175,97 @@ func TestCreateInvestigationRequiresTrustedTaskSpecAuthorizationWithoutPartialWr
 	}
 }
 
+func TestCreateInvestigationRejectsUntrustedIncidentScopeWithoutPartialWrite(t *testing.T) {
+	now := time.Date(2026, 7, 13, 4, 55, 0, 0, time.UTC)
+	for name, correlation := range map[string]investigation.CorrelateSignalRequest{
+		"wrong environment": {
+			CorrelationKey: "payments:staging:scope", ServiceID: "payments", EnvironmentID: "staging",
+			MappingStatus: domain.MappingExact,
+		},
+		"unresolved mapping": {
+			CorrelationKey: "payments:unknown:scope", MappingStatus: domain.MappingUnresolved,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			nextID := 0
+			authorizerCalls := 0
+			repository, err := memory.New(memory.Options{
+				Clock: func() time.Time { return now }, TenantResolver: testTenantResolver,
+				IDFactory: func() string { nextID++; return fmt.Sprintf("scope-admission-%d", nextID) },
+				TaskSpecAuthorizer: func(_ context.Context, scope investigation.TaskSpecScope, _ investigation.TaskSpec) error {
+					authorizerCalls++
+					if scope.TenantID != "tenant-workspace-1" || scope.WorkspaceID != "workspace-1" ||
+						scope.ServiceID != "payments" || scope.EnvironmentID != "prod" || scope.MappingStatus != domain.MappingExact {
+						return errors.New("scope-authorizer-canary")
+					}
+					return nil
+				},
+			})
+			if err != nil {
+				t.Fatalf("memory.New() error = %v", err)
+			}
+			signalID := "signal-scope-" + strings.ReplaceAll(name, " ", "-")
+			signal := testSignal("workspace-1", signalID, "firing", now)
+			if _, err := repository.RegisterSignal(context.Background(), signal); err != nil {
+				t.Fatalf("RegisterSignal() error = %v", err)
+			}
+			correlation.WorkspaceID = "workspace-1"
+			correlation.SignalID = signal.ID
+			correlated, err := repository.CorrelateSignal(context.Background(), correlation)
+			if err != nil {
+				t.Fatalf("CorrelateSignal() error = %v", err)
+			}
+			_, err = repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+				WorkspaceID: "workspace-1", IncidentID: correlated.Incident.ID,
+				IdempotencyKey: "investigate:scope:" + strings.ReplaceAll(name, " ", "-"),
+				Tasks: []investigation.TaskSpec{{
+					Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query",
+					Input: []byte(`{"lookback_minutes":15}`),
+				}},
+			})
+			if !errors.Is(err, investigation.ErrInvalidRequest) {
+				t.Fatalf("CreateOrGetInvestigation() error = %v, want ErrInvalidRequest", err)
+			}
+			if strings.Contains(fmt.Sprint(err), "scope-authorizer-canary") {
+				t.Fatalf("CreateOrGetInvestigation() leaked scope authorizer error: %v", err)
+			}
+			wantCalls := 1
+			if correlation.MappingStatus != domain.MappingExact {
+				wantCalls = 0
+			}
+			if authorizerCalls != wantCalls {
+				t.Fatalf("authorizer calls = %d, want %d", authorizerCalls, wantCalls)
+			}
+			stored, getErr := repository.GetIncident(context.Background(), "workspace-1", correlated.Incident.ID)
+			if getErr != nil || stored != correlated.Incident {
+				t.Fatalf("GetIncident(after scope rejection) = %#v, %v; want unchanged %#v", stored, getErr, correlated.Incident)
+			}
+			items, listErr := repository.ListInvestigations(context.Background(), investigation.ListInvestigationsRequest{
+				WorkspaceID: "workspace-1", IncidentID: correlated.Incident.ID,
+			})
+			if listErr != nil || len(items) != 0 {
+				t.Fatalf("ListInvestigations(after scope rejection) = %#v, %v; want empty", items, listErr)
+			}
+		})
+	}
+}
+
 func TestCreateInvestigationReplaySurvivesLaterTaskAuthorizationRevocation(t *testing.T) {
 	now := time.Date(2026, 7, 13, 5, 10, 0, 0, time.UTC)
 	authorized := true
+	authorizerCalls := 0
 	nextID := 0
 	repository, err := memory.New(memory.Options{
 		Clock: func() time.Time { return now }, TenantResolver: testTenantResolver,
 		IDFactory: func() string { nextID++; return fmt.Sprintf("authorization-replay-%d", nextID) },
-		TaskSpecAuthorizer: func(context.Context, string, investigation.TaskSpec) error {
+		TaskSpecAuthorizer: func(_ context.Context, scope investigation.TaskSpecScope, _ investigation.TaskSpec) error {
+			authorizerCalls++
+			if scope != (investigation.TaskSpecScope{
+				TenantID: "tenant-workspace-1", WorkspaceID: "workspace-1", EnvironmentID: "prod", ServiceID: "payments",
+				MappingStatus: domain.MappingExact,
+			}) {
+				return errors.New("wrong-task-scope-canary")
+			}
 			if !authorized {
 				return errors.New("revoked-task-authorizer-canary")
 			}
@@ -208,6 +291,9 @@ func TestCreateInvestigationReplaySurvivesLaterTaskAuthorizationRevocation(t *te
 	if err != nil || replay.Created || replay.Investigation.ID != first.Investigation.ID {
 		t.Fatalf("CreateOrGetInvestigation(replay after revocation) = %#v, %v; want original resource", replay, err)
 	}
+	if authorizerCalls != 1 {
+		t.Fatalf("authorizer calls after exact replay = %d, want 1", authorizerCalls)
+	}
 
 	conflict := request
 	conflict.Tasks = []investigation.TaskSpec{{
@@ -224,10 +310,16 @@ func TestCreateInvestigationReplaySurvivesLaterTaskAuthorizationRevocation(t *te
 	} else if strings.Contains(err.Error(), "revoked-task-authorizer-canary") {
 		t.Fatalf("CreateOrGetInvestigation() leaked authorizer error: %v", err)
 	}
+	if authorizerCalls != 2 {
+		t.Fatalf("authorizer calls after rejected active binding = %d, want 2", authorizerCalls)
+	}
 	authorized = true
 	bound, err := repository.CreateOrGetInvestigation(context.Background(), newKey)
 	if err != nil || bound.Created || bound.Investigation.ID != first.Investigation.ID {
 		t.Fatalf("CreateOrGetInvestigation(new key after reauthorization) = %#v, %v; want active resource", bound, err)
+	}
+	if authorizerCalls != 3 {
+		t.Fatalf("authorizer calls after authorized active binding = %d, want 3", authorizerCalls)
 	}
 }
 

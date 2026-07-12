@@ -440,6 +440,7 @@ func validReadTaskCompletionBinding(
 	receipt := result.Projection.Receipt()
 	if receipt.TaskID != fence.TaskID() || receipt.RunnerID != principal.RunnerID() ||
 		receipt.TenantID != principal.TenantID() || !principal.Allows(receipt.WorkspaceID, receipt.EnvironmentID) ||
+		!uuidPattern.MatchString(receipt.ServiceID) ||
 		receipt.ScopeRevision != principal.ScopeRevision() || receipt.CertificateSHA256 != principal.CertificateSHA256() ||
 		receipt.LeaseEpoch != fence.Epoch() || receipt.Outcome != outcome || result.Projection.Outcome() != outcome ||
 		receipt.RequestHash != result.Attempt.RequestHash || receipt.ReceiptHash != result.Attempt.ReceiptHash ||

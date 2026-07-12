@@ -16,24 +16,48 @@ import (
 
 const taskSpecsSemanticsV1 = "investigation.task-specs.v1"
 
+// TaskSpecScope is the trusted Incident identity used to authorize a read
+// task. It is derived from repository state; API callers never supply it.
+type TaskSpecScope struct {
+	TenantID      string
+	WorkspaceID   string
+	EnvironmentID string
+	ServiceID     string
+	MappingStatus domain.MappingStatus
+}
+
+// Validate requires an exact, fully resolved Incident mapping before a read
+// task can be admitted. Ambiguous or unresolved mappings fail closed.
+func (scope TaskSpecScope) Validate() error {
+	if !domain.ValidResourceID(scope.TenantID) || !domain.ValidResourceID(scope.WorkspaceID) ||
+		!domain.ValidResourceID(scope.EnvironmentID) || !domain.ValidResourceID(scope.ServiceID) ||
+		scope.MappingStatus != domain.MappingExact {
+		return fmt.Errorf("%w: trusted task specification scope must be an exact incident mapping", ErrInvalidRequest)
+	}
+	return nil
+}
+
 // TaskSpecAuthorizer is a trusted server-side registry/schema boundary. It
 // authorizes an exact connector/operation pair and validates its typed input.
-type TaskSpecAuthorizer func(context.Context, string, TaskSpec) error
+type TaskSpecAuthorizer func(context.Context, TaskSpecScope, TaskSpec) error
 
 // AuthorizeTaskSpecs applies the trusted server-side registry/schema to
 // detached canonical task specifications. Authorizer diagnostics are folded
 // into a low-sensitivity repository error.
-func AuthorizeTaskSpecs(ctx context.Context, authorizer TaskSpecAuthorizer, workspaceID string, specs []TaskSpec) error {
+func AuthorizeTaskSpecs(ctx context.Context, authorizer TaskSpecAuthorizer, scope TaskSpecScope, specs []TaskSpec) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if authorizer == nil {
 		return fmt.Errorf("%w: trusted task specification authorizer is required", ErrInvalidRequest)
 	}
+	if err := scope.Validate(); err != nil {
+		return err
+	}
 	for _, spec := range specs {
 		detached := spec
 		detached.Input = bytes.Clone(spec.Input)
-		if err := authorizer(ctx, workspaceID, detached); err != nil {
+		if err := authorizer(ctx, scope, detached); err != nil {
 			if contextErr := ctx.Err(); contextErr != nil {
 				return contextErr
 			}

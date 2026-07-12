@@ -174,7 +174,7 @@ func newCoreMockRepository(t *testing.T, idFactory func() string) (pgxmock.PgxPo
 	t.Cleanup(database.Close)
 	repository, err := New(database, Options{
 		IDFactory:          idFactory,
-		TaskSpecAuthorizer: func(context.Context, string, investigation.TaskSpec) error { return nil },
+		TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error { return nil },
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)

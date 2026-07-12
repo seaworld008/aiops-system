@@ -49,6 +49,7 @@ type Descriptor struct {
 	TenantID        string
 	WorkspaceID     string
 	EnvironmentID   string
+	ServiceID       string
 	IncidentID      string
 	InvestigationID string
 	TaskID          string
@@ -63,7 +64,7 @@ type Descriptor struct {
 func (descriptor Descriptor) Validate() error {
 	for _, identifier := range []string{
 		descriptor.TenantID, descriptor.WorkspaceID, descriptor.EnvironmentID,
-		descriptor.IncidentID, descriptor.InvestigationID, descriptor.TaskID,
+		descriptor.ServiceID, descriptor.IncidentID, descriptor.InvestigationID, descriptor.TaskID,
 	} {
 		if !validPersistentUUID(identifier) {
 			return ErrInvalidRequest

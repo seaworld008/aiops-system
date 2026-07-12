@@ -25,6 +25,7 @@ const (
 	testTenantID      = "10000000-0000-4000-8000-000000000001"
 	testWorkspaceID   = "20000000-0000-4000-8000-000000000002"
 	testEnvironmentID = "30000000-0000-4000-8000-000000000003"
+	testServiceID     = "35000000-0000-4000-8000-000000000003"
 	testTaskID        = "60000000-0000-4000-8000-000000000006"
 	testIncidentID    = "40000000-0000-4000-8000-000000000004"
 	testInvestigation = "50000000-0000-4000-8000-000000000005"
@@ -566,6 +567,7 @@ func newTestClaim(t *testing.T) readtask.Claim {
 	inputDigest := sha256.Sum256(input)
 	descriptor := readtask.Descriptor{
 		TenantID: testTenantID, WorkspaceID: testWorkspaceID, EnvironmentID: testEnvironmentID,
+		ServiceID:  testServiceID,
 		IncidentID: testIncidentID, InvestigationID: testInvestigation, TaskID: testTaskID,
 		TaskKey: "health", Position: 1, ConnectorID: "prometheus", Operation: "query",
 		Input: input, InputHash: hex.EncodeToString(inputDigest[:]),

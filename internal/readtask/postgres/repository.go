@@ -1068,6 +1068,7 @@ func lockTask(ctx context.Context, tx pgx.Tx, tenantID, taskID string) (storedTa
 	err := tx.QueryRow(ctx, `
 		SELECT task.tenant_id::text, task.workspace_id::text,
 			COALESCE(investigation.environment_id_snapshot::text, ''),
+			COALESCE(investigation.service_id_snapshot::text, ''),
 			task.incident_id::text, task.investigation_id::text, task.id::text,
 			task.task_key, task.position, task.tool_name, task.tool_version,
 			task.input_document, task.input_hash, task.status, investigation.status
@@ -1082,7 +1083,7 @@ func lockTask(ctx context.Context, tx pgx.Tx, tenantID, taskID string) (storedTa
 		FOR NO KEY UPDATE OF task
 	`, tenantID, taskID).Scan(
 		&task.descriptor.TenantID, &task.descriptor.WorkspaceID, &task.descriptor.EnvironmentID,
-		&task.descriptor.IncidentID, &task.descriptor.InvestigationID, &task.descriptor.TaskID,
+		&task.descriptor.ServiceID, &task.descriptor.IncidentID, &task.descriptor.InvestigationID, &task.descriptor.TaskID,
 		&task.descriptor.TaskKey, &task.descriptor.Position, &task.descriptor.ConnectorID,
 		&task.descriptor.Operation, &task.descriptor.Input, &task.descriptor.InputHash,
 		&task.taskStatus, &task.investigationStatus,
@@ -1090,7 +1091,7 @@ func lockTask(ctx context.Context, tx pgx.Tx, tenantID, taskID string) (storedTa
 	if err != nil {
 		return storedTask{}, err
 	}
-	if task.descriptor.EnvironmentID == "" {
+	if task.descriptor.EnvironmentID == "" || task.descriptor.ServiceID == "" {
 		return storedTask{}, pgx.ErrNoRows
 	}
 	return task, nil

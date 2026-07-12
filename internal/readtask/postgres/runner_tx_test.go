@@ -21,6 +21,7 @@ const (
 	testTenantID        = "10000000-0000-4000-8000-000000000001"
 	testWorkspaceID     = "20000000-0000-4000-8000-000000000001"
 	testEnvironmentID   = "30000000-0000-4000-8000-000000000001"
+	testServiceID       = "35000000-0000-4000-8000-000000000001"
 	testIncidentID      = "40000000-0000-4000-8000-000000000001"
 	testInvestigationID = "50000000-0000-4000-8000-000000000001"
 	testTaskID          = "60000000-0000-4000-8000-000000000001"
@@ -62,7 +63,7 @@ func TestClaimRunnerTxBindsPersistedTaskExactScopeCertificateAndHashedToken(t *t
 	database.ExpectQuery(`(?s)SELECT .*FROM tool_invocations AS task.*JOIN investigations AS investigation.*WHERE task.tenant_id = \$1.*task.id = \$2.*FOR NO KEY UPDATE OF task`).
 		WithArgs(testTenantID, testTaskID).
 		WillReturnRows(pgxmock.NewRows(taskLockColumns()).AddRow(
-			testTenantID, testWorkspaceID, testEnvironmentID, testIncidentID, testInvestigationID,
+			testTenantID, testWorkspaceID, testEnvironmentID, testServiceID, testIncidentID, testInvestigationID,
 			testTaskID, "metrics.up", int16(1), "prometheus-staging", "query_range",
 			[]byte(input), hex.EncodeToString(inputDigest[:]), "QUEUED", "QUEUED",
 		))
@@ -807,6 +808,7 @@ func testDescriptorAndInput() (readtask.Descriptor, json.RawMessage) {
 	digest := sha256.Sum256(input)
 	return readtask.Descriptor{
 		TenantID: testTenantID, WorkspaceID: testWorkspaceID, EnvironmentID: testEnvironmentID,
+		ServiceID:  testServiceID,
 		IncidentID: testIncidentID, InvestigationID: testInvestigationID, TaskID: testTaskID,
 		TaskKey: "metrics.up", Position: 1, ConnectorID: "prometheus-staging", Operation: "query_range",
 		Input: input, InputHash: hex.EncodeToString(digest[:]),
@@ -822,7 +824,7 @@ func expectTaskLock(
 	database.ExpectQuery(`(?s)SELECT .*FROM tool_invocations AS task.*JOIN investigations AS investigation.*WHERE task.tenant_id = \$1.*task.id = \$2.*FOR NO KEY UPDATE OF task`).
 		WithArgs(testTenantID, testTaskID).
 		WillReturnRows(pgxmock.NewRows(taskLockColumns()).AddRow(
-			descriptor.TenantID, descriptor.WorkspaceID, descriptor.EnvironmentID, descriptor.IncidentID,
+			descriptor.TenantID, descriptor.WorkspaceID, descriptor.EnvironmentID, descriptor.ServiceID, descriptor.IncidentID,
 			descriptor.InvestigationID, descriptor.TaskID, descriptor.TaskKey, int16(descriptor.Position),
 			descriptor.ConnectorID, descriptor.Operation, []byte(input), descriptor.InputHash,
 			taskStatus, investigationStatus,
@@ -872,7 +874,7 @@ func nullableString(value string) any {
 
 func taskLockColumns() []string {
 	return []string{
-		"tenant_id", "workspace_id", "environment_id", "incident_id", "investigation_id",
+		"tenant_id", "workspace_id", "environment_id", "service_id", "incident_id", "investigation_id",
 		"task_id", "task_key", "position", "connector_id", "operation", "input_document", "input_hash",
 		"task_status", "investigation_status",
 	}

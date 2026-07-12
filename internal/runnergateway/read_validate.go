@@ -5,9 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"regexp"
-	"strings"
 	"time"
-	"unicode"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/readtask"
@@ -198,14 +196,11 @@ func containsReservedReadTaskEvidenceField(value any) bool {
 	switch typed := value.(type) {
 	case map[string]any:
 		for name, child := range typed {
-			if readTaskEvidenceFieldReserved(name) {
+			if readtask.EvidenceFieldReserved(name) {
 				return true
 			}
-			normalizedName := readTaskEvidenceFieldSkeleton(name)
-			if normalizedName == "name" || normalizedName == "key" {
-				if text, ok := child.(string); ok && readTaskEvidenceFieldReserved(text) {
-					return true
-				}
+			if text, ok := child.(string); ok && readtask.EvidenceFieldValueReserved(name, text) {
+				return true
 			}
 			if containsReservedReadTaskEvidenceField(child) {
 				return true
@@ -219,151 +214,4 @@ func containsReservedReadTaskEvidenceField(value any) bool {
 		}
 	}
 	return false
-}
-
-func readTaskEvidenceFieldReserved(value string) bool {
-	normalized := readTaskEvidenceFieldSkeleton(value)
-	tokens := readTaskEvidenceFieldTokens(value)
-	for _, token := range tokens {
-		switch token {
-		case "source", "connector", "operation", "workspace", "environment", "runner",
-			"certificate", "cert", "truncated", "target", "url", "uri", "endpoint",
-			"header", "credential", "hash", "sha256":
-			return true
-		}
-	}
-	if readTaskEvidenceTokensContain(tokens, "scope", "revision") ||
-		readTaskEvidenceTokensContain(tokens, "item", "count") ||
-		readTaskEvidenceTokensContain(tokens, "idempotency", "key") ||
-		readTaskEvidenceTokensContain(tokens, "raw", "error") ||
-		readTaskEvidenceTokensContain(tokens, "error", "body") {
-		return true
-	}
-	for _, reserved := range []string{
-		"source", "connector", "connectorid", "operation", "workspace", "workspaceid",
-		"environment", "environmentid", "runner", "runnerid", "scoperevision",
-		"certificate", "certificatesha256", "itemcount", "idempotencykey", "truncated",
-		"target", "url", "uri", "endpoint", "header", "headers", "credential",
-		"rawerror", "errorbody", "sourceurl", "sourceuri", "sourceendpoint", "datasource",
-		"targeturl", "targeturi", "targetendpoint", "requestheader", "requestheaders",
-		"connectorname", "rawerrormessage", "sources", "credentials", "targeturls",
-		"scoperevisions", "rawerrors", "errorbodies", "urls", "contenthash", "requesthash",
-		"receipthash", "inputhash", "tokenhash", "certificatehash", "sha256",
-	} {
-		if normalized == reserved {
-			return true
-		}
-	}
-	return false
-}
-
-func readTaskEvidenceFieldTokens(value string) []string {
-	runes := []rune(value)
-	tokens := make([]string, 0, 4)
-	current := make([]rune, 0, len(runes))
-	flush := func() {
-		if len(current) == 0 {
-			return
-		}
-		tokens = append(tokens, string(current))
-		current = current[:0]
-	}
-	for index, character := range runes {
-		if !unicode.IsLetter(character) && !unicode.IsDigit(character) {
-			flush()
-			continue
-		}
-		if len(current) != 0 && unicode.IsUpper(character) {
-			previous := runes[index-1]
-			nextIsLower := index+1 < len(runes) && unicode.IsLower(runes[index+1])
-			acronymPlural := nextIsLower && runes[index+1] == 's' &&
-				(index+2 == len(runes) || !unicode.IsLetter(runes[index+2]) && !unicode.IsDigit(runes[index+2]))
-			if unicode.IsLower(previous) || unicode.IsDigit(previous) || unicode.IsUpper(previous) && nextIsLower && !acronymPlural {
-				flush()
-			}
-		}
-		current = append(current, unicode.ToLower(character))
-	}
-	flush()
-	for index := range tokens {
-		tokens[index] = readTaskEvidenceSingularToken(tokens[index])
-	}
-	return tokens
-}
-
-func readTaskEvidenceSingularToken(token string) string {
-	switch token {
-	case "sources":
-		return "source"
-	case "connectors":
-		return "connector"
-	case "operations":
-		return "operation"
-	case "workspaces":
-		return "workspace"
-	case "environments":
-		return "environment"
-	case "runners":
-		return "runner"
-	case "certificates":
-		return "certificate"
-	case "certs":
-		return "cert"
-	case "targets":
-		return "target"
-	case "urls":
-		return "url"
-	case "uris":
-		return "uri"
-	case "endpoints":
-		return "endpoint"
-	case "headers":
-		return "header"
-	case "credentials":
-		return "credential"
-	case "hashes":
-		return "hash"
-	case "scopes":
-		return "scope"
-	case "revisions":
-		return "revision"
-	case "items":
-		return "item"
-	case "counts":
-		return "count"
-	case "keys":
-		return "key"
-	case "errors":
-		return "error"
-	case "bodies":
-		return "body"
-	default:
-		return token
-	}
-}
-
-func readTaskEvidenceTokensContain(tokens []string, required ...string) bool {
-	for _, want := range required {
-		found := false
-		for _, token := range tokens {
-			if token == want {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
-	}
-	return true
-}
-
-func readTaskEvidenceFieldSkeleton(value string) string {
-	var normalized strings.Builder
-	for _, character := range value {
-		if unicode.IsLetter(character) || unicode.IsDigit(character) {
-			normalized.WriteRune(unicode.ToLower(character))
-		}
-	}
-	return normalized.String()
 }
