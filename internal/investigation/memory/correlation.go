@@ -21,9 +21,30 @@ func (repository *Repository) RegisterSignal(ctx context.Context, signal domain.
 	}
 	signal = normalized
 	key := scoped(signal.WorkspaceID, signal.ID)
+	repository.mu.RLock()
+	existing, exists := repository.signals[key]
+	storedTenant, hasTenant := repository.signalTenants[key]
+	repository.mu.RUnlock()
+	if exists {
+		if !hasTenant || !domain.ValidResourceID(storedTenant) {
+			return false, store.ErrScopeViolation
+		}
+		if reflect.DeepEqual(existing, signal) {
+			return false, nil
+		}
+		return false, store.ErrIdempotencyConflict
+	}
+	tenantID, err := repository.tenantResolver(signal.WorkspaceID)
+	if err != nil || !domain.ValidResourceID(tenantID) {
+		return false, fmt.Errorf("%w: trusted tenant resolution failed", investigation.ErrInvalidRequest)
+	}
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
 	if existing, exists := repository.signals[key]; exists {
+		storedTenant, hasTenant := repository.signalTenants[key]
+		if !hasTenant || !domain.ValidResourceID(storedTenant) {
+			return false, store.ErrScopeViolation
+		}
 		if reflect.DeepEqual(existing, signal) {
 			return false, nil
 		}
@@ -33,6 +54,7 @@ func (repository *Repository) RegisterSignal(ctx context.Context, signal domain.
 		return false, err
 	}
 	repository.signals[key] = signal
+	repository.signalTenants[key] = tenantID
 	return true, nil
 }
 
@@ -52,6 +74,42 @@ func (repository *Repository) GetSignal(ctx context.Context, workspaceID, signal
 	return cloneSignal(signal), nil
 }
 
+func (repository *Repository) GetRegisteredSignal(ctx context.Context, signalID string) (investigation.RegisteredSignal, error) {
+	if ctx == nil {
+		return investigation.RegisteredSignal{}, fmt.Errorf("%w: context is required", investigation.ErrInvalidRequest)
+	}
+	if err := ctx.Err(); err != nil {
+		return investigation.RegisteredSignal{}, err
+	}
+	if !investigation.ValidPersistentSignalID(signalID) {
+		return investigation.RegisteredSignal{}, fmt.Errorf("%w: invalid global signal ID", investigation.ErrInvalidRequest)
+	}
+	repository.mu.RLock()
+	var found domain.Signal
+	var tenantID string
+	matches := 0
+	for key, signal := range repository.signals {
+		if key.resourceID == signalID {
+			found = cloneSignal(signal)
+			tenantID = repository.signalTenants[key]
+			matches++
+		}
+	}
+	repository.mu.RUnlock()
+	if matches == 0 {
+		return investigation.RegisteredSignal{}, store.ErrNotFound
+	}
+	if matches != 1 {
+		return investigation.RegisteredSignal{}, store.ErrScopeViolation
+	}
+	if !domain.ValidResourceID(tenantID) {
+		return investigation.RegisteredSignal{}, store.ErrScopeViolation
+	}
+	return investigation.RegisteredSignal{
+		TenantID: tenantID, WorkspaceID: found.WorkspaceID, Signal: found,
+	}, nil
+}
+
 func (repository *Repository) CorrelateSignal(ctx context.Context, request investigation.CorrelateSignalRequest) (investigation.CorrelateSignalResult, error) {
 	if err := ctx.Err(); err != nil {
 		return investigation.CorrelateSignalResult{}, err
@@ -62,18 +120,22 @@ func (repository *Repository) CorrelateSignal(ctx context.Context, request inves
 	}
 	signalKey := scoped(request.WorkspaceID, request.SignalID)
 	repository.mu.RLock()
+	tenantID, tenantFound := repository.signalTenants[signalKey]
+	if !tenantFound || !domain.ValidResourceID(tenantID) {
+		repository.mu.RUnlock()
+		return investigation.CorrelateSignalResult{}, store.ErrScopeViolation
+	}
 	result, err, handled := repository.correlationReplayLocked(signalKey, request)
 	repository.mu.RUnlock()
 	if handled {
 		return result, err
 	}
-	tenantID, err := repository.tenantResolver(request.WorkspaceID)
-	if err != nil || !domain.ValidResourceID(tenantID) {
-		return investigation.CorrelateSignalResult{}, fmt.Errorf("%w: trusted tenant resolution failed", investigation.ErrInvalidRequest)
-	}
-
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
+	tenantID, tenantFound = repository.signalTenants[signalKey]
+	if !tenantFound || !domain.ValidResourceID(tenantID) {
+		return investigation.CorrelateSignalResult{}, store.ErrScopeViolation
+	}
 	result, err, handled = repository.correlationReplayLocked(signalKey, request)
 	if handled {
 		return result, err

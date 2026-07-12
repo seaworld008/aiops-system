@@ -342,14 +342,14 @@ func TestCorrelateSignalUsesTrustedTenantResolverWithoutPartialWrites(t *testing
 		t.Fatalf("memory.New() error = %v", err)
 	}
 	signal := testSignal("workspace-1", "signal-tenant", "firing", now)
-	if _, err := repository.RegisterSignal(context.Background(), signal); err != nil {
-		t.Fatalf("RegisterSignal() error = %v", err)
+	if _, err := repository.RegisterSignal(context.Background(), signal); !errors.Is(err, investigation.ErrInvalidRequest) {
+		t.Fatalf("RegisterSignal(resolver failure) error = %v, want ErrInvalidRequest", err)
 	}
 	request := investigation.CorrelateSignalRequest{
 		WorkspaceID: signal.WorkspaceID, SignalID: signal.ID, CorrelationKey: "tenant:test", MappingStatus: domain.MappingUnresolved,
 	}
-	if _, err := repository.CorrelateSignal(context.Background(), request); !errors.Is(err, investigation.ErrInvalidRequest) {
-		t.Fatalf("CorrelateSignal(resolver failure) error = %v, want ErrInvalidRequest", err)
+	if _, err := repository.CorrelateSignal(context.Background(), request); !errors.Is(err, store.ErrScopeViolation) {
+		t.Fatalf("CorrelateSignal(unregistered snapshot) error = %v, want ErrScopeViolation", err)
 	}
 	incidents, err := repository.ListIncidents(context.Background(), investigation.ListIncidentsRequest{WorkspaceID: signal.WorkspaceID})
 	if err != nil || len(incidents) != 0 {
@@ -357,6 +357,9 @@ func TestCorrelateSignalUsesTrustedTenantResolverWithoutPartialWrites(t *testing
 	}
 
 	resolverFails = false
+	if _, err := repository.RegisterSignal(context.Background(), signal); err != nil {
+		t.Fatalf("RegisterSignal(resolver recovery) error = %v", err)
+	}
 	result, err := repository.CorrelateSignal(context.Background(), request)
 	if err != nil {
 		t.Fatalf("CorrelateSignal(resolver recovery) error = %v", err)

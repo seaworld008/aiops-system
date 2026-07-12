@@ -66,6 +66,12 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 		}
 		delete(repository.activeInvestigation, incidentKey)
 	}
+	if incident.Status != domain.IncidentOpen && incident.Status != domain.IncidentInvestigating &&
+		incident.Status != domain.IncidentMitigating {
+		return investigation.CreateOrGetInvestigationResult{}, fmt.Errorf(
+			"%w: terminal incident cannot start a new investigation", investigation.ErrInvalidTransition,
+		)
+	}
 
 	investigationID, err := repository.newID()
 	if err != nil {

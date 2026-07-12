@@ -259,6 +259,43 @@ func TestCreateInvestigationRejectsUnresolvedIncidentBeforeAuthorizerOrWrites(t 
 	assertWriteMockExpectations(t, database)
 }
 
+func TestCreateInvestigationRejectsNewFactsForTerminalIncidentInsideLock(t *testing.T) {
+	for _, status := range []domain.IncidentStatus{domain.IncidentResolved, domain.IncidentClosed} {
+		t.Run(string(status), func(t *testing.T) {
+			database, repository := newWriteMockRepository(t, nil, nil)
+			now := time.Date(2026, 7, 12, 10, 30, 0, 0, time.UTC)
+			request := writeMockCreateRequest()
+			database.ExpectBegin()
+			expectWriteMockWorkspace(database)
+			expectWriteMockIdempotencyLock(database, request.IdempotencyKey)
+			database.ExpectQuery("FROM investigation_idempotency_records").
+				WithArgs(writeMockTenantID, writeMockWorkspaceID, request.IdempotencyKey).
+				WillReturnRows(emptyWriteMockIdempotencyRows())
+			database.ExpectRollback()
+
+			database.ExpectBegin()
+			expectWriteMockWorkspace(database)
+			expectWriteMockIdempotencyLock(database, request.IdempotencyKey)
+			database.ExpectQuery("FROM investigation_idempotency_records").
+				WithArgs(writeMockTenantID, writeMockWorkspaceID, request.IdempotencyKey).
+				WillReturnRows(emptyWriteMockIdempotencyRows())
+			database.ExpectQuery("FROM incidents AS incident").
+				WithArgs(writeMockTenantID, writeMockWorkspaceID, writeMockIncidentID, runtimeSchemaVersion).
+				WillReturnRows(writeMockIncidentRowsWithStatus(now, status))
+			database.ExpectQuery("FROM investigations AS investigation").
+				WithArgs(writeMockTenantID, writeMockWorkspaceID, writeMockIncidentID, runtimeSchemaVersion).
+				WillReturnRows(emptyWriteMockInvestigationRows())
+			database.ExpectRollback()
+
+			_, err := repository.CreateOrGetInvestigation(context.Background(), request)
+			if !errors.Is(err, investigation.ErrInvalidTransition) {
+				t.Fatalf("CreateOrGetInvestigation(%s) error = %v, want ErrInvalidTransition", status, err)
+			}
+			assertWriteMockExpectations(t, database)
+		})
+	}
+}
+
 func expectWriteMockCreateAdmission(
 	database pgxmock.PgxPoolIface,
 	request investigation.CreateOrGetInvestigationRequest,
@@ -344,6 +381,15 @@ func emptyWriteMockIncidentRows() *pgxmock.Rows {
 
 func writeMockIncidentRows(now time.Time) *pgxmock.Rows {
 	return writeMockIncidentRowsForScope(now, writeMockServiceID, writeMockEnvironmentID, domain.MappingExact)
+}
+
+func writeMockIncidentRowsWithStatus(now time.Time, status domain.IncidentStatus) *pgxmock.Rows {
+	return emptyWriteMockIncidentRows().AddRow(
+		writeMockIncidentID, writeMockTenantID, writeMockWorkspaceID,
+		writeMockServiceID, writeMockEnvironmentID, "payments:staging:latency",
+		domain.MappingExact, "UNKNOWN", "Unclassified operational incident", status,
+		nil, now, now, now, 1, int64(2),
+	)
 }
 
 func writeMockIncidentRowsForScope(now time.Time, serviceID, environmentID any, mappingStatus domain.MappingStatus) *pgxmock.Rows {

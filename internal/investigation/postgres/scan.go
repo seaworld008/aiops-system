@@ -126,6 +126,14 @@ const hypothesisProjection = `
 	hypothesis.created_at`
 
 func scanSignal(row rowScanner) (domain.Signal, error) {
+	registered, err := scanRegisteredSignal(row)
+	if err != nil {
+		return domain.Signal{}, err
+	}
+	return registered.Signal, nil
+}
+
+func scanRegisteredSignal(row rowScanner) (investigation.RegisteredSignal, error) {
 	var (
 		signal      domain.Signal
 		tenantID    string
@@ -144,20 +152,22 @@ func scanSignal(row rowScanner) (domain.Signal, error) {
 		&labelsBytes,
 		&signal.ObservedAt,
 	); err != nil {
-		return domain.Signal{}, err
+		return investigation.RegisteredSignal{}, err
 	}
 	if !validUUIDs(signal.ID, tenantID, signal.WorkspaceID, signal.IntegrationID) {
-		return domain.Signal{}, invalidPersistedData("signal")
+		return investigation.RegisteredSignal{}, invalidPersistedData("signal")
 	}
 	if err := json.Unmarshal(labelsBytes, &signal.Labels); err != nil || signal.Labels == nil {
-		return domain.Signal{}, invalidPersistedData("signal")
+		return investigation.RegisteredSignal{}, invalidPersistedData("signal")
 	}
 	signal.ObservedAt = databaseTime(signal.ObservedAt)
 	normalized, err := investigation.NormalizeSignalForReplay(signal)
 	if err != nil {
-		return domain.Signal{}, invalidPersistedData("signal")
+		return investigation.RegisteredSignal{}, invalidPersistedData("signal")
 	}
-	return normalized, nil
+	return investigation.RegisteredSignal{
+		TenantID: tenantID, WorkspaceID: normalized.WorkspaceID, Signal: normalized,
+	}, nil
 }
 
 func scanIncident(row rowScanner) (domain.Incident, error) {

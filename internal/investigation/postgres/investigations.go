@@ -184,6 +184,12 @@ func (repository *Repository) createOrBindInvestigation(
 		committed = true
 		return result, nil
 	}
+	if incident.Status != domain.IncidentOpen && incident.Status != domain.IncidentInvestigating &&
+		incident.Status != domain.IncidentMitigating {
+		return result, fmt.Errorf(
+			"%w: terminal incident cannot start a new investigation", investigation.ErrInvalidTransition,
+		)
+	}
 
 	investigationID, taskIDs, err := repository.prepareInvestigationIDs(len(canonicalTasks))
 	if err != nil {
