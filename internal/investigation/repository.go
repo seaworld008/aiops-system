@@ -22,12 +22,13 @@ type TaskSpec struct {
 }
 
 type CorrelateSignalRequest struct {
-	WorkspaceID    string
-	SignalID       string
-	CorrelationKey string
-	ServiceID      string
-	EnvironmentID  string
-	MappingStatus  domain.MappingStatus
+	WorkspaceID        string
+	SignalID           string
+	ExpectedSignalHash string
+	CorrelationKey     string
+	ServiceID          string
+	EnvironmentID      string
+	MappingStatus      domain.MappingStatus
 }
 
 type CorrelateSignalResult struct {

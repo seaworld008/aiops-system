@@ -20,6 +20,7 @@ type Repository struct {
 	mu sync.RWMutex
 
 	signals                      map[scopeKey]domain.Signal
+	signalTenants                map[scopeKey]string
 	incidents                    map[scopeKey]domain.Incident
 	activeIncidentByCorrelation  map[scopeKey]string
 	signalIncident               map[scopeKey]signalAssociationRecord
@@ -58,6 +59,7 @@ func New(options Options) (*Repository, error) {
 	}
 	return &Repository{
 		signals:                      make(map[scopeKey]domain.Signal),
+		signalTenants:                make(map[scopeKey]string),
 		incidents:                    make(map[scopeKey]domain.Incident),
 		activeIncidentByCorrelation:  make(map[scopeKey]string),
 		signalIncident:               make(map[scopeKey]signalAssociationRecord),

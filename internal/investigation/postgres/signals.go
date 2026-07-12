@@ -259,6 +259,53 @@ func (repository *Repository) GetSignal(ctx context.Context, workspaceID, signal
 	return signal, nil
 }
 
+func (repository *Repository) GetRegisteredSignal(ctx context.Context, signalID string) (investigation.RegisteredSignal, error) {
+	if ctx == nil {
+		return investigation.RegisteredSignal{}, fmt.Errorf("%w: context is required", investigation.ErrInvalidRequest)
+	}
+	if err := ctx.Err(); err != nil {
+		return investigation.RegisteredSignal{}, err
+	}
+	if !validUUID(signalID) {
+		return investigation.RegisteredSignal{}, fmt.Errorf("%w: invalid global signal ID", investigation.ErrInvalidRequest)
+	}
+	tx, err := repository.database.Begin(ctx)
+	if err != nil {
+		return investigation.RegisteredSignal{}, databaseError("begin registered signal read", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	registered, err := scanRegisteredSignal(tx.QueryRow(ctx, `
+		SELECT `+signalProjection+`
+		FROM signals AS signal
+		JOIN workspaces AS workspace
+		  ON workspace.id = signal.workspace_id
+		 AND workspace.tenant_id = signal.tenant_id
+		JOIN integrations AS integration
+		  ON integration.id = signal.integration_id
+		 AND integration.tenant_id = signal.tenant_id
+		 AND integration.workspace_id = signal.workspace_id
+		 AND integration.provider = signal.provider
+		WHERE signal.id = $1
+		FOR SHARE OF signal, workspace, integration
+	`, signalID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return investigation.RegisteredSignal{}, store.ErrNotFound
+	}
+	if err != nil {
+		return investigation.RegisteredSignal{}, databaseError("read registered signal", err)
+	}
+	if err := commit(ctx, tx, "commit registered signal read"); err != nil {
+		return investigation.RegisteredSignal{}, err
+	}
+	committed = true
+	return registered, nil
+}
+
 func findSignalByID(
 	ctx context.Context,
 	tx pgx.Tx,

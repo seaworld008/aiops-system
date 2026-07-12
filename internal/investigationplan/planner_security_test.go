@@ -117,6 +117,23 @@ func TestNewRejectsUnsafeDefinitions(t *testing.T) {
 	}
 }
 
+func TestPlannerAcceptsOnlyItsProcessAuthority(t *testing.T) {
+	registry, connectorID := testRegistry(t)
+	authority := investigationplan.NewScopeAuthority()
+	planner, err := investigationplan.New(context.Background(), authority, registry, testDefinition(registry.Digest(), connectorID))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	copyOfAuthority := *authority
+	if !planner.AcceptsAuthority(authority) || !planner.AcceptsAuthority(&copyOfAuthority) {
+		t.Fatalf("Planner rejected its own process authority")
+	}
+	if planner.AcceptsAuthority(nil) || planner.AcceptsAuthority(&investigationplan.ScopeAuthority{}) ||
+		planner.AcceptsAuthority(investigationplan.NewScopeAuthority()) {
+		t.Fatalf("Planner accepted nil, zero, or foreign authority")
+	}
+}
+
 func TestNewRejectsOversizedInMemoryDefinitionBeforeCanonicalization(t *testing.T) {
 	registry, connectorID := testRegistry(t)
 	authority := investigationplan.NewScopeAuthority()

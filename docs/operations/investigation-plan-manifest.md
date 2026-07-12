@@ -111,22 +111,23 @@ Manifest 与 READ connector registry 共用 `internal/securemanifest` 的 fail-c
 authorizer 或请求作用域不一致时都直接失败；没有内存默认配置、旧文件回退或跳过坏 profile
 的路径。
 
-## B1 History 与 digest-bound queue 后续契约
+## B1 History 与 digest-bound queue 契约
 
-M5C1B0 只产生不可变 Plan，不引入 Temporal SDK。后续 B1 Workflow History DTO 必须只携带
-持久 ID、脱敏状态以及上述四个摘要，不携带 manifest 正文、Task input、目标、凭据或连接器
-错误体。Activity task queue 必须与 plan/registry digest 绑定，使 Worker 只能处理它明确支持
-的不可变契约。
+M5C1B1 已在独立、未装配的 runtime 中实现上述契约。Workflow History DTO 只携带持久 ID、
+脱敏状态以及上述四个摘要，不携带 manifest 正文、Task input、目标、凭据或连接器错误体。
+Activity task queue 与完整 plan/registry digest 绑定，使 Worker 只能处理它明确支持的不可变契约。
 
 滚动升级时，仍有旧 digest History/Task 的兼容 Worker 必须保留到对应 Workflow 和 READ
 Task 终态；新 Planner 不得用同名新定义重新解释旧 digest。移除最后一个兼容 Worker 前应先
-证明旧 digest backlog 为零。这个兼容策略属于后续 B1 assembly/rollout，当前里程碑没有创建
-task queue、注册 Workflow/Activity 或启动 Worker。
+证明旧 digest backlog 为零。当前代码提供显式注册 helper，但没有任何 `cmd/*` 调用、live
+dispatcher 或常驻 Worker；运行与回滚细节见
+[Temporal preparation 运维契约](temporal-investigation-preparation.md)。
 
 ## 当前 rollout 边界
 
 - 无数据库迁移；Plan 和 Trusted scope 都不持久化。
-- 无 Temporal SDK、Workflow、Activity、task queue 或 History DTO 实现。
+- 有未装配的 Temporal Workflow/Activity、digest queue helper 与 History DTO；无常驻 Worker、
+  live dispatcher 或进程配置。
 - 无 `cmd/*`、环境变量、Control Plane 或 Worker assembly 变更；Signal dispatcher 仍未
   安装，Outbox 继续停在未 ACK 的安全等待点。
 - READ Runner target manifest、digest 一致性门禁和固定执行器尚未完成，READ claims、遗留

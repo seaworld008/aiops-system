@@ -234,6 +234,13 @@ func (planner *Planner) RegistryDigest() string {
 	return planner.registryDigest
 }
 
+// AcceptsAuthority verifies process-local authority identity without exposing
+// the private marker or adding it to any digest or serialized contract.
+func (planner *Planner) AcceptsAuthority(authority *ScopeAuthority) bool {
+	return planner != nil && planner.Ready() && authority != nil && authority.marker != nil &&
+		authority.marker == planner.scopeMarker
+}
+
 func (planner *Planner) Resolve(ctx context.Context, request ResolveRequest) (Plan, error) {
 	if err := contextError(ctx); err != nil {
 		return Plan{}, err

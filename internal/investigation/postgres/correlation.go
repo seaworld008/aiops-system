@@ -45,7 +45,8 @@ func (repository *Repository) CorrelateSignal(
 		return investigation.CorrelateSignalResult{}, err
 	}
 	if !validUUIDs(request.WorkspaceID, request.SignalID) ||
-		!domain.ValidCorrelationKey(request.CorrelationKey) || !validCorrelationMapping(request) {
+		!domain.ValidCorrelationKey(request.CorrelationKey) || !validCorrelationMapping(request) ||
+		(request.ExpectedSignalHash != "" && !domain.ValidSHA256Hex(request.ExpectedSignalHash)) {
 		return investigation.CorrelateSignalResult{}, fmt.Errorf("%w: invalid persistent signal correlation", investigation.ErrInvalidRequest)
 	}
 
@@ -80,12 +81,32 @@ func (repository *Repository) correlateSignalOnce(
 
 	var signalStatus string
 	var observedAt time.Time
-	err = tx.QueryRow(ctx, `
-		SELECT signal.status, signal.observed_at
-		FROM signals AS signal
-		WHERE signal.tenant_id = $1 AND signal.workspace_id = $2 AND signal.id = $3
-		FOR UPDATE OF signal
-	`, tenantID, request.WorkspaceID, request.SignalID).Scan(&signalStatus, &observedAt)
+	if request.ExpectedSignalHash != "" {
+		lockedSignal, lockErr := scanSignal(tx.QueryRow(ctx, `
+			SELECT `+signalProjection+`
+			FROM signals AS signal
+			WHERE signal.tenant_id = $1 AND signal.workspace_id = $2 AND signal.id = $3
+			FOR UPDATE OF signal
+		`, tenantID, request.WorkspaceID, request.SignalID))
+		err = lockErr
+		if err == nil {
+			actualHash, hashErr := investigation.RegisteredSignalSnapshotHash(investigation.RegisteredSignal{
+				TenantID: tenantID, WorkspaceID: lockedSignal.WorkspaceID, Signal: lockedSignal,
+			})
+			if hashErr != nil || actualHash != request.ExpectedSignalHash {
+				return result, false, store.ErrScopeViolation
+			}
+			signalStatus = lockedSignal.Status
+			observedAt = lockedSignal.ObservedAt
+		}
+	} else {
+		err = tx.QueryRow(ctx, `
+			SELECT signal.status, signal.observed_at
+			FROM signals AS signal
+			WHERE signal.tenant_id = $1 AND signal.workspace_id = $2 AND signal.id = $3
+			FOR UPDATE OF signal
+		`, tenantID, request.WorkspaceID, request.SignalID).Scan(&signalStatus, &observedAt)
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return result, false, store.ErrNotFound
 	}

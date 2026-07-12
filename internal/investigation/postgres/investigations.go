@@ -146,6 +146,16 @@ func (repository *Repository) createOrBindInvestigation(
 	if err != nil {
 		return result, databaseError("lock investigation incident", err)
 	}
+	active, activeFound, err := lockActiveInvestigation(ctx, tx, tenantID, request.WorkspaceID, request.IncidentID)
+	if err != nil {
+		return result, err
+	}
+	if !activeFound && incident.Status != domain.IncidentOpen && incident.Status != domain.IncidentInvestigating &&
+		incident.Status != domain.IncidentMitigating {
+		return result, fmt.Errorf(
+			"%w: terminal incident cannot start a new investigation", investigation.ErrInvalidTransition,
+		)
+	}
 	scope := investigation.TaskSpecScope{
 		TenantID:      incident.TenantID,
 		WorkspaceID:   incident.WorkspaceID,
@@ -156,11 +166,6 @@ func (repository *Repository) createOrBindInvestigation(
 	if err := investigation.AuthorizeTaskSpecs(
 		ctx, repository.taskSpecAuthorizer, scope, canonicalTasks,
 	); err != nil {
-		return result, err
-	}
-
-	active, activeFound, err := lockActiveInvestigation(ctx, tx, tenantID, request.WorkspaceID, request.IncidentID)
-	if err != nil {
 		return result, err
 	}
 	if activeFound {

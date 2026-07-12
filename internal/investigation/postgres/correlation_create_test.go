@@ -12,6 +12,7 @@ import (
 	"github.com/pashagolub/pgxmock/v4"
 	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/investigation"
+	"github.com/seaworld008/aiops-system/internal/store"
 )
 
 const (
@@ -73,6 +74,72 @@ func TestCorrelateSignalAtomicallyCreatesIncidentAssociationAndOutbox(t *testing
 	result, err := repository.CorrelateSignal(context.Background(), request)
 	if err != nil || !result.Created || !result.Associated || !result.Counted || result.Incident.ID != writeMockIncidentID {
 		t.Fatalf("CorrelateSignal() = %#v, %v", result, err)
+	}
+	assertWriteMockExpectations(t, database)
+}
+
+func TestCorrelateSignalRejectsStaleExpectedSignalSnapshotUnderRowLock(t *testing.T) {
+	database, repository := newWriteMockRepository(t, nil, nil)
+	now := time.Date(2026, 7, 12, 8, 0, 0, 123000, time.UTC)
+	database.ExpectBegin()
+	expectWriteMockWorkspace(database)
+	database.ExpectQuery(`(?s)SELECT.*signal\.id::text.*FROM signals AS signal.*FOR UPDATE OF signal`).
+		WithArgs(writeMockTenantID, writeMockWorkspaceID, writeMockSignalID).
+		WillReturnRows(pgxmock.NewRows([]string{
+			"id", "tenant_id", "workspace_id", "integration_id", "provider", "provider_event_id",
+			"payload_hash", "fingerprint", "status", "labels", "observed_at",
+		}).AddRow(
+			writeMockSignalID, writeMockTenantID, writeMockWorkspaceID, writeMockServiceID,
+			"alertmanager", "event-1", strings.Repeat("a", 64), "payments", "firing",
+			[]byte(`{"service":"payments"}`), now,
+		))
+	database.ExpectRollback()
+	_, err := repository.CorrelateSignal(context.Background(), investigation.CorrelateSignalRequest{
+		WorkspaceID: writeMockWorkspaceID, SignalID: writeMockSignalID,
+		ExpectedSignalHash: strings.Repeat("b", 64), CorrelationKey: "payments:staging:fenced",
+		MappingStatus: domain.MappingUnresolved,
+	})
+	if !errors.Is(err, store.ErrScopeViolation) {
+		t.Fatalf("CorrelateSignal(stale snapshot) error = %v, want ErrScopeViolation", err)
+	}
+	assertWriteMockExpectations(t, database)
+}
+
+func TestCorrelateSignalSnapshotHashBindsTenantResolvedByWorkspaceTransaction(t *testing.T) {
+	const otherTenantID = "12000000-0000-4000-8000-000000000001"
+	database, repository := newWriteMockRepository(t, nil, nil)
+	now := time.Date(2026, 7, 12, 8, 0, 0, 123000, time.UTC)
+	signal := domain.Signal{
+		ID: writeMockSignalID, WorkspaceID: writeMockWorkspaceID, IntegrationID: writeMockServiceID,
+		Provider: "alertmanager", ProviderEventID: "event-1", PayloadHash: strings.Repeat("a", 64),
+		Fingerprint: "payments", Status: "firing", Labels: map[string]string{"service": "payments"}, ObservedAt: now,
+	}
+	hashFromOtherTenant, err := investigation.RegisteredSignalSnapshotHash(investigation.RegisteredSignal{
+		TenantID: otherTenantID, WorkspaceID: writeMockWorkspaceID, Signal: signal,
+	})
+	if err != nil {
+		t.Fatalf("RegisteredSignalSnapshotHash(other tenant) error = %v", err)
+	}
+	database.ExpectBegin()
+	expectWriteMockWorkspace(database)
+	database.ExpectQuery(`(?s)SELECT.*signal\.id::text.*FROM signals AS signal.*FOR UPDATE OF signal`).
+		WithArgs(writeMockTenantID, writeMockWorkspaceID, writeMockSignalID).
+		WillReturnRows(pgxmock.NewRows([]string{
+			"id", "tenant_id", "workspace_id", "integration_id", "provider", "provider_event_id",
+			"payload_hash", "fingerprint", "status", "labels", "observed_at",
+		}).AddRow(
+			writeMockSignalID, writeMockTenantID, writeMockWorkspaceID, writeMockServiceID,
+			"alertmanager", "event-1", strings.Repeat("a", 64), "payments", "firing",
+			[]byte(`{"service":"payments"}`), now,
+		))
+	database.ExpectRollback()
+	_, err = repository.CorrelateSignal(context.Background(), investigation.CorrelateSignalRequest{
+		WorkspaceID: writeMockWorkspaceID, SignalID: writeMockSignalID,
+		ExpectedSignalHash: hashFromOtherTenant, CorrelationKey: "payments:staging:tenant-fenced",
+		MappingStatus: domain.MappingUnresolved,
+	})
+	if !errors.Is(err, store.ErrScopeViolation) {
+		t.Fatalf("CorrelateSignal(other tenant snapshot) error = %v, want ErrScopeViolation", err)
 	}
 	assertWriteMockExpectations(t, database)
 }
@@ -259,6 +326,50 @@ func TestCreateInvestigationRejectsUnresolvedIncidentBeforeAuthorizerOrWrites(t 
 	assertWriteMockExpectations(t, database)
 }
 
+func TestCreateInvestigationRejectsNewFactsForTerminalIncidentInsideLock(t *testing.T) {
+	for _, status := range []domain.IncidentStatus{domain.IncidentResolved, domain.IncidentClosed} {
+		t.Run(string(status), func(t *testing.T) {
+			authorizerCalls := 0
+			database, repository := newWriteMockRepository(t, nil, func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error {
+				authorizerCalls++
+				return fmt.Errorf("terminal authorizer must not run")
+			})
+			now := time.Date(2026, 7, 12, 10, 30, 0, 0, time.UTC)
+			request := writeMockCreateRequest()
+			database.ExpectBegin()
+			expectWriteMockWorkspace(database)
+			expectWriteMockIdempotencyLock(database, request.IdempotencyKey)
+			database.ExpectQuery("FROM investigation_idempotency_records").
+				WithArgs(writeMockTenantID, writeMockWorkspaceID, request.IdempotencyKey).
+				WillReturnRows(emptyWriteMockIdempotencyRows())
+			database.ExpectRollback()
+
+			database.ExpectBegin()
+			expectWriteMockWorkspace(database)
+			expectWriteMockIdempotencyLock(database, request.IdempotencyKey)
+			database.ExpectQuery("FROM investigation_idempotency_records").
+				WithArgs(writeMockTenantID, writeMockWorkspaceID, request.IdempotencyKey).
+				WillReturnRows(emptyWriteMockIdempotencyRows())
+			database.ExpectQuery("FROM incidents AS incident").
+				WithArgs(writeMockTenantID, writeMockWorkspaceID, writeMockIncidentID, runtimeSchemaVersion).
+				WillReturnRows(writeMockIncidentRowsWithStatus(now, status))
+			database.ExpectQuery("FROM investigations AS investigation").
+				WithArgs(writeMockTenantID, writeMockWorkspaceID, writeMockIncidentID, runtimeSchemaVersion).
+				WillReturnRows(emptyWriteMockInvestigationRows())
+			database.ExpectRollback()
+
+			_, err := repository.CreateOrGetInvestigation(context.Background(), request)
+			if !errors.Is(err, investigation.ErrInvalidTransition) {
+				t.Fatalf("CreateOrGetInvestigation(%s) error = %v, want ErrInvalidTransition", status, err)
+			}
+			if authorizerCalls != 0 {
+				t.Fatalf("terminal authorizer calls = %d, want 0", authorizerCalls)
+			}
+			assertWriteMockExpectations(t, database)
+		})
+	}
+}
+
 func expectWriteMockCreateAdmission(
 	database pgxmock.PgxPoolIface,
 	request investigation.CreateOrGetInvestigationRequest,
@@ -281,6 +392,9 @@ func expectWriteMockCreateAdmission(
 	database.ExpectQuery("FROM incidents AS incident").
 		WithArgs(writeMockTenantID, writeMockWorkspaceID, writeMockIncidentID, runtimeSchemaVersion).
 		WillReturnRows(incidentRows)
+	database.ExpectQuery("FROM investigations AS investigation").
+		WithArgs(writeMockTenantID, writeMockWorkspaceID, writeMockIncidentID, runtimeSchemaVersion).
+		WillReturnRows(emptyWriteMockInvestigationRows())
 	database.ExpectRollback()
 }
 
@@ -344,6 +458,15 @@ func emptyWriteMockIncidentRows() *pgxmock.Rows {
 
 func writeMockIncidentRows(now time.Time) *pgxmock.Rows {
 	return writeMockIncidentRowsForScope(now, writeMockServiceID, writeMockEnvironmentID, domain.MappingExact)
+}
+
+func writeMockIncidentRowsWithStatus(now time.Time, status domain.IncidentStatus) *pgxmock.Rows {
+	return emptyWriteMockIncidentRows().AddRow(
+		writeMockIncidentID, writeMockTenantID, writeMockWorkspaceID,
+		writeMockServiceID, writeMockEnvironmentID, "payments:staging:latency",
+		domain.MappingExact, "UNKNOWN", "Unclassified operational incident", status,
+		nil, now, now, now, 1, int64(2),
+	)
 }
 
 func writeMockIncidentRowsForScope(now time.Time, serviceID, environmentID any, mappingStatus domain.MappingStatus) *pgxmock.Rows {
