@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/investigationplan"
@@ -16,6 +19,7 @@ import (
 
 func TestNewRejectsUnsafeDefinitions(t *testing.T) {
 	registry, connectorID := testRegistry(t)
+	authority := investigationplan.NewScopeAuthority()
 	valid := testDefinition(registry.Digest(), connectorID)
 	otherEnvironment := "30000000-0000-4000-8000-000000000013"
 	tests := []struct {
@@ -106,7 +110,7 @@ func TestNewRejectsUnsafeDefinitions(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			definition := cloneDefinition(t, valid)
 			test.mutate(&definition)
-			if _, err := investigationplan.New(context.Background(), registry, definition); !errors.Is(err, test.want) {
+			if _, err := investigationplan.New(context.Background(), authority, registry, definition); !errors.Is(err, test.want) {
 				t.Fatalf("New() error = %v, want %v", err, test.want)
 			}
 		})
@@ -115,6 +119,7 @@ func TestNewRejectsUnsafeDefinitions(t *testing.T) {
 
 func TestNewRejectsOversizedInMemoryDefinitionBeforeCanonicalization(t *testing.T) {
 	registry, connectorID := testRegistry(t)
+	authority := investigationplan.NewScopeAuthority()
 	definition := testDefinition(registry.Digest(), connectorID)
 	definition.Profiles = repeatProfile(definition.Profiles[0], 2)
 	definition.Profiles[1].Match.Labels[1].Value = "staging-b"
@@ -127,20 +132,70 @@ func TestNewRejectsOversizedInMemoryDefinitionBeforeCanonicalization(t *testing.
 			)
 		}
 	}
-	_, err := investigationplan.New(context.Background(), registry, definition)
+	_, err := investigationplan.New(context.Background(), authority, registry, definition)
 	if !errors.Is(err, investigationplan.ErrDefinitionTooLarge) ||
 		!errors.Is(err, investigationplan.ErrInvalidDefinition) {
 		t.Fatalf("New() error = %v, want definition size rejection", err)
 	}
 }
 
+func TestNewRejectsDefinitionWhoseEscapedManifestExceedsFileLimit(t *testing.T) {
+	registry, connectorID := testRegistry(t)
+	authority := investigationplan.NewScopeAuthority()
+	definition := testDefinition(registry.Digest(), connectorID)
+	definition.Profiles = repeatProfile(definition.Profiles[0], 1000)
+	for index := range definition.Profiles {
+		definition.Profiles[index].Match.Labels = []investigationplan.LabelMatch{{
+			Key:   "cluster",
+			Value: fmt.Sprintf("%04d", index) + strings.Repeat(`\`, 508),
+		}}
+	}
+	encoded := manifestBytes(t, definition)
+	if len(encoded) <= investigationplan.MaximumDefinitionBytes {
+		t.Fatalf("escaped manifest size = %d, want > %d", len(encoded), investigationplan.MaximumDefinitionBytes)
+	}
+	if _, err := investigationplan.New(context.Background(), authority, registry, definition); !errors.Is(err, investigationplan.ErrDefinitionTooLarge) {
+		t.Fatalf("New() error = %v, want ErrDefinitionTooLarge for %d-byte manifest", err, len(encoded))
+	}
+}
+
+func TestNewRejectsRawDefinitionMaterialAboveLimitEvenWhenJSONCompacts(t *testing.T) {
+	registry, connectorID := testRegistry(t)
+	authority := investigationplan.NewScopeAuthority()
+	definition := testDefinition(registry.Digest(), connectorID)
+	definition.Profiles = repeatProfile(definition.Profiles[0], 2)
+	definition.Profiles[1].Match.Labels[1].Value = "staging-b"
+	core := `{"lookback_minutes":15}`
+	padding := (64 << 10) - len(core)
+	input := json.RawMessage(strings.Repeat(" ", padding/2) + core + strings.Repeat(" ", padding-padding/2))
+	rawBytes := 0
+	for profileIndex := range definition.Profiles {
+		definition.Profiles[profileIndex].Tasks = repeatTask(definition.Profiles[profileIndex].Tasks[0], 12)
+		for taskIndex := range definition.Profiles[profileIndex].Tasks {
+			definition.Profiles[profileIndex].Tasks[taskIndex].Key = fmt.Sprintf("task-%02d", taskIndex)
+			definition.Profiles[profileIndex].Tasks[taskIndex].Input = input
+			rawBytes += len(input)
+		}
+	}
+	if rawBytes <= investigationplan.MaximumDefinitionBytes {
+		t.Fatalf("raw task bytes = %d, want > %d", rawBytes, investigationplan.MaximumDefinitionBytes)
+	}
+	if encoded := manifestBytes(t, definition); len(encoded) >= investigationplan.MaximumDefinitionBytes {
+		t.Fatalf("compact manifest bytes = %d, want < %d", len(encoded), investigationplan.MaximumDefinitionBytes)
+	}
+	if _, err := investigationplan.New(context.Background(), authority, registry, definition); !errors.Is(err, investigationplan.ErrDefinitionTooLarge) {
+		t.Fatalf("New() error = %v, want ErrDefinitionTooLarge for %d raw task bytes", err, rawBytes)
+	}
+}
+
 func TestResolveFailsClosedOnUntrustedOrUnmatchedFacts(t *testing.T) {
 	registry, connectorID := testRegistry(t)
-	planner, err := investigationplan.New(context.Background(), registry, testDefinition(registry.Digest(), connectorID))
+	authority := investigationplan.NewScopeAuthority()
+	planner, err := investigationplan.New(context.Background(), authority, registry, testDefinition(registry.Digest(), connectorID))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	trusted := trustedScope(t, testTenantID, testWorkspaceID)
+	trusted := trustedScope(t, authority, testTenantID, testWorkspaceID)
 	tests := []struct {
 		name   string
 		mutate func(*investigationplan.ResolveRequest)
@@ -177,14 +232,151 @@ func TestResolveFailsClosedOnUntrustedOrUnmatchedFacts(t *testing.T) {
 	}
 }
 
+func TestScopeAuthorityBindsTrustedScopeToItsAuthority(t *testing.T) {
+	registry, connectorID := testRegistry(t)
+	authority := investigationplan.NewScopeAuthority()
+	planner, err := investigationplan.New(
+		context.Background(), authority, registry, testDefinition(registry.Digest(), connectorID),
+	)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	registration := investigationplan.TrustedSignalRegistration{
+		TenantID: testTenantID, WorkspaceID: testWorkspaceID,
+	}
+	sameScope, err := authority.Attest(registration)
+	if err != nil {
+		t.Fatalf("ScopeAuthority.Attest() error = %v", err)
+	}
+	request := investigationplan.ResolveRequest{
+		ExpectedPlanDigest: planner.ManifestDigest(), TrustedScope: sameScope, Signal: validSignal(),
+	}
+	if _, err := planner.Resolve(context.Background(), request); err != nil {
+		t.Fatalf("Resolve(same authority) error = %v", err)
+	}
+	changed := testDefinition(registry.Digest(), connectorID)
+	changed.Profiles[0].Tasks[0].Input = json.RawMessage(`{"lookback_minutes":20}`)
+	secondPlanner, err := investigationplan.New(context.Background(), authority, registry, changed)
+	if err != nil {
+		t.Fatalf("New(second Planner) error = %v", err)
+	}
+	request.ExpectedPlanDigest = secondPlanner.ManifestDigest()
+	if _, err := secondPlanner.Resolve(context.Background(), request); err != nil {
+		t.Fatalf("Resolve(same authority, second Planner) error = %v", err)
+	}
+	request.ExpectedPlanDigest = planner.ManifestDigest()
+	if _, err := secondPlanner.Resolve(context.Background(), request); !errors.Is(err, investigationplan.ErrPlanDigestMismatch) {
+		t.Fatalf("Resolve(wrong Planner digest) error = %v, want ErrPlanDigestMismatch", err)
+	}
+	request.ExpectedPlanDigest = planner.ManifestDigest()
+
+	foreign := investigationplan.NewScopeAuthority()
+	request.TrustedScope, err = foreign.Attest(registration)
+	if err != nil {
+		t.Fatalf("foreign ScopeAuthority.Attest() error = %v", err)
+	}
+	if _, err := planner.Resolve(context.Background(), request); !errors.Is(err, investigationplan.ErrInvalidRequest) {
+		t.Fatalf("Resolve(foreign authority) error = %v, want ErrInvalidRequest", err)
+	}
+
+	copiedAuthority := *authority
+	request.TrustedScope, err = (&copiedAuthority).Attest(registration)
+	if err != nil {
+		t.Fatalf("copied ScopeAuthority.Attest() error = %v", err)
+	}
+	copiedScope := request.TrustedScope
+	request.TrustedScope = copiedScope
+	if _, err := planner.Resolve(context.Background(), request); err != nil {
+		t.Fatalf("Resolve(copied authority/scope) error = %v", err)
+	}
+}
+
+func TestScopeAuthorityRejectsNilZeroAndDirectRegistrationPromotion(t *testing.T) {
+	registration := investigationplan.TrustedSignalRegistration{
+		TenantID: testTenantID, WorkspaceID: testWorkspaceID,
+	}
+	var nilAuthority *investigationplan.ScopeAuthority
+	if _, err := nilAuthority.Attest(registration); !errors.Is(err, investigationplan.ErrInvalidRequest) {
+		t.Fatalf("nil ScopeAuthority.Attest() error = %v", err)
+	}
+	zeroAuthority := &investigationplan.ScopeAuthority{}
+	if _, err := zeroAuthority.Attest(registration); !errors.Is(err, investigationplan.ErrInvalidRequest) {
+		t.Fatalf("zero ScopeAuthority.Attest() error = %v", err)
+	}
+	registry, connectorID := testRegistry(t)
+	definition := testDefinition(registry.Digest(), connectorID)
+	for name, authority := range map[string]*investigationplan.ScopeAuthority{
+		"nil": nil, "zero": zeroAuthority,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := investigationplan.New(context.Background(), authority, registry, definition); !errors.Is(err, investigationplan.ErrInvalidRequest) {
+				t.Fatalf("New() error = %v, want ErrInvalidRequest", err)
+			}
+		})
+	}
+	if _, found := reflect.TypeOf(registration).MethodByName("Scope"); found {
+		t.Fatal("TrustedSignalRegistration exposes a direct Scope promotion method")
+	}
+}
+
+func TestPlannerDetachesRetainedStringsFromLargeBackings(t *testing.T) {
+	registry, connectorID := testRegistry(t)
+	authority := investigationplan.NewScopeAuthority()
+	digestSource := strings.Repeat("x", 1<<20) + registry.Digest()
+	labelSource := strings.Repeat("x", 1<<20) + "payments"
+	tenantSource := strings.Repeat("x", 1<<20) + testTenantID
+	digestView := digestSource[len(digestSource)-len(registry.Digest()):]
+	labelView := labelSource[len(labelSource)-len("payments"):]
+	tenantView := tenantSource[len(tenantSource)-len(testTenantID):]
+	tenantSourcePointer := unsafe.StringData(tenantView)
+
+	definition := testDefinition(digestView, connectorID)
+	definition.Profiles[0].Scope.TenantID = tenantView
+	definition.Profiles[0].Match.Labels[0].Value = labelView
+	planner, err := investigationplan.New(context.Background(), authority, registry, definition)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	trusted, err := authority.Attest(investigationplan.TrustedSignalRegistration{
+		TenantID: tenantView, WorkspaceID: testWorkspaceID,
+	})
+	if err != nil {
+		t.Fatalf("ScopeAuthority.Attest() error = %v", err)
+	}
+	if unsafe.StringData(planner.RegistryDigest()) == unsafe.StringData(digestView) {
+		t.Fatal("Planner retained the large registry-digest backing string")
+	}
+	digestSource, labelSource, tenantSource = "", "", ""
+	digestView, labelView, tenantView = "", "", ""
+	definition = investigationplan.Definition{}
+	runtime.GC()
+
+	if planner.RegistryDigest() != registry.Digest() {
+		t.Fatalf("Planner retained registry digest backing: %q", planner.RegistryDigest())
+	}
+	plan, err := planner.Resolve(context.Background(), investigationplan.ResolveRequest{
+		ExpectedPlanDigest: planner.ManifestDigest(), TrustedScope: trusted, Signal: validSignal(),
+	})
+	if err != nil {
+		t.Fatalf("Resolve() after source backing release error = %v", err)
+	}
+	if plan.Scope().TenantID != testTenantID {
+		t.Fatalf("Plan.Scope().TenantID = %q", plan.Scope().TenantID)
+	}
+	if unsafe.StringData(plan.Scope().TenantID) == tenantSourcePointer {
+		t.Fatal("Plan retained the large tenant backing string")
+	}
+}
+
 func TestPlannerDigestAndCorrelationSemanticsAreStable(t *testing.T) {
 	registry, connectorID := testRegistry(t)
+	authority := investigationplan.NewScopeAuthority()
 	definition := testDefinition(registry.Digest(), connectorID)
 	definition.Profiles[0].Tasks = append(definition.Profiles[0].Tasks, investigationplan.TaskDefinition{
 		Key: "metrics-short", ConnectorID: connectorID, Operation: definition.Profiles[0].Tasks[0].Operation,
 		Input: json.RawMessage(`{"lookback_minutes":10}`),
 	})
-	planner, err := investigationplan.New(context.Background(), registry, definition)
+	planner, err := investigationplan.New(context.Background(), authority, registry, definition)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -193,14 +385,14 @@ func TestPlannerDigestAndCorrelationSemanticsAreStable(t *testing.T) {
 		reordered.Profiles[0].Match.Labels[1], reordered.Profiles[0].Match.Labels[0]
 	reordered.Profiles[0].Tasks[0], reordered.Profiles[0].Tasks[1] =
 		reordered.Profiles[0].Tasks[1], reordered.Profiles[0].Tasks[0]
-	reorderedPlanner, err := investigationplan.New(context.Background(), registry, reordered)
+	reorderedPlanner, err := investigationplan.New(context.Background(), authority, registry, reordered)
 	if err != nil {
 		t.Fatalf("New(reordered) error = %v", err)
 	}
 	if reorderedPlanner.ManifestDigest() != planner.ManifestDigest() {
 		t.Fatalf("manifest digest changed under semantic reorder: %q != %q", reorderedPlanner.ManifestDigest(), planner.ManifestDigest())
 	}
-	trusted := trustedScope(t, testTenantID, testWorkspaceID)
+	trusted := trustedScope(t, authority, testTenantID, testWorkspaceID)
 	plan := resolvePlan(t, planner, trusted, validSignal())
 	reorderedPlan := resolvePlan(t, reorderedPlanner, trusted, validSignal())
 	if reorderedPlan.ProfileDigest() != plan.ProfileDigest() || reorderedPlan.TasksHash() != plan.TasksHash() {
@@ -209,12 +401,12 @@ func TestPlannerDigestAndCorrelationSemanticsAreStable(t *testing.T) {
 	multiple := cloneDefinition(t, definition)
 	multiple.Profiles = repeatProfile(multiple.Profiles[0], 2)
 	multiple.Profiles[1].Match.Labels[1].Value = "staging-b"
-	multiplePlanner, err := investigationplan.New(context.Background(), registry, multiple)
+	multiplePlanner, err := investigationplan.New(context.Background(), authority, registry, multiple)
 	if err != nil {
 		t.Fatalf("New(multiple) error = %v", err)
 	}
 	multiple.Profiles[0], multiple.Profiles[1] = multiple.Profiles[1], multiple.Profiles[0]
-	reorderedProfilesPlanner, err := investigationplan.New(context.Background(), registry, multiple)
+	reorderedProfilesPlanner, err := investigationplan.New(context.Background(), authority, registry, multiple)
 	if err != nil {
 		t.Fatalf("New(reordered profiles) error = %v", err)
 	}
@@ -224,7 +416,7 @@ func TestPlannerDigestAndCorrelationSemanticsAreStable(t *testing.T) {
 
 	changed := cloneDefinition(t, definition)
 	changed.Profiles[0].Tasks[0].Input = json.RawMessage(`{"lookback_minutes":20}`)
-	changedPlanner, err := investigationplan.New(context.Background(), registry, changed)
+	changedPlanner, err := investigationplan.New(context.Background(), authority, registry, changed)
 	if err != nil {
 		t.Fatalf("New(changed) error = %v", err)
 	}
@@ -256,16 +448,17 @@ func TestPlannerDigestAndCorrelationSemanticsAreStable(t *testing.T) {
 
 func TestPlannerRejectsOverlappingProfilesAndAcceptsProvenDisjointProfiles(t *testing.T) {
 	registry, connectorID := testRegistry(t)
+	authority := investigationplan.NewScopeAuthority()
 	definition := testDefinition(registry.Digest(), connectorID)
 	definition.Profiles = repeatProfile(definition.Profiles[0], 2)
 	definition.Profiles[1].Match.Labels = []investigationplan.LabelMatch{{Key: "region", Value: "us-east"}}
-	if _, err := investigationplan.New(context.Background(), registry, definition); !errors.Is(err, investigationplan.ErrProfileOverlap) {
+	if _, err := investigationplan.New(context.Background(), authority, registry, definition); !errors.Is(err, investigationplan.ErrProfileOverlap) {
 		t.Fatalf("New(overlap) error = %v, want ErrProfileOverlap", err)
 	}
 	definition.Profiles[1].Match.Labels = []investigationplan.LabelMatch{
 		{Key: "service", Value: "payments"}, {Key: "cluster", Value: "staging-b"},
 	}
-	planner, err := investigationplan.New(context.Background(), registry, definition)
+	planner, err := investigationplan.New(context.Background(), authority, registry, definition)
 	if err != nil {
 		t.Fatalf("New(disjoint) error = %v", err)
 	}
@@ -273,7 +466,7 @@ func TestPlannerRejectsOverlappingProfilesAndAcceptsProvenDisjointProfiles(t *te
 	signal.Labels["cluster"] = "staging-b"
 	if _, err := planner.Resolve(context.Background(), investigationplan.ResolveRequest{
 		ExpectedPlanDigest: planner.ManifestDigest(),
-		TrustedScope:       trustedScope(t, testTenantID, testWorkspaceID),
+		TrustedScope:       trustedScope(t, authority, testTenantID, testWorkspaceID),
 		Signal:             signal,
 	}); err != nil {
 		t.Fatalf("Resolve(disjoint) error = %v", err)
@@ -282,14 +475,18 @@ func TestPlannerRejectsOverlappingProfilesAndAcceptsProvenDisjointProfiles(t *te
 
 func TestPlannerPlanAndTrustedScopeAreRedactedAndNonUnmarshalable(t *testing.T) {
 	registry, connectorID := testRegistry(t)
-	planner, err := investigationplan.New(context.Background(), registry, testDefinition(registry.Digest(), connectorID))
+	authority := investigationplan.NewScopeAuthority()
+	planner, err := investigationplan.New(context.Background(), authority, registry, testDefinition(registry.Digest(), connectorID))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	trusted := trustedScope(t, testTenantID, testWorkspaceID)
+	trusted := trustedScope(t, authority, testTenantID, testWorkspaceID)
 	registration := investigationplan.TrustedSignalRegistration{TenantID: testTenantID, WorkspaceID: testWorkspaceID}
 	plan := resolvePlan(t, planner, trusted, validSignal())
-	for name, value := range map[string]any{"planner": planner, "plan": plan, "registration": registration, "trusted": trusted} {
+	for name, value := range map[string]any{
+		"authority": authority, "planner": planner, "plan": plan,
+		"registration": registration, "trusted": trusted,
+	} {
 		t.Run(name, func(t *testing.T) {
 			formatted := fmt.Sprintf("%v|%#v|%+v", value, value, value)
 			encoded, err := json.Marshal(value)
@@ -310,6 +507,10 @@ func TestPlannerPlanAndTrustedScopeAreRedactedAndNonUnmarshalable(t *testing.T) 
 	if err := json.Unmarshal([]byte(`{"redacted":true}`), &registration); !errors.Is(err, investigationplan.ErrInvalidRequest) {
 		t.Fatalf("TrustedSignalRegistration.UnmarshalJSON() error = %v", err)
 	}
+	var decodedAuthority investigationplan.ScopeAuthority
+	if err := json.Unmarshal([]byte(`{"redacted":true}`), &decodedAuthority); !errors.Is(err, investigationplan.ErrInvalidRequest) {
+		t.Fatalf("ScopeAuthority.UnmarshalJSON() error = %v", err)
+	}
 	if err := json.Unmarshal([]byte(`{"redacted":true}`), &plan); !errors.Is(err, investigationplan.ErrInvalidRequest) {
 		t.Fatalf("Plan.UnmarshalJSON() error = %v", err)
 	}
@@ -320,6 +521,7 @@ func TestPlannerPlanAndTrustedScopeAreRedactedAndNonUnmarshalable(t *testing.T) 
 
 func TestPlannerReadyNilAndContextCancellation(t *testing.T) {
 	registry, connectorID := testRegistry(t)
+	authority := investigationplan.NewScopeAuthority()
 	var nilPlanner *investigationplan.Planner
 	if nilPlanner.Ready() || nilPlanner.ManifestDigest() != "" || nilPlanner.RegistryDigest() != "" {
 		t.Fatal("nil Planner reports ready state")
@@ -329,10 +531,10 @@ func TestPlannerReadyNilAndContextCancellation(t *testing.T) {
 	}
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := investigationplan.New(cancelled, registry, testDefinition(registry.Digest(), connectorID)); !errors.Is(err, context.Canceled) {
+	if _, err := investigationplan.New(cancelled, authority, registry, testDefinition(registry.Digest(), connectorID)); !errors.Is(err, context.Canceled) {
 		t.Fatalf("New(cancelled) error = %v", err)
 	}
-	planner, err := investigationplan.New(context.Background(), registry, testDefinition(registry.Digest(), connectorID))
+	planner, err := investigationplan.New(context.Background(), authority, registry, testDefinition(registry.Digest(), connectorID))
 	if err != nil || !planner.Ready() {
 		t.Fatalf("New() = %#v, %v", planner, err)
 	}
@@ -345,11 +547,12 @@ func TestPlannerReadyNilAndContextCancellation(t *testing.T) {
 
 func TestInvestigationPlanV1GoldenDigests(t *testing.T) {
 	registry, connectorID := testRegistry(t)
-	planner, err := investigationplan.New(context.Background(), registry, testDefinition(registry.Digest(), connectorID))
+	authority := investigationplan.NewScopeAuthority()
+	planner, err := investigationplan.New(context.Background(), authority, registry, testDefinition(registry.Digest(), connectorID))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	plan := resolvePlan(t, planner, trustedScope(t, testTenantID, testWorkspaceID), validSignal())
+	plan := resolvePlan(t, planner, trustedScope(t, authority, testTenantID, testWorkspaceID), validSignal())
 	got := map[string]string{
 		"registry":    registry.Digest(),
 		"manifest":    planner.ManifestDigest(),
@@ -373,11 +576,12 @@ func TestInvestigationPlanV1GoldenDigests(t *testing.T) {
 
 func TestPlannerConcurrentResolveReturnsDetachedPlans(t *testing.T) {
 	registry, connectorID := testRegistry(t)
-	planner, err := investigationplan.New(context.Background(), registry, testDefinition(registry.Digest(), connectorID))
+	authority := investigationplan.NewScopeAuthority()
+	planner, err := investigationplan.New(context.Background(), authority, registry, testDefinition(registry.Digest(), connectorID))
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	trusted := trustedScope(t, testTenantID, testWorkspaceID)
+	trusted := trustedScope(t, authority, testTenantID, testWorkspaceID)
 	const workers = 32
 	errorsChannel := make(chan error, workers)
 	var wait sync.WaitGroup
@@ -447,11 +651,18 @@ func repeatTask(source investigationplan.TaskDefinition, count int) []investigat
 	return tasks
 }
 
-func trustedScope(t *testing.T, tenantID, workspaceID string) investigationplan.TrustedSignalScope {
+func trustedScope(
+	t *testing.T,
+	authority *investigationplan.ScopeAuthority,
+	tenantID string,
+	workspaceID string,
+) investigationplan.TrustedSignalScope {
 	t.Helper()
-	scope, err := (investigationplan.TrustedSignalRegistration{TenantID: tenantID, WorkspaceID: workspaceID}).Scope()
+	scope, err := authority.Attest(investigationplan.TrustedSignalRegistration{
+		TenantID: tenantID, WorkspaceID: workspaceID,
+	})
 	if err != nil {
-		t.Fatalf("TrustedSignalRegistration.Scope() error = %v", err)
+		t.Fatalf("ScopeAuthority.Attest() error = %v", err)
 	}
 	return scope
 }

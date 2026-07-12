@@ -16,9 +16,17 @@ type manifestDocument struct {
 
 // LoadFile securely loads one immutable, process-owned plan manifest. It does
 // not accept inline definitions, environment expansion, or fallback content.
-func LoadFile(ctx context.Context, path string, registry *readconnector.Registry) (*Planner, error) {
+func LoadFile(
+	ctx context.Context,
+	authority *ScopeAuthority,
+	path string,
+	registry *readconnector.Registry,
+) (*Planner, error) {
 	if err := contextError(ctx); err != nil {
 		return nil, err
+	}
+	if authority == nil || authority.marker == nil {
+		return nil, ErrInvalidRequest
 	}
 	var planner *Planner
 	err := securemanifest.Load(path, func(contents []byte) error {
@@ -27,7 +35,7 @@ func LoadFile(ctx context.Context, path string, registry *readconnector.Registry
 			document.SchemaVersion != ManifestSchemaVersion {
 			return ErrManifestJSON
 		}
-		compiled, err := New(ctx, registry, Definition{
+		compiled, err := New(ctx, authority, registry, Definition{
 			RegistryDigest: document.RegistryDigest,
 			Profiles:       document.Profiles,
 		})

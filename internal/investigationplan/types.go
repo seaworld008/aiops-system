@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/investigation"
@@ -70,8 +71,8 @@ type TaskDefinition struct {
 }
 
 // TrustedSignalRegistration is populated only by trusted server-side
-// registration state. Scope returns the opaque authorization snapshot accepted
-// by Resolve; request JSON cannot construct that snapshot.
+// persistence state. It has no direct promotion method: ScopeAuthority.Attest
+// is the only boundary that can produce a scope accepted by its Planner.
 type TrustedSignalRegistration struct {
 	TenantID    string
 	WorkspaceID string
@@ -87,17 +88,47 @@ func (TrustedSignalRegistration) MarshalJSON() ([]byte, error) {
 }
 func (*TrustedSignalRegistration) UnmarshalJSON([]byte) error { return ErrInvalidRequest }
 
-type TrustedSignalScope struct {
-	tenantID    string
-	workspaceID string
+// scopeAuthorityState is deliberately non-zero-sized. Go does not guarantee
+// distinct pointer identity for separate zero-sized allocations.
+type scopeAuthorityState struct {
+	guard byte
 }
 
-func (registration TrustedSignalRegistration) Scope() (TrustedSignalScope, error) {
-	if !persistentUUIDPattern.MatchString(registration.TenantID) ||
+// ScopeAuthority is a process-local capability. Only the persistence/activity
+// boundary that owns an authority may attest trusted signal registrations for
+// a Planner built with that same authority.
+type ScopeAuthority struct {
+	marker *scopeAuthorityState
+}
+
+func NewScopeAuthority() *ScopeAuthority {
+	return &ScopeAuthority{marker: &scopeAuthorityState{guard: 1}}
+}
+
+func (ScopeAuthority) String() string   { return "ScopeAuthority{[REDACTED]}" }
+func (ScopeAuthority) GoString() string { return "ScopeAuthority{[REDACTED]}" }
+func (authority ScopeAuthority) Format(state fmt.State, _ rune) {
+	_, _ = io.WriteString(state, authority.String())
+}
+func (ScopeAuthority) MarshalJSON() ([]byte, error) { return []byte(`{"redacted":true}`), nil }
+func (*ScopeAuthority) UnmarshalJSON([]byte) error  { return ErrInvalidRequest }
+
+func (authority *ScopeAuthority) Attest(registration TrustedSignalRegistration) (TrustedSignalScope, error) {
+	if authority == nil || authority.marker == nil ||
+		!persistentUUIDPattern.MatchString(registration.TenantID) ||
 		!persistentUUIDPattern.MatchString(registration.WorkspaceID) {
 		return TrustedSignalScope{}, ErrInvalidRequest
 	}
-	return TrustedSignalScope{tenantID: registration.TenantID, workspaceID: registration.WorkspaceID}, nil
+	return TrustedSignalScope{
+		tenantID: strings.Clone(registration.TenantID), workspaceID: strings.Clone(registration.WorkspaceID),
+		marker: authority.marker,
+	}, nil
+}
+
+type TrustedSignalScope struct {
+	tenantID    string
+	workspaceID string
+	marker      *scopeAuthorityState
 }
 
 func (TrustedSignalScope) String() string   { return "TrustedSignalScope{[REDACTED]}" }

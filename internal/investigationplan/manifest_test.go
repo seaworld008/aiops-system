@@ -16,8 +16,9 @@ import (
 
 func TestLoadFileBuildsSameDigestAsTrustedMemoryDefinition(t *testing.T) {
 	registry, connectorID := testRegistry(t)
+	authority := investigationplan.NewScopeAuthority()
 	definition := testDefinition(registry.Digest(), connectorID)
-	want, err := investigationplan.New(context.Background(), registry, definition)
+	want, err := investigationplan.New(context.Background(), authority, registry, definition)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -26,7 +27,7 @@ func TestLoadFileBuildsSameDigestAsTrustedMemoryDefinition(t *testing.T) {
 	if err := os.WriteFile(path, encoded, 0o600); err != nil {
 		t.Fatalf("os.WriteFile() error = %v", err)
 	}
-	got, err := investigationplan.LoadFile(context.Background(), path, registry)
+	got, err := investigationplan.LoadFile(context.Background(), authority, path, registry)
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
@@ -34,10 +35,17 @@ func TestLoadFileBuildsSameDigestAsTrustedMemoryDefinition(t *testing.T) {
 		t.Fatalf("LoadFile() digests = (%q, %q), want (%q, %q)",
 			got.ManifestDigest(), got.RegistryDigest(), want.ManifestDigest(), registry.Digest())
 	}
+	trusted := trustedScope(t, authority, testTenantID, testWorkspaceID)
+	if _, err := got.Resolve(context.Background(), investigationplan.ResolveRequest{
+		ExpectedPlanDigest: got.ManifestDigest(), TrustedScope: trusted, Signal: validSignal(),
+	}); err != nil {
+		t.Fatalf("LoadFile() Planner.Resolve() error = %v", err)
+	}
 }
 
 func TestLoadFileRejectsStrictJSONAndNeverLeaksManifestMaterial(t *testing.T) {
 	registry, connectorID := testRegistry(t)
+	authority := investigationplan.NewScopeAuthority()
 	valid := manifestBytes(t, testDefinition(registry.Digest(), connectorID))
 	tests := []struct {
 		name    string
@@ -66,7 +74,7 @@ func TestLoadFileRejectsStrictJSONAndNeverLeaksManifestMaterial(t *testing.T) {
 			if err := os.WriteFile(path, test.encoded, 0o600); err != nil {
 				t.Fatalf("os.WriteFile() error = %v", err)
 			}
-			_, err := investigationplan.LoadFile(context.Background(), path, registry)
+			_, err := investigationplan.LoadFile(context.Background(), authority, path, registry)
 			if !errors.Is(err, investigationplan.ErrManifestJSON) {
 				t.Fatalf("LoadFile() error = %v, want ErrManifestJSON", err)
 			}
@@ -77,10 +85,11 @@ func TestLoadFileRejectsStrictJSONAndNeverLeaksManifestMaterial(t *testing.T) {
 
 func TestLoadFileRejectsUnsafeFilesDefinitionsAndCancelledContext(t *testing.T) {
 	registry, connectorID := testRegistry(t)
+	authority := investigationplan.NewScopeAuthority()
 	validDefinition := testDefinition(registry.Digest(), connectorID)
 
 	t.Run("relative path", func(t *testing.T) {
-		_, err := investigationplan.LoadFile(context.Background(), "manifest.json", registry)
+		_, err := investigationplan.LoadFile(context.Background(), authority, "manifest.json", registry)
 		if !errors.Is(err, investigationplan.ErrManifestPath) {
 			t.Fatalf("LoadFile() error = %v, want ErrManifestPath", err)
 		}
@@ -95,7 +104,7 @@ func TestLoadFileRejectsUnsafeFilesDefinitionsAndCancelledContext(t *testing.T) 
 		if err := os.Symlink(target, link); err != nil {
 			t.Fatal(err)
 		}
-		_, err := investigationplan.LoadFile(context.Background(), link, registry)
+		_, err := investigationplan.LoadFile(context.Background(), authority, link, registry)
 		if !errors.Is(err, investigationplan.ErrManifestFile) {
 			t.Fatalf("LoadFile() error = %v, want ErrManifestFile", err)
 		}
@@ -109,7 +118,7 @@ func TestLoadFileRejectsUnsafeFilesDefinitionsAndCancelledContext(t *testing.T) 
 		if err := os.Chmod(path, 0o620); err != nil {
 			t.Fatal(err)
 		}
-		_, err := investigationplan.LoadFile(context.Background(), path, registry)
+		_, err := investigationplan.LoadFile(context.Background(), authority, path, registry)
 		if !errors.Is(err, investigationplan.ErrManifestFile) {
 			t.Fatalf("LoadFile() error = %v, want ErrManifestFile", err)
 		}
@@ -125,7 +134,7 @@ func TestLoadFileRejectsUnsafeFilesDefinitionsAndCancelledContext(t *testing.T) 
 		if err := os.Link(path, other); err != nil {
 			t.Fatal(err)
 		}
-		_, err := investigationplan.LoadFile(context.Background(), path, registry)
+		_, err := investigationplan.LoadFile(context.Background(), authority, path, registry)
 		if !errors.Is(err, investigationplan.ErrManifestFile) {
 			t.Fatalf("LoadFile() error = %v, want ErrManifestFile", err)
 		}
@@ -136,7 +145,7 @@ func TestLoadFileRejectsUnsafeFilesDefinitionsAndCancelledContext(t *testing.T) 
 		if err := os.WriteFile(path, bytes.Repeat([]byte{'x'}, investigationplan.MaximumDefinitionBytes+1), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		_, err := investigationplan.LoadFile(context.Background(), path, registry)
+		_, err := investigationplan.LoadFile(context.Background(), authority, path, registry)
 		if !errors.Is(err, investigationplan.ErrManifestFile) {
 			t.Fatalf("LoadFile() error = %v, want ErrManifestFile", err)
 		}
@@ -146,7 +155,7 @@ func TestLoadFileRejectsUnsafeFilesDefinitionsAndCancelledContext(t *testing.T) 
 		definition := cloneDefinition(t, validDefinition)
 		definition.RegistryDigest = strings.Repeat("b", 64)
 		path := writeManifest(t, definition)
-		_, err := investigationplan.LoadFile(context.Background(), path, registry)
+		_, err := investigationplan.LoadFile(context.Background(), authority, path, registry)
 		if !errors.Is(err, investigationplan.ErrManifestDefinition) || !errors.Is(err, investigationplan.ErrRegistryMismatch) {
 			t.Fatalf("LoadFile() error = %v, want manifest registry rejection", err)
 		}
@@ -156,7 +165,7 @@ func TestLoadFileRejectsUnsafeFilesDefinitionsAndCancelledContext(t *testing.T) 
 		definition := cloneDefinition(t, validDefinition)
 		definition.Profiles = repeatProfile(definition.Profiles[0], 2)
 		path := writeManifest(t, definition)
-		_, err := investigationplan.LoadFile(context.Background(), path, registry)
+		_, err := investigationplan.LoadFile(context.Background(), authority, path, registry)
 		if !errors.Is(err, investigationplan.ErrManifestDefinition) || !errors.Is(err, investigationplan.ErrProfileOverlap) {
 			t.Fatalf("LoadFile() error = %v, want manifest overlap rejection", err)
 		}
@@ -165,11 +174,27 @@ func TestLoadFileRejectsUnsafeFilesDefinitionsAndCancelledContext(t *testing.T) 
 	t.Run("cancelled", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		_, err := investigationplan.LoadFile(ctx, filepath.Join(t.TempDir(), "does-not-matter.json"), registry)
+		_, err := investigationplan.LoadFile(ctx, authority, filepath.Join(t.TempDir(), "does-not-matter.json"), registry)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("LoadFile() error = %v, want context.Canceled", err)
 		}
 	})
+}
+
+func TestLoadFileRejectsInvalidAuthorityBeforeFileAccess(t *testing.T) {
+	registry, _ := testRegistry(t)
+	missing := filepath.Join(t.TempDir(), "missing.json")
+	for name, authority := range map[string]*investigationplan.ScopeAuthority{
+		"nil":  nil,
+		"zero": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := investigationplan.LoadFile(context.Background(), authority, missing, registry)
+			if !errors.Is(err, investigationplan.ErrInvalidRequest) {
+				t.Fatalf("LoadFile() error = %v, want ErrInvalidRequest before file access", err)
+			}
+		})
+	}
 }
 
 func testDefinition(registryDigest, connectorID string) investigationplan.Definition {

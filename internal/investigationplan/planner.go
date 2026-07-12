@@ -1,12 +1,14 @@
 package investigationplan
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/investigation"
@@ -14,13 +16,12 @@ import (
 )
 
 const (
-	minimumProfiles         = 1
-	maximumProfiles         = 1000
-	minimumLabels           = 1
-	maximumLabels           = 16
-	minimumTasks            = 1
-	maximumTasks            = 12
-	definitionOverheadBytes = 64
+	minimumProfiles = 1
+	maximumProfiles = 1000
+	minimumLabels   = 1
+	maximumLabels   = 16
+	minimumTasks    = 1
+	maximumTasks    = 12
 )
 
 var (
@@ -45,11 +46,20 @@ type Planner struct {
 	manifestDigest string
 	registryDigest string
 	profiles       []compiledProfile
+	scopeMarker    *scopeAuthorityState
 }
 
-func New(ctx context.Context, registry *readconnector.Registry, definition Definition) (*Planner, error) {
+func New(
+	ctx context.Context,
+	authority *ScopeAuthority,
+	registry *readconnector.Registry,
+	definition Definition,
+) (*Planner, error) {
 	if err := contextError(ctx); err != nil {
 		return nil, err
+	}
+	if authority == nil || authority.marker == nil {
+		return nil, ErrInvalidRequest
 	}
 	if registry == nil || !registry.Ready() || !domain.ValidSHA256Hex(definition.RegistryDigest) ||
 		definition.RegistryDigest != registry.Digest() {
@@ -64,7 +74,11 @@ func New(ctx context.Context, registry *readconnector.Registry, definition Defin
 			return nil, ErrInvalidDefinition
 		}
 	}
-	if !definitionWithinBudget(definition) {
+	withinBudget, err := definitionWithinBudget(definition)
+	if err != nil {
+		return nil, ErrInvalidDefinition
+	}
+	if !withinBudget {
 		return nil, errors.Join(ErrInvalidDefinition, ErrDefinitionTooLarge)
 	}
 
@@ -105,8 +119,9 @@ func New(ctx context.Context, registry *readconnector.Registry, definition Defin
 	})
 	return &Planner{
 		manifestDigest: manifestDigest,
-		registryDigest: definition.RegistryDigest,
+		registryDigest: strings.Clone(definition.RegistryDigest),
 		profiles:       compiled,
+		scopeMarker:    authority.marker,
 	}, nil
 }
 
@@ -115,7 +130,10 @@ func compileProfile(definition ProfileDefinition, registryDigest string) (compil
 		!providerPattern.MatchString(definition.Match.Provider) || !domain.ValidSafeText(definition.Match.Provider) {
 		return compiledProfile{}, ErrInvalidDefinition
 	}
-	labels := append([]LabelMatch(nil), definition.Match.Labels...)
+	labels := make([]LabelMatch, len(definition.Match.Labels))
+	for index, label := range definition.Match.Labels {
+		labels[index] = LabelMatch{Key: strings.Clone(label.Key), Value: strings.Clone(label.Value)}
+	}
 	sort.Slice(labels, func(left, right int) bool {
 		if labels[left].Key != labels[right].Key {
 			return labels[left].Key < labels[right].Key
@@ -131,7 +149,8 @@ func compileProfile(definition ProfileDefinition, registryDigest string) (compil
 	tasks := make([]investigation.TaskSpec, len(definition.Tasks))
 	for index, task := range definition.Tasks {
 		tasks[index] = investigation.TaskSpec{
-			Key: task.Key, ConnectorID: task.ConnectorID, Operation: task.Operation, Input: task.Input,
+			Key: strings.Clone(task.Key), ConnectorID: strings.Clone(task.ConnectorID),
+			Operation: strings.Clone(task.Operation), Input: bytes.Clone(task.Input),
 		}
 	}
 	canonicalTasks, tasksHash, err := investigation.CanonicalTaskSpecs(tasks)
@@ -139,13 +158,13 @@ func compileProfile(definition ProfileDefinition, registryDigest string) (compil
 		return compiledProfile{}, ErrInvalidDefinition
 	}
 	scope := investigation.TaskSpecScope{
-		TenantID: definition.Scope.TenantID, WorkspaceID: definition.Scope.WorkspaceID,
-		EnvironmentID: definition.Scope.EnvironmentID, ServiceID: definition.Scope.ServiceID,
+		TenantID: strings.Clone(definition.Scope.TenantID), WorkspaceID: strings.Clone(definition.Scope.WorkspaceID),
+		EnvironmentID: strings.Clone(definition.Scope.EnvironmentID), ServiceID: strings.Clone(definition.Scope.ServiceID),
 		MappingStatus: domain.MappingExact,
 	}
 	item := compiledProfile{
-		scope: scope, registryDigest: registryDigest, integrationID: definition.Match.IntegrationID,
-		provider: definition.Match.Provider, labels: labels,
+		scope: scope, registryDigest: strings.Clone(registryDigest), integrationID: strings.Clone(definition.Match.IntegrationID),
+		provider: strings.Clone(definition.Match.Provider), labels: labels,
 		tasks: canonicalTasks, tasksHash: tasksHash,
 	}
 	item.profileDigest, err = digestProfile(item)
@@ -160,40 +179,6 @@ func validScope(scope Scope) bool {
 		persistentUUIDPattern.MatchString(scope.WorkspaceID) &&
 		persistentUUIDPattern.MatchString(scope.EnvironmentID) &&
 		persistentUUIDPattern.MatchString(scope.ServiceID)
-}
-
-func definitionWithinBudget(definition Definition) bool {
-	remaining := MaximumDefinitionBytes
-	add := func(size int) bool {
-		if size < 0 || size > remaining {
-			return false
-		}
-		remaining -= size
-		return true
-	}
-	if !add(definitionOverheadBytes) || !add(len(definition.RegistryDigest)) {
-		return false
-	}
-	for _, profile := range definition.Profiles {
-		if !add(definitionOverheadBytes) || !add(len(profile.Scope.TenantID)) ||
-			!add(len(profile.Scope.WorkspaceID)) || !add(len(profile.Scope.EnvironmentID)) ||
-			!add(len(profile.Scope.ServiceID)) || !add(len(profile.Match.IntegrationID)) ||
-			!add(len(profile.Match.Provider)) {
-			return false
-		}
-		for _, label := range profile.Match.Labels {
-			if !add(definitionOverheadBytes) || !add(len(label.Key)) || !add(len(label.Value)) {
-				return false
-			}
-		}
-		for _, task := range profile.Tasks {
-			if !add(definitionOverheadBytes) || !add(len(task.Key)) || !add(len(task.ConnectorID)) ||
-				!add(len(task.Operation)) || !add(len(task.Input)) {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 func profilesOverlap(profiles []compiledProfile) bool {
@@ -238,7 +223,8 @@ func (planner *Planner) ManifestDigest() string {
 
 func (planner *Planner) Ready() bool {
 	return planner != nil && domain.ValidSHA256Hex(planner.manifestDigest) &&
-		domain.ValidSHA256Hex(planner.registryDigest) && len(planner.profiles) > 0
+		domain.ValidSHA256Hex(planner.registryDigest) && len(planner.profiles) > 0 &&
+		planner.scopeMarker != nil
 }
 
 func (planner *Planner) RegistryDigest() string {
@@ -257,7 +243,8 @@ func (planner *Planner) Resolve(ctx context.Context, request ResolveRequest) (Pl
 		return Plan{}, ErrPlanDigestMismatch
 	}
 	if !persistentUUIDPattern.MatchString(request.TrustedScope.tenantID) ||
-		!persistentUUIDPattern.MatchString(request.TrustedScope.workspaceID) {
+		!persistentUUIDPattern.MatchString(request.TrustedScope.workspaceID) ||
+		request.TrustedScope.marker == nil || request.TrustedScope.marker != planner.scopeMarker {
 		return Plan{}, ErrInvalidRequest
 	}
 	signal, err := investigation.NormalizeSignalForReplay(request.Signal)
@@ -298,7 +285,7 @@ func (planner *Planner) Resolve(ctx context.Context, request ResolveRequest) (Pl
 		scope:          matched.scope,
 		tasks:          cloneTaskSpecs(matched.tasks),
 		correlation: investigation.CorrelateSignalRequest{
-			WorkspaceID: signal.WorkspaceID, SignalID: signal.ID, CorrelationKey: correlationKey,
+			WorkspaceID: strings.Clone(signal.WorkspaceID), SignalID: strings.Clone(signal.ID), CorrelationKey: correlationKey,
 			ServiceID: matched.scope.ServiceID, EnvironmentID: matched.scope.EnvironmentID,
 			MappingStatus: domain.MappingExact,
 		},

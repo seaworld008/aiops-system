@@ -3,7 +3,9 @@ package investigationplan
 import (
 	"encoding/json"
 	"sort"
+	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/investigation"
@@ -14,6 +16,32 @@ type digestSnapshot struct {
 	profile     string
 	manifest    string
 	correlation string
+}
+
+func TestCompileProfileClonesRetainedLabelSubstring(t *testing.T) {
+	labelSource := strings.Repeat("x", 1<<20) + "payments"
+	labelView := labelSource[len(labelSource)-len("payments"):]
+	profile, err := compileProfile(ProfileDefinition{
+		Scope: Scope{
+			TenantID: "10000000-0000-4000-8000-000000000001", WorkspaceID: "20000000-0000-4000-8000-000000000002",
+			EnvironmentID: "30000000-0000-4000-8000-000000000003", ServiceID: "40000000-0000-4000-8000-000000000004",
+		},
+		Match: MatchDefinition{
+			IntegrationID: "50000000-0000-4000-8000-000000000005", Provider: "alertmanager",
+			Labels: []LabelMatch{{Key: "service", Value: labelView}},
+		},
+		Tasks: []TaskDefinition{{
+			Key:         "metrics",
+			ConnectorID: "prometheus-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Operation:   "range_query", Input: json.RawMessage(`{"lookback_minutes":15}`),
+		}},
+	}, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	if err != nil {
+		t.Fatalf("compileProfile() error = %v", err)
+	}
+	if unsafe.StringData(profile.labels[0].Value) == unsafe.StringData(labelView) {
+		t.Fatal("compiled profile retained the large label backing string")
+	}
 }
 
 func TestDigestDomainsBindExactlyTheirDeclaredSemantics(t *testing.T) {

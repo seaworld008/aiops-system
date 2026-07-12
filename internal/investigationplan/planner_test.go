@@ -22,7 +22,8 @@ const (
 
 func TestPlannerResolvesTrustedExactSignalToDetachedPlan(t *testing.T) {
 	registry, connectorID := testRegistry(t)
-	planner, err := investigationplan.New(context.Background(), registry, investigationplan.Definition{
+	authority := investigationplan.NewScopeAuthority()
+	planner, err := investigationplan.New(context.Background(), authority, registry, investigationplan.Definition{
 		RegistryDigest: registry.Digest(),
 		Profiles: []investigationplan.ProfileDefinition{{
 			Scope: investigationplan.Scope{
@@ -46,11 +47,11 @@ func TestPlannerResolvesTrustedExactSignalToDetachedPlan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	trusted, err := (investigationplan.TrustedSignalRegistration{
+	trusted, err := authority.Attest(investigationplan.TrustedSignalRegistration{
 		TenantID: testTenantID, WorkspaceID: testWorkspaceID,
-	}).Scope()
+	})
 	if err != nil {
-		t.Fatalf("TrustedSignalRegistration.Scope() error = %v", err)
+		t.Fatalf("ScopeAuthority.Attest() error = %v", err)
 	}
 	signal := validSignal()
 	signal.Labels["severity"] = "critical"

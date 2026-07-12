@@ -31,16 +31,23 @@ Tenant/Workspace/Environment/Service scope 精确一致的 ConnectorID/Operation
 所有 profile 在 Planner 构造时先规范化 TaskSpec，再调用 registry authorizer 做完整准入。
 这次启动期准入不替代持久化边界：后续 Repository 创建 Investigation/Task 时仍必须在锁定的
 可信 Incident scope 下用同一 digest 对应的 registry 重新授权，不能直接信任 Plan 快照。
-构造函数在任何深拷贝或 JCS 计算之前，对字符串、labels 和 task input 等全部定义材料执行
-溢出安全的 1 MiB 聚合预算检查；因此调用内存 API 不能绕过文件大小上限。构造成功后，
+构造函数在任何深拷贝或 JCS 计算之前先执行 1 MiB raw-definition material 粗门禁，再按完整
+compact manifest JSON 的实际字段、分隔符和 JSON 转义执行 1 MiB 精确 wire 门禁；任一超限都
+拒绝。双门禁既计入会被 JSON compact 丢弃的 RawMessage 空白，也计入反斜杠等转义膨胀。
+计数器不会物化整份文档，并在原始字节下界已经超限时 O(1) 早退。因此内存 API 不能绕过
+文件大小上限。构造成功后，
 Planner 和解析出的 Plan 都只返回深拷贝；安全字段为私有、不可从 JSON 反序列化，格式化或
 序列化时保持脱敏。
 
 ## 可信作用域与精确匹配
 
 Tenant/Workspace 授权不能来自 Signal、HTTP/Outbox payload 或 manifest 内可覆盖字段。
-调用方必须先通过服务端可信注册创建不可序列化的 `TrustedSignalScope`；注册只包含持久
-`tenant_id` 与 `workspace_id`，并在创建时校验。解析请求还必须提供当前 Planner 的精确
+进程启动时必须创建一个带私有非零尺寸 marker 的 opaque `ScopeAuthority`，并把同一 authority
+注入 Planner/LoadFile 与读取持久化 Signal 注册的 Activity。只有 `ScopeAuthority.Attest` 能把
+持久 `tenant_id`/`workspace_id` 注册签发为不可序列化的 `TrustedSignalScope`；普通 request
+handler 不得持有 authority，注册对象本身也没有直接提升方法。Planner 只保存 marker identity，
+独立 authority、零值、JSON 伪造或跨 authority scope 均失败；同 authority 的多个 Planner 可接受
+同一 scope，而计划版本仍由 `ExpectedPlanDigest` 精确绑定。解析请求还必须提供当前 Planner 的精确
 `ExpectedPlanDigest`，缺失或不一致都失败，不能回退到“最新”或默认 plan。
 
 `domain.Signal` 只提供匹配和相关性事实：
