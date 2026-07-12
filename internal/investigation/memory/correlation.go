@@ -115,13 +115,18 @@ func (repository *Repository) CorrelateSignal(ctx context.Context, request inves
 		return investigation.CorrelateSignalResult{}, err
 	}
 	if !domain.ValidResourceID(request.WorkspaceID) || !domain.ValidResourceID(request.SignalID) || !domain.ValidCorrelationKey(request.CorrelationKey) ||
-		!validMapping(request.MappingStatus, request.ServiceID, request.EnvironmentID) {
+		!validMapping(request.MappingStatus, request.ServiceID, request.EnvironmentID) ||
+		(request.ExpectedSignalHash != "" && !domain.ValidSHA256Hex(request.ExpectedSignalHash)) {
 		return investigation.CorrelateSignalResult{}, fmt.Errorf("%w: invalid signal correlation", investigation.ErrInvalidRequest)
 	}
 	signalKey := scoped(request.WorkspaceID, request.SignalID)
 	repository.mu.RLock()
 	tenantID, tenantFound := repository.signalTenants[signalKey]
 	if !tenantFound || !domain.ValidResourceID(tenantID) {
+		repository.mu.RUnlock()
+		return investigation.CorrelateSignalResult{}, store.ErrScopeViolation
+	}
+	if !repository.signalSnapshotMatchesLocked(signalKey, request.ExpectedSignalHash) {
 		repository.mu.RUnlock()
 		return investigation.CorrelateSignalResult{}, store.ErrScopeViolation
 	}
@@ -134,6 +139,9 @@ func (repository *Repository) CorrelateSignal(ctx context.Context, request inves
 	defer repository.mu.Unlock()
 	tenantID, tenantFound = repository.signalTenants[signalKey]
 	if !tenantFound || !domain.ValidResourceID(tenantID) {
+		return investigation.CorrelateSignalResult{}, store.ErrScopeViolation
+	}
+	if !repository.signalSnapshotMatchesLocked(signalKey, request.ExpectedSignalHash) {
 		return investigation.CorrelateSignalResult{}, store.ErrScopeViolation
 	}
 	result, err, handled = repository.correlationReplayLocked(signalKey, request)
@@ -215,6 +223,24 @@ func (repository *Repository) CorrelateSignal(ctx context.Context, request inves
 	return investigation.CorrelateSignalResult{
 		Incident: cloneIncident(incident), Created: created, Associated: true, Counted: true,
 	}, nil
+}
+
+func (repository *Repository) signalSnapshotMatchesLocked(signalKey scopeKey, expected string) bool {
+	if expected == "" {
+		return true
+	}
+	signal, exists := repository.signals[signalKey]
+	if !exists {
+		return false
+	}
+	tenantID, exists := repository.signalTenants[signalKey]
+	if !exists {
+		return false
+	}
+	actual, err := investigation.RegisteredSignalSnapshotHash(investigation.RegisteredSignal{
+		TenantID: tenantID, WorkspaceID: signal.WorkspaceID, Signal: signal,
+	})
+	return err == nil && actual == expected
 }
 
 func (repository *Repository) correlationReplayLocked(signalKey scopeKey, request investigation.CorrelateSignalRequest) (investigation.CorrelateSignalResult, error, bool) {

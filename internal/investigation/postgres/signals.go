@@ -289,6 +289,7 @@ func (repository *Repository) GetRegisteredSignal(ctx context.Context, signalID 
 		  ON integration.id = signal.integration_id
 		 AND integration.tenant_id = signal.tenant_id
 		 AND integration.workspace_id = signal.workspace_id
+		 AND integration.provider = signal.provider
 		WHERE signal.id = $1
 		FOR SHARE OF signal, workspace, integration
 	`, signalID))

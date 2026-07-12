@@ -16,7 +16,7 @@ func TestGetRegisteredSignalReadsGlobalPrimaryKeyAndTrustedCompositeScope(t *tes
 	database, repository := newRegisteredSignalMockRepository(t)
 	now := time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)
 	database.ExpectBegin()
-	database.ExpectQuery(regexp.QuoteMeta("WHERE signal.id = $1")).
+	database.ExpectQuery(`(?s)JOIN workspaces AS workspace.*workspace\.id = signal\.workspace_id.*workspace\.tenant_id = signal\.tenant_id.*JOIN integrations AS integration.*integration\.id = signal\.integration_id.*integration\.tenant_id = signal\.tenant_id.*integration\.workspace_id = signal\.workspace_id.*integration\.provider = signal\.provider.*WHERE signal\.id = \$1.*FOR SHARE OF signal, workspace, integration`).
 		WithArgs(writeMockSignalID).
 		WillReturnRows(pgxmock.NewRows([]string{
 			"id", "tenant_id", "workspace_id", "integration_id", "provider", "provider_event_id",

@@ -1,44 +1,24 @@
 package investigationworkflow_test
 
 import (
-	"reflect"
+	"errors"
 	"testing"
-
-	"go.temporal.io/sdk/activity"
-	"go.temporal.io/sdk/workflow"
 
 	"github.com/seaworld008/aiops-system/internal/investigationworkflow"
 )
 
-func TestRegisterUsesOnlyExplicitWorkflowAndActivityNames(t *testing.T) {
+func TestNewWorkerRejectsNilAndZeroSealedTemporalClient(t *testing.T) {
 	fixture := newActivityFixture(t, "firing")
-	registry := &fakeTemporalRegistry{}
-	if err := investigationworkflow.Register(registry, fixture.activities); err != nil {
-		t.Fatalf("Register() error = %v", err)
+	for name, temporalClient := range map[string]*investigationworkflow.TemporalClient{
+		"nil": nil, "zero": &investigationworkflow.TemporalClient{},
+	} {
+		t.Run(name, func(t *testing.T) {
+			created, err := investigationworkflow.NewWorker(
+				temporalClient, fixture.activities, fixture.planner.ManifestDigest(), fixture.planner.RegistryDigest(),
+			)
+			if created != nil || !errors.Is(err, investigationworkflow.ErrInvalidInput) {
+				t.Fatalf("NewWorker(%s client) = %#v, %v", name, created, err)
+			}
+		})
 	}
-	if registry.workflowOptions.Name != investigationworkflow.WorkflowName || registry.activityOptions.Name != investigationworkflow.ActivityName ||
-		reflect.ValueOf(registry.workflow).Pointer() != reflect.ValueOf(investigationworkflow.PreparationWorkflow).Pointer() ||
-		reflect.ValueOf(registry.activity).Pointer() != reflect.ValueOf(fixture.activities.Prepare).Pointer() {
-		t.Fatalf("registered workflow/activity = %#v/%#v options=%#v/%#v",
-			registry.workflow, registry.activity, registry.workflowOptions, registry.activityOptions)
-	}
-	options := investigationworkflow.WorkerOptions()
-	if !options.DisableRegistrationAliasing || !options.DisableEagerActivities {
-		t.Fatalf("WorkerOptions trust gates = %#v", options)
-	}
-}
-
-type fakeTemporalRegistry struct {
-	workflow        interface{}
-	workflowOptions workflow.RegisterOptions
-	activity        interface{}
-	activityOptions activity.RegisterOptions
-}
-
-func (registry *fakeTemporalRegistry) RegisterWorkflowWithOptions(value interface{}, options workflow.RegisterOptions) {
-	registry.workflow, registry.workflowOptions = value, options
-}
-
-func (registry *fakeTemporalRegistry) RegisterActivityWithOptions(value interface{}, options activity.RegisterOptions) {
-	registry.activity, registry.activityOptions = value, options
 }

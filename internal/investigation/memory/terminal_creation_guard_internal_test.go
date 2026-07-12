@@ -14,10 +14,14 @@ func TestCreateOrGetInvestigationRejectsNewFactsForTerminalIncident(t *testing.T
 	now := time.Date(2026, 7, 12, 2, 0, 0, 0, time.UTC)
 	for _, status := range []domain.IncidentStatus{domain.IncidentResolved, domain.IncidentClosed} {
 		t.Run(string(status), func(t *testing.T) {
+			authorizerCalls := 0
 			repository, err := New(Options{
 				Clock: func() time.Time { return now }, IDFactory: func() string { return "generated-id" },
-				TenantResolver:     func(string) (string, error) { return "tenant-1", nil },
-				TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error { return nil },
+				TenantResolver: func(string) (string, error) { return "tenant-1", nil },
+				TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error {
+					authorizerCalls++
+					return errors.New("terminal authorizer must not run")
+				},
 			})
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
@@ -41,6 +45,9 @@ func TestCreateOrGetInvestigationRejectsNewFactsForTerminalIncident(t *testing.T
 			})
 			if !errors.Is(createErr, investigation.ErrInvalidTransition) {
 				t.Fatalf("CreateOrGetInvestigation(%s) error = %v, want ErrInvalidTransition", status, createErr)
+			}
+			if authorizerCalls != 0 {
+				t.Fatalf("terminal authorizer calls = %d, want 0", authorizerCalls)
 			}
 			if len(repository.investigations) != 0 || len(repository.tasks) != 0 ||
 				len(repository.investigationIdempotency) != 0 || len(repository.idempotencyOwners) != 0 {

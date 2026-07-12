@@ -44,6 +44,23 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 	if !exists {
 		return investigation.CreateOrGetInvestigationResult{}, store.ErrNotFound
 	}
+	var active domain.Investigation
+	activeFound := false
+	if activeID := repository.activeInvestigation[incidentKey]; activeID != "" {
+		candidate, found := repository.investigations[scoped(request.WorkspaceID, activeID)]
+		if found && (candidate.Status == domain.InvestigationQueued || candidate.Status == domain.InvestigationRunning) {
+			active = candidate
+			activeFound = true
+		} else {
+			delete(repository.activeInvestigation, incidentKey)
+		}
+	}
+	if !activeFound && incident.Status != domain.IncidentOpen && incident.Status != domain.IncidentInvestigating &&
+		incident.Status != domain.IncidentMitigating {
+		return investigation.CreateOrGetInvestigationResult{}, fmt.Errorf(
+			"%w: terminal incident cannot start a new investigation", investigation.ErrInvalidTransition,
+		)
+	}
 	scope := investigation.TaskSpecScope{
 		TenantID:      incident.TenantID,
 		WorkspaceID:   incident.WorkspaceID,
@@ -54,23 +71,13 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 	if err := investigation.AuthorizeTaskSpecs(ctx, repository.taskSpecAuthorizer, scope, canonicalTasks); err != nil {
 		return investigation.CreateOrGetInvestigationResult{}, err
 	}
-	if activeID := repository.activeInvestigation[incidentKey]; activeID != "" {
-		active, found := repository.investigations[scoped(request.WorkspaceID, activeID)]
-		if found && (active.Status == domain.InvestigationQueued || active.Status == domain.InvestigationRunning) {
-			if active.RequestHash != requestHash {
-				return investigation.CreateOrGetInvestigationResult{}, store.ErrIdempotencyConflict
-			}
-			repository.investigationIdempotency[idempotencyKey] = idempotencyRecord{requestHash: requestHash, resourceID: active.ID}
-			repository.bindIdempotencyOwner(idempotencyKey, "create_investigation")
-			return repository.investigationResult(request.WorkspaceID, active.ID, false)
+	if activeFound {
+		if active.RequestHash != requestHash {
+			return investigation.CreateOrGetInvestigationResult{}, store.ErrIdempotencyConflict
 		}
-		delete(repository.activeInvestigation, incidentKey)
-	}
-	if incident.Status != domain.IncidentOpen && incident.Status != domain.IncidentInvestigating &&
-		incident.Status != domain.IncidentMitigating {
-		return investigation.CreateOrGetInvestigationResult{}, fmt.Errorf(
-			"%w: terminal incident cannot start a new investigation", investigation.ErrInvalidTransition,
-		)
+		repository.investigationIdempotency[idempotencyKey] = idempotencyRecord{requestHash: requestHash, resourceID: active.ID}
+		repository.bindIdempotencyOwner(idempotencyKey, "create_investigation")
+		return repository.investigationResult(request.WorkspaceID, active.ID, false)
 	}
 
 	investigationID, err := repository.newID()

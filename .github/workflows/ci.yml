@@ -77,6 +77,68 @@ jobs:
       - name: Scan reachable Go vulnerabilities
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
+  temporal-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AIOPS_TEMPORAL_INTEGRATION: "1"
+      AIOPS_TEMPORAL_CLI_VERSION: "1.6.1"
+      AIOPS_TEMPORAL_ADDRESS: 127.0.0.1:7233
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - run: go mod download
+      - name: Install pinned Temporal CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/temporal_cli_1.6.1_linux_amd64.tar.gz"
+          install_dir="${RUNNER_TEMP}/temporal-cli-1.6.1"
+          curl --fail --silent --show-error --location \
+            --output "${archive}" \
+            https://github.com/temporalio/cli/releases/download/v1.6.1/temporal_cli_1.6.1_linux_amd64.tar.gz
+          echo "85cfd2134eff7408e9e363f71a50f6d91f5df5f72eafa9eb87102d3793904faf  ${archive}" | sha256sum --check --strict
+          mkdir -p "${install_dir}"
+          tar --extract --gzip --file "${archive}" --directory "${install_dir}"
+          test "$("${install_dir}/temporal" --version | awk '{print $3}')" = "1.6.1"
+          echo "${install_dir}" >> "${GITHUB_PATH}"
+      - name: Start pinned Temporal dev server
+        shell: bash
+        run: |
+          set -euo pipefail
+          temporal server start-dev \
+            --headless \
+            --ip 127.0.0.1 \
+            --port 7233 \
+            --db-filename "${RUNNER_TEMP}/temporal-integration.db" \
+            >"${RUNNER_TEMP}/temporal-server.log" 2>&1 &
+          echo "$!" > "${RUNNER_TEMP}/temporal-server.pid"
+          for attempt in $(seq 1 60); do
+            if temporal operator cluster health \
+              --address "${AIOPS_TEMPORAL_ADDRESS}" \
+              --command-timeout 2s >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "${RUNNER_TEMP}/temporal-server.log" >&2
+          exit 1
+      - name: Run Temporal preparation, recovery, history and replay contracts
+        run: go test -race -shuffle=on -count=1 ./internal/investigationworkflow -run '^TestTemporalDevServer'
+      - name: Stop Temporal dev server
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "${RUNNER_TEMP}/temporal-server.pid" ]; then
+            kill "$(cat "${RUNNER_TEMP}/temporal-server.pid")" >/dev/null 2>&1 || true
+          fi
+          if [ "${{ job.status }}" != "success" ] && [ -f "${RUNNER_TEMP}/temporal-server.log" ]; then
+            cat "${RUNNER_TEMP}/temporal-server.log" >&2
+          fi
+
   runner-images:
     runs-on: ubuntu-latest
     timeout-minutes: 20

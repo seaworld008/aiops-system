@@ -25,6 +25,7 @@ var (
 	ErrInvalidInput   = errors.New("investigation preparation input rejected")
 	ErrInvalidReceipt = errors.New("investigation preparation receipt rejected")
 	workflowUUID      = regexp.MustCompile(`^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$`)
+	temporalRunUUID   = regexp.MustCompile(`^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$`)
 )
 
 type WorkflowInput struct {

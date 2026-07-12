@@ -36,10 +36,17 @@ func NewActivities(
 	authority *investigationplan.ScopeAuthority,
 	planner *investigationplan.Planner,
 ) (*Activities, error) {
-	if nilInterface(reader) || nilInterface(repository) || authority == nil || planner == nil || !planner.Ready() {
+	created := &Activities{reader: reader, repository: repository, authority: authority, planner: planner}
+	if !created.ready() {
 		return nil, ErrInvalidInput
 	}
-	return &Activities{reader: reader, repository: repository, authority: authority, planner: planner}, nil
+	return created, nil
+}
+
+func (activities *Activities) ready() bool {
+	return activities != nil && !nilInterface(activities.reader) && !nilInterface(activities.repository) &&
+		activities.authority != nil && activities.planner != nil && activities.planner.Ready() &&
+		activities.planner.AcceptsAuthority(activities.authority)
 }
 
 func nilInterface(value any) bool {
@@ -55,7 +62,7 @@ func nilInterface(value any) bool {
 	}
 }
 
-func (activities *Activities) Prepare(ctx context.Context, input WorkflowInput) (receipt PreparationReceipt, returnedErr error) {
+func (activities *Activities) prepareActivity(ctx context.Context, input WorkflowInput) (receipt PreparationReceipt, returnedErr error) {
 	defer func() {
 		if recover() != nil {
 			receipt = PreparationReceipt{}
@@ -66,8 +73,7 @@ func (activities *Activities) Prepare(ctx context.Context, input WorkflowInput) 
 }
 
 func (activities *Activities) prepare(ctx context.Context, input WorkflowInput) (PreparationReceipt, error) {
-	if ctx == nil || validateInput(input) != nil || activities == nil || nilInterface(activities.reader) ||
-		nilInterface(activities.repository) || activities.authority == nil || activities.planner == nil || !activities.planner.Ready() {
+	if ctx == nil || validateInput(input) != nil || !activities.ready() {
 		return PreparationReceipt{}, nonRetryableError("PREPARE_INPUT_INVALID", "investigation preparation input rejected")
 	}
 	if err := ctx.Err(); err != nil {
@@ -99,13 +105,19 @@ func (activities *Activities) prepare(ctx context.Context, input WorkflowInput) 
 		}
 		return PreparationReceipt{}, nonRetryableError("PREPARE_INTEGRITY_REJECTED", "investigation preparation integrity rejected")
 	}
+	signalSnapshotHash, err := investigation.RegisteredSignalSnapshotHash(registered)
+	if err != nil {
+		return PreparationReceipt{}, nonRetryableError("PREPARE_INTEGRITY_REJECTED", "investigation preparation integrity rejected")
+	}
 	base := PreparationReceipt{
 		Version: SchemaVersion, OutboxEventID: input.OutboxEventID,
 		TenantID: input.TenantID, WorkspaceID: input.WorkspaceID, SignalID: input.SignalID,
 		ManifestDigest: plan.ManifestDigest(), RegistryDigest: plan.RegistryDigest(),
 		ProfileDigest: plan.ProfileDigest(), TasksHash: plan.TasksHash(),
 	}
-	correlated, err := activities.repository.CorrelateSignal(ctx, plan.CorrelateSignalRequest())
+	correlation := plan.CorrelateSignalRequest()
+	correlation.ExpectedSignalHash = signalSnapshotHash
+	correlated, err := activities.repository.CorrelateSignal(ctx, correlation)
 	if err != nil {
 		return PreparationReceipt{}, mapDependencyError(ctx, err)
 	}
@@ -135,7 +147,7 @@ func (activities *Activities) prepare(ctx context.Context, input WorkflowInput) 
 	if err != nil {
 		return PreparationReceipt{}, mapDependencyError(ctx, err)
 	}
-	if !validIncidentForPlan(incident, plan) {
+	if incident.ID != correlated.Incident.ID || !validIncidentForPlan(incident, plan) {
 		return PreparationReceipt{}, nonRetryableError("PREPARE_FACT_CONFLICT", "investigation preparation fact rejected")
 	}
 	persistedInvestigation, err := activities.repository.GetInvestigation(ctx, input.WorkspaceID, created.Investigation.ID)

@@ -1,7 +1,9 @@
 package investigationworkflow_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -17,6 +19,7 @@ import (
 	"github.com/seaworld008/aiops-system/internal/investigationworkflow"
 	"github.com/seaworld008/aiops-system/internal/readconnector"
 	"go.temporal.io/sdk/temporal"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 const (
@@ -27,7 +30,7 @@ const (
 
 func TestPreparationActivityCreatesAndRevalidatesDurableInvestigationFacts(t *testing.T) {
 	fixture := newActivityFixture(t, "firing")
-	receipt, err := fixture.activities.Prepare(context.Background(), fixture.input)
+	receipt, err := investigationworkflow.PrepareActivityForTest(fixture.activities, context.Background(), fixture.input)
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
@@ -38,7 +41,7 @@ func TestPreparationActivityCreatesAndRevalidatesDurableInvestigationFacts(t *te
 		receipt.RegistryDigest != fixture.input.RegistryDigest || receipt.ProfileDigest == "" || receipt.TasksHash == "" {
 		t.Fatalf("Prepare() receipt = %#v", receipt)
 	}
-	replay, err := fixture.activities.Prepare(context.Background(), fixture.input)
+	replay, err := investigationworkflow.PrepareActivityForTest(fixture.activities, context.Background(), fixture.input)
 	if err != nil || !reflect.DeepEqual(replay, receipt) {
 		t.Fatalf("Prepare(replay) = %#v, %v; want %#v", replay, err, receipt)
 	}
@@ -52,11 +55,68 @@ func TestPreparationActivityCreatesAndRevalidatesDurableInvestigationFacts(t *te
 
 func TestPreparationActivityReturnsNoActiveIncidentForResolvedSignal(t *testing.T) {
 	fixture := newActivityFixture(t, "resolved")
-	receipt, err := fixture.activities.Prepare(context.Background(), fixture.input)
+	receipt, err := investigationworkflow.PrepareActivityForTest(fixture.activities, context.Background(), fixture.input)
 	if err != nil || receipt.State != investigationworkflow.StateNoActiveIncident || receipt.IncidentID != "" ||
 		receipt.InvestigationID != "" || receipt.TaskCount != 0 || len(receipt.TaskIDs) != 0 ||
 		receipt.ProfileDigest == "" || receipt.TasksHash == "" {
 		t.Fatalf("Prepare(resolved) = %#v, %v", receipt, err)
+	}
+}
+
+func TestPreparationActivityInjectsSignalSnapshotFenceOutsideHistoryDTOs(t *testing.T) {
+	fixture := newActivityFixture(t, "firing")
+	repository := &projectionRepository{Repository: fixture.repository}
+	activities, err := investigationworkflow.NewActivities(fixture.repository, repository, fixture.authority, fixture.planner)
+	if err != nil {
+		t.Fatalf("NewActivities() error = %v", err)
+	}
+	if _, err := investigationworkflow.PrepareActivityForTest(activities, context.Background(), fixture.input); err != nil {
+		t.Fatalf("Prepare() error = %v", err)
+	}
+	if !domain.ValidSHA256Hex(repository.expectedSignalHash) {
+		t.Fatalf("Activity correlation snapshot hash = %q", repository.expectedSignalHash)
+	}
+	encodedInput, _ := json.Marshal(fixture.input)
+	encodedReceipt, _ := json.Marshal(validReceipt())
+	if bytes.Contains(encodedInput, []byte(repository.expectedSignalHash)) || bytes.Contains(encodedReceipt, []byte(repository.expectedSignalHash)) {
+		t.Fatalf("signal snapshot fence entered History DTO")
+	}
+}
+
+func TestPreparationActivityTenantBoundSnapshotPreventsMiswiredRepositoryWrites(t *testing.T) {
+	fixture := newActivityFixture(t, "firing")
+	signal, err := fixture.repository.GetSignal(context.Background(), fixture.input.WorkspaceID, fixture.input.SignalID)
+	if err != nil {
+		t.Fatalf("GetSignal() error = %v", err)
+	}
+	repository, err := memory.New(memory.Options{
+		Clock:              func() time.Time { return time.Date(2026, 7, 12, 4, 0, 0, 0, time.UTC) },
+		IDFactory:          func() string { return "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee" },
+		TenantResolver:     func(string) (string, error) { return "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", nil },
+		TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("memory.New(miswired tenant) error = %v", err)
+	}
+	if _, err := repository.RegisterSignal(context.Background(), signal); err != nil {
+		t.Fatalf("RegisterSignal(miswired tenant) error = %v", err)
+	}
+	activities, err := investigationworkflow.NewActivities(
+		fixture.repository, repository, fixture.authority, fixture.planner,
+	)
+	if err != nil {
+		t.Fatalf("NewActivities(miswired repository) error = %v", err)
+	}
+	_, err = investigationworkflow.PrepareActivityForTest(activities, context.Background(), fixture.input)
+	var applicationError *temporal.ApplicationError
+	if !errors.As(err, &applicationError) || applicationError.Type() != "PREPARE_FACT_CONFLICT" {
+		t.Fatalf("Prepare(miswired tenant) error = %v", err)
+	}
+	incidents, listErr := repository.ListIncidents(context.Background(), investigation.ListIncidentsRequest{
+		WorkspaceID: fixture.input.WorkspaceID,
+	})
+	if listErr != nil || len(incidents) != 0 {
+		t.Fatalf("miswired repository left incidents = %#v, %v", incidents, listErr)
 	}
 }
 
@@ -70,7 +130,7 @@ func TestPreparationActivityIsConcurrentReplaySafe(t *testing.T) {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			receipt, err := fixture.activities.Prepare(context.Background(), fixture.input)
+			receipt, err := investigationworkflow.PrepareActivityForTest(fixture.activities, context.Background(), fixture.input)
 			if err != nil {
 				errorsFound <- err
 				return
@@ -103,15 +163,85 @@ func TestPreparationActivityAllowsMutableProjectionProgressAndTerminalIncidentRe
 	if err != nil {
 		t.Fatalf("NewActivities() error = %v", err)
 	}
-	receipt, err := activities.Prepare(context.Background(), fixture.input)
+	receipt, err := investigationworkflow.PrepareActivityForTest(activities, context.Background(), fixture.input)
 	if err != nil || receipt.State != investigationworkflow.StatePrepared {
 		t.Fatalf("Prepare(progressed projection) = %#v, %v", receipt, err)
 	}
 }
 
+func TestPreparationActivityAllowsValidTerminalAndPartialProjectionProgress(t *testing.T) {
+	tests := map[string]projectionMutation{
+		"completed with evidence": {
+			investigation: func(item *domain.Investigation) {
+				item.Status = domain.InvestigationCompleted
+				item.ModelStatus = domain.ModelCompleted
+				item.StartedAt, item.CompletedAt, item.UpdatedAt = item.CreatedAt, item.CreatedAt, item.CreatedAt
+			},
+			tasks: func(tasks []domain.ReadTask) {
+				tasks[0].Status = domain.ReadTaskEvidence
+				tasks[0].EvidenceID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+				tasks[0].StartedAt, tasks[0].CompletedAt, tasks[0].UpdatedAt = tasks[0].CreatedAt, tasks[0].CreatedAt, tasks[0].CreatedAt
+			},
+		},
+		"partial with failed task": {
+			investigation: func(item *domain.Investigation) {
+				item.Status = domain.InvestigationPartial
+				item.ModelStatus = domain.ModelFailed
+				item.ModelFailureCode = "model_unavailable"
+				item.StartedAt, item.CompletedAt, item.UpdatedAt = item.CreatedAt, item.CreatedAt, item.CreatedAt
+			},
+			tasks: func(tasks []domain.ReadTask) {
+				tasks[0].Status = domain.ReadTaskFailed
+				tasks[0].FailureCode = "connector_unavailable"
+				tasks[0].StartedAt, tasks[0].CompletedAt, tasks[0].UpdatedAt = tasks[0].CreatedAt, tasks[0].CreatedAt, tasks[0].CreatedAt
+			},
+		},
+		"failed with cancelled task": {
+			investigation: func(item *domain.Investigation) {
+				item.Status = domain.InvestigationFailed
+				item.ModelStatus = domain.ModelCancelled
+				item.FailureCode = "dependency_failed"
+				item.StartedAt, item.CompletedAt, item.UpdatedAt = item.CreatedAt, item.CreatedAt, item.CreatedAt
+			},
+			tasks: func(tasks []domain.ReadTask) {
+				tasks[0].Status = domain.ReadTaskCancelled
+				tasks[0].FailureCode = "investigation_failed"
+				tasks[0].StartedAt, tasks[0].CompletedAt, tasks[0].UpdatedAt = tasks[0].CreatedAt, tasks[0].CreatedAt, tasks[0].CreatedAt
+			},
+		},
+		"cancelled with cancelled task": {
+			investigation: func(item *domain.Investigation) {
+				item.Status = domain.InvestigationCancelled
+				item.ModelStatus = domain.ModelCancelled
+				item.FailureCode = "operator_cancelled"
+				item.StartedAt, item.CompletedAt, item.UpdatedAt = item.CreatedAt, item.CreatedAt, item.CreatedAt
+			},
+			tasks: func(tasks []domain.ReadTask) {
+				tasks[0].Status = domain.ReadTaskCancelled
+				tasks[0].FailureCode = "investigation_cancelled"
+				tasks[0].StartedAt, tasks[0].CompletedAt, tasks[0].UpdatedAt = tasks[0].CreatedAt, tasks[0].CreatedAt, tasks[0].CreatedAt
+			},
+		},
+	}
+	for name, mutation := range tests {
+		t.Run(name, func(t *testing.T) {
+			fixture := newActivityFixture(t, "firing")
+			repository := &projectionRepository{Repository: fixture.repository, mutation: mutation}
+			activities, err := investigationworkflow.NewActivities(fixture.repository, repository, fixture.authority, fixture.planner)
+			if err != nil {
+				t.Fatalf("NewActivities() error = %v", err)
+			}
+			receipt, err := investigationworkflow.PrepareActivityForTest(activities, context.Background(), fixture.input)
+			if err != nil || receipt.State != investigationworkflow.StatePrepared {
+				t.Fatalf("Prepare(%s projection) = %#v, %v", name, receipt, err)
+			}
+		})
+	}
+}
+
 func TestPreparationActivityAllowsDifferentSignalKeyToBindSameActiveInvestigation(t *testing.T) {
 	fixture := newActivityFixture(t, "firing")
-	first, err := fixture.activities.Prepare(context.Background(), fixture.input)
+	first, err := investigationworkflow.PrepareActivityForTest(fixture.activities, context.Background(), fixture.input)
 	if err != nil {
 		t.Fatalf("Prepare(first) error = %v", err)
 	}
@@ -129,7 +259,7 @@ func TestPreparationActivityAllowsDifferentSignalKeyToBindSameActiveInvestigatio
 	input := fixture.input
 	input.OutboxEventID = secondOutboxID
 	input.SignalID = secondSignalID
-	bound, err := fixture.activities.Prepare(context.Background(), input)
+	bound, err := investigationworkflow.PrepareActivityForTest(fixture.activities, context.Background(), input)
 	if err != nil || bound.InvestigationID != first.InvestigationID || !reflect.DeepEqual(bound.TaskIDs, first.TaskIDs) {
 		t.Fatalf("Prepare(second signal binding) = %#v, %v; first=%#v", bound, err, first)
 	}
@@ -137,6 +267,7 @@ func TestPreparationActivityAllowsDifferentSignalKeyToBindSameActiveInvestigatio
 
 func TestPreparationActivityRejectsImmutableProjectionDrift(t *testing.T) {
 	mutations := map[string]projectionMutation{
+		"incident id":                {incident: func(item *domain.Incident) { item.ID = workflowSignalID }},
 		"investigation workspace":    {investigation: func(item *domain.Investigation) { item.WorkspaceID = workflowTenantID }},
 		"investigation incident":     {investigation: func(item *domain.Investigation) { item.IncidentID = workflowSignalID }},
 		"investigation request hash": {investigation: func(item *domain.Investigation) { item.RequestHash = strings.Repeat("e", 64) }},
@@ -158,7 +289,7 @@ func TestPreparationActivityRejectsImmutableProjectionDrift(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewActivities() error = %v", err)
 			}
-			_, err = activities.Prepare(context.Background(), fixture.input)
+			_, err = investigationworkflow.PrepareActivityForTest(activities, context.Background(), fixture.input)
 			var applicationError *temporal.ApplicationError
 			if !errors.As(err, &applicationError) || applicationError.Type() != "PREPARE_FACT_CONFLICT" {
 				t.Fatalf("Prepare(%s drift) error = %v", name, err)
@@ -176,11 +307,25 @@ func TestPreparationActivityMapsDependencyPanicWithoutCanary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewActivities() error = %v", err)
 	}
-	_, err = activities.Prepare(context.Background(), fixture.input)
+	_, err = investigationworkflow.PrepareActivityForTest(activities, context.Background(), fixture.input)
 	var applicationError *temporal.ApplicationError
 	if !errors.As(err, &applicationError) || applicationError.Type() != "PREPARE_DEPENDENCY_UNAVAILABLE" ||
 		strings.Contains(fmt.Sprintf("%+v", err), canary) {
 		t.Fatalf("Prepare(panic) error = %+v", err)
+	}
+	failure := temporal.GetDefaultFailureConverter().ErrorToFailure(err)
+	encoded, marshalErr := protojson.Marshal(failure)
+	if marshalErr != nil || strings.Contains(string(encoded), canary) {
+		t.Fatalf("panic failure history payload leaked canary: %s, %v", encoded, marshalErr)
+	}
+}
+
+func TestNewActivitiesRejectsAuthorityNotBoundToPlanner(t *testing.T) {
+	fixture := newActivityFixture(t, "firing")
+	if activities, err := investigationworkflow.NewActivities(
+		fixture.repository, fixture.repository, investigationplan.NewScopeAuthority(), fixture.planner,
+	); activities != nil || !errors.Is(err, investigationworkflow.ErrInvalidInput) {
+		t.Fatalf("NewActivities(foreign authority) = %#v, %v", activities, err)
 	}
 }
 
@@ -196,7 +341,7 @@ func TestPreparationActivityRejectsWorkflowScopeAndDigestSubstitutionBeforeWrite
 			fixture := newActivityFixture(t, "firing")
 			input := fixture.input
 			mutate(&input)
-			_, err := fixture.activities.Prepare(context.Background(), input)
+			_, err := investigationworkflow.PrepareActivityForTest(fixture.activities, context.Background(), input)
 			var applicationError *temporal.ApplicationError
 			if !errors.As(err, &applicationError) || applicationError.Type() == "PREPARE_DEPENDENCY_UNAVAILABLE" {
 				t.Fatalf("Prepare(substitution) error = %v", err)
@@ -320,20 +465,30 @@ func (reader panicRegistrationReader) GetRegisteredSignal(context.Context, strin
 
 type projectionRepository struct {
 	investigation.Repository
-	mutation         projectionMutation
-	advance          bool
-	terminalIncident bool
+	mutation           projectionMutation
+	advance            bool
+	terminalIncident   bool
+	expectedSignalHash string
 }
 
 type projectionMutation struct {
+	incident      func(*domain.Incident)
 	investigation func(*domain.Investigation)
 	tasks         func([]domain.ReadTask)
+}
+
+func (repository *projectionRepository) CorrelateSignal(ctx context.Context, request investigation.CorrelateSignalRequest) (investigation.CorrelateSignalResult, error) {
+	repository.expectedSignalHash = request.ExpectedSignalHash
+	return repository.Repository.CorrelateSignal(ctx, request)
 }
 
 func (repository *projectionRepository) GetIncident(ctx context.Context, workspaceID, incidentID string) (domain.Incident, error) {
 	item, err := repository.Repository.GetIncident(ctx, workspaceID, incidentID)
 	if err == nil && repository.terminalIncident {
 		item.Status = domain.IncidentResolved
+	}
+	if err == nil && repository.mutation.incident != nil {
+		repository.mutation.incident(&item)
 	}
 	return item, err
 }

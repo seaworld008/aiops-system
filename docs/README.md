@@ -18,6 +18,7 @@ This directory separates current architecture, executable delivery plans, and su
 - [Isolated Runner runtime gates](operations/isolated-runner-runtime.md) — split image build, Linux capability checks, and external sandbox gates.
 - [READ connector registry](operations/read-connector-registry.md) — immutable typed connector contracts and target-manifest prerequisites.
 - [Investigation plan manifest](operations/investigation-plan-manifest.md) — trusted Signal scope, exact profile matching, four-digest binding, and fail-closed rollout boundary.
+- [Temporal investigation preparation](operations/temporal-investigation-preparation.md) — digest-bound Workflow/Activity, History allowlist, replay, and unassembled rollout boundary.
 
 ## Historical material
 

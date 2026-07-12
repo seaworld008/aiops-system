@@ -2,6 +2,7 @@ package investigationworkflow_test
 
 import (
 	"context"
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
@@ -34,8 +35,8 @@ func TestPreparationWorkflowRunsOneExplicitActivityAndReturnsSafeReceipt(t *test
 	input := validWorkflowInput()
 	receipt := validReceipt()
 	environment := newWorkflowEnvironment()
-	environment.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: input.OutboxEventID, TaskQueue: mustTaskQueue(t, input)})
-	environment.RegisterWorkflowWithOptions(investigationworkflow.PreparationWorkflow, workflow.RegisterOptions{Name: investigationworkflow.WorkflowName})
+	configureValidWorkflowStart(t, environment, input)
+	environment.RegisterWorkflowWithOptions(investigationworkflow.PreparationWorkflowForTest, workflow.RegisterOptions{Name: investigationworkflow.WorkflowName})
 	environment.RegisterActivityWithOptions(func(context.Context, investigationworkflow.WorkflowInput) (investigationworkflow.PreparationReceipt, error) {
 		return receipt, nil
 	}, activity.RegisterOptions{Name: investigationworkflow.ActivityName})
@@ -67,8 +68,8 @@ func TestPreparationWorkflowRejectsReceiptTampering(t *testing.T) {
 			receipt := validReceipt()
 			mutate(&receipt)
 			environment := newWorkflowEnvironment()
-			environment.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: input.OutboxEventID, TaskQueue: mustTaskQueue(t, input)})
-			environment.RegisterWorkflowWithOptions(investigationworkflow.PreparationWorkflow, workflow.RegisterOptions{Name: investigationworkflow.WorkflowName})
+			configureValidWorkflowStart(t, environment, input)
+			environment.RegisterWorkflowWithOptions(investigationworkflow.PreparationWorkflowForTest, workflow.RegisterOptions{Name: investigationworkflow.WorkflowName})
 			environment.RegisterActivityWithOptions(func(context.Context, investigationworkflow.WorkflowInput) (investigationworkflow.PreparationReceipt, error) {
 				return receipt, nil
 			}, activity.RegisterOptions{Name: investigationworkflow.ActivityName})
@@ -84,8 +85,8 @@ func TestPreparationWorkflowRetriesLowSensitivityActivityError(t *testing.T) {
 	input := validWorkflowInput()
 	attempts := 0
 	environment := newWorkflowEnvironment()
-	environment.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: input.OutboxEventID, TaskQueue: mustTaskQueue(t, input)})
-	environment.RegisterWorkflowWithOptions(investigationworkflow.PreparationWorkflow, workflow.RegisterOptions{Name: investigationworkflow.WorkflowName})
+	configureValidWorkflowStart(t, environment, input)
+	environment.RegisterWorkflowWithOptions(investigationworkflow.PreparationWorkflowForTest, workflow.RegisterOptions{Name: investigationworkflow.WorkflowName})
 	environment.RegisterActivityWithOptions(func(context.Context, investigationworkflow.WorkflowInput) (investigationworkflow.PreparationReceipt, error) {
 		attempts++
 		if attempts == 1 {
@@ -105,12 +106,39 @@ func TestPreparationWorkflowRejectsInvalidInputBeforeActivity(t *testing.T) {
 			input := validWorkflowInput()
 			mutate(&input)
 			environment := newWorkflowEnvironment()
-			environment.RegisterWorkflowWithOptions(investigationworkflow.PreparationWorkflow, workflow.RegisterOptions{Name: investigationworkflow.WorkflowName})
+			environment.RegisterWorkflowWithOptions(investigationworkflow.PreparationWorkflowForTest, workflow.RegisterOptions{Name: investigationworkflow.WorkflowName})
 			environment.ExecuteWorkflow(investigationworkflow.WorkflowName, input)
 			if environment.GetWorkflowError() == nil {
 				t.Fatalf("invalid input succeeded")
 			}
 		})
+	}
+}
+
+func TestPreparationWorkflowRejectsMemoInputMismatchBeforeActivity(t *testing.T) {
+	input := validWorkflowInput()
+	environment := newWorkflowEnvironment()
+	configureValidWorkflowStart(t, environment, input)
+	other := input
+	other.SignalID = "99999999-9999-4999-8999-999999999999"
+	payload, err := investigationworkflow.CanonicalMemoPayloadForTest(other)
+	if err != nil {
+		t.Fatalf("CanonicalMemoPayloadForTest(other) error = %v", err)
+	}
+	if err := environment.SetMemoOnStart(map[string]interface{}{
+		investigationworkflow.MemoIdentityKey: json.RawMessage(payload.Data),
+	}); err != nil {
+		t.Fatalf("SetMemoOnStart(other) error = %v", err)
+	}
+	activityCalls := 0
+	environment.RegisterWorkflowWithOptions(investigationworkflow.PreparationWorkflowForTest, workflow.RegisterOptions{Name: investigationworkflow.WorkflowName})
+	environment.RegisterActivityWithOptions(func(context.Context, investigationworkflow.WorkflowInput) (investigationworkflow.PreparationReceipt, error) {
+		activityCalls++
+		return validReceipt(), nil
+	}, activity.RegisterOptions{Name: investigationworkflow.ActivityName})
+	environment.ExecuteWorkflow(investigationworkflow.WorkflowName, input)
+	if environment.GetWorkflowError() == nil || activityCalls != 0 {
+		t.Fatalf("memo/input mismatch error = %v; activity calls = %d", environment.GetWorkflowError(), activityCalls)
 	}
 }
 
@@ -178,11 +206,27 @@ func newWorkflowEnvironment() *testsuite.TestWorkflowEnvironment {
 	return suite.NewTestWorkflowEnvironment()
 }
 
+func configureValidWorkflowStart(t *testing.T, environment *testsuite.TestWorkflowEnvironment, input investigationworkflow.WorkflowInput) {
+	t.Helper()
+	environment.SetStartWorkflowOptions(client.StartWorkflowOptions{
+		ID: input.OutboxEventID, TaskQueue: mustTaskQueue(t, input), WorkflowTaskTimeout: 10 * time.Second,
+	})
+	payload, err := investigationworkflow.CanonicalMemoPayloadForTest(input)
+	if err != nil {
+		t.Fatalf("CanonicalMemoPayloadForTest() error = %v", err)
+	}
+	if err := environment.SetMemoOnStart(map[string]interface{}{
+		investigationworkflow.MemoIdentityKey: json.RawMessage(payload.Data),
+	}); err != nil {
+		t.Fatalf("SetMemoOnStart() error = %v", err)
+	}
+}
+
 func TestPreparationWorkflowCancellationCannotInterruptDurablePreparation(t *testing.T) {
 	input := validWorkflowInput()
 	environment := newWorkflowEnvironment()
-	environment.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: input.OutboxEventID, TaskQueue: mustTaskQueue(t, input)})
-	environment.RegisterWorkflowWithOptions(investigationworkflow.PreparationWorkflow, workflow.RegisterOptions{Name: investigationworkflow.WorkflowName})
+	configureValidWorkflowStart(t, environment, input)
+	environment.RegisterWorkflowWithOptions(investigationworkflow.PreparationWorkflowForTest, workflow.RegisterOptions{Name: investigationworkflow.WorkflowName})
 	environment.RegisterActivityWithOptions(func(context.Context, investigationworkflow.WorkflowInput) (investigationworkflow.PreparationReceipt, error) {
 		return validReceipt(), nil
 	}, activity.RegisterOptions{Name: investigationworkflow.ActivityName})
