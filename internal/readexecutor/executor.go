@@ -134,7 +134,7 @@ func (executor *Executor) Prepare(
 		return nil, ErrExecutionRejected
 	}
 	created := &Prepared{
-		taskID: descriptor.TaskID, seal: trustedPreparedSeal, state: &preparedState{},
+		taskID: descriptor.TaskID, owner: executor, seal: trustedPreparedSeal, state: &preparedState{},
 		values: preparedValues{
 			leaseEpoch: leaseEpoch, scopeRevision: scopeRevision, execution: execution, policy: policy,
 			origin: *origin, tlsConfig: tlsConfiguration, endpointPath: endpointPath,
@@ -168,7 +168,8 @@ func (executor *Executor) Execute(
 			}
 		}
 	}()
-	if !executor.Ready() || prepared == nil || !prepared.ready() || start == nil || !start.ready() ||
+	if !executor.Ready() || prepared == nil || !prepared.ready() || prepared.owner != executor ||
+		start == nil || !start.ready() ||
 		credentials == nil || start.taskID != prepared.taskID {
 		return Result{}, ErrExecutionRejected
 	}

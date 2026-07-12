@@ -66,6 +66,41 @@ type entry struct {
 	victoria       *VictoriaLogsSearchV1
 }
 
+// RuntimeDependency is a detached, secret-free graph edge used only while a
+// READ runtime bundle validates that every connector has one exact target and
+// egress policy. Query and projection material are intentionally absent.
+type RuntimeDependency struct {
+	scope          Scope
+	connectorID    string
+	targetRef      string
+	kind           Kind
+	operation      string
+	contractDigest string
+}
+
+func (dependency RuntimeDependency) Scope() Scope {
+	return Scope{
+		TenantID: strings.Clone(dependency.scope.TenantID), WorkspaceID: strings.Clone(dependency.scope.WorkspaceID),
+		EnvironmentID: strings.Clone(dependency.scope.EnvironmentID), ServiceID: strings.Clone(dependency.scope.ServiceID),
+	}
+}
+func (dependency RuntimeDependency) ConnectorID() string {
+	return strings.Clone(dependency.connectorID)
+}
+func (dependency RuntimeDependency) TargetRef() string { return strings.Clone(dependency.targetRef) }
+func (dependency RuntimeDependency) Kind() Kind        { return dependency.kind }
+func (dependency RuntimeDependency) Operation() string { return strings.Clone(dependency.operation) }
+func (dependency RuntimeDependency) ContractDigest() string {
+	return strings.Clone(dependency.contractDigest)
+}
+func (RuntimeDependency) String() string   { return "<aiops-read-runtime-dependency>" }
+func (RuntimeDependency) GoString() string { return "<aiops-read-runtime-dependency>" }
+func (RuntimeDependency) Format(state fmt.State, _ rune) {
+	_, _ = io.WriteString(state, "<aiops-read-runtime-dependency>")
+}
+func (RuntimeDependency) MarshalJSON() ([]byte, error) { return []byte(`{"redacted":true}`), nil }
+func (*RuntimeDependency) UnmarshalJSON([]byte) error  { return ErrContractRejected }
+
 // Registry is constructed once, owns detached copies, and supports read-only
 // concurrent use. It intentionally has no mutation or hot-reload method.
 type Registry struct {
@@ -139,6 +174,35 @@ func (registry *Registry) Digest() string {
 		return ""
 	}
 	return registry.digest
+}
+
+// RuntimeDependencies returns a deterministic detached view containing only
+// the facts required to validate the runtime dependency graph. It does not
+// expose fixed queries, evidence projections, target URLs, or credentials.
+func (registry *Registry) RuntimeDependencies() ([]RuntimeDependency, error) {
+	if registry == nil || !registry.Ready() {
+		return nil, ErrContractRejected
+	}
+	dependencies := make([]RuntimeDependency, 0, len(registry.entries))
+	for _, item := range registry.entries {
+		dependencies = append(dependencies, RuntimeDependency{
+			scope: Scope{
+				TenantID: strings.Clone(item.scope.TenantID), WorkspaceID: strings.Clone(item.scope.WorkspaceID),
+				EnvironmentID: strings.Clone(item.scope.EnvironmentID), ServiceID: strings.Clone(item.scope.ServiceID),
+			},
+			connectorID: strings.Clone(item.connectorID), targetRef: strings.Clone(item.targetRef),
+			kind: item.kind, operation: strings.Clone(item.operation), contractDigest: strings.Clone(item.contractDigest),
+		})
+	}
+	sort.Slice(dependencies, func(left, right int) bool {
+		leftScope, rightScope := dependencies[left].scope, dependencies[right].scope
+		leftKey := leftScope.TenantID + "\x00" + leftScope.WorkspaceID + "\x00" + leftScope.EnvironmentID + "\x00" +
+			dependencies[left].connectorID + "\x00" + dependencies[left].operation
+		rightKey := rightScope.TenantID + "\x00" + rightScope.WorkspaceID + "\x00" + rightScope.EnvironmentID + "\x00" +
+			dependencies[right].connectorID + "\x00" + dependencies[right].operation
+		return leftKey < rightKey
+	})
+	return dependencies, nil
 }
 
 func (registry *Registry) AuthorizeTaskSpec(

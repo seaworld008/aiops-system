@@ -17,7 +17,7 @@
 2. 确认没有 `LEASED/RUNNING` READ attempt，也没有 `QUEUED/RUNNING` create.v1/unbound Investigation。
 3. 以受控迁移角色应用 `000013_investigation_runtime_binding.up.sql`。迁移使用 5 秒 `lock_timeout` 和确定顺序的 `ACCESS EXCLUSIVE` 锁；锁超时或 cutover guard 失败即中止发布，不重试为部分成功。
 4. 部署理解 create.v2、完整 binding、Attempt hash-version v3 与 Receipt v3 的 Control Plane/Gateway 代码。禁止旧、新 READ 写入者混跑。
-5. 保持 claim disabled，先验证查询、create/replay、未绑定 Task 拒绝和数据库告警；target/egress manifest 与固定 executor 已完成本地契约，但真实 C2-4 assembly 及外部 PKI/network/E2E 门禁完成前不得开启 claim。
+5. 保持关闭态 Admission，先验证查询、create/replay、未绑定 Task 拒绝和数据库告警；C2-4a Bundle 已完成本地契约，但真实 C2-4b/4c assembly 及外部 PKI/network/E2E 门禁完成前不得开启 claim。
 
 ## 验证查询
 

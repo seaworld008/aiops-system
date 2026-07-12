@@ -75,7 +75,7 @@ type Dependencies struct {
 	Database             DB
 	Identities           *runneridentitypostgres.Repository
 	Tasks                *readtaskpostgres.Repository
-	ClaimsEnabled        bool
+	Admission            *Admission
 	StartAuthorizer      StartAuthorizer
 	CompletionAuthorizer CompletionAuthorizer
 }
@@ -92,7 +92,7 @@ type operations struct {
 // Backend is the transaction boundary used by the READ Runner protocol.
 type Backend struct {
 	database             DB
-	claimsEnabled        bool
+	admission            *Admission
 	startAuthorizer      StartAuthorizer
 	completionAuthorizer CompletionAuthorizer
 	operations           operations
@@ -103,13 +103,14 @@ type Backend struct {
 // cannot be bypassed.
 func New(dependencies Dependencies) (*Backend, error) {
 	if nilInterface(dependencies.Database) || dependencies.Identities == nil || dependencies.Tasks == nil ||
+		!dependencies.Admission.valid() ||
 		dependencies.StartAuthorizer == nil || dependencies.CompletionAuthorizer == nil {
 		return nil, ErrInvalidConfiguration
 	}
 	identities := dependencies.Identities
 	tasks := dependencies.Tasks
 	backend := &Backend{
-		database: dependencies.Database, claimsEnabled: dependencies.ClaimsEnabled,
+		database: dependencies.Database, admission: dependencies.Admission,
 		startAuthorizer:      dependencies.StartAuthorizer,
 		completionAuthorizer: dependencies.CompletionAuthorizer,
 	}
@@ -226,14 +227,14 @@ func (backend *Backend) Claim(
 	identity runneridentity.Identity,
 	taskID string,
 ) (readtask.Claim, ResponseBinding, error) {
+	if backend == nil || !backend.admission.allowsLeaseProgression() {
+		return readtask.Claim{}, nil, readtask.ErrClaimsDisabled
+	}
 	transaction, err := backend.authenticatedTransaction(ctx, identity)
 	if err != nil {
 		return readtask.Claim{}, nil, err
 	}
 	defer transaction.rollback(ctx)
-	if !backend.claimsEnabled {
-		return readtask.Claim{}, nil, readtask.ErrClaimsDisabled
-	}
 	if backend.operations.claimTx == nil {
 		return readtask.Claim{}, nil, ErrUnavailable
 	}
@@ -262,6 +263,9 @@ func (backend *Backend) Start(
 	identity runneridentity.Identity,
 	start readtask.Start,
 ) (readtask.Attempt, ResponseBinding, error) {
+	if backend == nil || !backend.admission.allowsLeaseProgression() {
+		return readtask.Attempt{}, nil, readtask.ErrClaimsDisabled
+	}
 	transaction, err := backend.authenticatedTransaction(ctx, identity)
 	if err != nil {
 		return readtask.Attempt{}, nil, err
@@ -289,6 +293,9 @@ func (backend *Backend) Heartbeat(
 	identity runneridentity.Identity,
 	heartbeat readtask.Heartbeat,
 ) (readtask.HeartbeatResult, ResponseBinding, error) {
+	if backend == nil || !backend.admission.allowsLeaseProgression() {
+		return readtask.HeartbeatResult{}, nil, readtask.ErrClaimsDisabled
+	}
 	transaction, err := backend.authenticatedTransaction(ctx, identity)
 	if err != nil {
 		return readtask.HeartbeatResult{}, nil, err
@@ -343,6 +350,9 @@ func (backend *Backend) Complete(
 	identity runneridentity.Identity,
 	completion readtask.Completion,
 ) (readtask.CompletionResult, ResponseBinding, error) {
+	if backend == nil || !backend.admission.allowsLeaseProgression() {
+		return readtask.CompletionResult{}, nil, readtask.ErrClaimsDisabled
+	}
 	transaction, err := backend.authenticatedTransaction(ctx, identity)
 	if err != nil {
 		return readtask.CompletionResult{}, nil, err

@@ -38,11 +38,11 @@ M5C2-2 没有迁移、HTTP route 或 live assembly。部署本变更不会打开
 
 - `cmd/control-plane` 必须继续安装 disabled READ claim/start/complete callbacks；
 - preparation Workflow v1 与现有 Worker 注册保持不变；
-- 新 Recovery Activity 在 M5C2-4 的版本化 Workflow 与 task queue 设计落地前不得注册；
+- 新 Recovery Activity 在 M5C2-4b 的版本化 Workflow 与 task queue 设计落地前不得注册；
 - 使用真实 PostgreSQL 16 验证完成后无需 completion body、bearer 或 enabled Runner 即可恢复同一 Evidence ID/hash，并验证 Attempt/Receipt/Evidence 行数完全不变；
 - 使用 Temporal testsuite 验证严格 DTO、错误分类、panic 恢复和 History canary 不泄漏。
 
-M5C2-4 的预定编排是：对一次逻辑 Task 发起有限次数的 Runner Activity；若完成调用出现超时或结果未知，则调用 DB-only Recovery Activity。只有恢复返回可验证 `COMMITTED` 才向 Workflow 投影终态；返回 `PENDING` 时不得把未知远端结果伪装为失败或重新提交同一正文。
+M5C2-4b 的预定编排是：对一次逻辑 Task 发起有限次数的 Runner Activity；若完成调用出现超时或结果未知，则调用 DB-only Recovery Activity。只有恢复返回可验证 `COMMITTED` 才向 Workflow 投影终态；返回 `PENDING` 时不得把未知远端结果伪装为失败或重新提交同一正文。
 
 ## 回滚与未开放能力
 
