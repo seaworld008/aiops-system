@@ -695,7 +695,10 @@ func TestAcceptControlWorkerChildAcceptsExactBoundary(t *testing.T) {
 
 func newTestSupervisor(scenario, base string) *ControlWorkerSupervisor {
 	settings := defaultSupervisorSettings()
-	settings.startupTimeout = 300 * time.Millisecond
+	// A race-instrumented self-reexec can take well above 300 ms on a loaded CI
+	// host before TestMain reaches the child protocol. Keep this far below the
+	// production budget while avoiding scheduler-dependent pre-marker kills.
+	settings.startupTimeout = 2 * time.Second
 	settings.startupGrace = time.Second
 	settings.shutdownGrace = time.Second
 	settings.anomalyGrace = 250 * time.Millisecond
