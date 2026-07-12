@@ -45,4 +45,4 @@ Reports that only describe intended pre-alpha limitations, unsupported productio
 
 ## Deployment responsibility
 
-The repository defaults are for development. Operators are responsible for network segmentation, mTLS, Keycloak and Vault hardening, PostgreSQL security and backups, object-store policy, secret rotation, audit retention, and keeping all production mutation flags disabled until the published Go/No-Go gates pass.
+The repository defaults are for development. Operators are responsible for network segmentation, mTLS, Keycloak and Vault hardening, PostgreSQL security and backups, object-store policy, secret rotation, audit retention, and keeping all production mutation flags disabled until the published Go/No-Go gates pass. The fixed READ HTTP executor is currently an unassembled, locally tested contract; READ claims must also remain disabled until M5C2-4 assembly and its identity, digest, network, replay, and end-to-end gates pass.

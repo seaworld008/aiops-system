@@ -16,9 +16,12 @@ This directory separates current architecture, executable delivery plans, and su
 - [Roadmap and release gates](roadmap.md) — current delivery status and the conditions for enabling production writes.
 - [Runner Gateway security-file staging](operations/runner-gateway-identity-files.md) — secure Kubernetes staging and rotation runbook for mTLS and credential-protection material.
 - [Isolated Runner runtime gates](operations/isolated-runner-runtime.md) — split image build, Linux capability checks, and external sandbox gates.
-- [READ connector registry](operations/read-connector-registry.md) — immutable typed connector contracts and target-manifest prerequisites.
+- [READ connector registry](operations/read-connector-registry.md) — immutable typed connector contracts consumed by target/runtime admission.
+- [READ target and fixed executor runtime](operations/read-target-runtime.md) — content-addressed target/egress policy, fixed Prometheus/VictoriaLogs transport, and the still-unassembled claim boundary.
 - [Investigation plan manifest](operations/investigation-plan-manifest.md) — trusted Signal scope, exact profile matching, four-digest binding, and fail-closed rollout boundary.
 - [Temporal investigation preparation](operations/temporal-investigation-preparation.md) — digest-bound Workflow/Activity, History allowlist, replay, and unassembled rollout boundary.
+- [Investigation runtime binding](operations/investigation-runtime-binding.md) — persistent Plan/Task/Attempt/Receipt runtime fences and migration gates.
+- [Investigation result recovery](operations/investigation-result-recovery.md) — DB-only deterministic recovery after completion-response loss.
 
 ## Historical material
 

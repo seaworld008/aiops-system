@@ -237,7 +237,9 @@ the separately constrained `history-service`/controlled-operator identity
 rules described above.
 
 This PR has no migration, public HTTP API, environment configuration, or process
-assembly change. The next gate is the immutable READ target manifest and fixed
-executor/digest validation. Only a later atomic assembly change may install the
-dispatcher and consider READ claims after those gates pass. It may not enable
-WRITE claims or add a `production` execution mode.
+assembly change. Immutable READ target/egress admission, runtime binding, and
+the fixed HTTP executor now exist as unassembled contracts. M5C2-4 is the only
+milestone allowed to atomically install the dispatcher, Worker, READ Runner and
+Gateway callbacks; assembly still may not enable READ claims until all digest,
+PKI, network, replay and local E2E gates pass. It may not enable WRITE claims or
+add a `production` execution mode.

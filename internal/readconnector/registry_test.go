@@ -86,6 +86,24 @@ func TestRegistryAuthorizersShareOneExactImmutableContract(t *testing.T) {
 		query.Expression() != `sum(rate(http_requests_total[5m]))` || query.Step() != 30*time.Second {
 		t.Fatalf("resolved execution did not preserve the immutable typed contract")
 	}
+	if !execution.MatchesDescriptor(descriptor) {
+		t.Fatal("resolved execution did not retain the exact persisted input/runtime fences")
+	}
+	otherDescriptor := validDescriptor(
+		t, prometheusID, readconnector.OperationPrometheusRangeQuery, json.RawMessage(`{"lookback_minutes":10}`),
+	)
+	otherExecution, err := registry.ResolveExecution(otherDescriptor)
+	if err != nil || otherExecution.MatchesDescriptor(descriptor) || execution.MatchesDescriptor(otherDescriptor) {
+		t.Fatalf("execution/descriptor input-hash cross-pairing was accepted: %v", err)
+	}
+	if err := execution.ValidateEvidence(evidence); err != nil {
+		t.Fatalf("ExecutionSpec.ValidateEvidence() error = %v", err)
+	}
+	invalidEvidence := evidence
+	invalidEvidence.Items = []json.RawMessage{json.RawMessage(`{"metric":{"job":"api"},"values":[]}`)}
+	if err := execution.ValidateEvidence(invalidEvidence); !errors.Is(err, readconnector.ErrContractRejected) {
+		t.Fatalf("ExecutionSpec.ValidateEvidence(invalid) error = %v", err)
+	}
 	queryWire, queryMarshalErr := json.Marshal(query)
 	queryRendered := fmt.Sprintf("%+v %#v", query, query)
 	if queryMarshalErr != nil || string(queryWire) != `{"redacted":true}` || strings.Contains(queryRendered, "http_requests_total") {
@@ -134,10 +152,10 @@ func TestConnectorIDContentAddressBindsEveryAdmissionContractField(t *testing.T)
 	if err != nil || id != prometheusID || len(id) > 128 || len(id) < 64 || !domain.ValidSHA256Hex(id[len(id)-64:]) {
 		t.Fatalf("BuildConnectorID() = %q, %v", id, err)
 	}
-	const goldenPrometheusID = "prometheus-staging-health-v1-83004ffac7bfe4e53c40492220072dd08343bbbfddd0d3851de2de1378a6cf11"
-	const goldenVictoriaLogsID = "victorialogs-staging-errors-v1-e011d6bc0557c71650569feeee89d1853f9b0027610578e6fd15982b75be0bd2"
+	const goldenPrometheusID = "prometheus-staging-health-v1-ef492f70edbcc1bb7a86e3f2dbdeb90c6f88281831fa66cf724259d154ba4587"
+	const goldenVictoriaLogsID = "victorialogs-staging-errors-v1-950d6da545aef76c613b33721e73e83e515ee1704bb165017530621f4ddf1e11"
 	if prometheusID != goldenPrometheusID || victoriaID != goldenVictoriaLogsID {
-		t.Fatalf("validator v1 content IDs changed without a version bump: %q / %q", prometheusID, victoriaID)
+		t.Fatalf("validator v2 content IDs changed without a version bump: %q / %q", prometheusID, victoriaID)
 	}
 	mutations := map[string]func(*readconnector.Definition){
 		"tenant":    func(item *readconnector.Definition) { item.Scope.TenantID = "10000000-0000-4000-8000-000000000099" },
@@ -364,6 +382,12 @@ func TestRegistryTaskAndStartAuthorizationFailClosedOnEveryScopeAndSchemaDrift(t
 		"duplicate": {validScope, mutateSpec(validSpec, func(spec *investigation.TaskSpec) {
 			spec.Input = json.RawMessage(`{"lookback_minutes":15,"lookback_minutes":10}`)
 		})},
+		"case-folded input": {validScope, mutateSpec(validSpec, func(spec *investigation.TaskSpec) {
+			spec.Input = json.RawMessage(`{"LOOKBACK_MINUTES":15}`)
+		})},
+		"case-folded alias": {validScope, mutateSpec(validSpec, func(spec *investigation.TaskSpec) {
+			spec.Input = json.RawMessage(`{"lookback_minutes":10,"LOOKBACK_MINUTES":15}`)
+		})},
 		"string":      {validScope, mutateSpec(validSpec, func(spec *investigation.TaskSpec) { spec.Input = json.RawMessage(`{"lookback_minutes":"15"}`) })},
 		"float":       {validScope, mutateSpec(validSpec, func(spec *investigation.TaskSpec) { spec.Input = json.RawMessage(`{"lookback_minutes":15.0}`) })},
 		"zero":        {validScope, mutateSpec(validSpec, func(spec *investigation.TaskSpec) { spec.Input = json.RawMessage(`{"lookback_minutes":0}`) })},
@@ -558,6 +582,13 @@ func validDescriptor(t *testing.T, connectorID, operation string, input json.Raw
 		t.Fatalf("test ConnectorID %q has an invalid SHA-256 content-address suffix", connectorID)
 	}
 	digest := sha256.Sum256(input)
+	targetDigest := strings.Repeat("5", 64)
+	switch connectorID {
+	case prometheusID:
+		targetDigest = strings.Repeat("a", 64)
+	case victoriaID:
+		targetDigest = strings.Repeat("b", 64)
+	}
 	descriptor := readtask.Descriptor{
 		TenantID: tenantID, WorkspaceID: workspaceID, EnvironmentID: environmentID,
 		ServiceID:  serviceID,
@@ -572,7 +603,7 @@ func validDescriptor(t *testing.T, connectorID, operation string, input json.Raw
 		},
 		RuntimeBinding: domain.ReadTaskRuntimeBinding{
 			SchemaVersion:   domain.ReadTaskRuntimeBindingSchemaVersion,
-			ConnectorDigest: connectorDigest, TargetDigest: strings.Repeat("5", 64),
+			ConnectorDigest: connectorDigest, TargetDigest: targetDigest,
 			ExecutorDigest: strings.Repeat("6", 64), RuntimeDigest: strings.Repeat("7", 64),
 			BoundAt: time.Date(2026, 7, 12, 8, 9, 10, 123456000, time.UTC),
 		},

@@ -2,15 +2,15 @@
 
 The READ connector registry is the immutable admission contract shared by
 Investigation task creation, Runner Gateway start authorization, typed Evidence
-completion, and the future READ Runner executor. It contains no credentials,
+completion, and the fixed but currently unassembled READ HTTP executor. It contains no credentials,
 HTTP headers, arbitrary command material, or network client.
 
 This milestone does **not** wire the registry into the live Control Plane.
 `ClaimsEnabled` remains `false`, and the existing disabled start/completion
 callbacks remain installed. This also prevents an old lease from advancing
-during a rolling upgrade. A later assembly milestone may replace those gates
-only after the READ Runner, Temporal dispatch, target manifest, and registry
-digest checks are ready together.
+during a rolling upgrade. Only M5C2-4 may replace those gates atomically, after
+the READ Runner, Temporal dispatch, target/egress manifests, and component/profile
+digest checks are ready together; assembly does not itself authorize claims.
 
 ## Manifest contract
 
@@ -30,7 +30,7 @@ service ID may narrow the admission further.
         "environment_id": "30000000-0000-4000-8000-000000000003",
         "service_id": "40000000-0000-4000-8000-000000000004"
       },
-      "connector_id": "prometheus-staging-health-v1-83004ffac7bfe4e53c40492220072dd08343bbbfddd0d3851de2de1378a6cf11",
+      "connector_id": "prometheus-staging-health-v1-ef492f70edbcc1bb7a86e3f2dbdeb90c6f88281831fa66cf724259d154ba4587",
       "target_ref": "prometheus-staging-target-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "prometheus_range_query": {
         "expression": "sum(rate(http_requests_total[5m]))",
@@ -47,7 +47,7 @@ service ID may narrow the admission further.
         "environment_id": "30000000-0000-4000-8000-000000000003",
         "service_id": "40000000-0000-4000-8000-000000000004"
       },
-      "connector_id": "victorialogs-staging-errors-v1-e011d6bc0557c71650569feeee89d1853f9b0027610578e6fd15982b75be0bd2",
+      "connector_id": "victorialogs-staging-errors-v1-950d6da545aef76c613b33721e73e83e515ee1704bb165017530621f4ddf1e11",
       "target_ref": "victorialogs-staging-target-v1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "victorialogs_search": {
         "query": "_stream:{app=\"payments\"} level:error",
@@ -75,19 +75,21 @@ step, item limits, and sample limits remain server-owned. The same connector ID
 cannot be reused for another environment in one tenant/workspace. Connector IDs
 are full content addresses in the form `<base>-v1-<sha256>`. Use
 `BuildConnectorID` to derive the ID from normalized scope, target reference,
-kind/operation, fixed query, projection, budgets, and validator-v1 profile.
+kind/operation, fixed query, projection, budgets, and validator-v2 profile.
 Changing any of those values while retaining the old ID fails registry loading.
-Validator-v1 semantics are frozen; a semantic validator change requires a new
-profile/version and retention of the old executor until its tasks are terminal.
+Validator-v2 additionally rejects case-folded JSON field aliases at Task input
+and typed Evidence boundaries. Validator-v1 semantics remain frozen; a semantic
+validator change always requires a new profile/content address and retention of
+the compatible old binary until its tasks are terminal.
 
 `target_ref` is a low-cardinality opaque content-address-shaped reference. It is
-not a URL or a secret. This milestone validates its canonical form but cannot
-yet recompute the suffix because the target contract is intentionally held by
-the future READ Runner target manifest. That loader must hash the fixed HTTPS
-endpoint identity, explicit CA, credential/role reference, redirect/proxy
-policy, and network-policy profile (but not rotating Secret bytes), and require
-the suffix to match before readiness can succeed. Until that check exists,
-claims remain disabled. The target manifest and its secrets must never enter
+not a URL or a secret. M5C2-3a's `read-target-manifest.v1` loader now recomputes
+the suffix from the fixed HTTPS endpoint identity, explicit CA, credential-role
+reference and network-policy reference (but not rotating Secret bytes).
+M5C2-3b additionally resolves that policy through content-addressed
+`read-egress-policy.v1` admission and a fixed one-shot executor. Claims remain
+disabled until M5C2-4 assembly and separate Go/No-Go evidence pass. Target/policy
+manifests and their secrets must never enter
 Task input, claim responses, Evidence, Temporal History, logs, or audit events.
 
 ## File and rollout requirements
@@ -100,9 +102,9 @@ error.
 
 The registry digest covers exact scope, connector ID, operation, target
 reference, fixed query, output projection, and budgets; it excludes actual
-credentials. Gateway and READ Runner must advertise the same digest before
-claims can be enabled. A mismatch is a startup failure, not a partial registry
-fallback.
+credentials. C2-4 must make Gateway and READ Runner prove the same registry,
+target, egress and executor profile digests before any later claim decision.
+A mismatch is a startup failure, not a partial registry fallback.
 
 The current READ heartbeat revalidates Runner identity/scope but does not yet
 re-run connector admission. Removing a definition while an attempt is already

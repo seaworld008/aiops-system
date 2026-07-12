@@ -578,10 +578,10 @@ func TestInvestigationPlanV1GoldenDigests(t *testing.T) {
 		"correlation": plan.CorrelateSignalRequest().CorrelationKey,
 	}
 	want := map[string]string{
-		"registry":    "e936b99babbd772561ab9e059530c918d635ff5430614691f828d19005ee3c32",
-		"manifest":    "141e51b8790fb2bdf89329e36fc588fd1ca6bfea575f100b1a1a984e226193a0",
-		"profile":     "8306af2765d24a5b85d7e14f2ed2e1003a075c614fe2a6533037eedef402041c",
-		"tasks":       "77e3e084cd46c0c0d3fc5f2424961152e01a784fa773ed69d29bc30c5b3113d2",
+		"registry":    "7ab132dddd812c1a4ee531b4fe8ce10bd6326d768b69796c53d8c87ff27ba680",
+		"manifest":    "24598b4bfab3c2bd1c0dbd7a32efb4213575803c97f05663fffdb2f70acec5cf",
+		"profile":     "11afccf69dcd45bfb1f796d6b541b64f1af943d2a92feb6ca63a37322c0ad020",
+		"tasks":       "9649a920bf23d6bcfff48a1aa4e71628c750b5e75528291065f287424367e3d6",
 		"correlation": "corr.v1.ec495239aa517f9142cb7a7d0e3f870befd397f7bcc3c88c422809465b497a52",
 	}
 	for name, expected := range want {
