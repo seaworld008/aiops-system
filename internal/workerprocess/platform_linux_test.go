@@ -23,16 +23,20 @@ import (
 
 const controlWorkerTestScenario = "AIOPS_WORKERPROCESS_TEST_SCENARIO"
 const controlWorkerPdeathParentArgument = "--aiops-workerprocess-test-pdeath-parent"
+const controlWorkerRaceOptions = "GORACE=atexit_sleep_ms=0"
 
 func TestMain(testingMain *testing.M) {
 	scenario := os.Getenv(controlWorkerTestScenario)
 	if scenario != "" {
+		// The race runtime otherwise sleeps for one second while the helper exits,
+		// which is not part of the supervised process's shutdown behavior. Clear
+		// both test-only inputs before the child validates its empty environment.
+		_ = os.Unsetenv(controlWorkerTestScenario)
+		_ = os.Unsetenv("GORACE")
 		switch {
 		case len(os.Args) == 2 && os.Args[1] == controlWorkerPdeathParentArgument:
-			_ = os.Unsetenv(controlWorkerTestScenario)
 			os.Exit(runPdeathParentTestHelper(scenario))
 		case IsControlWorkerChild(os.Args[1:]):
-			_ = os.Unsetenv(controlWorkerTestScenario)
 			os.Exit(runControlWorkerTestChild(scenario))
 		}
 	}
@@ -309,7 +313,10 @@ func TestParentDeathSignalKillsAcceptedChild(t *testing.T) {
 	base := filepath.Join(t.TempDir(), "pdeath")
 	command := exec.Command(controlWorkerExecutable, controlWorkerPdeathParentArgument)
 	command.Args = []string{controlWorkerExecutable, controlWorkerPdeathParentArgument}
-	command.Env = []string{controlWorkerTestScenario + "=pdeath-parent|" + base}
+	command.Env = []string{
+		controlWorkerTestScenario + "=pdeath-parent|" + base,
+		controlWorkerRaceOptions,
+	}
 	command.Dir = "/"
 	command.Stdin = nil
 	command.Stdout = io.Discard
@@ -405,14 +412,20 @@ func newTestSupervisor(scenario, base string) *ControlWorkerSupervisor {
 	settings.shutdownGrace = time.Second
 	settings.anomalyGrace = 250 * time.Millisecond
 	settings.killConfirm = 3 * time.Second
-	settings.childEnv = []string{controlWorkerTestScenario + "=" + scenario + "|" + base}
+	settings.childEnv = []string{
+		controlWorkerTestScenario + "=" + scenario + "|" + base,
+		controlWorkerRaceOptions,
+	}
 	return newControlWorkerSupervisor(settings)
 }
 
 func acceptBoundaryCommand(scenario string, statusFile *os.File) *exec.Cmd {
 	command := exec.Command(controlWorkerExecutable, controlWorkerChildArgument)
 	command.Args = []string{controlWorkerExecutable, controlWorkerChildArgument}
-	command.Env = []string{controlWorkerTestScenario + "=" + scenario + "|"}
+	command.Env = []string{
+		controlWorkerTestScenario + "=" + scenario + "|",
+		controlWorkerRaceOptions,
+	}
 	command.Dir = "/"
 	command.Stdin = nil
 	command.Stdout = io.Discard
@@ -590,7 +603,10 @@ func runPdeathParentTestHelper(raw string) int {
 	}
 	command := exec.Command(controlWorkerExecutable, controlWorkerChildArgument)
 	command.Args = []string{controlWorkerExecutable, controlWorkerChildArgument}
-	command.Env = []string{controlWorkerTestScenario + "=pdeath-leaf|" + base}
+	command.Env = []string{
+		controlWorkerTestScenario + "=pdeath-leaf|" + base,
+		controlWorkerRaceOptions,
+	}
 	command.Dir = "/"
 	command.Stdin = nil
 	command.Stdout = io.Discard
