@@ -39,10 +39,14 @@ func TestPostgresTerminalIncidentGuardPreventsNewInvestigationFacts(t *testing.T
 	if err != nil || !correlated.Associated {
 		t.Fatalf("CorrelateSignal() = %#v, %v", correlated, err)
 	}
-	if _, err := fixture.harness.db.Exec(context.Background(), `
-		UPDATE incidents SET status = 'RESOLVED' WHERE id = $1
-	`, correlated.Incident.ID); err != nil {
-		t.Fatalf("resolve incident fixture: %v", err)
+	for _, status := range []string{"INVESTIGATING", "MITIGATING", "RESOLVED"} {
+		if _, err := fixture.harness.db.Exec(context.Background(), `
+			UPDATE incidents
+			SET status = $2, updated_at = updated_at + interval '1 microsecond', version = version + 1
+			WHERE id = $1
+		`, correlated.Incident.ID, status); err != nil {
+			t.Fatalf("advance incident fixture to %s: %v", status, err)
+		}
 	}
 	const idempotencyKey = "temporal.prepare.v1/90000000-0000-4000-8000-000000000009"
 	_, err = fixture.repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
