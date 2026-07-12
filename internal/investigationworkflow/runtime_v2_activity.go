@@ -21,6 +21,8 @@ type RuntimeV2Activities struct {
 	namespace    string
 }
 
+// NewRuntimeV2Activities is the low-level control Activity constructor.
+// Production callsites are repository-gated to readassembly.Snapshot.
 func NewRuntimeV2Activities(
 	preparation *Activities,
 	recovery *RecoveryActivities,
@@ -66,6 +68,25 @@ func (activities *RuntimeV2Activities) prepareActivityV2(
 		)
 	}
 	return activities.prepareV2(ctx, input)
+}
+
+// registeredPrepareActivityV2 prevents the Temporal SDK from attempting to
+// serialize an invalid zero-value result before it converts an Activity error.
+// The strict converter therefore never needs an unsafe DTO fallback.
+func (activities *RuntimeV2Activities) registeredPrepareActivityV2(
+	ctx context.Context,
+	input WorkflowInputV2,
+) (*PreparationReceiptV2, error) {
+	output, err := activities.prepareActivityV2(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	if output.ValidateAgainst(input) != nil {
+		return nil, runtimeV2NonRetryableError(
+			"READ_PREPARE_RESULT_INVALID", "investigation READ preparation result rejected",
+		)
+	}
+	return &output, nil
 }
 
 func (activities *RuntimeV2Activities) prepareV2(
@@ -187,6 +208,25 @@ func (activities *RuntimeV2Activities) recoverActivityV1(
 		)
 	}
 	return activities.recovery.recoverActivity(ctx, input)
+}
+
+// registeredRecoverActivityV1 applies the same nil-on-error wire boundary to
+// Recovery. Successful pointer results still decode into the Workflow's value
+// DTO, while failed attempts carry no semantically invalid result payload.
+func (activities *RuntimeV2Activities) registeredRecoverActivityV1(
+	ctx context.Context,
+	input RecoveryActivityInput,
+) (*RecoveryActivityOutput, error) {
+	output, err := activities.recoverActivityV1(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	if output.validateAgainst(input) != nil {
+		return nil, recoveryNonRetryableError(
+			recoveryResultInvalidErrorType, ErrInvalidRecoveryResult.Error(),
+		)
+	}
+	return &output, nil
 }
 
 func validPrepareActivityInfoV2(info activity.Info, input WorkflowInputV2, namespace string) bool {

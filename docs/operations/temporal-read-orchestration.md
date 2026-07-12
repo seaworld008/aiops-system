@@ -1,11 +1,84 @@
 # Temporal READ investigation orchestration
 
-阶段：M5C2-4b / M5C2-4c1a（版本化只读编排、Plan-bound Runner 路由；尚未进行进程装配，READ claims 关闭）
+阶段：M5C2-4b / M5C2-4c1a / M5C2-4c1b（版本化只读编排、Plan-bound Runner 路由与角色隔离的
+Temporal 控制边界；尚未进行进程装配，READ claims 关闭）
 
 本阶段把既有 investigation preparation、持久 READ Task、mTLS Gateway、结果恢复和 atomic
-runtime Bundle 连接成可 replay 的 Temporal v2 协议，但不修改 `cmd/*`、配置、Outbox dispatcher、
-Gateway Admission、迁移或公开 API。Control Plane 仍安装关闭态 Admission，生产代码仍没有打开 READ
-claims 的构造器；WRITE claims 与 production write 也继续不存在启用路径。
+runtime Bundle 连接成可 replay 的 Temporal v2 协议，并由不可互换的 Starter/Control Client、严格
+converter、sealed Starter/Control Worker 和 Snapshot 高层工厂封闭控制侧装配边界，但不修改 `cmd/*`、
+配置、Outbox dispatcher、Gateway Admission、迁移或业务 HTTP API。Control Plane 仍安装关闭态
+Admission，生产代码仍没有打开 READ claims 的构造器；WRITE claims 与 production write 也继续不存在
+启用路径。
+
+## 角色隔离的 Temporal 控制边界
+
+C2-4c1b 只提供库级角色装配，不把它安装进常驻进程：
+
+- `RuntimeV2StarterClient` 与 `RuntimeV2ControlClient` 是编译期不可互换、不可复制且关闭后永久失效的
+  sealed capability。前者只能启动并核验 Workflow，后者只能交给固定 Control Worker；生产 API 不返回
+  raw `client.Client`、transport、data converter 或 SDK Worker。
+- 两种 client 使用不同固定 identity 和独立连接。窄配置只允许显式 `host:port`、namespace、server name、
+  root pool 与客户端证书；TLS 固定为 1.3 双向认证，客户端 key 固定为 ECDSA P-256，禁用系统代理，并在
+  拨号前验证 endpoint、证书有效期、ClientAuth EKU、私钥 scalar/公钥/certificate 匹配及调用方存储别名。
+  不会自动回退系统根；后续配置 loader 必须仅从 owner-only 显式 CA 文件构造 root pool。API key、header
+  provider、interceptor、context propagator、自定义 converter 和任意 gRPC dial option 都没有生产配置入口。
+- eager Dial 成功后，每个角色还必须在同一个最长 5 秒 context 中、无应用层重试地调用
+  `GetClusterInfo` 与强一致 `DescribeNamespace`。响应必须给出 canonical non-zero cluster UUID、匹配且为
+  `REGISTERED` 的 namespace、canonical non-zero namespace UUID 和无控制/格式字符的 cluster name；固定
+  domain-separated SHA-256 proof 只保存在不透明 capability 中。相同 endpoint/SNI/root/namespace 但落到
+  不同 cluster，或同名 namespace 被重建，都会拒绝后续组装。生产 Temporal 身份因此还需要 cluster
+  `System Reader` 与目标 namespace `Reader`；权限、空 ID、旧服务端或 RPC 失败一律 fail closed。
+- 承载私钥的临时 `RuntimeV2ClientOptions` 自身对全部 `fmt` 格式固定脱敏并拒绝 JSON 编解码；调用方仍须
+  只在启动边界短暂持有它，拨号成功后立即清除原始 key material，不能把该值放进日志、配置快照或审计。
+- package-owned v2 data/failure converter 没有可直达 wire 的 SDK 默认 converter fallback。业务 payload 必须恰好一个、JCS canonical、
+  `json/plain` 且不超过 4096 字节的 allowlisted History DTO；唯一零 payload 例外是 Temporal SDK 对“无
+  error details”的 `nil Payloads` plumbing，非 nil 空对象仍拒绝。未知类型、额外 payload、非 canonical
+  JSON、未知/重复字段、非 allowlist error details 和私有 Memo identity 的普通 JSON 序列化全部 fail closed。
+  Failure graph 另受 4 KiB/四层深度、固定 failure kind/activity type/application type/retryability 约束；message/source
+  被规范为固定低敏值，stack trace、encoded attributes、所有 details、未知 proto 字段、Child/Nexus/Reset kind
+  均拒绝。SDK `failureHolder` 的原始 proto 也必须经过同一规范化，非法 graph 固定变成 non-retryable
+  `READ_RUNTIME_FAILURE_REJECTED`，当前错误契约不携带 details。
+- `RuntimeV2Starter` 只能把 `signal.ingested.v1` 的持久安全 ID 映射为固定 M/R/B 身份和 control queue；新启动
+  与 `AlreadyStarted` 都必须完成 exact-run Describe → immutable Started event → Describe 证明后才能让
+  Outbox ACK。远端错误与 panic 只返回固定低敏 code。
+- `RuntimeV2ControlWorker` 固定注册一个 v2 Workflow、Prepare v2 和 Recovery v1；不能注册 Runner Execute
+  Activity，也不接受 queue、registration、`worker.Options`、alias/plugin 或 eager execution。并发度、poller、
+  heartbeat throttle、35 秒 stop timeout 和无错误正文的 fatal signal 均由包固定。Prepare/Recovery 在唯一
+  注册边界使用 pointer-result adapter：错误返回 `nil,error`，成功才返回 `*DTO,nil`，避免 SDK 在转换错误前
+  序列化无效零值 DTO；strict converter 不为该 SDK 行为开放非法结果 fallback。
+  包装层不会在持锁时调用 SDK `Start`；并发 `Stop` 只记录意图，待 `Start` 返回后串行清理，且此时
+  `Start` 固定返回 rejected，不能把已停止 Worker 发布为运行中。SDK 没有 `Start(ctx)`，内部 namespace
+  RPC 的超时不能替代进程级启动预算；C2-4c2 supervisor 必须在独立进程上执行 deadline + hard fail-stop。
+- `Snapshot.NewRuntimeV2TemporalRoles` 是唯一跨 package 的高层装配入口。它从 Snapshot 私有 Summary 取得
+  M/R/B，要求两个 client 的 HostPort、namespace、server name、完整 cloned root pool 与服务端
+  cluster/namespace proof 精确属于同一 Temporal connection binding（客户端证书允许按角色不同），并在
+  Snapshot 先用私有 authority/planner 创建未发布的 Activities，再在两个 client 的共享 lifecycle lease 内
+  原子比较 connection 并创建、发布 Starter 与 Control Worker；并发 `Close` 只能在这段 client-bound
+  组装完成后取得独占 lease，任一失败都不向调用方发布部分结果。调用方不能覆盖 digest、queue、namespace、
+  converter、注册集或 Worker options。
+- Go 没有 friend package，因此 `investigationworkflow` 的少数低层构造器仍需导出给 `readassembly`；仓库
+  仅保留 bound roles 与 Activities 组装所需入口；单独 Starter/Control Worker 构造器及 connection compare
+  已降为包私有，外部真实服务测试只能使用 `_test.go` bridge。AST 门禁要求其余生产调用点恰好只存在于
+  Snapshot 桥，函数取值/别名同样拒绝，两个 public Dial 在本子阶段必须保持零生产调用。
+  Snapshot 的 control Activities 构造器已降为包私有；任何新 `cmd/internal` 绕过都会使测试失败，后续
+  supervisor 接入必须显式审查并收窄更新 allowlist。旧的共享角色 v1 `DialTemporalClient`、`NewStarter`
+  与 `NewWorker` 已标记 deprecated，并同样被锁为零生产调用，不能成为 plaintext/default-converter fallback；
+  `go.temporal.io/sdk/client|worker` 的 raw 生产 import 也被锁定到 `investigationworkflow` 内现有的六个
+  审核文件，新增文件默认失败。
+
+固定 identity 字符串不是授权机制。真实部署仍必须为 Starter 与 Control Worker 分配不同证书/凭据及最小
+Temporal RBAC；本地 mTLS 和 pinned dev-server 测试不能证明企业 PKI、namespace ACL 或 HA 服务端配置。
+一次 deployment probe 也不能约束后续 gRPC reconnect；DNS/VIP 必须只包含同一个 Temporal cluster，不能把
+active/standby 或独立 deployment 放在同一名称下，最好再使用 cluster 专属服务端 PKI/SPIFFE 身份。
+正常关闭顺序必须固定为 Control Worker `Stop` → Control Client `Close` → Starter Client `Close` →
+PostgreSQL 连接关闭。Temporal SDK 在 `OnFatalError` 返回后自行 `Stop`，因此 `Fatal()` 只允许 supervisor
+标记进程不健康并按 grace deadline 终止隔离进程，不能因该信号立即再次调用 Worker `Stop` 或关闭 clients；
+即使正常人工 `Stop` 已开始，随后与 SDK fatal auto-stop 重叠也没有可由 v1.46.0 公开 API 证明的进程内
+无竞态语义。该限制登记为 `C2-4c2 BLOCKED EXTERNAL GATE`：Worker/clients 必须位于独立子进程，父
+supervisor 对启动、Stop、fatal、panic 和通知丢失统一执行 deadline、强杀及 `Wait`/reap；在确定性 overlap
+shim 证明 containment 前 READ claims 不得开启。任何 fatal/stop 异常都使 rollout 失败，不能报告 graceful success。
+后续 READ Runner Worker 注册 Execute Activity 时也必须使用同样的 pointer-result adapter，并以 pinned
+dev-server 失败路径证明 `nil,error`；在此之前不得让 Runner 轮询真实 Activity queue。
 
 ## 固定协议身份
 
@@ -105,10 +178,10 @@ Start 后确认 executor 已收敛。
 
 ## 部署与后续门禁
 
-C2-4b 只能作为库和 testsuite 契约合并。C2-4c 才能在单一 assembly factory 中加载 plan、connector、
-target、egress、Bundle 和部署摘要，创建角色分离的 Temporal client/worker，安装真实 Outbox supervisor、
-`READ_TASK_PENDING` durable-handoff 监控、Gateway callbacks 与 READ Runner，并完成 PostgreSQL 16 + Temporal + mTLS Gateway + TLS 数据源的本地
-Signal→Evidence E2E。
+C2-4b、C2-4c1a 与 C2-4c1b 只能作为库和 testsuite 契约合并。后续 C2-4c 才能在受监督的常驻进程中
+加载 Snapshot 和 PostgreSQL repository，按固定关闭顺序持有上述 Temporal roles，安装真实 Outbox
+supervisor、`READ_TASK_PENDING` durable-handoff 监控、Gateway callbacks 与 READ Runner，并完成
+PostgreSQL 16 + Temporal + mTLS Gateway + TLS 数据源的本地 Signal→Evidence E2E。
 
 即使 C2-4c 完成，以下证据齐备前 Admission 仍必须关闭：真实 context-compliant Bearer provider、
 Heartbeat 事务内 Bundle 重新授权、企业 PKI/Temporal RBAC、NetworkPolicy/egress、源侧 DLP、无混版

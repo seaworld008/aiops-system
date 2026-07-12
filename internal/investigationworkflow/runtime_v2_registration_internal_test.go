@@ -24,8 +24,8 @@ func TestRuntimeV2RegistrationIsExplicitAndRunnerOptionsAreFailClosed(t *testing
 		t.Fatalf("NewRuntimeV2Activities() error = %v", err)
 	}
 	registry := &runtimeV2CaptureRegistry{}
-	if err := RegisterRuntimeV2(registry, activities); err != nil {
-		t.Fatalf("RegisterRuntimeV2() error = %v", err)
+	if err := registerRuntimeV2(registry, activities); err != nil {
+		t.Fatalf("registerRuntimeV2() error = %v", err)
 	}
 	if len(registry.workflows) != 1 || registry.workflows[0].Name != WorkflowNameV2 {
 		t.Fatalf("registered Workflows = %#v", registry.workflows)

@@ -45,7 +45,7 @@ func TestSnapshotCreatesRuntimeV2ActivitiesWithoutExportingRawPlanningComponents
 	if err != nil {
 		t.Fatal(err)
 	}
-	activities, err := snapshot.NewRuntimeV2Activities(repository, repository, recovery, "default")
+	activities, err := snapshot.newRuntimeV2Activities(repository, repository, recovery, "default")
 	if err != nil || activities == nil {
 		t.Fatalf("NewRuntimeV2Activities() = %#v, %v", activities, err)
 	}
@@ -67,11 +67,64 @@ func TestSnapshotCreatesRuntimeV2ActivitiesWithoutExportingRawPlanningComponents
 	}
 
 	copy := *snapshot
-	if activities, err := copy.NewRuntimeV2Activities(repository, repository, recovery, "default"); activities != nil || !errors.Is(err, investigationworkflow.ErrInvalidRuntimeV2Input) {
+	if activities, err := copy.newRuntimeV2Activities(repository, repository, recovery, "default"); activities != nil || !errors.Is(err, investigationworkflow.ErrInvalidRuntimeV2Input) {
 		t.Fatalf("copied Snapshot NewRuntimeV2Activities() = %#v, %v", activities, err)
 	}
-	if activities, err := snapshot.NewRuntimeV2Activities(nil, repository, recovery, "default"); activities != nil || !errors.Is(err, investigationworkflow.ErrInvalidRuntimeV2Input) {
+	if activities, err := snapshot.newRuntimeV2Activities(nil, repository, recovery, "default"); activities != nil || !errors.Is(err, investigationworkflow.ErrInvalidRuntimeV2Input) {
 		t.Fatalf("NewRuntimeV2Activities(nil reader) = %#v, %v", activities, err)
+	}
+}
+
+func TestSnapshotRuntimeV2TemporalRolesFailClosedBeforeTemporalAssembly(t *testing.T) {
+	fixture := newSnapshotFixture(t)
+	snapshot, err := LoadFiles(context.Background(), fixture.options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := memory.New(memory.Options{
+		Clock:     func() time.Time { return time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC) },
+		IDFactory: func() string { return "a0000000-0000-4000-8000-000000000002" },
+		TenantResolver: func(string) (string, error) {
+			return snapshotTenantID, nil
+		},
+		TaskSpecAuthorizer: snapshot.AuthorizeTaskSpec,
+		TaskRuntimeBinder:  snapshot.Bind,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := investigationworkflow.NewRecoveryActivities(snapshotRecoveryReader{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var factory func(
+		*investigationworkflow.RuntimeV2StarterClient,
+		*investigationworkflow.RuntimeV2ControlClient,
+		investigation.SignalRegistrationReader,
+		investigation.Repository,
+		*investigationworkflow.RecoveryActivities,
+	) (*investigationworkflow.RuntimeV2Starter, *investigationworkflow.RuntimeV2ControlWorker, error) = snapshot.NewRuntimeV2TemporalRoles
+	if factory == nil {
+		t.Fatal("Snapshot Runtime v2 role factory is nil")
+	}
+
+	starter, controlWorker, err := factory(nil, nil, repository, repository, recovery)
+	if starter != nil || controlWorker != nil ||
+		!errors.Is(err, investigationworkflow.ErrInvalidRuntimeV2Input) {
+		t.Fatalf("NewRuntimeV2TemporalRoles(nil clients) = %#v, %#v, %v", starter, controlWorker, err)
+	}
+	copy := *snapshot
+	starter, controlWorker, err = copy.NewRuntimeV2TemporalRoles(nil, nil, repository, repository, recovery)
+	if starter != nil || controlWorker != nil ||
+		!errors.Is(err, investigationworkflow.ErrInvalidRuntimeV2Input) {
+		t.Fatalf("copied Snapshot NewRuntimeV2TemporalRoles() = %#v, %#v, %v", starter, controlWorker, err)
+	}
+	var nilSnapshot *Snapshot
+	starter, controlWorker, err = nilSnapshot.NewRuntimeV2TemporalRoles(nil, nil, repository, repository, recovery)
+	if starter != nil || controlWorker != nil ||
+		!errors.Is(err, investigationworkflow.ErrInvalidRuntimeV2Input) {
+		t.Fatalf("nil Snapshot NewRuntimeV2TemporalRoles() = %#v, %#v, %v", starter, controlWorker, err)
 	}
 }
 

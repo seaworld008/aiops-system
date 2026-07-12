@@ -21,7 +21,7 @@ This directory separates current architecture, executable delivery plans, and su
 - [READ runtime bundle and closed admission](operations/read-runtime-bundle.md) — atomic connector/target/egress/executor digest graph, READ-only client capabilities, and the non-configurable closed claim gate.
 - [Investigation plan manifest](operations/investigation-plan-manifest.md) — trusted Signal scope, exact profile matching, four-digest binding, and fail-closed rollout boundary.
 - [Temporal investigation preparation](operations/temporal-investigation-preparation.md) — digest-bound Workflow/Activity, History allowlist, replay, and unassembled rollout boundary.
-- [Temporal READ orchestration](operations/temporal-read-orchestration.md) — v2 digest queues, recovery-first READ Task state machine, Runner Activity boundary, and closed rollout gate.
+- [Temporal READ orchestration](operations/temporal-read-orchestration.md) — v2 digest queues, recovery-first READ Task state machine, strict converter, server-attested role-isolated Starter/Control Worker, Runner Activity boundary, and closed rollout gate.
 - [Investigation runtime binding](operations/investigation-runtime-binding.md) — persistent Plan/Task/Attempt/Receipt runtime fences and migration gates.
 - [Investigation result recovery](operations/investigation-result-recovery.md) — DB-only deterministic recovery after completion-response loss.
 

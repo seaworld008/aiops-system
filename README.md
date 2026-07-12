@@ -28,7 +28,7 @@ AIOps System is designed around four rules:
 | --- | --- | --- |
 | Signal ingestion | Implemented | Scoped and signed Alertmanager/Nightingale webhooks, idempotency, deduplication foundations |
 | Read-only evidence | Implemented | Bounded clients for Prometheus, VictoriaLogs, Kubernetes, AWX, Argo CD, GitLab, Jenkins, and GitHub Actions |
-| Investigation | Implemented foundation | Persistent facts, a strict mTLS READ Task Gateway, an atomic connector/target/egress/executor Bundle, a recovery-first Temporal v2 Workflow, and a fixed READ Runner Activity exist as unassembled contracts; live process/Outbox assembly is absent and the non-configurable Admission remains closed pending M5C2-4c and external Go/No-Go gates |
+| Investigation | Implemented foundation | Persistent facts, a strict mTLS READ Task Gateway, an atomic connector/target/egress/executor Bundle, a recovery-first Temporal v2 Workflow, fixed READ Runner Activity, immutable assembly Snapshot, and role-isolated Temporal Starter/Control Worker exist as library contracts; live process/Outbox assembly is absent and the non-configurable Admission remains closed pending M5C2-4c and external Go/No-Go gates |
 | Identity and policy | Implemented foundation | Keycloak OIDC, workspace/environment RBAC, signed ActionEnvelope, three-stage CEL decisions |
 | Execution safety | Implemented foundation | Exact runner scopes, durable credential revocation, TLS 1.3 mTLS Gateway, split READ/WRITE images, fixed killable executor, target locks, heartbeat, cancellation, and reconciliation |
 | Production automation | **Disabled** | Requires fixed real adapters, external sandbox/network gates, non-production drills, and formal Go/No-Go approval |

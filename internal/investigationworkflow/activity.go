@@ -30,6 +30,9 @@ type Activities struct {
 	planner    *investigationplan.Planner
 }
 
+// NewActivities is a low-level preparation constructor. Production v2
+// callsites are repository-gated to readassembly.Snapshot so callers cannot
+// inject a foreign Planner or authority into the live Temporal graph.
 func NewActivities(
 	reader investigation.SignalRegistrationReader,
 	repository preparationRepository,

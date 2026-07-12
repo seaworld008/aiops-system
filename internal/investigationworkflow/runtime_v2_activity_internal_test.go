@@ -92,6 +92,11 @@ func TestRuntimeV2PrepareRejectsNonActivityContextBeforeTrustedReads(t *testing.
 	if reader.calls.Load() != 0 {
 		t.Fatalf("untrusted Activity context reached Signal reader %d times", reader.calls.Load())
 	}
+	pointerResult, pointerErr := activities.registeredPrepareActivityV2(context.Background(), input)
+	if pointerResult != nil || !errors.As(pointerErr, &applicationError) ||
+		applicationError.Type() != "READ_PREPARE_EXECUTION_MISMATCH" {
+		t.Fatalf("registeredPrepareActivityV2(non Activity) = %#v, %v", pointerResult, pointerErr)
+	}
 }
 
 func TestRuntimeV2ControlActivityInfoIsExactAndRejectedBeforeRecoveryRead(t *testing.T) {
@@ -173,6 +178,12 @@ func TestRuntimeV2ControlActivityInfoIsExactAndRejectedBeforeRecoveryRead(t *tes
 	if result.Version != 0 || !errors.As(err, &applicationError) ||
 		applicationError.Type() != "READ_RESULT_RECOVERY_EXECUTION_MISMATCH" || recoveryReader.calls.Load() != 0 {
 		t.Fatalf("recoverActivityV1(untrusted context) = %#v, %v; reads=%d", result, err, recoveryReader.calls.Load())
+	}
+	pointerResult, pointerErr := activities.registeredRecoverActivityV1(context.Background(), input)
+	if pointerResult != nil || !errors.As(pointerErr, &applicationError) ||
+		applicationError.Type() != "READ_RESULT_RECOVERY_EXECUTION_MISMATCH" || recoveryReader.calls.Load() != 0 {
+		t.Fatalf("registeredRecoverActivityV1(untrusted context) = %#v, %v; reads=%d",
+			pointerResult, pointerErr, recoveryReader.calls.Load())
 	}
 }
 

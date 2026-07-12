@@ -82,6 +82,10 @@ type TemporalClient struct {
 // DialTemporalClient installs the package-owned memo routing converter over
 // Temporal's fixed default converter. Custom converter profiles are rejected
 // until a profile digest can be bound to the task queue and workflow identity.
+//
+// Deprecated: this shared-role v1 compatibility path is test-only. A repository
+// architecture gate requires zero production callsites; new assembly must use
+// the separate Runtime v2 mTLS role capabilities.
 func DialTemporalClient(ctx context.Context, options client.Options) (*TemporalClient, error) {
 	if ctx == nil {
 		return nil, errTemporalClientRejected
