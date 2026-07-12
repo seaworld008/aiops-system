@@ -7,7 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
+
+	"github.com/seaworld008/aiops-system/internal/domain"
+	"github.com/seaworld008/aiops-system/internal/readtask"
 )
 
 const (
@@ -80,6 +84,7 @@ type ExecutionSpec struct {
 	operation      string
 	targetRef      string
 	contractDigest string
+	inputHash      string
 	lookback       time.Duration
 	prometheus     *prometheusExecution
 	victoria       *victoriaExecution
@@ -106,6 +111,44 @@ func (spec ExecutionSpec) Operation() string       { return spec.operation }
 func (spec ExecutionSpec) TargetRef() string       { return spec.targetRef }
 func (spec ExecutionSpec) ContractDigest() string  { return spec.contractDigest }
 func (spec ExecutionSpec) Lookback() time.Duration { return spec.lookback }
+
+// MatchesDescriptor proves that this process-owned resolution was derived
+// from the exact persisted task input and runtime component fences. It keeps
+// callers from pairing a valid descriptor with a different resolution from
+// the same connector.
+func (spec ExecutionSpec) MatchesDescriptor(descriptor readtask.Descriptor) bool {
+	return descriptor.Validate() == nil && spec.operation == descriptor.Operation &&
+		domain.ValidSHA256Hex(spec.contractDigest) && spec.contractDigest == descriptor.RuntimeBinding.ConnectorDigest &&
+		domain.ValidSHA256Hex(spec.inputHash) && spec.inputHash == descriptor.InputHash &&
+		domain.ConnectorDigestMatchesID(descriptor.ConnectorID, spec.contractDigest) &&
+		domain.ValidSHA256Hex(descriptor.RuntimeBinding.TargetDigest) &&
+		strings.HasSuffix(spec.targetRef, "-v1-"+descriptor.RuntimeBinding.TargetDigest)
+}
+
+// ValidateEvidence applies the same immutable connector contract inside the
+// READ executor before the Gateway independently validates the completion.
+// It accepts no caller-supplied scope, query, target, digest, or budget.
+func (spec ExecutionSpec) ValidateEvidence(evidence readtask.EvidenceCompletion) error {
+	if spec.lookback <= 0 || !domain.ValidSHA256Hex(spec.contractDigest) || !domain.ValidSHA256Hex(spec.inputHash) {
+		return ErrContractRejected
+	}
+	switch {
+	case spec.kind == KindPrometheus && spec.operation == OperationPrometheusRangeQuery &&
+		spec.prometheus != nil && spec.victoria == nil && spec.prometheus.step > 0 &&
+		spec.prometheus.step%time.Second == 0:
+		return validatePrometheusEvidence(PrometheusRangeQueryV1{
+			StepSeconds: int(spec.prometheus.step / time.Second), MaxItems: spec.prometheus.maxItems,
+			MaxSamples: spec.prometheus.maxSamples,
+		}, evidence, spec.lookback)
+	case spec.kind == KindVictoriaLogs && spec.operation == OperationVictoriaLogsSearch &&
+		spec.prometheus == nil && spec.victoria != nil:
+		return validateVictoriaEvidence(VictoriaLogsSearchV1{
+			Fields: append([]FieldSpec(nil), spec.victoria.fields...), Limit: spec.victoria.limit,
+		}, evidence, spec.lookback)
+	default:
+		return ErrContractRejected
+	}
+}
 
 func (spec ExecutionSpec) PrometheusRangeQuery() (PrometheusRangeExecution, bool) {
 	if spec.prometheus == nil {

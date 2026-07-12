@@ -28,7 +28,7 @@ AIOps System 坚持四条原则：
 | --- | --- | --- |
 | 信号接入 | 已实现 | Alertmanager/夜莺作用域验签、幂等与去重基础 |
 | 只读证据 | 已实现 | Prometheus、VictoriaLogs、Kubernetes、AWX、Argo CD、GitLab、Jenkins、GitHub Actions 有界客户端 |
-| 调查引擎 | 基础已实现 | 有界并行取证、`PARTIAL` 降级、混合模型路由、证据关联假设 |
+| 调查引擎 | 基础已实现 | 持久调查事实、严格 mTLS READ Task Gateway、不可变 connector/target/runtime binding，以及固定进程内 Prometheus/VictoriaLogs executor；尚无 live Runner/Temporal 装配，READ claims 在 M5C2-4 门禁前保持关闭 |
 | 身份与策略 | 基础已实现 | Keycloak OIDC、Workspace/Environment RBAC、签名 ActionEnvelope、CEL 三阶段裁决 |
 | 执行安全 | 基础已实现 | 精确 Runner scope、持久凭据吊销、TLS 1.3 mTLS Gateway、READ/WRITE 拆分镜像、固定可终止 Executor、目标锁、心跳、取消和对账 |
 | 生产自动化 | **关闭** | 仍需固定真实适配器、外部 sandbox/网络门禁、非生产演练与正式 Go/No-Go 审查 |

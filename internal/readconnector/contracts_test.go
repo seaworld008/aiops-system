@@ -28,6 +28,8 @@ func TestPrometheusRangeCompletionContractRejectsEveryShapeOrBudgetDrift(t *test
 		"missing metric":           json.RawMessage(fmt.Sprintf(`{"values":[[%d,"1"]]}`, now.Unix())),
 		"missing values":           json.RawMessage(`{"metric":{"job":"api"}}`),
 		"extra field":              json.RawMessage(fmt.Sprintf(`{"metric":{},"values":[[%d,"1"]],"histograms":[]}`, now.Unix())),
+		"case-folded metric":       json.RawMessage(fmt.Sprintf(`{"METRIC":{},"values":[[%d,"1"]]}`, now.Unix())),
+		"case-folded metric alias": json.RawMessage(fmt.Sprintf(`{"metric":null,"METRIC":{},"values":[[%d,"1"]]}`, now.Unix())),
 		"native histogram":         json.RawMessage(fmt.Sprintf(`{"metric":{},"values":[[%d,{"count":"1"}]]}`, now.Unix())),
 		"bad label":                json.RawMessage(fmt.Sprintf(`{"metric":{"bad-label":"x"},"values":[[%d,"1"]]}`, now.Unix())),
 		"reserved label":           json.RawMessage(fmt.Sprintf(`{"metric":{"source":"x"},"values":[[%d,"1"]]}`, now.Unix())),

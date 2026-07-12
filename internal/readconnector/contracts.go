@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -126,6 +127,9 @@ func parseLookback(item entry, raw json.RawMessage) (time.Duration, error) {
 }
 
 func strictDecodeObject(raw []byte, target any) error {
+	if exactTopLevelJSONFields(raw, target) != nil {
+		return ErrContractRejected
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	decoder.UseNumber()
@@ -135,6 +139,44 @@ func strictDecodeObject(raw []byte, target any) error {
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return ErrContractRejected
+	}
+	return nil
+}
+
+func exactTopLevelJSONFields(raw []byte, target any) error {
+	if target == nil {
+		return ErrContractRejected
+	}
+	targetType := reflect.TypeOf(target)
+	for targetType.Kind() == reflect.Pointer {
+		targetType = targetType.Elem()
+	}
+	if targetType.Kind() != reflect.Struct {
+		return ErrContractRejected
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) != nil || object == nil {
+		return ErrContractRejected
+	}
+	allowed := make(map[string]struct{}, targetType.NumField())
+	for index := 0; index < targetType.NumField(); index++ {
+		field := targetType.Field(index)
+		if field.PkgPath != "" {
+			continue
+		}
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if name == "-" {
+			continue
+		}
+		if name == "" {
+			name = field.Name
+		}
+		allowed[name] = struct{}{}
+	}
+	for name := range object {
+		if _, exists := allowed[name]; !exists {
+			return ErrContractRejected
+		}
 	}
 	return nil
 }

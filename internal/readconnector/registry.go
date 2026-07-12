@@ -181,7 +181,8 @@ func (registry *Registry) ResolveTaskSpec(
 	if err != nil {
 		return ExecutionSpec{}, ErrContractRejected
 	}
-	return resolvedExecutionSpec(item, lookback), nil
+	inputDigest := sha256.Sum256(spec.Input)
+	return resolvedExecutionSpec(item, lookback, hex.EncodeToString(inputDigest[:])), nil
 }
 
 func (registry *Registry) AuthorizeStart(ctx context.Context, descriptor readtask.Descriptor) error {
@@ -238,13 +239,13 @@ func (registry *Registry) ResolveExecution(descriptor readtask.Descriptor) (Exec
 	if err != nil {
 		return ExecutionSpec{}, readtask.ErrIntegrity
 	}
-	return resolvedExecutionSpec(item, lookback), nil
+	return resolvedExecutionSpec(item, lookback, descriptor.InputHash), nil
 }
 
-func resolvedExecutionSpec(item entry, lookback time.Duration) ExecutionSpec {
+func resolvedExecutionSpec(item entry, lookback time.Duration, inputHash string) ExecutionSpec {
 	resolved := ExecutionSpec{
 		kind: item.kind, operation: item.operation, targetRef: item.targetRef,
-		contractDigest: item.contractDigest, lookback: lookback,
+		contractDigest: item.contractDigest, inputHash: inputHash, lookback: lookback,
 	}
 	if item.prometheus != nil {
 		resolved.prometheus = &prometheusExecution{
@@ -423,6 +424,7 @@ func entryContractDigest(item entry) (string, error) {
 	document := struct {
 		SchemaVersion                string                  `json:"schema_version"`
 		ValidatorProfile             string                  `json:"validator_profile"`
+		JSONFieldProfile             string                  `json:"json_field_profile"`
 		NumericProfile               string                  `json:"numeric_profile"`
 		EvidenceFieldsProfile        string                  `json:"evidence_fields_profile"`
 		Scope                        Scope                   `json:"scope"`
@@ -440,8 +442,9 @@ func entryContractDigest(item entry) (string, error) {
 		MaxVictoriaFields            int                     `json:"max_victorialogs_fields"`
 		MaxVictoriaStringBytes       int                     `json:"max_victorialogs_string_bytes"`
 	}{
-		SchemaVersion: entryContractSchemaV1, ValidatorProfile: "read-connector-validator.v1",
-		NumericProfile: "jcs-ijson-safe-integer.v1", EvidenceFieldsProfile: "readtask-evidence-fields.v2",
+		SchemaVersion: entryContractSchemaV1, ValidatorProfile: "read-connector-validator.v2",
+		JSONFieldProfile: "exact-case-no-folded-alias.v1",
+		NumericProfile:   "jcs-ijson-safe-integer.v1", EvidenceFieldsProfile: "readtask-evidence-fields.v2",
 		Scope: item.scope, TargetRef: item.targetRef, Kind: item.kind, Operation: item.operation,
 		PrometheusRangeQuery: item.prometheus, VictoriaLogsSearch: item.victoria,
 		MaxEvidenceBytes: readtask.MaxEvidencePayloadBytes, MaxEvidenceDepth: readtask.MaxEvidenceJSONDepth,
