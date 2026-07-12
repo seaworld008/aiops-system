@@ -103,15 +103,33 @@ func (response ReadTaskDescriptor) valid() bool {
 	if !uuidPattern.MatchString(response.ID) || len(response.Key) == 0 || len(response.Key) > 64 ||
 		response.Position < 1 || response.Position > 12 || !domain.ValidConnectorID(response.ConnectorID) ||
 		!domain.ValidOperation(response.Operation) || !hashPattern.MatchString(response.InputHash) ||
-		domain.ValidateSafeJSONObject(response.Input) != nil {
+		domain.ValidateSafeJSONObject(response.Input) != nil || !response.PlanBinding.valid() ||
+		!response.RuntimeBinding.valid() ||
+		!domain.ConnectorDigestMatchesID(response.ConnectorID, response.RuntimeBinding.ConnectorDigest) {
 		return false
 	}
 	digest := sha256.Sum256(response.Input)
 	return hex.EncodeToString(digest[:]) == response.InputHash
 }
 
+func (response ReadTaskPlanBinding) valid() bool {
+	return (domain.InvestigationPlanBinding{
+		SchemaVersion: response.SchemaVersion, ManifestDigest: response.ManifestDigest,
+		RegistryDigest: response.RegistryDigest, ProfileDigest: response.ProfileDigest,
+		TasksHash: response.TasksHash,
+	}).Validate() == nil
+}
+
+func (response ReadTaskRuntimeBinding) valid() bool {
+	return (domain.ReadTaskRuntimeBinding{
+		SchemaVersion: response.SchemaVersion, ConnectorDigest: response.ConnectorDigest,
+		TargetDigest: response.TargetDigest, ExecutorDigest: response.ExecutorDigest,
+		RuntimeDigest: response.RuntimeDigest, BoundAt: response.BoundAt,
+	}).Validate() == nil
+}
+
 func (response ReadTaskClaimResponse) valid() bool {
-	return response.SchemaVersion == "runner-read-task-claim-response.v1" && response.Task.valid() &&
+	return response.SchemaVersion == "runner-read-task-claim-response.v2" && response.Task.valid() &&
 		readTaskTokenPattern.MatchString(response.LeaseToken) && response.LeaseEpoch > 0 &&
 		response.ScopeRevision > 0 && validReadTaskTime(response.LeaseExpiresAt) &&
 		response.HeartbeatAfterSeconds == readTaskHeartbeatAfterSeconds
@@ -137,7 +155,7 @@ func (response ReadTaskReleaseResponse) valid() bool {
 }
 
 func (response ReadTaskCompleteResponse) valid() bool {
-	if response.SchemaVersion != "runner-read-task-complete-response.v1" ||
+	if response.SchemaVersion != "runner-read-task-complete-response.v2" ||
 		!uuidPattern.MatchString(response.TaskID) || response.LeaseEpoch <= 0 ||
 		response.AttemptStatus != string(readtask.AttemptCompleted) || !uuidPattern.MatchString(response.ReceiptID) ||
 		!hashPattern.MatchString(response.ReceiptHash) {

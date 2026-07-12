@@ -63,6 +63,7 @@ func newRegisteredSignalMockRepository(t *testing.T) (pgxmock.PgxPoolIface, *Rep
 	}
 	t.Cleanup(database.Close)
 	repository, err := New(database, Options{
+		TaskRuntimeBinder:  testTaskRuntimeBinder,
 		IDFactory:          func() string { return writeMockInvestigationID },
 		TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error { return nil },
 	})

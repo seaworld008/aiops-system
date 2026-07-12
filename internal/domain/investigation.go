@@ -28,19 +28,21 @@ const (
 )
 
 type Investigation struct {
-	ID               string
-	WorkspaceID      string
-	IncidentID       string
-	Status           InvestigationStatus
-	ModelStatus      ModelStatus
-	IdempotencyKey   string
-	RequestHash      string
-	FailureCode      string
-	ModelFailureCode string
-	CreatedAt        time.Time
-	StartedAt        time.Time
-	CompletedAt      time.Time
-	UpdatedAt        time.Time
+	ID                 string
+	WorkspaceID        string
+	IncidentID         string
+	Status             InvestigationStatus
+	ModelStatus        ModelStatus
+	IdempotencyKey     string
+	RequestHash        string
+	RequestHashVersion string
+	PlanBinding        InvestigationPlanBinding
+	FailureCode        string
+	ModelFailureCode   string
+	CreatedAt          time.Time
+	StartedAt          time.Time
+	CompletedAt        time.Time
+	UpdatedAt          time.Time
 }
 
 func (investigation Investigation) Validate() error {
@@ -67,6 +69,18 @@ func (investigation Investigation) Validate() error {
 	}
 	if !ValidSHA256Hex(investigation.RequestHash) {
 		return fmt.Errorf("investigation request hash is invalid")
+	}
+	switch investigation.RequestHashVersion {
+	case InvestigationCreateRequestVersionV1:
+		if !investigation.PlanBinding.IsZero() {
+			return fmt.Errorf("legacy investigation cannot contain a plan binding")
+		}
+	case InvestigationCreateRequestVersionV2:
+		if err := investigation.PlanBinding.Validate(); err != nil {
+			return fmt.Errorf("bound investigation plan is invalid")
+		}
+	default:
+		return fmt.Errorf("investigation request hash version is invalid")
 	}
 	switch investigation.Status {
 	case InvestigationFailed, InvestigationCancelled:

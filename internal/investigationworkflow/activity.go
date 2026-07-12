@@ -138,7 +138,7 @@ func (activities *Activities) prepare(ctx context.Context, input WorkflowInput) 
 	created, err := activities.repository.CreateOrGetInvestigation(ctx, investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: input.WorkspaceID, IncidentID: correlated.Incident.ID,
 		IdempotencyKey: "temporal.prepare.v1/" + input.OutboxEventID,
-		Tasks:          plan.TaskSpecs(),
+		PlanBinding:    planBinding(plan), Tasks: plan.TaskSpecs(),
 	})
 	if err != nil {
 		return PreparationReceipt{}, mapDependencyError(ctx, err)
@@ -187,6 +187,14 @@ func validIncidentForPlan(incident domain.Incident, plan investigationplan.Plan)
 		incident.MappingStatus == scope.MappingStatus && incident.CorrelationKey == correlation.CorrelationKey
 }
 
+func planBinding(plan investigationplan.Plan) domain.InvestigationPlanBinding {
+	return domain.InvestigationPlanBinding{
+		SchemaVersion:  domain.InvestigationPlanBindingSchemaVersion,
+		ManifestDigest: plan.ManifestDigest(), RegistryDigest: plan.RegistryDigest(),
+		ProfileDigest: plan.ProfileDigest(), TasksHash: plan.TasksHash(),
+	}
+}
+
 func validInvestigationProjection(
 	input WorkflowInput,
 	incidentID string,
@@ -194,12 +202,14 @@ func validInvestigationProjection(
 	tasks []domain.ReadTask,
 	plan investigationplan.Plan,
 ) bool {
+	expectedPlanBinding := planBinding(plan)
 	if item.Validate() != nil || item.WorkspaceID != input.WorkspaceID || item.IncidentID != incidentID ||
+		item.RequestHashVersion != domain.InvestigationCreateRequestVersionV2 || !item.PlanBinding.Equal(expectedPlanBinding) ||
 		len(tasks) == 0 || len(tasks) > 12 {
 		return false
 	}
 	expectedRequestHash, err := investigation.CreateOrGetInvestigationRequestHash(
-		investigation.CreateOrGetInvestigationRequest{IncidentID: incidentID}, plan.TasksHash(),
+		investigation.CreateOrGetInvestigationRequest{IncidentID: incidentID, PlanBinding: expectedPlanBinding}, plan.TasksHash(),
 	)
 	if err != nil || item.RequestHash != expectedRequestHash {
 		return false
@@ -214,6 +224,16 @@ func validInvestigationProjection(
 			task.IncidentID != incidentID || task.InvestigationID != item.ID || !workflowUUID.MatchString(task.ID) ||
 			task.Key != want[index].Key || task.ConnectorID != want[index].ConnectorID ||
 			task.Operation != want[index].Operation || !bytes.Equal(task.Input, want[index].Input) {
+			return false
+		}
+		expectedRuntimeBinding, bindingErr := investigation.BuildReadTaskRuntimeBinding(
+			plan.Scope(), expectedPlanBinding, want[index], index+1,
+			investigation.TaskRuntimeComponents{
+				ConnectorDigest: task.RuntimeBinding.ConnectorDigest,
+				TargetDigest:    task.RuntimeBinding.TargetDigest, ExecutorDigest: task.RuntimeBinding.ExecutorDigest,
+			}, task.RuntimeBinding.BoundAt,
+		)
+		if bindingErr != nil || !task.RuntimeBinding.Equal(expectedRuntimeBinding) {
 			return false
 		}
 		inputHash := sha256.Sum256(task.Input)
@@ -239,7 +259,9 @@ func validInvestigationProjection(
 
 func sameImmutableInvestigation(left, right domain.Investigation) bool {
 	return left.ID == right.ID && left.WorkspaceID == right.WorkspaceID && left.IncidentID == right.IncidentID &&
-		left.IdempotencyKey == right.IdempotencyKey && left.RequestHash == right.RequestHash && left.CreatedAt.Equal(right.CreatedAt)
+		left.IdempotencyKey == right.IdempotencyKey && left.RequestHash == right.RequestHash &&
+		left.RequestHashVersion == right.RequestHashVersion && left.PlanBinding.Equal(right.PlanBinding) &&
+		left.CreatedAt.Equal(right.CreatedAt)
 }
 
 func sameImmutableTasks(left, right []domain.ReadTask) bool {
@@ -252,6 +274,7 @@ func sameImmutableTasks(left, right []domain.ReadTask) bool {
 			left[index].Key != right[index].Key || left[index].Position != right[index].Position ||
 			left[index].ConnectorID != right[index].ConnectorID || left[index].Operation != right[index].Operation ||
 			left[index].InputHash != right[index].InputHash || !bytes.Equal(left[index].Input, right[index].Input) ||
+			!left[index].RuntimeBinding.Equal(right[index].RuntimeBinding) ||
 			!left[index].CreatedAt.Equal(right[index].CreatedAt) {
 			return false
 		}

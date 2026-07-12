@@ -22,7 +22,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/execution"
+	"github.com/seaworld008/aiops-system/internal/investigation"
 	"github.com/seaworld008/aiops-system/internal/readtask"
 	readtaskpostgres "github.com/seaworld008/aiops-system/internal/readtask/postgres"
 	"github.com/seaworld008/aiops-system/internal/runneridentity"
@@ -52,6 +54,7 @@ func TestRepositoryPostgres16PersistsAuthenticatedLifecycleAndCompletionReplay(t
 	fixture := newRepositoryIntegrationFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	verifyPostCutoverRejectsUnboundWriters(t, ctx, fixture.database)
 
 	claim, err := repositoryRunnerTransaction(ctx, fixture, func(
 		tx pgx.Tx,
@@ -170,6 +173,72 @@ func TestRepositoryPostgres16PersistsAuthenticatedLifecycleAndCompletionReplay(t
 	verifyOldEpochAndTokenRejected(t, ctx, fixture)
 	verifyScopeRevisionDriftTerminatesAndTerminalHistoryIsImmutable(t, ctx, fixture)
 	verifyUnsafeRunnerIngressDownIsAtomic(t, ctx, fixture)
+}
+
+func verifyPostCutoverRejectsUnboundWriters(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+) {
+	t.Helper()
+	const (
+		legacyInvestigationID = "88000000-0000-4000-8000-000000000099"
+		unboundTaskID         = "99000000-0000-4000-8000-000000000099"
+		legacyLedgerKey       = "investigate:post-cutover-ledger-v1"
+	)
+	_, err := database.Exec(ctx, `
+		INSERT INTO investigations (
+			id, tenant_id, workspace_id, incident_id, status, window_start, window_end,
+			tool_schema_version, created_at, model_status, idempotency_key, request_hash,
+			request_hash_version, updated_at, service_id_snapshot, environment_id_snapshot,
+			mapping_status_snapshot, runtime_schema_version
+		) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'QUEUED',
+			clock_timestamp() - interval '1 minute', clock_timestamp(), 'investigation-task.v1',
+			clock_timestamp(), 'PENDING', 'investigate:post-cutover-legacy', $5,
+			'investigation.create.v1', clock_timestamp(), $6::uuid, $7::uuid,
+			'EXACT', 'investigation-runtime.v1')
+	`, legacyInvestigationID, integrationTenantID, integrationWorkspaceID, integrationIncidentID,
+		strings.Repeat("9", 64), integrationServiceID, integrationEnvironmentID)
+	expectIntegrationConstraint(t, err, "23514", "investigations_plan_binding_insert_guard")
+
+	_, err = database.Exec(ctx, `
+		INSERT INTO tool_invocations (
+			id, tenant_id, workspace_id, investigation_id, tool_name, tool_version,
+			input_hash, status, incident_id, task_key, position, input_document,
+			created_at, updated_at, runtime_schema_version
+		) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'legacy-reader', 'search',
+			$5, 'QUEUED', $6::uuid, 'legacy.unbound', 12, $7, clock_timestamp(),
+			clock_timestamp(), 'investigation-runtime.v1')
+	`, unboundTaskID, integrationTenantID, integrationWorkspaceID, integrationInvestigationID,
+		strings.Repeat("8", 64), integrationIncidentID, []byte(`{"query":"health"}`))
+	expectIntegrationConstraint(t, err, "23514", "tool_invocations_runtime_binding_insert_guard")
+
+	_, err = database.Exec(ctx, `
+		INSERT INTO investigation_idempotency_records (
+			tenant_id, workspace_id, idempotency_key, operation, request_hash,
+			request_hash_version, resource_type, resource_id
+		) VALUES ($1::uuid, $2::uuid, $3, 'create_investigation', $4,
+			'investigation.create.v1', 'INVESTIGATION', $5::uuid)
+	`, integrationTenantID, integrationWorkspaceID, legacyLedgerKey, strings.Repeat("7", 64), integrationInvestigationID)
+	expectIntegrationConstraint(t, err, "23514", "investigation_idempotency_create_v2_insert_guard")
+
+	var persisted int
+	if err := database.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM investigations WHERE id = $1::uuid) +
+			(SELECT count(*) FROM tool_invocations WHERE id = $2::uuid) +
+			(SELECT count(*) FROM investigation_idempotency_records WHERE idempotency_key = $3)
+	`, legacyInvestigationID, unboundTaskID, legacyLedgerKey).Scan(&persisted); err != nil || persisted != 0 {
+		t.Fatalf("post-cutover rejected writes persisted=%d, error=%v", persisted, err)
+	}
+}
+
+func expectIntegrationConstraint(t *testing.T, err error, sqlState, constraint string) {
+	t.Helper()
+	var postgresError *pgconn.PgError
+	if !errors.As(err, &postgresError) || postgresError.Code != sqlState || postgresError.ConstraintName != constraint {
+		t.Fatalf("PostgreSQL error = %v, want SQLSTATE %s constraint %s", err, sqlState, constraint)
+	}
 }
 
 func TestInvestigationRunnerIngressPostgres16AllowsEmptyDown(t *testing.T) {
@@ -573,7 +642,7 @@ type repositoryIntegrationFixture struct {
 func newRepositoryIntegrationFixture(t *testing.T) *repositoryIntegrationFixture {
 	t.Helper()
 	harness := newReadTaskPostgresHarness(t)
-	harness.applyThroughRunnerIngress(t)
+	harness.applyThroughRuntimeBinding(t)
 	identity := newRepositoryIntegrationIdentity(t)
 	seedRuntimeInvestigation(t, harness.database)
 	seedRepositoryIntegrationRunner(t, harness.database, identity)
@@ -655,24 +724,40 @@ func verifyCommittedReadTaskCompletion(
 	ctx := context.Background()
 	digest := sha256.Sum256(bearerToken)
 	wantTokenHash := hex.EncodeToString(digest[:])
-	var tokenHash, attemptStatus, requestHash, receiptHash, attemptDocument string
+	var tokenHash, attemptStatus, requestHash, receiptHash, requestHashVersion, receiptHashVersion, attemptDocument string
+	var planSchema, planManifest, planRegistry, planProfile, planTasks string
+	var runtimeSchema, connectorDigest, targetDigest, executorDigest, runtimeDigest string
+	var runtimeBoundAt time.Time
 	if err := database.QueryRow(ctx, `
-		SELECT lease_token_sha256, status, request_hash, receipt_hash, to_jsonb(attempt)::text
+		SELECT lease_token_sha256, status, request_hash, receipt_hash,
+		       request_hash_version, receipt_hash_version,
+		       plan_schema_version, plan_manifest_digest, plan_registry_digest,
+		       plan_profile_digest, plan_tasks_hash,
+		       read_runtime_schema_version, connector_digest, target_digest,
+		       executor_digest, runtime_digest, runtime_bound_at,
+		       to_jsonb(attempt)::text
 		FROM investigation_task_attempts AS attempt
 		WHERE tenant_id = $1::uuid AND workspace_id = $2::uuid
 		  AND investigation_id = $3::uuid AND task_id = $4::uuid AND lease_epoch = $5
 	`, integrationTenantID, integrationWorkspaceID, integrationInvestigationID,
 		integrationLifecycleTaskID, claim.Attempt().Epoch).Scan(
-		&tokenHash, &attemptStatus, &requestHash, &receiptHash, &attemptDocument,
+		&tokenHash, &attemptStatus, &requestHash, &receiptHash, &requestHashVersion, &receiptHashVersion,
+		&planSchema, &planManifest, &planRegistry, &planProfile, &planTasks,
+		&runtimeSchema, &connectorDigest, &targetDigest, &executorDigest, &runtimeDigest, &runtimeBoundAt,
+		&attemptDocument,
 	); err != nil {
 		t.Fatalf("read completed attempt: %v", err)
 	}
 	if tokenHash != wantTokenHash || attemptStatus != "COMPLETED" ||
 		requestHash != result.Projection.RequestHash() || receiptHash != result.Projection.ReceiptHash() ||
+		requestHashVersion != readtask.CompletionRequestHashVersionV3 ||
+		receiptHashVersion != readtask.CompletionReceiptHashVersionV3 ||
 		strings.Contains(attemptDocument, string(bearerToken)) {
 		t.Fatalf("unsafe completed attempt: token=%q status=%q request=%q receipt=%q document=%q",
 			tokenHash, attemptStatus, requestHash, receiptHash, attemptDocument)
 	}
+	assertStoredRuntimeBinding(t, claim.Descriptor(), planSchema, planManifest, planRegistry, planProfile, planTasks,
+		runtimeSchema, connectorDigest, targetDigest, executorDigest, runtimeDigest, runtimeBoundAt)
 	var plaintextTokenColumns int
 	if err := database.QueryRow(ctx, `
 		SELECT count(*) FROM information_schema.columns
@@ -706,25 +791,62 @@ func verifyCommittedReadTaskCompletion(
 		t.Fatalf("Evidence projection mismatch: hash=%q trust=%q payload=%s", evidenceHash, trustLevel, evidencePayload)
 	}
 
-	var schemaVersion string
+	var schemaVersion, receiptRequestHashVersion, storedReceiptHashVersion string
 	var leaseEpoch int64
 	var receiptEvidenceID, receiptRequestHash, storedReceiptHash string
+	var receiptPlanSchema, receiptPlanManifest, receiptPlanRegistry, receiptPlanProfile, receiptPlanTasks string
+	var receiptRuntimeSchema, receiptConnectorDigest, receiptTargetDigest, receiptExecutorDigest, receiptRuntimeDigest string
+	var receiptRuntimeBoundAt time.Time
 	if err := database.QueryRow(ctx, `
-		SELECT schema_version, lease_epoch, evidence_id::text, request_hash, receipt_hash
+		SELECT schema_version, lease_epoch, evidence_id::text, request_hash, receipt_hash,
+		       request_hash_version, receipt_hash_version,
+		       plan_schema_version, plan_manifest_digest, plan_registry_digest,
+		       plan_profile_digest, plan_tasks_hash,
+		       read_runtime_schema_version, connector_digest, target_digest,
+		       executor_digest, runtime_digest, runtime_bound_at
 		FROM runner_evidence_receipts
 		WHERE tenant_id = $1::uuid AND id = $2::uuid
 	`, integrationTenantID, result.ReceiptID).Scan(
 		&schemaVersion, &leaseEpoch, &receiptEvidenceID, &receiptRequestHash, &storedReceiptHash,
+		&receiptRequestHashVersion, &storedReceiptHashVersion,
+		&receiptPlanSchema, &receiptPlanManifest, &receiptPlanRegistry, &receiptPlanProfile, &receiptPlanTasks,
+		&receiptRuntimeSchema, &receiptConnectorDigest, &receiptTargetDigest, &receiptExecutorDigest,
+		&receiptRuntimeDigest, &receiptRuntimeBoundAt,
 	); err != nil {
-		t.Fatalf("read immutable v2 receipt: %v", err)
+		t.Fatalf("read immutable v3 receipt: %v", err)
 	}
-	if schemaVersion != "runner-evidence.v2" || leaseEpoch != claim.Attempt().Epoch ||
+	if schemaVersion != readtask.RunnerEvidenceSchemaVersionV3 || leaseEpoch != claim.Attempt().Epoch ||
+		receiptRequestHashVersion != readtask.CompletionRequestHashVersionV3 ||
+		storedReceiptHashVersion != readtask.CompletionReceiptHashVersionV3 ||
 		receiptEvidenceID != result.EvidenceID || receiptRequestHash != result.Projection.RequestHash() ||
 		storedReceiptHash != result.Projection.ReceiptHash() {
 		t.Fatalf("receipt projection mismatch: %q/%d/%q/%q/%q", schemaVersion, leaseEpoch,
 			receiptEvidenceID, receiptRequestHash, storedReceiptHash)
 	}
+	assertStoredRuntimeBinding(t, claim.Descriptor(), receiptPlanSchema, receiptPlanManifest, receiptPlanRegistry,
+		receiptPlanProfile, receiptPlanTasks, receiptRuntimeSchema, receiptConnectorDigest, receiptTargetDigest,
+		receiptExecutorDigest, receiptRuntimeDigest, receiptRuntimeBoundAt)
 	verifySingleCompletionProjection(t, database)
+}
+
+func assertStoredRuntimeBinding(
+	t *testing.T,
+	descriptor readtask.Descriptor,
+	planSchema, planManifest, planRegistry, planProfile, planTasks string,
+	runtimeSchema, connectorDigest, targetDigest, executorDigest, runtimeDigest string,
+	runtimeBoundAt time.Time,
+) {
+	t.Helper()
+	if planSchema != descriptor.PlanBinding.SchemaVersion || planManifest != descriptor.PlanBinding.ManifestDigest ||
+		planRegistry != descriptor.PlanBinding.RegistryDigest || planProfile != descriptor.PlanBinding.ProfileDigest ||
+		planTasks != descriptor.PlanBinding.TasksHash || runtimeSchema != descriptor.RuntimeBinding.SchemaVersion ||
+		connectorDigest != descriptor.RuntimeBinding.ConnectorDigest || targetDigest != descriptor.RuntimeBinding.TargetDigest ||
+		executorDigest != descriptor.RuntimeBinding.ExecutorDigest || runtimeDigest != descriptor.RuntimeBinding.RuntimeDigest ||
+		!runtimeBoundAt.Equal(descriptor.RuntimeBinding.BoundAt) {
+		t.Fatalf("stored runtime binding does not match descriptor: plan=%q/%q/%q/%q/%q runtime=%q/%q/%q/%q/%q/%s descriptor=%#v",
+			planSchema, planManifest, planRegistry, planProfile, planTasks, runtimeSchema, connectorDigest,
+			targetDigest, executorDigest, runtimeDigest, runtimeBoundAt, descriptor)
+	}
 }
 
 func verifySingleCompletionProjection(t *testing.T, database *pgxpool.Pool) {
@@ -745,6 +867,19 @@ func verifySingleCompletionProjection(t *testing.T, database *pgxpool.Pool) {
 			  AND receipt.certificate_sha256 = attempt.certificate_sha256
 			  AND receipt.request_hash = attempt.request_hash
 			  AND receipt.receipt_hash = attempt.receipt_hash
+			  AND receipt.request_hash_version = attempt.request_hash_version
+			  AND receipt.receipt_hash_version = attempt.receipt_hash_version
+			  AND receipt.plan_schema_version = attempt.plan_schema_version
+			  AND receipt.plan_manifest_digest = attempt.plan_manifest_digest
+			  AND receipt.plan_registry_digest = attempt.plan_registry_digest
+			  AND receipt.plan_profile_digest = attempt.plan_profile_digest
+			  AND receipt.plan_tasks_hash = attempt.plan_tasks_hash
+			  AND receipt.read_runtime_schema_version = attempt.read_runtime_schema_version
+			  AND receipt.connector_digest = attempt.connector_digest
+			  AND receipt.target_digest = attempt.target_digest
+			  AND receipt.executor_digest = attempt.executor_digest
+			  AND receipt.runtime_digest = attempt.runtime_digest
+			  AND receipt.runtime_bound_at = attempt.runtime_bound_at
 			 JOIN evidence AS evidence
 			   ON evidence.tenant_id = receipt.tenant_id
 			  AND evidence.workspace_id = receipt.workspace_id
@@ -753,7 +888,9 @@ func verifySingleCompletionProjection(t *testing.T, database *pgxpool.Pool) {
 			  AND evidence.id = receipt.evidence_id
 			  AND evidence.content_hash = receipt.content_hash
 			 WHERE attempt.task_id = $1::uuid AND attempt.status = 'COMPLETED'
-			   AND receipt.schema_version = 'runner-evidence.v2'),
+			   AND receipt.schema_version = 'runner-evidence.v3'
+			   AND attempt.request_hash_version = 'read-task-completion-request.v3'
+			   AND attempt.receipt_hash_version = 'read-task-completion-receipt.v3'),
 			(SELECT count(*) FROM evidence WHERE task_id = $1::uuid),
 			(SELECT count(*) FROM runner_evidence_receipts WHERE task_id = $1::uuid)
 	`, integrationLifecycleTaskID).Scan(&boundRows, &evidenceRows, &receiptRows)
@@ -856,9 +993,39 @@ func (harness *readTaskPostgresHarness) applyThroughRunnerIngress(t *testing.T) 
 	}
 }
 
+func (harness *readTaskPostgresHarness) applyThroughRuntimeBinding(t *testing.T) {
+	t.Helper()
+	harness.applyThroughRunnerIngress(t)
+	for _, name := range []string{
+		"000012_outbox_event_routing.up.sql",
+		"000013_investigation_runtime_binding.up.sql",
+	} {
+		if _, err := harness.migration.Exec(context.Background(), readMigration(t, name)); err != nil {
+			t.Fatalf("apply migration %s: %v", name, err)
+		}
+	}
+}
+
 func seedRuntimeInvestigation(t *testing.T, database *pgxpool.Pool) {
 	t.Helper()
 	base := time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond)
+	connectorDigest := strings.Repeat("c", 64)
+	connectorID := "prometheus-staging-v1-" + connectorDigest
+	taskIDs := []string{
+		integrationLifecycleTaskID, integrationClaimTaskID, integrationFenceTaskID, integrationDriftTaskID,
+	}
+	taskSpecs := make([]investigation.TaskSpec, len(taskIDs))
+	for index := range taskIDs {
+		taskSpecs[index] = investigation.TaskSpec{
+			Key: fmt.Sprintf("metrics.%d", index+1), ConnectorID: connectorID, Operation: "query_range",
+			Input: json.RawMessage(fmt.Sprintf(`{"query":"up","window_seconds":%d}`, 300+index)),
+		}
+	}
+	_, tasksHash, err := investigation.CanonicalTaskSpecs(taskSpecs)
+	if err != nil {
+		t.Fatalf("canonicalize runtime task fixture: %v", err)
+	}
+	planBinding := integrationPlanBinding(tasksHash)
 	integrationExec(t, database, `INSERT INTO tenants (id, name) VALUES ($1::uuid, 'readtask-tenant')`, integrationTenantID)
 	integrationExec(t, database, `
 		INSERT INTO workspaces (id, tenant_id, name)
@@ -935,31 +1102,40 @@ func seedRuntimeInvestigation(t *testing.T, database *pgxpool.Pool) {
 			id, tenant_id, workspace_id, incident_id, status, window_start, window_end,
 			tool_schema_version, created_at, model_status, idempotency_key, request_hash,
 			request_hash_version, updated_at, service_id_snapshot, environment_id_snapshot,
-			mapping_status_snapshot, runtime_schema_version
+			mapping_status_snapshot, runtime_schema_version,
+			plan_schema_version, plan_manifest_digest, plan_registry_digest,
+			plan_profile_digest, plan_tasks_hash
 		) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'QUEUED', $5, $6,
 			'investigation-task.v1', $7, 'PENDING', 'investigate:readtask-runtime', $8,
-			'investigation.create.v1', $7, $9::uuid, $10::uuid, 'EXACT', 'investigation-runtime.v1')
+			'investigation.create.v2', $7, $9::uuid, $10::uuid, 'EXACT', 'investigation-runtime.v1',
+			$11, $12, $13, $14, $15)
 	`, integrationInvestigationID, integrationTenantID, integrationWorkspaceID, integrationIncidentID,
 		base, base.Add(2*time.Second), createdAt, strings.Repeat("b", 64),
-		integrationServiceID, integrationEnvironmentID); err != nil {
+		integrationServiceID, integrationEnvironmentID,
+		planBinding.SchemaVersion, planBinding.ManifestDigest, planBinding.RegistryDigest,
+		planBinding.ProfileDigest, planBinding.TasksHash); err != nil {
 		_ = investigationTx.Rollback(ctx)
 		t.Fatalf("insert runtime investigation: %v", err)
 	}
-	for index, taskID := range []string{
-		integrationLifecycleTaskID, integrationClaimTaskID, integrationFenceTaskID, integrationDriftTaskID,
-	} {
-		input := []byte(fmt.Sprintf(`{"query":"up","window_seconds":%d}`, 300+index))
+	for index, taskID := range taskIDs {
+		input := []byte(taskSpecs[index].Input)
 		digest := sha256.Sum256(input)
+		runtimeBinding := integrationRuntimeBinding(t, createdAt, planBinding, taskSpecs[index], connectorDigest, index+1)
 		if _, err := investigationTx.Exec(ctx, `
 			INSERT INTO tool_invocations (
 				id, tenant_id, workspace_id, investigation_id, tool_name, tool_version,
 				input_hash, status, incident_id, task_key, position, input_document,
-				created_at, updated_at, runtime_schema_version
-			) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'prometheus-staging', 'query_range',
-				$5, 'QUEUED', $6::uuid, $7, $8, $9, $10, $10, 'investigation-runtime.v1')
+				created_at, updated_at, runtime_schema_version,
+				read_runtime_schema_version, connector_digest, target_digest,
+				executor_digest, runtime_digest, runtime_bound_at
+			) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, 'query_range',
+				$6, 'QUEUED', $7::uuid, $8, $9, $10, $11, $11, 'investigation-runtime.v1',
+				$12, $13, $14, $15, $16, $17)
 		`, taskID, integrationTenantID, integrationWorkspaceID, integrationInvestigationID,
-			hex.EncodeToString(digest[:]), integrationIncidentID, fmt.Sprintf("metrics.%d", index+1), index+1,
-			input, createdAt); err != nil {
+			connectorID, hex.EncodeToString(digest[:]), integrationIncidentID,
+			fmt.Sprintf("metrics.%d", index+1), index+1, input, createdAt,
+			runtimeBinding.SchemaVersion, runtimeBinding.ConnectorDigest, runtimeBinding.TargetDigest,
+			runtimeBinding.ExecutorDigest, runtimeBinding.RuntimeDigest, runtimeBinding.BoundAt); err != nil {
 			_ = investigationTx.Rollback(ctx)
 			t.Fatalf("insert runtime task %d: %v", index+1, err)
 		}
@@ -967,6 +1143,47 @@ func seedRuntimeInvestigation(t *testing.T, database *pgxpool.Pool) {
 	if err := investigationTx.Commit(ctx); err != nil {
 		t.Fatalf("commit runtime investigation fixture: %v", err)
 	}
+}
+
+func integrationPlanBinding(tasksHash string) domain.InvestigationPlanBinding {
+	return domain.InvestigationPlanBinding{
+		SchemaVersion:  domain.InvestigationPlanBindingSchemaVersion,
+		ManifestDigest: strings.Repeat("3", 64),
+		RegistryDigest: strings.Repeat("4", 64),
+		ProfileDigest:  strings.Repeat("5", 64),
+		TasksHash:      tasksHash,
+	}
+}
+
+func integrationRuntimeBinding(
+	t *testing.T,
+	boundAt time.Time,
+	plan domain.InvestigationPlanBinding,
+	spec investigation.TaskSpec,
+	connectorDigest string,
+	position int,
+) domain.ReadTaskRuntimeBinding {
+	t.Helper()
+	binding, err := investigation.BuildReadTaskRuntimeBinding(
+		investigation.TaskSpecScope{
+			TenantID: integrationTenantID, WorkspaceID: integrationWorkspaceID,
+			EnvironmentID: integrationEnvironmentID, ServiceID: integrationServiceID,
+			MappingStatus: domain.MappingExact,
+		},
+		plan,
+		spec,
+		position,
+		investigation.TaskRuntimeComponents{
+			ConnectorDigest: connectorDigest,
+			TargetDigest:    strings.Repeat(fmt.Sprintf("%x", position+5), 64),
+			ExecutorDigest:  strings.Repeat("d", 64),
+		},
+		boundAt,
+	)
+	if err != nil {
+		t.Fatalf("build runtime task binding fixture %d: %v", position, err)
+	}
+	return binding
 }
 
 func seedRepositoryIntegrationRunner(t *testing.T, database *pgxpool.Pool, identity runneridentity.Identity) {

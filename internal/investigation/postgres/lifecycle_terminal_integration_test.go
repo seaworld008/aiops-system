@@ -13,7 +13,7 @@ import (
 )
 
 func TestPostgresFailQueuedInvestigationCancelsTasksAndOwnsReplayKey(t *testing.T) {
-	fixture := newRuntimeFixture(t)
+	fixture := newLatestRuntimeFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	repository := newTerminalLifecycleRepository(t, fixture)
@@ -61,7 +61,7 @@ func TestPostgresFailQueuedInvestigationCancelsTasksAndOwnsReplayKey(t *testing.
 }
 
 func TestPostgresFinalizeModelFailedRejectsWrongDerivedStatusWithoutPartialWrite(t *testing.T) {
-	fixture := newRuntimeFixture(t)
+	fixture := newLatestRuntimeFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	repository := newTerminalLifecycleRepository(t, fixture)
@@ -123,7 +123,7 @@ func TestPostgresFinalizeModelFailedRejectsWrongDerivedStatusWithoutPartialWrite
 }
 
 func TestPostgresFinalizeSkippedPersistsPartialWithoutHypotheses(t *testing.T) {
-	fixture := newRuntimeFixture(t)
+	fixture := newLatestRuntimeFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	repository := newTerminalLifecycleRepository(t, fixture)
@@ -166,7 +166,8 @@ func newTerminalLifecycleRepository(
 ) *investigationpostgres.Repository {
 	t.Helper()
 	repository, err := investigationpostgres.New(fixture.harness.extendedPool(t), investigationpostgres.Options{
-		IDFactory: func() string { return "89000000-0000-4000-8000-000000000001" },
+		TaskRuntimeBinder: testTaskRuntimeBinder,
+		IDFactory:         func() string { return "89000000-0000-4000-8000-000000000001" },
 		TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error {
 			return nil
 		},

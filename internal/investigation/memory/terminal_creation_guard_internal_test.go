@@ -16,7 +16,8 @@ func TestCreateOrGetInvestigationRejectsNewFactsForTerminalIncident(t *testing.T
 		t.Run(string(status), func(t *testing.T) {
 			authorizerCalls := 0
 			repository, err := New(Options{
-				Clock: func() time.Time { return now }, IDFactory: func() string { return "generated-id" },
+				TaskRuntimeBinder: testTaskRuntimeBinder,
+				Clock:             func() time.Time { return now }, IDFactory: func() string { return "generated-id" },
 				TenantResolver: func(string) (string, error) { return "tenant-1", nil },
 				TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error {
 					authorizerCalls++
@@ -36,13 +37,14 @@ func TestCreateOrGetInvestigationRejectsNewFactsForTerminalIncident(t *testing.T
 			incident.Status = status
 			repository.incidents[scoped("workspace-1", incident.ID)] = incident
 
-			_, createErr := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+			_, createErr := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 				WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "temporal.prepare.v1/event-1",
 				Tasks: []investigation.TaskSpec{{
-					Key: "metrics", ConnectorID: "prometheus-staging", Operation: "range_query",
+					Key: "metrics", ConnectorID: "prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", Operation: "range_query",
 					Input: []byte(`{"lookback_minutes":15}`),
 				}},
-			})
+			}))
+
 			if !errors.Is(createErr, investigation.ErrInvalidTransition) {
 				t.Fatalf("CreateOrGetInvestigation(%s) error = %v, want ErrInvalidTransition", status, createErr)
 			}

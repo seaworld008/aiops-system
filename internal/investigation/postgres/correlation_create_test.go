@@ -162,7 +162,7 @@ func TestCreateInvestigationAtomicallyPersistsTasksTransitionAndLedger(t *testin
 		},
 	)
 	now := time.Date(2026, 7, 12, 9, 0, 0, 456000, time.UTC)
-	request := writeMockCreateRequest()
+	request := boundCreateRequest(t, writeMockCreateRequest())
 	canonical, taskHash, err := investigation.CanonicalTaskSpecs(request.Tasks)
 	if err != nil {
 		t.Fatalf("CanonicalTaskSpecs() error = %v", err)
@@ -200,18 +200,24 @@ func TestCreateInvestigationAtomicallyPersistsTasksTransitionAndLedger(t *testin
 		WithArgs(
 			writeMockInvestigationID, writeMockTenantID, writeMockWorkspaceID, writeMockIncidentID,
 			request.IdempotencyKey, now, now, now, investigationTaskSchemaVersion,
-			requestHash, requestVersionCreateInvestigation, writeMockServiceID, writeMockEnvironmentID,
+			requestHash, requestVersionCreateInvestigation,
+			request.PlanBinding.SchemaVersion, request.PlanBinding.ManifestDigest, request.PlanBinding.RegistryDigest,
+			request.PlanBinding.ProfileDigest, request.PlanBinding.TasksHash,
+			writeMockServiceID, writeMockEnvironmentID,
 			domain.MappingExact, runtimeSchemaVersion,
 		).
-		WillReturnRows(writeMockInvestigationRows(now, request.IdempotencyKey, requestHash))
+		WillReturnRows(writeMockInvestigationRows(now, request.IdempotencyKey, requestHash, request.PlanBinding))
 	inputHash := writeMockSHA256(canonical[0].Input)
+	runtimeBinding := writeMockRuntimeBinding(request.PlanBinding, canonical[0], now)
 	database.ExpectQuery("INSERT INTO tool_invocations AS task").
 		WithArgs(
 			writeMockTaskID, writeMockTenantID, writeMockWorkspaceID, writeMockInvestigationID,
 			canonical[0].ConnectorID, canonical[0].Operation, inputHash,
 			writeMockIncidentID, canonical[0].Key, 1, []byte(canonical[0].Input), now, runtimeSchemaVersion,
+			runtimeBinding.SchemaVersion, runtimeBinding.ConnectorDigest, runtimeBinding.TargetDigest,
+			runtimeBinding.ExecutorDigest, runtimeBinding.RuntimeDigest, runtimeBinding.BoundAt,
 		).
-		WillReturnRows(writeMockTaskRows(now, canonical[0], inputHash))
+		WillReturnRows(writeMockTaskRows(now, canonical[0], inputHash, runtimeBinding))
 	database.ExpectExec("UPDATE incidents AS incident").
 		WithArgs(writeMockTenantID, writeMockWorkspaceID, writeMockIncidentID, now, runtimeSchemaVersion).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
@@ -224,7 +230,7 @@ func TestCreateInvestigationAtomicallyPersistsTasksTransitionAndLedger(t *testin
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	database.ExpectCommit()
 
-	result, err := repository.CreateOrGetInvestigation(context.Background(), request)
+	result, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, request))
 	if err != nil || !result.Created || result.Investigation.ID != writeMockInvestigationID ||
 		len(result.Tasks) != 1 || result.Tasks[0].ID != writeMockTaskID || authorizerCalls != 1 {
 		t.Fatalf("CreateOrGetInvestigation() = %#v, %v; authorizer calls = %d", result, err, authorizerCalls)
@@ -243,7 +249,7 @@ func TestCreateInvestigationDurableReplayBypassesMutableAuthorizer(t *testing.T)
 		},
 	)
 	now := time.Date(2026, 7, 12, 10, 0, 0, 789000, time.UTC)
-	request := writeMockCreateRequest()
+	request := boundCreateRequest(t, writeMockCreateRequest())
 	canonical, taskHash, err := investigation.CanonicalTaskSpecs(request.Tasks)
 	if err != nil {
 		t.Fatalf("CanonicalTaskSpecs() error = %v", err)
@@ -263,13 +269,16 @@ func TestCreateInvestigationDurableReplayBypassesMutableAuthorizer(t *testing.T)
 		))
 	database.ExpectQuery("FROM tool_invocations AS task").
 		WithArgs(writeMockTenantID, writeMockWorkspaceID, writeMockInvestigationID, runtimeSchemaVersion).
-		WillReturnRows(writeMockTaskRows(now, canonical[0], writeMockSHA256(canonical[0].Input)))
+		WillReturnRows(writeMockTaskRows(
+			now, canonical[0], writeMockSHA256(canonical[0].Input),
+			writeMockRuntimeBinding(request.PlanBinding, canonical[0], now),
+		))
 	database.ExpectQuery("FROM investigations AS investigation").
 		WithArgs(writeMockTenantID, writeMockWorkspaceID, writeMockInvestigationID, runtimeSchemaVersion).
-		WillReturnRows(writeMockInvestigationRows(now, request.IdempotencyKey, requestHash))
+		WillReturnRows(writeMockInvestigationRows(now, request.IdempotencyKey, requestHash, request.PlanBinding))
 	database.ExpectCommit()
 
-	result, err := repository.CreateOrGetInvestigation(context.Background(), request)
+	result, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, request))
 	if err != nil || result.Created || result.Investigation.ID != writeMockInvestigationID || authorizerCalls != 0 {
 		t.Fatalf("CreateOrGetInvestigation(replay) = %#v, %v; authorizer calls = %d", result, err, authorizerCalls)
 	}
@@ -293,7 +302,7 @@ func TestCreateInvestigationRejectsWrongEnvironmentInsideLockedTransaction(t *te
 	request := writeMockCreateRequest()
 	expectWriteMockCreateAdmission(database, request, writeMockIncidentRows(now))
 
-	_, err := repository.CreateOrGetInvestigation(context.Background(), request)
+	_, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, request))
 	if !errors.Is(err, investigation.ErrInvalidRequest) {
 		t.Fatalf("CreateOrGetInvestigation(wrong environment) error = %v, want ErrInvalidRequest", err)
 	}
@@ -316,7 +325,7 @@ func TestCreateInvestigationRejectsUnresolvedIncidentBeforeAuthorizerOrWrites(t 
 	request := writeMockCreateRequest()
 	expectWriteMockCreateAdmission(database, request, writeMockIncidentRowsForScope(now, nil, nil, domain.MappingUnresolved))
 
-	_, err := repository.CreateOrGetInvestigation(context.Background(), request)
+	_, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, request))
 	if !errors.Is(err, investigation.ErrInvalidRequest) {
 		t.Fatalf("CreateOrGetInvestigation(unresolved) error = %v, want ErrInvalidRequest", err)
 	}
@@ -358,7 +367,7 @@ func TestCreateInvestigationRejectsNewFactsForTerminalIncidentInsideLock(t *test
 				WillReturnRows(emptyWriteMockInvestigationRows())
 			database.ExpectRollback()
 
-			_, err := repository.CreateOrGetInvestigation(context.Background(), request)
+			_, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, request))
 			if !errors.Is(err, investigation.ErrInvalidTransition) {
 				t.Fatalf("CreateOrGetInvestigation(%s) error = %v, want ErrInvalidTransition", status, err)
 			}
@@ -414,6 +423,7 @@ func newWriteMockRepository(
 	}
 	nextID := 0
 	repository, err := New(database, Options{
+		TaskRuntimeBinder: testTaskRuntimeBinder,
 		IDFactory: func() string {
 			if nextID >= len(generatedIDs) {
 				return writeMockOutboxID
@@ -488,29 +498,68 @@ func emptyWriteMockIdempotencyRows() *pgxmock.Rows {
 func emptyWriteMockInvestigationRows() *pgxmock.Rows {
 	return pgxmock.NewRows([]string{
 		"id", "tenant_id", "workspace_id", "incident_id", "status", "model_status",
-		"idempotency_key", "request_hash", "failure_code", "model_failure_code",
+		"idempotency_key", "request_hash", "request_hash_version", "plan_schema_version",
+		"plan_manifest_digest", "plan_registry_digest", "plan_profile_digest", "plan_tasks_hash",
+		"failure_code", "model_failure_code",
 		"created_at", "started_at", "completed_at", "updated_at",
 	})
 }
 
-func writeMockInvestigationRows(now time.Time, idempotencyKey, requestHash string) *pgxmock.Rows {
+func writeMockInvestigationRows(
+	now time.Time,
+	idempotencyKey, requestHash string,
+	plan domain.InvestigationPlanBinding,
+) *pgxmock.Rows {
 	return emptyWriteMockInvestigationRows().AddRow(
 		writeMockInvestigationID, writeMockTenantID, writeMockWorkspaceID, writeMockIncidentID,
 		domain.InvestigationQueued, domain.ModelPending, idempotencyKey, requestHash,
+		domain.InvestigationCreateRequestVersionV2, plan.SchemaVersion, plan.ManifestDigest,
+		plan.RegistryDigest, plan.ProfileDigest, plan.TasksHash,
 		"", "", now, nil, nil, now,
 	)
 }
 
-func writeMockTaskRows(now time.Time, spec investigation.TaskSpec, inputHash string) *pgxmock.Rows {
+func writeMockTaskRows(
+	now time.Time,
+	spec investigation.TaskSpec,
+	inputHash string,
+	runtimeBinding domain.ReadTaskRuntimeBinding,
+) *pgxmock.Rows {
 	return pgxmock.NewRows([]string{
 		"id", "tenant_id", "workspace_id", "incident_id", "investigation_id", "task_key", "position",
-		"tool_name", "tool_version", "input_document", "input_hash", "status", "evidence_id",
+		"tool_name", "tool_version", "input_document", "input_hash", "read_runtime_schema_version",
+		"connector_digest", "target_digest", "executor_digest", "runtime_digest", "runtime_bound_at", "status", "evidence_id",
 		"failure_code", "created_at", "started_at", "completed_at", "updated_at",
 	}).AddRow(
 		writeMockTaskID, writeMockTenantID, writeMockWorkspaceID, writeMockIncidentID,
 		writeMockInvestigationID, spec.Key, 1, spec.ConnectorID, spec.Operation,
-		[]byte(spec.Input), inputHash, domain.ReadTaskQueued, nil, "", now, nil, nil, now,
+		[]byte(spec.Input), inputHash, runtimeBinding.SchemaVersion, runtimeBinding.ConnectorDigest,
+		runtimeBinding.TargetDigest, runtimeBinding.ExecutorDigest, runtimeBinding.RuntimeDigest, runtimeBinding.BoundAt,
+		domain.ReadTaskQueued, nil, "", now, nil, nil, now,
 	)
+}
+
+func writeMockRuntimeBinding(
+	plan domain.InvestigationPlanBinding,
+	spec investigation.TaskSpec,
+	boundAt time.Time,
+) domain.ReadTaskRuntimeBinding {
+	components, err := testTaskRuntimeBinder(context.Background(), investigation.TaskSpecScope{}, plan, spec)
+	if err != nil {
+		panic(err)
+	}
+	binding, err := investigation.BuildReadTaskRuntimeBinding(
+		investigation.TaskSpecScope{
+			TenantID: writeMockTenantID, WorkspaceID: writeMockWorkspaceID,
+			EnvironmentID: writeMockEnvironmentID, ServiceID: writeMockServiceID,
+			MappingStatus: domain.MappingExact,
+		},
+		plan, spec, 1, components, boundAt,
+	)
+	if err != nil {
+		panic(err)
+	}
+	return binding
 }
 
 func writeMockCreateRequest() investigation.CreateOrGetInvestigationRequest {
@@ -518,7 +567,7 @@ func writeMockCreateRequest() investigation.CreateOrGetInvestigationRequest {
 		WorkspaceID: writeMockWorkspaceID, IncidentID: writeMockIncidentID,
 		IdempotencyKey: "investigate:write-mock",
 		Tasks: []investigation.TaskSpec{{
-			Key: "metrics", ConnectorID: "prometheus-staging", Operation: "range_query",
+			Key: "metrics", ConnectorID: "prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", Operation: "range_query",
 			Input: []byte(`{"lookback_minutes":15}`),
 		}},
 	}

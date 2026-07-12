@@ -14,15 +14,16 @@ import (
 func TestInvestigationValidateEnforcesBoundedStateAndIntegrityMetadata(t *testing.T) {
 	now := time.Date(2026, 7, 11, 10, 0, 0, 0, time.UTC)
 	valid := domain.Investigation{
-		ID:             "investigation-1",
-		WorkspaceID:    "workspace-1",
-		IncidentID:     "incident-1",
-		Status:         domain.InvestigationQueued,
-		ModelStatus:    domain.ModelPending,
-		IdempotencyKey: "investigate:incident-1:v1",
-		RequestHash:    strings.Repeat("a", 64),
-		CreatedAt:      now,
-		UpdatedAt:      now,
+		ID:                 "investigation-1",
+		WorkspaceID:        "workspace-1",
+		IncidentID:         "incident-1",
+		Status:             domain.InvestigationQueued,
+		ModelStatus:        domain.ModelPending,
+		IdempotencyKey:     "investigate:incident-1:v1",
+		RequestHash:        strings.Repeat("a", 64),
+		RequestHashVersion: domain.InvestigationCreateRequestVersionV1,
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v, want valid investigation", err)
@@ -481,7 +482,8 @@ func TestInvestigationFailureCodeIsBoundToFailureStates(t *testing.T) {
 		ID: "investigation-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
 		Status: domain.InvestigationQueued, ModelStatus: domain.ModelPending,
 		IdempotencyKey: "investigate:1", RequestHash: strings.Repeat("a", 64),
-		CreatedAt: now, UpdatedAt: now,
+		RequestHashVersion: domain.InvestigationCreateRequestVersionV1,
+		CreatedAt:          now, UpdatedAt: now,
 	}
 	queued.FailureCode = "internal_failure"
 	if err := queued.Validate(); err == nil {
@@ -513,7 +515,8 @@ func TestCancelledInvestigationUsesDistinctModelCancelledStatus(t *testing.T) {
 		ID: "investigation-1", WorkspaceID: "workspace-1", IncidentID: "incident-1",
 		Status: domain.InvestigationCancelled, ModelStatus: domain.ModelSkipped, FailureCode: "cancelled",
 		IdempotencyKey: "investigate:1", RequestHash: strings.Repeat("a", 64),
-		CreatedAt: now, CompletedAt: now, UpdatedAt: now,
+		RequestHashVersion: domain.InvestigationCreateRequestVersionV1,
+		CreatedAt:          now, CompletedAt: now, UpdatedAt: now,
 	}
 	if err := cancelled.Validate(); err == nil {
 		t.Fatal("CANCELLED Investigation accepted SKIPPED model status")

@@ -173,6 +173,7 @@ func newCoreMockRepository(t *testing.T, idFactory func() string) (pgxmock.PgxPo
 	}
 	t.Cleanup(database.Close)
 	repository, err := New(database, Options{
+		TaskRuntimeBinder:  testTaskRuntimeBinder,
 		IDFactory:          idFactory,
 		TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error { return nil },
 	})

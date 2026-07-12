@@ -42,6 +42,7 @@ type CreateOrGetInvestigationRequest struct {
 	WorkspaceID    string
 	IncidentID     string
 	IdempotencyKey string
+	PlanBinding    domain.InvestigationPlanBinding
 	Tasks          []TaskSpec
 }
 

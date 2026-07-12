@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/store"
 )
 
@@ -19,7 +20,7 @@ const (
 	operationFailInvestigation     = "fail_investigation"
 	operationRecordFeedback        = "record_feedback"
 
-	requestVersionCreateInvestigation   = "investigation.create.v1"
+	requestVersionCreateInvestigation   = domain.InvestigationCreateRequestVersionV2
 	requestVersionCompleteTask          = "investigation.complete-task.v1"
 	requestVersionStartModel            = "investigation.start-model.v1"
 	requestVersionFinalizeInvestigation = "investigation.finalize.v1"

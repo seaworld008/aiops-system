@@ -204,12 +204,16 @@ func emptyCoreIncidentRows() *pgxmock.Rows {
 }
 
 func coreInvestigationRows(investigationID string, now time.Time) *pgxmock.Rows {
+	// Historical create.v1 facts remain readable with an entirely NULL plan
+	// binding. Runtime code must never infer or backfill a v2 identity for them.
 	return pgxmock.NewRows([]string{
 		"id", "tenant_id", "workspace_id", "incident_id", "status", "model_status", "idempotency_key", "request_hash",
+		"request_hash_version", "plan_schema_version", "plan_manifest_digest", "plan_registry_digest", "plan_profile_digest", "plan_tasks_hash",
 		"failure_code", "model_failure_code", "created_at", "started_at", "completed_at", "updated_at",
 	}).AddRow(
 		investigationID, coreTenantID, coreWorkspaceID, coreIncidentID,
 		domain.InvestigationQueued, domain.ModelPending, "investigate:payments", coreHash('d'),
+		domain.InvestigationCreateRequestVersionV1, nil, nil, nil, nil, nil,
 		"", "", now, nil, nil, now,
 	)
 }
@@ -221,9 +225,13 @@ func coreTaskRows(taskID string, position int, now time.Time) *pgxmock.Rows {
 }
 
 func emptyCoreTaskRows() *pgxmock.Rows {
+	// These rows intentionally model legacy unbound READ tasks. They are query
+	// fixtures only; all new create fixtures use the bound v2 helpers.
 	return pgxmock.NewRows([]string{
 		"id", "tenant_id", "workspace_id", "incident_id", "investigation_id", "task_key", "position",
-		"tool_name", "tool_version", "input_document", "input_hash", "status", "evidence_id", "failure_code",
+		"tool_name", "tool_version", "input_document", "input_hash", "read_runtime_schema_version",
+		"connector_digest", "target_digest", "executor_digest", "runtime_digest", "runtime_bound_at",
+		"status", "evidence_id", "failure_code",
 		"created_at", "started_at", "completed_at", "updated_at",
 	})
 }
@@ -233,8 +241,9 @@ func addCoreTaskRow(rows *pgxmock.Rows, taskID string, position int, now time.Ti
 	digest := sha256.Sum256(input)
 	rows.AddRow(
 		taskID, coreTenantID, coreWorkspaceID, coreIncidentID, coreInvestigationID,
-		fmt.Sprintf("metrics-%d", position), position, "prometheus-prod", "range_query",
-		input, fmt.Sprintf("%x", digest[:]), domain.ReadTaskQueued, nil, "", now, nil, nil, now,
+		fmt.Sprintf("metrics-%d", position), position, "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "range_query",
+		input, fmt.Sprintf("%x", digest[:]), nil, nil, nil, nil, nil, nil,
+		domain.ReadTaskQueued, nil, "", now, nil, nil, now,
 	)
 }
 
@@ -246,7 +255,7 @@ func coreEvidenceRows(evidenceID string, now time.Time) *pgxmock.Rows {
 		"connector", "content_hash", "payload_document", "attributes", "collected_at", "created_at",
 	}).AddRow(
 		evidenceID, coreTenantID, coreWorkspaceID, coreIncidentID, coreInvestigationID, coreTaskID,
-		"prometheus-prod", fmt.Sprintf("%x", digest[:]), payload, []byte(`{"source":"prometheus"}`), now, now,
+		"prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", fmt.Sprintf("%x", digest[:]), payload, []byte(`{"source":"prometheus"}`), now, now,
 	)
 }
 

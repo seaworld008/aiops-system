@@ -58,6 +58,12 @@ const investigationProjection = `
 	investigation.model_status,
 	investigation.idempotency_key,
 	investigation.request_hash,
+	investigation.request_hash_version,
+	investigation.plan_schema_version,
+	investigation.plan_manifest_digest,
+	investigation.plan_registry_digest,
+	investigation.plan_profile_digest,
+	investigation.plan_tasks_hash,
 	COALESCE(investigation.failure_code, ''),
 	COALESCE(investigation.model_failure_code, ''),
 	investigation.created_at,
@@ -77,6 +83,12 @@ const taskProjection = `
 	task.tool_version,
 	task.input_document,
 	task.input_hash,
+	task.read_runtime_schema_version,
+	task.connector_digest,
+	task.target_digest,
+	task.executor_digest,
+	task.runtime_digest,
+	task.runtime_bound_at,
 	task.status,
 	task.evidence_id::text,
 	COALESCE(task.failure_code, ''),
@@ -221,10 +233,15 @@ func scanIncident(row rowScanner) (domain.Incident, error) {
 
 func scanInvestigation(row rowScanner) (domain.Investigation, error) {
 	var (
-		item        domain.Investigation
-		tenantID    string
-		startedAt   pgtype.Timestamptz
-		completedAt pgtype.Timestamptz
+		item               domain.Investigation
+		tenantID           string
+		planSchemaVersion  pgtype.Text
+		planManifestDigest pgtype.Text
+		planRegistryDigest pgtype.Text
+		planProfileDigest  pgtype.Text
+		planTasksHash      pgtype.Text
+		startedAt          pgtype.Timestamptz
+		completedAt        pgtype.Timestamptz
 	)
 	if err := row.Scan(
 		&item.ID,
@@ -235,6 +252,12 @@ func scanInvestigation(row rowScanner) (domain.Investigation, error) {
 		&item.ModelStatus,
 		&item.IdempotencyKey,
 		&item.RequestHash,
+		&item.RequestHashVersion,
+		&planSchemaVersion,
+		&planManifestDigest,
+		&planRegistryDigest,
+		&planProfileDigest,
+		&planTasksHash,
 		&item.FailureCode,
 		&item.ModelFailureCode,
 		&item.CreatedAt,
@@ -246,6 +269,20 @@ func scanInvestigation(row rowScanner) (domain.Investigation, error) {
 	}
 	if !validUUIDs(item.ID, tenantID, item.WorkspaceID, item.IncidentID) {
 		return domain.Investigation{}, invalidPersistedData("investigation")
+	}
+	planFields := []pgtype.Text{planSchemaVersion, planManifestDigest, planRegistryDigest, planProfileDigest, planTasksHash}
+	planPresent := planFields[0].Valid
+	for _, field := range planFields[1:] {
+		if field.Valid != planPresent {
+			return domain.Investigation{}, invalidPersistedData("investigation")
+		}
+	}
+	if planPresent {
+		item.PlanBinding = domain.InvestigationPlanBinding{
+			SchemaVersion: planSchemaVersion.String, ManifestDigest: planManifestDigest.String,
+			RegistryDigest: planRegistryDigest.String, ProfileDigest: planProfileDigest.String,
+			TasksHash: planTasksHash.String,
+		}
 	}
 	item.CreatedAt = databaseTime(item.CreatedAt)
 	item.StartedAt = optionalDatabaseTimestamp(startedAt)
@@ -259,11 +296,17 @@ func scanInvestigation(row rowScanner) (domain.Investigation, error) {
 
 func scanTask(row rowScanner) (domain.ReadTask, error) {
 	var (
-		task       domain.ReadTask
-		tenantID   string
-		evidenceID pgtype.Text
-		startedAt  pgtype.Timestamptz
-		completed  pgtype.Timestamptz
+		task            domain.ReadTask
+		tenantID        string
+		evidenceID      pgtype.Text
+		runtimeSchema   pgtype.Text
+		connectorDigest pgtype.Text
+		targetDigest    pgtype.Text
+		executorDigest  pgtype.Text
+		runtimeDigest   pgtype.Text
+		runtimeBoundAt  pgtype.Timestamptz
+		startedAt       pgtype.Timestamptz
+		completed       pgtype.Timestamptz
 	)
 	if err := row.Scan(
 		&task.ID,
@@ -277,6 +320,12 @@ func scanTask(row rowScanner) (domain.ReadTask, error) {
 		&task.Operation,
 		&task.Input,
 		&task.InputHash,
+		&runtimeSchema,
+		&connectorDigest,
+		&targetDigest,
+		&executorDigest,
+		&runtimeDigest,
+		&runtimeBoundAt,
 		&task.Status,
 		&evidenceID,
 		&task.FailureCode,
@@ -293,6 +342,23 @@ func scanTask(row rowScanner) (domain.ReadTask, error) {
 	}
 	if !validUUIDs(task.ID, tenantID, task.WorkspaceID, task.IncidentID, task.InvestigationID) {
 		return domain.ReadTask{}, invalidPersistedData("read task")
+	}
+	runtimeTextFields := []pgtype.Text{runtimeSchema, connectorDigest, targetDigest, executorDigest, runtimeDigest}
+	runtimePresent := runtimeTextFields[0].Valid
+	for _, field := range runtimeTextFields[1:] {
+		if field.Valid != runtimePresent {
+			return domain.ReadTask{}, invalidPersistedData("read task")
+		}
+	}
+	if runtimeBoundAt.Valid != runtimePresent {
+		return domain.ReadTask{}, invalidPersistedData("read task")
+	}
+	if runtimePresent {
+		task.RuntimeBinding = domain.ReadTaskRuntimeBinding{
+			SchemaVersion: runtimeSchema.String, ConnectorDigest: connectorDigest.String,
+			TargetDigest: targetDigest.String, ExecutorDigest: executorDigest.String,
+			RuntimeDigest: runtimeDigest.String, BoundAt: databaseTime(runtimeBoundAt.Time),
+		}
 	}
 	task.Input = append([]byte(nil), task.Input...)
 	task.CreatedAt = databaseTime(task.CreatedAt)

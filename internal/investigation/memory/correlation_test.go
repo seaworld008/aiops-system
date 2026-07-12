@@ -77,7 +77,8 @@ func TestCorrelateSignalKeepsExistingIncidentUpdatedAtMonotonic(t *testing.T) {
 	clockNow := base.Add(10 * time.Minute)
 	nextID := 0
 	repository, err := memory.New(memory.Options{
-		Clock: func() time.Time { return clockNow }, TenantResolver: testTenantResolver, TaskSpecAuthorizer: testTaskSpecAuthorizer,
+		TaskRuntimeBinder: testTaskRuntimeBinder,
+		Clock:             func() time.Time { return clockNow }, TenantResolver: testTenantResolver, TaskSpecAuthorizer: testTaskSpecAuthorizer,
 		IDFactory: func() string { nextID++; return fmt.Sprintf("monotonic-correlation-%d", nextID) },
 	})
 	if err != nil {
@@ -328,6 +329,7 @@ func TestCorrelateSignalUsesTrustedTenantResolverWithoutPartialWrites(t *testing
 	now := time.Date(2026, 7, 12, 19, 15, 0, 0, time.UTC)
 	resolverFails := true
 	repository, err := memory.New(memory.Options{
+		TaskRuntimeBinder:  testTaskRuntimeBinder,
 		Clock:              func() time.Time { return now },
 		IDFactory:          func() string { return "incident-tenant" },
 		TaskSpecAuthorizer: testTaskSpecAuthorizer,
@@ -372,7 +374,8 @@ func TestCorrelateSignalUsesTrustedTenantResolverWithoutPartialWrites(t *testing
 func TestNewRepositoryRequiresTrustedTenantResolver(t *testing.T) {
 	now := time.Date(2026, 7, 12, 19, 20, 0, 0, time.UTC)
 	if _, err := memory.New(memory.Options{
-		Clock: func() time.Time { return now }, IDFactory: func() string { return "generated-1" },
+		TaskRuntimeBinder: testTaskRuntimeBinder,
+		Clock:             func() time.Time { return now }, IDFactory: func() string { return "generated-1" },
 		TaskSpecAuthorizer: testTaskSpecAuthorizer,
 	}); !errors.Is(err, investigation.ErrInvalidRequest) {
 		t.Fatalf("memory.New(without TenantResolver) error = %v, want ErrInvalidRequest", err)
@@ -381,12 +384,25 @@ func TestNewRepositoryRequiresTrustedTenantResolver(t *testing.T) {
 
 func TestNewRepositoryRequiresTrustedTaskSpecAuthorizer(t *testing.T) {
 	_, err := memory.New(memory.Options{
-		Clock:          func() time.Time { return time.Date(2026, 7, 13, 4, 30, 0, 0, time.UTC) },
-		IDFactory:      func() string { return "generated-1" },
-		TenantResolver: testTenantResolver,
+		TaskRuntimeBinder: testTaskRuntimeBinder,
+		Clock:             func() time.Time { return time.Date(2026, 7, 13, 4, 30, 0, 0, time.UTC) },
+		IDFactory:         func() string { return "generated-1" },
+		TenantResolver:    testTenantResolver,
 	})
 	if !errors.Is(err, investigation.ErrInvalidRequest) {
 		t.Fatalf("memory.New(without TaskSpecAuthorizer) error = %v, want ErrInvalidRequest", err)
+	}
+}
+
+func TestNewRepositoryRequiresTrustedTaskRuntimeBinder(t *testing.T) {
+	_, err := memory.New(memory.Options{
+		Clock:              func() time.Time { return time.Date(2026, 7, 13, 4, 30, 0, 0, time.UTC) },
+		IDFactory:          func() string { return "generated-1" },
+		TenantResolver:     testTenantResolver,
+		TaskSpecAuthorizer: testTaskSpecAuthorizer,
+	})
+	if !errors.Is(err, investigation.ErrInvalidRequest) {
+		t.Fatalf("memory.New(without TaskRuntimeBinder) error = %v, want ErrInvalidRequest", err)
 	}
 }
 
@@ -482,7 +498,8 @@ func TestRegisterSignalReplaySurvivesClockRollbackBeyondFutureSkew(t *testing.T)
 	clockNow := base
 	nextID := 0
 	repository, err := memory.New(memory.Options{
-		Clock: func() time.Time { return clockNow }, TenantResolver: testTenantResolver, TaskSpecAuthorizer: testTaskSpecAuthorizer,
+		TaskRuntimeBinder: testTaskRuntimeBinder,
+		Clock:             func() time.Time { return clockNow }, TenantResolver: testTenantResolver, TaskSpecAuthorizer: testTaskSpecAuthorizer,
 		IDFactory: func() string { nextID++; return fmt.Sprintf("signal-clock-replay-%d", nextID) },
 	})
 	if err != nil {
@@ -595,7 +612,8 @@ func TestCorrelateSignalValidatesOptionalAndExactMappingResourceIDs(t *testing.T
 func TestCorrelateSignalRejectsDuplicateGeneratedIncidentIDWithoutPartialWrites(t *testing.T) {
 	now := time.Date(2026, 7, 12, 15, 0, 0, 0, time.UTC)
 	repository, err := memory.New(memory.Options{
-		Clock: func() time.Time { return now }, IDFactory: func() string { return "duplicate-incident" }, TenantResolver: testTenantResolver,
+		TaskRuntimeBinder: testTaskRuntimeBinder,
+		Clock:             func() time.Time { return now }, IDFactory: func() string { return "duplicate-incident" }, TenantResolver: testTenantResolver,
 		TaskSpecAuthorizer: testTaskSpecAuthorizer,
 	})
 	if err != nil {

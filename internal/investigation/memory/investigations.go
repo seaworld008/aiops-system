@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/investigation"
@@ -71,8 +72,16 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 	if err := investigation.AuthorizeTaskSpecs(ctx, repository.taskSpecAuthorizer, scope, canonicalTasks); err != nil {
 		return investigation.CreateOrGetInvestigationResult{}, err
 	}
+	runtimeComponents, err := investigation.ResolveTaskRuntimeComponents(
+		ctx, repository.taskRuntimeBinder, scope, request.PlanBinding, canonicalTasks,
+	)
+	if err != nil {
+		return investigation.CreateOrGetInvestigationResult{}, err
+	}
 	if activeFound {
-		if active.RequestHash != requestHash {
+		if active.RequestHashVersion != domain.InvestigationCreateRequestVersionV2 ||
+			active.RequestHash != requestHash || !active.PlanBinding.Equal(request.PlanBinding) ||
+			!repository.activeRuntimeBindingsMatch(request.WorkspaceID, active.ID, scope, canonicalTasks, runtimeComponents) {
 			return investigation.CreateOrGetInvestigationResult{}, store.ErrIdempotencyConflict
 		}
 		repository.investigationIdempotency[idempotencyKey] = idempotencyRecord{requestHash: requestHash, resourceID: active.ID}
@@ -107,11 +116,17 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 	if now.IsZero() {
 		return investigation.CreateOrGetInvestigationResult{}, fmt.Errorf("%w: clock returned zero time", investigation.ErrInvalidRequest)
 	}
-	commitAt := latestTime(now, incident.OpenedAt, incident.LastSignalAt, incident.UpdatedAt)
+	commitBoundary := latestTime(now, incident.OpenedAt, incident.LastSignalAt, incident.UpdatedAt).UTC()
+	commitAt := commitBoundary.Truncate(time.Microsecond)
+	if commitAt.Before(commitBoundary) {
+		commitAt = commitAt.Add(time.Microsecond)
+	}
 	item := domain.Investigation{
 		ID: investigationID, WorkspaceID: request.WorkspaceID, IncidentID: request.IncidentID,
 		Status: domain.InvestigationQueued, ModelStatus: domain.ModelPending,
-		IdempotencyKey: request.IdempotencyKey, RequestHash: requestHash, CreatedAt: commitAt, UpdatedAt: commitAt,
+		IdempotencyKey: request.IdempotencyKey, RequestHash: requestHash,
+		RequestHashVersion: domain.InvestigationCreateRequestVersionV2, PlanBinding: request.PlanBinding,
+		CreatedAt: commitAt, UpdatedAt: commitAt,
 	}
 	if err := item.Validate(); err != nil {
 		return investigation.CreateOrGetInvestigationResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, err)
@@ -119,11 +134,18 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 	createdTasks := make([]domain.ReadTask, 0, len(canonicalTasks))
 	for index, spec := range canonicalTasks {
 		inputDigest := sha256.Sum256(spec.Input)
+		runtimeBinding, bindingErr := investigation.BuildReadTaskRuntimeBinding(
+			scope, request.PlanBinding, spec, index+1, runtimeComponents[index], commitAt,
+		)
+		if bindingErr != nil {
+			return investigation.CreateOrGetInvestigationResult{}, bindingErr
+		}
 		task := domain.ReadTask{
 			ID: taskIDs[index], WorkspaceID: request.WorkspaceID, IncidentID: request.IncidentID, InvestigationID: item.ID,
 			Key: spec.Key, Position: index + 1, ConnectorID: spec.ConnectorID, Operation: spec.Operation,
 			Input: bytes.Clone(spec.Input), InputHash: fmt.Sprintf("%x", inputDigest[:]), Status: domain.ReadTaskQueued,
-			CreatedAt: commitAt, UpdatedAt: commitAt,
+			RuntimeBinding: runtimeBinding,
+			CreatedAt:      commitAt, UpdatedAt: commitAt,
 		}
 		if validateErr := task.Validate(); validateErr != nil {
 			return investigation.CreateOrGetInvestigationResult{}, fmt.Errorf("%w: %v", investigation.ErrInvalidRequest, validateErr)
@@ -147,6 +169,38 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 	return investigation.CreateOrGetInvestigationResult{
 		Investigation: cloneInvestigation(item), Tasks: cloneTasks(createdTasks), Created: true,
 	}, nil
+}
+
+// activeRuntimeBindingsMatch verifies the locked active resource against the
+// current trusted plan and binder output. A new idempotency key may bind to an
+// existing active v2 Investigation only when every immutable task and runtime
+// digest still matches; legacy or drifted state is never upgraded in place.
+func (repository *Repository) activeRuntimeBindingsMatch(
+	workspaceID, investigationID string,
+	scope investigation.TaskSpecScope,
+	specs []investigation.TaskSpec,
+	components []investigation.TaskRuntimeComponents,
+) bool {
+	taskIDs := repository.taskIDsByInvestigation[scoped(workspaceID, investigationID)]
+	if len(taskIDs) != len(specs) || len(components) != len(specs) {
+		return false
+	}
+	for index, taskID := range taskIDs {
+		task, found := repository.tasks[scoped(workspaceID, taskID)]
+		if !found || task.Position != index+1 || task.Key != specs[index].Key ||
+			task.ConnectorID != specs[index].ConnectorID || task.Operation != specs[index].Operation ||
+			!bytes.Equal(task.Input, specs[index].Input) || task.RuntimeBinding.IsZero() {
+			return false
+		}
+		expected, err := investigation.BuildReadTaskRuntimeBinding(
+			scope, repository.investigations[scoped(workspaceID, investigationID)].PlanBinding,
+			specs[index], index+1, components[index], task.RuntimeBinding.BoundAt,
+		)
+		if err != nil || !task.RuntimeBinding.Equal(expected) {
+			return false
+		}
+	}
+	return true
 }
 
 // createInvestigationReplayLocked checks the immutable workspace-scoped

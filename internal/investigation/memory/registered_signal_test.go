@@ -81,8 +81,9 @@ func newRegistrationRepository(t *testing.T) *memory.Repository {
 	t.Helper()
 	now := time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)
 	repository, err := memory.New(memory.Options{
-		Clock:     func() time.Time { return now },
-		IDFactory: func() string { return "77777777-7777-4777-8777-777777777777" },
+		TaskRuntimeBinder: testTaskRuntimeBinder,
+		Clock:             func() time.Time { return now },
+		IDFactory:         func() string { return "77777777-7777-4777-8777-777777777777" },
 		TenantResolver: func(workspaceID string) (string, error) {
 			switch workspaceID {
 			case registrationWorkspaceA:

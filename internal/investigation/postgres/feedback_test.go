@@ -107,10 +107,12 @@ func coreCompletedInvestigationRows(now time.Time) *pgxmock.Rows {
 	startedAt := now.Add(-time.Hour)
 	return pgxmock.NewRows([]string{
 		"id", "tenant_id", "workspace_id", "incident_id", "status", "model_status", "idempotency_key", "request_hash",
+		"request_hash_version", "plan_schema_version", "plan_manifest_digest", "plan_registry_digest", "plan_profile_digest", "plan_tasks_hash",
 		"failure_code", "model_failure_code", "created_at", "started_at", "completed_at", "updated_at",
 	}).AddRow(
 		coreInvestigationID, coreTenantID, coreWorkspaceID, coreIncidentID,
 		domain.InvestigationCompleted, domain.ModelCompleted, "investigate:payments", coreHash('d'),
+		domain.InvestigationCreateRequestVersionV1, nil, nil, nil, nil, nil,
 		"", "", createdAt, startedAt, now, now,
 	)
 }

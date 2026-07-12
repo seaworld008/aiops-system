@@ -12,8 +12,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/pashagolub/pgxmock/v4"
+	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/execution"
 	"github.com/seaworld008/aiops-system/internal/executionlease"
+	"github.com/seaworld008/aiops-system/internal/investigation"
 	"github.com/seaworld008/aiops-system/internal/readtask"
 )
 
@@ -47,14 +49,13 @@ func TestClaimRunnerTxRejectsWriteScopeBeforeTaskSQL(t *testing.T) {
 	rollbackReadTaskTx(t, database, tx)
 }
 
-func TestClaimRunnerTxBindsPersistedTaskExactScopeCertificateAndHashedToken(t *testing.T) {
+func TestClaimRunnerTxBindsPersistedTaskExactScopeCertificateRuntimeAndHashedToken(t *testing.T) {
 	database, repository := newReadTaskRepository(t)
 	tx := beginReadTaskTx(t, database)
 	now := testNow()
 	leaseNow := now.Add(2 * time.Second)
 	certificate := readtask.CertificateBinding{SHA256: testCertificateHash, NotAfter: now.Add(time.Minute)}
-	input := json.RawMessage(`{"query":"up","window_seconds":300}`)
-	inputDigest := sha256.Sum256(input)
+	descriptor, input := testDescriptorAndInput()
 	tokenDigest := sha256.Sum256([]byte(testLeaseToken))
 
 	database.ExpectExec(`SELECT pg_advisory_xact_lock\(hashtextextended\(\$1, 0\)\)`).
@@ -64,8 +65,14 @@ func TestClaimRunnerTxBindsPersistedTaskExactScopeCertificateAndHashedToken(t *t
 		WithArgs(testTenantID, testTaskID).
 		WillReturnRows(pgxmock.NewRows(taskLockColumns()).AddRow(
 			testTenantID, testWorkspaceID, testEnvironmentID, testServiceID, testIncidentID, testInvestigationID,
-			testTaskID, "metrics.up", int16(1), "prometheus-staging", "query_range",
-			[]byte(input), hex.EncodeToString(inputDigest[:]), "QUEUED", "QUEUED",
+			testTaskID, "metrics.up", int16(1), descriptor.ConnectorID, "query_range",
+			[]byte(input), descriptor.InputHash,
+			descriptor.PlanBinding.SchemaVersion, descriptor.PlanBinding.ManifestDigest,
+			descriptor.PlanBinding.RegistryDigest, descriptor.PlanBinding.ProfileDigest, descriptor.PlanBinding.TasksHash,
+			descriptor.RuntimeBinding.SchemaVersion, descriptor.RuntimeBinding.ConnectorDigest,
+			descriptor.RuntimeBinding.TargetDigest, descriptor.RuntimeBinding.ExecutorDigest,
+			descriptor.RuntimeBinding.RuntimeDigest, descriptor.RuntimeBinding.BoundAt,
+			"QUEUED", "QUEUED",
 		))
 	expectDatabaseClock(database, now)
 	database.ExpectExec(`(?s)UPDATE investigation_task_attempts.*SET status = 'EXPIRED'.*lease_expires_at <= \$5`).
@@ -76,15 +83,15 @@ func TestClaimRunnerTxBindsPersistedTaskExactScopeCertificateAndHashedToken(t *t
 		WillReturnRows(pgxmock.NewRows([]string{"task_active", "runner_active", "max_epoch", "last_terminal_at"}).
 			AddRow(false, int64(0), int64(0), nil))
 	expectDatabaseClock(database, leaseNow)
+	leased := testAttempt(leaseNow, certificate, readtask.AttemptLeased)
+	leased.LeaseExpiresAt = leaseNow.Add(30 * time.Second)
 	database.ExpectQuery(`(?s)INSERT INTO investigation_task_attempts.*lease_token_sha256.*certificate_not_after.*'LEASED'.*RETURNING`).
 		WithArgs(
 			testTenantID, testWorkspaceID, testEnvironmentID, testInvestigationID, testTaskID,
 			int64(1), hex.EncodeToString(tokenDigest[:]), testRunnerID, int64(7), testCertificateHash,
 			certificate.NotAfter, leaseNow.Add(30*time.Second),
 		).
-		WillReturnRows(pgxmock.NewRows([]string{
-			"lease_acquired_at", "last_heartbeat_at", "lease_expires_at", "certificate_not_after", "updated_at",
-		}).AddRow(leaseNow, leaseNow, leaseNow.Add(30*time.Second), certificate.NotAfter, leaseNow))
+		WillReturnRows(attemptRows(leased))
 
 	claim, err := repository.ClaimRunnerTx(
 		context.Background(), tx, testRunnerScope(t, executionlease.PoolRead), certificate, testTaskID, 30*time.Second,
@@ -99,11 +106,51 @@ func TestClaimRunnerTxBindsPersistedTaskExactScopeCertificateAndHashedToken(t *t
 	defer claim.Destroy()
 	if !claim.Valid() || claim.Attempt().Epoch != 1 || claim.Attempt().ScopeRevision != 7 ||
 		claim.Descriptor().WorkspaceID != testWorkspaceID || claim.Descriptor().EnvironmentID != testEnvironmentID ||
+		!claim.Descriptor().PlanBinding.Equal(descriptor.PlanBinding) ||
+		!claim.Descriptor().RuntimeBinding.Equal(descriptor.RuntimeBinding) ||
+		!claim.Attempt().PlanBinding.Equal(descriptor.PlanBinding) ||
+		!claim.Attempt().RuntimeBinding.Equal(descriptor.RuntimeBinding) ||
 		claim.TokenSHA256() != hex.EncodeToString(tokenDigest[:]) {
 		t.Fatalf("ClaimRunnerTx() = %s / %#v / %#v", claim.String(), claim.Descriptor(), claim.Attempt())
 	}
 	if strings.Contains(claim.String(), testLeaseToken) {
 		t.Fatal("claim rendering leaked the lease token")
+	}
+	rollbackReadTaskTx(t, database, tx)
+}
+
+func TestClaimRunnerTxUnboundTaskIsInvisibleWithoutGeneratingToken(t *testing.T) {
+	database, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("pgxmock.NewPool() error = %v", err)
+	}
+	t.Cleanup(database.Close)
+	tokenCalls := 0
+	repository, err := New(database, Options{
+		TokenSource: func() ([]byte, error) {
+			tokenCalls++
+			return make([]byte, 32), nil
+		},
+		IDSource: func() string { return testEvidenceID },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	tx := beginReadTaskTx(t, database)
+	database.ExpectExec(`SELECT pg_advisory_xact_lock\(hashtextextended\(\$1, 0\)\)`).
+		WithArgs("read-task-runner:" + testTenantID + ":" + testRunnerID).
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	database.ExpectQuery(`(?s)SELECT .*FROM tool_invocations AS task.*task.read_runtime_schema_version = 'read-task-runtime-binding.v1'.*investigation.request_hash_version = 'investigation.create.v2'.*investigation.plan_schema_version = 'investigation-plan-manifest.v1'.*FOR NO KEY UPDATE OF task`).
+		WithArgs(testTenantID, testTaskID).
+		WillReturnError(pgx.ErrNoRows)
+
+	claim, err := repository.ClaimRunnerTx(
+		context.Background(), tx, testRunnerScope(t, executionlease.PoolRead),
+		readtask.CertificateBinding{SHA256: testCertificateHash, NotAfter: testNow().Add(time.Minute)},
+		testTaskID, 30*time.Second,
+	)
+	if !errors.Is(err, readtask.ErrNotFound) || claim.Valid() || tokenCalls != 0 {
+		t.Fatalf("ClaimRunnerTx(unbound) = %s, %v; token calls=%d", claim.String(), err, tokenCalls)
 	}
 	rollbackReadTaskTx(t, database, tx)
 }
@@ -486,7 +533,7 @@ func TestReleaseRunnerTxOnlyTerminatesPreStartAttempt(t *testing.T) {
 	rollbackReadTaskTx(t, database, tx)
 }
 
-func TestCompleteRunnerAuthorizedTxAtomicallyPersistsEvidenceTaskAttemptAndV2Receipt(t *testing.T) {
+func TestCompleteRunnerAuthorizedTxAtomicallyPersistsEvidenceTaskAttemptAndV3Receipt(t *testing.T) {
 	database, repository := newReadTaskRepository(t)
 	tx := beginReadTaskTx(t, database)
 	now := testNow().Add(2 * time.Second)
@@ -518,6 +565,8 @@ func TestCompleteRunnerAuthorizedTxAtomicallyPersistsEvidenceTaskAttemptAndV2Rec
 	completed.UpdatedAt = completed.TerminalAt
 	completed.RequestHash = projection.RequestHash()
 	completed.ReceiptHash = projection.ReceiptHash()
+	completed.RequestHashVersion = readtask.CompletionRequestHashVersionV3
+	completed.ReceiptHashVersion = readtask.CompletionReceiptHashVersionV3
 
 	expectTaskLock(database, descriptor, input, "RUNNING", "RUNNING")
 	database.ExpectQuery(`(?s)SELECT .*FROM investigation_task_attempts AS attempt.*FOR UPDATE OF attempt`).
@@ -537,10 +586,12 @@ func TestCompleteRunnerAuthorizedTxAtomicallyPersistsEvidenceTaskAttemptAndV2Rec
 	database.ExpectExec(`(?s)UPDATE tool_invocations.*SET status = \$5, evidence_id = \$6, output_hash = \$7`).
 		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, "EVIDENCE", testEvidenceID, projection.ContentHash(), nil).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
-	database.ExpectQuery(`(?s)UPDATE investigation_task_attempts.*status = 'COMPLETED'.*request_hash = \$6.*receipt_hash = \$7.*RETURNING`).
-		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1), projection.RequestHash(), projection.ReceiptHash()).
+	database.ExpectQuery(`(?s)UPDATE investigation_task_attempts.*status = 'COMPLETED'.*request_hash = \$6.*receipt_hash = \$7.*request_hash_version = \$8.*receipt_hash_version = \$9.*RETURNING`).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1),
+			projection.RequestHash(), projection.ReceiptHash(),
+			readtask.CompletionRequestHashVersionV3, readtask.CompletionReceiptHashVersionV3).
 		WillReturnRows(attemptRows(completed))
-	database.ExpectQuery(`(?s)INSERT INTO runner_evidence_receipts .*'runner-evidence.v2'.*RETURNING received_at`).
+	database.ExpectQuery(`(?s)INSERT INTO runner_evidence_receipts .*request_hash_version.*receipt_hash_version.*'read-task-completion-request.v3'.*'read-task-completion-receipt.v3'.*'runner-evidence.v3'.*RETURNING received_at`).
 		WithArgs(
 			testReceiptID, testTenantID, testWorkspaceID, testEnvironmentID, testInvestigationID, testTaskID,
 			testRunnerID, int64(7), testCertificateHash, descriptor.ConnectorID, testEvidenceID,
@@ -603,6 +654,8 @@ func TestCompleteRunnerAuthorizedTxReplaysOriginalReceiptWithoutMutablePolicy(t 
 	completed.UpdatedAt = completed.TerminalAt
 	completed.RequestHash = projection.RequestHash()
 	completed.ReceiptHash = projection.ReceiptHash()
+	completed.RequestHashVersion = readtask.CompletionRequestHashVersionV3
+	completed.ReceiptHashVersion = readtask.CompletionReceiptHashVersionV3
 
 	expectTaskLock(database, descriptor, input, "EVIDENCE", "RUNNING")
 	database.ExpectQuery(`(?s)SELECT .*FROM investigation_task_attempts AS attempt.*FOR UPDATE OF attempt`).
@@ -612,9 +665,14 @@ func TestCompleteRunnerAuthorizedTxReplaysOriginalReceiptWithoutMutablePolicy(t 
 		WithArgs(testTenantID, testWorkspaceID, testInvestigationID).
 		WillReturnRows(pgxmock.NewRows([]string{"status"}).AddRow("RUNNING"))
 	expectDatabaseClock(database, base.Add(5*time.Second))
-	database.ExpectQuery(`(?s)SELECT receipt.id::text.*FROM runner_evidence_receipts AS receipt.*FOR SHARE OF receipt`).
+	database.ExpectQuery(`(?s)SELECT receipt.id::text.*FROM runner_evidence_receipts AS receipt.*receipt.schema_version = 'runner-evidence.v3'.*receipt.request_hash_version = 'read-task-completion-request.v3'.*receipt.receipt_hash_version = 'read-task-completion-receipt.v3'.*receipt.runtime_bound_at = \$19.*FOR SHARE OF receipt`).
 		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, testRunnerID,
-			int64(1), projection.RequestHash(), projection.ReceiptHash()).
+			int64(1), projection.RequestHash(), projection.ReceiptHash(),
+			descriptor.PlanBinding.SchemaVersion, descriptor.PlanBinding.ManifestDigest,
+			descriptor.PlanBinding.RegistryDigest, descriptor.PlanBinding.ProfileDigest, descriptor.PlanBinding.TasksHash,
+			descriptor.RuntimeBinding.SchemaVersion, descriptor.RuntimeBinding.ConnectorDigest,
+			descriptor.RuntimeBinding.TargetDigest, descriptor.RuntimeBinding.ExecutorDigest,
+			descriptor.RuntimeBinding.RuntimeDigest, descriptor.RuntimeBinding.BoundAt).
 		WillReturnRows(pgxmock.NewRows([]string{"id", "evidence_id", "received_at"}).
 			AddRow(testReceiptID, testEvidenceID, base.Add(3*time.Second)))
 
@@ -720,6 +778,8 @@ func TestProjectRunnerCompletionClassifiesChangedCommittedReplayByHash(t *testin
 	completed.UpdatedAt = completed.TerminalAt
 	completed.RequestHash = original.RequestHash()
 	completed.ReceiptHash = original.ReceiptHash()
+	completed.RequestHashVersion = readtask.CompletionRequestHashVersionV3
+	completed.ReceiptHashVersion = readtask.CompletionReceiptHashVersionV3
 
 	same, err := projectRunnerCompletion(descriptor, completed, completion, base.Add(5*time.Second))
 	if err != nil || same.RequestHash() != original.RequestHash() || same.ReceiptHash() != original.ReceiptHash() {
@@ -806,13 +866,46 @@ func testNow() time.Time {
 func testDescriptorAndInput() (readtask.Descriptor, json.RawMessage) {
 	input := json.RawMessage(`{"query":"up","window_seconds":300}`)
 	digest := sha256.Sum256(input)
-	return readtask.Descriptor{
+	connectorDigest := strings.Repeat("a", 64)
+	descriptor := readtask.Descriptor{
 		TenantID: testTenantID, WorkspaceID: testWorkspaceID, EnvironmentID: testEnvironmentID,
 		ServiceID:  testServiceID,
 		IncidentID: testIncidentID, InvestigationID: testInvestigationID, TaskID: testTaskID,
-		TaskKey: "metrics.up", Position: 1, ConnectorID: "prometheus-staging", Operation: "query_range",
+		TaskKey: "metrics.up", Position: 1,
+		ConnectorID: "prometheus-staging-v1-" + connectorDigest, Operation: "query_range",
 		Input: input, InputHash: hex.EncodeToString(digest[:]),
-	}, input
+		PlanBinding: domain.InvestigationPlanBinding{
+			SchemaVersion:  domain.InvestigationPlanBindingSchemaVersion,
+			ManifestDigest: strings.Repeat("b", 64), RegistryDigest: strings.Repeat("c", 64),
+			ProfileDigest: strings.Repeat("d", 64), TasksHash: strings.Repeat("e", 64),
+		},
+		RuntimeBinding: domain.ReadTaskRuntimeBinding{
+			SchemaVersion: domain.ReadTaskRuntimeBindingSchemaVersion, ConnectorDigest: connectorDigest,
+			TargetDigest: strings.Repeat("f", 64), ExecutorDigest: strings.Repeat("1", 64),
+			RuntimeDigest: strings.Repeat("2", 64), BoundAt: testNow().Add(-time.Minute),
+		},
+	}
+	runtimeDigest, err := investigation.ReadTaskRuntimeDigest(
+		investigation.TaskSpecScope{
+			TenantID: descriptor.TenantID, WorkspaceID: descriptor.WorkspaceID,
+			EnvironmentID: descriptor.EnvironmentID, ServiceID: descriptor.ServiceID,
+			MappingStatus: domain.MappingExact,
+		}, descriptor.PlanBinding,
+		investigation.TaskSpec{
+			Key: descriptor.TaskKey, ConnectorID: descriptor.ConnectorID,
+			Operation: descriptor.Operation, Input: append(json.RawMessage(nil), descriptor.Input...),
+		}, descriptor.Position,
+		investigation.TaskRuntimeComponents{
+			ConnectorDigest: descriptor.RuntimeBinding.ConnectorDigest,
+			TargetDigest:    descriptor.RuntimeBinding.TargetDigest,
+			ExecutorDigest:  descriptor.RuntimeBinding.ExecutorDigest,
+		},
+	)
+	if err != nil {
+		panic(err)
+	}
+	descriptor.RuntimeBinding.RuntimeDigest = runtimeDigest
+	return descriptor, input
 }
 
 func expectTaskLock(
@@ -827,6 +920,11 @@ func expectTaskLock(
 			descriptor.TenantID, descriptor.WorkspaceID, descriptor.EnvironmentID, descriptor.ServiceID, descriptor.IncidentID,
 			descriptor.InvestigationID, descriptor.TaskID, descriptor.TaskKey, int16(descriptor.Position),
 			descriptor.ConnectorID, descriptor.Operation, []byte(input), descriptor.InputHash,
+			descriptor.PlanBinding.SchemaVersion, descriptor.PlanBinding.ManifestDigest,
+			descriptor.PlanBinding.RegistryDigest, descriptor.PlanBinding.ProfileDigest, descriptor.PlanBinding.TasksHash,
+			descriptor.RuntimeBinding.SchemaVersion, descriptor.RuntimeBinding.ConnectorDigest,
+			descriptor.RuntimeBinding.TargetDigest, descriptor.RuntimeBinding.ExecutorDigest,
+			descriptor.RuntimeBinding.RuntimeDigest, descriptor.RuntimeBinding.BoundAt,
 			taskStatus, investigationStatus,
 		))
 }
@@ -838,9 +936,11 @@ func expectDatabaseClock(database pgxmock.PgxPoolIface, now time.Time) {
 
 func testAttempt(now time.Time, certificate readtask.CertificateBinding, status readtask.AttemptStatus) readtask.Attempt {
 	digest := sha256.Sum256([]byte(testLeaseToken))
+	descriptor, _ := testDescriptorAndInput()
 	return readtask.Attempt{
 		TaskID: testTaskID, RunnerID: testRunnerID, ScopeRevision: 7, Certificate: certificate,
 		TokenSHA256: hex.EncodeToString(digest[:]), Epoch: 1, Status: status,
+		PlanBinding: descriptor.PlanBinding, RuntimeBinding: descriptor.RuntimeBinding,
 		LeaseAcquiredAt: now, LastHeartbeatAt: now, LeaseExpiresAt: now.Add(30 * time.Second), UpdatedAt: now,
 	}
 }
@@ -849,12 +949,22 @@ func attemptRows(attempt readtask.Attempt) *pgxmock.Rows {
 	return pgxmock.NewRows([]string{
 		"task_id", "runner_id", "scope_revision", "certificate_sha256", "certificate_not_after",
 		"lease_token_sha256", "lease_epoch", "status", "heartbeat_seq", "lease_acquired_at",
-		"last_heartbeat_at", "lease_expires_at", "started_at", "terminal_at", "request_hash", "receipt_hash", "updated_at",
+		"last_heartbeat_at", "lease_expires_at", "started_at", "terminal_at", "request_hash", "receipt_hash",
+		"request_hash_version", "receipt_hash_version",
+		"plan_schema_version", "plan_manifest_digest", "plan_registry_digest", "plan_profile_digest", "plan_tasks_hash",
+		"read_runtime_schema_version", "connector_digest", "target_digest", "executor_digest", "runtime_digest", "runtime_bound_at",
+		"updated_at",
 	}).AddRow(
 		attempt.TaskID, attempt.RunnerID, attempt.ScopeRevision, attempt.Certificate.SHA256, attempt.Certificate.NotAfter,
 		attempt.TokenSHA256, attempt.Epoch, attempt.Status, attempt.HeartbeatSequence, attempt.LeaseAcquiredAt,
 		attempt.LastHeartbeatAt, attempt.LeaseExpiresAt, nullableTime(attempt.StartedAt), nullableTime(attempt.TerminalAt),
-		nullableString(attempt.RequestHash), nullableString(attempt.ReceiptHash), attempt.UpdatedAt,
+		nullableString(attempt.RequestHash), nullableString(attempt.ReceiptHash),
+		nullableString(attempt.RequestHashVersion), nullableString(attempt.ReceiptHashVersion),
+		attempt.PlanBinding.SchemaVersion, attempt.PlanBinding.ManifestDigest, attempt.PlanBinding.RegistryDigest,
+		attempt.PlanBinding.ProfileDigest, attempt.PlanBinding.TasksHash,
+		attempt.RuntimeBinding.SchemaVersion, attempt.RuntimeBinding.ConnectorDigest, attempt.RuntimeBinding.TargetDigest,
+		attempt.RuntimeBinding.ExecutorDigest, attempt.RuntimeBinding.RuntimeDigest, attempt.RuntimeBinding.BoundAt,
+		attempt.UpdatedAt,
 	)
 }
 
@@ -876,6 +986,8 @@ func taskLockColumns() []string {
 	return []string{
 		"tenant_id", "workspace_id", "environment_id", "service_id", "incident_id", "investigation_id",
 		"task_id", "task_key", "position", "connector_id", "operation", "input_document", "input_hash",
+		"plan_schema_version", "plan_manifest_digest", "plan_registry_digest", "plan_profile_digest", "plan_tasks_hash",
+		"read_runtime_schema_version", "connector_digest", "target_digest", "executor_digest", "runtime_digest", "runtime_bound_at",
 		"task_status", "investigation_status",
 	}
 }

@@ -14,12 +14,13 @@ func TestRecordFeedbackRequiresHumanAndIsTheOnlyRootCauseConfirmationPath(t *tes
 	now := time.Date(2026, 7, 11, 17, 0, 0, 0, time.UTC)
 	repository := newRepository(t, now)
 	incident := createIncident(t, repository, "workspace-1", "signal-feedback", now)
-	created, err := repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+	created, err := repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: "workspace-1", IncidentID: incident.ID, IdempotencyKey: "investigate:feedback",
 		Tasks: []investigation.TaskSpec{{
-			Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
+			Key: "metrics", ConnectorID: "prometheus-prod-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
 		}},
-	})
+	}))
+
 	if err != nil {
 		t.Fatalf("CreateOrGetInvestigation() error = %v", err)
 	}

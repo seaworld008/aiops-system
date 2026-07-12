@@ -26,12 +26,14 @@ type DB interface {
 type Options struct {
 	IDFactory          func() string
 	TaskSpecAuthorizer investigation.TaskSpecAuthorizer
+	TaskRuntimeBinder  investigation.TaskRuntimeBinder
 }
 
 type Repository struct {
 	database           DB
 	idFactory          func() string
 	taskSpecAuthorizer investigation.TaskSpecAuthorizer
+	taskRuntimeBinder  investigation.TaskRuntimeBinder
 }
 
 var _ investigation.Repository = (*Repository)(nil)
@@ -39,13 +41,14 @@ var _ investigation.Repository = (*Repository)(nil)
 var errDatabaseOperation = errors.New("investigation database operation failed")
 
 func New(database DB, options Options) (*Repository, error) {
-	if nilInterface(database) || options.IDFactory == nil || options.TaskSpecAuthorizer == nil {
+	if nilInterface(database) || options.IDFactory == nil || options.TaskSpecAuthorizer == nil || options.TaskRuntimeBinder == nil {
 		return nil, fmt.Errorf("%w: trusted PostgreSQL repository dependencies are required", investigation.ErrInvalidRequest)
 	}
 	return &Repository{
 		database:           database,
 		idFactory:          options.IDFactory,
 		taskSpecAuthorizer: options.TaskSpecAuthorizer,
+		taskRuntimeBinder:  options.TaskRuntimeBinder,
 	}, nil
 }
 

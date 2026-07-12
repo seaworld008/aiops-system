@@ -13,7 +13,7 @@ import (
 )
 
 func TestPostgresConcurrentHumanConfirmCommitsOneRootCause(t *testing.T) {
-	fixture := newRuntimeFixture(t)
+	fixture := newLatestRuntimeFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	prepareEvidenceTaskForFeedbackConcurrency(t, ctx, fixture)
@@ -25,6 +25,7 @@ func TestPostgresConcurrentHumanConfirmCommitsOneRootCause(t *testing.T) {
 	}
 	var generated atomic.Uint32
 	repository, err := investigationpostgres.New(fixture.harness.extendedPool(t), investigationpostgres.Options{
+		TaskRuntimeBinder: testTaskRuntimeBinder,
 		IDFactory: func() string {
 			index := int(generated.Add(1)) - 1
 			if index >= len(generatedIDs) {
@@ -178,7 +179,7 @@ func prepareEvidenceTaskForFeedbackConcurrency(t *testing.T, ctx context.Context
 			collected_at, redacted_summary, content_hash, trust_level, truncated, created_at,
 			incident_id, task_id, payload_document, attributes, runtime_schema_version
 		) VALUES (
-			$1, $2, $3, $4, 'prometheus-staging', '{}', $5, $6::jsonb, $7,
+			$1, $2, $3, $4, 'prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', '{}', $5, $6::jsonb, $7,
 			'AUTHENTICATED_READ_RUNNER', false, $8, $9, $10, $11, '{}',
 			'investigation-runtime.v1'
 		)

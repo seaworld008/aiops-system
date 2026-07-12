@@ -72,7 +72,7 @@ func TestProjectCompletionBuildsCanonicalServerOwnedEvidenceAndHashes(t *testing
 	}
 	var receiptDocument map[string]any
 	if err := json.Unmarshal(receiptJSON, &receiptDocument); err != nil ||
-		receiptDocument["schema_version"] != "runner-evidence.v2" || receiptDocument["lease_epoch"] != "7" ||
+		receiptDocument["schema_version"] != readtask.RunnerEvidenceSchemaVersionV3 || receiptDocument["lease_epoch"] != "7" ||
 		receiptDocument["scope_revision"] != "3" || receiptDocument["service_id"] != descriptor.ServiceID ||
 		bytes.Contains(receiptJSON, []byte(testToken)) {
 		t.Fatalf("safe receipt wire = %s, %v", receiptJSON, err)
@@ -82,6 +82,8 @@ func TestProjectCompletionBuildsCanonicalServerOwnedEvidenceAndHashes(t *testing
 	terminal.TerminalAt = now
 	terminal.RequestHash = projected.RequestHash()
 	terminal.ReceiptHash = projected.ReceiptHash()
+	terminal.RequestHashVersion = readtask.CompletionRequestHashVersionV3
+	terminal.ReceiptHashVersion = readtask.CompletionReceiptHashVersionV3
 	completionResult := readtask.CompletionResult{
 		Attempt: terminal, Projection: projected,
 		EvidenceID: "12121212-1212-4121-8121-121212121212",
@@ -95,7 +97,10 @@ func TestProjectCompletionBuildsCanonicalServerOwnedEvidenceAndHashes(t *testing
 	if err := projected.ValidateAgainst(changedService, attempt); err == nil {
 		t.Fatal("ProjectedCompletion accepted a different trusted service binding")
 	}
-	changedServiceProjection, err := readtask.ProjectCompletion(changedService, attempt, completion, now)
+	rebindDescriptorRuntime(t, &changedService)
+	changedServiceAttempt := attempt
+	changedServiceAttempt.RuntimeBinding = changedService.RuntimeBinding
+	changedServiceProjection, err := readtask.ProjectCompletion(changedService, changedServiceAttempt, completion, now)
 	if err != nil || changedServiceProjection.RequestHash() == projected.RequestHash() ||
 		changedServiceProjection.ReceiptHash() == projected.ReceiptHash() {
 		t.Fatalf("service binding did not change completion hashes: %#v, %v", changedServiceProjection.Receipt(), err)
@@ -159,6 +164,8 @@ func TestProjectCompletionEnforcesBoundsExpiryAndDatabaseReceiptTime(t *testing.
 	completed.UpdatedAt = completed.TerminalAt
 	completed.RequestHash = projected.RequestHash()
 	completed.ReceiptHash = projected.ReceiptHash()
+	completed.RequestHashVersion = readtask.CompletionRequestHashVersionV3
+	completed.ReceiptHashVersion = readtask.CompletionReceiptHashVersionV3
 	lateDatabaseACK := attempt.LeaseExpiresAt.Add(time.Microsecond)
 	lateBound, err := projected.WithReceivedAt(lateDatabaseACK, descriptor, completed)
 	if err != nil || !lateBound.ReceivedAt().Equal(lateDatabaseACK) || lateBound.ReceiptHash() != projected.ReceiptHash() {
@@ -250,6 +257,7 @@ func runningAttempt(t *testing.T, descriptor readtask.Descriptor, now time.Time)
 		TokenSHA256: fmt.Sprintf("%x", tokenDigest), Epoch: 7, Status: readtask.AttemptRunning,
 		LeaseAcquiredAt: now.Add(-time.Second), LastHeartbeatAt: now.Add(-time.Second),
 		LeaseExpiresAt: now.Add(30 * time.Second), StartedAt: now.Add(-500 * time.Millisecond), UpdatedAt: now,
+		PlanBinding: descriptor.PlanBinding, RuntimeBinding: descriptor.RuntimeBinding,
 	}
 	if err := attempt.ValidateAgainst(descriptor); err != nil {
 		t.Fatalf("running Attempt.ValidateAgainst() error = %v", err)

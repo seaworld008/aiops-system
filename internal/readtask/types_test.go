@@ -5,9 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/seaworld008/aiops-system/internal/domain"
+	"github.com/seaworld008/aiops-system/internal/investigation"
 	"github.com/seaworld008/aiops-system/internal/readtask"
 )
 
@@ -61,6 +64,7 @@ func TestClaimBindsValidatedDescriptorAttemptCertificateAndBearer(t *testing.T) 
 		Certificate: readtask.CertificateBinding{SHA256: fmt.Sprintf("%x", sha256.Sum256([]byte("certificate"))), NotAfter: now.Add(time.Minute)},
 		TokenSHA256: fmt.Sprintf("%x", tokenDigest), Epoch: 7, Status: readtask.AttemptLeased,
 		LeaseAcquiredAt: now, LastHeartbeatAt: now, LeaseExpiresAt: now.Add(30 * time.Second), UpdatedAt: now,
+		PlanBinding: descriptor.PlanBinding, RuntimeBinding: descriptor.RuntimeBinding,
 	}
 	claim, err := readtask.NewClaim(descriptor, attempt, []byte(testToken))
 	if err != nil {
@@ -137,11 +141,50 @@ func validDescriptor(t *testing.T) readtask.Descriptor {
 		EnvironmentID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", IncidentID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
 		ServiceID:       "c1000000-0000-4000-8000-000000000001",
 		InvestigationID: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", TaskID: testTaskID,
-		TaskKey: "service.health", Position: 1, ConnectorID: "prometheus", Operation: "query_range",
+		TaskKey: "service.health", Position: 1,
+		ConnectorID: "prometheus-v1-" + strings.Repeat("5", 64), Operation: "query_range",
 		Input: input, InputHash: fmt.Sprintf("%x", digest),
+		PlanBinding: domain.InvestigationPlanBinding{
+			SchemaVersion:  domain.InvestigationPlanBindingSchemaVersion,
+			ManifestDigest: strings.Repeat("1", 64), RegistryDigest: strings.Repeat("2", 64),
+			ProfileDigest: strings.Repeat("3", 64), TasksHash: strings.Repeat("4", 64),
+		},
+		RuntimeBinding: domain.ReadTaskRuntimeBinding{
+			SchemaVersion:   domain.ReadTaskRuntimeBindingSchemaVersion,
+			ConnectorDigest: strings.Repeat("5", 64), TargetDigest: strings.Repeat("6", 64),
+			ExecutorDigest: strings.Repeat("7", 64), RuntimeDigest: strings.Repeat("8", 64),
+			BoundAt: time.Date(2026, 7, 12, 7, 0, 0, 123000, time.UTC),
+		},
 	}
+	rebindDescriptorRuntime(t, &descriptor)
 	if err := descriptor.Validate(); err != nil {
 		t.Fatalf("valid Descriptor.Validate() error = %v", err)
 	}
 	return descriptor
+}
+
+func rebindDescriptorRuntime(t *testing.T, descriptor *readtask.Descriptor) {
+	t.Helper()
+	digest, err := investigation.ReadTaskRuntimeDigest(
+		investigation.TaskSpecScope{
+			TenantID: descriptor.TenantID, WorkspaceID: descriptor.WorkspaceID,
+			EnvironmentID: descriptor.EnvironmentID, ServiceID: descriptor.ServiceID,
+			MappingStatus: domain.MappingExact,
+		},
+		descriptor.PlanBinding,
+		investigation.TaskSpec{
+			Key: descriptor.TaskKey, ConnectorID: descriptor.ConnectorID,
+			Operation: descriptor.Operation, Input: append(json.RawMessage(nil), descriptor.Input...),
+		},
+		descriptor.Position,
+		investigation.TaskRuntimeComponents{
+			ConnectorDigest: descriptor.RuntimeBinding.ConnectorDigest,
+			TargetDigest:    descriptor.RuntimeBinding.TargetDigest,
+			ExecutorDigest:  descriptor.RuntimeBinding.ExecutorDigest,
+		},
+	)
+	if err != nil {
+		t.Fatalf("rebind test Descriptor runtime: %v", err)
+	}
+	descriptor.RuntimeBinding.RuntimeDigest = digest
 }

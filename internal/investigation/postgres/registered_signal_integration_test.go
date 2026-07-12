@@ -49,13 +49,14 @@ func TestPostgresTerminalIncidentGuardPreventsNewInvestigationFacts(t *testing.T
 		}
 	}
 	const idempotencyKey = "temporal.prepare.v1/90000000-0000-4000-8000-000000000009"
-	_, err = fixture.repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+	_, err = fixture.repository.CreateOrGetInvestigation(context.Background(), boundCreateRequest(t, investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: testWorkspaceID, IncidentID: correlated.Incident.ID, IdempotencyKey: idempotencyKey,
 		Tasks: []investigation.TaskSpec{{
-			Key: "metrics", ConnectorID: "prometheus-staging", Operation: "range_query",
+			Key: "metrics", ConnectorID: "prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", Operation: "range_query",
 			Input: []byte(`{"lookback_minutes":15}`),
 		}},
-	})
+	}))
+
 	if !errors.Is(err, investigation.ErrInvalidTransition) {
 		t.Fatalf("CreateOrGetInvestigation(terminal) error = %v, want ErrInvalidTransition", err)
 	}

@@ -249,9 +249,11 @@ func TestCreateInvestigationRequestHashIsVersionedAndScopeIndependent(t *testing
 	}
 	request := investigation.CreateOrGetInvestigationRequest{
 		WorkspaceID: "workspace-1", IncidentID: "incident-1", IdempotencyKey: "investigate:create-hash",
+		PlanBinding: validPlanBindingForInvestigation(),
 	}
+	request.PlanBinding.TasksHash = taskHash
 	requestHash, err := investigation.CreateOrGetInvestigationRequestHash(request, taskHash)
-	const goldenCreateHash = "ce7078b6d0af8770614bf44c1142987fdde706f978269d5e3fca5dffa5e1e79b"
+	const goldenCreateHash = "5fe4fc634a41b8bb6a0ff49b0ac0e7715a74f11c7de0af65f3d2fa8c2ad837f8"
 	if err != nil || requestHash != goldenCreateHash {
 		t.Fatalf("CreateOrGetInvestigationRequestHash() = %q, %v", requestHash, err)
 	}
@@ -270,6 +272,35 @@ func TestCreateInvestigationRequestHashIsVersionedAndScopeIndependent(t *testing
 	}
 	if _, err := investigation.CreateOrGetInvestigationRequestHash(request, "invalid"); !errors.Is(err, investigation.ErrInvalidRequest) {
 		t.Fatalf("invalid task hash error = %v, want ErrInvalidRequest", err)
+	}
+	for name, mutate := range map[string]func(*domain.InvestigationPlanBinding){
+		"schema": func(binding *domain.InvestigationPlanBinding) {
+			binding.SchemaVersion = "investigation-plan-manifest.v2"
+		},
+		"manifest": func(binding *domain.InvestigationPlanBinding) { binding.ManifestDigest = strings.Repeat("5", 64) },
+		"registry": func(binding *domain.InvestigationPlanBinding) { binding.RegistryDigest = strings.Repeat("6", 64) },
+		"profile":  func(binding *domain.InvestigationPlanBinding) { binding.ProfileDigest = strings.Repeat("7", 64) },
+		"tasks":    func(binding *domain.InvestigationPlanBinding) { binding.TasksHash = strings.Repeat("8", 64) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := request
+			mutate(&changed.PlanBinding)
+			changedHash, changedErr := investigation.CreateOrGetInvestigationRequestHash(changed, taskHash)
+			if name == "schema" || name == "tasks" {
+				if !errors.Is(changedErr, investigation.ErrInvalidRequest) {
+					t.Fatalf("CreateOrGetInvestigationRequestHash() error = %v, want ErrInvalidRequest", changedErr)
+				}
+				return
+			}
+			if changedErr != nil || changedHash == requestHash {
+				t.Fatalf("changed plan hash = %q, %v; want distinct v2 hash", changedHash, changedErr)
+			}
+		})
+	}
+	legacyHash, err := investigation.LegacyCreateOrGetInvestigationRequestHash(request, taskHash)
+	const goldenLegacyHash = "ce7078b6d0af8770614bf44c1142987fdde706f978269d5e3fca5dffa5e1e79b"
+	if err != nil || legacyHash != goldenLegacyHash || legacyHash == requestHash {
+		t.Fatalf("LegacyCreateOrGetInvestigationRequestHash() = %q, %v", legacyHash, err)
 	}
 }
 

@@ -22,19 +22,21 @@ import (
 const maxSnapshotBytes = 8 * 1024 * 1024
 
 type investigationSnapshotDTO struct {
-	ID               string                     `json:"id"`
-	WorkspaceID      string                     `json:"workspace_id"`
-	IncidentID       string                     `json:"incident_id"`
-	Status           domain.InvestigationStatus `json:"status"`
-	ModelStatus      domain.ModelStatus         `json:"model_status"`
-	IdempotencyKey   string                     `json:"idempotency_key"`
-	RequestHash      string                     `json:"request_hash"`
-	FailureCode      string                     `json:"failure_code,omitempty"`
-	ModelFailureCode string                     `json:"model_failure_code,omitempty"`
-	CreatedAt        string                     `json:"created_at"`
-	StartedAt        string                     `json:"started_at,omitempty"`
-	CompletedAt      string                     `json:"completed_at,omitempty"`
-	UpdatedAt        string                     `json:"updated_at"`
+	ID                 string                           `json:"id"`
+	WorkspaceID        string                           `json:"workspace_id"`
+	IncidentID         string                           `json:"incident_id"`
+	Status             domain.InvestigationStatus       `json:"status"`
+	ModelStatus        domain.ModelStatus               `json:"model_status"`
+	IdempotencyKey     string                           `json:"idempotency_key"`
+	RequestHash        string                           `json:"request_hash"`
+	RequestHashVersion string                           `json:"request_hash_version,omitempty"`
+	PlanBinding        *domain.InvestigationPlanBinding `json:"plan_binding,omitempty"`
+	FailureCode        string                           `json:"failure_code,omitempty"`
+	ModelFailureCode   string                           `json:"model_failure_code,omitempty"`
+	CreatedAt          string                           `json:"created_at"`
+	StartedAt          string                           `json:"started_at,omitempty"`
+	CompletedAt        string                           `json:"completed_at,omitempty"`
+	UpdatedAt          string                           `json:"updated_at"`
 }
 
 type hypothesisSnapshotDTO struct {
@@ -217,13 +219,19 @@ func decodeSnapshot(document []byte, destination any) error {
 }
 
 func investigationToSnapshot(item domain.Investigation) investigationSnapshotDTO {
-	return investigationSnapshotDTO{
+	snapshot := investigationSnapshotDTO{
 		ID: item.ID, WorkspaceID: item.WorkspaceID, IncidentID: item.IncidentID,
 		Status: item.Status, ModelStatus: item.ModelStatus, IdempotencyKey: item.IdempotencyKey,
-		RequestHash: item.RequestHash, FailureCode: item.FailureCode, ModelFailureCode: item.ModelFailureCode,
+		RequestHash: item.RequestHash, RequestHashVersion: item.RequestHashVersion,
+		FailureCode: item.FailureCode, ModelFailureCode: item.ModelFailureCode,
 		CreatedAt: snapshotTimeString(item.CreatedAt), StartedAt: snapshotTimeString(item.StartedAt),
 		CompletedAt: snapshotTimeString(item.CompletedAt), UpdatedAt: snapshotTimeString(item.UpdatedAt),
 	}
+	if !item.PlanBinding.IsZero() {
+		binding := item.PlanBinding
+		snapshot.PlanBinding = &binding
+	}
+	return snapshot
 }
 
 func investigationFromSnapshot(snapshot investigationSnapshotDTO) (domain.Investigation, error) {
@@ -243,12 +251,22 @@ func investigationFromSnapshot(snapshot investigationSnapshotDTO) (domain.Invest
 	if err != nil {
 		return domain.Investigation{}, err
 	}
+	requestHashVersion := snapshot.RequestHashVersion
+	if requestHashVersion == "" && snapshot.PlanBinding == nil {
+		// Historical v1 snapshots predate explicit hash-version metadata. Their
+		// canonical bytes remain verified above; the missing pair has exactly one
+		// valid legacy interpretation and is never persisted back as a v2 fact.
+		requestHashVersion = domain.InvestigationCreateRequestVersionV1
+	}
 	item := domain.Investigation{
 		ID: snapshot.ID, WorkspaceID: snapshot.WorkspaceID, IncidentID: snapshot.IncidentID,
 		Status: snapshot.Status, ModelStatus: snapshot.ModelStatus, IdempotencyKey: snapshot.IdempotencyKey,
-		RequestHash: snapshot.RequestHash, FailureCode: snapshot.FailureCode,
+		RequestHash: snapshot.RequestHash, RequestHashVersion: requestHashVersion, FailureCode: snapshot.FailureCode,
 		ModelFailureCode: snapshot.ModelFailureCode, CreatedAt: createdAt, StartedAt: startedAt,
 		CompletedAt: completedAt, UpdatedAt: updatedAt,
+	}
+	if snapshot.PlanBinding != nil {
+		item.PlanBinding = *snapshot.PlanBinding
 	}
 	if err := item.Validate(); err != nil {
 		return domain.Investigation{}, fmt.Errorf("invalid investigation snapshot")

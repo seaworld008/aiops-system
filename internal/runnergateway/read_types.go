@@ -27,13 +27,32 @@ type ReadTaskClaimRequest struct {
 }
 
 type ReadTaskDescriptor struct {
-	ID          string          `json:"id"`
-	Key         string          `json:"key"`
-	Position    int             `json:"position"`
-	ConnectorID string          `json:"connector_id"`
-	Operation   string          `json:"operation"`
-	Input       json.RawMessage `json:"input"`
-	InputHash   string          `json:"input_hash"`
+	ID             string                 `json:"id"`
+	Key            string                 `json:"key"`
+	Position       int                    `json:"position"`
+	ConnectorID    string                 `json:"connector_id"`
+	Operation      string                 `json:"operation"`
+	Input          json.RawMessage        `json:"input"`
+	InputHash      string                 `json:"input_hash"`
+	PlanBinding    ReadTaskPlanBinding    `json:"plan_binding"`
+	RuntimeBinding ReadTaskRuntimeBinding `json:"runtime_binding"`
+}
+
+type ReadTaskPlanBinding struct {
+	SchemaVersion  string `json:"schema_version"`
+	ManifestDigest string `json:"manifest_digest"`
+	RegistryDigest string `json:"registry_digest"`
+	ProfileDigest  string `json:"profile_digest"`
+	TasksHash      string `json:"tasks_hash"`
+}
+
+type ReadTaskRuntimeBinding struct {
+	SchemaVersion   string    `json:"schema_version"`
+	ConnectorDigest string    `json:"connector_digest"`
+	TargetDigest    string    `json:"target_digest"`
+	ExecutorDigest  string    `json:"executor_digest"`
+	RuntimeDigest   string    `json:"runtime_digest"`
+	BoundAt         time.Time `json:"bound_at"`
 }
 
 type ReadTaskClaimResponse struct {

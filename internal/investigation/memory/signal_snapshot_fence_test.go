@@ -48,6 +48,7 @@ func TestCorrelateSignalTenantBoundSnapshotPreventsCrossTenantMiswireWrites(t *t
 		t.Fatalf("RegisteredSignalSnapshotHash(tenant A) error = %v", err)
 	}
 	repository, err := memory.New(memory.Options{
+		TaskRuntimeBinder:  testTaskRuntimeBinder,
 		Clock:              func() time.Time { return time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC) },
 		IDFactory:          func() string { return "77777777-7777-4777-8777-777777777777" },
 		TenantResolver:     func(string) (string, error) { return registrationTenantB, nil },

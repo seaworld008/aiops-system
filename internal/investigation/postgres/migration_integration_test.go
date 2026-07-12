@@ -136,7 +136,7 @@ func newRuntimeFixture(t *testing.T) runtimeFixture {
 			input_hash, status, incident_id, task_key, position, input_document,
 			created_at, updated_at, runtime_schema_version
 		) VALUES (
-			$1, $2, $3, $4, 'prometheus-staging', 'range_query', $5, 'QUEUED',
+			$1, $2, $3, $4, 'prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', 'range_query', $5, 'QUEUED',
 			$6, 'metrics', 1, $7, $8, $8, 'investigation-runtime.v1'
 		)
 	`, testTaskID, testTenantID, testWorkspaceID, testInvestigationID, sha256Hex(input),
@@ -638,7 +638,7 @@ func TestInvestigationRuntimeEvidenceAdmissionUsesTaskBeforeParentLockOrder(t *t
 				collected_at, redacted_summary, content_hash, trust_level, truncated, created_at,
 				incident_id, task_id, payload_document, attributes, runtime_schema_version
 			) VALUES (
-				$1, $2, $3, $4, 'prometheus-staging', '{}', $5, '{}', $6,
+				$1, $2, $3, $4, 'prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', '{}', $5, '{}', $6,
 				'AUTHENTICATED_READ_RUNNER', false, $7, $8, $9, $10, '{}',
 				'investigation-runtime.v1'
 			)
@@ -700,7 +700,7 @@ func TestInvestigationRuntimeEvidenceAdmissionUsesTaskBeforeParentLockOrder(t *t
 			evidence_id, content_hash, idempotency_key, request_hash, receipt_hash, schema_version
 		) VALUES (
 			'69000000-0000-4000-8000-000000000021', $1, $2, $3, $4, $5,
-			'read-runner-success', $6, $7, 'prometheus-staging', $8, $9,
+			'read-runner-success', $6, $7, 'prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', $8, $9,
 			'receipt:evidence-success', $10, $11, 'runner-evidence.v1'
 		)
 	`, testTenantID, testWorkspaceID, testEnvironmentID, testInvestigationID, testTaskID,
@@ -805,7 +805,7 @@ func TestInvestigationRuntimeRejectsNullFactsReparentingAndStateRegression(t *te
 			input_hash, status, incident_id, task_key, position, input_document,
 			created_at, updated_at, runtime_schema_version
 		) VALUES (
-			'65000000-0000-4000-8000-000000000002', $1, $2, $3, 'prometheus-staging',
+			'65000000-0000-4000-8000-000000000002', $1, $2, $3, 'prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
 			'range_query', $4, 'QUEUED', $5, 'null-input', 2, NULL, $6, $6,
 			'investigation-runtime.v1'
 		)
@@ -832,7 +832,7 @@ func TestInvestigationRuntimeRejectsNullFactsReparentingAndStateRegression(t *te
 			collected_at, redacted_summary, content_hash, trust_level, truncated, created_at,
 			incident_id, task_id, payload_document, attributes, runtime_schema_version
 		) VALUES (
-			$1, $2, $3, $4, 'prometheus-staging', '{}', $5, '{}', $6,
+			$1, $2, $3, $4, 'prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', '{}', $5, '{}', $6,
 			'AUTHENTICATED_READ_RUNNER', false, $7, $8, $9, $10, '{}',
 			'investigation-runtime.v1'
 		)
@@ -880,7 +880,7 @@ func TestInvestigationRuntimeRejectsNullFactsReparentingAndStateRegression(t *te
 			created_at, updated_at, runtime_schema_version
 		) VALUES (
 			'65000000-0000-4000-8000-000000000010', $1, $2, $3,
-			'prometheus-staging', 'range_query', $4, 'QUEUED', $5, 'late-task', 2,
+			'prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', 'range_query', $4, 'QUEUED', $5, 'late-task', 2,
 			$6, $7, $7, 'investigation-runtime.v1'
 		)
 	`, testTenantID, testWorkspaceID, testInvestigationID, sha256Hex(lateInput),
@@ -923,7 +923,7 @@ func TestInvestigationRuntimeRejectsNullFactsReparentingAndStateRegression(t *te
 			runtime_schema_version
 		) VALUES (
 			'65000000-0000-4000-8000-000000000011', $1, $2, $3,
-			'prometheus-staging', 'range_query', $4, 'FAILED', $5, $5, NULL, $6,
+			'prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', 'range_query', $4, 'FAILED', $5, $5, NULL, $6,
 			'late-terminal-task', 2, $7, 'late_failure', $5, $5,
 			'investigation-runtime.v1'
 		)
@@ -961,7 +961,7 @@ func TestInvestigationRuntimeRequiresExactHumanFeedbackAndOneConfirmedRootCause(
 			collected_at, redacted_summary, content_hash, trust_level, truncated, created_at,
 			incident_id, task_id, payload_document, attributes, runtime_schema_version
 		) VALUES (
-			$1, $2, $3, $4, 'prometheus-staging', '{}', $5, $6::jsonb, $7,
+			$1, $2, $3, $4, 'prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', '{}', $5, $6::jsonb, $7,
 			'AUTHENTICATED_READ_RUNNER', false, $8, $9, $10, $11, '{}', 'investigation-runtime.v1'
 		)
 	`, testEvidenceID, testTenantID, testWorkspaceID, testInvestigationID, fixture.base.Add(time.Second),
@@ -1282,7 +1282,7 @@ func TestRunnerEvidenceReceiptRequiresCurrentReadIdentityExactScopeAndTerminalRe
 			collected_at, redacted_summary, content_hash, trust_level, truncated, created_at,
 			incident_id, task_id, payload_document, attributes, runtime_schema_version
 		) VALUES (
-			$1, $2, $3, $4, 'prometheus-staging', '{}', $5, '{}', $6,
+			$1, $2, $3, $4, 'prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', '{}', $5, '{}', $6,
 			'AUTHENTICATED_READ_RUNNER', false, $5, $7, $8, $9, '{}',
 			'investigation-runtime.v1'
 		)
@@ -1299,7 +1299,7 @@ func TestRunnerEvidenceReceiptRequiresCurrentReadIdentityExactScopeAndTerminalRe
 			id, tenant_id, workspace_id, environment_id, investigation_id, task_id,
 			runner_id, scope_revision, certificate_sha256, connector_id,
 			failure_code, idempotency_key, request_hash, receipt_hash, schema_version
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'prometheus-staging',
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
 			$10, $11, $12, $13, 'runner-evidence.v1')
 	`
 	expectSQLState(t, database, "23514", receiptInsert,
@@ -1399,7 +1399,7 @@ func TestRunnerEvidenceReceiptScopeRemovalUsesBindingBeforeRegistrationLockOrder
 				failure_code, idempotency_key, request_hash, receipt_hash, schema_version
 			) VALUES (
 				'69000000-0000-4000-8000-000000000020', $1, $2, $3, $4, $5,
-				$6, $7, $8, 'prometheus-staging', 'collector_failed',
+				$6, $7, $8, 'prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd', 'collector_failed',
 				'receipt:scope-removal', $9, $10, 'runner-evidence.v1'
 			)
 		`, testTenantID, testWorkspaceID, testEnvironmentID, testInvestigationID, testTaskID,

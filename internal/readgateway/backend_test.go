@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/seaworld008/aiops-system/internal/domain"
 	"github.com/seaworld008/aiops-system/internal/execution"
 	"github.com/seaworld008/aiops-system/internal/executionlease"
+	"github.com/seaworld008/aiops-system/internal/investigation"
 	"github.com/seaworld008/aiops-system/internal/readtask"
 	readtaskpostgres "github.com/seaworld008/aiops-system/internal/readtask/postgres"
 	"github.com/seaworld008/aiops-system/internal/runneridentity"
@@ -569,9 +571,42 @@ func newTestClaim(t *testing.T) readtask.Claim {
 		TenantID: testTenantID, WorkspaceID: testWorkspaceID, EnvironmentID: testEnvironmentID,
 		ServiceID:  testServiceID,
 		IncidentID: testIncidentID, InvestigationID: testInvestigation, TaskID: testTaskID,
-		TaskKey: "health", Position: 1, ConnectorID: "prometheus", Operation: "query",
+		TaskKey: "health", Position: 1,
+		ConnectorID: "prometheus-v1-" + strings.Repeat("5", 64), Operation: "query",
 		Input: input, InputHash: hex.EncodeToString(inputDigest[:]),
+		PlanBinding: domain.InvestigationPlanBinding{
+			SchemaVersion:  domain.InvestigationPlanBindingSchemaVersion,
+			ManifestDigest: strings.Repeat("1", 64), RegistryDigest: strings.Repeat("2", 64),
+			ProfileDigest: strings.Repeat("3", 64), TasksHash: strings.Repeat("4", 64),
+		},
+		RuntimeBinding: domain.ReadTaskRuntimeBinding{
+			SchemaVersion:   domain.ReadTaskRuntimeBindingSchemaVersion,
+			ConnectorDigest: strings.Repeat("5", 64), TargetDigest: strings.Repeat("6", 64),
+			ExecutorDigest: strings.Repeat("7", 64), RuntimeDigest: strings.Repeat("8", 64),
+			BoundAt: testCertificateNotAfter.Add(-2 * time.Hour),
+		},
 	}
+	runtimeDigest, err := investigation.ReadTaskRuntimeDigest(
+		investigation.TaskSpecScope{
+			TenantID: descriptor.TenantID, WorkspaceID: descriptor.WorkspaceID,
+			EnvironmentID: descriptor.EnvironmentID, ServiceID: descriptor.ServiceID,
+			MappingStatus: domain.MappingExact,
+		},
+		descriptor.PlanBinding,
+		investigation.TaskSpec{
+			Key: descriptor.TaskKey, ConnectorID: descriptor.ConnectorID,
+			Operation: descriptor.Operation, Input: append([]byte(nil), descriptor.Input...),
+		}, descriptor.Position,
+		investigation.TaskRuntimeComponents{
+			ConnectorDigest: descriptor.RuntimeBinding.ConnectorDigest,
+			TargetDigest:    descriptor.RuntimeBinding.TargetDigest,
+			ExecutorDigest:  descriptor.RuntimeBinding.ExecutorDigest,
+		},
+	)
+	if err != nil {
+		t.Fatalf("build test runtime digest: %v", err)
+	}
+	descriptor.RuntimeBinding.RuntimeDigest = runtimeDigest
 	raw := make([]byte, 32)
 	token := []byte(base64.RawURLEncoding.EncodeToString(raw))
 	tokenDigest := sha256.Sum256(token)
@@ -580,6 +615,7 @@ func newTestClaim(t *testing.T) readtask.Claim {
 		TaskID: testTaskID, RunnerID: testRunnerID, ScopeRevision: 7,
 		Certificate: readtask.CertificateBinding{SHA256: testCertificate, NotAfter: testCertificateNotAfter},
 		TokenSHA256: hex.EncodeToString(tokenDigest[:]), Epoch: 1, Status: readtask.AttemptLeased,
+		PlanBinding: descriptor.PlanBinding, RuntimeBinding: descriptor.RuntimeBinding,
 		LeaseAcquiredAt: now, LastHeartbeatAt: now, LeaseExpiresAt: now.Add(30 * time.Second), UpdatedAt: now,
 	}
 	claim, err := readtask.NewClaim(descriptor, attempt, token)

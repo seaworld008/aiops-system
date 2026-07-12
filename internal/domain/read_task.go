@@ -27,6 +27,7 @@ type ReadTask struct {
 	Operation       string
 	Input           json.RawMessage
 	InputHash       string
+	RuntimeBinding  ReadTaskRuntimeBinding
 	Status          ReadTaskStatus
 	EvidenceID      string
 	FailureCode     string
@@ -52,6 +53,13 @@ func (task ReadTask) Validate() error {
 	}
 	if err := validateHashedJSONObject(task.Input, task.InputHash); err != nil {
 		return fmt.Errorf("read task input: %w", err)
+	}
+	if !task.RuntimeBinding.IsZero() {
+		if err := task.RuntimeBinding.Validate(); err != nil ||
+			!ConnectorDigestMatchesID(task.ConnectorID, task.RuntimeBinding.ConnectorDigest) ||
+			!task.RuntimeBinding.BoundAt.Equal(task.CreatedAt) {
+			return fmt.Errorf("read task runtime binding is invalid")
+		}
 	}
 	switch task.Status {
 	case ReadTaskQueued, ReadTaskRunning, ReadTaskEvidence, ReadTaskFailed, ReadTaskCancelled:
