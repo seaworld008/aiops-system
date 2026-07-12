@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,15 +73,74 @@ func TestProductionCommandBoundaryIsFixed(t *testing.T) {
 	if command.WaitDelay != controlWorkerWaitDelay {
 		t.Fatalf("WaitDelay = %s, want %s", command.WaitDelay, controlWorkerWaitDelay)
 	}
-	if command.SysProcAttr == nil || !command.SysProcAttr.Setpgid ||
-		command.SysProcAttr.Pdeathsig != syscall.SIGKILL || command.SysProcAttr.PidFD == nil {
+	if command.SysProcAttr == nil || command.SysProcAttr.PidFD == nil {
 		t.Fatalf("SysProcAttr = %#v", command.SysProcAttr)
+	}
+	// Compare the complete structure so Setsid/Foreground/Pgid, clone and
+	// unshare flags, credentials and ID mappings, ambient capabilities, cgroup
+	// placement, terminal controls, ptrace and chroot all remain at zero values.
+	wantSysProcAttr := &syscall.SysProcAttr{
+		Setpgid:   true,
+		Pdeathsig: syscall.SIGKILL,
+		PidFD:     command.SysProcAttr.PidFD,
+	}
+	if !reflect.DeepEqual(command.SysProcAttr, wantSysProcAttr) {
+		t.Fatalf("SysProcAttr = %#v, want %#v", command.SysProcAttr, wantSysProcAttr)
 	}
 }
 
 func TestCurrentParentDeathSignalUsesPointerResult(t *testing.T) {
 	if _, err := currentParentDeathSignal(); err != nil {
 		t.Fatalf("currentParentDeathSignal() error = %v", err)
+	}
+}
+
+func TestTerminationPreflightDrainsREADYBeforeQueuedFATAL(t *testing.T) {
+	events := make(chan childEvent, 2)
+	events <- childEventReady
+	events <- childEventFatal
+	cause, observed := terminationPreflight(events, nil, nil, errChildExit)
+	if !observed || cause != errChildFatal {
+		t.Fatalf("terminationPreflight(READY,FATAL) = %v, %t; want %v, true",
+			cause, observed, errChildFatal)
+	}
+
+	readyOnly := make(chan childEvent, 1)
+	readyOnly <- childEventReady
+	if cause, observed := terminationPreflight(readyOnly, nil, nil, errChildExit); observed || cause != nil {
+		t.Fatalf("terminationPreflight(READY) = %v, %t; want nil, false", cause, observed)
+	}
+}
+
+func TestTerminatedClassificationRequiresStatusMonitorCompletion(t *testing.T) {
+	openEvents := make(chan childEvent)
+	if cause := classifyTerminatedControlWorker(openEvents, nil); cause != errChildProtocol {
+		t.Fatalf("classifyTerminatedControlWorker(open status) = %v, want %v", cause, errChildProtocol)
+	}
+
+	closedEvents := make(chan childEvent)
+	close(closedEvents)
+	if cause := classifyTerminatedControlWorker(closedEvents, nil); cause != nil {
+		t.Fatalf("classifyTerminatedControlWorker(closed status) = %v, want nil", cause)
+	}
+
+	fatalEvents := make(chan childEvent, 1)
+	fatalEvents <- childEventFatal
+	close(fatalEvents)
+	if cause := classifyTerminatedControlWorker(fatalEvents, nil); cause != errChildFatal {
+		t.Fatalf("classifyTerminatedControlWorker(FATAL then close) = %v, want %v", cause, errChildFatal)
+	}
+}
+
+func TestStatusMonitorClosesOnlyAfterPublishingBufferedFrames(t *testing.T) {
+	events := make(chan childEvent, 4)
+	go monitorChildStatus(strings.NewReader("RF"), events)
+	var observed []childEvent
+	for event := range events {
+		observed = append(observed, event)
+	}
+	if len(observed) != 2 || observed[0] != childEventReady || observed[1] != childEventFatal {
+		t.Fatalf("monitorChildStatus(RF) events = %#v, want READY,FATAL before close", observed)
 	}
 }
 
@@ -301,11 +361,54 @@ func TestSupervisorConcurrentCancelAndFatalExitRaceHundred(t *testing.T) {
 		}()
 		close(gate)
 		racers.Wait()
-		err := receiveResult(t, result)
-		if err != nil && err != errChildFatal && err != errChildStop && err != errChildExit {
-			t.Fatalf("iteration %d: Run() error = %v", iteration, err)
+		if err := receiveResult(t, result); err != errChildFatal {
+			t.Fatalf("iteration %d: Run() error = %v, want %v", iteration, err, errChildFatal)
 		}
 		assertRecordedPIDGone(t, base+".pid")
+	}
+}
+
+func TestSupervisorMonitorsAnomaliesDuringTERMGraceAndContains(t *testing.T) {
+	tests := []struct {
+		name     string
+		scenario string
+		want     error
+		marker   string
+	}{
+		{name: "fatal hang", scenario: "term-stop-then-fatal-hang", want: errChildFatal, marker: ".fatal"},
+		{name: "fatal immediate exit", scenario: "term-stop-then-fatal-exit", want: errChildFatal, marker: ".fatal"},
+		{name: "protocol", scenario: "term-stop-then-protocol-hang", want: errChildProtocol, marker: ".protocol"},
+		{name: "output", scenario: "term-stop-then-output-hang", want: errOutputLimit, marker: ".output"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			base := filepath.Join(t.TempDir(), "term-anomaly")
+			supervisor := newTestSupervisor(test.scenario, base)
+			// Make the ordinary graceful window visibly longer than the anomaly
+			// containment window. A parent that stops consuming status after TERM
+			// will therefore fail deterministically instead of winning a race.
+			supervisor.settings.shutdownGrace = 3 * time.Second
+			ctx, cancel := context.WithCancel(context.Background())
+			result := make(chan error, 1)
+			go func() { result <- supervisor.Run(ctx) }()
+			waitForMarker(t, base+".ready")
+			cancel()
+			waitForMarker(t, base+".stop-entered")
+			started := time.Now()
+			writeChildMarker(base+".anomaly-trigger", "trigger")
+			if err := receiveResult(t, result); err != test.want {
+				t.Fatalf("Run() error = %v, want %v", err, test.want)
+			}
+			if elapsed := time.Since(started); elapsed >= supervisor.settings.shutdownGrace {
+				t.Fatalf("anomaly containment took %s, ordinary shutdown grace is %s",
+					elapsed, supervisor.settings.shutdownGrace)
+			}
+			waitForMarker(t, base+test.marker)
+			// This marker is auxiliary evidence; the production AST gate locks the
+			// sole SIGTERM callsite because standard signals may coalesce.
+			assertMarkerValue(t, base+".term-count", "1")
+			assertRecordedPIDGone(t, base+".pid")
+		})
 	}
 }
 
@@ -570,6 +673,9 @@ func runControlWorkerTestChild(raw string) int {
 			select {
 			case <-signals:
 				writeChildMarker(base+".term", "term")
+				if waitForChildMarker(base+".trigger", time.Second) {
+					ExitControlWorkerFatal(status)
+				}
 				_ = CloseControlWorkerChild(status)
 				return 0
 			default:
@@ -579,6 +685,9 @@ func runControlWorkerTestChild(raw string) int {
 			}
 			time.Sleep(time.Millisecond)
 		}
+	case "term-stop-then-fatal-hang", "term-stop-then-fatal-exit",
+		"term-stop-then-protocol-hang", "term-stop-then-output-hang":
+		return runTermAnomalyTestChild(scenario, status, base)
 	case "pdeath-leaf":
 		if ReportControlWorkerReady(status) != nil {
 			return 99
@@ -645,10 +754,68 @@ func waitForTestTERM(status *ChildStatus, base string, exit bool, signals <-chan
 	}
 }
 
+func recordTestTERMs(signals <-chan os.Signal, base string, first chan<- struct{}) {
+	count := 0
+	for range signals {
+		count++
+		writeChildMarker(base+".term-count", strconv.Itoa(count))
+		if count == 1 {
+			close(first)
+		}
+	}
+}
+
+func runTermAnomalyTestChild(scenario string, status *ChildStatus, base string) int {
+	signals := captureTestTERM()
+	termSeen := make(chan struct{})
+	go recordTestTERMs(signals, base, termSeen)
+	go func() {
+		if !waitForChildMarker(base+".anomaly-trigger", 5*time.Second) {
+			return
+		}
+		switch scenario {
+		case "term-stop-then-fatal-hang":
+			if writeStatusByte(status.file, controlWorkerFatalByte) == nil {
+				writeChildMarker(base+".fatal", "fatal")
+			}
+			select {}
+		case "term-stop-then-fatal-exit":
+			writeChildMarker(base+".fatal", "fatal")
+			ExitControlWorkerFatal(status)
+		case "term-stop-then-protocol-hang":
+			_, _ = status.file.Write([]byte{'X'})
+			writeChildMarker(base+".protocol", "protocol")
+			select {}
+		case "term-stop-then-output-hang":
+			_, _ = fmt.Fprint(os.Stdout, strings.Repeat("x", defaultOutputByteLimit+1))
+			writeChildMarker(base+".output", "output")
+			select {}
+		}
+	}()
+	if ReportControlWorkerReady(status) != nil {
+		return 104
+	}
+	writeChildMarker(base+".ready", "ready")
+	<-termSeen
+	writeChildMarker(base+".stop-entered", "stop")
+	select {}
+}
+
 func writeChildMarker(path, value string) {
 	if path != "" {
 		_ = os.WriteFile(path, []byte(value), 0o600)
 	}
+}
+
+func waitForChildMarker(path string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return false
 }
 
 func waitForMarker(t *testing.T, path string) {
@@ -667,6 +834,17 @@ func assertMarkerAbsent(t *testing.T, path string) {
 	t.Helper()
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("unexpected TERM marker %q: %v", path, err)
+	}
+}
+
+func assertMarkerValue(t *testing.T, path, want string) {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read marker %q: %v", path, err)
+	}
+	if got := string(contents); got != want {
+		t.Fatalf("marker %q = %q, want %q", path, got, want)
 	}
 }
 

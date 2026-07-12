@@ -140,7 +140,10 @@ func runControlWorkerSupervisor(ctx context.Context, settings supervisorSettings
 	defer startup.Stop()
 	for {
 		select {
-		case event := <-events:
+		case event, ok := <-events:
+			if !ok {
+				return rejectAfterContainment(process, settings, errChildProtocol)
+			}
 			switch event {
 			case childEventReady:
 				return superviseReadyControlWorker(ctx, settings, process, events, outputExceeded)
@@ -155,15 +158,15 @@ func runControlWorkerSupervisor(ctx context.Context, settings supervisorSettings
 			cause := classifyExitedControlWorker(events, outputExceeded, errChildStartup)
 			return rejectAfterContainment(process, settings, cause)
 		case <-startup.C:
-			if !terminateAfterTerm(process, settings.startupGrace, settings.killConfirm) {
-				return errChildStop
-			}
-			return errChildStartup
+			return terminateControlWorker(
+				process, settings, events, outputExceeded,
+				settings.startupGrace, errChildStartup, errChildStartup,
+			)
 		case <-ctx.Done():
-			if !terminateAfterTerm(process, settings.startupGrace, settings.killConfirm) {
-				return errChildStop
-			}
-			return nil
+			return terminateControlWorker(
+				process, settings, events, outputExceeded,
+				settings.startupGrace, nil, errChildStartup,
+			)
 		}
 	}
 }
@@ -177,7 +180,10 @@ func superviseReadyControlWorker(
 ) error {
 	for {
 		select {
-		case event := <-events:
+		case event, ok := <-events:
+			if !ok {
+				return rejectAfterContainment(process, settings, errChildProtocol)
+			}
 			if event == childEventFatal {
 				return rejectAfterContainment(process, settings, errChildFatal)
 			}
@@ -188,25 +194,10 @@ func superviseReadyControlWorker(
 			cause := classifyExitedControlWorker(events, outputExceeded, errChildExit)
 			return rejectAfterContainment(process, settings, cause)
 		case <-ctx.Done():
-			// Give already-observed fatal/protocol/output/exit events priority over
-			// the graceful path so they can never cause a TERM callback re-entry.
-			select {
-			case event := <-events:
-				if event == childEventFatal {
-					return rejectAfterContainment(process, settings, errChildFatal)
-				}
-				return rejectAfterContainment(process, settings, errChildProtocol)
-			case <-outputExceeded:
-				return rejectAfterContainment(process, settings, errOutputLimit)
-			case <-process.exitDone:
-				cause := classifyExitedControlWorker(events, outputExceeded, errChildExit)
-				return rejectAfterContainment(process, settings, cause)
-			default:
-			}
-			if !terminateAfterTerm(process, settings.shutdownGrace, settings.killConfirm) {
-				return errChildStop
-			}
-			return nil
+			return terminateControlWorker(
+				process, settings, events, outputExceeded,
+				settings.shutdownGrace, nil, errChildExit,
+			)
 		}
 	}
 }
@@ -281,7 +272,10 @@ func classifyExitedControlWorker(
 	cause := fallback
 	for {
 		select {
-		case event := <-events:
+		case event, ok := <-events:
+			if !ok {
+				return cause
+			}
 			switch event {
 			case childEventFatal:
 				return errChildFatal
@@ -299,6 +293,7 @@ func classifyExitedControlWorker(
 }
 
 func monitorChildStatus(reader io.Reader, events chan<- childEvent) {
+	defer close(events)
 	state := childStatusOpen
 	buffer := make([]byte, 32)
 	for {
@@ -318,7 +313,9 @@ func monitorChildStatus(reader io.Reader, events chan<- childEvent) {
 			}
 		}
 		if err != nil {
-			if !errors.Is(err, io.EOF) || state != childStatusClosed {
+			if !errors.Is(err, io.EOF) {
+				events <- childEventProtocol
+			} else if state != childStatusClosed {
 				events <- childEventStatusClosed
 			}
 			return
@@ -330,22 +327,155 @@ func monitorChildStatus(reader io.Reader, events chan<- childEvent) {
 	}
 }
 
-func terminateAfterTerm(process *controlWorkerProcess, grace, killConfirm time.Duration) bool {
-	if process == nil {
-		return false
+func terminateControlWorker(
+	process *controlWorkerProcess,
+	settings supervisorSettings,
+	events <-chan childEvent,
+	outputExceeded <-chan struct{},
+	grace time.Duration,
+	cleanResult error,
+	exitFallback error,
+) error {
+	if process == nil || grace <= 0 {
+		_ = forceKillAndReap(process, settings.killConfirm)
+		return errChildStop
 	}
-	termOK := process.signalGroup(syscall.SIGTERM)
-	if process.waitForContained(grace) {
-		reaped, clean := process.reapWithin(killConfirm)
-		return termOK && reaped && clean && process.processGroupGone()
+	if cause, observed := terminationPreflight(events, outputExceeded, process.exitDone, exitFallback); observed {
+		return rejectAfterContainment(process, settings, cause)
 	}
-	killOK := process.signalGroup(syscall.SIGKILL)
-	if !killOK && process.command != nil && process.command.Process != nil {
-		_ = process.command.Process.Kill()
+	if !process.signalGroup(syscall.SIGTERM) {
+		_ = forceKillAndReap(process, settings.killConfirm)
+		return errChildStop
 	}
-	_ = process.waitForContained(killConfirm)
-	_, _ = process.reapWithin(killConfirm)
-	return false
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	exitDone := process.exitDone
+	exited := false
+	statusTerminal := false
+	for {
+		if exited {
+			members, trusted := process.groupHasOtherMembers()
+			if process.exitTrusted.Load() && trusted && !members {
+				if !statusTerminal {
+					if cause := classifyTerminatedControlWorker(events, outputExceeded); cause != nil {
+						return rejectAfterContainment(process, settings, cause)
+					}
+				}
+				reaped, clean := process.reapWithin(settings.killConfirm)
+				if !reaped || !process.processGroupGone() {
+					return errChildStop
+				}
+				// Cmd.Wait has now joined the bounded stdout/stderr copier, so this
+				// non-blocking check observes its final state without racing a late
+				// overflow notification.
+				select {
+				case <-outputExceeded:
+					return errOutputLimit
+				default:
+				}
+				if clean {
+					return cleanResult
+				}
+				return errChildStop
+			}
+		}
+		select {
+		case event, ok := <-events:
+			if !ok {
+				statusTerminal = true
+				events = nil
+				continue
+			}
+			switch event {
+			case childEventFatal:
+				// TERM may already have entered the SDK Stop path. Do not send it
+				// again: shorten the remaining window to anomaly containment, then
+				// hard-stop and reap the entire original process group.
+				return rejectAfterContainment(process, settings, errChildFatal)
+			case childEventProtocol:
+				return rejectAfterContainment(process, settings, errChildProtocol)
+			case childEventReady, childEventStatusClosed:
+				// READY can race startup cancellation. Closing the status FD is
+				// expected while a cooperative child exits after TERM. Neither is
+				// sufficient to claim successful process containment.
+			default:
+				return rejectAfterContainment(process, settings, errChildProtocol)
+			}
+		case <-outputExceeded:
+			return rejectAfterContainment(process, settings, errOutputLimit)
+		case <-exitDone:
+			exited = true
+			exitDone = nil
+		case <-ticker.C:
+		case <-timer.C:
+			_ = forceKillAndReap(process, settings.killConfirm)
+			return errChildStop
+		}
+	}
+}
+
+func terminationPreflight(
+	events <-chan childEvent,
+	outputExceeded <-chan struct{},
+	exitDone <-chan struct{},
+	exitFallback error,
+) (error, bool) {
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return errChildProtocol, true
+			}
+			switch event {
+			case childEventReady:
+				// READY can already be queued when startup cancellation or its
+				// deadline wins. Drain it and keep looking for a following FATAL.
+				continue
+			case childEventFatal:
+				return errChildFatal, true
+			default:
+				return errChildProtocol, true
+			}
+		case <-outputExceeded:
+			return errOutputLimit, true
+		case <-exitDone:
+			return classifyExitedControlWorker(events, outputExceeded, exitFallback), true
+		default:
+			return nil, false
+		}
+	}
+}
+
+func classifyTerminatedControlWorker(
+	events <-chan childEvent,
+	outputExceeded <-chan struct{},
+) error {
+	timer := time.NewTimer(exitClassificationGrace)
+	defer timer.Stop()
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return nil
+			}
+			switch event {
+			case childEventFatal:
+				return errChildFatal
+			case childEventProtocol:
+				return errChildProtocol
+			case childEventReady, childEventStatusClosed:
+				continue
+			default:
+				return errChildProtocol
+			}
+		case <-outputExceeded:
+			return errOutputLimit
+		case <-timer.C:
+			return errChildProtocol
+		}
+	}
 }
 
 func rejectAfterContainment(process *controlWorkerProcess, settings supervisorSettings, cause error) error {
@@ -360,14 +490,22 @@ func containWithoutTerm(process *controlWorkerProcess, grace, killConfirm time.D
 		return false
 	}
 	contained := process.waitForContained(grace)
-	killOK := true
 	if !contained {
-		killOK = process.signalGroup(syscall.SIGKILL)
-		if !killOK && process.command != nil && process.command.Process != nil {
-			killOK = process.command.Process.Kill() == nil || process.exited()
-		}
-		contained = process.waitForContained(killConfirm)
+		return forceKillAndReap(process, killConfirm)
 	}
+	reaped, _ := process.reapWithin(killConfirm)
+	return reaped && process.processGroupGone()
+}
+
+func forceKillAndReap(process *controlWorkerProcess, killConfirm time.Duration) bool {
+	if process == nil || killConfirm <= 0 {
+		return false
+	}
+	killOK := process.signalGroup(syscall.SIGKILL)
+	if !killOK && process.command != nil && process.command.Process != nil {
+		killOK = process.command.Process.Kill() == nil || process.exited()
+	}
+	contained := process.waitForContained(killConfirm)
 	reaped, _ := process.reapWithin(killConfirm)
 	return killOK && contained && reaped && process.processGroupGone()
 }

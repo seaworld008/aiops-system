@@ -65,13 +65,9 @@ func runWithSupervisor(
 	return supervisor.Run(ctx)
 }
 
-func runControlWorkerChild(_ context.Context, status *workerprocess.ChildStatus) error {
-	if status != nil {
-		_ = workerprocess.CloseControlWorkerChild(status)
-	}
-	// C2-4c2a installs only the containment boundary. Until the separately
-	// reviewed Snapshot/Temporal/PostgreSQL assembly lands, the child must exit
-	// without READY and the parent must report startup failure. READ claims and
-	// the Outbox dispatcher therefore remain closed.
-	return errControlWorkerAssemblyUnavailable
+func runControlWorkerChild(ctx context.Context, status *workerprocess.ChildStatus) error {
+	// C2-4c2b0 adds only the fatal/normal-stop lifecycle arbiter. The fixed
+	// runtime factory remains unavailable, so production still exits before
+	// READY and cannot activate READ claims or the Outbox dispatcher.
+	return runControlWorkerChildRuntime(ctx, status)
 }
