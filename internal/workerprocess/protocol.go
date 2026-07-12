@@ -2,16 +2,19 @@ package workerprocess
 
 import (
 	"errors"
+	"io"
 	"os"
 	"sync"
 )
 
 const (
-	controlWorkerChildArgument = "--aiops-internal-control-worker-child-v1"
-	controlWorkerStatusFD      = uintptr(3)
-	controlWorkerReadyByte     = byte('R')
-	controlWorkerFatalByte     = byte('F')
-	controlWorkerFatalExitCode = 70
+	controlWorkerChildArgument  = "--aiops-internal-control-worker-child-v1"
+	controlWorkerLoaderArgument = "--aiops-internal-control-worker-source-loader-v1"
+	controlWorkerStatusFD       = uintptr(3)
+	controlWorkerSourceFD       = 4
+	controlWorkerReadyByte      = byte('R')
+	controlWorkerFatalByte      = byte('F')
+	controlWorkerFatalExitCode  = 70
 )
 
 var (
@@ -26,8 +29,26 @@ func IsControlWorkerChild(args []string) bool {
 	return len(args) == 1 && args[0] == controlWorkerChildArgument
 }
 
+// IsControlWorkerSourceLoaderChild recognizes only the private, fixed source
+// loader invocation. The loader is public-source-only and never receives
+// credentials.
+func IsControlWorkerSourceLoaderChild(args []string) bool {
+	return len(args) == 1 && args[0] == controlWorkerLoaderArgument
+}
+
+// RunControlWorkerSourceLoaderChild validates the contained loader boundary,
+// snapshots the fixed production root, writes its public frame to FD3, and
+// exits. It fails closed on non-Linux platforms.
+func RunControlWorkerSourceLoaderChild(args []string) error {
+	if !IsControlWorkerSourceLoaderChild(args) {
+		return errInvalidChildInvocation
+	}
+	return runControlWorkerSourceLoaderChild()
+}
+
 // AcceptControlWorkerChild validates and takes ownership of the anonymous
-// supervisor status descriptor. It fails closed outside the Linux boundary.
+// supervisor status descriptor and inherited public source. It fails closed
+// outside the Linux boundary.
 func AcceptControlWorkerChild(args []string) (*ChildStatus, error) {
 	if !IsControlWorkerChild(args) {
 		return nil, errInvalidChildInvocation
@@ -38,11 +59,12 @@ func AcceptControlWorkerChild(args []string) (*ChildStatus, error) {
 // ChildStatus is the write-only status capability inherited from the parent.
 // It never carries application data or error text.
 type ChildStatus struct {
-	mu    sync.Mutex
-	file  *os.File
-	state childStatusState
-	seal  *childStatusMarker
-	self  *ChildStatus
+	mu     sync.Mutex
+	file   *os.File
+	source io.Closer
+	state  childStatusState
+	seal   *childStatusMarker
+	self   *ChildStatus
 }
 
 type childStatusMarker struct{ value byte }
@@ -57,9 +79,9 @@ const (
 	childStatusClosed
 )
 
-func newChildStatus(file *os.File) *ChildStatus {
+func newChildStatus(file *os.File, source io.Closer) *ChildStatus {
 	created := &ChildStatus{
-		file:  file,
+		file: file, source: source,
 		state: childStatusOpen,
 		seal:  sealedChildStatusMarker,
 	}
@@ -78,13 +100,15 @@ func ReportControlWorkerReady(status *ChildStatus) error {
 	}
 	status.mu.Lock()
 	defer status.mu.Unlock()
-	if status.state != childStatusOpen || status.file == nil {
+	if status.state != childStatusOpen || status.file == nil || status.source == nil {
 		return errStatusAlreadyReported
 	}
 	if err := writeStatusByte(status.file, controlWorkerReadyByte); err != nil {
 		status.state = childStatusClosed
 		_ = status.file.Close()
 		status.file = nil
+		_ = status.source.Close()
+		status.source = nil
 		return errInvalidStatusChannel
 	}
 	status.state = childStatusReady
@@ -118,15 +142,31 @@ func CloseControlWorkerChild(status *ChildStatus) error {
 	status.mu.Lock()
 	defer status.mu.Unlock()
 	if status.state == childStatusClosed {
+		if status.source != nil {
+			err := status.source.Close()
+			status.source = nil
+			if err != nil {
+				return errInvalidStatusChannel
+			}
+		}
 		return nil
 	}
 	status.state = childStatusClosed
+	var statusErr error
 	if status.file == nil {
-		return errInvalidStatusChannel
+		statusErr = errInvalidStatusChannel
+	} else {
+		statusErr = status.file.Close()
+		status.file = nil
 	}
-	err := status.file.Close()
-	status.file = nil
-	if err != nil {
+	var sourceErr error
+	if status.source == nil {
+		sourceErr = errInvalidStatusChannel
+	} else {
+		sourceErr = status.source.Close()
+		status.source = nil
+	}
+	if statusErr != nil || sourceErr != nil {
 		return errInvalidStatusChannel
 	}
 	return nil

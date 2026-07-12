@@ -3,6 +3,9 @@ package workerprocess
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -39,6 +42,25 @@ type supervisorSettings struct {
 	killConfirm    time.Duration
 	outputLimit    int64
 	childEnv       []string
+	openSource     func(context.Context, time.Duration) (controlWorkerSource, error)
+}
+
+type controlWorkerSource interface {
+	StartChild(*exec.Cmd, *os.File) error
+	Close() error
+}
+
+func nilControlWorkerSource(value controlWorkerSource) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }
 
 type controlWorkerSupervisorMarker struct{ value byte }
@@ -54,13 +76,14 @@ func defaultSupervisorSettings() supervisorSettings {
 		killConfirm:    defaultKillConfirmation,
 		outputLimit:    defaultOutputByteLimit,
 		childEnv:       []string{},
+		openSource:     openProductionControlWorkerSource,
 	}
 }
 
 func (settings supervisorSettings) valid() bool {
 	return settings.startupTimeout > 0 && settings.startupGrace > 0 &&
 		settings.shutdownGrace > 0 && settings.anomalyGrace > 0 &&
-		settings.killConfirm > 0 && settings.outputLimit > 0 && settings.childEnv != nil
+		settings.killConfirm > 0 && settings.outputLimit > 0 && settings.childEnv != nil && settings.openSource != nil
 }
 
 // ControlWorkerSupervisor owns one fixed-path control worker child process.

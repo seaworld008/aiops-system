@@ -3,6 +3,7 @@
 package workerprocess
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -37,6 +39,8 @@ func TestMain(testingMain *testing.M) {
 		switch {
 		case len(os.Args) == 2 && os.Args[1] == controlWorkerPdeathParentArgument:
 			os.Exit(runPdeathParentTestHelper(scenario))
+		case IsControlWorkerSourceLoaderChild(os.Args[1:]):
+			os.Exit(runSourceLoaderTestChild(scenario))
 		case IsControlWorkerChild(os.Args[1:]):
 			os.Exit(runControlWorkerTestChild(scenario))
 		}
@@ -53,7 +57,7 @@ func TestProductionCommandBoundaryIsFixed(t *testing.T) {
 	defer writer.Close()
 	settings := defaultSupervisorSettings()
 	output := newBoundedDiscard(settings.outputLimit)
-	command := buildControlWorkerCommand(settings, writer, output, new(int))
+	command := buildControlWorkerCommand(settings, output, new(int))
 	if command.Path != controlWorkerExecutable {
 		t.Fatalf("Path = %q, want fixed executable", command.Path)
 	}
@@ -66,9 +70,8 @@ func TestProductionCommandBoundaryIsFixed(t *testing.T) {
 	if command.Dir != "/" || command.Stdin != nil {
 		t.Fatalf("Dir/Stdin = (%q, %#v), want root/nil", command.Dir, command.Stdin)
 	}
-	if command.Stdout != output || command.Stderr != output ||
-		len(command.ExtraFiles) != 1 || command.ExtraFiles[0] != writer {
-		t.Fatal("output or anonymous status descriptor boundary changed")
+	if command.Stdout != output || command.Stderr != output || len(command.ExtraFiles) != 0 {
+		t.Fatal("output or pre-handoff descriptor boundary changed")
 	}
 	if command.WaitDelay != controlWorkerWaitDelay {
 		t.Fatalf("WaitDelay = %s, want %s", command.WaitDelay, controlWorkerWaitDelay)
@@ -86,6 +89,24 @@ func TestProductionCommandBoundaryIsFixed(t *testing.T) {
 	}
 	if !reflect.DeepEqual(command.SysProcAttr, wantSysProcAttr) {
 		t.Fatalf("SysProcAttr = %#v, want %#v", command.SysProcAttr, wantSysProcAttr)
+	}
+}
+
+func TestProductionSourceLoaderCommandBoundaryIsFixed(t *testing.T) {
+	pidFD := -1
+	command := buildSourceLoaderCommand(&pidFD)
+	if command.Path != controlWorkerExecutable ||
+		!equalStrings(command.Args, []string{controlWorkerExecutable, controlWorkerLoaderArgument}) {
+		t.Fatalf("loader path/args = %q/%q", command.Path, command.Args)
+	}
+	if command.Env == nil || len(command.Env) != 0 || command.Dir != "/" || command.Stdin != nil ||
+		command.Stdout != io.Discard || command.Stderr != io.Discard || len(command.ExtraFiles) != 0 ||
+		command.WaitDelay != controlWorkerWaitDelay {
+		t.Fatal("loader process boundary changed")
+	}
+	want := &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL, PidFD: &pidFD}
+	if !reflect.DeepEqual(command.SysProcAttr, want) {
+		t.Fatalf("loader SysProcAttr = %#v, want %#v", command.SysProcAttr, want)
 	}
 }
 
@@ -431,6 +452,152 @@ func TestParentDeathSignalKillsAcceptedChild(t *testing.T) {
 	waitForRecordedPIDGone(t, base+".pid")
 }
 
+func TestSourceFailureAfterStartKillsAndReapsEntireProcessGroup(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "source-start-failure")
+	settings := defaultSupervisorSettings()
+	settings.killConfirm = 3 * time.Second
+	settings.childEnv = []string{
+		controlWorkerTestScenario + "=ready-hold-on-term-with-descendant|" + base,
+		controlWorkerRaceOptions,
+	}
+	source, err := newTestControlWorkerSource()
+	if err != nil {
+		t.Fatal(err)
+	}
+	concrete := source.(*testControlWorkerSource)
+	concrete.failAfterStart = true
+	concrete.afterStart = func() { waitForMarker(t, base+".descendant-pid") }
+	process, events, output, err := startControlWorker(settings, concrete)
+	if process != nil || events != nil || output != nil || err != errChildStart {
+		t.Fatalf("startControlWorker() = (%#v, %#v, %#v, %v), want contained start failure", process, events, output, err)
+	}
+	assertRecordedPIDGone(t, base+".pid")
+	assertRecordedPIDGone(t, base+".descendant-pid")
+}
+
+func TestSourceLoaderTimeoutKillsAndReapsEntireProcessGroup(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "source-loader-timeout")
+	command := exec.Command(controlWorkerExecutable, controlWorkerLoaderArgument)
+	command.Args = []string{controlWorkerExecutable, controlWorkerLoaderArgument}
+	command.Env = []string{
+		controlWorkerTestScenario + "=source-loader-hang|" + base,
+		controlWorkerRaceOptions,
+	}
+	command.Dir = "/"
+	command.Stdin = nil
+	command.Stdout = io.Discard
+	command.Stderr = io.Discard
+	command.WaitDelay = controlWorkerWaitDelay
+	pidFD := -1
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL, PidFD: &pidFD}
+	started := time.Now()
+	source, err := loadControlWorkerSourceFromCommandUnchecked(context.Background(), 250*time.Millisecond, command)
+	if source != nil || err != errChildStart {
+		t.Fatalf("loadControlWorkerSourceFromCommand() = (%#v, %v), want contained failure", source, err)
+	}
+	if elapsed := time.Since(started); elapsed >= sourceLoaderKillConfirmation {
+		t.Fatalf("source loader containment took %s", elapsed)
+	}
+	assertRecordedPIDGone(t, base+".pid")
+	assertRecordedPIDGone(t, base+".descendant-pid")
+}
+
+func TestInvalidSourceLoaderFrameStillKillsSameGroupDescendant(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "source-loader-invalid")
+	command := exec.Command(controlWorkerExecutable, controlWorkerLoaderArgument)
+	command.Args = []string{controlWorkerExecutable, controlWorkerLoaderArgument}
+	command.Env = []string{
+		controlWorkerTestScenario + "=source-loader-invalid|" + base,
+		controlWorkerRaceOptions,
+	}
+	command.Dir = "/"
+	command.Stdin = nil
+	command.Stdout = io.Discard
+	command.Stderr = io.Discard
+	command.WaitDelay = controlWorkerWaitDelay
+	pidFD := -1
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL, PidFD: &pidFD}
+	source, err := loadControlWorkerSourceFromCommandUnchecked(context.Background(), 3*time.Second, command)
+	if source != nil || err != errChildStart {
+		t.Fatalf("loadControlWorkerSourceFromCommand() = (%#v, %v), want contained rejection", source, err)
+	}
+	assertRecordedPIDGone(t, base+".pid")
+	assertRecordedPIDGone(t, base+".descendant-pid")
+}
+
+func TestUntrustedSourceLoaderPIDFDNeverCallsWait(t *testing.T) {
+	pidFD := -1
+	command := exec.Command("/bin/sh", "-c", "trap '' TERM; while :; do sleep 1; done")
+	command.Env = []string{}
+	command.Stdout = io.Discard
+	command.Stderr = io.Discard
+	command.WaitDelay = controlWorkerWaitDelay
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL, PidFD: &pidFD}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exitDone := make(chan struct{})
+	close(exitDone)
+	var exitTrusted atomic.Bool
+	contained, err := finalizeSourceLoader(
+		command, nil, pidFD, exitDone, &exitTrusted, true, sourceLoaderKillConfirmation,
+	)
+	if contained || err != errChildStart {
+		t.Fatalf("finalizeSourceLoader() = %t, %v; want untrusted fail-stop", contained, err)
+	}
+	// The fail-stop path returns without synchronously waiting. Its sole
+	// background reaper owns Wait; the process was already group-killed.
+}
+
+func TestSourceLoaderStartRejectsPostBuildCommandDrift(t *testing.T) {
+	for name, mutate := range map[string]func(*exec.Cmd){
+		"path":          func(command *exec.Cmd) { command.Path = "/tmp/not-worker" },
+		"argument":      func(command *exec.Cmd) { command.Args[1] = "--other" },
+		"environment":   func(command *exec.Cmd) { command.Env = []string{"A=B"} },
+		"directory":     func(command *exec.Cmd) { command.Dir = "/tmp" },
+		"stdin":         func(command *exec.Cmd) { command.Stdin = bytes.NewReader(nil) },
+		"stdout":        func(command *exec.Cmd) { command.Stdout = &bytes.Buffer{} },
+		"wait delay":    func(command *exec.Cmd) { command.WaitDelay++ },
+		"process group": func(command *exec.Cmd) { command.SysProcAttr.Setpgid = false },
+		"death signal":  func(command *exec.Cmd) { command.SysProcAttr.Pdeathsig = 0 },
+		"missing pidfd": func(command *exec.Cmd) { command.SysProcAttr.PidFD = nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			pidFD := -1
+			command := buildSourceLoaderCommand(&pidFD)
+			mutate(command)
+			source, err := loadControlWorkerSourceFromCommand(context.Background(), time.Second, command)
+			if source != nil || err != errChildStart || command.Process != nil {
+				t.Fatalf("drifted loader start = (%#v, %v, process %#v)", source, err, command.Process)
+			}
+		})
+	}
+}
+
+func TestCancellationAfterSourceLoadDoesNotStartControlChild(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	source, err := newTestControlWorkerSource()
+	if err != nil {
+		t.Fatal(err)
+	}
+	concrete := source.(*testControlWorkerSource)
+	settings := defaultSupervisorSettings()
+	settings.openSource = func(context.Context, time.Duration) (controlWorkerSource, error) {
+		cancel()
+		return concrete, nil
+	}
+	if err := runControlWorkerSupervisor(ctx, settings); err != errChildStart {
+		t.Fatalf("runControlWorkerSupervisor() error = %v, want %v", err, errChildStart)
+	}
+	concrete.mu.Lock()
+	starts, closed := concrete.starts, concrete.closed
+	concrete.mu.Unlock()
+	if starts != 0 || !closed {
+		t.Fatalf("cancelled source lifecycle = starts %d, closed %t", starts, closed)
+	}
+}
+
 func TestBoundedDiscardSignalsOnceAndNeverRetainsOutput(t *testing.T) {
 	writer := newBoundedDiscard(4)
 	if written, err := writer.Write([]byte("1234")); written != 4 || err != nil {
@@ -465,6 +632,20 @@ func TestAcceptControlWorkerChildRejectsBoundaryDrift(t *testing.T) {
 			command.ExtraFiles = []*os.File{reader}
 			t.Cleanup(func() { _ = reader.Close(); _ = writer.Close() })
 		}},
+		{name: "missing source fd", configure: func(command *exec.Cmd, _ *os.File, _ string) {
+			command.ExtraFiles = command.ExtraFiles[:1]
+		}},
+		{name: "swapped status and source", configure: func(command *exec.Cmd, _ *os.File, _ string) {
+			command.ExtraFiles[0], command.ExtraFiles[1] = command.ExtraFiles[1], command.ExtraFiles[0]
+		}},
+		{name: "extra inherited descriptor", configure: func(command *exec.Cmd, _ *os.File, _ string) {
+			extra, err := os.Open(os.DevNull)
+			if err != nil {
+				t.Fatal(err)
+			}
+			command.ExtraFiles = append(command.ExtraFiles, extra)
+			t.Cleanup(func() { _ = extra.Close() })
+		}},
 		{name: "non-empty environment", configure: func(command *exec.Cmd, _ *os.File, _ string) {
 			command.Env = append(command.Env, "UNEXPECTED=value")
 		}},
@@ -487,7 +668,7 @@ func TestAcceptControlWorkerChildRejectsBoundaryDrift(t *testing.T) {
 			}
 			defer reader.Close()
 			defer writer.Close()
-			command := acceptBoundaryCommand("accept-reject", writer)
+			command := acceptBoundaryCommand(t, "accept-reject", writer)
 			test.configure(command, writer, directory)
 			if err := command.Run(); err != nil {
 				t.Fatalf("boundary rejection helper failed: %v", err)
@@ -503,7 +684,7 @@ func TestAcceptControlWorkerChildAcceptsExactBoundary(t *testing.T) {
 	}
 	defer reader.Close()
 	defer writer.Close()
-	if err := acceptBoundaryCommand("accept-exact", writer).Run(); err != nil {
+	if err := acceptBoundaryCommand(t, "accept-exact", writer).Run(); err != nil {
 		t.Fatalf("exact boundary helper failed: %v", err)
 	}
 }
@@ -519,10 +700,125 @@ func newTestSupervisor(scenario, base string) *ControlWorkerSupervisor {
 		controlWorkerTestScenario + "=" + scenario + "|" + base,
 		controlWorkerRaceOptions,
 	}
+	settings.openSource = func(context.Context, time.Duration) (controlWorkerSource, error) {
+		return newTestControlWorkerSource()
+	}
 	return newControlWorkerSupervisor(settings)
 }
 
-func acceptBoundaryCommand(scenario string, statusFile *os.File) *exec.Cmd {
+const testControlWorkerSourceContents = "aiops-workerprocess-test-source-v1"
+
+type testControlWorkerSource struct {
+	mu             sync.Mutex
+	file           *os.File
+	closed         bool
+	starts         int
+	afterStart     func()
+	failAfterStart bool
+}
+
+func newTestControlWorkerSource() (controlWorkerSource, error) {
+	file, err := os.CreateTemp("", "aiops-workerprocess-source")
+	if err != nil {
+		return nil, err
+	}
+	_ = os.Remove(file.Name())
+	if _, err := file.WriteString(testControlWorkerSourceContents); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return &testControlWorkerSource{file: file}, nil
+}
+
+func (source *testControlWorkerSource) StartChild(command *exec.Cmd, status *os.File) error {
+	if source == nil || command == nil || status == nil {
+		return errChildStart
+	}
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	if source.closed || source.file == nil {
+		return errChildStart
+	}
+	source.starts++
+	command.ExtraFiles = []*os.File{status, source.file}
+	defer func() { command.ExtraFiles = nil }()
+	err := command.Start()
+	if err == nil && source.afterStart != nil {
+		source.afterStart()
+	}
+	closeErr := source.file.Close()
+	source.file = nil
+	source.closed = true
+	if err != nil || closeErr != nil || source.failAfterStart {
+		return errChildStart
+	}
+	return nil
+}
+
+func (source *testControlWorkerSource) Close() error {
+	if source == nil {
+		return errChildStart
+	}
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	if source.closed {
+		return nil
+	}
+	source.closed = true
+	if source.file == nil {
+		return errChildStart
+	}
+	err := source.file.Close()
+	source.file = nil
+	return err
+}
+
+func newTestSourceFile(t *testing.T) *os.File {
+	t.Helper()
+	source, err := newTestControlWorkerSource()
+	if err != nil {
+		t.Fatal(err)
+	}
+	concrete := source.(*testControlWorkerSource)
+	file := concrete.file
+	t.Cleanup(func() { _ = concrete.Close() })
+	return file
+}
+
+func acceptTestInheritedControlWorkerSource() (io.Closer, error) {
+	fd := inheritedTestSourceFD()
+	if fd < 0 {
+		return nil, errInvalidChildInvocation
+	}
+	unix.CloseOnExec(fd)
+	contents := make([]byte, len(testControlWorkerSourceContents))
+	read, err := unix.Pread(fd, contents, 0)
+	if err != nil || read != len(contents) || string(contents) != testControlWorkerSourceContents {
+		return nil, errInvalidChildInvocation
+	}
+	file := os.NewFile(uintptr(fd), "control-worker-test-source")
+	if file == nil {
+		return nil, errInvalidChildInvocation
+	}
+	return file, nil
+}
+
+func inheritedTestSourceFD() int {
+	fd := 4
+	var stat unix.Stat_t
+	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG {
+		return -1
+	}
+	return fd
+}
+
+func acceptBoundaryCommand(t *testing.T, scenario string, statusFile *os.File) *exec.Cmd {
+	t.Helper()
+	sourceFile := newTestSourceFile(t)
 	command := exec.Command(controlWorkerExecutable, controlWorkerChildArgument)
 	command.Args = []string{controlWorkerExecutable, controlWorkerChildArgument}
 	command.Env = []string{
@@ -533,7 +829,7 @@ func acceptBoundaryCommand(scenario string, statusFile *os.File) *exec.Cmd {
 	command.Stdin = nil
 	command.Stdout = io.Discard
 	command.Stderr = io.Discard
-	command.ExtraFiles = []*os.File{statusFile}
+	command.ExtraFiles = []*os.File{statusFile, sourceFile}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
 	return command
 }
@@ -545,7 +841,7 @@ func runControlWorkerTestChild(raw string) int {
 	if len(parts) == 2 {
 		base = parts[1]
 	}
-	status, err := AcceptControlWorkerChild(os.Args[1:])
+	status, err := acceptControlWorkerChildWithSource(acceptTestInheritedControlWorkerSource)
 	if scenario == "accept-reject" {
 		if err != nil && status == nil {
 			return 0
@@ -710,6 +1006,13 @@ func runPdeathParentTestHelper(raw string) int {
 	if err != nil {
 		return 101
 	}
+	source, err := newTestControlWorkerSource()
+	if err != nil {
+		_ = statusReader.Close()
+		_ = statusWriter.Close()
+		return 104
+	}
+	concreteSource := source.(*testControlWorkerSource)
 	command := exec.Command(controlWorkerExecutable, controlWorkerChildArgument)
 	command.Args = []string{controlWorkerExecutable, controlWorkerChildArgument}
 	command.Env = []string{
@@ -720,11 +1023,13 @@ func runPdeathParentTestHelper(raw string) int {
 	command.Stdin = nil
 	command.Stdout = io.Discard
 	command.Stderr = io.Discard
-	command.ExtraFiles = []*os.File{statusWriter}
+	command.ExtraFiles = []*os.File{statusWriter, concreteSource.file}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
 	if err := command.Start(); err != nil {
+		_ = source.Close()
 		return 102
 	}
+	_ = source.Close()
 	_ = statusWriter.Close()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -735,6 +1040,31 @@ func runPdeathParentTestHelper(raw string) int {
 		time.Sleep(10 * time.Millisecond)
 	}
 	return 103
+}
+
+func runSourceLoaderTestChild(raw string) int {
+	parts := strings.SplitN(raw, "|", 2)
+	if len(parts) != 2 || (parts[0] != "source-loader-hang" && parts[0] != "source-loader-invalid") {
+		return 105
+	}
+	base := parts[1]
+	writeChildMarker(base+".pid", strconv.Itoa(os.Getpid()))
+	descendant := exec.Command("/bin/sh", "-c", "trap '' TERM; while :; do sleep 1; done")
+	descendant.Env = []string{}
+	if descendant.Start() != nil {
+		return 106
+	}
+	writeChildMarker(base+".descendant-pid", strconv.Itoa(descendant.Process.Pid))
+	if parts[0] == "source-loader-invalid" {
+		writer := os.NewFile(controlWorkerStatusFD, "source-loader-invalid")
+		if writer == nil {
+			return 107
+		}
+		_, _ = writer.Write([]byte("invalid-public-source-frame"))
+		_ = writer.Close()
+		return 0
+	}
+	select {}
 }
 
 func captureTestTERM() chan os.Signal {

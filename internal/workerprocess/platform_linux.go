@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -18,10 +19,298 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/seaworld008/aiops-system/internal/workerbootstrap"
 	"golang.org/x/sys/unix"
 )
 
 const controlWorkerExecutable = "/proc/self/exe"
+
+const sourceLoaderKillConfirmation = 5 * time.Second
+
+type sourceLoadResult struct {
+	source controlWorkerSource
+	err    error
+}
+
+func openProductionControlWorkerSource(ctx context.Context, timeout time.Duration) (controlWorkerSource, error) {
+	pidFD := -1
+	return loadControlWorkerSourceFromCommand(ctx, timeout, buildSourceLoaderCommand(&pidFD))
+}
+
+func buildSourceLoaderCommand(pidFD *int) *exec.Cmd {
+	command := exec.Command(controlWorkerExecutable, controlWorkerLoaderArgument)
+	command.Args = []string{controlWorkerExecutable, controlWorkerLoaderArgument}
+	command.Env = []string{}
+	command.Dir = "/"
+	command.Stdin = nil
+	command.Stdout = io.Discard
+	command.Stderr = io.Discard
+	command.ExtraFiles = nil
+	command.WaitDelay = controlWorkerWaitDelay
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL, PidFD: pidFD}
+	return command
+}
+
+func loadControlWorkerSourceFromCommand(
+	ctx context.Context,
+	timeout time.Duration,
+	command *exec.Cmd,
+) (controlWorkerSource, error) {
+	if !validFixedSourceLoaderCommand(command) {
+		return nil, errChildStart
+	}
+	return loadControlWorkerSourceFromCommandUnchecked(ctx, timeout, command)
+}
+
+func loadControlWorkerSourceFromCommandUnchecked(
+	ctx context.Context,
+	timeout time.Duration,
+	command *exec.Cmd,
+) (controlWorkerSource, error) {
+	if ctx == nil || ctx.Err() != nil || timeout <= 0 || command == nil || command.Process != nil ||
+		len(command.ExtraFiles) != 0 || command.SysProcAttr == nil || command.SysProcAttr.PidFD == nil {
+		return nil, errChildStart
+	}
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return nil, errChildStart
+	}
+	if startSourceLoaderCommand(command, writer) != nil {
+		_ = reader.Close()
+		_ = writer.Close()
+		return nil, errChildStart
+	}
+	_ = writer.Close()
+	pidFD := *command.SysProcAttr.PidFD
+	if pidFD < 0 {
+		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+		_ = containStartedCommandWithoutPIDFD(command, reader, sourceLoaderKillConfirmation)
+		return nil, errChildStart
+	}
+	loaded := make(chan sourceLoadResult, 1)
+	go func() {
+		source, receiveErr := receiveProductionControlWorkerSource(reader)
+		loaded <- sourceLoadResult{source: source, err: receiveErr}
+	}()
+	exitDone := make(chan struct{})
+	var exitTrusted atomic.Bool
+	go func() {
+		exitTrusted.Store(waitPIDFD(pidFD) == nil)
+		close(exitDone)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var result sourceLoadResult
+	received := false
+	exited := false
+	loadSignal := (<-chan sourceLoadResult)(loaded)
+	exitSignal := (<-chan struct{})(exitDone)
+	kill := false
+	failed := false
+	for !received || !exited {
+		select {
+		case result = <-loadSignal:
+			received = true
+			loadSignal = nil
+			if result.err != nil || nilControlWorkerSource(result.source) {
+				failed = true
+				kill = true
+			}
+		case <-exitSignal:
+			exited = true
+			exitSignal = nil
+			if !exitTrusted.Load() {
+				failed = true
+				kill = true
+			}
+		case <-ctx.Done():
+			failed = true
+			kill = true
+		case <-timer.C:
+			failed = true
+			kill = true
+		}
+		if failed {
+			break
+		}
+	}
+	contained, waitErr := finalizeSourceLoader(command, reader, pidFD, exitDone, &exitTrusted, kill, timeout)
+	if !received {
+		discardSourceLoad(loaded, result, false)
+	}
+	if failed || !contained || waitErr != nil || result.err != nil || nilControlWorkerSource(result.source) {
+		_ = closeControlWorkerSource(result.source)
+		return nil, errChildStart
+	}
+	if ctx.Err() != nil {
+		_ = closeControlWorkerSource(result.source)
+		return nil, errChildStart
+	}
+	return result.source, nil
+}
+
+func validFixedSourceLoaderCommand(command *exec.Cmd) bool {
+	if command == nil || command.Path != controlWorkerExecutable || len(command.Args) != 2 ||
+		command.Args[0] != controlWorkerExecutable || command.Args[1] != controlWorkerLoaderArgument ||
+		command.Env == nil || len(command.Env) != 0 || command.Dir != "/" || command.Stdin != nil ||
+		command.Stdout != io.Discard || command.Stderr != io.Discard || len(command.ExtraFiles) != 0 ||
+		command.WaitDelay != controlWorkerWaitDelay || command.Cancel != nil || command.Process != nil ||
+		command.ProcessState != nil || command.Err != nil || command.SysProcAttr == nil ||
+		command.SysProcAttr.PidFD == nil || *command.SysProcAttr.PidFD != -1 {
+		return false
+	}
+	want := &syscall.SysProcAttr{
+		Setpgid: true, Pdeathsig: syscall.SIGKILL, PidFD: command.SysProcAttr.PidFD,
+	}
+	return reflect.DeepEqual(command.SysProcAttr, want)
+}
+
+func startSourceLoaderCommand(command *exec.Cmd, writer *os.File) (returnedErr error) {
+	defer func() {
+		if recover() != nil {
+			returnedErr = errChildStart
+		}
+		if command != nil {
+			command.ExtraFiles = nil
+		}
+	}()
+	if command == nil || writer == nil || command.Process != nil || len(command.ExtraFiles) != 0 {
+		return errChildStart
+	}
+	command.ExtraFiles = []*os.File{writer}
+	if err := command.Start(); err != nil {
+		return errChildStart
+	}
+	return nil
+}
+
+func receiveProductionControlWorkerSource(reader *os.File) (source controlWorkerSource, returnedErr error) {
+	if reader != nil {
+		defer reader.Close()
+	}
+	defer func() {
+		if recover() != nil {
+			source = nil
+			returnedErr = errChildStart
+		}
+	}()
+	source, err := workerbootstrap.ReceiveProductionSource(reader)
+	if err != nil || nilControlWorkerSource(source) {
+		_ = closeControlWorkerSource(source)
+		return nil, errChildStart
+	}
+	return source, nil
+}
+
+func discardSourceLoad(loaded <-chan sourceLoadResult, current sourceLoadResult, received bool) {
+	_ = closeControlWorkerSource(current.source)
+	if received || loaded == nil {
+		return
+	}
+	timer := time.NewTimer(sourceLoaderKillConfirmation)
+	defer timer.Stop()
+	select {
+	case late := <-loaded:
+		_ = closeControlWorkerSource(late.source)
+	case <-timer.C:
+	}
+}
+
+func closeControlWorkerSource(source controlWorkerSource) error {
+	if nilControlWorkerSource(source) {
+		return nil
+	}
+	return invokeControlWorkerSourceClose(source)
+}
+
+func finalizeSourceLoader(
+	command *exec.Cmd,
+	reader *os.File,
+	pidFD int,
+	exitDone <-chan struct{},
+	exitTrusted *atomic.Bool,
+	kill bool,
+	timeout time.Duration,
+) (bool, error) {
+	if reader != nil {
+		_ = reader.Close()
+	}
+	if command == nil || command.Process == nil || command.Process.Pid <= 1 || pidFD < 0 ||
+		exitDone == nil || exitTrusted == nil || timeout <= 0 {
+		if pidFD >= 0 {
+			_ = unix.Close(pidFD)
+		}
+		return false, errChildStart
+	}
+	pid := command.Process.Pid
+	killOK := true
+	if kill {
+		killErr := syscall.Kill(-pid, syscall.SIGKILL)
+		killOK = killErr == nil || errors.Is(killErr, syscall.ESRCH)
+	}
+	confirmation := sourceLoaderKillConfirmation
+	if timeout < confirmation {
+		confirmation = timeout
+	}
+	timer := time.NewTimer(confirmation)
+	defer timer.Stop()
+	select {
+	case <-exitDone:
+	case <-timer.C:
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		_ = unix.Close(pidFD)
+		startSourceLoaderFailStopReaper(command)
+		return false, errChildStart
+	}
+	trusted := exitTrusted.Load()
+	if !trusted {
+		// A closed exitDone only proves the pidfd poll goroutine returned. If the
+		// poll itself was untrusted, never enter Wait: the leader may still be in
+		// uninterruptible sleep. Trigger process-level fail-stop; the fixed
+		// Pdeathsig contains the child when cmd/worker exits.
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		_ = unix.Close(pidFD)
+		startSourceLoaderFailStopReaper(command)
+		return false, errChildStart
+	}
+	probe := &controlWorkerProcess{pid: pid}
+	members, groupTrusted := probe.groupHasOtherMembers()
+	groupClean := groupTrusted && !members
+	if !groupTrusted || members {
+		killErr := syscall.Kill(-pid, syscall.SIGKILL)
+		killOK = killOK && (killErr == nil || errors.Is(killErr, syscall.ESRCH))
+	}
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		members, groupTrusted = probe.groupHasOtherMembers()
+		if groupTrusted && !members {
+			break
+		}
+		select {
+		case <-ticker.C:
+		case <-timer.C:
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			_ = unix.Close(pidFD)
+			startSourceLoaderFailStopReaper(command)
+			return false, errChildStart
+		}
+	}
+	// pidfd has proved the leader exited and every other original-PGID member
+	// is gone. With fixed io.Discard outputs and WaitDelay, this sole Wait is a
+	// local reap and cannot depend on the fixed-root filesystem.
+	waitErr := command.Wait()
+	closeErr := unix.Close(pidFD)
+	groupGone := errors.Is(syscall.Kill(-pid, 0), syscall.ESRCH)
+	return killOK && trusted && groupTrusted && groupClean && groupGone && closeErr == nil, waitErr
+}
+
+func startSourceLoaderFailStopReaper(command *exec.Cmd) {
+	if command == nil || command.Process == nil || command.ProcessState != nil {
+		return
+	}
+	go func() { _ = command.Wait() }()
+}
 
 type childEvent uint8
 
@@ -69,6 +358,10 @@ func (writer *boundedDiscard) Write(value []byte) (int, error) {
 }
 
 func acceptControlWorkerChild() (*ChildStatus, error) {
+	return acceptControlWorkerChildWithSource(acceptInheritedControlWorkerSource)
+}
+
+func acceptControlWorkerChildWithSource(acceptSource func() (io.Closer, error)) (*ChildStatus, error) {
 	if len(os.Environ()) != 0 {
 		return nil, errInvalidChildInvocation
 	}
@@ -107,7 +400,102 @@ func acceptControlWorkerChild() (*ChildStatus, error) {
 	if file == nil {
 		return nil, errInvalidStatusChannel
 	}
-	return newChildStatus(file), nil
+	if !onlyExpectedInheritedDescriptors(controlWorkerSourceFD) {
+		_ = file.Close()
+		return nil, errInvalidChildInvocation
+	}
+	source, err := invokeInheritedSourceAccept(acceptSource)
+	if err != nil || nilIOCloser(source) {
+		_ = file.Close()
+		return nil, errInvalidChildInvocation
+	}
+	return newChildStatus(file, source), nil
+}
+
+func onlyExpectedInheritedDescriptors(maximum int) bool {
+	if maximum < 2 {
+		return false
+	}
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		descriptor, parseErr := strconv.Atoi(entry.Name())
+		if parseErr != nil || descriptor <= maximum {
+			continue
+		}
+		flags, flagsErr := unix.FcntlInt(uintptr(descriptor), unix.F_GETFD, 0)
+		if errors.Is(flagsErr, syscall.EBADF) {
+			continue
+		}
+		if flagsErr != nil || flags&unix.FD_CLOEXEC == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func runControlWorkerSourceLoaderChild() error {
+	if len(os.Environ()) != 0 {
+		return errInvalidChildInvocation
+	}
+	workingDirectory, err := os.Getwd()
+	if err != nil || workingDirectory != "/" {
+		return errInvalidChildInvocation
+	}
+	pid := os.Getpid()
+	group, groupErr := syscall.Getpgid(0)
+	deathSignal, deathErr := currentParentDeathSignal()
+	if groupErr != nil || deathErr != nil || pid <= 1 || group != pid || os.Getppid() <= 0 ||
+		deathSignal != syscall.SIGKILL {
+		return errInvalidChildInvocation
+	}
+	unix.CloseOnExec(int(controlWorkerStatusFD))
+	if !onlyExpectedInheritedDescriptors(int(controlWorkerStatusFD)) {
+		return errInvalidChildInvocation
+	}
+	if err := workerbootstrap.WriteProductionSourceToLoaderFD(); err != nil {
+		return errInvalidChildInvocation
+	}
+	return nil
+}
+
+func acceptInheritedControlWorkerSource() (io.Closer, error) {
+	return workerbootstrap.AcceptInheritedSource()
+}
+
+func invokeInheritedSourceAccept(accept func() (io.Closer, error)) (source io.Closer, returnedErr error) {
+	defer func() {
+		if recover() != nil {
+			source = nil
+			returnedErr = errInvalidChildInvocation
+		}
+	}()
+	if accept == nil {
+		return nil, errInvalidChildInvocation
+	}
+	source, err := accept()
+	if err != nil || nilIOCloser(source) {
+		if !nilIOCloser(source) {
+			_ = source.Close()
+		}
+		return nil, errInvalidChildInvocation
+	}
+	return source, nil
+}
+
+func nilIOCloser(value io.Closer) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }
 
 func currentParentDeathSignal() (syscall.Signal, error) {
@@ -132,11 +520,32 @@ func currentParentDeathSignal() (syscall.Signal, error) {
 }
 
 func runControlWorkerSupervisor(ctx context.Context, settings supervisorSettings) error {
-	process, events, outputExceeded, err := startControlWorker(settings)
+	startedAt := time.Now()
+	source, err := invokeControlWorkerSourceOpen(settings.openSource, ctx, settings.startupTimeout)
+	if err != nil || nilControlWorkerSource(source) {
+		return errChildStart
+	}
+	if ctx.Err() != nil {
+		_ = invokeControlWorkerSourceClose(source)
+		return errChildStart
+	}
+	remaining := settings.startupTimeout - time.Since(startedAt)
+	if remaining <= 0 {
+		_ = invokeControlWorkerSourceClose(source)
+		return errChildStart
+	}
+	process, events, outputExceeded, err := startControlWorker(settings, source)
 	if err != nil {
 		return errChildStart
 	}
-	startup := time.NewTimer(settings.startupTimeout)
+	remaining = settings.startupTimeout - time.Since(startedAt)
+	if remaining <= 0 {
+		return terminateControlWorker(
+			process, settings, events, outputExceeded,
+			settings.startupGrace, errChildStartup, errChildStartup,
+		)
+	}
+	startup := time.NewTimer(remaining)
 	defer startup.Stop()
 	for {
 		select {
@@ -202,26 +611,45 @@ func superviseReadyControlWorker(
 	}
 }
 
-func startControlWorker(settings supervisorSettings) (*controlWorkerProcess, <-chan childEvent, <-chan struct{}, error) {
+func startControlWorker(
+	settings supervisorSettings,
+	source controlWorkerSource,
+) (*controlWorkerProcess, <-chan childEvent, <-chan struct{}, error) {
+	if nilControlWorkerSource(source) {
+		return nil, nil, nil, errChildStart
+	}
 	statusReader, statusWriter, err := os.Pipe()
 	if err != nil {
+		_ = invokeControlWorkerSourceClose(source)
 		return nil, nil, nil, errChildStart
 	}
 	output := newBoundedDiscard(settings.outputLimit)
 	pidFD := -1
-	command := buildControlWorkerCommand(settings, statusWriter, output, &pidFD)
-	if err := command.Start(); err != nil {
-		_ = statusReader.Close()
+	command := buildControlWorkerCommand(settings, output, &pidFD)
+	startErr := invokeControlWorkerSourceStart(source, command, statusWriter)
+	closeErr := invokeControlWorkerSourceClose(source)
+	var process *controlWorkerProcess
+	if command.Process != nil && pidFD >= 0 {
+		process = newStartedControlWorkerProcess(command, pidFD, statusReader)
+	}
+	if startErr != nil || closeErr != nil || process == nil {
 		_ = statusWriter.Close()
+		if process != nil {
+			_ = forceKillAndReap(process, settings.killConfirm)
+		} else if command.Process != nil {
+			_ = containStartedCommandWithoutPIDFD(command, statusReader, settings.killConfirm)
+		} else {
+			_ = statusReader.Close()
+		}
 		return nil, nil, nil, errChildStart
 	}
 	_ = statusWriter.Close()
-	if pidFD < 0 {
-		_ = command.Process.Kill()
-		_ = command.Wait()
-		_ = statusReader.Close()
-		return nil, nil, nil, errChildStart
-	}
+	events := make(chan childEvent, 4)
+	go monitorChildStatus(statusReader, events)
+	return process, events, output.exceeded, nil
+}
+
+func newStartedControlWorkerProcess(command *exec.Cmd, pidFD int, statusReader *os.File) *controlWorkerProcess {
 	process := &controlWorkerProcess{
 		command:      command,
 		pid:          command.Process.Pid,
@@ -234,14 +662,11 @@ func startControlWorker(settings supervisorSettings) (*controlWorkerProcess, <-c
 		process.exitTrusted.Store(waitPIDFD(pidFD) == nil)
 		close(process.exitDone)
 	}()
-	events := make(chan childEvent, 4)
-	go monitorChildStatus(statusReader, events)
-	return process, events, output.exceeded, nil
+	return process
 }
 
 func buildControlWorkerCommand(
 	settings supervisorSettings,
-	statusWriter *os.File,
 	output io.Writer,
 	pidFD *int,
 ) *exec.Cmd {
@@ -252,7 +677,7 @@ func buildControlWorkerCommand(
 	command.Stdin = nil
 	command.Stdout = output
 	command.Stderr = output
-	command.ExtraFiles = []*os.File{statusWriter}
+	command.ExtraFiles = nil
 	command.WaitDelay = controlWorkerWaitDelay
 	command.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid:   true,
@@ -260,6 +685,109 @@ func buildControlWorkerCommand(
 		PidFD:     pidFD,
 	}
 	return command
+}
+
+func invokeControlWorkerSourceOpen(
+	open func(context.Context, time.Duration) (controlWorkerSource, error),
+	ctx context.Context,
+	timeout time.Duration,
+) (source controlWorkerSource, returnedErr error) {
+	defer func() {
+		if recover() != nil {
+			source = nil
+			returnedErr = errChildStart
+		}
+	}()
+	if open == nil || ctx == nil || timeout <= 0 {
+		return nil, errChildStart
+	}
+	source, err := open(ctx, timeout)
+	if err != nil || nilControlWorkerSource(source) {
+		if !nilControlWorkerSource(source) {
+			_ = source.Close()
+		}
+		return nil, errChildStart
+	}
+	return source, nil
+}
+
+func invokeControlWorkerSourceStart(
+	source controlWorkerSource,
+	command *exec.Cmd,
+	status *os.File,
+) (returnedErr error) {
+	defer func() {
+		if recover() != nil {
+			returnedErr = errChildStart
+		}
+	}()
+	if nilControlWorkerSource(source) || command == nil || status == nil || source.StartChild(command, status) != nil {
+		return errChildStart
+	}
+	return nil
+}
+
+func invokeControlWorkerSourceClose(source controlWorkerSource) (returnedErr error) {
+	defer func() {
+		if recover() != nil {
+			returnedErr = errChildStart
+		}
+	}()
+	if nilControlWorkerSource(source) || source.Close() != nil {
+		return errChildStart
+	}
+	return nil
+}
+
+func containStartedCommandWithoutPIDFD(
+	command *exec.Cmd,
+	statusReader *os.File,
+	killConfirm time.Duration,
+) bool {
+	if command == nil || command.Process == nil || command.Process.Pid <= 1 || killConfirm <= 0 {
+		if statusReader != nil {
+			_ = statusReader.Close()
+		}
+		return false
+	}
+	pid := command.Process.Pid
+	group, groupErr := syscall.Getpgid(pid)
+	killErr := error(nil)
+	if groupErr == nil && group == pid {
+		killErr = syscall.Kill(-pid, syscall.SIGKILL)
+	} else {
+		killErr = command.Process.Kill()
+	}
+	waitDone := make(chan struct{})
+	go func() {
+		_ = command.Wait()
+		close(waitDone)
+	}()
+	timer := time.NewTimer(killConfirm)
+	defer timer.Stop()
+	select {
+	case <-waitDone:
+	case <-timer.C:
+		if statusReader != nil {
+			_ = statusReader.Close()
+		}
+		return false
+	}
+	if statusReader != nil {
+		_ = statusReader.Close()
+	}
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if errors.Is(syscall.Kill(-pid, 0), syscall.ESRCH) {
+			return killErr == nil || errors.Is(killErr, syscall.ESRCH)
+		}
+		select {
+		case <-ticker.C:
+		case <-timer.C:
+			return false
+		}
+	}
 }
 
 func classifyExitedControlWorker(

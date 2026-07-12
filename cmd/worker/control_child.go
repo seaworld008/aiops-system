@@ -270,8 +270,8 @@ func (status *processControlChildStatus) Fatal() {
 }
 
 func newControlChildRuntime() (controlChildRuntime, error) {
-	// C2-4c2b0 validates only lifecycle containment. Secure bootstrap and the
-	// Snapshot/PostgreSQL/Temporal assembly remain separate reviewed gates.
+	// The child has accepted the independently validated public-source FD4,
+	// but semantic Snapshot/PostgreSQL/Temporal assembly remains unavailable.
 	return nil, errControlWorkerAssemblyUnavailable
 }
 

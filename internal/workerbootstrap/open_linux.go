@@ -68,7 +68,7 @@ type fixedArtifactSpec struct {
 
 // OpenProductionSource snapshots the one compile-time production root. It has
 // no environment, path, FD, or fallback input. The result is not a semantic
-// Snapshot proof and currently has no production consumer.
+// Snapshot proof; its only production consumer is the reviewed FD4 handoff.
 func OpenProductionSource() (capability *PublicSourceCapability, returnedErr error) {
 	defer func() {
 		if recover() != nil {
