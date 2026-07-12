@@ -358,10 +358,13 @@ func (writer *boundedDiscard) Write(value []byte) (int, error) {
 }
 
 func acceptControlWorkerChild() (*ChildStatus, error) {
-	return acceptControlWorkerChildWithSource(acceptInheritedControlWorkerSource)
+	return acceptControlWorkerChildWithSource(acceptInheritedControlWorkerSource, true)
 }
 
-func acceptControlWorkerChildWithSource(acceptSource func() (io.Closer, error)) (*ChildStatus, error) {
+func acceptControlWorkerChildWithSource(
+	acceptSource func() (io.Closer, error),
+	enforceInheritedDescriptors bool,
+) (*ChildStatus, error) {
 	if len(os.Environ()) != 0 {
 		return nil, errInvalidChildInvocation
 	}
@@ -400,7 +403,7 @@ func acceptControlWorkerChildWithSource(acceptSource func() (io.Closer, error)) 
 	if file == nil {
 		return nil, errInvalidStatusChannel
 	}
-	if !onlyExpectedInheritedDescriptors(controlWorkerSourceFD) {
+	if enforceInheritedDescriptors && !onlyExpectedInheritedDescriptors(controlWorkerSourceFD) {
 		_ = file.Close()
 		return nil, errInvalidChildInvocation
 	}

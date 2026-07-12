@@ -668,7 +668,11 @@ func TestAcceptControlWorkerChildRejectsBoundaryDrift(t *testing.T) {
 			}
 			defer reader.Close()
 			defer writer.Close()
-			command := acceptBoundaryCommand(t, "accept-reject", writer)
+			scenario := "accept-reject"
+			if test.name == "extra inherited descriptor" {
+				scenario = "accept-reject-extra"
+			}
+			command := acceptBoundaryCommand(t, scenario, writer)
 			test.configure(command, writer, directory)
 			if err := command.Run(); err != nil {
 				t.Fatalf("boundary rejection helper failed: %v", err)
@@ -841,7 +845,16 @@ func runControlWorkerTestChild(raw string) int {
 	if len(parts) == 2 {
 		base = parts[1]
 	}
-	status, err := acceptControlWorkerChildWithSource(acceptTestInheritedControlWorkerSource)
+	if scenario == "accept-reject-extra" {
+		if onlyExpectedInheritedDescriptors(controlWorkerSourceFD) {
+			return 91
+		}
+		return 0
+	}
+	// The race runtime creates its own process-local descriptors after exec.
+	// Production always enforces the scan; helpers bypass only that runtime
+	// noise, while accept-reject-extra above exercises the real FD5 scan.
+	status, err := acceptControlWorkerChildWithSource(acceptTestInheritedControlWorkerSource, false)
 	if scenario == "accept-reject" {
 		if err != nil && status == nil {
 			return 0
