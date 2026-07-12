@@ -1,6 +1,6 @@
 # Temporal READ investigation orchestration
 
-阶段：M5C2-4b / M5C2-4c1a / M5C2-4c1b / M5C2-4c2a / M5C2-4c2b0 / M5C2-4c2b1a（版本化只读编排、
+阶段：M5C2-4b / M5C2-4c1a / M5C2-4c1b / M5C2-4c2a / M5C2-4c2b0 / M5C2-4c2b1a / M5C2-4c2b1b0（版本化只读编排、
 Plan-bound Runner 路由、角色隔离的 Temporal 控制边界、fail-closed 子进程 containment 与预装配
 进程逃逸静态门禁；真实 Worker/Outbox/Runner 尚未装配，READ claims 关闭）
 
@@ -12,8 +12,9 @@ READY 前固定失败。该切片不修改配置、Outbox dispatcher、Gateway A
 Admission，生产代码仍没有打开 READ claims 的构造器；WRITE claims 与 production write 也继续不存在
 启用路径。C2-4c2b0 让父监督器在 TERM grace 内继续处理晚到 FATAL，并把“受信 child 代码不得创建
 或逃逸到另一进程组/namespace”固化为仓库静态门禁；它仍不安装任何 live 依赖或打开 Admission。
-C2-4c2b1a 只新增固定根 public-source snapshot 与 sealed memfd capability；架构门禁要求它保持零生产
-consumer，因此 `cmd/worker`、父子 FD 表、秘密管道、Snapshot/Temporal/PostgreSQL 装配均未改变。
+C2-4c2b1a 只新增固定根 public-source snapshot 与 sealed memfd capability。C2-4c2b1b0 将它以唯一固定
+FD4 交给 contained child，并在 child 内重复验证 descriptor、frame、工件闭包与证书；仍不构造语义
+Snapshot、不读取秘密、不 Dial、不 READY。
 
 ## C2-4c2a 进程级 containment
 
@@ -116,14 +117,48 @@ tmpfs regular inode、`nlink=0`、owner/mode/size、完整 seals 和只读 acces
 
 这里的 `Source` 是关键边界：`expected_snapshot` 是部署方声明，不是已经验证的 Snapshot proof；b1a
 只证明受信来源、完整闭包与不可变传输，不调用四个既有语义 loader，也不构造 `readassembly.Snapshot`。
-仓库 AST 门禁要求当前生产代码对该包保持零 import/consumer。C2-4c2b1b 只有从同一 envelope 构造真实
-Snapshot 并精确比较完整 Summary 后，才可继续读取一次性秘密；任一语义错误都必须在 Dial/READY 前
-失败。Starter/Control/PostgreSQL 的证书不同也不等于企业 PKI profile、Temporal RBAC 或数据库授权已经
-隔离；这些仍是外部 Go/No-Go 门禁。
+仓库 AST 门禁只允许 `internal/workerprocess/platform_linux.go` 作为生产 consumer，并精确固定
+`OpenProductionSource` 与 `AcceptInheritedSource` 各一次直接调用。C2-4c2b1b1 只有从同一 envelope 构造
+真实 Snapshot 并精确比较完整 Summary 后，才可进入 secret-ready 阶段；任一语义错误都必须在
+Dial/READY 前失败。Starter/Control/PostgreSQL 的证书不同也不等于企业 PKI profile、Temporal RBAC 或
+数据库授权已经隔离；这些仍是外部 Go/No-Go 门禁。
 
-当前 capability 不进入 `cmd/worker.ExtraFiles`，不读取密码、private key 或 DSN，不创建 PostgreSQL pool，
-不执行任何 Temporal Dial，不安装 Outbox，也不发送 READY。下一切片才审查固定 FD4、child 对 frame/
-seals/角色的重复验证，以及 Starter/Control 私钥和 PostgreSQL secret 的独立一次性匿名 pipe。
+当前 capability 已进入固定 FD4，但不读取密码、private key 或 DSN，不创建 PostgreSQL pool，不执行任何
+Temporal Dial，不安装 Outbox，也不发送 READY。独立一次性 Starter/Control 私钥与 PostgreSQL secret
+匿名 pipe 必须等待 child 完成语义 Snapshot 并发出非 READY 的 secret-ready 证明后再实现。
+
+## C2-4c2b1b0 固定 FD4 与 child 独立复验
+
+固定根读取先在一个短生命周期、空环境、独立进程组且带 `Pdeathsig=SIGKILL` 的 public-source loader
+child 内完成。loader 只通过固定 FD3 匿名 pipe 输出最多 8 MiB 的公开 frame；父进程在
+`workerbootstrap` 内有界接收、独立复验并重建 sealed memfd。整个 loader 读取、传输、退出与 PGID 清空
+共同占用启动预算；超时或取消会关闭 pipe，在 pidfd 钉住且 leader 尚未 reap 时强杀并确认原 loader
+进程组无其他成员，最后执行唯一 `Wait`，避免裸 PID/PGID 复用误杀。因此阻塞的 FUSE/CSI/NFS 读取不会
+冻结常驻父进程。pidfd 证明或确认窗口本身失效时不会在当前 goroutine 进入无界 Wait，而是返回未确认
+fail-stop，并仅安排唯一后台 reaper；`cmd/worker` 随即退出，Pdeathsig 继续约束 loader。该 loader 不接收
+任何秘密，FD4 仍只用于后续 control child。
+
+父监督器启动 control child 时，`ExtraFiles` 必须恰好是 `[statusWriter, publicSource]`：FD3 仍是
+child→parent 的只写状态 pipe，FD4 只能是 parent→child 的只读 sealed memfd。
+`PublicSourceCapability.StartChild` 在 Linux 先完整核验固定 `/proc/self/exe`/隐藏参数、空环境、根目录、
+无 stdin、同一有界输出 sink、500 毫秒 WaitDelay、精确 Setpgid/Pdeathsig/pidfd 及 FD3 pipe，再自己安装
+FD3/FD4 并调用一次 `Start`；它不会把 source `*os.File` 交给回调或保留在返回后的 `exec.Cmd`。`Start`
+返回后无论成功、失败或 panic 都关闭父句柄并永久消费 capability。Start、Close 和重复启动互斥；若启动后的任何清理失败，父进程会强杀整个原 PGID、有界
+`Wait` 并验证进程组消失，不能把半装配进程或同组后代交给 supervisor。
+
+child 在接受状态 FD3 后，只从固定 FD4 取得 source，不接受调用方传入 FD、path 或 bytes。它设置并复验
+`CLOEXEC`，要求 FD4 是当前 euid 拥有的 tmpfs regular inode、`0400`、`nlink=0`、`O_RDONLY`、8 MiB
+以内且四类 seal 精确齐全；前后 `fstat` 必须稳定。随后使用有界 `pread` 重验 magic、长度、domain-separated
+SHA-256、严格 JSON、固定 artifact 顺序/名称/摘要、5 MiB source 预算、target CA 闭包及三套当前有效且
+互异的公共 client certificate。缺失、交换、普通文件、pipe、可写或少 seal 的 memfd，frame 截断/尾随、
+未知字段、非规范 JSON、角色或摘要替换都会在 READY/Dial 前失败。child 同时拒绝 FD5 及以上任何额外
+非 `CLOEXEC` 继承能力。
+
+成功后 child 只得到不可复制、不可序列化且固定脱敏的 `InheritedSource` 生命周期 capability；原始字节仍不
+对 runtime 层公开，source 由 `ChildStatus` 持有，并在 READY 写失败或正常关闭时一并关闭。该结果只证明
+FD4 传输后的不可变工件集合，明确不是 `readassembly.Snapshot` 语义证明。固定 runtime factory 仍返回
+assembly unavailable，因此 hidden child 会在 READY 前退出；FD5 及以上、秘密读取、PostgreSQL/Temporal
+连接、Outbox、Gateway Admission、READ/WRITE claims 和所有生产写状态均未改变。
 
 ## 角色隔离的 Temporal 控制边界
 

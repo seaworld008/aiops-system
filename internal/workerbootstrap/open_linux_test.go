@@ -229,9 +229,9 @@ func TestPublicSourceDoesNotAttestManifestOrSnapshotSemantics(t *testing.T) {
 	if err != nil || capability == nil {
 		t.Fatalf("open trusted semantic-invalid source = %#v, %v", capability, err)
 	}
-	// This capability currently has zero production consumers. C2-4c2b1b must
-	// build and compare the real Snapshot from this exact envelope before Dial
-	// or READY; source integrity alone is deliberately not that proof.
+	// FD handoff consumes this capability without widening its summary. The
+	// next gate must still build and compare the real Snapshot from this exact
+	// envelope before Dial or READY; source integrity is not that proof.
 	if err := capability.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}

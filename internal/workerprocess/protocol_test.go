@@ -3,6 +3,8 @@ package workerprocess
 import (
 	"context"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -30,6 +32,23 @@ func TestIsControlWorkerChildRequiresExactPrivateArgument(t *testing.T) {
 	}
 }
 
+func TestIsControlWorkerSourceLoaderChildRequiresExactPrivateArgument(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		args []string
+		want bool
+	}{
+		{args: []string{controlWorkerLoaderArgument}, want: true},
+		{args: nil},
+		{args: []string{"--aiops-internal-control-worker-source-loader"}},
+		{args: []string{controlWorkerLoaderArgument, "extra"}},
+	} {
+		if got := IsControlWorkerSourceLoaderChild(test.args); got != test.want {
+			t.Fatalf("IsControlWorkerSourceLoaderChild(%q) = %t, want %t", test.args, got, test.want)
+		}
+	}
+}
+
 func TestChildStatusReadyIsExactlyOnce(t *testing.T) {
 	t.Parallel()
 	reader, writer, err := os.Pipe()
@@ -37,7 +56,8 @@ func TestChildStatusReadyIsExactlyOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	status := newChildStatus(writer)
+	source := &testChildSource{}
+	status := newChildStatus(writer, source)
 	if err := ReportControlWorkerReady(status); err != nil {
 		t.Fatalf("Ready() error = %v", err)
 	}
@@ -51,6 +71,9 @@ func TestChildStatusReadyIsExactlyOnce(t *testing.T) {
 	if err := CloseControlWorkerChild(status); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
+	if !source.closed {
+		t.Fatal("Close() did not close inherited source")
+	}
 	if err := CloseControlWorkerChild(status); err != nil {
 		t.Fatalf("second Close() error = %v", err)
 	}
@@ -63,7 +86,7 @@ func TestChildStatusCopyCannotDuplicateCapability(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	status := newChildStatus(writer)
+	status := newChildStatus(writer, &testChildSource{})
 	copied := &ChildStatus{
 		file: status.file, state: status.state, seal: status.seal, self: status.self,
 	}
@@ -83,6 +106,53 @@ func TestChildStatusCopyCannotDuplicateCapability(t *testing.T) {
 	if err := CloseControlWorkerChild(status); err != nil {
 		t.Fatalf("original Close() error = %v", err)
 	}
+}
+
+func TestChildStatusReadyAndCloseRaceKeepsOneLifecycle(t *testing.T) {
+	for iteration := range 100 {
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		source := &countingChildSource{}
+		status := newChildStatus(writer, source)
+		results := make(chan error, 2)
+		var wait sync.WaitGroup
+		wait.Add(2)
+		go func() {
+			defer wait.Done()
+			results <- ReportControlWorkerReady(status)
+		}()
+		go func() {
+			defer wait.Done()
+			results <- CloseControlWorkerChild(status)
+		}()
+		wait.Wait()
+		close(results)
+		for result := range results {
+			if result != nil && result != errStatusAlreadyReported {
+				t.Fatalf("iteration %d lifecycle error = %v", iteration, result)
+			}
+		}
+		if got := source.closes.Load(); got != 1 {
+			t.Fatalf("iteration %d source closes = %d, want 1", iteration, got)
+		}
+		_ = reader.Close()
+	}
+}
+
+type testChildSource struct{ closed bool }
+
+func (source *testChildSource) Close() error {
+	source.closed = true
+	return nil
+}
+
+type countingChildSource struct{ closes atomic.Int32 }
+
+func (source *countingChildSource) Close() error {
+	source.closes.Add(1)
+	return nil
 }
 
 func TestSupervisorIsSingleUse(t *testing.T) {

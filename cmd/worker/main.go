@@ -45,6 +45,9 @@ func runWithSupervisor(
 	if ctx == nil {
 		return errInvalidInvocation
 	}
+	if workerprocess.IsControlWorkerSourceLoaderChild(args) {
+		return workerprocess.RunControlWorkerSourceLoaderChild(args)
+	}
 	if workerprocess.IsControlWorkerChild(args) {
 		status, err := workerprocess.AcceptControlWorkerChild(args)
 		if err != nil {

@@ -52,59 +52,75 @@ type processBoundaryScan struct {
 }
 
 var guardedWorkerProcessAPI = map[string]struct{}{
-	"NewControlWorkerSupervisor": {},
-	"IsControlWorkerChild":       {},
-	"AcceptControlWorkerChild":   {},
-	"ReportControlWorkerReady":   {},
-	"ExitControlWorkerFatal":     {},
-	"CloseControlWorkerChild":    {},
+	"NewControlWorkerSupervisor":        {},
+	"IsControlWorkerChild":              {},
+	"AcceptControlWorkerChild":          {},
+	"ReportControlWorkerReady":          {},
+	"ExitControlWorkerFatal":            {},
+	"CloseControlWorkerChild":           {},
+	"IsControlWorkerSourceLoaderChild":  {},
+	"RunControlWorkerSourceLoaderChild": {},
 }
 
 var guardedWorkerProcessInternals = map[string]struct{}{
-	"defaultSupervisorSettings":  {},
-	"newControlWorkerSupervisor": {},
-	"runControlWorkerSupervisor": {},
-	"acceptControlWorkerChild":   {},
-	"newChildStatus":             {},
-	"buildControlWorkerCommand":  {},
-	"startControlWorker":         {},
-	"writeStatusByte":            {},
+	"defaultSupervisorSettings":                   {},
+	"newControlWorkerSupervisor":                  {},
+	"runControlWorkerSupervisor":                  {},
+	"acceptControlWorkerChild":                    {},
+	"newChildStatus":                              {},
+	"buildControlWorkerCommand":                   {},
+	"buildSourceLoaderCommand":                    {},
+	"loadControlWorkerSourceFromCommand":          {},
+	"loadControlWorkerSourceFromCommandUnchecked": {},
+	"startControlWorker":                          {},
+	"writeStatusByte":                             {},
 }
 
 var expectedProcessBoundaryCalls = map[processBoundaryKey]int{
-	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "NewControlWorkerSupervisor"}:                  1,
-	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "IsControlWorkerChild"}:                        1,
-	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "AcceptControlWorkerChild"}:                    1,
-	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "ReportControlWorkerReady"}:           1,
-	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "ExitControlWorkerFatal"}:             1,
-	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "CloseControlWorkerChild"}:            2,
-	{file: "internal/workerprocess/supervisor.go", source: "workerprocess", symbol: "defaultSupervisorSettings"}:     1,
-	{file: "internal/workerprocess/supervisor.go", source: "workerprocess", symbol: "newControlWorkerSupervisor"}:    1,
-	{file: "internal/workerprocess/supervisor.go", source: "workerprocess", symbol: "runControlWorkerSupervisor"}:    1,
-	{file: "internal/workerprocess/protocol.go", source: "workerprocess", symbol: "acceptControlWorkerChild"}:        1,
-	{file: "internal/workerprocess/protocol.go", source: workerProcessImport, symbol: "IsControlWorkerChild"}:        1,
-	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "newChildStatus"}:            1,
-	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "buildControlWorkerCommand"}: 1,
-	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "startControlWorker"}:        1,
-	{file: "internal/workerprocess/protocol.go", source: "workerprocess", symbol: "writeStatusByte"}:                 2,
-	{file: "internal/workerprocess/platform_linux.go", source: "os/exec", symbol: "Command"}:                         1,
+	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "NewControlWorkerSupervisor"}:                                    1,
+	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "IsControlWorkerChild"}:                                          1,
+	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "AcceptControlWorkerChild"}:                                      1,
+	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "IsControlWorkerSourceLoaderChild"}:                              1,
+	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "RunControlWorkerSourceLoaderChild"}:                             1,
+	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "ReportControlWorkerReady"}:                             1,
+	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "ExitControlWorkerFatal"}:                               1,
+	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "CloseControlWorkerChild"}:                              2,
+	{file: "internal/workerprocess/supervisor.go", source: "workerprocess", symbol: "defaultSupervisorSettings"}:                       1,
+	{file: "internal/workerprocess/supervisor.go", source: "workerprocess", symbol: "newControlWorkerSupervisor"}:                      1,
+	{file: "internal/workerprocess/supervisor.go", source: "workerprocess", symbol: "runControlWorkerSupervisor"}:                      1,
+	{file: "internal/workerprocess/protocol.go", source: "workerprocess", symbol: "acceptControlWorkerChild"}:                          1,
+	{file: "internal/workerprocess/protocol.go", source: workerProcessImport, symbol: "IsControlWorkerChild"}:                          1,
+	{file: "internal/workerprocess/protocol.go", source: workerProcessImport, symbol: "IsControlWorkerSourceLoaderChild"}:              1,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "newChildStatus"}:                              1,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "buildControlWorkerCommand"}:                   1,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "buildSourceLoaderCommand"}:                    1,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "loadControlWorkerSourceFromCommand"}:          1,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "loadControlWorkerSourceFromCommandUnchecked"}: 1,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "startControlWorker"}:                          1,
+	{file: "internal/workerprocess/protocol.go", source: "workerprocess", symbol: "writeStatusByte"}:                                   2,
+	{file: "internal/workerprocess/platform_linux.go", source: "os/exec", symbol: "Command"}:                                           2,
 }
 
 var expectedWorkerProcessExports = map[string]int{
-	"type:ControlWorkerSupervisor":       1,
-	"type:ChildStatus":                   1,
-	"func:NewControlWorkerSupervisor":    1,
-	"func:IsControlWorkerChild":          1,
-	"func:AcceptControlWorkerChild":      1,
-	"func:ReportControlWorkerReady":      1,
-	"func:ExitControlWorkerFatal":        1,
-	"func:CloseControlWorkerChild":       1,
-	"method:ControlWorkerSupervisor.Run": 1,
-	"method:boundedDiscard.Write":        1,
+	"type:ControlWorkerSupervisor":           1,
+	"type:ChildStatus":                       1,
+	"func:NewControlWorkerSupervisor":        1,
+	"func:IsControlWorkerChild":              1,
+	"func:AcceptControlWorkerChild":          1,
+	"func:ReportControlWorkerReady":          1,
+	"func:ExitControlWorkerFatal":            1,
+	"func:CloseControlWorkerChild":           1,
+	"func:IsControlWorkerSourceLoaderChild":  1,
+	"func:RunControlWorkerSourceLoaderChild": 1,
+	"method:ControlWorkerSupervisor.Run":     1,
+	"method:boundedDiscard.Write":            1,
 }
 
 var expectedRawExecReferences = map[processBoundaryKey]int{
-	{file: "internal/workerprocess/platform_linux.go", source: "os/exec", symbol: "Cmd"}: 2,
+	{file: "internal/workerbootstrap/handoff_linux.go", source: "os/exec", symbol: "Cmd"}: 2,
+	{file: "internal/workerbootstrap/handoff_other.go", source: "os/exec", symbol: "Cmd"}: 1,
+	{file: "internal/workerprocess/platform_linux.go", source: "os/exec", symbol: "Cmd"}:  12,
+	{file: "internal/workerprocess/supervisor.go", source: "os/exec", symbol: "Cmd"}:      1,
 }
 
 var expectedWorkerProcessSignalReferences = map[processBoundaryKey]int{
@@ -127,7 +143,10 @@ var expectedRawSyscalls = map[rawSyscallBoundaryKey]int{
 }
 
 var rawExecImportAllowlist = map[string]struct{}{
+	"internal/workerbootstrap/handoff_linux.go":       {},
+	"internal/workerbootstrap/handoff_other.go":       {},
 	"internal/workerprocess/platform_linux.go":        {},
+	"internal/workerprocess/supervisor.go":            {},
 	"internal/isolatedexec/platform_linux.go":         {},
 	"internal/isolatedexec/platform_other.go":         {},
 	"internal/isolatedexec/process.go":                {},
@@ -532,7 +551,8 @@ func scanProcessBoundary(repositoryRoot string) (processBoundaryScan, error) {
 		}
 		relative = filepath.ToSlash(relative)
 		inWorkerBoundary := strings.HasPrefix(relative, "cmd/worker/") ||
-			strings.HasPrefix(relative, "internal/workerprocess/")
+			strings.HasPrefix(relative, "internal/workerprocess/") ||
+			strings.HasPrefix(relative, "internal/workerbootstrap/handoff_")
 		parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
 		if err != nil {
 			return err

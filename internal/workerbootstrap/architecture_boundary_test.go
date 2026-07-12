@@ -5,6 +5,8 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -47,6 +49,17 @@ func TestPublicSourceAPIExposesNoPathDescriptorOrContents(t *testing.T) {
 			t.Errorf("PublicSourceSummary field = %s %s", field.Name, field.Type)
 		}
 	}
+	startChild, ok := reflect.TypeOf((*workerbootstrap.PublicSourceCapability)(nil)).MethodByName("StartChild")
+	if !ok || startChild.Type.NumIn() != 3 || startChild.Type.In(1) != reflect.TypeOf((*exec.Cmd)(nil)) ||
+		startChild.Type.In(2) != reflect.TypeOf((*os.File)(nil)) || startChild.Type.NumOut() != 1 ||
+		startChild.Type.Out(0) != reflect.TypeOf((*error)(nil)).Elem() {
+		t.Fatalf("StartChild signature = %#v; want fixed command/status inputs and error only", startChild.Type)
+	}
+	for index := 0; index < startChild.Type.NumIn(); index++ {
+		if startChild.Type.In(index).Kind() == reflect.Func {
+			t.Fatal("StartChild exposes a callback that could retain the public-source descriptor")
+		}
+	}
 }
 
 func TestPublicSourceProductionBoundaryRemainsUnassembledAndNonConfigurable(t *testing.T) {
@@ -59,6 +72,12 @@ func TestPublicSourceProductionBoundaryRemainsUnassembledAndNonConfigurable(t *t
 	exports := make(map[string]int)
 	rootLiteralCount := 0
 	openProductionDeclarations := 0
+	consumerImports := make(map[string]int)
+	consumerReferences := make(map[string]int)
+	consumerCalls := make(map[string]int)
+	handoffReferences := make(map[string]int)
+	handoffCalls := make(map[string]int)
+	bootstrapStartCalls := make(map[string]int)
 	var violations []string
 
 	err := filepath.WalkDir(repositoryRoot, func(path string, entry fs.DirEntry, walkErr error) error {
@@ -83,16 +102,63 @@ func TestPublicSourceProductionBoundaryRemainsUnassembledAndNonConfigurable(t *t
 			return relativeErr
 		}
 		insidePackage := filepath.Dir(relative) == "internal/workerbootstrap"
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			switch typed := node.(type) {
+			case *ast.SelectorExpr:
+				if typed.Sel.Name == "StartChild" {
+					handoffReferences[relative]++
+				}
+			case *ast.CallExpr:
+				selector, ok := typed.Fun.(*ast.SelectorExpr)
+				if ok && selector.Sel.Name == "StartChild" {
+					handoffCalls[relative]++
+				}
+				if insidePackage && ok && selector.Sel.Name == "Start" {
+					bootstrapStartCalls[relative]++
+				}
+			}
+			return true
+		})
+		consumerAlias := ""
 		for _, imported := range parsed.Imports {
 			value, unquoteErr := strconv.Unquote(imported.Path.Value)
 			if unquoteErr != nil {
 				return unquoteErr
 			}
 			if value == workerBootstrapImport && !insidePackage {
-				violations = append(violations, relative+" imports the unassembled worker bootstrap capability")
+				consumerImports[relative]++
+				if imported.Name != nil {
+					violations = append(violations, relative+" aliases the worker bootstrap import")
+				} else {
+					consumerAlias = "workerbootstrap"
+				}
+				if relative != "internal/workerprocess/platform_linux.go" {
+					violations = append(violations, relative+" imports the worker bootstrap outside the reviewed FD4 handoff")
+				}
 			}
 		}
 		if !insidePackage {
+			if consumerAlias != "" {
+				ast.Inspect(parsed, func(node ast.Node) bool {
+					switch typed := node.(type) {
+					case *ast.SelectorExpr:
+						identifier, ok := typed.X.(*ast.Ident)
+						if ok && identifier.Name == consumerAlias {
+							consumerReferences[typed.Sel.Name]++
+						}
+					case *ast.CallExpr:
+						selector, ok := typed.Fun.(*ast.SelectorExpr)
+						if !ok {
+							return true
+						}
+						identifier, ok := selector.X.(*ast.Ident)
+						if ok && identifier.Name == consumerAlias {
+							consumerCalls[selector.Sel.Name]++
+						}
+					}
+					return true
+				})
+			}
 			return nil
 		}
 		ast.Inspect(parsed, func(node ast.Node) bool {
@@ -156,17 +222,35 @@ func TestPublicSourceProductionBoundaryRemainsUnassembledAndNonConfigurable(t *t
 		t.Fatalf("scan production boundary: %v", err)
 	}
 	wantExports := map[string]int{
-		"type:PublicSourceCapability": 1, "type:PublicSourceSummary": 1,
+		"type:PublicSourceCapability": 1, "type:PublicSourceSummary": 1, "type:InheritedSource": 1,
 		"value:ErrBootstrapRejected": 1, "value:PublicSourceSchemaVersion": 1,
-		"func:OpenProductionSource": 2,
-		"method:Summary":            1, "method:Close": 1, "method:String": 1, "method:GoString": 1,
-		"method:Format": 1, "method:MarshalJSON": 1, "method:UnmarshalJSON": 1,
+		"func:OpenProductionSource": 2, "func:AcceptInheritedSource": 2,
+		"func:WriteProductionSourceToLoaderFD": 2, "func:ReceiveProductionSource": 2,
+		"method:Summary": 2, "method:Close": 2, "method:String": 2, "method:GoString": 2,
+		"method:Format": 2, "method:MarshalJSON": 2, "method:UnmarshalJSON": 2,
+		"method:StartChild": 2,
 	}
 	if !reflect.DeepEqual(exports, wantExports) {
 		t.Errorf("workerbootstrap exports = %#v, want %#v", exports, wantExports)
 	}
 	if openProductionDeclarations != 2 || rootLiteralCount != 1 {
 		t.Errorf("OpenProductionSource declarations/root literals = %d/%d, want 2/1", openProductionDeclarations, rootLiteralCount)
+	}
+	if !reflect.DeepEqual(consumerImports, map[string]int{"internal/workerprocess/platform_linux.go": 1}) {
+		t.Errorf("workerbootstrap production consumers = %#v, want only workerprocess FD4 handoff", consumerImports)
+	}
+	wantConsumerCalls := map[string]int{
+		"WriteProductionSourceToLoaderFD": 1, "ReceiveProductionSource": 1, "AcceptInheritedSource": 1,
+	}
+	if !reflect.DeepEqual(consumerCalls, wantConsumerCalls) || !reflect.DeepEqual(consumerReferences, wantConsumerCalls) {
+		t.Errorf("workerbootstrap consumer calls/references = %#v/%#v, want %#v", consumerCalls, consumerReferences, wantConsumerCalls)
+	}
+	wantHandoff := map[string]int{"internal/workerprocess/platform_linux.go": 1}
+	if !reflect.DeepEqual(handoffReferences, wantHandoff) || !reflect.DeepEqual(handoffCalls, wantHandoff) {
+		t.Errorf("public-source StartChild references/calls = %#v/%#v, want the reviewed direct FD4 handoff only", handoffReferences, handoffCalls)
+	}
+	if !reflect.DeepEqual(bootstrapStartCalls, map[string]int{"internal/workerbootstrap/handoff_linux.go": 1}) {
+		t.Errorf("workerbootstrap Start calls = %#v, want only the descriptor-hiding StartChild boundary", bootstrapStartCalls)
 	}
 	for _, violation := range violations {
 		t.Error(violation)

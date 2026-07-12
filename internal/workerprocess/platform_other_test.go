@@ -15,4 +15,7 @@ func TestNonLinuxSupervisorFailsClosed(t *testing.T) {
 	if status, err := AcceptControlWorkerChild([]string{controlWorkerChildArgument}); status != nil || err != errUnsupported {
 		t.Fatalf("AcceptControlWorkerChild() = (%v, %v), want (nil, %v)", status, err, errUnsupported)
 	}
+	if err := RunControlWorkerSourceLoaderChild([]string{controlWorkerLoaderArgument}); err != errUnsupported {
+		t.Fatalf("RunControlWorkerSourceLoaderChild() error = %v, want %v", err, errUnsupported)
+	}
 }

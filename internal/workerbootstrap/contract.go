@@ -31,10 +31,11 @@ type publicCapabilityMarker struct{ value byte }
 var sealedPublicCapabilityMarker = &publicCapabilityMarker{value: 1}
 
 type publicCapabilityState struct {
-	mu      sync.Mutex
-	file    *os.File
-	summary PublicSourceSummary
-	closed  bool
+	mu       sync.Mutex
+	file     *os.File
+	summary  PublicSourceSummary
+	closed   bool
+	transfer bool
 }
 
 // PublicSourceCapability privately owns one read-only, fully sealed memfd. It
@@ -68,7 +69,7 @@ func (capability *PublicSourceCapability) Summary() PublicSourceSummary {
 	}
 	capability.state.mu.Lock()
 	defer capability.state.mu.Unlock()
-	if capability.state.closed || capability.state.file == nil {
+	if capability.state.closed || capability.state.transfer || capability.state.file == nil {
 		return PublicSourceSummary{}
 	}
 	return capability.state.summary
@@ -82,6 +83,9 @@ func (capability *PublicSourceCapability) Close() error {
 	}
 	capability.state.mu.Lock()
 	defer capability.state.mu.Unlock()
+	if capability.state.transfer {
+		return ErrBootstrapRejected
+	}
 	if capability.state.closed {
 		return nil
 	}
@@ -90,6 +94,45 @@ func (capability *PublicSourceCapability) Close() error {
 	capability.state.file = nil
 	capability.state.summary = PublicSourceSummary{}
 	if file == nil || file.Close() != nil {
+		return ErrBootstrapRejected
+	}
+	return nil
+}
+
+func (capability *PublicSourceCapability) startChild(start func(*os.File) error) error {
+	if !capability.structurallyValid() || start == nil {
+		return ErrBootstrapRejected
+	}
+	capability.state.mu.Lock()
+	if capability.state.closed || capability.state.transfer || capability.state.file == nil {
+		capability.state.mu.Unlock()
+		return ErrBootstrapRejected
+	}
+	capability.state.transfer = true
+	file := capability.state.file
+	capability.state.mu.Unlock()
+
+	startErr := invokeChildStart(start, file)
+	closeErr := file.Close()
+	capability.state.mu.Lock()
+	capability.state.file = nil
+	capability.state.summary = PublicSourceSummary{}
+	capability.state.closed = true
+	capability.state.transfer = false
+	capability.state.mu.Unlock()
+	if startErr != nil || closeErr != nil {
+		return ErrBootstrapRejected
+	}
+	return nil
+}
+
+func invokeChildStart(start func(*os.File) error, file *os.File) (returnedErr error) {
+	defer func() {
+		if recover() != nil {
+			returnedErr = ErrBootstrapRejected
+		}
+	}()
+	if start == nil || file == nil || start(file) != nil {
 		return ErrBootstrapRejected
 	}
 	return nil
