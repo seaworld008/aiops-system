@@ -1,6 +1,7 @@
 package readconnector
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -144,11 +146,25 @@ func (registry *Registry) AuthorizeTaskSpec(
 	scope investigation.TaskSpecScope,
 	spec investigation.TaskSpec,
 ) error {
+	_, err := registry.ResolveTaskSpec(ctx, scope, spec)
+	return err
+}
+
+// ResolveTaskSpec is the trusted construction-time counterpart to
+// ResolveExecution. It resolves only a canonical TaskSpec under the exact
+// server-owned scope and never accepts a TargetRef, query, or digest from the
+// caller. The detached result is suitable for a TaskRuntimeBinder.
+func (registry *Registry) ResolveTaskSpec(
+	ctx context.Context,
+	scope investigation.TaskSpecScope,
+	spec investigation.TaskSpec,
+) (ExecutionSpec, error) {
 	if err := contextError(ctx); err != nil {
-		return err
+		return ExecutionSpec{}, err
 	}
-	if registry == nil || !registry.Ready() || scope.Validate() != nil || scope.MappingStatus != domain.MappingExact {
-		return ErrContractRejected
+	if registry == nil || !registry.Ready() || scope.Validate() != nil || scope.MappingStatus != domain.MappingExact ||
+		!canonicalTaskSpec(spec) {
+		return ExecutionSpec{}, ErrContractRejected
 	}
 	item, found := registry.entries[registryKey{
 		tenantID: scope.TenantID, workspaceID: scope.WorkspaceID, environmentID: scope.EnvironmentID,
@@ -156,9 +172,16 @@ func (registry *Registry) AuthorizeTaskSpec(
 	}]
 	if !found || item.scope.ServiceID != "" && item.scope.ServiceID != scope.ServiceID ||
 		validateInput(item, spec.Input) != nil {
-		return ErrContractRejected
+		return ExecutionSpec{}, ErrContractRejected
 	}
-	return contextError(ctx)
+	if err := contextError(ctx); err != nil {
+		return ExecutionSpec{}, err
+	}
+	lookback, err := parseLookback(item, spec.Input)
+	if err != nil {
+		return ExecutionSpec{}, ErrContractRejected
+	}
+	return resolvedExecutionSpec(item, lookback), nil
 }
 
 func (registry *Registry) AuthorizeStart(ctx context.Context, descriptor readtask.Descriptor) error {
@@ -215,6 +238,10 @@ func (registry *Registry) ResolveExecution(descriptor readtask.Descriptor) (Exec
 	if err != nil {
 		return ExecutionSpec{}, readtask.ErrIntegrity
 	}
+	return resolvedExecutionSpec(item, lookback), nil
+}
+
+func resolvedExecutionSpec(item entry, lookback time.Duration) ExecutionSpec {
 	resolved := ExecutionSpec{
 		kind: item.kind, operation: item.operation, targetRef: item.targetRef,
 		contractDigest: item.contractDigest, lookback: lookback,
@@ -230,7 +257,7 @@ func (registry *Registry) ResolveExecution(descriptor readtask.Descriptor) (Exec
 			query: item.victoria.Query, fields: append([]FieldSpec(nil), item.victoria.Fields...), limit: item.victoria.Limit,
 		}
 	}
-	return resolved, nil
+	return resolved
 }
 
 func (registry *Registry) lookupDescriptor(descriptor readtask.Descriptor) (entry, bool) {
@@ -335,7 +362,21 @@ func contextError(ctx context.Context) error {
 	if ctx == nil {
 		return ErrContractRejected
 	}
+	value := reflect.ValueOf(ctx)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		if value.IsNil() {
+			return ErrContractRejected
+		}
+	}
 	return ctx.Err()
+}
+
+func canonicalTaskSpec(spec investigation.TaskSpec) bool {
+	canonical, _, err := investigation.CanonicalTaskSpecs([]investigation.TaskSpec{spec})
+	return err == nil && len(canonical) == 1 && canonical[0].Key == spec.Key &&
+		canonical[0].ConnectorID == spec.ConnectorID && canonical[0].Operation == spec.Operation &&
+		bytes.Equal(canonical[0].Input, spec.Input)
 }
 
 func registryDigest(entries []entry) (string, error) {

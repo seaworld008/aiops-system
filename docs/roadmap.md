@@ -9,10 +9,10 @@ This roadmap is deliberately gate-driven. Calendar progress never enables produc
 | Repository and domain foundation | Implemented | Keep migrations and domain contracts backward compatible |
 | Scoped signal ingestion | Implemented foundation | Validate against real Alertmanager and Nightingale endpoints |
 | Read-only connectors | Implemented foundation | Run contract and failure tests against pilot environments |
-| Investigation and model routing | Persistent runtime, authenticated READ Task Gateway, immutable connector/plan admission, and unassembled Temporal preparation runtime implemented; claims remain closed | Complete target manifest/fixed READ executor gates, then atomically assemble Outbox dispatch and build a replay set of at least 100 historical incidents |
+| Investigation and model routing | Persistent runtime, authenticated READ Task Gateway, immutable connector/plan/target admission, fixed executor profile, and unassembled Temporal preparation runtime implemented; claims remain closed | Prove the fixed READ HTTP executor contract, then atomically assemble Outbox dispatch and build a replay set of at least 100 historical incidents |
 | Identity, RBAC, policy, and signed plans | Implemented foundation | Complete real Keycloak/Vault integration and adversarial tests |
 | Fenced action execution | Secure queue, durable revocation, mTLS Gateway, split Runner images, and killable Executor foundation implemented | Add only fixed non-production adapters after external sandbox/network gates |
-| Temporal orchestration | Digest-bound investigation preparation Workflow/Activity implemented but not process-assembled | Complete target-manifest gate, live Outbox assembly, full evidence/model workflow, and approval/execution workflows |
+| Temporal orchestration | Digest-bound investigation preparation Workflow/Activity implemented but not process-assembled | Complete fixed READ executor validation, live Outbox assembly, full evidence/model workflow, and approval/execution workflows |
 | Web console and Feishu | Planned | Investigation, approval, execution, and audit user journeys |
 | Production pilot | Blocked by gates | Non-production drills plus formal Go/No-Go review |
 

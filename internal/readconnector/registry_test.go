@@ -432,6 +432,64 @@ func TestRegistrySupportsConcurrentReadOnlyAuthorization(t *testing.T) {
 	}
 }
 
+func TestRegistryResolvesCanonicalTaskSpecForTrustedRuntimeBinder(t *testing.T) {
+	registry := mustRegistry(t)
+	scope := validTaskScope()
+	spec := investigation.TaskSpec{
+		Key: "metrics", ConnectorID: prometheusID,
+		Operation: readconnector.OperationPrometheusRangeQuery,
+		Input:     json.RawMessage(`{"lookback_minutes":15}`),
+	}
+
+	resolved, err := registry.ResolveTaskSpec(context.Background(), scope, spec)
+	if err != nil || resolved.Kind() != readconnector.KindPrometheus ||
+		resolved.Operation() != readconnector.OperationPrometheusRangeQuery ||
+		resolved.TargetRef() != prometheusTargetRef ||
+		resolved.ContractDigest() != prometheusID[len(prometheusID)-64:] ||
+		resolved.Lookback() != 15*time.Minute {
+		t.Fatalf("ResolveTaskSpec() = %#v, %v", resolved, err)
+	}
+
+	wrongScope := scope
+	wrongScope.EnvironmentID = "30000000-0000-4000-8000-000000000099"
+	if result, err := registry.ResolveTaskSpec(context.Background(), wrongScope, spec); result.Kind() != "" ||
+		!errors.Is(err, readconnector.ErrContractRejected) {
+		t.Fatalf("ResolveTaskSpec(wrong scope) = %#v, %v", result, err)
+	}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if result, err := registry.ResolveTaskSpec(cancelled, scope, spec); result.Kind() != "" ||
+		!errors.Is(err, context.Canceled) {
+		t.Fatalf("ResolveTaskSpec(cancelled) = %#v, %v", result, err)
+	}
+
+	var typedNil *nilSafeContext
+	if result, err := registry.ResolveTaskSpec(typedNil, scope, spec); result.Kind() != "" ||
+		!errors.Is(err, readconnector.ErrContractRejected) {
+		t.Fatalf("ResolveTaskSpec(typed nil context) = %#v, %v", result, err)
+	}
+	if err := registry.AuthorizeTaskSpec(typedNil, scope, spec); !errors.Is(err, readconnector.ErrContractRejected) {
+		t.Fatalf("AuthorizeTaskSpec(typed nil context) error = %v", err)
+	}
+
+	for name, invalid := range map[string]investigation.TaskSpec{
+		"non canonical input": mutateSpec(spec, func(value *investigation.TaskSpec) {
+			value.Input = json.RawMessage(`{ "lookback_minutes": 15 }`)
+		}),
+		"invalid key": mutateSpec(spec, func(value *investigation.TaskSpec) {
+			value.Key = "Metrics"
+		}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if result, err := registry.ResolveTaskSpec(context.Background(), scope, invalid); result.Kind() != "" ||
+				!errors.Is(err, readconnector.ErrContractRejected) {
+				t.Fatalf("ResolveTaskSpec(%s) = %#v, %v", name, result, err)
+			}
+		})
+	}
+}
+
 func unboundDefinitions() []readconnector.Definition {
 	return []readconnector.Definition{
 		{
@@ -567,3 +625,10 @@ func mutateSpec(source investigation.TaskSpec, mutate func(*investigation.TaskSp
 	mutate(&source)
 	return source
 }
+
+type nilSafeContext struct{}
+
+func (*nilSafeContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (*nilSafeContext) Done() <-chan struct{}       { return nil }
+func (*nilSafeContext) Err() error                  { return nil }
+func (*nilSafeContext) Value(any) any               { return nil }
