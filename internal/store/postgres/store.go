@@ -239,7 +239,6 @@ func (repository *Store) ClaimOutbox(ctx context.Context, request store.ClaimOut
 	if err := request.Validate(); err != nil {
 		return nil, err
 	}
-	claimToken := ids.NewUUID()
 	rows, err := repository.database.Query(ctx, `
 		WITH candidates AS (
 			SELECT id
@@ -253,8 +252,8 @@ func (repository *Store) ClaimOutbox(ctx context.Context, request store.ClaimOut
 			LIMIT $2
 		)
 		UPDATE outbox_events AS event
-		SET claimed_at = statement_timestamp(), claimed_by = $3, claim_token = $4,
-			claim_expires_at = statement_timestamp() + make_interval(secs => $5::double precision),
+		SET claimed_at = statement_timestamp(), claimed_by = $3, claim_token = gen_random_uuid(),
+			claim_expires_at = statement_timestamp() + make_interval(secs => $4::double precision),
 			attempts = event.attempts + 1
 		FROM candidates
 		WHERE event.id = candidates.id
@@ -263,7 +262,7 @@ func (repository *Store) ClaimOutbox(ctx context.Context, request store.ClaimOut
 			event.event_type, event.payload, event.created_at, event.available_at,
 			event.claimed_at, event.claimed_by, event.claim_token::text,
 			event.claim_expires_at, event.attempts, COALESCE(event.last_error_code, '')
-	`, request.EventType, request.Limit, request.ConsumerID, claimToken, request.Lease.Seconds())
+	`, request.EventType, request.Limit, request.ConsumerID, request.Lease.Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("claim outbox events: %w", err)
 	}

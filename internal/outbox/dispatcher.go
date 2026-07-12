@@ -103,17 +103,22 @@ func (dispatcher *SignalDispatcher) RunOnce(ctx context.Context) (Result, error)
 		return Result{}, fmt.Errorf("claim signal outbox batch: %w", err)
 	}
 	result := Result{Claimed: len(events)}
+	var poisonErr error
 	for _, event := range events {
 		start, validationErr := newSignalWorkflowStart(event)
 		if validationErr != nil {
-			return result, ErrInvalidSignalOutboxEvent
+			poisonErr = ErrInvalidSignalOutboxEvent
+			continue
 		}
 		outcome, startErr := dispatcher.starter.Start(ctx, start)
 		if startErr != nil {
 			failureCode := "workflow_start_failed"
 			var coded interface{ FailureCode() string }
-			if errors.As(startErr, &coded) && store.ValidFailureCode(coded.FailureCode()) {
-				failureCode = coded.FailureCode()
+			if errors.As(startErr, &coded) {
+				candidate := coded.FailureCode()
+				if store.ValidFailureCode(candidate) {
+					failureCode = candidate
+				}
 			}
 			if err := dispatcher.retry(ctx, event, failureCode); err != nil {
 				return result, err
@@ -140,7 +145,7 @@ func (dispatcher *SignalDispatcher) RunOnce(ctx context.Context) (Result, error)
 			result.Retried++
 		}
 	}
-	return result, nil
+	return result, poisonErr
 }
 
 func (dispatcher *SignalDispatcher) retry(ctx context.Context, event domain.OutboxEvent, failureCode string) error {

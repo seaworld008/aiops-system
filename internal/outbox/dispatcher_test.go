@@ -164,6 +164,22 @@ func TestSignalDispatcherRetriesStartErrorWithSanitizedBoundedBackoff(t *testing
 	}
 }
 
+func TestSignalDispatcherValidatesExactlyTheFailureCodeItPersists(t *testing.T) {
+	event := validSignalEvent()
+	repository := &fakeOutboxRepository{batches: [][]domain.OutboxEvent{{event}}}
+	failure := &changingFailureCodeError{}
+	starter := &fakeSignalStarter{errs: []error{failure}}
+	dispatcher := newTestDispatcher(t, repository, starter, event.ClaimedAt, 1)
+
+	result, err := dispatcher.RunOnce(context.Background())
+	if err != nil || result.Retried != 1 || repository.retryCalls != 1 {
+		t.Fatalf("RunOnce() = (%#v, %v), retries=%d", result, err, repository.retryCalls)
+	}
+	if failure.calls != 1 || repository.failureCodes[0] != "temporal_unavailable" {
+		t.Fatalf("FailureCode() calls/code = %d/%q, want 1/temporal_unavailable", failure.calls, repository.failureCodes[0])
+	}
+}
+
 func TestSignalDispatcherRejectsPoisonEventsWithoutStartingAcknowledgingOrRetrying(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -210,6 +226,28 @@ func TestSignalDispatcherRejectsPoisonEventsWithoutStartingAcknowledgingOrRetryi
 				t.Fatalf("poison error leaked payload/token: %v", err)
 			}
 		})
+	}
+}
+
+func TestSignalDispatcherRetainsPoisonWithoutStarvingValidClaimedEvents(t *testing.T) {
+	poison := validSignalEvent()
+	poison.Payload = json.RawMessage(`{"signal_id":"not-a-uuid"}`)
+	valid := validSignalEvent()
+	valid.ID = "77777777-7777-4777-8777-777777777777"
+	valid.ClaimToken = "88888888-8888-4888-8888-888888888888"
+	repository := &fakeOutboxRepository{batches: [][]domain.OutboxEvent{{poison, valid}}}
+	starter := &fakeSignalStarter{}
+	dispatcher := newTestDispatcher(t, repository, starter, poison.ClaimedAt, 2)
+
+	result, err := dispatcher.RunOnce(context.Background())
+	if !errors.Is(err, outbox.ErrInvalidSignalOutboxEvent) {
+		t.Fatalf("RunOnce() error = %v, want retained poison error", err)
+	}
+	if result.Claimed != 2 || result.Started != 1 || len(starter.starts) != 1 {
+		t.Fatalf("RunOnce() = (%#v, %v), starts=%#v", result, err, starter.starts)
+	}
+	if starter.starts[0].OutboxEventID != valid.ID || repository.ackCalls != 1 || repository.retryCalls != 0 {
+		t.Fatalf("valid event progress = start:%#v ack:%d retry:%d", starter.starts, repository.ackCalls, repository.retryCalls)
 	}
 }
 
@@ -314,6 +352,22 @@ type fakeSignalStarter struct {
 	outcomes []outbox.StartOutcome
 	errs     []error
 	starts   []outbox.SignalWorkflowStart
+}
+
+type changingFailureCodeError struct {
+	calls int
+}
+
+func (failure *changingFailureCodeError) Error() string {
+	return secretCanary
+}
+
+func (failure *changingFailureCodeError) FailureCode() string {
+	failure.calls++
+	if failure.calls == 1 {
+		return "temporal_unavailable"
+	}
+	return secretCanary
 }
 
 func (starter *fakeSignalStarter) Start(

@@ -344,6 +344,16 @@ func exerciseRealOutboxEventRouting(
 	if err != nil || len(credentials) != 3 {
 		t.Fatalf("real independent credential ClaimOutbox() = (%#v, %v)", credentials, err)
 	}
+	credentialTokens := make(map[string]struct{}, len(credentials))
+	for _, event := range credentials {
+		if event.ClaimToken == "" {
+			t.Fatal("real credential ClaimOutbox() returned an empty per-event fence")
+		}
+		credentialTokens[event.ClaimToken] = struct{}{}
+	}
+	if len(credentialTokens) != len(credentials) {
+		t.Fatalf("real credential ClaimOutbox() reused a batch fence: %#v", credentials)
+	}
 	if err := repository.AckOutbox(ctx, signals[0].ID, "incident.created.v1", signals[0].ClaimToken); !errors.Is(err, store.ErrStaleClaim) {
 		t.Fatalf("real AckOutbox(wrong type) error = %v", err)
 	}

@@ -231,7 +231,7 @@ func TestCreateIncidentRollsBackWhenOutboxInsertFails(t *testing.T) {
 	}
 }
 
-func TestOutboxClaimReturnsFencingTokenAndAckUsesIt(t *testing.T) {
+func TestOutboxClaimReturnsIndependentFencingTokensAndAckUsesThem(t *testing.T) {
 	database, err := pgxmock.NewPool()
 	if err != nil {
 		t.Fatalf("NewPool() error = %v", err)
@@ -239,8 +239,8 @@ func TestOutboxClaimReturnsFencingTokenAndAckUsesIt(t *testing.T) {
 	defer database.Close()
 	now := time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)
 	payload, _ := json.Marshal(map[string]string{"incident_id": incidentID})
-	database.ExpectQuery(`(?s)WITH candidates AS \(.*WHERE event_type = \$1.*ORDER BY available_at, created_at, id.*FOR UPDATE SKIP LOCKED.*LIMIT \$2`).
-		WithArgs("incident.created.v1", 1, "dispatcher-1", pgxmock.AnyArg(), float64(60)).
+	database.ExpectQuery(`(?s)WITH candidates AS \(.*WHERE event_type = \$1.*ORDER BY available_at, created_at, id.*FOR UPDATE SKIP LOCKED.*LIMIT \$2.*claim_token = gen_random_uuid\(\)`).
+		WithArgs("incident.created.v1", 2, "dispatcher-1", float64(60)).
 		WillReturnRows(pgxmock.NewRows([]string{
 			"id", "tenant_id", "workspace_id", "aggregate_type", "aggregate_id", "aggregate_version",
 			"event_type", "payload", "created_at", "available_at", "claimed_at", "claimed_by",
@@ -249,20 +249,30 @@ func TestOutboxClaimReturnsFencingTokenAndAckUsesIt(t *testing.T) {
 			"66666666-6666-4666-8666-666666666666", tenantID, workspaceID, "INCIDENT", incidentID, int64(1),
 			"incident.created.v1", payload, now, now, now, "dispatcher-1",
 			"77777777-7777-4777-8777-777777777777", now.Add(time.Minute), 1, "",
+		).AddRow(
+			"88888888-8888-4888-8888-888888888888", tenantID, workspaceID, "INCIDENT", incidentID, int64(1),
+			"incident.created.v1", payload, now, now, now, "dispatcher-1",
+			"99999999-9999-4999-8999-999999999999", now.Add(time.Minute), 1, "",
 		))
 	database.ExpectExec("UPDATE outbox_events").
 		WithArgs("66666666-6666-4666-8666-666666666666", "incident.created.v1", "77777777-7777-4777-8777-777777777777").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	database.ExpectExec("UPDATE outbox_events").
+		WithArgs("88888888-8888-4888-8888-888888888888", "incident.created.v1", "99999999-9999-4999-8999-999999999999").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 
 	repository := postgresstore.New(database)
 	events, err := repository.ClaimOutbox(context.Background(), store.ClaimOutboxRequest{
-		EventType: "incident.created.v1", ConsumerID: "dispatcher-1", Limit: 1, Lease: time.Minute,
+		EventType: "incident.created.v1", ConsumerID: "dispatcher-1", Limit: 2, Lease: time.Minute,
 	})
-	if err != nil || len(events) != 1 || events[0].ClaimToken == "" || events[0].ClaimedBy != "dispatcher-1" {
+	if err != nil || len(events) != 2 || events[0].ClaimToken == "" || events[1].ClaimToken == "" ||
+		events[0].ClaimToken == events[1].ClaimToken || events[0].ClaimedBy != "dispatcher-1" {
 		t.Fatalf("ClaimOutbox() = (%#v, %v)", events, err)
 	}
-	if err := repository.AckOutbox(context.Background(), events[0].ID, "incident.created.v1", events[0].ClaimToken); err != nil {
-		t.Fatalf("AckOutbox() error = %v", err)
+	for _, event := range events {
+		if err := repository.AckOutbox(context.Background(), event.ID, "incident.created.v1", event.ClaimToken); err != nil {
+			t.Fatalf("AckOutbox(%s) error = %v", event.ID, err)
+		}
 	}
 	if err := database.ExpectationsWereMet(); err != nil {
 		t.Fatalf("database expectations: %v", err)
@@ -315,7 +325,7 @@ func TestOutboxClaimFailsClosedWhenReturnedTypeDoesNotMatch(t *testing.T) {
 	now := time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)
 	const canary = "payload-token-canary"
 	database.ExpectQuery("WITH candidates").
-		WithArgs("signal.ingested.v1", 1, "dispatcher-1", pgxmock.AnyArg(), float64(60)).
+		WithArgs("signal.ingested.v1", 1, "dispatcher-1", float64(60)).
 		WillReturnRows(pgxmock.NewRows([]string{
 			"id", "tenant_id", "workspace_id", "aggregate_type", "aggregate_id", "aggregate_version",
 			"event_type", "payload", "created_at", "available_at", "claimed_at", "claimed_by",
