@@ -28,13 +28,14 @@ import (
 )
 
 const (
-	defaultResponseLimit  = int64(64 << 10)
-	claimResponseLimit    = int64(256 << 10)
-	requestTimeout        = 30 * time.Second
-	maximumLeaseLifetime  = 30 * time.Second
-	protocolClockSkew     = time.Second
-	heartbeatInterval     = 10 * time.Second
-	minimumLeaseRemaining = 2 * heartbeatInterval
+	defaultResponseLimit        = int64(64 << 10)
+	claimResponseLimit          = int64(256 << 10)
+	requestTimeout              = 30 * time.Second
+	maximumLeaseLifetime        = 30 * time.Second
+	protocolClockSkew           = time.Second
+	heartbeatInterval           = 10 * time.Second
+	minimumLeaseRemaining       = 2 * heartbeatInterval
+	minimumCertificateRemaining = requestTimeout + minimumLeaseRemaining + protocolClockSkew
 )
 
 var (
@@ -55,12 +56,18 @@ type problemWire struct {
 	Instance string `json:"instance"`
 }
 
+type clientSeal struct{ value byte }
+
+var trustedClientSeal = &clientSeal{value: 1}
+
 type Client struct {
 	baseURL             url.URL
 	httpClient          *http.Client
 	runnerInstance      string
 	certificateSHA256   string
 	certificateNotAfter time.Time
+	seal                *clientSeal
+	self                *Client
 }
 
 func (Client) String() string   { return "ReadRunnerGatewayClient{Security:[REDACTED]}" }
@@ -120,15 +127,46 @@ func New(options Options) (*Client, error) {
 		DisableCompression: true,
 		TLSNextProto:       make(map[string]func(string, *tls.Conn) http.RoundTripper),
 	}
-	return &Client{
+	createdClient := &Client{
 		baseURL: *baseURL,
 		httpClient: &http.Client{
 			Transport: transport, Timeout: requestTimeout,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return ErrRedirectRejected },
 		},
 		runnerInstance: instance, certificateSHA256: hex.EncodeToString(digest[:]),
-		certificateNotAfter: leaf.NotAfter.UTC(),
-	}, nil
+		certificateNotAfter: leaf.NotAfter.UTC(), seal: trustedClientSeal,
+	}
+	createdClient.self = createdClient
+	if !createdClient.Ready() {
+		createdClient.CloseIdleConnections()
+		return nil, ErrInvalidConfiguration
+	}
+	return createdClient, nil
+}
+
+// Ready reports whether this is the exact sealed client returned by New and
+// its READ mTLS certificate has enough lifetime to claim a new usable lease.
+// It exposes no transport, path, certificate, or Runner identity material.
+func (client *Client) Ready() bool {
+	return client.readyWithMinimumCertificateLifetime(minimumCertificateRemaining)
+}
+
+// usableForExistingLease keeps an already-issued lease able to Start,
+// Heartbeat, Release, or Complete until either its local fence or the client
+// certificate actually expires. It deliberately does not authorize Claim.
+func (client *Client) usableForExistingLease() bool {
+	return client.readyWithMinimumCertificateLifetime(0)
+}
+
+func (client *Client) readyWithMinimumCertificateLifetime(minimum time.Duration) bool {
+	if minimum < 0 {
+		return false
+	}
+	now := time.Now().UTC()
+	return client != nil && client.self == client && client.seal == trustedClientSeal && client.httpClient != nil &&
+		client.baseURL.Scheme == "https" && client.baseURL.Host != "" && runnerInstancePattern.MatchString(client.runnerInstance) &&
+		hashPattern.MatchString(client.certificateSHA256) && client.certificateNotAfter.Location() == time.UTC &&
+		now.Add(minimum).Before(client.certificateNotAfter)
 }
 
 func (client *Client) CloseIdleConnections() {
@@ -138,7 +176,7 @@ func (client *Client) CloseIdleConnections() {
 }
 
 func (client *Client) newRequest(ctx context.Context, method, path string, body []byte) (*http.Request, error) {
-	if client == nil || client.httpClient == nil || ctx == nil || !strings.HasPrefix(path, "/runner/v1/read-tasks/") ||
+	if !client.usableForExistingLease() || ctx == nil || !strings.HasPrefix(path, "/runner/v1/read-tasks/") ||
 		strings.ContainsAny(path, "?#%") || len(body) == 0 || int64(len(body)) > defaultResponseLimit {
 		return nil, ErrInvalidConfiguration
 	}

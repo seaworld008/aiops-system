@@ -9,10 +9,10 @@ This roadmap is deliberately gate-driven. Calendar progress never enables produc
 | Repository and domain foundation | Implemented | Keep migrations and domain contracts backward compatible |
 | Scoped signal ingestion | Implemented foundation | Validate against real Alertmanager and Nightingale endpoints |
 | Read-only connectors | Implemented foundation | Run contract and failure tests against pilot environments |
-| Investigation and model routing | Persistent runtime, authenticated READ Task Gateway, atomic runtime Bundle, independent READ-only client and fixed READ HTTP executor implemented but not process-assembled; a sealed Admission blocks both new claims and legacy lease progression | Complete Temporal v2 in M5C2-4b, atomically assemble Runner/Worker/Gateway/Outbox and local E2E in M5C2-4c, then pass external identity/network gates and build a replay set of at least 100 historical incidents |
+| Investigation and model routing | Persistent runtime, authenticated READ Task Gateway, atomic runtime Bundle, independent READ-only client, fixed READ HTTP executor, recovery-first Temporal v2 and READ Runner Activity implemented but not process-assembled; a sealed Admission blocks both new claims and legacy lease progression | Atomically assemble Runner/Worker/Gateway/Outbox and local E2E in M5C2-4c, then pass external identity/network gates and build a replay set of at least 100 historical incidents |
 | Identity, RBAC, policy, and signed plans | Implemented foundation | Complete real Keycloak/Vault integration and adversarial tests |
 | Fenced action execution | Secure queue, durable revocation, mTLS Gateway, split Runner images, and killable Executor foundation implemented | Add only fixed non-production adapters after external sandbox/network gates |
-| Temporal orchestration | Digest-bound investigation preparation and DB-only result recovery implemented but not process-assembled | Add the versioned READ runtime workflow, then complete live Outbox/Worker/Runner/Gateway assembly, full evidence/model workflow, and approval/execution workflows |
+| Temporal orchestration | Digest/Bundle-bound READ runtime v2, DB-only result recovery, strict History allowlist and runner-only Activity implemented but not process-assembled | Complete live Outbox/Worker/Runner/Gateway assembly, then the evidence/model workflow and approval/execution workflows |
 | Web console and Feishu | Planned | Investigation, approval, execution, and audit user journeys |
 | Production pilot | Blocked by gates | Non-production drills plus formal Go/No-Go review |
 

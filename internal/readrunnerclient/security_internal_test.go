@@ -2,6 +2,7 @@ package readrunnerclient
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -70,6 +71,41 @@ func TestStartResponseAndCapabilityFailClosedAfterLocalLeaseExpiry(t *testing.T)
 	if capability.TaskID() != "" || capability.LeaseEpoch() != 0 || capability.ScopeRevision() != 0 ||
 		!capability.StartedAt().IsZero() {
 		t.Fatal("near-expiry StartCapability retained usable accessors")
+	}
+}
+
+func TestDedicatedClientReadinessRequiresEnoughCertificateLifetimeForAUsableClaim(t *testing.T) {
+	now := time.Now().UTC()
+	client := &Client{
+		baseURL:             url.URL{Scheme: "https", Host: "gateway-expired.invalid:8443"},
+		httpClient:          &http.Client{},
+		runnerInstance:      "runner-expired",
+		certificateSHA256:   strings.Repeat("a", 64),
+		certificateNotAfter: now.Add(-time.Microsecond),
+		seal:                trustedClientSeal,
+	}
+	client.self = client
+	if client.Ready() {
+		t.Fatal("Client with an expired READ certificate reported ready")
+	}
+	client.certificateNotAfter = now.Add(minimumCertificateRemaining)
+	if client.Ready() {
+		t.Fatal("Client without enough certificate lifetime for a usable claim reported ready")
+	}
+	if !client.usableForExistingLease() {
+		t.Fatal("Client with a current certificate could not finish an existing lease")
+	}
+	request, err := client.newRequest(
+		context.Background(), http.MethodPost,
+		"/runner/v1/read-tasks/70000000-0000-4000-8000-000000000007:release", []byte(`{}`),
+	)
+	if err != nil {
+		t.Fatalf("existing lease request with a current certificate error = %v", err)
+	}
+	_ = request.Body.Close()
+	client.certificateNotAfter = now.Add(minimumCertificateRemaining + time.Second)
+	if !client.Ready() {
+		t.Fatal("Client with sufficient certificate lifetime did not report ready")
 	}
 }
 

@@ -172,8 +172,8 @@ claim/assembly，因此当前回滚不需要迁移或数据修复。
 ## 后续 Go/No-Go 门禁
 
 C2-4a 的本地 TLS、Bundle 与负向测试只证明代码契约，不等价于企业 PKI、真实数据源、Vault role、
-ServiceAccount、NetworkPolicy 或 egress enforcement 验收。C2-4b/4c 才负责 Temporal v2 与原子装配配置、READ Runner、
-Worker、Gateway callbacks 与 Outbox dispatcher；还必须核验 component/profile digest 一致、PKI
+ServiceAccount、NetworkPolicy 或 egress enforcement 验收。C2-4b 已完成未装配的 Temporal v2 与 READ Runner
+Activity；C2-4c 才负责原子装配配置、Worker、Gateway callbacks 与 Outbox dispatcher；还必须核验 component/profile digest 一致、PKI
 轮换、Temporal replay、身份/网络边界、真实源侧脱敏/DLP 和本地 Signal→Evidence 端到端证据。
 原文污染检查不能检测主动分片或再编码的 secret，不能替代源侧控制。即使完成装配，也只有
 全部 Go/No-Go 证据通过后才能另行考虑 READ claims；任一门禁缺失时 claims 保持关闭。

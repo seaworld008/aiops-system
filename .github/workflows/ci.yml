@@ -126,8 +126,8 @@ jobs:
           done
           cat "${RUNNER_TEMP}/temporal-server.log" >&2
           exit 1
-      - name: Run Temporal preparation, recovery, history and replay contracts
-        run: go test -race -shuffle=on -count=1 ./internal/investigationworkflow -run '^TestTemporalDevServer'
+      - name: Run Temporal orchestration, READ Activity, history and replay contracts
+        run: go test -race -shuffle=on -count=1 ./internal/investigationworkflow ./internal/readrunneractivity -run '^TestTemporalDevServer'
       - name: Stop Temporal dev server
         if: always()
         shell: bash

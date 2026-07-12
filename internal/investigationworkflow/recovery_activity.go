@@ -43,7 +43,7 @@ type RecoveryActivityInput struct {
 }
 
 func (input *RecoveryActivityInput) UnmarshalJSON(data []byte) error {
-	if input == nil {
+	if input == nil || len(data) == 0 || len(data) > maximumHistoryDTOBytes {
 		return ErrInvalidRecoveryInput
 	}
 	var decoded RecoveryActivityInput
@@ -100,7 +100,7 @@ type RecoveryActivityOutput struct {
 }
 
 func (output *RecoveryActivityOutput) UnmarshalJSON(data []byte) error {
-	if output == nil {
+	if output == nil || len(data) == 0 || len(data) > maximumHistoryDTOBytes {
 		return ErrInvalidRecoveryResult
 	}
 	var decoded RecoveryActivityOutput
