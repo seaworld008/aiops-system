@@ -3,7 +3,9 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,8 +82,15 @@ func TestCreateInvestigationAtomicallyPersistsTasksTransitionAndLedger(t *testin
 	database, repository := newWriteMockRepository(
 		t,
 		[]string{writeMockInvestigationID, writeMockTaskID},
-		func(context.Context, string, investigation.TaskSpec) error {
+		func(_ context.Context, scope investigation.TaskSpecScope, _ investigation.TaskSpec) error {
 			authorizerCalls++
+			if scope != (investigation.TaskSpecScope{
+				TenantID: writeMockTenantID, WorkspaceID: writeMockWorkspaceID,
+				EnvironmentID: writeMockEnvironmentID, ServiceID: writeMockServiceID,
+				MappingStatus: domain.MappingExact,
+			}) {
+				return fmt.Errorf("unexpected trusted scope")
+			}
 			return nil
 		},
 	)
@@ -161,7 +170,7 @@ func TestCreateInvestigationDurableReplayBypassesMutableAuthorizer(t *testing.T)
 	database, repository := newWriteMockRepository(
 		t,
 		nil,
-		func(context.Context, string, investigation.TaskSpec) error {
+		func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error {
 			authorizerCalls++
 			return fmt.Errorf("revoked")
 		},
@@ -200,6 +209,81 @@ func TestCreateInvestigationDurableReplayBypassesMutableAuthorizer(t *testing.T)
 	assertWriteMockExpectations(t, database)
 }
 
+func TestCreateInvestigationRejectsWrongEnvironmentInsideLockedTransaction(t *testing.T) {
+	authorizerCalls := 0
+	database, repository := newWriteMockRepository(t, nil, func(_ context.Context, scope investigation.TaskSpecScope, _ investigation.TaskSpec) error {
+		authorizerCalls++
+		if scope != (investigation.TaskSpecScope{
+			TenantID: writeMockTenantID, WorkspaceID: writeMockWorkspaceID,
+			EnvironmentID: writeMockEnvironmentID, ServiceID: writeMockServiceID,
+			MappingStatus: domain.MappingExact,
+		}) {
+			return fmt.Errorf("unexpected-scope-canary")
+		}
+		return fmt.Errorf("wrong-environment-canary")
+	})
+	now := time.Date(2026, 7, 12, 10, 10, 0, 0, time.UTC)
+	request := writeMockCreateRequest()
+	expectWriteMockCreateAdmission(database, request, writeMockIncidentRows(now))
+
+	_, err := repository.CreateOrGetInvestigation(context.Background(), request)
+	if !errors.Is(err, investigation.ErrInvalidRequest) {
+		t.Fatalf("CreateOrGetInvestigation(wrong environment) error = %v, want ErrInvalidRequest", err)
+	}
+	if strings.Contains(fmt.Sprint(err), "canary") {
+		t.Fatalf("CreateOrGetInvestigation(wrong environment) leaked authorizer detail: %v", err)
+	}
+	if authorizerCalls != 1 {
+		t.Fatalf("authorizer calls = %d, want 1", authorizerCalls)
+	}
+	assertWriteMockExpectations(t, database)
+}
+
+func TestCreateInvestigationRejectsUnresolvedIncidentBeforeAuthorizerOrWrites(t *testing.T) {
+	authorizerCalls := 0
+	database, repository := newWriteMockRepository(t, nil, func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error {
+		authorizerCalls++
+		return nil
+	})
+	now := time.Date(2026, 7, 12, 10, 20, 0, 0, time.UTC)
+	request := writeMockCreateRequest()
+	expectWriteMockCreateAdmission(database, request, writeMockIncidentRowsForScope(now, nil, nil, domain.MappingUnresolved))
+
+	_, err := repository.CreateOrGetInvestigation(context.Background(), request)
+	if !errors.Is(err, investigation.ErrInvalidRequest) {
+		t.Fatalf("CreateOrGetInvestigation(unresolved) error = %v, want ErrInvalidRequest", err)
+	}
+	if authorizerCalls != 0 {
+		t.Fatalf("authorizer calls = %d, want 0 for unresolved scope", authorizerCalls)
+	}
+	assertWriteMockExpectations(t, database)
+}
+
+func expectWriteMockCreateAdmission(
+	database pgxmock.PgxPoolIface,
+	request investigation.CreateOrGetInvestigationRequest,
+	incidentRows *pgxmock.Rows,
+) {
+	database.ExpectBegin()
+	expectWriteMockWorkspace(database)
+	expectWriteMockIdempotencyLock(database, request.IdempotencyKey)
+	database.ExpectQuery("FROM investigation_idempotency_records").
+		WithArgs(writeMockTenantID, writeMockWorkspaceID, request.IdempotencyKey).
+		WillReturnRows(emptyWriteMockIdempotencyRows())
+	database.ExpectRollback()
+
+	database.ExpectBegin()
+	expectWriteMockWorkspace(database)
+	expectWriteMockIdempotencyLock(database, request.IdempotencyKey)
+	database.ExpectQuery("FROM investigation_idempotency_records").
+		WithArgs(writeMockTenantID, writeMockWorkspaceID, request.IdempotencyKey).
+		WillReturnRows(emptyWriteMockIdempotencyRows())
+	database.ExpectQuery("FROM incidents AS incident").
+		WithArgs(writeMockTenantID, writeMockWorkspaceID, writeMockIncidentID, runtimeSchemaVersion).
+		WillReturnRows(incidentRows)
+	database.ExpectRollback()
+}
+
 func newWriteMockRepository(
 	t *testing.T,
 	generatedIDs []string,
@@ -212,7 +296,7 @@ func newWriteMockRepository(
 	}
 	t.Cleanup(database.Close)
 	if authorizer == nil {
-		authorizer = func(context.Context, string, investigation.TaskSpec) error { return nil }
+		authorizer = func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error { return nil }
 	}
 	nextID := 0
 	repository, err := New(database, Options{
@@ -259,10 +343,14 @@ func emptyWriteMockIncidentRows() *pgxmock.Rows {
 }
 
 func writeMockIncidentRows(now time.Time) *pgxmock.Rows {
+	return writeMockIncidentRowsForScope(now, writeMockServiceID, writeMockEnvironmentID, domain.MappingExact)
+}
+
+func writeMockIncidentRowsForScope(now time.Time, serviceID, environmentID any, mappingStatus domain.MappingStatus) *pgxmock.Rows {
 	return emptyWriteMockIncidentRows().AddRow(
 		writeMockIncidentID, writeMockTenantID, writeMockWorkspaceID,
-		writeMockServiceID, writeMockEnvironmentID, "payments:staging:latency",
-		domain.MappingExact, "UNKNOWN", "Unclassified operational incident", domain.IncidentOpen,
+		serviceID, environmentID, "payments:staging:latency",
+		mappingStatus, "UNKNOWN", "Unclassified operational incident", domain.IncidentOpen,
 		nil, now, now, now, 1, int64(1),
 	)
 }

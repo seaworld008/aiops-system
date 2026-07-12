@@ -106,6 +106,6 @@ func TestCompleteTaskReadsCommitClockAfterLockedPreparation(t *testing.T) {
 	}
 }
 
-func allowTaskSpecForTest(context.Context, string, investigation.TaskSpec) error {
+func allowTaskSpecForTest(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error {
 	return nil
 }

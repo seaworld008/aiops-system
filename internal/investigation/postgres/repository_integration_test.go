@@ -117,7 +117,7 @@ func TestPostgresRepositoryLifecyclePersistsImmutableReplayAndHumanFeedback(t *t
 			generatedIndex++
 			return id
 		},
-		TaskSpecAuthorizer: func(context.Context, string, investigation.TaskSpec) error { return nil },
+		TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error { return nil },
 	})
 	if err != nil {
 		t.Fatalf("construct PostgreSQL repository: %v", err)

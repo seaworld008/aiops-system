@@ -18,12 +18,66 @@ func TestAuthorizeTaskSpecsHonorsCancellationAfterAuthorizerReturns(t *testing.T
 	spec := investigation.TaskSpec{
 		Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: []byte(`{"lookback_minutes":15}`),
 	}
-	err := investigation.AuthorizeTaskSpecs(ctx, func(context.Context, string, investigation.TaskSpec) error {
+	scope := investigation.TaskSpecScope{
+		TenantID: "tenant-1", WorkspaceID: "workspace-1", EnvironmentID: "prod", ServiceID: "payments",
+		MappingStatus: domain.MappingExact,
+	}
+	err := investigation.AuthorizeTaskSpecs(ctx, func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error {
 		cancel()
 		return nil
-	}, "workspace-1", []investigation.TaskSpec{spec})
+	}, scope, []investigation.TaskSpec{spec})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("AuthorizeTaskSpecs() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestTaskSpecScopeRequiresExactResolvedTrustedIdentity(t *testing.T) {
+	valid := investigation.TaskSpecScope{
+		TenantID: "tenant-1", WorkspaceID: "workspace-1", EnvironmentID: "prod", ServiceID: "payments",
+		MappingStatus: domain.MappingExact,
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("TaskSpecScope.Validate(valid) error = %v", err)
+	}
+	for name, mutate := range map[string]func(*investigation.TaskSpecScope){
+		"tenant":        func(scope *investigation.TaskSpecScope) { scope.TenantID = "" },
+		"workspace":     func(scope *investigation.TaskSpecScope) { scope.WorkspaceID = "workspace with spaces" },
+		"environment":   func(scope *investigation.TaskSpecScope) { scope.EnvironmentID = "" },
+		"service":       func(scope *investigation.TaskSpecScope) { scope.ServiceID = "" },
+		"ambiguous":     func(scope *investigation.TaskSpecScope) { scope.MappingStatus = domain.MappingAmbiguous },
+		"unresolved":    func(scope *investigation.TaskSpecScope) { scope.MappingStatus = domain.MappingUnresolved },
+		"unknown state": func(scope *investigation.TaskSpecScope) { scope.MappingStatus = "UNKNOWN" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			scope := valid
+			mutate(&scope)
+			if err := scope.Validate(); !errors.Is(err, investigation.ErrInvalidRequest) {
+				t.Fatalf("TaskSpecScope.Validate() error = %v, want ErrInvalidRequest", err)
+			}
+		})
+	}
+}
+
+func TestAuthorizeTaskSpecsPassesDetachedScopeAndInput(t *testing.T) {
+	scope := investigation.TaskSpecScope{
+		TenantID: "tenant-1", WorkspaceID: "workspace-1", EnvironmentID: "prod", ServiceID: "payments",
+		MappingStatus: domain.MappingExact,
+	}
+	input := []byte(`{"lookback_minutes":15}`)
+	spec := investigation.TaskSpec{
+		Key: "metrics", ConnectorID: "prometheus-prod", Operation: "range_query", Input: input,
+	}
+	var receivedScope investigation.TaskSpecScope
+	err := investigation.AuthorizeTaskSpecs(context.Background(), func(_ context.Context, got investigation.TaskSpecScope, gotSpec investigation.TaskSpec) error {
+		receivedScope = got
+		gotSpec.Input[0] = 'X'
+		return nil
+	}, scope, []investigation.TaskSpec{spec})
+	if err != nil {
+		t.Fatalf("AuthorizeTaskSpecs() error = %v", err)
+	}
+	if receivedScope != scope || string(input) != `{"lookback_minutes":15}` {
+		t.Fatalf("AuthorizeTaskSpecs() scope/input = %#v/%s, want detached exact values", receivedScope, input)
 	}
 }
 

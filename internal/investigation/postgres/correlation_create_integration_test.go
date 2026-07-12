@@ -32,7 +32,7 @@ func TestPostgresInvestigationWritesRejectInvalidUUIDsBeforeSQL(t *testing.T) {
 	authorizerCalls := 0
 	repository, err := investigationpostgres.New(database, investigationpostgres.Options{
 		IDFactory: func() string { return "90000000-0000-4000-8000-000000000001" },
-		TaskSpecAuthorizer: func(context.Context, string, investigation.TaskSpec) error {
+		TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error {
 			authorizerCalls++
 			return nil
 		},
@@ -320,8 +320,17 @@ func TestPostgresCorrelateSameSignalConcurrentlyCountsAndAssociatesOnce(t *testi
 
 func TestPostgresCreateInvestigationReplaysBeforeAuthorizationAndBindsActiveHash(t *testing.T) {
 	var authorized atomic.Bool
+	var authorizerCalls atomic.Int64
 	authorized.Store(true)
-	fixture := newRepositoryWriteFixture(t, func(context.Context, string, investigation.TaskSpec) error {
+	fixture := newRepositoryWriteFixture(t, func(_ context.Context, scope investigation.TaskSpecScope, _ investigation.TaskSpec) error {
+		authorizerCalls.Add(1)
+		if scope != (investigation.TaskSpecScope{
+			TenantID: testTenantID, WorkspaceID: testWorkspaceID,
+			EnvironmentID: testEnvironmentID, ServiceID: testServiceID,
+			MappingStatus: domain.MappingExact,
+		}) {
+			return errors.New("wrong-task-scope-canary")
+		}
 		if !authorized.Load() {
 			return errors.New("revoked-task-authorizer-canary")
 		}
@@ -343,11 +352,17 @@ func TestPostgresCreateInvestigationReplaysBeforeAuthorizationAndBindsActiveHash
 		first.Tasks[1].Key != "metrics" || first.Tasks[1].Position != 2 {
 		t.Fatalf("CreateOrGetInvestigation(first) = %#v, want stable task order", first)
 	}
+	if authorizerCalls.Load() != 2 {
+		t.Fatalf("authorizer calls after create = %d, want 2", authorizerCalls.Load())
+	}
 
 	authorized.Store(false)
 	replay, err := fixture.repository.CreateOrGetInvestigation(context.Background(), request)
 	if err != nil || replay.Created || replay.Investigation.ID != first.Investigation.ID {
 		t.Fatalf("CreateOrGetInvestigation(replay after revocation) = %#v, %v", replay, err)
+	}
+	if authorizerCalls.Load() != 2 {
+		t.Fatalf("authorizer calls after exact replay = %d, want 2", authorizerCalls.Load())
 	}
 	conflict := request
 	conflict.Tasks = []investigation.TaskSpec{{
@@ -362,10 +377,16 @@ func TestPostgresCreateInvestigationReplaysBeforeAuthorizationAndBindsActiveHash
 		strings.Contains(fmt.Sprint(err), "revoked-task-authorizer-canary") {
 		t.Fatalf("CreateOrGetInvestigation(unauthorized binding) error = %v", err)
 	}
+	if authorizerCalls.Load() != 3 {
+		t.Fatalf("authorizer calls after rejected active binding = %d, want 3", authorizerCalls.Load())
+	}
 	authorized.Store(true)
 	bound, err := fixture.repository.CreateOrGetInvestigation(context.Background(), newKey)
 	if err != nil || bound.Created || bound.Investigation.ID != first.Investigation.ID {
 		t.Fatalf("CreateOrGetInvestigation(active binding) = %#v, %v", bound, err)
+	}
+	if authorizerCalls.Load() != 5 {
+		t.Fatalf("authorizer calls after authorized active binding = %d, want 5", authorizerCalls.Load())
 	}
 
 	var status, schemaVersion string
@@ -392,6 +413,92 @@ func TestPostgresCreateInvestigationReplaysBeforeAuthorizationAndBindsActiveHash
 		!windowStart.Equal(incident.OpenedAt) || !windowEnd.Equal(incident.LastSignalAt) || ledgerCount != 2 {
 		t.Fatalf("admission snapshot = status:%s version:%d window:%s..%s schema:%s ledgers:%d",
 			status, version, windowStart, windowEnd, schemaVersion, ledgerCount)
+	}
+}
+
+func TestPostgresCreateInvestigationRejectsUntrustedIncidentScopeWithoutPartialWrite(t *testing.T) {
+	const wrongEnvironmentID = "26000000-0000-4000-8000-000000000001"
+	for name, configure := range map[string]func(*testing.T, repositoryWriteFixture) investigation.CorrelateSignalRequest{
+		"wrong environment": func(t *testing.T, fixture repositoryWriteFixture) investigation.CorrelateSignalRequest {
+			execSQL(t, fixture.harness.db, `
+				INSERT INTO environments (id, tenant_id, workspace_id, name, kind)
+				VALUES ($1, $2, $3, 'other-staging', 'STAGING')
+			`, wrongEnvironmentID, testTenantID, testWorkspaceID)
+			return investigation.CorrelateSignalRequest{
+				CorrelationKey: "payments:other-staging:scope", ServiceID: testServiceID,
+				EnvironmentID: wrongEnvironmentID, MappingStatus: domain.MappingExact,
+			}
+		},
+		"unresolved mapping": func(_ *testing.T, _ repositoryWriteFixture) investigation.CorrelateSignalRequest {
+			return investigation.CorrelateSignalRequest{
+				CorrelationKey: "payments:unknown:scope", MappingStatus: domain.MappingUnresolved,
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var authorizerCalls atomic.Int64
+			fixture := newRepositoryWriteFixture(t, func(_ context.Context, scope investigation.TaskSpecScope, _ investigation.TaskSpec) error {
+				authorizerCalls.Add(1)
+				if scope.TenantID != testTenantID || scope.WorkspaceID != testWorkspaceID ||
+					scope.ServiceID != testServiceID || scope.EnvironmentID != testEnvironmentID ||
+					scope.MappingStatus != domain.MappingExact {
+					return errors.New("scope-authorizer-canary")
+				}
+				return nil
+			})
+			correlation := configure(t, fixture)
+			signal := fixture.registerSignal(
+				t, repositorySignalID, "firing", fixture.base,
+				"event-scope-"+strings.ReplaceAll(name, " ", "-"),
+			)
+			correlation.WorkspaceID = testWorkspaceID
+			correlation.SignalID = signal.ID
+			correlated, err := fixture.repository.CorrelateSignal(context.Background(), correlation)
+			if err != nil {
+				t.Fatalf("CorrelateSignal() error = %v", err)
+			}
+			idempotencyKey := "investigate:postgres-scope:" + strings.ReplaceAll(name, " ", "-")
+			_, err = fixture.repository.CreateOrGetInvestigation(context.Background(), investigation.CreateOrGetInvestigationRequest{
+				WorkspaceID: testWorkspaceID, IncidentID: correlated.Incident.ID, IdempotencyKey: idempotencyKey,
+				Tasks: []investigation.TaskSpec{{
+					Key: "metrics", ConnectorID: "prometheus-staging", Operation: "range_query",
+					Input: []byte(`{"lookback_minutes":15}`),
+				}},
+			})
+			if !errors.Is(err, investigation.ErrInvalidRequest) {
+				t.Fatalf("CreateOrGetInvestigation() error = %v, want ErrInvalidRequest", err)
+			}
+			if strings.Contains(fmt.Sprint(err), "scope-authorizer-canary") {
+				t.Fatalf("CreateOrGetInvestigation() leaked scope authorizer detail: %v", err)
+			}
+			wantCalls := int64(1)
+			if correlation.MappingStatus != domain.MappingExact {
+				wantCalls = 0
+			}
+			if authorizerCalls.Load() != wantCalls {
+				t.Fatalf("authorizer calls = %d, want %d", authorizerCalls.Load(), wantCalls)
+			}
+
+			var status string
+			var version int64
+			var investigations, tasks, ledgers int
+			if err := fixture.harness.db.QueryRow(context.Background(), `
+				SELECT incident.status, incident.version,
+				       (SELECT count(*) FROM investigations WHERE tenant_id = incident.tenant_id AND workspace_id = incident.workspace_id AND incident_id = incident.id),
+				       (SELECT count(*) FROM tool_invocations WHERE tenant_id = incident.tenant_id AND workspace_id = incident.workspace_id AND incident_id = incident.id),
+				       (SELECT count(*) FROM investigation_idempotency_records WHERE tenant_id = incident.tenant_id AND workspace_id = incident.workspace_id AND idempotency_key = $4)
+				FROM incidents AS incident
+				WHERE incident.tenant_id = $1 AND incident.workspace_id = $2 AND incident.id = $3
+			`, testTenantID, testWorkspaceID, correlated.Incident.ID, idempotencyKey).Scan(
+				&status, &version, &investigations, &tasks, &ledgers,
+			); err != nil {
+				t.Fatalf("read rejected scope facts: %v", err)
+			}
+			if status != string(domain.IncidentOpen) || version != 1 || investigations != 0 || tasks != 0 || ledgers != 0 {
+				t.Fatalf("rejected scope facts = status:%s version:%d investigations:%d tasks:%d ledgers:%d",
+					status, version, investigations, tasks, ledgers)
+			}
+		})
 	}
 }
 
@@ -525,7 +632,7 @@ func newRepositoryWriteFixture(
 		VALUES ($1, $2, $3, 'alertmanager', 'alerts', 'vault://alerts')
 	`, testIntegrationID, testTenantID, testWorkspaceID)
 	if authorizer == nil {
-		authorizer = func(context.Context, string, investigation.TaskSpec) error { return nil }
+		authorizer = func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error { return nil }
 	}
 	var next atomic.Uint64
 	repository, err := investigationpostgres.New(harness.extendedPool(t), investigationpostgres.Options{

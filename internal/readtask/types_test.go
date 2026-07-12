@@ -135,6 +135,7 @@ func validDescriptor(t *testing.T) readtask.Descriptor {
 	descriptor := readtask.Descriptor{
 		TenantID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", WorkspaceID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
 		EnvironmentID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", IncidentID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+		ServiceID:       "c1000000-0000-4000-8000-000000000001",
 		InvestigationID: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", TaskID: testTaskID,
 		TaskKey: "service.health", Position: 1, ConnectorID: "prometheus", Operation: "query_range",
 		Input: input, InputHash: fmt.Sprintf("%x", digest),

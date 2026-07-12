@@ -48,7 +48,7 @@ func TestNewFailsClosedWithoutEveryTrustedDependency(t *testing.T) {
 		t.Fatalf("pgxmock.NewPool() error = %v", err)
 	}
 	defer database.Close()
-	authorizer := func(context.Context, string, investigation.TaskSpec) error { return nil }
+	authorizer := func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error { return nil }
 	factory := func() string { return "11111111-1111-4111-8111-111111111111" }
 	for name, operation := range map[string]func() (*Repository, error){
 		"database": func() (*Repository, error) {
@@ -102,7 +102,7 @@ func TestInvalidPersistentReadIDsAreRejectedBeforeBegin(t *testing.T) {
 	defer database.Close()
 	repository, err := New(database, Options{
 		IDFactory:          func() string { return "11111111-1111-4111-8111-111111111111" },
-		TaskSpecAuthorizer: func(context.Context, string, investigation.TaskSpec) error { return nil },
+		TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error { return nil },
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)

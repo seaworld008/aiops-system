@@ -37,7 +37,7 @@ func newRepository(t *testing.T, now time.Time) *memory.Repository {
 	return repository
 }
 
-func testTaskSpecAuthorizer(_ context.Context, _ string, spec investigation.TaskSpec) error {
+func testTaskSpecAuthorizer(_ context.Context, _ investigation.TaskSpecScope, spec investigation.TaskSpec) error {
 	allowed := spec.ConnectorID == "prometheus-prod" && spec.Operation == "range_query" ||
 		(spec.ConnectorID == "victorialogs-prod" || spec.ConnectorID == "tempo-prod") && spec.Operation == "search"
 	if !allowed {

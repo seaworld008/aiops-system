@@ -20,8 +20,8 @@ const (
 	MaxEvidenceJSONDepth    = 16
 	MaxEvidencePayloadBytes = 64 << 10
 
-	completionRequestSchemaV1 = "read-task-completion-request.v1"
-	completionReceiptHashV1   = "read-task-completion-receipt.v1"
+	completionRequestSchemaV2 = "read-task-completion-request.v2"
+	completionReceiptHashV2   = "read-task-completion-receipt.v2"
 	runnerEvidenceSchemaV2    = "runner-evidence.v2"
 )
 
@@ -32,6 +32,7 @@ type Receipt struct {
 	TenantID          string
 	WorkspaceID       string
 	EnvironmentID     string
+	ServiceID         string
 	IncidentID        string
 	InvestigationID   string
 	TaskID            string
@@ -54,6 +55,7 @@ func (receipt Receipt) ValidateAgainst(descriptor Descriptor, attempt Attempt) e
 	if descriptor.Validate() != nil || attempt.ValidateAgainst(descriptor) != nil ||
 		receipt.SchemaVersion != runnerEvidenceSchemaV2 || receipt.TenantID != descriptor.TenantID ||
 		receipt.WorkspaceID != descriptor.WorkspaceID || receipt.EnvironmentID != descriptor.EnvironmentID ||
+		receipt.ServiceID != descriptor.ServiceID ||
 		receipt.IncidentID != descriptor.IncidentID || receipt.InvestigationID != descriptor.InvestigationID ||
 		receipt.TaskID != descriptor.TaskID || receipt.RunnerID != attempt.RunnerID ||
 		receipt.ScopeRevision != attempt.ScopeRevision || receipt.CertificateSHA256 != attempt.Certificate.SHA256 ||
@@ -238,6 +240,7 @@ func ProjectCompletion(
 	projection.receipt = Receipt{
 		SchemaVersion: runnerEvidenceSchemaV2,
 		TenantID:      descriptor.TenantID, WorkspaceID: descriptor.WorkspaceID, EnvironmentID: descriptor.EnvironmentID,
+		ServiceID:  descriptor.ServiceID,
 		IncidentID: descriptor.IncidentID, InvestigationID: descriptor.InvestigationID, TaskID: descriptor.TaskID,
 		RunnerID: attempt.RunnerID, ScopeRevision: attempt.ScopeRevision,
 		CertificateSHA256: attempt.Certificate.SHA256, LeaseEpoch: attempt.Epoch,
@@ -315,7 +318,7 @@ func completionRequestHash(
 	contentHash string,
 	failureCode FailureCode,
 ) (string, error) {
-	return canonicalHash(completionRequestSchemaV1, struct {
+	return canonicalHash(completionRequestSchemaV2, struct {
 		TaskID            string            `json:"task_id"`
 		TaskKey           string            `json:"task_key"`
 		TaskPosition      int               `json:"task_position"`
@@ -323,6 +326,7 @@ func completionRequestHash(
 		TenantID          string            `json:"tenant_id"`
 		WorkspaceID       string            `json:"workspace_id"`
 		EnvironmentID     string            `json:"environment_id"`
+		ServiceID         string            `json:"service_id"`
 		IncidentID        string            `json:"incident_id"`
 		InvestigationID   string            `json:"investigation_id"`
 		RunnerID          string            `json:"runner_id"`
@@ -336,7 +340,7 @@ func completionRequestHash(
 		FailureCode       FailureCode       `json:"failure_code,omitempty"`
 	}{
 		descriptor.TaskID, descriptor.TaskKey, descriptor.Position, descriptor.InputHash,
-		descriptor.TenantID, descriptor.WorkspaceID, descriptor.EnvironmentID, descriptor.IncidentID,
+		descriptor.TenantID, descriptor.WorkspaceID, descriptor.EnvironmentID, descriptor.ServiceID, descriptor.IncidentID,
 		descriptor.InvestigationID, attempt.RunnerID, strconv.FormatInt(attempt.ScopeRevision, 10),
 		attempt.Certificate.SHA256, strconv.FormatInt(attempt.Epoch, 10), descriptor.ConnectorID,
 		descriptor.Operation, outcome, contentHash, failureCode,
@@ -348,6 +352,7 @@ type receiptWire struct {
 	TenantID          string            `json:"tenant_id"`
 	WorkspaceID       string            `json:"workspace_id"`
 	EnvironmentID     string            `json:"environment_id"`
+	ServiceID         string            `json:"service_id"`
 	IncidentID        string            `json:"incident_id"`
 	InvestigationID   string            `json:"investigation_id"`
 	TaskID            string            `json:"task_id"`
@@ -369,7 +374,7 @@ type receiptWire struct {
 func receiptHashWire(receipt Receipt) receiptWire {
 	return receiptWire{
 		SchemaVersion: receipt.SchemaVersion, TenantID: receipt.TenantID, WorkspaceID: receipt.WorkspaceID,
-		EnvironmentID: receipt.EnvironmentID, IncidentID: receipt.IncidentID,
+		EnvironmentID: receipt.EnvironmentID, ServiceID: receipt.ServiceID, IncidentID: receipt.IncidentID,
 		InvestigationID: receipt.InvestigationID, TaskID: receipt.TaskID, RunnerID: receipt.RunnerID,
 		ScopeRevision: strconv.FormatInt(receipt.ScopeRevision, 10), CertificateSHA256: receipt.CertificateSHA256,
 		LeaseEpoch: strconv.FormatInt(receipt.LeaseEpoch, 10), ConnectorID: receipt.ConnectorID,
@@ -383,7 +388,7 @@ func completionReceiptHash(receipt Receipt) (string, error) {
 	wire := receiptHashWire(receipt)
 	wire.ReceiptHash = ""
 	wire.ReceivedAt = nil
-	return canonicalHash(completionReceiptHashV1, wire)
+	return canonicalHash(completionReceiptHashV2, wire)
 }
 
 func canonicalHash(schema string, value any) (string, error) {

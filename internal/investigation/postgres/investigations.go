@@ -44,11 +44,6 @@ func (repository *Repository) CreateOrGetInvestigation(
 	if handled || err != nil {
 		return result, err
 	}
-	if err := investigation.AuthorizeTaskSpecs(
-		ctx, repository.taskSpecAuthorizer, request.WorkspaceID, canonicalTasks,
-	); err != nil {
-		return investigation.CreateOrGetInvestigationResult{}, err
-	}
 	return repository.createOrBindInvestigation(ctx, request, canonicalTasks, requestHash)
 }
 
@@ -150,6 +145,18 @@ func (repository *Repository) createOrBindInvestigation(
 	}
 	if err != nil {
 		return result, databaseError("lock investigation incident", err)
+	}
+	scope := investigation.TaskSpecScope{
+		TenantID:      incident.TenantID,
+		WorkspaceID:   incident.WorkspaceID,
+		EnvironmentID: incident.EnvironmentID,
+		ServiceID:     incident.ServiceID,
+		MappingStatus: incident.MappingStatus,
+	}
+	if err := investigation.AuthorizeTaskSpecs(
+		ctx, repository.taskSpecAuthorizer, scope, canonicalTasks,
+	); err != nil {
+		return result, err
 	}
 
 	active, activeFound, err := lockActiveInvestigation(ctx, tx, tenantID, request.WorkspaceID, request.IncidentID)

@@ -32,7 +32,7 @@ func TestPostgresConcurrentHumanConfirmCommitsOneRootCause(t *testing.T) {
 			}
 			return generatedIDs[index]
 		},
-		TaskSpecAuthorizer: func(context.Context, string, investigation.TaskSpec) error { return nil },
+		TaskSpecAuthorizer: func(context.Context, investigation.TaskSpecScope, investigation.TaskSpec) error { return nil },
 	})
 	if err != nil {
 		t.Fatalf("construct feedback concurrency repository: %v", err)

@@ -34,9 +34,6 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 	if handled {
 		return replay, replayErr
 	}
-	if err := investigation.AuthorizeTaskSpecs(ctx, repository.taskSpecAuthorizer, request.WorkspaceID, canonicalTasks); err != nil {
-		return investigation.CreateOrGetInvestigationResult{}, err
-	}
 	repository.mu.Lock()
 	defer repository.mu.Unlock()
 	if replay, replayErr, handled = repository.createInvestigationReplayLocked(request.WorkspaceID, idempotencyKey, requestHash); handled {
@@ -46,6 +43,16 @@ func (repository *Repository) CreateOrGetInvestigation(ctx context.Context, requ
 	incident, exists := repository.incidents[incidentKey]
 	if !exists {
 		return investigation.CreateOrGetInvestigationResult{}, store.ErrNotFound
+	}
+	scope := investigation.TaskSpecScope{
+		TenantID:      incident.TenantID,
+		WorkspaceID:   incident.WorkspaceID,
+		EnvironmentID: incident.EnvironmentID,
+		ServiceID:     incident.ServiceID,
+		MappingStatus: incident.MappingStatus,
+	}
+	if err := investigation.AuthorizeTaskSpecs(ctx, repository.taskSpecAuthorizer, scope, canonicalTasks); err != nil {
+		return investigation.CreateOrGetInvestigationResult{}, err
 	}
 	if activeID := repository.activeInvestigation[incidentKey]; activeID != "" {
 		active, found := repository.investigations[scoped(request.WorkspaceID, activeID)]
