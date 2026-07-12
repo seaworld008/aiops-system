@@ -156,6 +156,8 @@ func (*TemporalWorker) UnmarshalJSON([]byte) error   { return ErrInvalidInput }
 
 var _ json.Marshaler = (*TemporalWorker)(nil)
 
+// NewWorker is the legacy shared-role v1 compatibility constructor.
+// Deprecated: repository architecture tests require zero production callsites.
 func NewWorker(
 	temporalClient *TemporalClient,
 	activities *Activities,

@@ -30,6 +30,8 @@ type Starter struct {
 
 var _ outbox.SignalStarter = (*Starter)(nil)
 
+// NewStarter is the legacy shared-role v1 compatibility constructor.
+// Deprecated: repository architecture tests require zero production callsites.
 func NewStarter(temporalClient *TemporalClient, manifestDigest, registryDigest string) (*Starter, error) {
 	if !temporalClient.validForStarter() {
 		return nil, ErrInvalidInput

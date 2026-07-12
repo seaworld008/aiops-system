@@ -1,7 +1,8 @@
 # READ Runtime Bundle 与关闭态 Admission
 
 日期：2026-07-11
-阶段：M5C2-4a / M5C2-4c0 / M5C2-4c1a（不可变运行时、heartbeat 重授权与原子装配快照；READ claims 关闭）
+阶段：M5C2-4a / M5C2-4c0 / M5C2-4c1a / M5C2-4c1b（不可变运行时、heartbeat 重授权、原子装配
+快照与角色隔离的 Temporal 控制边界；READ claims 关闭）
 
 ## 目的与硬边界
 
@@ -33,6 +34,16 @@ M5C2-4c1a 新增 `internal/readassembly.Snapshot`，把 Plan、同一 Connector 
 ScopeAuthority、Registry 或 Bundle 原始 getter；Control Plane/Worker 只能使用窄的 plan resolve、
 task/runtime binding、start/heartbeat/completion authorizer 门面，以及直接构造 Runtime v2/READ Runner
 Activities 的高层工厂，不能取得私有组件后把不同快照重新混装。
+
+M5C2-4c1b 再由 Snapshot 的单一高层工厂构造角色隔离的 Temporal Starter/Control Worker。调用方只能
+提供两个独立 mTLS capability、Signal reader、Repository 与 Recovery Activity，不能提交 namespace、
+queue、摘要、converter、SDK Worker 或 Worker options；两个 capability 的 endpoint/server name/root
+pool/namespace connection binding 漂移、复制、关闭或任一依赖无效都会在发布部分 runtime 前失败；两种
+角色仍可使用各自的客户端证书。connection binding 还包含有界 RPC 取得的 Temporal cluster UUID 与
+namespace UUID proof；Activities 先由 Snapshot 私有构造，connection 比较及 Starter/Worker 构造发布则在
+两个 client 的共享生命周期 lease 内完成。相同 LB/CA 后的不同 deployment、同名重建 namespace 或并发
+`Close` 均不能穿透该边界。单独 Starter/Control Worker 构造器和 connection compare 不再公开。该库级边界仍未安装 Outbox dispatcher、READ Runner、
+Gateway callback 或 open Admission。
 
 ## Egress manifest 与 registry
 
@@ -176,10 +187,11 @@ M5C2-4a 没有迁移、配置、Temporal 注册或 live READ Runner 装配。部
 关闭态 Admission 与 disabled callbacks；未 ACK Outbox 不移动，READ Task 不会被新领或由旧 lease
 推进。回滚二进制即可，不需要数据回填。
 
-M5C2-4b 已安装尚未进程装配的 Temporal runtime v2、结果恢复注册和真实 READ Activity。后续 C2-4c
-必须在同一个 assembly factory 中加载 connector、target、egress、plan 与 Bundle，核对
-Worker/Gateway/READ Runner 的相同 Bundle digest，安装 Outbox supervisor 并完成本地
-Signal→Evidence E2E。即使这些代码完成，企业
+M5C2-4b 已安装尚未进程装配的 Temporal runtime v2、结果恢复注册和真实 READ Activity；C2-4c1a/b
+进一步封闭 Snapshot 与角色隔离的 Temporal 库级装配。后续 C2-4c 必须在受监督进程中加载
+connector、target、egress、plan 与 Bundle，核对 Worker/Gateway/READ Runner 的相同 Bundle digest，
+按 Worker Stop→clients Close 顺序持有 runtime，安装 Outbox supervisor 并完成本地 Signal→Evidence
+E2E。即使这些代码完成，企业
 PKI、Bearer provider、NetworkPolicy/egress enforcement、源侧 DLP、Temporal replay 与无混版部署
 证据缺一项时，生产配置仍只能使用关闭态 Admission。
 

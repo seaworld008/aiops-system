@@ -12,10 +12,10 @@ type RuntimeV2Registry interface {
 	RegisterActivityWithOptions(interface{}, activity.RegisterOptions)
 }
 
-// RegisterRuntimeV2 registers only the digest-bound control-plane protocol.
-// It does not construct a Worker, Temporal client, Starter, Outbox dispatcher,
-// or READ Runner and therefore cannot open claims by itself.
-func RegisterRuntimeV2(
+// registerRuntimeV2 is package-owned so production callers cannot combine the
+// private Workflow/Activity methods with a raw SDK Worker. Tests reach it only
+// through a _test bridge; the sealed control Worker is the production path.
+func registerRuntimeV2(
 	registry RuntimeV2Registry,
 	activities *RuntimeV2Activities,
 ) (returnedErr error) {
@@ -29,11 +29,11 @@ func RegisterRuntimeV2(
 	}()
 	registry.RegisterWorkflowWithOptions(activities.readWorkflowV2, workflow.RegisterOptions{Name: WorkflowNameV2})
 	registry.RegisterActivityWithOptions(
-		activities.prepareActivityV2,
+		activities.registeredPrepareActivityV2,
 		activity.RegisterOptions{Name: PrepareActivityNameV2},
 	)
 	registry.RegisterActivityWithOptions(
-		activities.recoverActivityV1,
+		activities.registeredRecoverActivityV1,
 		activity.RegisterOptions{Name: RecoveryActivityNameV1},
 	)
 	return nil
