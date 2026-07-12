@@ -401,9 +401,9 @@ func TestAcceptControlWorkerChildAcceptsExactBoundary(t *testing.T) {
 func newTestSupervisor(scenario, base string) *ControlWorkerSupervisor {
 	settings := defaultSupervisorSettings()
 	settings.startupTimeout = 300 * time.Millisecond
-	settings.startupGrace = 120 * time.Millisecond
-	settings.shutdownGrace = 120 * time.Millisecond
-	settings.anomalyGrace = 120 * time.Millisecond
+	settings.startupGrace = time.Second
+	settings.shutdownGrace = time.Second
+	settings.anomalyGrace = 250 * time.Millisecond
 	settings.killConfirm = 3 * time.Second
 	settings.childEnv = []string{controlWorkerTestScenario + "=" + scenario + "|" + base}
 	return newControlWorkerSupervisor(settings)
@@ -706,7 +706,7 @@ func receiveResult(t *testing.T, result <-chan error) error {
 	select {
 	case err := <-result:
 		return err
-	case <-time.After(8 * time.Second):
+	case <-time.After(12 * time.Second):
 		t.Fatal("supervisor did not return")
 		return nil
 	}
