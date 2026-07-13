@@ -20,10 +20,13 @@ import (
 )
 
 const workerProcessImport = "github.com/seaworld008/aiops-system/internal/workerprocess"
+const workerBootstrapProcessImport = "github.com/seaworld008/aiops-system/internal/workerbootstrap"
 
 var (
 	_ func() *workerprocess.ControlWorkerSupervisor                                     = workerprocess.NewControlWorkerSupervisor
 	_ func([]string) bool                                                               = workerprocess.IsControlWorkerChild
+	_ func([]string) bool                                                               = workerprocess.IsControlWorkerSecretLoaderChild
+	_ func([]string) error                                                              = workerprocess.RunControlWorkerSecretLoaderChild
 	_ func([]string) (*workerprocess.ChildStatus, error)                                = workerprocess.AcceptControlWorkerChild
 	_ func(context.Context, *workerprocess.ChildStatus) (*readassembly.Snapshot, error) = workerprocess.BuildControlWorkerSnapshot
 	_ func(*workerprocess.ChildStatus) error                                            = workerprocess.ReportControlWorkerSecretReady
@@ -67,48 +70,67 @@ var guardedWorkerProcessAPI = map[string]struct{}{
 	"CloseControlWorkerChild":           {},
 	"IsControlWorkerSourceLoaderChild":  {},
 	"RunControlWorkerSourceLoaderChild": {},
+	"IsControlWorkerSecretLoaderChild":  {},
+	"RunControlWorkerSecretLoaderChild": {},
 }
 
 var guardedWorkerProcessInternals = map[string]struct{}{
-	"defaultSupervisorSettings":                   {},
-	"newControlWorkerSupervisor":                  {},
-	"runControlWorkerSupervisor":                  {},
-	"acceptControlWorkerChild":                    {},
-	"newChildStatus":                              {},
-	"buildControlWorkerCommand":                   {},
-	"buildSourceLoaderCommand":                    {},
-	"loadControlWorkerSourceFromCommand":          {},
-	"loadControlWorkerSourceFromCommandUnchecked": {},
-	"startControlWorker":                          {},
-	"writeStatusByte":                             {},
+	"defaultSupervisorSettings":                      {},
+	"newControlWorkerSupervisor":                     {},
+	"runControlWorkerSupervisor":                     {},
+	"acceptControlWorkerChild":                       {},
+	"newChildStatus":                                 {},
+	"buildControlWorkerCommand":                      {},
+	"buildSourceLoaderCommand":                       {},
+	"buildSecretLoaderCommand":                       {},
+	"runControlWorkerSecretLoaderChild":              {},
+	"supplyControlWorkerSecretsFromCommand":          {},
+	"supplyControlWorkerSecretsFromCommandUnchecked": {},
+	"validFixedSecretLoaderCommand":                  {},
+	"startSecretLoaderCommand":                       {},
+	"validSecretLoaderWriters":                       {},
+	"loadControlWorkerSourceFromCommand":             {},
+	"loadControlWorkerSourceFromCommandUnchecked":    {},
+	"startControlWorker":                             {},
+	"writeStatusByte":                                {},
 }
 
 var expectedProcessBoundaryCalls = map[processBoundaryKey]int{
-	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "NewControlWorkerSupervisor"}:                                    1,
-	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "IsControlWorkerChild"}:                                          1,
-	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "AcceptControlWorkerChild"}:                                      1,
-	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "IsControlWorkerSourceLoaderChild"}:                              1,
-	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "RunControlWorkerSourceLoaderChild"}:                             1,
-	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "ReportControlWorkerReady"}:                             1,
-	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "ExitControlWorkerFatal"}:                               1,
-	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "BuildControlWorkerSnapshot"}:                           1,
-	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "ReportControlWorkerSecretReady"}:                       1,
-	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "BindControlWorkerSecrets"}:                             1,
-	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "CloseControlWorkerChild"}:                              2,
-	{file: "internal/workerprocess/supervisor.go", source: "workerprocess", symbol: "defaultSupervisorSettings"}:                       1,
-	{file: "internal/workerprocess/supervisor.go", source: "workerprocess", symbol: "newControlWorkerSupervisor"}:                      1,
-	{file: "internal/workerprocess/supervisor.go", source: "workerprocess", symbol: "runControlWorkerSupervisor"}:                      1,
-	{file: "internal/workerprocess/protocol.go", source: "workerprocess", symbol: "acceptControlWorkerChild"}:                          1,
-	{file: "internal/workerprocess/protocol.go", source: workerProcessImport, symbol: "IsControlWorkerChild"}:                          1,
-	{file: "internal/workerprocess/protocol.go", source: workerProcessImport, symbol: "IsControlWorkerSourceLoaderChild"}:              1,
-	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "newChildStatus"}:                              1,
-	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "buildControlWorkerCommand"}:                   1,
-	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "buildSourceLoaderCommand"}:                    1,
-	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "loadControlWorkerSourceFromCommand"}:          1,
-	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "loadControlWorkerSourceFromCommandUnchecked"}: 1,
-	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "startControlWorker"}:                          1,
-	{file: "internal/workerprocess/protocol.go", source: "workerprocess", symbol: "writeStatusByte"}:                                   3,
-	{file: "internal/workerprocess/platform_linux.go", source: "os/exec", symbol: "Command"}:                                           2,
+	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "NewControlWorkerSupervisor"}:                                       1,
+	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "IsControlWorkerChild"}:                                             1,
+	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "AcceptControlWorkerChild"}:                                         1,
+	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "IsControlWorkerSourceLoaderChild"}:                                 1,
+	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "RunControlWorkerSourceLoaderChild"}:                                1,
+	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "IsControlWorkerSecretLoaderChild"}:                                 1,
+	{file: "cmd/worker/main.go", source: workerProcessImport, symbol: "RunControlWorkerSecretLoaderChild"}:                                1,
+	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "ReportControlWorkerReady"}:                                1,
+	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "ExitControlWorkerFatal"}:                                  1,
+	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "BuildControlWorkerSnapshot"}:                              1,
+	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "ReportControlWorkerSecretReady"}:                          1,
+	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "BindControlWorkerSecrets"}:                                1,
+	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "CloseControlWorkerChild"}:                                 2,
+	{file: "internal/workerprocess/supervisor.go", source: "workerprocess", symbol: "defaultSupervisorSettings"}:                          1,
+	{file: "internal/workerprocess/supervisor.go", source: "workerprocess", symbol: "newControlWorkerSupervisor"}:                         1,
+	{file: "internal/workerprocess/supervisor.go", source: "workerprocess", symbol: "runControlWorkerSupervisor"}:                         1,
+	{file: "internal/workerprocess/protocol.go", source: "workerprocess", symbol: "acceptControlWorkerChild"}:                             1,
+	{file: "internal/workerprocess/protocol.go", source: workerProcessImport, symbol: "IsControlWorkerChild"}:                             1,
+	{file: "internal/workerprocess/protocol.go", source: workerProcessImport, symbol: "IsControlWorkerSourceLoaderChild"}:                 1,
+	{file: "internal/workerprocess/protocol.go", source: workerProcessImport, symbol: "IsControlWorkerSecretLoaderChild"}:                 1,
+	{file: "internal/workerprocess/protocol.go", source: "workerprocess", symbol: "runControlWorkerSecretLoaderChild"}:                    1,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "newChildStatus"}:                                 1,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "buildControlWorkerCommand"}:                      1,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "buildSourceLoaderCommand"}:                       1,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "buildSecretLoaderCommand"}:                       1,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "supplyControlWorkerSecretsFromCommand"}:          1,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "supplyControlWorkerSecretsFromCommandUnchecked"}: 1,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "validFixedSecretLoaderCommand"}:                  1,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "startSecretLoaderCommand"}:                       1,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "validSecretLoaderWriters"}:                       2,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "loadControlWorkerSourceFromCommand"}:             1,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "loadControlWorkerSourceFromCommandUnchecked"}:    1,
+	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "startControlWorker"}:                             1,
+	{file: "internal/workerprocess/protocol.go", source: "workerprocess", symbol: "writeStatusByte"}:                                      3,
+	{file: "internal/workerprocess/platform_linux.go", source: "os/exec", symbol: "Command"}:                                              3,
 }
 
 var expectedWorkerProcessExports = map[string]int{
@@ -125,6 +147,8 @@ var expectedWorkerProcessExports = map[string]int{
 	"func:CloseControlWorkerChild":           1,
 	"func:IsControlWorkerSourceLoaderChild":  1,
 	"func:RunControlWorkerSourceLoaderChild": 1,
+	"func:IsControlWorkerSecretLoaderChild":  1,
+	"func:RunControlWorkerSecretLoaderChild": 1,
 	"method:ControlWorkerSupervisor.Run":     1,
 	"method:boundedDiscard.Write":            1,
 }
@@ -132,7 +156,7 @@ var expectedWorkerProcessExports = map[string]int{
 var expectedRawExecReferences = map[processBoundaryKey]int{
 	{file: "internal/workerbootstrap/handoff_linux.go", source: "os/exec", symbol: "Cmd"}: 2,
 	{file: "internal/workerbootstrap/handoff_other.go", source: "os/exec", symbol: "Cmd"}: 1,
-	{file: "internal/workerprocess/platform_linux.go", source: "os/exec", symbol: "Cmd"}:  12,
+	{file: "internal/workerprocess/platform_linux.go", source: "os/exec", symbol: "Cmd"}:  17,
 	{file: "internal/workerprocess/supervisor.go", source: "os/exec", symbol: "Cmd"}:      1,
 }
 
@@ -211,6 +235,289 @@ func TestControlWorkerProcessAssemblyCallsitesAreClosed(t *testing.T) {
 	for _, violation := range validateProcessBoundary(scan) {
 		t.Error(violation)
 	}
+}
+
+func TestControlWorkerSecretLoaderEntryPointHasNoRuntimeSurface(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate process-boundary architecture test")
+	}
+	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "../.."))
+	calls, violations, err := scanSecretLoaderEntryPoints(repositoryRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{
+		"internal/workerprocess/protocol.go:IsControlWorkerSecretLoaderChild":                        1,
+		"internal/workerprocess/protocol.go:runControlWorkerSecretLoaderChild":                       1,
+		"internal/workerprocess/platform_linux.go:len":                                               1,
+		"internal/workerprocess/platform_linux.go:os.Environ":                                        1,
+		"internal/workerprocess/platform_linux.go:os.Getwd":                                          1,
+		"internal/workerprocess/platform_linux.go:os.Getpid":                                         1,
+		"internal/workerprocess/platform_linux.go:syscall.Getpgid":                                   1,
+		"internal/workerprocess/platform_linux.go:currentParentDeathSignal":                          1,
+		"internal/workerprocess/platform_linux.go:os.Getppid":                                        1,
+		"internal/workerprocess/platform_linux.go:inheritedDescriptorRangeIsDistinct":                1,
+		"internal/workerprocess/platform_linux.go:int":                                               2,
+		"internal/workerprocess/platform_linux.go:unix.CloseOnExec":                                  1,
+		"internal/workerprocess/platform_linux.go:onlyExpectedInheritedDescriptors":                  1,
+		"internal/workerprocess/platform_linux.go:workerbootstrap.WriteProductionSecretsToLoaderFDs": 1,
+	}
+	if !sameProcessStringCounts(calls, want) {
+		t.Errorf("secret-loader entry-point calls = %#v, want %#v", calls, want)
+	}
+	for _, violation := range violations {
+		t.Error(violation)
+	}
+}
+
+func TestControlWorkerParentCannotReadOrEncodeSecretMaterial(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate process-boundary architecture test")
+	}
+	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "../.."))
+	violations, supplierDeclarations, err := scanParentSecretIsolation(repositoryRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if supplierDeclarations != 1 {
+		t.Errorf("controlWorkerSecretSupplier declarations = %d, want exactly 1", supplierDeclarations)
+	}
+	for _, violation := range violations {
+		t.Error(violation)
+	}
+}
+
+func scanSecretLoaderEntryPoints(repositoryRoot string) (map[string]int, []string, error) {
+	calls := make(map[string]int)
+	var violations []string
+	err := filepath.WalkDir(filepath.Join(repositoryRoot, "internal/workerprocess"), func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(repositoryRoot, path)
+		if err != nil {
+			return err
+		}
+		relative = filepath.ToSlash(relative)
+		aliases := processImportAliases(parsed)
+		for _, declaration := range parsed.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil ||
+				(function.Name.Name != "RunControlWorkerSecretLoaderChild" &&
+					function.Name.Name != "runControlWorkerSecretLoaderChild") {
+				continue
+			}
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				symbol := secretBoundaryCallName(call.Fun, aliases)
+				if symbol == "" {
+					violations = append(violations, relative+":"+function.Name.Name+" uses an unresolved call")
+					return true
+				}
+				key := relative + ":" + symbol
+				calls[key]++
+				switch symbol {
+				case "IsControlWorkerSecretLoaderChild", "runControlWorkerSecretLoaderChild":
+					if relative != "internal/workerprocess/protocol.go" ||
+						function.Name.Name != "RunControlWorkerSecretLoaderChild" {
+						violations = append(violations, key+" is outside the reviewed exported dispatcher")
+					}
+				case "workerbootstrap.WriteProductionSecretsToLoaderFDs":
+					if relative != "internal/workerprocess/platform_linux.go" ||
+						function.Name.Name != "runControlWorkerSecretLoaderChild" || len(call.Args) != 0 {
+						violations = append(violations, key+" is outside the fixed zero-input loader child")
+					}
+				case "len", "os.Environ", "os.Getwd", "os.Getpid", "syscall.Getpgid",
+					"currentParentDeathSignal", "os.Getppid", "inheritedDescriptorRangeIsDistinct",
+					"int", "unix.CloseOnExec", "onlyExpectedInheritedDescriptors":
+					if relative != "internal/workerprocess/platform_linux.go" ||
+						function.Name.Name != "runControlWorkerSecretLoaderChild" {
+						violations = append(violations, key+" is outside the fixed Linux loader boundary validation")
+					}
+				default:
+					violations = append(violations, key+" expands the secret-loader child into runtime, dial, READY, or claim assembly")
+				}
+				return true
+			})
+		}
+		return nil
+	})
+	return calls, violations, err
+}
+
+func scanParentSecretIsolation(repositoryRoot string) ([]string, int, error) {
+	var violations []string
+	supplierDeclarations := 0
+	bannedImports := map[string]struct{}{
+		"bytes": {}, "crypto": {}, "database/sql": {}, "encoding": {}, "encoding/binary": {},
+		"encoding/json": {}, "encoding/pem": {}, "net": {}, "net/http": {},
+	}
+	bannedSecretCalls := map[string]struct{}{
+		"Decode": {}, "Encode": {}, "Marshal": {}, "Open": {}, "OpenFile": {},
+		"ParseECPrivateKey": {}, "ParsePKCS8PrivateKey": {}, "Read": {}, "ReadAll": {}, "ReadAt": {}, "ReadFile": {}, "Unmarshal": {},
+	}
+	bannedLiterals := map[string]struct{}{
+		"/run/aiops/control-worker-secrets/v1": {},
+		"postgres-password":                    {},
+		"postgres-client-private-key.pkcs8":    {},
+		"temporal-starter-private-key.pkcs8":   {},
+		"temporal-control-private-key.pkcs8":   {},
+	}
+	err := filepath.WalkDir(filepath.Join(repositoryRoot, "internal/workerprocess"), func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(repositoryRoot, path)
+		if err != nil {
+			return err
+		}
+		relative = filepath.ToSlash(relative)
+		for _, imported := range parsed.Imports {
+			importPath, err := strconv.Unquote(imported.Path.Value)
+			if err != nil {
+				return err
+			}
+			_, exact := bannedImports[importPath]
+			if exact || strings.HasPrefix(importPath, "crypto/") || strings.HasPrefix(importPath, "encoding/") ||
+				strings.HasPrefix(importPath, "go.temporal.io/") || strings.Contains(importPath, "/internal/action") ||
+				strings.Contains(importPath, "/internal/credential") || strings.Contains(importPath, "/internal/runner") {
+				violations = append(violations, relative+" imports secret codec, runtime, dial, or claim capability "+importPath)
+			}
+		}
+		for _, declaration := range parsed.Decls {
+			specification, ok := declaration.(*ast.GenDecl)
+			if ok {
+				for _, item := range specification.Specs {
+					typeSpec, ok := item.(*ast.TypeSpec)
+					if !ok || typeSpec.Name.Name != "controlWorkerSecretSupplier" {
+						continue
+					}
+					supplierDeclarations++
+					if !validControlWorkerSecretSupplierType(typeSpec.Type) {
+						violations = append(violations, relative+" expands controlWorkerSecretSupplier beyond context, deadline budget, and three *os.File capabilities")
+					}
+				}
+			}
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil || !strings.Contains(strings.ToLower(function.Name.Name), "secret") {
+				continue
+			}
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				switch typed := node.(type) {
+				case *ast.BasicLit:
+					if typed.Kind != token.STRING {
+						return true
+					}
+					value, err := strconv.Unquote(typed.Value)
+					if err == nil {
+						if _, banned := bannedLiterals[value]; banned {
+							violations = append(violations, relative+":"+function.Name.Name+" embeds raw secret storage knowledge")
+						}
+					}
+				case *ast.CallExpr:
+					selector, ok := typed.Fun.(*ast.SelectorExpr)
+					if ok {
+						if _, banned := bannedSecretCalls[selector.Sel.Name]; banned {
+							violations = append(violations, relative+":"+function.Name.Name+" reads or encodes secret bytes through "+selector.Sel.Name)
+						}
+					}
+				case *ast.Ident:
+					if typed.Name == "controlWorkerReadyByte" {
+						violations = append(violations, relative+":"+function.Name.Name+" reaches the READY boundary")
+					}
+				}
+				return true
+			})
+		}
+		return nil
+	})
+	return violations, supplierDeclarations, err
+}
+
+func processImportAliases(parsed *ast.File) map[string]string {
+	aliases := make(map[string]string)
+	for _, imported := range parsed.Imports {
+		importPath, err := strconv.Unquote(imported.Path.Value)
+		if err != nil {
+			continue
+		}
+		alias := filepath.Base(importPath)
+		if imported.Name != nil {
+			alias = imported.Name.Name
+		}
+		aliases[alias] = importPath
+	}
+	return aliases
+}
+
+func secretBoundaryCallName(function ast.Expr, aliases map[string]string) string {
+	switch typed := function.(type) {
+	case *ast.Ident:
+		return typed.Name
+	case *ast.SelectorExpr:
+		qualifier, ok := typed.X.(*ast.Ident)
+		if !ok {
+			return ""
+		}
+		if aliases[qualifier.Name] == workerBootstrapProcessImport {
+			return "workerbootstrap." + typed.Sel.Name
+		}
+		return qualifier.Name + "." + typed.Sel.Name
+	default:
+		return ""
+	}
+}
+
+func validControlWorkerSecretSupplierType(expression ast.Expr) bool {
+	function, ok := expression.(*ast.FuncType)
+	if !ok || function.Params == nil || len(function.Params.List) != 5 ||
+		function.Results == nil || len(function.Results.List) != 1 {
+		return false
+	}
+	return processSelectorType(function.Params.List[0].Type, "context", "Context") &&
+		processSelectorType(function.Params.List[1].Type, "time", "Duration") &&
+		processPointerSelectorType(function.Params.List[2].Type, "os", "File") &&
+		processPointerSelectorType(function.Params.List[3].Type, "os", "File") &&
+		processPointerSelectorType(function.Params.List[4].Type, "os", "File") &&
+		processIdentifierType(function.Results.List[0].Type, "error")
+}
+
+func processSelectorType(expression ast.Expr, qualifier, name string) bool {
+	selector, ok := expression.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != name {
+		return false
+	}
+	identifier, ok := selector.X.(*ast.Ident)
+	return ok && identifier.Name == qualifier
+}
+
+func processPointerSelectorType(expression ast.Expr, qualifier, name string) bool {
+	pointer, ok := expression.(*ast.StarExpr)
+	return ok && processSelectorType(pointer.X, qualifier, name)
+}
+
+func processIdentifierType(expression ast.Expr, name string) bool {
+	identifier, ok := expression.(*ast.Ident)
+	return ok && identifier.Name == name
 }
 
 func TestSemanticSnapshotReadyProofHasOneProductionWrite(t *testing.T) {

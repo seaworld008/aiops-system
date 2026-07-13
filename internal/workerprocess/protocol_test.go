@@ -8,7 +8,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/seaworld008/aiops-system/internal/readassembly"
 )
@@ -50,6 +49,24 @@ func TestIsControlWorkerSourceLoaderChildRequiresExactPrivateArgument(t *testing
 	} {
 		if got := IsControlWorkerSourceLoaderChild(test.args); got != test.want {
 			t.Fatalf("IsControlWorkerSourceLoaderChild(%q) = %t, want %t", test.args, got, test.want)
+		}
+	}
+}
+
+func TestIsControlWorkerSecretLoaderChildRequiresExactPrivateArgument(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		args []string
+		want bool
+	}{
+		{args: []string{controlWorkerSecretLoaderArgument}, want: true},
+		{args: nil},
+		{args: []string{"--aiops-internal-control-worker-secret-loader"}},
+		{args: []string{controlWorkerLoaderArgument}},
+		{args: []string{controlWorkerSecretLoaderArgument, "extra"}},
+	} {
+		if got := IsControlWorkerSecretLoaderChild(test.args); got != test.want {
+			t.Fatalf("IsControlWorkerSecretLoaderChild(%q) = %t, want %t", test.args, got, test.want)
 		}
 	}
 }
@@ -434,34 +451,10 @@ func TestSupervisorCopyAndZeroValueFailClosed(t *testing.T) {
 	}
 }
 
-func TestProductionSupervisorSecretSupplierIsFixedUnavailableAndWritesNothing(t *testing.T) {
+func TestProductionSupervisorSecretSupplierIsInstalled(t *testing.T) {
 	settings := defaultSupervisorSettings()
 	if settings.supplySecrets == nil {
-		t.Fatal("production secret supplier is nil instead of fixed unavailable")
-	}
-	var readers [3]*os.File
-	var writers [3]*os.File
-	for index := range readers {
-		var err error
-		readers[index], writers[index], err = os.Pipe()
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := settings.supplySecrets(
-		context.Background(), time.Second, writers[0], writers[1], writers[2],
-	); err != errUnsupported {
-		t.Fatalf("production secret supplier error = %v, want %v", err, errUnsupported)
-	}
-	for index := range readers {
-		if err := writers[index].Close(); err != nil {
-			t.Fatal(err)
-		}
-		contents, err := io.ReadAll(readers[index])
-		_ = readers[index].Close()
-		if err != nil || len(contents) != 0 {
-			t.Fatalf("production supplier pipe %d = %x, %v; want empty EOF", index, contents, err)
-		}
+		t.Fatal("production secret supplier is nil")
 	}
 }
 

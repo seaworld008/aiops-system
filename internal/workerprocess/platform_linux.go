@@ -51,6 +51,187 @@ func buildSourceLoaderCommand(pidFD *int) *exec.Cmd {
 	return command
 }
 
+func productionControlWorkerSecretSupplier(
+	ctx context.Context,
+	timeout time.Duration,
+	postgres *os.File,
+	starter *os.File,
+	control *os.File,
+) error {
+	pidFD := -1
+	return supplyControlWorkerSecretsFromCommand(
+		ctx,
+		timeout,
+		buildSecretLoaderCommand(&pidFD),
+		postgres,
+		starter,
+		control,
+	)
+}
+
+func buildSecretLoaderCommand(pidFD *int) *exec.Cmd {
+	command := exec.Command(controlWorkerExecutable, controlWorkerSecretLoaderArgument)
+	command.Args = []string{controlWorkerExecutable, controlWorkerSecretLoaderArgument}
+	command.Env = []string{}
+	command.Dir = "/"
+	command.Stdin = nil
+	command.Stdout = io.Discard
+	command.Stderr = io.Discard
+	command.ExtraFiles = nil
+	command.WaitDelay = controlWorkerWaitDelay
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL, PidFD: pidFD}
+	return command
+}
+
+func supplyControlWorkerSecretsFromCommand(
+	ctx context.Context,
+	timeout time.Duration,
+	command *exec.Cmd,
+	postgres *os.File,
+	starter *os.File,
+	control *os.File,
+) error {
+	if !validFixedSecretLoaderCommand(command) {
+		return errChildStart
+	}
+	return supplyControlWorkerSecretsFromCommandUnchecked(
+		ctx,
+		timeout,
+		command,
+		postgres,
+		starter,
+		control,
+	)
+}
+
+func supplyControlWorkerSecretsFromCommandUnchecked(
+	ctx context.Context,
+	timeout time.Duration,
+	command *exec.Cmd,
+	postgres *os.File,
+	starter *os.File,
+	control *os.File,
+) error {
+	writers := [3]*os.File{postgres, starter, control}
+	if ctx == nil || ctx.Err() != nil || timeout <= 0 || command == nil || command.Process != nil ||
+		len(command.ExtraFiles) != 0 || command.SysProcAttr == nil || command.SysProcAttr.PidFD == nil ||
+		!validSecretLoaderWriters(writers) {
+		return errChildStart
+	}
+	deadline := time.Now().Add(timeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if time.Until(deadline) <= 0 || startSecretLoaderCommand(command, writers) != nil {
+		return errChildStart
+	}
+	// Start has duplicated the three write capabilities into child FD3-FD5.
+	// Drop the supervisor copies immediately so EOF is controlled solely by the
+	// short-lived loader, never by the long-lived parent.
+	closeControlWorkerFiles(writers[:])
+	pidFD := *command.SysProcAttr.PidFD
+	if pidFD < 0 {
+		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+		_ = containStartedCommandWithoutPIDFD(command, nil, sourceLoaderKillConfirmation)
+		return errChildStart
+	}
+	exitDone := make(chan struct{})
+	var exitTrusted atomic.Bool
+	go func() {
+		exitTrusted.Store(waitPIDFD(pidFD) == nil)
+		close(exitDone)
+	}()
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		remaining = time.Nanosecond
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	kill := false
+	select {
+	case <-exitDone:
+		if !exitTrusted.Load() {
+			kill = true
+		}
+	case <-ctx.Done():
+		kill = true
+	case <-timer.C:
+		kill = true
+	}
+	contained, waitErr := finalizeSourceLoader(
+		command,
+		nil,
+		pidFD,
+		exitDone,
+		&exitTrusted,
+		kill,
+		sourceLoaderKillConfirmation,
+	)
+	if kill || !contained || waitErr != nil || ctx.Err() != nil || time.Until(deadline) <= 0 {
+		return errChildStart
+	}
+	return nil
+}
+
+func validFixedSecretLoaderCommand(command *exec.Cmd) bool {
+	if command == nil || command.Path != controlWorkerExecutable || len(command.Args) != 2 ||
+		command.Args[0] != controlWorkerExecutable || command.Args[1] != controlWorkerSecretLoaderArgument ||
+		command.Env == nil || len(command.Env) != 0 || command.Dir != "/" || command.Stdin != nil ||
+		command.Stdout != io.Discard || command.Stderr != io.Discard || len(command.ExtraFiles) != 0 ||
+		command.WaitDelay != controlWorkerWaitDelay || command.Cancel != nil || command.Process != nil ||
+		command.ProcessState != nil || command.Err != nil || command.SysProcAttr == nil ||
+		command.SysProcAttr.PidFD == nil || *command.SysProcAttr.PidFD != -1 {
+		return false
+	}
+	want := &syscall.SysProcAttr{
+		Setpgid: true, Pdeathsig: syscall.SIGKILL, PidFD: command.SysProcAttr.PidFD,
+	}
+	return reflect.DeepEqual(command.SysProcAttr, want)
+}
+
+func startSecretLoaderCommand(command *exec.Cmd, writers [3]*os.File) (returnedErr error) {
+	defer func() {
+		if recover() != nil {
+			returnedErr = errChildStart
+		}
+		if command != nil {
+			command.ExtraFiles = nil
+		}
+	}()
+	if command == nil || command.Process != nil || len(command.ExtraFiles) != 0 ||
+		!validSecretLoaderWriters(writers) {
+		return errChildStart
+	}
+	command.ExtraFiles = []*os.File{writers[0], writers[1], writers[2]}
+	if err := command.Start(); err != nil {
+		return errChildStart
+	}
+	return nil
+}
+
+func validSecretLoaderWriters(writers [3]*os.File) bool {
+	seen := make(map[[2]uint64]struct{}, len(writers))
+	for _, writer := range writers {
+		if writer == nil {
+			return false
+		}
+		var stat unix.Stat_t
+		flags, flagsErr := unix.FcntlInt(writer.Fd(), unix.F_GETFL, 0)
+		descriptorFlags, descriptorErr := unix.FcntlInt(writer.Fd(), unix.F_GETFD, 0)
+		if unix.Fstat(int(writer.Fd()), &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFIFO ||
+			flagsErr != nil || flags&unix.O_ACCMODE != unix.O_WRONLY || descriptorErr != nil ||
+			descriptorFlags&unix.FD_CLOEXEC == 0 {
+			return false
+		}
+		identity := [2]uint64{uint64(stat.Dev), stat.Ino}
+		if _, duplicate := seen[identity]; duplicate {
+			return false
+		}
+		seen[identity] = struct{}{}
+	}
+	return true
+}
+
 func loadControlWorkerSourceFromCommand(
 	ctx context.Context,
 	timeout time.Duration,
@@ -421,8 +602,15 @@ func acceptControlWorkerChildWithSource(
 }
 
 func fixedInheritedDescriptorsAreDistinct() bool {
-	seen := make(map[[2]uint64]struct{}, controlWorkerControlFD-int(controlWorkerStatusFD)+1)
-	for descriptor := int(controlWorkerStatusFD); descriptor <= controlWorkerControlFD; descriptor++ {
+	return inheritedDescriptorRangeIsDistinct(int(controlWorkerStatusFD), controlWorkerControlFD)
+}
+
+func inheritedDescriptorRangeIsDistinct(minimum, maximum int) bool {
+	if minimum < 0 || maximum < minimum {
+		return false
+	}
+	seen := make(map[[2]uint64]struct{}, maximum-minimum+1)
+	for descriptor := minimum; descriptor <= maximum; descriptor++ {
 		var stat unix.Stat_t
 		if unix.Fstat(descriptor, &stat) != nil {
 			return false
@@ -480,6 +668,37 @@ func runControlWorkerSourceLoaderChild() error {
 		return errInvalidChildInvocation
 	}
 	if err := workerbootstrap.WriteProductionSourceToLoaderFD(); err != nil {
+		return errInvalidChildInvocation
+	}
+	return nil
+}
+
+func runControlWorkerSecretLoaderChild() error {
+	if len(os.Environ()) != 0 {
+		return errInvalidChildInvocation
+	}
+	workingDirectory, err := os.Getwd()
+	if err != nil || workingDirectory != "/" {
+		return errInvalidChildInvocation
+	}
+	pid := os.Getpid()
+	group, groupErr := syscall.Getpgid(0)
+	deathSignal, deathErr := currentParentDeathSignal()
+	if groupErr != nil || deathErr != nil || pid <= 1 || group != pid || os.Getppid() <= 0 ||
+		deathSignal != syscall.SIGKILL ||
+		!inheritedDescriptorRangeIsDistinct(
+			int(controlWorkerStatusFD),
+			controlWorkerSecretLoaderMaxFD,
+		) {
+		return errInvalidChildInvocation
+	}
+	for descriptor := int(controlWorkerStatusFD); descriptor <= controlWorkerSecretLoaderMaxFD; descriptor++ {
+		unix.CloseOnExec(descriptor)
+	}
+	if !onlyExpectedInheritedDescriptors(controlWorkerSecretLoaderMaxFD) {
+		return errInvalidChildInvocation
+	}
+	if err := workerbootstrap.WriteProductionSecretsToLoaderFDs(); err != nil {
 		return errInvalidChildInvocation
 	}
 	return nil
@@ -571,93 +790,108 @@ func runControlWorkerSupervisor(ctx context.Context, settings supervisorSettings
 	}
 	startup := time.NewTimer(remaining)
 	defer startup.Stop()
-	var secretSupply <-chan error
+	var secretSupply *controlWorkerSecretSupplyOperation
+	var secretSupplySignal <-chan error
+	stopSecretSupply := func() {
+		if secretSupply != nil {
+			secretSupply.cancelAndWait()
+			secretSupply = nil
+			secretSupplySignal = nil
+		}
+	}
+	defer stopSecretSupply()
+	rejectStartup := func(cause error) error {
+		stopSecretSupply()
+		return rejectAfterContainment(process, settings, cause)
+	}
+	terminateStartup := func(grace time.Duration, cleanResult error, exitFallback error) error {
+		stopSecretSupply()
+		return terminateControlWorker(
+			process,
+			settings,
+			events,
+			outputExceeded,
+			grace,
+			cleanResult,
+			exitFallback,
+		)
+	}
 	secretSupplied := false
 	for {
 		select {
 		case event, ok := <-events:
 			if !ok {
-				return rejectAfterContainment(process, settings, errChildProtocol)
+				return rejectStartup(errChildProtocol)
 			}
 			switch event {
 			case childEventSecretReady:
 				if secretSupply != nil || secretSupplied {
-					return rejectAfterContainment(process, settings, errChildProtocol)
+					return rejectStartup(errChildProtocol)
 				}
 				if ctx.Err() != nil {
-					return terminateControlWorker(
-						process, settings, events, outputExceeded,
-						settings.startupGrace, nil, errChildStartup,
-					)
+					return terminateStartup(settings.startupGrace, nil, errChildStartup)
 				}
 				remaining = time.Until(startupDeadline)
 				if remaining <= 0 {
-					return terminateControlWorker(
-						process, settings, events, outputExceeded,
-						settings.startupGrace, errChildStartup, errChildStartup,
-					)
+					return terminateStartup(settings.startupGrace, errChildStartup, errChildStartup)
 				}
 				secretSupply = beginControlWorkerSecretSupply(ctx, remaining, settings.supplySecrets, process)
+				secretSupplySignal = secretSupply.result
 			case childEventReady:
 				if time.Until(startupDeadline) <= 0 {
-					return terminateControlWorker(
-						process, settings, events, outputExceeded,
-						settings.startupGrace, errChildStartup, errChildStartup,
-					)
+					return terminateStartup(settings.startupGrace, errChildStartup, errChildStartup)
 				}
 				if !secretSupplied {
 					select {
-					case supplyErr := <-secretSupply:
+					case supplyErr := <-secretSupplySignal:
+						secretSupply.finish()
 						secretSupply = nil
+						secretSupplySignal = nil
 						if supplyErr != nil {
-							return rejectAfterContainment(process, settings, errChildStart)
+							return rejectStartup(errChildStart)
 						}
 						if time.Until(startupDeadline) <= 0 {
-							return terminateControlWorker(
-								process, settings, events, outputExceeded,
-								settings.startupGrace, errChildStartup, errChildStartup,
-							)
+							return terminateStartup(settings.startupGrace, errChildStartup, errChildStartup)
 						}
 						secretSupplied = true
 					default:
-						return rejectAfterContainment(process, settings, errChildProtocol)
+						return rejectStartup(errChildProtocol)
 					}
 				}
 				return superviseReadyControlWorker(ctx, settings, process, events, outputExceeded)
 			case childEventFatal:
-				return rejectAfterContainment(process, settings, errChildFatal)
+				return rejectStartup(errChildFatal)
 			default:
-				return rejectAfterContainment(process, settings, errChildProtocol)
+				return rejectStartup(errChildProtocol)
 			}
 		case <-outputExceeded:
-			return rejectAfterContainment(process, settings, errOutputLimit)
+			return rejectStartup(errOutputLimit)
 		case <-process.exitDone:
 			cause := classifyExitedControlWorker(events, outputExceeded, errChildStartup)
-			return rejectAfterContainment(process, settings, cause)
+			return rejectStartup(cause)
 		case <-startup.C:
-			return terminateControlWorker(
-				process, settings, events, outputExceeded,
-				settings.startupGrace, errChildStartup, errChildStartup,
-			)
+			return terminateStartup(settings.startupGrace, errChildStartup, errChildStartup)
 		case <-ctx.Done():
-			return terminateControlWorker(
-				process, settings, events, outputExceeded,
-				settings.startupGrace, nil, errChildStartup,
-			)
-		case supplyErr := <-secretSupply:
+			return terminateStartup(settings.startupGrace, nil, errChildStartup)
+		case supplyErr := <-secretSupplySignal:
+			secretSupply.finish()
 			secretSupply = nil
+			secretSupplySignal = nil
 			if supplyErr != nil {
-				return rejectAfterContainment(process, settings, errChildStart)
+				return rejectStartup(errChildStart)
 			}
 			if time.Until(startupDeadline) <= 0 {
-				return terminateControlWorker(
-					process, settings, events, outputExceeded,
-					settings.startupGrace, errChildStartup, errChildStartup,
-				)
+				return terminateStartup(settings.startupGrace, errChildStartup, errChildStartup)
 			}
 			secretSupplied = true
 		}
 	}
+}
+
+type controlWorkerSecretSupplyOperation struct {
+	result chan error
+	done   chan struct{}
+	cancel context.CancelFunc
 }
 
 func beginControlWorkerSecretSupply(
@@ -665,16 +899,38 @@ func beginControlWorkerSecretSupply(
 	timeout time.Duration,
 	supplier controlWorkerSecretSupplier,
 	process *controlWorkerProcess,
-) <-chan error {
-	result := make(chan error, 1)
+) *controlWorkerSecretSupplyOperation {
+	supplyCtx, cancel := context.WithCancel(ctx)
+	operation := &controlWorkerSecretSupplyOperation{
+		result: make(chan error, 1),
+		done:   make(chan struct{}),
+		cancel: cancel,
+	}
 	go func() {
-		result <- process.supplySecrets(ctx, timeout, supplier)
+		operation.result <- process.supplySecrets(supplyCtx, timeout, supplier)
 		// The completion result is buffered before EOF is published. Therefore a
 		// child cannot legitimately report READY before the supervisor can prove
 		// that the supplier returned successfully.
 		process.closeSecretWriters()
+		close(operation.done)
 	}()
-	return result
+	return operation
+}
+
+func (operation *controlWorkerSecretSupplyOperation) finish() {
+	if operation == nil {
+		return
+	}
+	<-operation.done
+	operation.cancel()
+}
+
+func (operation *controlWorkerSecretSupplyOperation) cancelAndWait() {
+	if operation == nil {
+		return
+	}
+	operation.cancel()
+	<-operation.done
 }
 
 func superviseReadyControlWorker(

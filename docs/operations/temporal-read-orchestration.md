@@ -1,6 +1,6 @@
 # Temporal READ investigation orchestration
 
-阶段：M5C2-4b / M5C2-4c1a / M5C2-4c1b / M5C2-4c2a / M5C2-4c2b0 / M5C2-4c2b1a / M5C2-4c2b1b0 / M5C2-4c2b1b1 / M5C2-4c2b1b2a（版本化只读编排、
+阶段：M5C2-4b / M5C2-4c1a / M5C2-4c1b / M5C2-4c2a / M5C2-4c2b0 / M5C2-4c2b1a / M5C2-4c2b1b0 / M5C2-4c2b1b1 / M5C2-4c2b1b2a / M5C2-4c2b1b2b（版本化只读编排、
 Plan-bound Runner 路由、角色隔离的 Temporal 控制边界、fail-closed 子进程 containment 与预装配
 进程逃逸静态门禁；真实 Worker/Outbox/Runner 尚未装配，READ claims 关闭）
 
@@ -15,8 +15,9 @@ Admission，生产代码仍没有打开 READ claims 的构造器；WRITE claims 
 C2-4c2b1a 只新增固定根 public-source snapshot 与 sealed memfd capability。C2-4c2b1b0 将它以唯一固定
 FD4 交给 contained child，并在 child 内重复验证 descriptor、frame、工件闭包与证书。C2-4c2b1b1 再从
 同一次验证捕获的四份 manifest 与 target CA 闭包构造真实语义 Snapshot，完整比较
-`expected_snapshot`。C2-4c2b1b2a 再加入非 READY 的 `SECRET_READY`、固定 FD5–FD7 和证书私钥绑定；生产
-secret supplier 仍固定不可用，因此不 Dial、不 READY。
+`expected_snapshot`。C2-4c2b1b2a 再加入非 READY 的 `SECRET_READY`、固定 FD5–FD7 和证书私钥绑定；
+C2-4c2b1b2b 将独立 tmpfs 固定根的 secret-loader 安装为生产 supplier，并证明取消、deadline、后代与
+异常退出均同步 kill/reap。runtime factory 仍固定不可用，因此不 Dial、不 READY。
 
 ## C2-4c2a 进程级 containment
 
@@ -126,9 +127,10 @@ Dial/READY 前失败。Starter/Control/PostgreSQL 的证书不同也不等于企
 数据库授权已经隔离；这些仍是外部 Go/No-Go 门禁。
 
 当前 capability 已进入固定 FD4 并完成语义 Snapshot 比较；父进程同时预建空的 FD5–FD7 匿名 pipe，只有
-child 发出非 READY 的 `SECRET_READY` 后才允许调用 supplier。child 对三份有界 role frame 做完整性、精确
-EOF、P-256 PKCS#8 与 FD4 client certificate SPKI 绑定校验，但生产 supplier 仍固定不可用；因此不创建
-PostgreSQL pool，不执行 Temporal Dial、不安装 Outbox，也不发送 READY。
+child 发出非 READY 的 `SECRET_READY` 后才允许调用 supplier。生产 supplier 已固定为下一节的独立
+secret-loader；child 仍对三份有界 role frame 做完整性、精确 EOF、P-256 PKCS#8 与 FD4 client certificate
+SPKI 绑定校验。固定 runtime factory 仍不可用，因此不创建 PostgreSQL pool，不执行 Temporal Dial、不安装
+Outbox，也不发送 READY。
 
 ## C2-4c2b1b0 固定 FD4 与 child 独立复验
 
@@ -204,9 +206,39 @@ PKCS#8，两个 Temporal frame 各只含对应角色 PKCS#8；三者均只接受
 与 Close 会清空 owned buffer 并永久消费 capability。Go heap 与加密库内部复制不构成物理内存清零证明，
 部署仍需 dump/ptrace、swap 与节点内存控制。
 
-b1b2a 的生产 supplier 和 `newControlChildRuntime` 都固定 unavailable，用于证明 transport/barrier 而不是伪造
-企业 Secret 集成。因此当前仍是零 PostgreSQL/Temporal Dial、零 Worker Start、零 READY、零 claims；
-b1b2b 才允许在 `S` 之后启动受 containment 的固定 secret-loader，并补齐崩溃/强杀时的 loader 回收证据。
+b1b2a 先只证明 transport/barrier；b1b2b 已按下一节把生产 supplier 固定为受 containment 的
+secret-loader。`newControlChildRuntime` 仍固定 unavailable，因此当前仍是零 PostgreSQL/Temporal Dial、
+零 Worker Start、零 READY、零 claims。
+
+## C2-4c2b1b2b 独立固定根 secret-loader
+
+生产 Secret 根固定为 `/run/aiops/control-worker-secrets/v1`，不位于公共
+`/run/aiops/control-worker/v1` 之下，也不存在 fallback 或交叉读取。该根必须位于 tmpfs；祖先必须由 root 或当前
+euid 拥有且不可被 group/world 写，最终 `v1` 必须为当前 euid 的精确 `0700`。四个固定 `0400`、当前
+euid、`nlink=1` regular file 分别是 `postgres-password`、`postgres-client-private-key.pkcs8`、
+`temporal-starter-private-key.pkcs8` 和 `temporal-control-private-key.pkcs8`。POSIX ACL、`user.*`、未知
+xattr、symlink、hardlink、FIFO、device、普通磁盘文件、空文件和超限文件全部拒绝。部署不能直接使用
+Kubernetes Secret 的 symlink/`..data` 投影；必须由受控初始化步骤复制到独立 memory-backed `emptyDir`
+或提供同等 inode/mode/owner/tmpfs 证明的 CSI mount。
+
+loader 先打开并验证全部四个固定文件，再对每个已钉住 FD 做前后 stat 与两次有界 `pread`，重开完整目录
+链核对 root identity；只有密码、三份 canonical ECDSA P-256 PKCS#8 和三把互异公钥全部通过后才编码任何
+输出。三帧沿用 b1b2a 的固定 role/magic/version/长度/domain-separated SHA-256 协议且各自小于
+`PIPE_BUF`。loader 直接将 PostgreSQL、Temporal Starter、Temporal Control 帧写到自身固定 FD3、FD4、
+FD5；父进程只转交三个互异的 `O_WRONLY` 匿名 FIFO，并在 `Start` 后立即关闭自己的 writer，不读取、解析、
+缓冲或记录任何 Secret 字节。control child 继续在固定 FD5–FD7 上独立验证 role、精确 EOF 和证书 SPKI，
+所以交换 writer、截断、重复 key 或部分写不会发布 bundle。
+
+secret-loader 使用独立隐藏参数、固定 `/proc/self/exe`、空环境、`cwd=/`、nil stdin、丢弃 stdout/stderr、
+独立 PGID、`Pdeathsig=SIGKILL` 和 pidfd；调用方不能传 path、argv、env、文件名、role 或额外 FD。它只在
+合法且唯一的 `S` 后启动，并占用最初 30 秒 startup deadline 的剩余预算。成功必须同时证明 pidfd 可信
+退出、原 PGID 无成员、唯一 `Wait` 成功、pidfd 关闭且进程组消失。取消、超时、panic、读取/写入失败、
+非零退出或 surviving descendant 都会整组 `SIGKILL` 并同步回收；异步 supplier operation 在 supervisor
+返回前必须 cancel/join，不能遗留后台 loader。PGID 仍不能证明恶意后代没有 `setsid` 逃逸，因此真实 claims
+之前的每作业 cgroup/PID namespace、seccomp/LSM 和网络隔离仍是外部门禁。
+
+本切片没有 PostgreSQL/Temporal Dial、Worker Start、READY、Outbox dispatcher 或 READ claims；下一切片
+只能在同一 contained control child 内装配真实客户端/runtime，并继续由关闭态 Admission 阻止任务推进。
 
 ## 角色隔离的 Temporal 控制边界
 
