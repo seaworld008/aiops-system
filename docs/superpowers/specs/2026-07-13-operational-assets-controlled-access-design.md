@@ -180,15 +180,20 @@ AWX_INVENTORY
 
 来源枚举本身不等于已支持。除 `MANUAL` 外，每种来源都必须有独立生产 Adapter、真实验证、opaque `CredentialReference`、最小权限、增量 cursor/checkpoint、durable lease/fencing、限流/退避、字段 provenance、软删除/恢复和真实协议 E2E，并通过自己的 `AVAILABLE` gate 后才能创建权威 Observation。`CONTROL_PLANE_API` 使用有 Scope 的机器身份和幂等批次；`CSV_IMPORT` 使用签名批次、严格 schema 与隔离解析；CMDB、vSphere、Proxmox、OpenStack、Cloud、Kubernetes Operator 和 AWX 各自保持独立 Provider contract，不能退化为任意 endpoint/JSON 采集器。缺 Adapter、身份、验证或 gate 的类型必须明确 `UNAVAILABLE`，不得仅凭 SourceKind 接受数据。
 
+Source 执行契约同样属于安全边界：每个 Source 最多一个 durable nonterminal Run；Validation 只绑定待验证 Revision 的空 checkpoint shape，不能读取、比较或推进已发布 Source checkpoint。Gate epoch 采用闭合算术：起点 `G` 的首次发布路径为 Validation Run `G`、publication `UNAVAILABLE/G+1`、open `AVAILABLE/G+2`；显式可见验证路径为 Source `VALIDATING/G+1`、publication `UNAVAILABLE/G+2`、open `AVAILABLE/G+3`；稳定 `AVAILABLE` 更新不得改变 epoch/binding；lineage rollover 则固定为 Run `G`、执行期 `DEGRADED/G+1`、terminal `AVAILABLE|SUSPENDED/G+2`。任何 epoch 跳跃、无治理事实的单独递增或旧验证证明复用都拒绝。成功数据页和 Validation 必须分别封存不可变 `DATA_PROJECTION`、`VALIDATION_PROOF` 后进入 `FINALIZING`，再以 Broker-owned opaque cleanup attempt 完成凭据/会话吊销；cleanup 不确定必须 `FAILED + SUSPENDED`，不能覆盖已经封存的 work result 或伪造成功。`Complete/Fail` 持久化由完整 terminal tuple 计算的 `terminal_command_sha256`，并写 exact `ASSET_SOURCE_RUN/TERMINAL_COMMITTED` receipt `request_id="source-terminal:<run_uuid>"`、`payload_hash=terminal_command_sha256` 后才销毁 raw fence；响应丢失只能按该 receipt 只读重放。Terminal Run、其 receipt、Validation Revision `VALIDATED|REJECTED` 或数据 Source success/complete/gate closure 必须在同一 serializable transaction 原子闭合；cleanup `UNCERTAIN` 缺 Source `SUSPENDED` 时整笔回滚。
+
+Observation 只在 live exact lease/fence、published Source definition/gate/checkpoint 与 next page 均匹配时接纳，并由 deferred closure 绑定同事务 `PAGE_APPLIED` receipt。page transaction 先读取固定的服务端 `transaction_timestamp()`，Go 以该值构造唯一 canonical provenance/chain bytes，PostgreSQL 再精确复验；生产 INSERT 不得用 SQL 构造 JSON/canonical bytes，也不得依赖下一语句才确定的 `statement_timestamp()`。Relationship 额外持久 `accepted_checkpoint_version/run_fence_epoch`，使用独立 `RELATION_PAGE_COMMITTED` receipt `request_id="source-relation-page:<run_uuid>:<page_sequence>"`、`payload_hash=relation_page_sha256`，不能借用资产页 receipt。任何 `complete_snapshot=true` 的 final page 必须在同一事务把关系页序号精确推进一次、封存新的关系页 digest 与 exact receipt；关系为空也必须提交 canonical empty relation page。Provider cursor/resourceVersion 失效只能让同一 fenced Run 走受治理 checkpoint-lineage rollover：Run 的原 gate revision 不变，执行期 Source 固定为 `run+1/DEGRADED`，terminal 固定为 `run+2/AVAILABLE|SUSPENDED`；旧 checkpoint 在 successor page CAS 前保持不变，version 单调递增，禁止同修订任意清零/回退或创建旁路 Run。`MANUAL_V1` 是唯一无外部 Adapter 的同步特例；`MANUAL` Source 创建时即必须绑定 `provider_kind=MANUAL_V1`，Revision 必须使用 `profile_code=MANUAL_V1` 且 Credential/Trust/Network references 全为 `NULL`，非 MANUAL 不得声明该 Provider/Profile。它没有 Provider cursor，因此不得进入 checkpoint-lineage rollover；`NO_CREDENTIAL` 必须由 exact Run/Revision/fence 确定性求 digest并有 exact `ATTEMPT_CLEANED` receipt。MANUAL 不能进入 Broker `PENDING|REVOKED|UNCERTAIN`、pending `DELAY`、`DELAYED` 或 cleanup reset；任何非终态 MANUAL Run 在事务提交点都由 deferred guard 拒绝，故 Validation/MANUAL_MUTATION 必须在同一 serializable API transaction 内完成全部 Run/receipt/Revision-or-Source closure，失败整笔回滚且不留下 Run。但它仍须经过 exact Revision/Validation/Run/Observation/Audit 路径，并且其 `SINGLE_ENVIRONMENT` Source 只能在该唯一 authority Environment 创建资产。`MANUAL_MUTATION` 绝不是 authoritative complete snapshot，`complete_snapshot/effective_complete_snapshot` 均为 `false`，成功只推进 `last_success` 而不推进 `last_complete_snapshot`。
+
 字段所有权规则：
 
-- `external_id`、Provider 类型、来源版本和发现时间由来源拥有，人工不可修改。
+- `external_id`、Provider 类型、Source 定义修订、Provider 事实新鲜度和发现时间由来源拥有，人工不可修改。其中持久 `source_revision` 只表示不可变 Source definition revision，不得复用为 Provider object version；Provider 版本/时间/快照顺序必须经闭合 Adapter 转为可持久、可对比的 freshness proof。`observed_at` 是服务端在锁定上一条事实后生成的 Catalog 接纳时间；Provider event/update time 只进入 freshness/checkpoint proof。
 - Service、Owner、关键度、数据等级与人工标签由治理人员拥有，发现同步不可覆盖。
 - 健康、观测版本、组件数量与运行状态由最新有效 Observation 投影。
 - 同一字段出现来源冲突时创建 `AssetConflict`，不按名称或优先级静默合并。
 - 去重键为 `(tenant_id, workspace_id, source_id, provider_kind, external_id)`。
 - 跨来源合并必须产生显式 Merge Decision、版本和审计记录。
 - `MANUAL` 资产只登记稳定身份、Owner、作用域和连接候选，不声明外部系统的期望状态；一旦与权威来源建立映射，来源事实和人工治理字段仍按字段所有权分别维护。
+- 资产事实与关系事实分别分页和校验：关系是 top-level、带双端 Environment、独立 freshness/version/fact digest 的事实，不得为了承载后续关系而在同一 Run 重复资产 Observation。完整快照必须先提交最终页关系坐标，再对全 Run 未出现的资产和关系执行 soft stale/inactive closure。
 
 ### 5.3 生命周期与关系
 

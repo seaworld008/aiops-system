@@ -9,8 +9,8 @@ import (
 
 // newLatestRuntimeFixture is intentionally separate from newRuntimeFixture.
 // The latter remains a pre-cutover 000010 fixture for migration compatibility
-// tests, while repository lifecycle tests must exercise the current schema and
-// bound v2 facts produced through the real write path.
+// tests, while repository lifecycle tests exercise the latest investigation-owned
+// schema through 000014 and bound v2 facts produced through the real write path.
 func newLatestRuntimeFixture(t *testing.T) runtimeFixture {
 	t.Helper()
 	ids := []string{

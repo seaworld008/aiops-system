@@ -31,6 +31,7 @@
 
 - `assetcatalog.Scope`、`AssetLocator`、`Reader.Get(context.Context, AssetLocator) (Asset,error)` 和 `assets UNIQUE (tenant_id,workspace_id,environment_id,id)`。
 - 稳定 `asset_sources` + append-only/content-addressed `asset_source_revisions`，以及 fenced Run、encrypted checkpoint、Observation/provenance、Asset/Conflict/Relationship/Binding 事实。
+- `source_revision` 唯一表示 Source definition revision；Provider 事实新鲜度用 profile-locked `FreshnessCandidate` 与 append-only Observation chain 持久，不同 Run 可追加同一未变事实，同 Run 漂移重放、时间/序列回退或碰撞整页关闭。
 - `SourceRevisionRepository`、`discoverysource.Provider`、`discoveryqueue.Queue`、`discoveryworker.Worker` 和真实 `cmd/discovery-worker`。
 - 严格 Control Plane OpenAPI、`ASSET_*`/`ASSET_SOURCE_*` 权限、`effective_actions`、签名 Cursor、ETag/Idempotency/RFC 9457 和唯一生成 TypeScript 契约。
 - 唯一 `web/` 壳层、`/overview`、`/assets`、`/asset-mappings`、`/asset-sources` 与 Source revision wizard；持久设计文档 `foundation-assets.md`、`asset-sources.md`、`overview.md`。

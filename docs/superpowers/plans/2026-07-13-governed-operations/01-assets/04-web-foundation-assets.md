@@ -578,7 +578,7 @@ Top banners for STALE/QUARANTINED/AMBIGUOUS/UNRESOLVED state reason, impact, and
 
 - [ ] **Step 4: Implement governed create/edit/quarantine/retire flows**
 
-“添加资产” is shown only for collection `CREATE_ASSET`. The Radix dialog states: “仅登记可运维引用；不会创建、接管或连接外部资源。” RHF+Zod accepts an ACTIVE `MANUAL` source selected from the real Source API plus kind/external ID/display name/owner/criticality/data classification/safe labels；服务端从 Source 固定派生 `provider_kind=MANUAL`，浏览器不提交该字段。If no MANUAL source exists, show a disabled explanation that Source creation becomes available only after Task 16's complete revision/profile flow; do not invent browser state or a reduced create form. It sends a fresh `crypto.randomUUID()` Idempotency-Key; never renders endpoint, credential, raw JSON, command, SQL, Header, or Body fields.
+“添加资产” is shown only for collection `CREATE_ASSET`. The Radix dialog states: “仅登记可运维引用；不会创建、接管或连接外部资源。” It loads the server-filtered query `usage=manual_asset_create&environment_id=<current environment>` and offers only rows whose server `effective_actions` contains `CREATE_ASSET`；the browser never infers eligibility from status/role names. The server admits only exact `MANUAL/MANUAL + ACTIVE + PUBLISHED + AVAILABLE` Sources whose `SINGLE_ENVIRONMENT` authority equals the current path Environment. RHF+Zod accepts that opaque `source_id` plus kind/external ID/display name/owner/criticality/data classification/safe labels；服务端固定派生 Provider/revision/freshness/run facts，浏览器不提交。If no eligible MANUAL source exists, show a disabled explanation that Source creation becomes available only after Task 16's complete revision/profile flow；do not invent browser state or a reduced create form. It sends a fresh `crypto.randomUUID()` Idempotency-Key；never renders endpoint, credential, raw JSON, command, SQL, Header, or Body fields.
 
 Edit is shown only for `EDIT_GOVERNANCE`, preloads governance fields, and sends the latest ETag. Quarantine/retire use AlertDialog with asset name/ID, impact, required bounded reason, and ETag. A 409 keeps the dialog open and renders old vs server version with “重新加载并审阅”; it never auto-retries a governance mutation. Success renders a persistent inline result with audit/trace ID and refetches.
 
@@ -705,7 +705,7 @@ git commit -m "feat(web): add explicit asset mapping workbench"
 it("resumes an existing run timeline after refresh without exposing premature actions", async () => {
   renderSources("/asset-sources?workspace=w&sourceId=s&runId=r");
   expect(await screen.findByText("发现完成")).toBeVisible();
-  expect(screen.getByText("新增 2")).toBeVisible();
+  expect(screen.getByText("已创建 2")).toBeVisible();
   expect(screen.queryByRole("button", { name: /创建来源|立即同步/ })).not.toBeInTheDocument();
   expect(screen.queryByText(/raw_payload|access_token|provider_error/)).not.toBeInTheDocument();
 });
@@ -717,13 +717,13 @@ Expected: FAIL because discovery UI does not exist.
 
 - [ ] **Step 2: Implement source inventory and run timeline**
 
-The list shows source type/provider/name/authority scope/sync mode/status/last success/current cursor digest and observed/new/changed/conflict/stale/rejected counts. Never show raw cursor, payload, credential, endpoint or provider error.
+The list shows source type/provider/name/authority scope/sync mode/status/last success/current cursor digest. Its `last_run_counts` are the exact `observed/created/changed/unchanged/conflicts/missing/stale/restored/tombstoned/rejected` values from the server's `last_success_run_id` only；a separate current-run area uses `current_run_counts` only while the one nonterminal Run exists. Neither display sums history, and `PARTIAL` remains visible in the timeline without replacing last-success counts. Never show raw cursor, payload, credential, endpoint or provider error.
 
 Pack 04 intentionally renders neither Source creation nor “立即同步”: the complete immutable revision/profile contract is not implemented until Pack 05, and the API returns no such `effective_actions` here. Task 16 extends this same page with the six-step Source+revision workspace and governed sync action; it must not revive a reduced Provider/Integration form.
 
-For a selected existing run, poll `GET asset-source-runs/{runId}` every 2 seconds only while `QUEUED|RUNNING`, pause when the tab is hidden, resume on focus, and stop on `SUCCEEDED|PARTIAL|FAILED|CANCELLED`.
+For a selected existing run, poll `GET asset-source-runs/{runId}` every 2 seconds only while `QUEUED|DELAYED|RUNNING|FINALIZING`, pause when the tab is hidden, resume on focus, and stop on `SUCCEEDED|PARTIAL|FAILED|CANCELLED`.
 
-Timeline stages are 请求已接受 → 等待执行 → 读取来源 → 规范化 → 合并投影 → 完成. The server exposes stable stage/status/counts; failed runs show stable error code + Trace ID and a permitted retry action, never upstream text. Completion links conflicts to the mapping workbench while preserving workspace/environment.
+Timeline renders the server-owned closed stage mapping：`WAITING` 请求已接受/等待执行、`DELAYED` 延迟重试、`VALIDATING` 验证来源、`READING` 读取来源、`NORMALIZING` 规范化、`APPLYING` 合并投影、`CLEANING_UP` 清理凭据、`COMPLETED` 完成. It never derives stage from elapsed time or role/status guesses. Failed runs show stable error code + Trace ID and a permitted retry action, never upstream text. Completion links conflicts to the mapping workbench while preserving workspace/environment.
 
 Persist `docs/design/frontend/foundation-assets.md` as the unique Phase 1 shell/asset design source. It records the navigation IA, flat route map and validated URL search schema; 220px navigation, 46px Scope bar, spacing/color/type/radius/focus/motion tokens; Asset table/drawer/detail and Mapping workbench components; loading/empty/403/404/409/503/stale/quarantined/ambiguous/offline states; 1440/1024/768/390 breakpoints; mouse/keyboard behavior; WCAG 2.2 AA; Keycloak Server 26.6.3 with browser `keycloak-js` 26.2.4; API `effective_actions`; and the forbidden chat/AI avatar/gradient/glow/glass/Bento/secret/editor patterns. Later plans may link and extend it but must not create a parallel foundation file.
 

@@ -17,8 +17,11 @@
 - 每个 Runtime 只暴露 adapter 所需的闭合 GET/List/Describe 方法；终端/VNC/Console、Guest Exec、power、resize、migration、tag mutation、security-group/network/storage mutation 不得进入接口或调用图。
 - 资产 OS 类型仅由受信任闭合 Provider 字段映射；无确定信号的 VM 使用 `CLOUD_RESOURCE` + 明确 provider subtype，不按名称/image text 猜测。
 - 标签/metadata 只投影 server-allow-listed key 并通过 DLP；user-data、cloud-init、password、SSH key、custom-data、console output、IP/MAC、endpoint、raw fault/message 全部排除。
-- 每个 Provider 的分页 token/marker 加密且绑定 account/project/subscription/cluster、region、source revision 和 fence；audit/UI 只保存 digest/version/age。
+- 每个 Provider 的分页 token/marker 加密且绑定 account/project/subscription/cluster、region 和 exact Source definition revision/digests；audit/UI 只保存 digest/version/age。持久 checkpoint AAD 不绑定 fence，但每次解封、Provider 调用和页提交都必须重新验证 exact live fence，使 reclaim 可恢复而 stale worker 不能提交。
 - 删除仅由显式 Provider tombstone 或完整 inventory snapshot 缺失产生 `STALE`；部分页、限流、权限缺失、某 region 失败不做 missing detection。
+- 这五个 Profile 均为 `SINGLE_ENVIRONMENT`: Proxmox cluster、OpenStack project、AWS account、Azure subscription 或 GCP project 的 immutable authority binding each resolves exactly one same-Workspace Environment; regions/zones are source fields, never caller-selected Catalog Environments.
+- 五个 Adapter 都固定使用 `CHECKPOINT_SEQUENCE`，`OrderSequence` 等于本页 accepted next checkpoint version；各自的 `ProviderVersionSHA256` 必须逐字采用下述 domain-separated `SHA256(FramedTupleV1(...))` 公式与 Pack 01 字节编码，字段不得重排、拼接或省略，命名 digest 字段以解码后的 32 raw bytes 入帧。Provider 永不注入 Source revision 或 Catalog time。
+- 对五个 Adapter，一次更晚 Run 的同内容观察仍必须追加新的 Observation/chain 并推进它实际接受的 checkpoint；`provider_fact_sha256` 不变只抑制 business projection/Type Detail 写入，不能抑制 Observation、审计或 checkpoint 证据。
 - CI 协议 fixture 必须经过真实 TLS/HTTP/SDK serialization；每个 Provider 生产开门还必须有它自己的非生产账户/集群 canary、负向证据和 HA receipt。
 - 完成后进入 [09-discovery-worker-ha-e2e.md](./09-discovery-worker-ha-e2e.md)。
 
@@ -39,8 +42,8 @@
 
 **Interfaces:**
 - Produces `PROXMOX/PROXMOX_VE_V1`; wrapper methods are only `Version`, `ClusterStatus`, `ListNodes`, `ListClusterResources`.
-- Checkpoint is `{cluster_identity_digest,cluster_generation,resource_digest,completed_at}`; every run is a bounded full snapshot, while digest/checkpoint avoids duplicate Observations when inventory is unchanged.
-- Maps node to `BARE_METAL_HOST`, QEMU/LXC to `CLOUD_RESOURCE` with subtype, and `RUNS_ON/CONTAINS` relations.
+- Checkpoint is `{cluster_identity_digest,cluster_generation,resource_digest,completed_at}`; every run is a bounded full snapshot. `ProviderVersionSHA256=SHA256(FramedTupleV1("proxmox-object-version.v1",cluster_identity_digest,cluster_generation,resource_digest,external_id))` exactly, using the common byte encoding above.
+- Maps node to `BARE_METAL_HOST`, QEMU/LXC to `CLOUD_RESOURCE` with subtype, and emits `RUNS_ON/CONTAINS` only as top-level `Page.Relations`. Each relation uses the accepted checkpoint sequence and `ProviderVersionSHA256=SHA256(FramedTupleV1("proxmox-relation-version.v1",cluster_identity_digest,cluster_generation,resource_digest,source_external_id,target_external_id,relationship_type))`.
 
 - [ ] **Step 1: Write failing identity, read-only surface, provenance, and tombstone tests**
 
@@ -58,7 +61,7 @@ func TestProxmoxAdapterExposesOnlyInventoryReads(t *testing.T) {
 
 func TestProxmoxIncompleteClusterResponseCannotMarkVMStale(t *testing.T) {
 	result := runWithNodeFailure(t)
-	if result.Complete || result.Stale != 0 || result.GateReason != "PROXMOX_PARTIAL_CLUSTER" {
+	if result.CompleteSnapshot || result.Stale != 0 || result.GateReason != "PROXMOX_PARTIAL_CLUSTER" {
 		t.Fatalf("result = %#v", result)
 	}
 }
@@ -72,7 +75,7 @@ Expected: FAIL because Proxmox provider is absent.
 
 Pin `go-proxmox v0.8.0`, but wrap it behind the four-method interface and disable its generic retry/mutation/terminal surfaces. Runtime uses pinned CA/SNI, API Token reference, no environment proxy and hard timeouts. Validation checks `/version`, stable cluster identity/quorum, token read privilege and a one-item resource probe; proof binds cluster identity, TLS peer, role digest, definition and credential cleanup.
 
-Normalize only node ID/status/capacity and QEMU/LXC ID/name/status/template/capacity/node relation. Exclude config, cloud-init, description, tags outside allow-list, network/disk secrets, VNC/term data and errors. Field provenance uses closed `PROXMOX_V1_*` codes. Sort full inventory and compute digest; unchanged digest returns zero mutation with checkpoint advance. Complete changed snapshot performs soft-missing; reappearance stays stale pending revalidation.
+Normalize only node ID/status/capacity and QEMU/LXC ID/name/status/template/capacity/node relation. Exclude config, cloud-init, description, tags outside allow-list, network/disk secrets, VNC/term data and errors. Field provenance uses closed `PROXMOX_V1_*` codes. Sort full inventory and compute digest. An unchanged later Run still emits every membership item and appends an Observation/chain while advancing checkpoint; it suppresses only business projection/Type Detail changes. A rejection-free complete snapshot performs soft-missing; reappearance stays stale pending revalidation.
 
 Rate limits: 2 concurrent calls/source, 4 req/s burst 8, 5,000 resources/run, 8 MiB and 30s/call. `429/502/503` returns persisted retry-after without automatic SDK mutation retry.
 
@@ -106,6 +109,7 @@ git commit -m "feat(assetdiscovery): add proxmox inventory provider"
 - Produces `OPENSTACK/OPENSTACK_NOVA_V2_1` with pinned Nova microversion `2.79` and exact project/region identity.
 - Wrapper methods are `AuthenticateApplicationCredential`, `GetProject`, `ListServersDetail`; no all-project, hypervisor-admin or mutation method.
 - Checkpoint is `{cloud_identity_digest,project_id,region,microversion,changes_since,marker,full_snapshot_epoch}`.
+- `ProviderVersionSHA256=SHA256(FramedTupleV1("openstack-object-version.v1",project_id,region,microversion,updated,server_id,deleted))` exactly, using the common byte encoding above; Catalog order remains the accepted checkpoint sequence.
 
 - [ ] **Step 1: Write failing project identity, pagination, deletion, and admin-surface tests**
 
@@ -139,7 +143,7 @@ Pin `gophercloud/v2 v2.13.0`. Authenticate only with an opaque Application Crede
 
 Use `changes-since`, `deleted=true`, `marker`, `limit=500` for delta pages where supported, plus scheduled complete snapshots for authoritative absence. Require stable project/region/microversion and monotonic `(updated,server_id)`. Map server ID/name/status/flavor-code/image-ID-safe-code/availability-zone to source fields; exclude addresses, security groups, fault body, user data, metadata except allow-listed safe keys and attached credential hints. Unknown OS remains `CLOUD_RESOURCE`. Deleted server emits tombstone; partial region does not mark missing.
 
-Rate limits: 2 calls/source, 5 req/s burst 10, 10,000 servers/snapshot, 8 MiB/page, max 30s. Respect capped `Retry-After`, persist backpressure and stop on catalog/schema/token ambiguity.
+Rate limits: 2 calls/source, 5 req/s burst 10, 10,000 servers/snapshot, 8 MiB/page, max 30s. Respect `Retry-After` only through the common closed `Delay{Reason: PROVIDER_RETRY_AFTER}` outcome capped at 60 seconds；by type it carries no items/relations/checkpoint/final flags. Persist backpressure only after attempt cleanup and stop on catalog/schema/token ambiguity.
 
 - [ ] **Step 3: Verify real Keystone/Nova HTTP and commit**
 
@@ -211,7 +215,7 @@ Validation binds authority identity, region-set digest, workload subject, SDK/AP
 
 - [ ] **Step 3: Implement paged checkpoints, provenance, and soft lifecycle**
 
-AWS checkpoint `{account,region_index,next_token,snapshot_epoch}`; Azure `{tenant,subscription,location_index,next_link_token,snapshot_epoch}`; GCP `{project,aggregated_page_token,snapshot_epoch}`. Tokens are sealed and bound to revision/fence. Only completion across every server-owned region/location marks a snapshot complete. Delta APIs are not invented where the provider offers only list pagination; periodic complete snapshots plus per-page checkpoint/digest provide resumability and unchanged suppression.
+AWS checkpoint `{account,region_index,next_token,snapshot_epoch}`; Azure `{tenant,subscription,location_index,next_link_token,snapshot_epoch}`; GCP `{project,aggregated_page_token,snapshot_epoch}`. Tokens are sealed under the common typed `CheckpointAAD`; fence is enforced at decrypt/use/commit boundaries rather than embedded in persistent AAD. Provider-version digests are exactly `SHA256(FramedTupleV1("aws-ec2-object-version.v1",account,region,instance_id,normalized_document_sha256-or-NULL,tombstone))`, `SHA256(FramedTupleV1("azure-compute-object-version.v1",tenant,subscription,location,resource_id,normalized_document_sha256-or-NULL,tombstone))`, and `SHA256(FramedTupleV1("gcp-compute-object-version.v1",project,zone,instance_id,normalized_document_sha256-or-NULL,tombstone))`, using the common byte encoding above; no missing upstream version is guessed. Only completion across every server-owned region/location marks a snapshot complete. Delta APIs are not invented where the provider offers only list pagination; periodic complete snapshots plus per-page checkpoint/digest provide resumability. Unchanged later Runs still append Observation/chain and suppress only business projection/Type Detail changes.
 
 Normalize provider instance ID, safe name, lifecycle/power state, machine/flavor code, zone/region code, CPU/memory capacity and allow-listed governance-neutral tags. Network addresses/MAC, IAM profile internals, user/custom data, disks' encryption key refs, startup script, console output and provider error body are excluded. Every field gets `AWS_EC2_V1_*`, `AZURE_COMPUTE_V1_*` or `GCP_COMPUTE_V1_*` provenance. Missing instance after complete snapshot becomes stale; reappearance stays stale pending revalidation.
 

@@ -192,7 +192,7 @@ DLP 在 isolated read executor 内、写入 artifact 或 completion 之前执行
 | Concern | Authoritative artifact | Derived projections | Never authoritative |
 |---|---|---|---|
 | Asset identity/lifecycle | Phase 1 `assets` + current observation | API/UI Victoria summary | Kubernetes display label alone |
-| Operator source | published `victoria_operator_source_revisions` | discovery worker config | process environment snapshot |
+| Operator source | exact published Phase 1 `asset_source_revisions` + 1:1 `victoria_operator_source_revisions` typed extension | discovery worker config | process environment snapshot |
 | Taxonomy | Go literal catalog + `assets_kind_check` | filter labels/badges | image/name prefix inference |
 | Product topology | exact UID relationship graph | accessible topology/read model | UI graph coordinates |
 | Version support | published Compatibility Profile revision | supported/unsupported reason | loose semver or newest image |

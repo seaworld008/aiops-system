@@ -4,7 +4,7 @@
 
 **Goal:** 建立 VictoriaMetrics 生态的完整资产分类、`000017` 持久契约、版本兼容 profile 和服务端租户路由，使后续发现与只读能力只能在精确闭包内工作。
 
-**Architecture:** 扩展统一 Asset Kind 与 Connection Provider，不建立第二套资产表；新增不可变 Operator source revision、Compatibility profile 和 Connection contract revision。查询租户值只存在于私有 contract，公共 projection 只返回 mode/digest；兼容矩阵以精确测试版本起步，未知版本 fail closed。
+**Architecture:** 扩展统一 Asset Kind 与 Connection Provider，不建立第二套资产或 Source lifecycle；新增 Phase 1 Operator Source Revision 的不可变 typed extension、Compatibility profile 和 Connection contract revision。查询租户值只存在于私有 contract，公共 projection 只返回 mode/digest；兼容矩阵以精确测试版本起步，未知版本 fail closed。
 
 **Tech Stack:** Go 1.26.5、PostgreSQL 18.4+、pgx v5、RFC 8785 JCS、SHA-256、标准库 `testing`。
 
@@ -69,17 +69,19 @@ type CompileInput struct {
 - Create: `migrations/000017_victoriametrics_ecosystem.up.sql`
 - Create: `migrations/000017_victoriametrics_ecosystem.down.sql`
 - Modify: `internal/store/postgres/migrations_integration_test.go`
+- Modify: `internal/assetcatalog/types.go`
+- Modify: `internal/assetcatalog/types_test.go`
 
 **Interfaces:**
 - Consumes: `assets` and `asset_sources` from `000015`; `credential_reference_revisions`, `connection_revisions`, `capability_definitions` and `runtime_publications` from `000016`.
-- Produces: expanded Asset/Provider constraints and four immutable, Scope-bound Victoria-specific contract relations.
+- Produces: expanded Asset/Provider/Relationship constraints and matching shared Go enums, plus four immutable, Scope-bound Victoria-specific contract relations.
 - Safety: down migration refuses while any Victoria asset/provider/source/contract/profile remains; no secret-bearing column is permitted.
 
 The migration owns exactly these new relations:
 
 | Relation | Identity | Purpose |
 |---|---|---|
-| `victoria_operator_source_revisions` | Scope + source + revision | cluster/namespace/API-discovery/opaque credential/network/realm closure |
+| `victoria_operator_source_revisions` | exact Phase 1 Source Revision + Environment | 1:1 typed cluster/namespace/API-discovery/opaque credential/network/realm closure; sealed only by Phase 1 `TypedSourceExtensionRegistry`, with no independent status/publish owner |
 | `victoria_compatibility_profiles` | Scope + profile + revision | exact Operator/product/schema/executor compatibility |
 | `victoria_compatibility_capabilities` | Scope + profile revision + capability definition revision | closed allowlist of compiled read capabilities |
 | `victoria_connection_contracts` | Scope + connection revision | target role/topology/private tenant route/profile closure |
@@ -91,6 +93,7 @@ Add these exact test cases:
 ```go
 func TestVictoriaMetricsEcosystemMigrationRequiresPhaseOneAndTwo(t *testing.T)
 func TestVictoriaMetricsEcosystemMigrationAcceptsEveryVictoriaAssetKind(t *testing.T)
+func TestVictoriaMetricsEcosystemMigrationAcceptsOnlyVictoriaRelationshipExtensions(t *testing.T)
 func TestVictoriaMetricsEcosystemMigrationEnforcesScopedForeignKeys(t *testing.T)
 func TestVictoriaMetricsEcosystemMigrationRejectsTenantRangeAndModeMismatch(t *testing.T)
 func TestVictoriaMetricsEcosystemMigrationMakesPublishedContractsImmutable(t *testing.T)
@@ -98,7 +101,7 @@ func TestVictoriaMetricsEcosystemMigrationDownRefusesPersistedState(t *testing.T
 func TestVictoriaMetricsEcosystemMigrationRoundTripsEmptyDatabase(t *testing.T)
 ```
 
-Assert all 37 new kinds insert successfully; an unlisted kind fails `assets_kind_check`; `VICTORIAMETRICS` and `VICTORIATRACES` providers are accepted while arbitrary provider text is rejected; cross-Scope FKs fail; tenant values outside `0..4294967295` fail; published rows reject UPDATE/DELETE with SQLSTATE `55000`; non-empty down names constraint `victoria_ecosystem_down_guard`; empty up/down/up succeeds.
+Assert all 37 new kinds insert successfully；an unlisted kind fails `assets_kind_check`；`CONFIGURES|SELECTS|OWNED_BY` Relationship values insert successfully while arbitrary text fails `asset_relationships_type_check`；`VICTORIAMETRICS` and `VICTORIATRACES` providers are accepted while arbitrary provider text is rejected；cross-Scope FKs fail；tenant values outside `0..4294967295` fail；published rows reject UPDATE/DELETE with SQLSTATE `55000`；non-empty down names constraint `victoria_ecosystem_down_guard`；empty up/down/up succeeds. Shared `assetcatalog.RelationshipType` must expose exactly Phase 1 values plus these three after Phase 3, so Adapter and database cannot drift.
 
 - [ ] **Step 2: Run the focused test and verify the expected failure**
 
@@ -147,6 +150,15 @@ ALTER TABLE assets ADD CONSTRAINT assets_kind_check CHECK (kind IN (
     'VMCTL','VMBACKUP','VMRESTORE','VMALERT_TOOL'
 ));
 
+ALTER TABLE asset_relationships
+    DROP CONSTRAINT asset_relationships_type_check;
+ALTER TABLE asset_relationships
+    ADD CONSTRAINT asset_relationships_type_check CHECK (relationship_type IN (
+        'RUNS_ON','CONTAINS','DEPENDS_ON','MONITORED_BY','LOGS_TO','TRACES_TO',
+        'DELIVERED_BY','MANAGED_BY','PRIMARY_RUNTIME_FOR',
+        'CONFIGURES','SELECTS','OWNED_BY'
+    ));
+
 ALTER TABLE connection_profiles
     DROP CONSTRAINT connection_profiles_provider_kind_check;
 ALTER TABLE connection_profiles
@@ -186,13 +198,13 @@ CREATE TABLE victoria_operator_source_revisions (
     namespace_allowlist text[] NOT NULL CHECK (cardinality(namespace_allowlist) BETWEEN 1 AND 128),
     api_discovery_profile_digest text NOT NULL CHECK (api_discovery_profile_digest ~ '^[a-f0-9]{64}$'),
     artifact_inventory_digest text NOT NULL CHECK (artifact_inventory_digest ~ '^[a-f0-9]{64}$'),
-    status text NOT NULL CHECK (status IN ('DRAFT','PUBLISHED','SUPERSEDED','REVOKED')),
     manifest_digest text NOT NULL CHECK (manifest_digest ~ '^[a-f0-9]{64}$'),
-    created_by text NOT NULL,
     created_at timestamptz NOT NULL,
-    PRIMARY KEY (tenant_id,workspace_id,environment_id,source_id,revision),
-    FOREIGN KEY (tenant_id,workspace_id,source_id)
-        REFERENCES asset_sources (tenant_id,workspace_id,id),
+    PRIMARY KEY (tenant_id,workspace_id,source_id,revision),
+    UNIQUE (tenant_id,workspace_id,environment_id,source_id,revision),
+    FOREIGN KEY (tenant_id,workspace_id,source_id,revision)
+        REFERENCES asset_source_revisions (tenant_id,workspace_id,source_id,revision)
+        DEFERRABLE INITIALLY DEFERRED,
     FOREIGN KEY (tenant_id,workspace_id,environment_id,kubernetes_cluster_asset_id)
         REFERENCES assets (tenant_id,workspace_id,environment_id,id),
     FOREIGN KEY (tenant_id,workspace_id,environment_id,credential_reference_id,credential_reference_revision)
@@ -305,6 +317,7 @@ BEGIN
        OR EXISTS (SELECT 1 FROM connection_profiles WHERE provider_kind IN ('VICTORIAMETRICS','VICTORIATRACES'))
        OR EXISTS (SELECT 1 FROM runner_capability_bindings WHERE provider_kind IN ('VICTORIAMETRICS','VICTORIATRACES'))
        OR EXISTS (SELECT 1 FROM capability_definitions WHERE provider_kind IN ('VICTORIAMETRICS','VICTORIATRACES'))
+       OR EXISTS (SELECT 1 FROM asset_relationships WHERE relationship_type IN ('CONFIGURES','SELECTS','OWNED_BY'))
        OR EXISTS (SELECT 1 FROM assets WHERE kind LIKE 'VICTORIA%' OR kind IN (
             'VMAGENT','VLAGENT','VMALERT','VMAUTH','VMGATEWAY','VMALERTMANAGER','VMANOMALY',
             'VMOPERATOR','VMBACKUPMANAGER','VMRULE','VMUSER','VMALERTMANAGER_CONFIG',
@@ -320,7 +333,7 @@ END;
 $$;
 ```
 
-空状态回滚必须把 `connection_profiles_provider_kind_check`、`runner_capability_bindings_provider_kind_check`、`capability_definitions_provider_kind_check` 三者都恢复到 Phase 2 的 `PROMETHEUS|VICTORIALOGS`；不能只恢复 Connection 而留下 Capability/Realm 接受新 Provider。
+空状态回滚必须把 `connection_profiles_provider_kind_check`、`runner_capability_bindings_provider_kind_check`、`capability_definitions_provider_kind_check` 三者都恢复到 Phase 2 的 `PROMETHEUS|VICTORIALOGS`；不能只恢复 Connection 而留下 Capability/Realm 接受新 Provider。它还必须把 `asset_relationships_type_check` 精确恢复为 Phase 1 九值并同步还原 shared Go enum；任何扩展关系仍存在时 down guard 先拒绝，不能靠 constraint drop 丢失事实。
 
 - [ ] **Step 5: Run migration tests**
 
@@ -552,8 +565,8 @@ git commit -m "feat(victoria): add exact compatibility profiles"
 - Modify: `internal/capability/compiler_test.go`
 
 **Interfaces:**
-- Consumes: a published Asset Source/Connection Revision, eligible Asset, published Compatibility Profile and 18 Phase 3 capability definitions.
-- Produces: immutable Operator Source Revision, private tenant route contract, safe public summary and compiler compatibility gate.
+- Consumes: a Phase 1 Asset Source Revision transaction, eligible Asset, published Connection Revision/Compatibility Profile and 18 Phase 3 capability definitions.
+- Produces: immutable 1:1 typed extension of the exact Phase 1 Source Revision, private tenant route contract, safe public summary and compiler compatibility gate.
 - Safety: compiler never accepts tenant/path/header from `CompileInput`; profile bootstrap is idempotent per Scope and only seeds exact tested versions.
 
 - [ ] **Step 1: Write failing route, redaction and compiler tests**
@@ -564,7 +577,9 @@ func TestConnectionContractPublicSummaryNeverContainsTenantValues(t *testing.T)
 func TestConnectionContractManifestBindsProfileAndTenantRoute(t *testing.T)
 func TestConnectionContractRepositoryIsScopedAndImmutable(t *testing.T)
 func TestOperatorSourceRevisionRequiresScopedOpaqueReferencesAndSortedNamespaces(t *testing.T)
-func TestOperatorSourceRepositoryIsScopedImmutableAndIdempotent(t *testing.T)
+func TestOperatorSourcePreparedExtensionCreateInTxIsScopedImmutableAndIdempotent(t *testing.T)
+func TestOperatorSourceExtensionUsesPhase1RegistryAndSameSerializableTransaction(t *testing.T)
+func TestOperatorSourceRevisionCannotCommitWithoutPreparedExtension(t *testing.T)
 func TestBootstrapPublishesOnlyExactTestedVersions(t *testing.T)
 func TestCompilerRejectsIncompatibleVictoriaClosure(t *testing.T)
 func TestCompilerRejectsConfigurationToolInsertAndStorageAssets(t *testing.T)
@@ -595,17 +610,27 @@ type OperatorSourceRevision struct {
     NamespaceAllowlist          []string
     APIDiscoveryProfileDigest   string
     ArtifactInventoryDigest     string
-    Status                      string
     ManifestDigest              string
 }
 
-type OperatorSourceRepository interface {
-    Publish(context.Context, OperatorSourceRevision) error
+type OperatorSourceExtension struct {
+    repository *postgres.OperatorSourceRepository
+}
+
+func (e *OperatorSourceExtension) ValidateAndDigestInTx(
+    context.Context,
+    assetcatalog.SourceRevisionTx,
+    assetcatalog.SourceRevisionDraft,
+) (assetcatalog.PreparedExtension, error)
+
+type OperatorSourceReader interface {
     GetPublished(context.Context, assetcatalog.Scope, string) (OperatorSourceRevision, error)
 }
 ```
 
-Validation sorts and deduplicates `NamespaceAllowlist`, requires a same-Scope Kubernetes cluster Asset and Credential Reference revision, and validates network/realm/discovery/inventory content-addressed refs. The artifact inventory is a signed private manifest of explicitly managed workload UID + OCI digest + taxonomy kind；it contains no environment/argument/config/credential data. Publish uses a Scope-bound transaction and immutable revision/idempotency rules identical to compatibility profiles.
+`VICTORIAMETRICS_OPERATOR_V1` Source Profile 必须在 bootstrap 时把 `OperatorSourceExtension` 注册到 Phase 1 `TypedSourceExtensionRegistry`，不得直接调用 typed repository 创建行。Phase 1 `SourceRevisionRepository` 是唯一事务 owner：它启动同一个 `SERIALIZABLE` transaction，锁定 stable Source 后调用 `ValidateAndDigestInTx`；callback 只能获得 repository-owned sealed `assetcatalog.SourceRevisionTx`，其最小查询接口不暴露 `Commit/Rollback/Begin/CopyFrom/Conn` 或底层 `pgx.Tx`。返回的 `PreparedExtension` 必须封存验证后的 canonical bytes/digest，该 digest 被纳入 base `source_definition_digest` 与 `canonical_revision_digest`。base revision insert 后，Phase 1 在原 transaction 内调用该 `PreparedExtension.CreateInTx`，并在两个 insert、deferred FK 与 commit-time digest check 都成功后才由外层 Repository commit；任一校验、digest、insert 或 hook 漂移整笔回滚。`PreparedExtension` 不得在该 transaction 外复用，typed package 不得拥有 begin/commit/retry 或独立 create lifecycle。测试包含无法提前 commit/rollback 或修改 base/audit 表的恶意 extension。
+
+`victoria_operator_source_revisions` has no independent status、actor、publish/supersede/revoke path. It is an append-only 1:1 typed extension keyed by the exact Phase 1 `(Tenant,Workspace,Source,Revision)`. Validation sorts and deduplicates `NamespaceAllowlist`, requires a same-Scope Kubernetes cluster Asset and Credential Reference revision, and validates network/realm/discovery/inventory content-addressed refs. The Source Profile is `SINGLE_ENVIRONMENT`, so the base authority Environment must equal this extension/cluster Environment. The artifact inventory is a signed private manifest of explicitly managed workload UID + OCI digest + taxonomy kind；it contains no environment/argument/config/credential data. Only the Phase 1 revision lifecycle may validate/publish/supersede the joined revision. Publishing a new canonical revision is the only path that clears its checkpoint and closes the old gate; runtime token/resourceVersion expiry must instead use Phase 1 `CHECKPOINT_LINEAGE_ROLLOVER` and must never invoke the extension hook as a same-revision reset. `GetPublished` joins the exact base row and fails closed unless base status/pointer/digests are current.
 
 - [ ] **Step 4: Implement the private/public connection split**
 

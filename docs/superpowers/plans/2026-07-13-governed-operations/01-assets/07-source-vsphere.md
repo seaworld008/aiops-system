@@ -17,7 +17,7 @@
 - 持久化字段限定为实例 UUID/MoRef 安全标识、名称、对象类型、电源/连接状态、CPU/内存容量、guest family code 和关系；不持久化 Guest IP/MAC、custom attributes、annotation、alarm body、event message、endpoint 或主机凭据。
 - OS 类型仅由闭合 guest ID 映射为 `LINUX_VM|WINDOWS_VM`；未知/冲突为 `CLOUD_RESOURCE` 并创建治理冲突，不根据名称猜测。
 - 每源最多 2 个并发 SOAP 读、500 objects/page、8 MiB/page、30s/call、1 full snapshot at a time；上游忙/会话失效进入持久 backpressure，不忙循环。
-- PropertyCollector token/version 加密保存；audit/UI 仅显示 hash/version/age。token 过期触发新的完整 snapshot run，不把不完整结果视为删除。
+- PropertyCollector token/version 加密保存；audit/UI 仅显示 hash/version/age。token 过期必须让当前 exact Run 走 Phase 1 `CHECKPOINT_LINEAGE_ROLLOVER` 并切换到新的完整 snapshot lineage；不得创建旁路 Run、清零或任意重置 checkpoint，也不得把不完整结果视为删除。
 - 真实协议 CI 使用 govmomi simulator 的 SOAP wire；生产 gate 还需受控非生产 vCenter canary 与 HA 故障演练。
 - 完成后进入 [08-source-proxmox-openstack-cloud.md](./08-source-proxmox-openstack-cloud.md)。
 
@@ -121,6 +121,8 @@ git commit -m "feat(assetdiscovery): add governed vsphere provider"
 - Consumes checkpoint `{instance_uuid,mode,collector_version,full_snapshot_id,page_token_hash}` and current lease fence.
 - Produces bounded pages from `RetrievePropertiesEx/ContinueRetrievePropertiesEx` or `WaitForUpdatesEx`; raw page token/version exists only inside sealed checkpoint.
 - Produces complete-snapshot marker only after every configured inventory root closes on the same vCenter instance/version.
+- `VSPHERE_VCENTER_V1` is `SINGLE_ENVIRONMENT`; the exact Source authority binding resolves one Environment and wire objects cannot select another.
+- Every emitted item/tombstone uses `CHECKPOINT_SEQUENCE{OrderSequence=accepted next checkpoint version,ProviderVersionSHA256=SHA256(FramedTupleV1("vsphere-object-version.v1",instance_uuid,collector_version,object_moref))}` with the Pack 01 byte encoding; Adapter never supplies Source revision or Catalog time.
 
 - [ ] **Step 1: Write failing full/delta/delete/resume tests**
 
@@ -131,7 +133,7 @@ func TestIncrementalLeaveCreatesTombstoneWithoutHardDelete(t *testing.T) {
 	checkpoint := completeInitialInventory(t, provider, simulator.Runtime())
 	removedID := simulator.RemoveVM(t, "vm-delete-me")
 
-	page, err := provider.Discover(context.Background(), simulator.Runtime(), requestAt(checkpoint))
+	page, err := requirePageOutcome(provider.Discover(context.Background(), simulator.Runtime(), requestAt(checkpoint)))
 	if err != nil || len(page.Items) != 1 || !page.Items[0].Tombstone || page.Items[0].ExternalID != removedID {
 		t.Fatalf("page = (%#v, %v)", page, err)
 	}
@@ -144,6 +146,8 @@ func TestStaleFenceCannotAdvancePropertyCollectorCheckpoint(t *testing.T) {
 		t.Fatalf("result = %#v", result)
 	}
 }
+
+func TestSameRunVCenterPageReplayIsIdempotentAndLaterRunUnchangedAppendsObservation(t *testing.T)
 ~~~
 
 Run: `go test ./internal/assetsource/vsphere ./internal/assetcatalog/postgres -run VCenter -count=1`
@@ -152,13 +156,13 @@ Expected: FAIL because inventory/update/checkpoint flows are missing.
 
 - [ ] **Step 2: Implement deterministic full inventory and relation closure**
 
-Create one ContainerView per configured root with a fixed object-type/property spec. Sort normalized objects by `(provider_kind,external_id)` and relations by full tuple before hashing. A full snapshot checkpoint binds instance UUID, root digest, source revision digest and snapshot ID. Only the final page has `Complete=true`; any root error, page token loss, vCenter restart, object schema rejection or DLP finding fails the run and prevents missing detection.
+Create one ContainerView per configured root with a fixed object-type/property spec. Sort normalized objects by `(provider_kind,external_id)` and emit relations in top-level `Page.Relations`, sorted by the Pack 01 full tuple；never duplicate the source Item on a later relation page. Every relation uses `CHECKPOINT_SEQUENCE{OrderSequence=accepted next checkpoint version,ProviderVersionSHA256=SHA256(FramedTupleV1("vsphere-relation-version.v1",instance_uuid,collector_version,source_moref,target_moref,relationship_type))}`. A full snapshot checkpoint binds instance UUID, root digest, source revision digest and snapshot ID. Intermediate pages use `(FinalPage=false,CompleteSnapshot=false)`；only a rejection-free asset-and-relation final closure uses `(true,true)`. Any root error, page token loss, vCenter restart, object schema rejection or DLP finding fails/downgrades closure and prevents missing detection.
 
-- [ ] **Step 3: Implement incremental updates and checkpoint reset**
+- [ ] **Step 3: Implement incremental updates and governed checkpoint-lineage rollover**
 
-Use `WaitForUpdatesEx` with bounded wait and max object updates. Accept only `enter|modify|leave` for known objects/properties. `leave` emits a tombstone; `enter/modify` emits a complete allow-listed projection. If Collector version expires or vCenter instance UUID changes, return `VSPHERE_CHECKPOINT_RESET_REQUIRED`, close the current run, gate `DEGRADED` and create a new full-snapshot run after backoff; never continue with an old token.
+Use `WaitForUpdatesEx` with bounded wait and max object updates. Accept only `enter|modify|leave` for known objects/properties. `leave` emits a tombstone; `enter/modify` emits a complete allow-listed projection. If the Collector version expires while the exact validated vCenter instance UUID is unchanged, return the closed reason `VSPHERE_COLLECTOR_VERSION_EXPIRED` and enter the Phase 1 `CHECKPOINT_LINEAGE_ROLLOVER` path; after bounded backoff that same exact governed Run is the sole gate exception and must establish the successor lineage through a full snapshot. If the vCenter instance UUID changes, fail as `VSPHERE_INSTANCE_IDENTITY_DRIFT`, suspend the gate and require a newly validated/published canonical Source revision; identity drift is never a rollover. Neither case may continue with the old token.
 
-For each page, Reconciler verifies fence/source revision/gate/checkpoint-before, commits Observations/relations/checkpoint-after together, and rejects stale page digest replay. A recovered VM remains `STALE` until later Connection publication revalidates it. Credential/session cleanup is terminal evidence even when the run is cancelled.
+For each page, Reconciler verifies fence/source revision/gate/checkpoint-before and exact `CHECKPOINT_SEQUENCE`, commits Observations/relations/checkpoint-after together, returns an exact same-Run replay receipt, and rejects a changed replay digest. A later Run observing unchanged content still appends its Observation/chain but does not append Type Detail or alter governance fields. Collector expiry consumes the Phase 1 rollover receipt exactly as defined by the core contract: the persisted prior checkpoint remains intact until an accepted successor-lineage page advances it by CAS, `checkpoint_version` stays monotonic, and neither Control Plane nor Adapter may clear, decrement or synthesize a reset. The gate remains degraded and missing detection remains disabled until a rejection-free full snapshot closes the rollover. Only publication of a newly validated canonical revision follows the separate publication checkpoint transition. A recovered VM remains `STALE` until later Connection publication revalidates it. Credential/session cleanup is terminal evidence even when the run is cancelled.
 
 - [ ] **Step 4: Run real SOAP simulator and PostgreSQL failover tests**
 

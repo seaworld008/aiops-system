@@ -370,7 +370,7 @@ test ! -d .worktrees
 go test ./... -count=1
 go test -race -shuffle=on -count=1 ./internal/assetdiscovery/victoriametrics/... ./internal/readconnector/... ./internal/readtarget/... ./internal/readexecutor/... ./internal/readruntime/... ./internal/victoriametrics/...
 go vet ./...
-go build ./cmd/control-plane ./cmd/asset-discovery-worker ./cmd/validation-runner ./cmd/read-runner
+go build ./cmd/control-plane ./cmd/discovery-worker ./cmd/validation-runner ./cmd/read-runner
 AIOPS_TEST_POSTGRES_DSN="$AIOPS_TEST_POSTGRES_DSN" go test ./internal/store/postgres ./internal/victoriametrics/postgres -count=1
 ```
 

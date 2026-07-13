@@ -632,7 +632,7 @@ func newRepositoryWriteFixtureWithIDFactory(
 		t.Fatal("repository write fixture requires an ID factory")
 	}
 	harness := newPostgresHarness(t)
-	harness.applyMigrations(t, ".up.sql", false, nil)
+	harness.applyThroughLatestInvestigationSchema(t)
 	base := time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond)
 	execSQL(t, harness.db, `INSERT INTO tenants (id, name) VALUES ($1, 'tenant')`, testTenantID)
 	execSQL(t, harness.db, `INSERT INTO workspaces (id, tenant_id, name) VALUES ($1, $2, 'workspace')`, testWorkspaceID, testTenantID)

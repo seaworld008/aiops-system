@@ -211,7 +211,7 @@ Only projection `apiRoutes.ts` fulfills typed fixture responses and validates ea
 
 - [ ] **Step 3: Cover production workflows and negative paths**
 
-Full-stack Asset E2E: filters/back-forward/share URL; row keyboard/drawer/full route; manual create/idempotent replay; edit; quarantine; viewer/admin actions; then SQL-assert exactly one domain mutation, audit and outbox result.
+Full-stack Asset E2E: filters/back-forward/share URL；row keyboard/drawer/full route；manual create/idempotent replay；edit；quarantine；viewer/admin actions. Manual create SQL-asserts one synchronous private-fenced `MANUAL_MUTATION`, exact `CATALOG_SEQUENCE` plus `manual-catalog-version.v1` digest, append-only Observation/chain, Type Detail/Asset/audit/outbox and terminal `NO_CREDENTIAL` proof in one transaction；identical replay returns the same receipt and allocates no new Run/sequence/Observation. Seed a second Environment in the same Workspace and prove the Env-A `SINGLE_ENVIRONMENT` MANUAL Source is absent from Env-B's eligible query/effective actions；a forged Env-B POST rolls back with no Run/sequence/audit. Then assert every other UI mutation has exactly one domain/audit/outbox result.
 
 Full-stack Mapping E2E resolves a seeded conflict and SQL-asserts conflict/asset/binding versions atomically. Full-stack Source E2E creates a signed `CSV_IMPORT` source revision, validates/publishes it and enqueues one real Source Run against quarantine storage without target-network access；另断言 `MANUAL` source 永远不能进入 Discovery Worker queue。
 
@@ -294,7 +294,7 @@ Cache only Go modules/build and pnpm store keyed by lockfile; never cache browse
 
 - [ ] **Step 3: Exercise rolling and failure behavior**
 
-`verify-asset-ha.sh` starts two Control Plane replicas against PostgreSQL, sends concurrent idempotent create/update/sync/decision requests through a round-robin proxy, kills one replica mid-request, and asserts exactly one domain mutation/audit/outbox result. It then interrupts a source run, verifies DB lease/advisory lock recovery, and confirms no process-local state is required.
+`verify-asset-ha.sh` starts two Control Plane replicas against PostgreSQL, sends concurrent idempotent create/update/sync/decision requests through a round-robin proxy, kills one replica mid-request, and asserts exactly one domain mutation/audit/outbox result. It then interrupts a Source Run, verifies durable Queue lease/fence、single-nonterminal constraint and transaction row-lock recovery, and confirms no process-local/advisory discovery ownership state is required. Transaction advisory locking remains only inside the Idempotency-Key ledger.
 
 Compatibility matrix:
 

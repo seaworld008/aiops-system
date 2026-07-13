@@ -15,6 +15,7 @@
 - 迁移归属固定为 `000015_assets_catalog`；本包不得新建或修改 000016 及以后迁移。
 - 复合 Scope 固定为 Tenant + Workspace + Environment；所有读写都必须带复合作用域。
 - 去重键固定为 `(tenant_id, workspace_id, source_id, provider_kind, external_id)`；跨来源不得按名称或优先级静默合并。
+- `SourceRevision` 在领域、provenance 和 PostgreSQL 中只表示 immutable Source definition revision；Provider object/version/sequence 使用各 Adapter 的闭合类型并在进入 Reconciler 前按其 checkpoint contract 验证，不能复用该字段。
 - `AssetObservation` 与 `AssetTypeDetail` revision append-only；同步不得覆盖 Owner、Service、关键度、数据等级或人工标签。
 - 同步只能标记 `STALE` 或记录来源已恢复；恢复资产仍保持 `STALE`，直到后续 Connection Publication 复验显式转为 `ACTIVE`；Capability availability 不参与资产生命周期转换。
 - 资产、审计、Outbox、幂等结果必须同事务提交；错误不得把数据库或 Provider 文本透传。
@@ -36,13 +37,15 @@
 - Create: **internal/assetcatalog/postgres/repository.go**
 - Create: **internal/assetcatalog/postgres/scope.go**
 - Create: **internal/assetcatalog/postgres/assets.go**
+- Create: **internal/assetcatalog/postgres/manual_run.go**
 - Create: **internal/assetcatalog/postgres/scan.go**
 - Create: **internal/assetcatalog/postgres/assets_test.go**
+- Create: **internal/assetcatalog/postgres/manual_run_test.go**
 - Create: **internal/assetcatalog/postgres/assets_integration_test.go**
 
 **Interfaces:**
 - Consumes: `assetcatalog.Repository`、`pgxpool.Pool`、现有 `audit_records` 和 `outbox_events`。
-- Produces: `postgres.New(*pgxpool.Pool, func() time.Time, func() string) (*Repository, error)`；该对象同时实现 `assetcatalog.Reader`、`ScopeResolver` 和资产写仓储。
+- Produces: `postgres.New(*pgxpool.Pool, func() time.Time, func() string) (*Repository, error)`；该对象同时实现 `assetcatalog.Reader`、`ScopeResolver` 和资产写仓储，并由私有 `ManualRunExecutor` 构造唯一的同步 MANUAL validation/mutation fence；它不导出任意 token/fence factory。
 - Transaction rule: 资产、Observation、Type Detail、Audit、Outbox 和幂等结果必须在同一 `SERIALIZABLE` 事务提交；任何一步失败全部回滚。
 
 - [ ] **Step 1: Write failing SQL-shape and repository contract tests**
@@ -249,7 +252,7 @@ For every write:
 1. Validate command, canonical UUIDs, SHA-256 lowercase request hash, bounded reason, and UTC microsecond times before opening the transaction.
 2. Begin `pgx.Serializable`; resolve workspace/environment to a tenant within the transaction.
 3. Acquire the Workspace+Idempotency-Key transaction advisory lock, query the partial-unique asset audit ledger, and either return an identical scoped replay or reject a key/hash/operation conflict; then lock the governed asset using `FOR UPDATE`.
-4. On create, insert the supplied normalized Observation, append revision `1` Type Detail, then insert `DISCOVERED` Asset.
+4. On create, lock the existing same-Workspace `MANUAL/MANUAL` Source and its exact revision and require `ACTIVE + PUBLISHED + AVAILABLE` with all revision/gate/binding digests equal. Because `MANUAL_V1` is `SINGLE_ENVIRONMENT`, also resolve the revision's sole `AuthorityEnvironmentID` and require it to equal the command/path Environment exactly；same Workspace alone is insufficient. In this same serializable transaction, create and privately claim one `MANUAL_MUTATION` Run, allocate `CATALOG_SEQUENCE = source.checkpoint_version + 1`, build the allow-listed MANUAL document/provenance/fingerprint/fact/chain using database-owned Catalog time and the exact `manual-catalog-version.v1` Provider-version digest, insert its Observation, append revision `1` Type Detail, insert the `DISCOVERED` Asset, CAS the server-owned MANUAL logical checkpoint version (no ciphertext/key), and complete the Run under a private process-local fence. The command never supplies Observation、ProviderKind、Source revision、freshness、Catalog time、run/fence/checkpoint fields or canonical digests. Matching idempotent replay returns the original Asset/Run receipt without allocating another sequence or Run. Add a cross-Environment negative test proving an otherwise eligible Env-A Source cannot create an Env-B Asset and allocates no Run/sequence/audit row.
 5. On replay, return the scoped resource only when operation and request hashes match; otherwise return `ErrIdempotency`. This rule covers create, governance update, transition, source create/sync, binding and conflict decisions.
 6. On governance update, update only `display_name`、`owner_group`、`criticality`、`data_classification` and `labels`, using `WHERE version = $expected`, then increment version.
 7. `Transition` accepts only `QUARANTINED` or `RETIRED` in this plan. It must call `CanTransition`, use the expected version, persist a bounded reason in audit metadata, and increment version.
@@ -294,6 +297,7 @@ Expected: both commands PASS; the integration suite proves cross-tenant/workspac
 ~~~bash
 git add internal/assetcatalog/postgres/repository.go \
   internal/assetcatalog/postgres/scope.go internal/assetcatalog/postgres/assets.go \
+  internal/assetcatalog/postgres/manual_run.go internal/assetcatalog/postgres/manual_run_test.go \
   internal/assetcatalog/postgres/scan.go internal/assetcatalog/postgres/assets_test.go \
   internal/assetcatalog/postgres/assets_integration_test.go
 git commit -m "feat(assetcatalog): persist scoped governed assets"
@@ -312,7 +316,7 @@ git commit -m "feat(assetcatalog): persist scoped governed assets"
 
 **Interfaces:**
 - Consumes: normalized source batches produced outside the Control Plane process; this plan does not open target sockets and does not put provider credentials in a job payload.
-- Produces: read-only `assetcatalog.SourceReadRepository` and `assetdiscovery.Reconciler.Reconcile(context.Context, Batch) (Result, error)`; Source create/sync remains exclusively owned by Tasks 13–14.
+- Produces: read-only `assetcatalog.SourceReadRepository` and `assetdiscovery.Reconciler.Reconcile(context.Context, assetcatalog.LeaseFence, Batch) (Result, error)`; Source create/sync remains exclusively owned by Tasks 13–14.
 - Event contract: sync requests write `asset.source.sync.requested.v1`; completed reconciliation writes `asset.source.run.completed.v1` or `asset.source.run.failed.v1` with only IDs/counts/status.
 
 - [ ] **Step 1: Add failing reconciliation scenario tests**
@@ -322,6 +326,7 @@ package assetdiscovery
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -334,9 +339,9 @@ func TestReconcileIsDeterministicAndNeverOverwritesGovernance(t *testing.T) {
 	store.assets[fixture.existing.ID] = fixture.existing
 	reconciler := mustReconciler(store, fixture.clock)
 
-	result, err := reconciler.Reconcile(context.Background(), Batch{
-		Scope: fixture.scope, SourceID: fixture.source.ID, RunID: fixture.runID,
-		ObservedAt: fixture.now, Complete: true,
+	result, err := reconciler.Reconcile(context.Background(), fixture.fenceFor(fixture.runID), Batch{
+		Scope: fixture.sourceScope, SourceID: fixture.source.ID, RunID: fixture.runID,
+		FinalPage: true, CompleteSnapshot: true,
 		CursorBeforeHash: "0000000000000000000000000000000000000000000000000000000000000000",
 		CursorAfterHash: "1111111111111111111111111111111111111111111111111111111111111111",
 		PageSequence: 1, PageDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -352,7 +357,7 @@ func TestReconcileIsDeterministicAndNeverOverwritesGovernance(t *testing.T) {
 		updated.Labels["manual"] != "preserved" {
 		t.Fatalf("governance was overwritten: %#v", updated)
 	}
-	if result.Created != 1 || result.Updated != 1 || result.Conflicts != 0 {
+	if result.Created != 1 || result.Changed != 1 || result.Conflicts != 0 {
 		t.Fatalf("result = %#v", result)
 	}
 }
@@ -363,9 +368,9 @@ func TestCompleteRunMarksMissingAssetsStaleAndRecoveryDoesNotActivate(t *testing
 	store.assets[fixture.existing.ID] = fixture.existingActive
 	reconciler := mustReconciler(store, fixture.clock)
 
-	_, err := reconciler.Reconcile(context.Background(), Batch{
-		Scope: fixture.scope, SourceID: fixture.source.ID, RunID: fixture.runID,
-		ObservedAt: fixture.now, Complete: true,
+	_, err := reconciler.Reconcile(context.Background(), fixture.fenceFor(fixture.runID), Batch{
+		Scope: fixture.sourceScope, SourceID: fixture.source.ID, RunID: fixture.runID,
+		FinalPage: true, CompleteSnapshot: true,
 		CursorBeforeHash: "0000000000000000000000000000000000000000000000000000000000000000",
 		CursorAfterHash: "1111111111111111111111111111111111111111111111111111111111111111",
 		PageSequence: 1, PageDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -375,9 +380,9 @@ func TestCompleteRunMarksMissingAssetsStaleAndRecoveryDoesNotActivate(t *testing
 		t.Fatalf("stale reconcile = (%#v, %v)", store.assets[fixture.existing.ID], err)
 	}
 
-	_, err = reconciler.Reconcile(context.Background(), Batch{
-		Scope: fixture.scope, SourceID: fixture.source.ID, RunID: fixture.nextRunID,
-		ObservedAt: fixture.now.Add(time.Minute), Complete: true,
+	_, err = reconciler.Reconcile(context.Background(), fixture.fenceFor(fixture.nextRunID), Batch{
+		Scope: fixture.sourceScope, SourceID: fixture.source.ID, RunID: fixture.nextRunID,
+		FinalPage: true, CompleteSnapshot: true,
 		CursorBeforeHash: "1111111111111111111111111111111111111111111111111111111111111111",
 		CursorAfterHash: "2222222222222222222222222222222222222222222222222222222222222222",
 		PageSequence: 1, PageDigest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -396,9 +401,9 @@ func TestCrossSourceCandidateCreatesConflictWithoutImplicitMerge(t *testing.T) {
 	candidate := fixture.newItem
 	candidate.Fingerprints = map[string]string{"provider_instance_id": fixture.existing.ExternalID}
 
-	result, err := reconciler.Reconcile(context.Background(), Batch{
-		Scope: fixture.scope, SourceID: fixture.secondSourceID, RunID: fixture.runID,
-		ObservedAt: fixture.now, Complete: true,
+	result, err := reconciler.Reconcile(context.Background(), fixture.fenceFor(fixture.runID), Batch{
+		Scope: fixture.sourceScope, SourceID: fixture.secondSourceID, RunID: fixture.runID,
+		FinalPage: true, CompleteSnapshot: true,
 		CursorBeforeHash: "0000000000000000000000000000000000000000000000000000000000000000",
 		CursorAfterHash: "1111111111111111111111111111111111111111111111111111111111111111",
 		PageSequence: 1, PageDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -410,6 +415,38 @@ func TestCrossSourceCandidateCreatesConflictWithoutImplicitMerge(t *testing.T) {
 	if len(store.assets) != 1 {
 		t.Fatal("cross-source candidate was merged or created before a decision")
 	}
+}
+
+func TestHigherFreshnessKindDriftRollsBackWholePage(t *testing.T) {
+	fixture := persistedDiscoveryFixture()
+	drifted := fixture.nextItem
+	drifted.Kind = assetcatalog.KindDatabase
+	before := fixture.snapshotCountsAndCheckpoint(t)
+	_, err := fixture.reconcile(drifted)
+	if !errors.Is(err, assetcatalog.ErrSourceAssetKindDrift) {
+		t.Fatalf("kind drift error = %v", err)
+	}
+	fixture.assertCountsAndCheckpointEqual(t, before) // no Observation/receipt/checkpoint
+}
+
+func TestProviderFactGoldenBindsEveryProjectionInputButNotCatalogTime(t *testing.T) {
+	base := semanticFactFixture()
+	want := goldenProviderFactDigest()
+	if got := providerFactSHA256(base); got != want {
+		t.Fatalf("provider fact = %s, want %s", got, want)
+	}
+	for _, mutate := range []func(*SemanticFact){changeKind, changeDisplayName, changeFingerprintSet} {
+		candidate := base.Clone(); mutate(&candidate)
+		if providerFactSHA256(candidate) == want { t.Fatal("projection input was not bound") }
+	}
+	base.CatalogObservedAt = base.CatalogObservedAt.Add(time.Hour)
+	if providerFactSHA256(base) != want { t.Fatal("Catalog time changed semantic fact") }
+	assertLaterRunAppendsUnchangedObservation(t, base)
+}
+
+func TestCompleteClosureSeesRelationsFromFinalAndIntermediatePages(t *testing.T) {
+	assertRelationRemainsActiveWhenSeenOnlyOnFinalPage(t)
+	assertRelationRemainsActiveWhenSeenOnlyOnIntermediatePage(t)
 }
 ~~~
 
@@ -431,65 +468,90 @@ import (
 )
 
 type NormalizedItem struct {
+	EnvironmentID     string
 	ProviderKind      string
 	ExternalID        string
 	Kind              assetcatalog.Kind
 	DisplayName       string
-	SourceRevision    int64
 	SchemaVersion     string
 	Document          json.RawMessage
 	DocumentSHA256    string
+	Freshness         FreshnessCandidate
 	FieldProvenance   []FieldProvenance
-	ProvenanceSHA256  string
 	Tombstone         bool
 	TombstoneReason   string
 	Fingerprints      map[string]string
-	ObservedRelations []ObservedRelation
+}
+
+type FreshnessKind string
+
+const (
+	FreshnessCatalogSequence    FreshnessKind = "CATALOG_SEQUENCE"
+	FreshnessObjectSequence     FreshnessKind = "OBJECT_SEQUENCE"
+	FreshnessObjectTimeSequence FreshnessKind = "OBJECT_TIME_SEQUENCE"
+	FreshnessCheckpointSequence FreshnessKind = "CHECKPOINT_SEQUENCE"
+)
+
+type FreshnessCandidate struct {
+	Kind                  FreshnessKind
+	OrderTime             *time.Time
+	OrderSequence         int64
+	ProviderVersionSHA256 string
 }
 
 type FieldProvenance struct {
-	FieldCode       string
+	FieldCode        string
 	ProviderPathCode string
-	Ownership       string
-	SourceRevision  int64
-	ObservedAt      time.Time
-	Confidence      int
+	Ownership        string
+	Confidence       int
 }
 
 type ObservedRelation struct {
-	FromExternalID string
-	ToExternalID   string
-	Type           assetcatalog.RelationshipType
-	Confidence     int
+	SourceEnvironmentID string
+	TargetEnvironmentID string
+	FromExternalID      string
+	ToExternalID        string
+	Type                assetcatalog.RelationshipType
+	ProviderPathCode    string
+	Confidence          int
+	Freshness           FreshnessCandidate
+}
+
+type SourceScope struct {
+	TenantID    string
+	WorkspaceID string
 }
 
 type Batch struct {
-	Scope      assetcatalog.Scope
-	SourceID   string
-	RunID      string
-	ObservedAt time.Time
-	Complete   bool
+	Scope            SourceScope
+	SourceID         string
+	RunID            string
+	FinalPage        bool
+	CompleteSnapshot bool
 	CursorBeforeHash string
 	CursorAfterHash  string
 	PageSequence     int64
 	PageDigest       string
-	Items      []NormalizedItem
+	Items            []NormalizedItem
+	Relations        []ObservedRelation
 }
 
 type Result struct {
 	RunID      string
+	Observed   int
 	Created    int
-	Updated    int
+	Changed    int
 	Unchanged  int
+	Conflicts  int
+	Missing    int
 	Stale      int
 	Restored   int
 	Tombstoned int
-	Conflicts  int
 	Rejected   int
 }
 
 type Store interface {
-	ReconcileBatch(context.Context, Batch) (Result, error)
+	ReconcileBatch(context.Context, assetcatalog.LeaseFence, Batch) (Result, error)
 }
 
 type Reconciler struct {
@@ -503,13 +565,21 @@ func New(store Store) (*Reconciler, error) {
 	return &Reconciler{store: store}, nil
 }
 
-func (reconciler *Reconciler) Reconcile(ctx context.Context, batch Batch) (Result, error) {
+func (reconciler *Reconciler) Reconcile(
+	ctx context.Context,
+	fence assetcatalog.LeaseFence,
+	batch Batch,
+) (Result, error) {
 	if err := validateBatch(batch); err != nil {
 		return Result{}, err
 	}
-	return reconciler.store.ReconcileBatch(ctx, canonicalizeBatch(batch))
+	return reconciler.store.ReconcileBatch(ctx, fence, canonicalizeBatch(batch))
 }
 ~~~
+
+`PageDigest` is never trusted caller text. After canonical sorting, Repository computes `item_page_sha256 = SHA256(FramedTupleV1("asset-item-page.v1",item_count,repeated environment_id,provider_kind,external_id,freshness_kind,freshness_order_time-or-NULL,freshness_order_sequence,provider_version_sha256,provider_fact_sha256))` and the Pack 01 `relation_page_sha256` over independently sorted top-level relations. It then recomputes `PageDigest = SHA256(FramedTupleV1("asset-source-page.v2",tenant_id,workspace_id,source_id,run_id,page_sequence,cursor_before_sha256,cursor_after_sha256,final_page,complete_snapshot,item_count,item_page_sha256,relation_count,relation_page_sha256))` and requires exact equality. Asset and relation semantic digests exclude Catalog time/Observation ID, so relation-only pages and exact replay are identifiable without duplicating an Item. The immutable page receipt uses `audit_records.resource_type='ASSET_SOURCE_RUN'`, operation `PAGE_APPLIED`, request ID `source-page:<run_uuid>:<page_sequence>`, `payload_hash=PageDigest`, and a closed safe metadata object containing only cursor hashes、final flags、item/relation page digests and exact per-page/cumulative counts；Workspace request-key uniqueness prevents a second receipt.
+
+`LeaseFence` is the sealed process-local value defined in Pack 01 and returned by Queue claim: exact Run ID、owner、epoch and a private 32-byte raw token. It rejects JSON/text/log serialization and exposes only constant-time comparison against the already locked PostgreSQL Run coordinates/token hash; raw token never enters `Batch`、Task payload、audit、outbox or errors. Provider items cannot submit Source definition revision or Catalog time. The Repository injects both from the locked Run and database clock, and the Profile Registry fixes the only legal `FreshnessKind` for that canonical revision.
 
 Add to `assetcatalog/repository.go`:
 
@@ -523,25 +593,43 @@ type SourceRun struct {
 	SourceRevisionDigest string
 	RunKind              string
 	Status               string
+	Stage                string
+	StageChangedAt       time.Time
+	TriggerType          string
+	GateRevision         int64
 	PageSequence         int64
 	PageDigest           string
 	CursorBeforeHash     string
 	CursorAfterHash      string
+	CheckpointVersion    int64
+	NotBefore            time.Time
+	LeaseExpiresAt       time.Time
 	FenceEpoch           int64
 	HeartbeatSequence    int64
-	ObservedFrom         time.Time
-	ObservedTo           time.Time
+	FinalPageApplied     bool
+	CompleteSnapshot     bool
+	WorkResultKind       string
+	WorkResultStatus     string
+	WorkResultDigest     string
+	WorkResultRecordedAt time.Time
+	ValidationProofDigest string
+	CredentialCleanupStatus string
+	Observed             int
 	Created              int
-	Updated              int
+	Changed              int
 	Unchanged            int
+	Conflicts            int
+	Missing              int
 	Stale                int
 	Restored             int
 	Tombstoned           int
-	Conflicts            int
 	Rejected             int
+	FailureCode          string
 	Version              int64
 	CreatedAt            time.Time
-	FinishedAt           time.Time
+	StartedAt            time.Time
+	HeartbeatAt          time.Time
+	CompletedAt          time.Time
 }
 
 type SourceReadRepository interface {
@@ -551,7 +639,7 @@ type SourceReadRepository interface {
 }
 ~~~
 
-`assetdiscovery.Store` owns `ReconcileBatch(context.Context, Batch) (Result, error)` and is implemented by `internal/assetcatalog/postgres.Repository`. Safe Source/run reads remain in `assetcatalog.SourceReadRepository`. This keeps the final dependency direction `assetdiscovery -> assetcatalog`; `assetcatalog` never imports `assetdiscovery`. This pack must not create a stable Source without revision 1 or enqueue a run before the complete Source revision gate exists.
+The internal Run row additionally retains the opaque cleanup attempt ID/epoch and cleanup/terminal receipt digests required by Pack 09；the public `SourceRun` deliberately omits all of them. `SourceScope` is exactly Tenant+Workspace because Source/Run rows stop at Workspace; every normalized Fact carries its explicit Environment and Repository resolves that Environment inside the Source's immutable authority mapping. `assetdiscovery.Store` owns `ReconcileBatch(context.Context, assetcatalog.LeaseFence, Batch) (Result, error)` and is implemented by `internal/assetcatalog/postgres.Repository`. Safe Source/run reads remain in `assetcatalog.SourceReadRepository`. This keeps the final dependency direction `assetdiscovery -> assetcatalog`; `assetcatalog` never imports `assetdiscovery`. This pack must not create a stable Source without revision 1 or enqueue a run before the complete Source revision gate exists.
 
 - [ ] **Step 3: Implement canonical validation before persistence**
 
@@ -559,13 +647,15 @@ type SourceReadRepository interface {
 
 - sort Items by `(provider_kind, external_id)` and relations by their full tuple;
 - reject more than 10,000 items or 50,000 relations per batch;
-- require canonical provider/external IDs, exact lowercase 64-character document SHA-256, UTC microsecond `ObservedAt`, and unique item keys;
+- require canonical Environment/provider/external IDs, exact lowercase 64-character document SHA-256 for non-tombstones, a Profile-allowed `FreshnessCandidate`, and unique `(provider_kind,external_id)` keys within the page；Repository plus the same-Run unique constraint rejects Item duplicates across different pages of the Run, because a page-local canonicalizer cannot prove prior-page membership;
+- require each top-level Relation to carry both explicit Environment IDs、both external IDs、a Profile-allowed independent freshness candidate and an allowed path/confidence；its stable same-Run identity `(source_environment_id,target_environment_id,from_external_id,to_external_id,type,provider_path_code)` must be unique within the page, and the persisted Relationship last-Run/page coordinates reject a duplicate on any other page as `SOURCE_RUN_RELATION_DUPLICATE`;
 - reject unknown JSON fields, arrays at document root, documents over 64 KiB, label-like credential/endpoint keys, and any raw document containing secret-bearing field names;
 - recompute the canonical JSON SHA-256 rather than trusting the caller;
-- reject a partial batch that attempts stale detection (`Complete=false` means no missing-asset transition).
-- require provenance for every source-owned normalized field; provenance field/path codes come from the Provider adapter allow-list and cannot contain raw values, JSONPath, endpoint, credential or source error text;
-- accept a tombstone only with no document/relations, a stable reason code and a source revision newer than the stored observation; a tombstone is never a hard delete or automatic retirement;
-- require `PageSequence > 0`, a lowercase SHA-256 `PageDigest`, and exact cursor-before equality with the current sealed checkpoint projection before persistence.
+- require `CompleteSnapshot` to imply `FinalPage`; an intermediate page (`FinalPage=false`) keeps the Run `RUNNING`, while a final incremental page may use `FinalPage=true, CompleteSnapshot=false` and never performs missing-asset transitions;
+- require provenance for every source-owned normalized field and observed relation; provenance field/path codes come from the Provider adapter allow-list, confidence is an integer 0–100, and neither can contain raw values, JSONPath, endpoint, credential or source error text; Repository injects Source ID/provider/revision and Catalog acceptance time;
+- accept an Item tombstone only with no document, empty Kind/DisplayName/fingerprints, a stable reason code and a Profile-allowed freshness candidate；relations remain separate facts and cannot use tombstone shape. Repository derives the exact Source definition revision from the locked Run, and a tombstone is never a hard delete or automatic retirement;
+- permit a relation-only page but reject a page with neither Items nor Relations unless it is the final empty authoritative snapshot. Each relation's endpoints must already exist as exact same-Source Assets from a prior committed page/Run or be created by Items in this same page；Adapters must buffer/reorder an edge until both endpoints are ready, and exceeding the bounded buffer fails closed as `SOURCE_RELATION_ENDPOINT_NOT_READY` without checkpoint advance;
+- require `PageSequence > 0`, recompute the exact domain-separated `PageDigest` above, and require exact cursor-before equality with the current sealed checkpoint projection before persistence.
 
 Use this exact invariant in the test:
 
@@ -574,8 +664,8 @@ func TestCanonicalizeRejectsCredentialShapedDocument(t *testing.T) {
 	fixture := discoveryFixture()
 	fixture.newItem.Document = json.RawMessage(`{"name":"vm-1","access_token":"forbidden"}`)
 	_, err := canonicalizeBatch(Batch{
-		Scope: fixture.scope, SourceID: fixture.source.ID, RunID: fixture.runID,
-		ObservedAt: fixture.now, Complete: true,
+		Scope: fixture.sourceScope, SourceID: fixture.source.ID, RunID: fixture.runID,
+		FinalPage: true, CompleteSnapshot: true,
 		CursorBeforeHash: "0000000000000000000000000000000000000000000000000000000000000000",
 		CursorAfterHash: "1111111111111111111111111111111111111111111111111111111111111111",
 		PageSequence: 1, PageDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -591,21 +681,23 @@ func TestCanonicalizeRejectsCredentialShapedDocument(t *testing.T) {
 
 For each canonical batch, `internal/assetcatalog/postgres/discovery.go` must execute this exact order:
 
-1. Lock `asset_source_runs` by `(tenant_id, workspace_id, run_id)`. Matching `request_hash` replay returns persisted counts; a different hash returns `ErrIdempotency`.
-2. Lock the `asset_sources` row in the same tenant/workspace and reject paused, disabled, or wrong-source runs.
-3. Insert every Observation with `ON CONFLICT (tenant_id, workspace_id, source_id, provider_kind, external_id, source_revision) DO NOTHING`; matching replays verify `document_sha256`.
-4. Match only the fixed dedupe key `(tenant_id, workspace_id, source_id, provider_kind, external_id)`.
-5. New exact-source items create `DISCOVERED` assets with defaults `UNRESOLVED/INTERNAL/MEDIUM`, `owner_group="unassigned"` and empty governance labels, then append Type Detail revision 1. The sentinel renders as “未分配” and is not an inferred owner or Service.
-6. Existing exact-source items update only source-owned projection fields: `display_name`、`last_observation_id`、`last_observed_at`、`last_source_revision`; append Type Detail only when document hash changes. Persist the allow-listed field-provenance digest with the Observation and preserve governance fields.
-7. Cross-source fingerprint candidates create or refresh `OPEN` AssetConflict with `AMBIGUOUS`; do not create, merge, bind, or overwrite an Asset.
-8. Only a complete successful run identifies source-owned assets not observed in this run. `ACTIVE` becomes `STALE`; `DISCOVERED` remains `DISCOVERED`; `QUARANTINED/RETIRED` remain unchanged.
-9. A provider tombstone or complete-run absence changes `ACTIVE` to `STALE`, retires only source-owned active relation projections, and preserves Asset/Observation/Type Detail history. A recovered `STALE` asset receives the new Observation and `asset.source.asset.restored.v1` event but remains `STALE`; only the later publication/capability revalidation path may move it to `ACTIVE`.
-10. Resolve relations only when both endpoint assets have exact same-source keys; otherwise record a conflict. Upsert relation version by content hash.
-11. Within the same transaction and under the current run fence, advance the encrypted source checkpoint by compare-and-swap from `CursorBeforeHash` to `CursorAfterHash`, increment `checkpoint_version` and `page_sequence` once, and store only cursor/page digests in audit/outbox. A stale fence, page replay with a different digest, or checkpoint mismatch rolls back every Observation and projection mutation.
-12. Mark run `SUCCEEDED` when all items were accepted or `PARTIAL` when bounded item validation produced rejections; persist counts/cursor hashes, update source `last_success_at` only for a complete applied projection, insert one safe audit row and one completion outbox event, then commit.
-13. On any error, roll back batch mutations and use a separate bounded transaction to mark an already-created run `FAILED` with stable `error_code`; never persist provider error text.
+1. Canonicalize the page and compute its stable request/page digest before allocating an Observation ID or Catalog time. Immediately after beginning the serializable transaction, read its fixed server `transaction_timestamp()` once；this value is not yet an allocated Observation fact and must be reused unchanged if the transaction reaches insertion. Lock `asset_source_runs` by `(tenant_id,workspace_id,run_id)`. First check the immutable safe `ASSET_SOURCE_RUN/PAGE_APPLIED` audit receipt keyed by `(run_id,page_sequence,page_digest)`: an exact replay validates scope、cursor/final markers、incoming freshness/semantic digests and all stored Observation coordinates, then returns the persisted per-page/cumulative result without requiring a now-destroyed terminal fence and without any mutation. This covers a committed final-page response loss even after the Run is terminal; a stale Worker gains no write authority. A same/lower page sequence with a different receipt/digest is `ErrIdempotency`. Only a genuinely new page proceeds to exact live owner/raw-token hash/epoch/unexpired-lease admission.
+2. Lock the `asset_sources` row in the same tenant/workspace and reject paused, disabled, wrong-source, gate/revision/digest/checkpoint drift. Lock each exact Asset and its last Observation, then every addressed Relationship in deterministic identity order；resolve and authorize every item/relation Environment against the immutable revision authority. Before allocating any Observation, reject an existing exact-source Asset whose immutable `kind` differs from the incoming non-tombstone Kind as `SOURCE_ASSET_KIND_DRIFT`; the whole page rolls back and checkpoint does not advance.
+3. Registry validates each asset and relation `FreshnessCandidate`, then Repository uses Pack 01's sole `FramedTupleV1` encoder to compute full persisted provenance, time-free Provider provenance, fingerprints, asset semantic `provider_fact_sha256`, independent `relation_fact_sha256` and Observation-chain digests. For an asset, compare the locked prior Source definition revision and `(freshness order,provider_version_sha256,provider_fact_sha256)`：a smaller order rolls back the whole page as `SOURCE_FRESHNESS_REGRESSION`; an equal order with a different Provider-version or semantic-fact digest rolls back as `SOURCE_FRESHNESS_COLLISION`; an equal fully identical tuple in the same Run is replay, while in a later Run it appends an unchanged Observation; a greater order appends an Observation and is `Unchanged` when semantic fact is equal or `Changed` when it differs. Relations use the same comparisons against their independently persisted last freshness/fact tuple. A new canonical Source revision starts a new freshness domain only after exact publication initializes its checkpoint；checkpoint-lineage rollover does not reset object freshness. Tombstone follows the same rule. Regression/collision is never item-level PARTIAL and never advances checkpoint.
+4. Use only the transaction-fixed `transaction_timestamp()` read in step 1 as every new `observed_at` and inject that exact canonical UTC microsecond value into provenance/chain bytes. After locking the prior Asset/Observation, if this transaction timestamp is not strictly later than the prior `observed_at`, roll back the whole page and retry from a new serializable transaction with a fresh timestamp；never derive a replacement with `clock_timestamp()`、`statement_timestamp()` or `max(prior+1 microsecond)`. Provider update/event time exists only in freshness/checkpoint proof.
+5. Before allocating any new Observation ID/time/chain or advancing an Asset pointer, query the exact same-Run identity `(tenant_id,workspace_id,source_id,run_id,provider_kind,external_id)`. Existing rows are replay only when **all** belong to the same `page_sequence + page_digest + immutable page receipt`; verify Environment、Source definition revision、accepted checkpoint/fence/page coordinates、freshness、tombstone shape and semantic/document/fingerprint/full-provenance/chain digests and return that receipt. If the key exists on another page of the same Run—even with identical content—fail the whole page as `SOURCE_RUN_OBJECT_DUPLICATE`; mixed present/absent state under a purported receipt is corruption. For a nonterminal immediate replay the Asset must still point to that Observation；for a historical terminal replay, the current pointer must be that Observation or a later immutable chain descendant. Only the absent path allocates database Catalog time/ID/chain and inserts；`ON CONFLICT ... DO NOTHING` remains a final race defense, never the primary replay algorithm. A later Run under the same published revision always appends. The new row's `previous_observation_id/previous_chain_sha256` must match the locked Asset pointer；pointer CAS prevents ABA.
+6. Match only the fixed dedupe key `(tenant_id, workspace_id, source_id, provider_kind, external_id)`.
+7. New exact-source items create `DISCOVERED` assets with defaults `UNRESOLVED/INTERNAL/MEDIUM`, `owner_group="unassigned"` and empty governance labels, then append exact-identity Type Detail revision 1. The sentinel renders as “未分配” and is not an inferred owner or Service.
+8. Existing exact-source items update only source-owned projection fields: `display_name`、exact last Observation/chain、`last_observed_at`、`last_source_revision`; append Type Detail only when normalized detail hash changes. Preserve governance fields.
+9. Cross-source fingerprint candidates create or refresh `OPEN` AssetConflict with the exact candidate Source+Observation and `AMBIGUOUS`; do not create, merge, bind, or overwrite an Asset.
+10. Process top-level relations after same-page Items **before any final membership closure**. Resolve both explicit Environment+external keys only to exact same-Source Assets and require both Environments in the immutable authority scope；an endpoint not yet committed/created is `SOURCE_RELATION_ENDPOINT_NOT_READY`, while an unauthorized/cross-source endpoint is a relation conflict. Before mutation, check the Relationship's last Run/page identity：the same relation identity on another page of this Run is `SOURCE_RUN_RELATION_DUPLICATE`；an exact replay is served only by its immutable page receipt. Compare independent relation freshness/version/fact as in step 3, upsert the current projection and its last exact Run/page/fact coordinates, and include every accepted relation in the immutable page receipt. A later Run with an unchanged relation still advances its last-seen coordinates and appends receipt evidence but does not change semantic relationship fields.
+11. After step 10 has written every final-page relation coordinate, only a `FinalPage=true, CompleteSnapshot=true` Run with zero projection/schema/DLP/identity/relation rejections proves authoritative asset-and-relation membership closure and identifies source-owned Assets/Relationships not observed anywhere in this Run. Any rejection makes effective `CompleteSnapshot=false`, yields no missing/stale/inactive transition, and cannot update `last_complete_snapshot_at`；the system does not guess membership from a partially parsed record. Missing `ACTIVE` Assets become `STALE`；`DISCOVERED` remains `DISCOVERED`；`QUARANTINED/RETIRED` remain unchanged. Missing source-owned active Relationships become `INACTIVE` by their last-seen Run coordinate. Intermediate pages, final incremental Runs and all `PARTIAL` Runs never perform either missing detection. Tests cover a relation present only on the final page and one present only on an intermediate page so neither is falsely inactivated.
+12. A fresh Provider tombstone or complete-run absence changes `ACTIVE` to `STALE`, retires only source-owned active relation projections, and preserves Asset/Observation/Type Detail history. A recovered `STALE` Asset receives the new Observation and `asset.source.asset.restored.v1` event but remains `STALE`；only later publication/capability revalidation may move it to `ACTIVE`.
+13. Within the same transaction and under the current Run fence, advance the Source checkpoint by CAS from `CursorBeforeHash` to `CursorAfterHash`, increment checkpoint/page sequence once, revalidate the live fence using `clock_timestamp()` immediately before commit, and insert an immutable safe page receipt with exact page/cumulative counts. Non-MANUAL checkpoints use the exact `CheckpointAAD`; MANUAL uses only its logical Catalog-sequence CAS. Any stale fence/page/checkpoint mismatch rolls back Observation, projection, receipt, audit and outbox together.
+14. Intermediate pages persist page/checkpoint/count progress and leave the Run `RUNNING` with no completion event. A final page persists `DATA_PROJECTION` with proposed `SUCCEEDED|PARTIAL`, final/effective-complete-snapshot flags, exact work-result digest and `work_result_recorded_at`, then transitions only to `FINALIZING/CLEANING_UP`；it does not set `completed_at`、Source success pointers or emit a completion event. After Broker-backed Provider/runtime cleanup, `Queue.Complete` verifies the terminal command's Run ID、work-result digest and `REVOKED|NO_CREDENTIAL` cleanup digest, atomically writes its receipt and terminal status/`completed_at`, advances `last_success_run_id/at` only for `SUCCEEDED` non-Validation data Runs, advances `last_complete_snapshot_run_id/at` only for `SUCCEEDED + effective complete_snapshot=true`, and emits completion audit/outbox. `PARTIAL` advances neither pointer. `MANUAL_MUTATION` supplies `NO_CREDENTIAL` and performs both transitions inside its one transaction.
+15. On any reconciliation error, roll back every batch mutation and return only a typed stable error code to the Worker；Reconciler never writes `FAILED` itself. The Worker first calls fenced `Queue.PrepareFailureIntent` to persist that exact stable code/digest and enter `FINALIZING/CLEANING_UP`, then revokes any cleanup attempt and persists its receipt, and finally calls `Queue.Fail` to consume the already-persisted intent. The synchronous MANUAL transaction rolls back in full and returns its stable error without leaving a Run. Provider error text is never persisted.
 
-Use row-level advisory locking keyed by the source UUID before processing so two different run IDs for the same source cannot reorder observations.
+Do not create a second discovery-ownership mechanism with advisory locks. The durable Queue's partial unique nonterminal-Run constraint and lease/fence establish ownership；inside each page transaction, the Repository locks the exact Run then Source row and prior projections in deterministic order. Any impossible second nonterminal Run is rejected as corruption rather than serialized by a parallel lock. Transactional advisory locking remains limited to the separate Idempotency-Key ledger described in Task 2.
 
 - [ ] **Step 5: Test append-only enforcement, stale/recovery, replay, and concurrent runs**
 

@@ -13,12 +13,13 @@
 - 前置完成 [05-source-ingestion-csv-api.md](./05-source-ingestion-csv-api.md)、[06-source-external-cmdb.md](./06-source-external-cmdb.md)、[07-source-vsphere.md](./07-source-vsphere.md) 与 [08-source-proxmox-openstack-cloud.md](./08-source-proxmox-openstack-cloud.md)。
 - 每个 Task 严格执行 `Red → Green → Refactor`：先运行并保留预期失败，再做最小生产实现，随后消除重复、复跑指定验证并按 Task 提交；不得跳过失败或弱化断言。
 - 生产必须有独立 `cmd/discovery-worker`；不得把 Provider SDK、Credential Resolver 或目标网络客户端装入 Control Plane、通用 `cmd/worker` 或浏览器。
-- Job/Run 只含 Source/Revision/Gate/Checkpoint digest、Scope、Run ID、预算和 fence；不含 endpoint、Secret、Token、PEM、cursor plaintext、Header/Body 或 Provider 错误。
+- 持久 Job/Run 只含 Source/Revision/Gate/Checkpoint digest、Scope、Run ID、预算、fence epoch/owner/token hash；不含 endpoint、Secret、raw Token、PEM、cursor plaintext、Header/Body 或 Provider 错误。完整 sealed `LeaseFence` 只由 Claim 返回到当前 Worker 内存，绝不进入 Job/Task/Batch/audit/log payload。
 - Raw lease token 只存 Worker 内存，DB 仅存 SHA-256；每次 reclaim 必须 `fence_epoch+1` 且旧 fence 无法 heartbeat/reconcile/checkpoint/complete。
-- Checkpoint 使用 AES-256-GCM，AAD 绑定 Tenant/Workspace/Source/Provider/Revision/Definition/Fence epoch/Checkpoint version；key 只通过 workload secret binding 读取。
+- Checkpoint 使用 AES-256-GCM；唯一 AAD 构造器消费 Pack 01 typed `CheckpointAAD`，并用 `FramedTupleV1("asset-source-checkpoint.v1",Tenant,Workspace,Source,Provider,Source definition revision,canonical revision digest,source definition digest,checkpoint key ID,Checkpoint version)` 的精确九字段顺序。key 只通过 workload secret binding 读取。持久 AAD 不含 gate revision/fence epoch/token，因为 checkpoint 必须跨 reclaim 和后续 Run 恢复且 Claim 不得制造 checkpoint 版本变更；每次 Open、Provider call、Reconcile、checkpoint 提交和 Complete 仍分别要求 exact live owner/token/epoch。Codec 必须有 golden bytes/hash、九字段逐项篡改、NULL/empty 和 key-rotation 测试。
 - 数据库持久每 source/workspace/provider 并发、token bucket、`not_before`、queue depth 和 failure streak；进程内 semaphore 只是二次保护，不是授权事实。
 - Validation Run 可消费 `VALIDATING` revision；Discovery/Import/Ingestion Run 仅可消费 exact `PUBLISHED + ACTIVE + AVAILABLE`。任何漂移停止并关闭影响的 provider/source gate。
-- Credential open/session cleanup 是 terminal 成功的必要证据；cleanup 未知不能把 run 写为成功。
+- Validation Run 的 checkpoint 输入固定为空；它不得比较、解密或推进当前 published revision 的 Source checkpoint。Discovery/Import/Ingestion 才消费 exact current checkpoint；checkpoint-lineage-rollover 仅走 Pack 01 的受治理同一 Run 例外。
+- Credential open/session cleanup 是 terminal 成功的必要证据。每个 attempt 先持久化 Broker-owned opaque UUID，再允许 open；Broker 持有真实 revoke/session handle，Run/API/日志永不携带。cleanup 未知不能把 run 写为成功并必须暂停 Source gate。
 - `MANUAL` 不进 Worker；`KUBERNETES_OPERATOR` 由 Phase 3 注册；`AWX_INVENTORY` 由 Phase 5 固定 AWX 契约注册。未注册时都是 `UNAVAILABLE`，不得用通用 Provider 替代。
 - 完成后进入 [10-overview-control-room.md](./10-overview-control-room.md)。
 
@@ -36,9 +37,12 @@
 - Create: `internal/discoverylimit/limiter.go`
 - Create: `internal/discoverylimit/postgres/limiter.go`
 - Create: `internal/discoverylimit/postgres/limiter_integration_test.go`
+- Create: `internal/discoverycleanup/broker.go`
+- Create: `internal/discoverycleanup/broker_test.go`
 
 **Interfaces:**
-- Produces `Queue.Claim/Heartbeat/Delay/Complete/Fail` and `PageCommitter.ApplyPage` with exact `LeaseFence`.
+- Produces `Queue.Claim/Reclaim/ReclaimFinalizing/ReapDrifted/CancelIneligible/Heartbeat/AdvanceStage/ReserveCleanupAttempt/RecordCleanup/Delay/ProposeValidationResult/PrepareFailureIntent/BeginCheckpointLineageRollover/Complete/Fail` and `PageCommitter.ApplyPage(ctx, LeaseFence, Batch)` with exact sealed `LeaseFence`; raw token is never a Batch field.
+- Produces `CleanupBroker.OpenAttempt/RevokeAttempt`；only the Broker owns the revocation/session handle，while Queue stores a random opaque attempt UUID/epoch and verifies signed cleanup proof.
 - Produces `CheckpointCodec.Seal/Open` and `Limiter.Acquire/Release/Delay` bound to Source/Workspace/Provider.
 - Consumes nine-table `000015` schema; creates no new migration.
 
@@ -50,8 +54,8 @@ func TestExpiredRunReclaimInvalidatesOldFence(t *testing.T) {
 	first := claimRun(t, queue, "worker-a", 30*time.Second)
 	advanceClock(t, 31*time.Second)
 	second := claimRun(t, queue, "worker-b", 30*time.Second)
-	if second.Fence.Epoch != first.Fence.Epoch+1 || second.Fence.Token == first.Fence.Token {
-		t.Fatalf("fences = %#v %#v", first.Fence, second.Fence)
+	if second.Epoch != first.Epoch+1 {
+		t.Fatalf("epochs = %d, %d", first.Epoch, second.Epoch)
 	}
 	if _, err := queue.Heartbeat(context.Background(), first.Fence, 1, 30*time.Second); !errors.Is(err, discoveryqueue.ErrStaleFence) {
 		t.Fatalf("old heartbeat error = %v", err)
@@ -68,21 +72,97 @@ func TestCheckpointCannotOpenInAnotherScopeOrRevision(t *testing.T) {
 		t.Fatalf("cross-revision open error = %v", err)
 	}
 }
+
+func TestValidationRunNeverReadsOrChangesPublishedCheckpoint(t *testing.T) {
+	fixture := sourceWithPublishedCheckpointAndNewDraftValidation(t)
+	codec := failOnCallCheckpointCodec(t)
+	before := fixture.rawSourceCheckpoint(t)
+	claim := fixture.claimValidation(t, codec)
+	fixture.heartbeatValidation(t, claim)
+	fixture.proposeAndCompleteValidation(t, claim)
+	if codec.Calls() != 0 || !bytes.Equal(before, fixture.rawSourceCheckpoint(t)) {
+		t.Fatal("Validation touched the published Source checkpoint")
+	}
+}
+
+func TestCleanupReceiptCrashConsumesExactPersistedNextIntent(t *testing.T) {
+	fixture := runningRunWithAttempt(t)
+	fixture.persistDelayIntent(t, "TRANSPORT_BACKOFF")
+	fixture.recordRevokedCleanupThenCrash(t)
+	reclaimed := fixture.reclaim(t)
+	fixture.assertCleanupOnly(t, reclaimed)
+	fixture.consumeDelayIntent(t, reclaimed)
+	fixture.assertOneAttemptReceiptAndDelayed(t)
+}
+
+func TestCleanupUncertainOverridesPersistedSuccessWithoutReplacingIt(t *testing.T) {
+	for _, kind := range []string{"DATA_PROJECTION", "VALIDATION_PROOF"} {
+		fixture := finalizingSuccessfulRun(t, kind)
+		original := fixture.workResultDigest(t)
+		fixture.failCleanupUncertain(t)
+		fixture.assertTerminal(t, "FAILED", "SUSPENDED")
+		if fixture.workResultDigest(t) != original || fixture.failureOverride(t) != "CLEANUP_UNCERTAIN" {
+			t.Fatalf("%s result was replaced", kind)
+		}
+		fixture.assertNoSuccessPointerAndValidationRejectedWhenApplicable(t)
+	}
+}
+
+func TestFailureIntentSurvivesCrashesBeforeAndAfterCleanup(t *testing.T) {
+	assertReclaimFinalizesPreparedFailureIntent(t, crashBeforeCleanup)
+	assertReclaimFinalizesPreparedFailureIntent(t, crashAfterCleanupReceipt)
+}
+
+func TestReserveCleanupAttemptResponseLossReturnsSameAttempt(t *testing.T) {
+	fixture := claimedRun(t)
+	first := fixture.reserveThenLoseResponse(t)
+	replay := fixture.reserveAgain(t)
+	if replay.AttemptID != first.AttemptID || fixture.attemptCount(t) != 1 {
+		t.Fatalf("reserve replay = %#v, first = %#v", replay, first)
+	}
+}
+
+func TestOpenAttemptResponseLossRevokesKnownAttemptBeforeDelay(t *testing.T) {
+	fixture := claimedRun(t)
+	attempt := fixture.reserve(t)
+	fixture.brokerOpenThenLoseResponse(t, attempt)
+	fixture.assertNoSecondOpenOrAttempt(t)
+	fixture.revokeRecordAndDelayTransportBackoff(t, attempt)
+	fixture.assertBrokerHasNoLiveSession(t, attempt)
+}
+
+func TestRevokeAttemptResponseLossReturnsSameProofAndOneReceipt(t *testing.T) {
+	fixture := claimedRunWithOpenedAttempt(t)
+	first := fixture.brokerRevokeThenLoseResponse(t)
+	replay := fixture.brokerRevokeAgain(t)
+	if replay.Digest != first.Digest || replay.Status != first.Status {
+		t.Fatalf("revoke replay = %#v, first = %#v", replay, first)
+	}
+	fixture.recordCleanup(t, replay)
+	fixture.recordCleanupReplay(t, first)
+	fixture.assertAttemptCleanedReceiptCount(t, 1)
+}
 ~~~
 
-Run: `go test ./internal/discoveryqueue/... ./internal/discoverycheckpoint ./internal/discoverylimit/... -count=1`
+Run: `go test ./internal/discoveryqueue/... ./internal/discoverycheckpoint ./internal/discoverylimit/... ./internal/discoverycleanup -count=1`
 
 Expected: FAIL because durable queue/checkpoint/limiter are absent.
 
 - [ ] **Step 2: Implement exact HA claim and fenced state transitions**
 
-`Claim` uses one serializable transaction and `FOR UPDATE SKIP LOCKED`, filters supported Provider kinds, `not_before<=now`, source/revision eligibility and persisted capacity. It generates 32 random bytes, returns raw token once, stores its SHA-256, sets owner/lease/heartbeat sequence and increments epoch. Reclaim only expired leases. `Heartbeat` requires token hash+epoch+owner+strict sequence+live source/gate/revision; maximum extension is 30s.
+`Claim` uses one serializable transaction and `FOR UPDATE SKIP LOCKED`, filters `QUEUED|DELAYED` supported Provider Runs, `not_before<=now`, run-kind-specific source/gate/revision/checkpoint eligibility and persisted capacity. It generates 32 random bytes, returns a sealed process-local fence once, stores only token SHA-256, sets owner/lease/heartbeat sequence, increments epoch and moves stage to `VALIDATING` or `READING`. Validation binds its `VALIDATING` revision but neither compares nor returns the published Source checkpoint. Normal reclaim accepts only an expired `RUNNING` lease whose Source remains exact eligible. If the old attempt is `NOT_OPENED|NO_CREDENTIAL`, it may continue under the new fence；if an opaque attempt is `PENDING`, reclaim sets `CLEANING_UP`, persists/uses a bounded `TRANSPORT_BACKOFF` delay intent and returns cleanup-only work that must revoke then delay before a fresh claim—no Provider/checkpoint/page admission is available. If cleanup is already `REVOKED|NO_CREDENTIAL`, reclaim verifies `ATTEMPT_CLEANED` and executes the previously persisted delay intent；it never resumes Provider work. `ReclaimFinalizing` accepts only an expired `FINALIZING` row, increments the fence and returns cleanup-only work；an already-clean receipt goes directly to the persisted work-result `Complete|Fail`. `CancelIneligible` serializably cancels no-lease `QUEUED|DELAYED` rows after disable/drift and, for an exact Validation Run, atomically rejects the still-bound Revision with stable proof. For an expired drifted `RUNNING` row, `ReapDrifted` advances the fence without Provider/checkpoint access and fails directly only if no credential was opened；otherwise it enters cleanup-only work and requires Broker revocation before terminal failure. `Heartbeat` repeats run-kind-specific exact facts plus token/epoch/owner/strict-sequence：Validation verifies only its empty checkpoint shape，data Runs verify the current Source checkpoint. Maximum extension is 30s. The current holder may fail/clean up before expiry after drift but cannot extend.
 
-`Delay` atomically records bounded stable reason and `not_before`, releases capacity and clears lease fields. `Complete/Fail` require current fence and terminal credential-cleanup proof; they clear lease/capacity and freeze terminal run. A matching terminal replay is idempotent; any other fence/result hash is rejected.
+`ReserveCleanupAttempt` must commit a random opaque attempt UUID plus the current fence epoch before `CleanupBroker.OpenAttempt` may resolve/open credentials or sessions. It is idempotent for exact `(run,fence epoch)`；a lost response is retried to retrieve the same UUID, never to allocate another. Broker `OpenAttempt(attempt_id)` creates at most one logical session and `RevokeAttempt(attempt_id)` returns one idempotent signed proof. If Open succeeds but its response is lost/ambiguous, Worker must not Open again for work, create a new attempt or make a Provider call；it persists `TRANSPORT_BACKOFF`, revokes the known attempt, records proof and delays. `RecordCleanup` accepts only a signed Broker proof bound to the same Run/attempt/epoch and writes an append-only `ATTEMPT_CLEANED` receipt；the current Run summary is not the history owner. A new Worker can therefore call `RevokeAttempt` using only the opaque UUID, without runtime、checkpoint、credential reference or endpoint. `REVOKED|NO_CREDENTIAL` are clean；missing/invalid/`UNCERTAIN` proof fails the Run and sets gate `SUSPENDED`.
+
+`Delay` requires the current attempt's clean proof, then atomically transitions cleanup-only `RUNNING→DELAYED`, consumes the persisted closed reason `PROVIDER_RETRY_AFTER|TRANSPORT_BACKOFF` and bounded `not_before`, releases capacity and clears the lease while preserving committed page/checkpoint/count progress plus the immutable attempt receipt. The next claim creates a new fence and may clear the current cleanup summary to `NOT_OPENED` only after verifying that receipt. `ProposeValidationResult` persists exact revision/canonical/binding/outcome/proof digest as `VALIDATION_PROOF` and transitions `RUNNING→FINALIZING`；the invalid outcome proposes `FAILED`, never `PARTIAL`. Any other fatal path must call fenced `PrepareFailureIntent` **before cleanup** to persist stable code/digest and transition `RUNNING→FINALIZING/CLEANING_UP`；it cannot overwrite an existing data/validation result. `Complete/Fail` accept a safe terminal command containing Run ID、work-result/intent digest and cleanup digest. They first look up the immutable `TERMINAL_COMMITTED` receipt；an exact replay returns read-only even after the first call destroyed every fence copy, while any changed tuple is rejected. Only the first terminal mutation requires current fence, writes the receipt and atomically updates the bound Revision validation state. If cleanup is `UNCERTAIN` after a success result, `Fail` preserves that result and writes the sole `CLEANUP_UNCERTAIN` override/digest, producing `FAILED + SUSPENDED` and no success pointer. Both terminal methods release capacity, destroy the raw token and freeze terminal Run while preserving owner/token-hash/epoch/heartbeat evidence.
 
 - [ ] **Step 3: Implement atomic page/checkpoint and persisted rate/backpressure**
 
-`ApplyPage` transaction order: lock run/source/revision; verify fence, gate, revision/digest, page sequence and checkpoint-before; call scoped Reconciler; seal checkpoint outside SQL but authenticate exact AAD; persist ciphertext/key ID/hash/version and page digest; insert safe audit/outbox; commit. A crash before commit changes nothing; after commit replay returns the same result. Checkpoint key rotation reads previous key IDs but every new page writes current key.
+Provider discovery returns the Pack 05 closed `DiscoverOutcome` with concrete `Page|Delay`, never a struct in which retry and data coexist. `Delay{Reason=PROVIDER_RETRY_AFTER,RetryAfter}` requires `0 < RetryAfter <= 60s` and by construction has no Items、Relations、next checkpoint or final flags. `Page` has no delay and contains the page/checkpoint/final fields. Transport ambiguity is created only by the Worker as Queue `TRANSPORT_BACKOFF` intent（exponential, max 15m）after stopping Provider calls and before cleanup. Neither delay path calls `ApplyPage` or changes checkpoint/counts.
+
+`ApplyPage(ctx, fence, batch)` transaction order: lock run/source/revision；perform exact persisted page-replay lookup before live-fence admission；for a new page verify the separate sealed fence, gate/revision/digest, stage, page sequence and checkpoint-before；call scoped Reconciler, which derives Source revision and Catalog acceptance time rather than accepting them from Provider items；seal checkpoint outside SQL but authenticate the exact typed `CheckpointAAD` including key ID；revalidate the same live fence with database `clock_timestamp()` inside the serializable transaction；persist ciphertext/key ID/hash/version, page digest and safe page receipt；a final page persists `DATA_PROJECTION` and transitions only to `FINALIZING/CLEANING_UP`；commit. Claim/reclaim never decrypt-and-reseal or bump checkpoint version. A crash before commit changes nothing；after commit an exact replay returns the persisted result even when final cleanup has already made the Run terminal. Checkpoint key rotation reads previous key IDs but every new page writes current key.
+
+`BeginCheckpointLineageRollover` is available only to Profiles with a closed expiry reason and a verified Adapter evidence digest. It binds that proof to the exact current fence/Run/revision/checkpoint, degrades the gate and leaves the old checkpoint untouched；the same Run must then emit an authoritative full-snapshot `Page` whose first commit CASes from the old hash into a new lineage. No API/Worker can clear、rewind or create a side Run. Recoverable Provider/transport failure cleans and delays this same Run. Only terminal `SUCCEEDED + effective complete snapshot` seals rollover and restores the gate；any terminal failure or cleanup/checkpoint uncertainty suspends it and requires a newly validated/published revision.
 
 Limiter defaults come from immutable Source Profile and are clamped by server maxima. Persist active slots and next token time using source row/CAS so two replicas cannot exceed source/Workspace/provider limits. Queue depth beyond 10,000 runs/Workspace rejects new sync with `SOURCE_BACKPRESSURE`; no run is silently dropped. Provider `Retry-After` max 60s and exponential transport backoff max 15m are persisted.
 
@@ -91,16 +171,16 @@ Limiter defaults come from immutable Source Profile and are clamped by server ma
 Run:
 
 ~~~bash
-gofmt -w internal/discoveryqueue internal/discoverycheckpoint internal/discoverylimit
-go test -race ./internal/discoveryqueue/... ./internal/discoverycheckpoint ./internal/discoverylimit/... -count=1
+gofmt -w internal/discoveryqueue internal/discoverycheckpoint internal/discoverylimit internal/discoverycleanup
+go test -race ./internal/discoveryqueue/... ./internal/discoverycheckpoint ./internal/discoverylimit/... ./internal/discoverycleanup -count=1
 TEST_DATABASE_URL="$TEST_DATABASE_URL" \
   go test -race ./internal/discoveryqueue/postgres ./internal/discoverylimit/postgres -run Integration -count=1
 ~~~
 
-Expected: PASS for concurrent claims, lease expiry/reclaim, stale fence at every boundary, crash-before/after-commit, checkpoint tamper/rotation, global limit across replicas, 429 delay, queue overflow and PostgreSQL reconnect.
+Expected: PASS for concurrent claims, lease expiry/reclaim, stale fence at every boundary, crash-before/after-page commit, crash after `RecordCleanup` but before `Delay|Complete|Fail`, exact attempt/terminal receipt recovery, checkpoint tamper/rotation, global limit across replicas, Provider/transport delay, queue overflow and PostgreSQL reconnect.
 
 ~~~bash
-git add internal/discoveryqueue internal/discoverycheckpoint internal/discoverylimit
+git add internal/discoveryqueue internal/discoverycheckpoint internal/discoverylimit internal/discoverycleanup
 git commit -m "feat(assetdiscovery): add fenced discovery queue"
 ~~~
 
@@ -124,7 +204,7 @@ git commit -m "feat(assetdiscovery): add fenced discovery queue"
 **Interfaces:**
 - Produces `discoveryworker.New(Dependencies) (*Worker,error)` and `cmd/discovery-worker.newProduction(Config) (*Worker,error)`.
 - Registry contains exact adapters `CSV_IMPORT`, `CONTROL_PLANE_API`, `EXTERNAL_CMDB/CMDB_CATALOG_V1`, `VSPHERE_VCENTER_V1`, `PROXMOX_VE_V1`, `OPENSTACK_NOVA_V2_1`, `AWS_EC2_V1`, `AZURE_COMPUTE_V1`, `GCP_COMPUTE_V1`.
-- Production constructor uses PostgreSQL Queue/Reconciler, secure Source Profile resolver, workload Credential/Trust resolver, checkpoint keyring, metrics and mTLS workload identity; no fake fallback exists.
+- Production constructor uses PostgreSQL Queue/Reconciler, secure Source Profile resolver, Broker-backed workload Credential/Trust resolver, checkpoint keyring, metrics and mTLS workload identity; no fake fallback exists.
 
 - [ ] **Step 1: Write failing production dependency and secret-boundary tests**
 
@@ -135,7 +215,7 @@ func TestProductionConstructorFailsClosedForEveryMissingDependency(t *testing.T)
 		func(d *Dependencies) { d.Queue = nil },
 		func(d *Dependencies) { d.Reconciler = nil },
 		func(d *Dependencies) { d.RuntimeResolver = nil },
-		func(d *Dependencies) { d.CredentialResolver = nil },
+		func(d *Dependencies) { d.CleanupBroker = nil },
 		func(d *Dependencies) { d.Checkpoints = nil },
 		func(d *Dependencies) { d.Registry = nil },
 	} {
@@ -161,16 +241,16 @@ Expected: FAIL because Worker and production constructor do not exist.
 For every claim:
 
 1. revalidate workload identity, Scope, source, exact revision/profile/gate and fence;
-2. decrypt checkpoint through keyring and resolve non-serializable RuntimeBinding;
-3. open the opaque CredentialReference for this source/revision/lease only;
-4. for validation, call fixed `Validate`; for discovery, call `Discover` page-by-page;
-5. before and after every network call heartbeat and revalidate fence/gate;
-6. DLP/schema/budget check, then `ApplyPage` with current fence;
-7. on Retry-After call fenced Delay; on ambiguity stop, degrade/suspend gate and never guess/retry side effects;
-8. close/zero runtime, credential/session and provider response buffers;
-9. persist cleanup proof, then Complete/Fail.
+2. for Validation, construct an empty checkpoint input and never read the published Source checkpoint；for data Runs, decrypt the exact checkpoint through keyring；then resolve the non-serializable RuntimeBinding;
+3. call `ReserveCleanupAttempt` and only then `CleanupBroker.OpenAttempt` for this source/revision/run/epoch；the Worker receives a non-serializable process handle, never a durable secret payload;
+4. advance the stable stage and, for Validation, call fixed `Validate` then fenced `ProposeValidationResult` with exact proof；for discovery, consume only the closed `DiscoverOutcome` (`Page|Delay`) and call `Discover` page-by-page;
+5. before and after every network call heartbeat and revalidate the run-kind-specific fence/gate/revision/checkpoint facts;
+6. for a Page outcome, advance `NORMALIZING→APPLYING`, perform DLP/schema/budget checks, then `ApplyPage`；cycle to `READING` only for another page;
+7. for Provider Retry-After or transport ambiguity, stop all Provider calls；never combine it with data or guess/retry side effects；a verified token-expiry reason may only call `BeginCheckpointLineageRollover` and continue the same authoritative full Run;
+8. before cleanup, persist exactly one next path：bounded delay intent for retry、`PrepareFailureIntent` for fatal error、or the already-recorded data/validation work result；then advance `CLEANING_UP`, close/zero runtime and provider response buffers, call Broker `RevokeAttempt`, and persist its signed cleanup proof/immutable attempt receipt;
+9. call fenced `Delay` for the persisted `PROVIDER_RETRY_AFTER|TRANSPORT_BACKOFF` intent only after clean proof；otherwise call `Complete/Fail` using the already persisted work result/intent. Cleanup uncertainty preserves any prior work result and uses the closed failure override. Exact terminal replay is served from its receipt before fence matching.
 
-Panic recovery only performs cleanup/failure recording and process health degradation; it cannot mark success. Context cancellation stops new claims and gives current runs at most one lease interval to clean up. Unsupported provider closes only its source gate with `SOURCE_PROVIDER_UNAVAILABLE`.
+Panic recovery only performs Broker cleanup/failure recording and process health degradation；it cannot mark success. Context cancellation stops new claims and gives current runs at most one lease interval to clean up. A reclaimed pending attempt is cleanup-only, then delayed or failed；it never resumes Provider work under the replacement fence. Unsupported provider closes only its source gate with `SOURCE_PROVIDER_UNAVAILABLE`.
 
 - [ ] **Step 3: Assemble the real binary without production fake branches**
 
@@ -258,7 +338,7 @@ Each Phase 1 row requires current validation, real protocol, negative, DLP, prov
 
 - [ ] **Step 3: Execute kill/failover/backpressure and full provider E2E**
 
-`verify-discovery-worker-ha.sh` starts two real Worker processes and PostgreSQL, queues validation and discovery for every CI protocol provider, kills the lease owner during provider read and after page commit, expires the lease, verifies one reclaim/epoch increment, no duplicate Observation, no stale checkpoint commit, terminal credential cleanup and correct gate. It restarts PostgreSQL, saturates source/workspace/provider limits and proves durable Retry-After/queue rejection/recovery.
+`verify-discovery-worker-ha.sh` starts two real Worker processes and PostgreSQL, queues validation and discovery for every CI protocol provider, kills the lease owner during Provider read、after final page commit and after `RecordCleanup` but before each of `Delay|Complete|Fail`, expires the lease, verifies one reclaim/epoch increment, cleanup-only Broker revocation/receipt consumption by opaque attempt ID, deterministic persisted next intent, no runtime/checkpoint access during that cleanup, no duplicate same-Run Observation/relation, one append-only unchanged Observation in a later Run, no stale checkpoint commit, one terminal receipt and correct gate. It separately loses the first `Complete/Fail` response and proves exact receipt-first replay succeeds after `LeaseFence.Destroy` while a changed digest is rejected. It also drifts a Source under an expired lease and proves `ReapDrifted` closes the Run/slot without any Provider call；cleanup uncertainty deterministically yields `FAILED + SUSPENDED`. It restarts PostgreSQL, saturates source/workspace/provider limits and proves durable Provider Retry-After/transport backoff/queue rejection/recovery.
 
 Run:
 

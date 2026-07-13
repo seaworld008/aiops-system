@@ -76,20 +76,20 @@ The protocol contract allows only stable fields:
 ~~~text
 Capability: protocol_version, authority_id, snapshot_epoch, max_page_size,
             supports_delta, supports_tombstone, server_time
-Asset: external_id, type_code, display_name, source_revision, updated_at,
+Asset: external_id, type_code, display_name, object_revision_positive_int64, updated_at,
        deleted, tombstone_reason, attributes{allow-listed code:string}
 Relation: external_id, from_external_id, to_external_id, type_code,
-          source_revision, updated_at, deleted
-Page: items, next_cursor, snapshot_epoch, complete
+          object_revision_positive_int64, updated_at, deleted
+Page: items, next_cursor, snapshot_epoch, final_page, complete_snapshot
 ~~~
 
-No response may include secrets, arbitrary nested objects, executable text, HTML, endpoint, credential or opaque vendor payload. `Validate` performs TLS/SNI/CA and optional client-certificate verification, authority ID equality, clock skew ≤60s, protocol equality, read-only permission exactness, one max-limit asset probe, schema/DLP test and credential cleanup. Proof exposes booleans/stable codes/counts/digests only.
+No response may include secrets, arbitrary nested objects, executable text, HTML, endpoint, credential or opaque vendor payload. `object_revision` is canonical decimal `1..MaxInt64`, not an opaque token. `CMDB_CATALOG_V1` Source Profile is `SINGLE_ENVIRONMENT`: the immutable authority scope must resolve to exactly one same-Workspace Environment, Adapter assigns that Environment to every item/relation, and the wire protocol cannot choose it. `Validate` performs TLS/SNI/CA and optional client-certificate verification, authority ID equality, clock skew ≤60s, protocol equality, read-only permission exactness, one max-limit asset probe, schema/DLP test and credential cleanup. Proof exposes booleans/stable codes/counts/digests only.
 
 - [ ] **Step 3: Implement strict client and normalization**
 
 Use a dedicated `http.Client` with TLS 1.3 minimum, no environment proxy, redirect rejection, 5s connect/15s request deadlines, max 64 KiB headers and exact content type. Decode with `DisallowUnknownFields`, limit body before decode and reject duplicate JSON keys. OAuth/mTLS material comes from `BoundRuntime`; logs receive only operation/result/latency/Trace ID.
 
-Map CMDB type codes through a closed table to Asset Kind; unknown types become rejected items, never guessed. Each field gets provenance `(field_code,CMDB_V1_*_FIELD,SOURCE,source_revision,observed_at,confidence=100)`. Map relation types through the approved relationship enum. A deleted record yields only tombstone ID/revision/reason; it never physically deletes history.
+Map CMDB type codes through a closed table to Asset Kind; unknown types become rejected items, never guessed. Each object maps exactly to `OBJECT_TIME_SEQUENCE{OrderTime=updated_at UTC microsecond,OrderSequence=object_revision,ProviderVersionSHA256=SHA256(FramedTupleV1("cmdb-object-version.v1",object_revision))}` using the Pack 01 byte encoding. `snapshot_epoch` belongs only to checkpoint lineage and complete-snapshot closure and is deliberately excluded from the per-object Provider-version digest, so the same object version cannot collide merely because a new snapshot began. `external_id` is only the stable identity/page-order tie-break and never freshness. Neither Provider field is stored in or compared as Catalog integer `source_revision`. Adapter provenance contains only `(field_code,CMDB_V1_*_FIELD,SOURCE,confidence=100)`; Repository injects Source ID/provider/definition revision/Catalog time. Map relation types through the approved relationship enum and closed path code. A deleted record yields only identity, exact freshness, tombstone reason and provenance; it never physically deletes history.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -121,7 +121,7 @@ git commit -m "feat(assetdiscovery): add fixed external cmdb provider"
 - Create: `testdata/asset-source/external-cmdb/relations.json`
 
 **Interfaces:**
-- Consumes: sealed checkpoint and exact run fence; returns one bounded `discoverysource.Page` at a time.
+- Consumes the process-local opened checkpoint through `DiscoverRequest` while the Worker validates its exact fence around the call；returns one bounded closed `discoverysource.Page|Delay` outcome at a time and never receives the fence.
 - Produces cursor order `(updated_at,external_id)` separately for assets/relations plus immutable `snapshot_epoch`.
 - Produces only `assetdiscovery.NormalizedItem/ObservedRelation`; repository remains the sole projection writer.
 
@@ -131,11 +131,11 @@ git commit -m "feat(assetdiscovery): add fixed external cmdb provider"
 func TestDiscoverResumesAssetsThenRelationsAtExactCheckpoint(t *testing.T) {
 	server := newPagedCatalogServer(t, twoAssetPagesAndRelations())
 	provider := newProviderForServer(t, server, expectedAuthority(server.AuthorityID()))
-	first, err := provider.Discover(context.Background(), server.Runtime(), requestAt(emptyCheckpoint()))
-	if err != nil || first.Complete || len(first.Items) != 500 {
+	first, err := requirePageOutcome(provider.Discover(context.Background(), server.Runtime(), requestAt(emptyCheckpoint())))
+	if err != nil || first.FinalPage || first.CompleteSnapshot || len(first.Items) != 500 {
 		t.Fatalf("first = (%#v, %v)", first, err)
 	}
-	second, err := provider.Discover(context.Background(), server.Runtime(), requestAt(first.NextCheckpoint))
+	second, err := requirePageOutcome(provider.Discover(context.Background(), server.Runtime(), requestAt(first.NextCheckpoint)))
 	if err != nil || second.NextCheckpoint.AssetCursor == first.NextCheckpoint.AssetCursor {
 		t.Fatalf("second = (%#v, %v)", second, err)
 	}
@@ -155,9 +155,9 @@ Expected: FAIL because delta paging/checkpoint integration is missing.
 
 - [ ] **Step 2: Implement page state machine and atomic checkpoint rules**
 
-The phase order is `CAPABILITIES→ASSETS→RELATIONS→COMPLETE`. Every request carries the server-returned cursor only from process-local decrypted checkpoint; no caller can change it. Each response must keep the same authority/snapshot epoch and nondecreasing `(updated_at,external_id)`. The Worker calls Reconciler with current fence, before/after cursor hashes, page sequence and page digest; Observation/projection/checkpoint advance commit atomically.
+The phase order is `CAPABILITIES→ASSETS→RELATIONS→COMPLETE`. Every request carries the server-returned cursor only from process-local decrypted checkpoint；no caller can change it. Each response must keep the same authority/snapshot epoch and nondecreasing `(updated_at,external_id)`. ASSETS pages emit only top-level `Page.Items`；RELATIONS pages emit top-level `Page.Relations` and never repeat their source Item. Every relation carries both Environment IDs plus `OBJECT_TIME_SEQUENCE(updated_at,positive relation_revision,SHA256(FramedTupleV1("cmdb-relation-version.v1",relation_revision)))` and may be committed only after both endpoints were created in an earlier/same accepted page. The Worker calls Reconciler with current fence, before/after cursor hashes, page sequence and page digest；Observation/relation projection/checkpoint advance commit atomically. Intermediate pages set both final flags false；the last delta page is `(FinalPage=true,CompleteSnapshot=false)` and only an all-assets/all-relations authoritative closure is `(true,true)`.
 
-On `429/503`, parse only integer/date `Retry-After`, cap at 60s and return `Page.RetryAfter`; queue persists `not_before` and releases the lease without advancing checkpoint. On transport ambiguity, schema drift, snapshot epoch change, clock regression or stale fence, stop without missing detection. Full completion may mark absent source-owned assets stale. Tombstone has the same effect for one asset. Reappearance appends Observation and recovery event but remains stale pending later connection validation.
+On `429/503`, parse only integer/date `Retry-After`, cap at 60s and return the common `Delay{Reason: PROVIDER_RETRY_AFTER}` outcome；by type it has no items/relations/checkpoint/final flags. Queue persists `not_before` only after Broker cleanup and releases the lease without advancing checkpoint. On transport ambiguity, schema drift, snapshot epoch change, clock regression or stale fence, stop without missing detection. Full completion may mark absent source-owned assets stale. Tombstone has the same effect for one asset. Reappearance appends Observation and recovery event but remains stale pending later connection validation.
 
 - [ ] **Step 3: Run real TLS protocol integration and concurrency tests**
 
@@ -171,7 +171,7 @@ TEST_DATABASE_URL="$TEST_DATABASE_URL" \
   go test -race ./internal/assetcatalog/postgres -run CMDBDiscoveryIntegration -count=1
 ~~~
 
-Expected: PASS for resume, dedupe, provenance, relation ordering, explicit/implicit deletion, recovery, 429 backpressure, crash/reclaim and stale-fence rejection.
+Expected: PASS for resume, same-Run page replay, later-Run unchanged Observation append without Type Detail change, freshness regression/collision rollback, provenance, relation ordering, explicit/implicit deletion, recovery, 429 backpressure, crash/reclaim and stale-fence rejection.
 
 - [ ] **Step 4: Commit**
 
@@ -218,7 +218,7 @@ Expected: FAIL because provider gate evaluation does not exist.
 
 - [ ] **Step 2: Implement gate evidence and automatic closure**
 
-`AVAILABLE` requires current source/revision/binding digests, successful identity/trust/credential-cleanup/fixed-probe validation, contract+negative+DLP tests, real TLS protocol receipt, two-replica fence failover receipt, rate/backpressure receipt and a non-production external CMDB canary less than 24 hours old. Any credential/trust/network/profile/revision change, repeated auth/schema failures, checkpoint ambiguity, cleanup uncertainty or protocol drift closes the gate before another claim. A plain upstream outage sets `DEGRADED` and applies backoff; it never silently switches endpoint.
+`AVAILABLE` requires current source/revision/binding digests, successful identity/trust/credential-cleanup/fixed-probe validation, contract+negative+DLP tests, real TLS protocol receipt, two-replica fence failover receipt, rate/backpressure receipt and a non-production external CMDB canary less than 24 hours old. Any credential/trust/network/profile/revision change, repeated auth/schema failures, checkpoint ambiguity or protocol drift closes the gate before another claim；cleanup uncertainty specifically produces terminal `FAILED + SUSPENDED` and cannot be downgraded to `DEGRADED|UNAVAILABLE`. A plain upstream outage sets `DEGRADED` and applies backoff；it never silently switches endpoint.
 
 - [ ] **Step 3: Execute staging canary and UI/E2E verification**
 

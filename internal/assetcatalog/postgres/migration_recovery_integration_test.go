@@ -1,17 +1,16 @@
 package postgres_test
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
-	"os"
-	"os/exec"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	assetpostgres "github.com/seaworld008/aiops-system/internal/assetcatalog/postgres"
 )
 
 type recoveredTableProof struct {
@@ -20,55 +19,33 @@ type recoveredTableProof struct {
 }
 
 func TestAssetCatalogRecovery(t *testing.T) {
-	dsn := os.Getenv("AIOPS_TEST_POSTGRES_DSN")
-	if dsn == "" {
-		t.Skip("AIOPS_TEST_POSTGRES_DSN is not configured; real PostgreSQL 18.4 logical recovery was not run")
-	}
-	assertContainerPostgreSQLTools(t)
-	ctx := context.Background()
-	adminConfig, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		t.Fatalf("parse recovery PostgreSQL DSN: %v", err)
-	}
-	adminConfig.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
-	admin, err := pgxpool.NewWithConfig(ctx, adminConfig)
-	if err != nil {
-		t.Fatalf("connect recovery PostgreSQL admin database: %v", err)
-	}
-	t.Cleanup(admin.Close)
-	assertRecoveryServerVersion(t, admin)
-
-	suffix := randomAssetHex(t, 6)
-	sourceName := "aiops_assets_source_" + suffix
-	targetName := "aiops_assets_target_" + suffix
-	var source, target *pgxpool.Pool
-	t.Cleanup(func() {
-		if source != nil {
-			source.Close()
-		}
-		if target != nil {
-			target.Close()
-		}
-		dropRecoveryDatabase(t, admin, sourceName)
-		dropRecoveryDatabase(t, admin, targetName)
-	})
-	createRecoveryDatabase(t, admin, sourceName)
-	createRecoveryDatabase(t, admin, targetName)
-
-	source = connectRecoveryDatabase(t, dsn, sourceName)
+	pair := prepareRecoveryPostgreSQLPair(t)
+	source := pair.sourcePool
 	(&assetCatalogHarness{db: source}).applyThroughAssetCatalog(t)
 	fixture := seedRepresentativeAssetCatalog(t, source)
 	seedRecoveryProjection(t, source, fixture)
+	authoritativeSeed := fixture
+	authoritativeSeed.observationID = "69000000-0000-4000-8000-000000000201"
+	authoritativeSeed.secondObservationID = "69000000-0000-4000-8000-000000000202"
+	authoritativeSeed.assetID = "6a000000-0000-4000-8000-000000000201"
+	authoritativeSeed.secondAssetID = "6a000000-0000-4000-8000-000000000202"
+	authoritativeSeed.typeDetailID = "6b000000-0000-4000-8000-000000000201"
+	authoritativeSeed.conflictID = "6c000000-0000-4000-8000-000000000201"
+	authoritativeSeed.relationshipID = "6d000000-0000-4000-8000-000000000201"
+	authoritativeSeed.bindingID = "6e000000-0000-4000-8000-000000000201"
+	authoritativeFixture := seedClosureAuthoritativeCompleteCatalogOnFixture(t, source, authoritativeSeed)
 	sourceProof := collectAssetCatalogProof(t, source)
 	verifyAssetCatalogClosure(t, source, fixture)
+	verifyAuthoritativeCompletePointer(t, source, authoritativeFixture)
 
-	backup := logicalDumpDatabase(t, sourceName)
-	if len(backup) < 1024 {
+	backup := logicalDumpDatabase(t, pair.source)
+	if len(backup) < 1024 || !strings.HasPrefix(string(backup[:5]), "PGDMP") {
 		t.Fatalf("logical backup is unexpectedly small: %d bytes", len(backup))
 	}
-	restoreLogicalDump(t, targetName, backup)
-	target = connectRecoveryDatabase(t, dsn, targetName)
-	assertRecoveryServerVersion(t, target)
+	backupSHA256 := sha256.Sum256(backup)
+	t.Logf("logical recovery archive SHA-256=%x", backupSHA256)
+	restoreLogicalDump(t, pair.target, backup)
+	target := pair.targetPool
 	targetProof := collectAssetCatalogProof(t, target)
 	if len(sourceProof) != len(targetProof) {
 		t.Fatalf("restored proof table count=%d, want %d", len(targetProof), len(sourceProof))
@@ -80,109 +57,127 @@ func TestAssetCatalogRecovery(t *testing.T) {
 		}
 	}
 	verifyAssetCatalogClosure(t, target, fixture)
-	expectAssetSQLState(t, target, "55000", `UPDATE asset_observations SET source_revision='restored-tamper'`)
-	expectAssetSQLState(t, target, "55000", `DELETE FROM asset_type_details WHERE id=$1`, fixture.typeDetailID)
-}
-
-func assertContainerPostgreSQLTools(t *testing.T) {
-	t.Helper()
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Fatalf("docker CLI is required for PostgreSQL 18 logical recovery proof: %v", err)
+	verifyAuthoritativeCompletePointer(t, target, authoritativeFixture)
+	verifyRestoredMutationGuards(t, target, fixture)
+	if err := assetpostgres.NewSchemaAdmission(target, "public").Check(context.Background()); err != nil {
+		t.Fatalf("restored schema admission: %v", err)
 	}
-	for _, tool := range []string{"pg_dump", "pg_restore"} {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		command := exec.CommandContext(ctx, "docker", "--context", "colima-aiops", "exec", "aiops-postgres18", tool, "--version")
-		output, err := command.CombinedOutput()
-		cancel()
-		if err != nil {
-			t.Fatalf("run container %s --version: %v: %s", tool, err, sanitizeToolOutput(output))
-		}
-		if !strings.Contains(string(output), "PostgreSQL) 18.4") {
-			t.Fatalf("container %s version=%q, want PostgreSQL 18.4", tool, strings.TrimSpace(string(output)))
-		}
+	execAssetSQL(t, target, `
+		ALTER TABLE asset_observations DROP CONSTRAINT asset_observations_run_revision_fk
+	`)
+	if err := assetpostgres.NewSchemaAdmission(target, "public").Check(context.Background()); !errors.Is(err, assetpostgres.ErrAssetCatalogUnavailable) {
+		t.Fatalf("schema admission after restored exact-FK removal error=%v, want %v",
+			err, assetpostgres.ErrAssetCatalogUnavailable)
 	}
 }
 
-func createRecoveryDatabase(t *testing.T, admin *pgxpool.Pool, name string) {
+func verifyAuthoritativeCompletePointer(
+	t *testing.T,
+	database *pgxpool.Pool,
+	fixture assetCatalogFixture,
+) {
 	t.Helper()
-	identifier := pgx.Identifier{name}.Sanitize()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if _, err := admin.Exec(ctx, "CREATE DATABASE "+identifier+" TEMPLATE template0"); err != nil {
-		t.Fatalf("create clean recovery database %s: %v", name, err)
+	var exact bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT source.status='ACTIVE' AND source.gate_status='AVAILABLE' AND
+			source.published_revision=run.source_revision AND
+			source.published_revision_digest=run.source_revision_digest AND
+			source.last_success_run_id=run.id AND source.last_success_at=run.completed_at AND
+			source.last_complete_snapshot_run_id=run.id AND
+			source.last_complete_snapshot_at=run.completed_at AND
+			run.status='SUCCEEDED' AND run.stage_code='COMPLETED' AND
+			run.run_kind='DISCOVERY' AND run.final_page AND run.complete_snapshot AND
+			run.effective_complete_snapshot AND run.completed_at IS NOT NULL
+		FROM asset_sources AS source
+		JOIN asset_source_runs AS run
+		  ON run.tenant_id=source.tenant_id
+		 AND run.workspace_id=source.workspace_id
+		 AND run.source_id=source.id
+		 AND run.id=source.last_complete_snapshot_run_id
+		WHERE source.id=$1 AND run.id=$2
+	`, fixture.sourceID, fixture.runID).Scan(&exact); err != nil {
+		t.Fatalf("verify authoritative complete pointer: %v", err)
 	}
-}
-
-func dropRecoveryDatabase(t *testing.T, admin *pgxpool.Pool, name string) {
-	t.Helper()
-	identifier := pgx.Identifier{name}.Sanitize()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if _, err := admin.Exec(ctx, "DROP DATABASE IF EXISTS "+identifier+" WITH (FORCE)"); err != nil {
-		t.Errorf("drop recovery database %s: %v", name, err)
-	}
-}
-
-func connectRecoveryDatabase(t *testing.T, dsn, name string) *pgxpool.Pool {
-	t.Helper()
-	config, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		t.Fatalf("parse isolated recovery database config: %v", err)
-	}
-	config.ConnConfig.Database = name
-	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
-	if config.ConnConfig.RuntimeParams == nil {
-		config.ConnConfig.RuntimeParams = make(map[string]string)
-	}
-	config.ConnConfig.RuntimeParams["search_path"] = "public"
-	database, err := pgxpool.NewWithConfig(context.Background(), config)
-	if err != nil {
-		t.Fatalf("connect isolated recovery database %s: %v", name, err)
-	}
-	if err := database.Ping(context.Background()); err != nil {
-		database.Close()
-		t.Fatalf("ping isolated recovery database %s: %v", name, err)
-	}
-	return database
-}
-
-func assertRecoveryServerVersion(t *testing.T, database *pgxpool.Pool) {
-	t.Helper()
-	var serverVersion int
-	if err := database.QueryRow(context.Background(), `SELECT current_setting('server_version_num')::integer`).Scan(&serverVersion); err != nil {
-		t.Fatalf("read recovery PostgreSQL server version: %v", err)
-	}
-	if serverVersion < 180004 || serverVersion >= 190000 {
-		t.Fatalf("recovery proof requires PostgreSQL 18.4 or newer 18.x, got server_version_num=%d", serverVersion)
+	if !exact {
+		t.Fatal("authoritative complete pointer is not bound to the exact current revision and completion")
 	}
 }
 
 func seedRecoveryProjection(t *testing.T, database *pgxpool.Pool, fixture assetCatalogFixture) {
 	t.Helper()
-	validationRunID := "62000000-0000-4000-8000-000000000209"
-	validationDigest := strings.Repeat("9", 64)
-	execAssetSQL(t, database, `
-		INSERT INTO asset_source_runs (
-			id,tenant_id,workspace_id,source_id,source_revision,source_revision_digest,
-			run_kind,status,trigger_type,definition_revision,gate_revision,idempotency_key,
-			request_hash,validation_digest,completed_at
-		) VALUES ($1,$2,$3,$4,1,$5,'VALIDATION','SUCCEEDED','HUMAN',1,0,
-			'recovery-validation',repeat('8',64),$6,statement_timestamp())
-	`, validationRunID, fixture.tenantID, fixture.workspaceID, fixture.sourceID, fixture.revisionDigest, validationDigest)
-	execAssetSQL(t, database, `UPDATE asset_source_revisions SET state='VALIDATING',version=version+1 WHERE id=$1`, fixture.revisionID)
-	execAssetSQL(t, database, `
-		UPDATE asset_source_revisions
-		SET state='VALIDATED',validation_run_id=$1,validation_digest=$2,version=version+1
-		WHERE id=$3
-	`, validationRunID, validationDigest, fixture.revisionID)
-	execAssetSQL(t, database, `UPDATE asset_source_revisions SET state='PUBLISHED',version=version+1 WHERE id=$1`, fixture.revisionID)
-	execAssetSQL(t, database, `
-		UPDATE asset_sources
-		SET gate_status='AVAILABLE',gate_revision=gate_revision+1,validated_run_id=$1,
-			validation_digest=$2,validated_binding_digest=repeat('c',64),version=version+1
-		WHERE id=$3
-	`, validationRunID, validationDigest, fixture.sourceID)
 	execAssetSQL(t, database, `UPDATE assets SET lifecycle='ACTIVE',version=version+1 WHERE id=$1`, fixture.assetID)
+	seedRecoveryAuditOutbox(t, database, fixture)
+}
+
+func verifyRestoredMutationGuards(t *testing.T, database *pgxpool.Pool, fixture assetCatalogFixture) {
+	t.Helper()
+	expectAssetSQLState(t, database, "55000", `
+		UPDATE asset_observations SET source_revision=source_revision+1 WHERE id=$1
+	`, fixture.observationID)
+	expectAssetSQLState(t, database, "55000", `
+		UPDATE asset_type_details SET actor_id='tampered' WHERE id=$1
+	`, fixture.typeDetailID)
+
+	rows := []struct {
+		table string
+		id    string
+	}{
+		{"asset_sources", fixture.sourceID},
+		{"asset_source_revisions", fixture.revisionID},
+		{"asset_source_runs", fixture.runID},
+		{"asset_observations", fixture.observationID},
+		{"assets", fixture.assetID},
+		{"asset_type_details", fixture.typeDetailID},
+		{"asset_conflicts", fixture.conflictID},
+		{"asset_relationships", fixture.relationshipID},
+		{"service_asset_bindings", fixture.bindingID},
+	}
+	for _, row := range rows {
+		query := fmt.Sprintf("DELETE FROM %s WHERE id=$1", pgx.Identifier{row.table}.Sanitize())
+		expectAssetSQLState(t, database, "55000", query, row.id)
+	}
+
+	expectAssetSQLState(t, database, "P0001", `
+		UPDATE audit_records SET action='tampered' WHERE request_id='recovery-audit'
+	`)
+	expectAssetSQLState(t, database, "23514", `
+		UPDATE outbox_events SET attempts=-1 WHERE id='6a000000-0000-4000-8000-000000000201'
+	`)
+}
+
+func seedRecoveryAuditOutbox(t *testing.T, database *pgxpool.Pool, fixture assetCatalogFixture) {
+	t.Helper()
+	payload := fmt.Sprintf(`{"audit_request_id":"recovery-audit","asset_id":%q}`, fixture.assetID)
+	tx, err := database.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin recovery audit/outbox transaction: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(context.Background(), `
+		INSERT INTO audit_records (
+			id,tenant_id,workspace_id,actor_type,actor_id,action,resource_type,resource_id,
+			request_id,trace_id,payload_hash
+		) VALUES (
+			'69000000-0000-4000-8000-000000000209',$1,$2,'HUMAN','fixture-human',
+			'asset.recovery.proof','ASSET',$3,'recovery-audit','recovery-trace',
+			encode(sha256(convert_to(($4::jsonb)::text,'UTF8')),'hex')
+		)
+	`, fixture.tenantID, fixture.workspaceID, fixture.assetID, payload); err != nil {
+		t.Fatalf("insert recovery audit proof: %v", err)
+	}
+	if _, err := tx.Exec(context.Background(), `
+		INSERT INTO outbox_events (
+			id,tenant_id,workspace_id,aggregate_type,aggregate_id,aggregate_version,event_type,payload
+		) VALUES (
+			'6a000000-0000-4000-8000-000000000201',$1,$2,'ASSET',$3,2,
+			'asset.recovery.proof.v1',$4::jsonb
+		)
+	`, fixture.tenantID, fixture.workspaceID, fixture.assetID, payload); err != nil {
+		t.Fatalf("insert recovery outbox proof: %v", err)
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("commit recovery audit/outbox transaction: %v", err)
+	}
 }
 
 func collectAssetCatalogProof(t *testing.T, database *pgxpool.Pool) map[string]recoveredTableProof {
@@ -190,6 +185,7 @@ func collectAssetCatalogProof(t *testing.T, database *pgxpool.Pool) map[string]r
 	tables := []string{
 		"asset_sources", "asset_source_revisions", "asset_source_runs", "asset_observations",
 		"assets", "asset_type_details", "asset_conflicts", "asset_relationships", "service_asset_bindings",
+		"audit_records", "outbox_events",
 	}
 	proof := make(map[string]recoveredTableProof, len(tables))
 	for _, table := range tables {
@@ -213,35 +209,189 @@ func collectAssetCatalogProof(t *testing.T, database *pgxpool.Pool) map[string]r
 
 func verifyAssetCatalogClosure(t *testing.T, database *pgxpool.Pool, fixture assetCatalogFixture) {
 	t.Helper()
+	verifyCatalogForeignKeyClosure(t, database)
+	verifyCatalogContentHashes(t, database)
+	verifyCatalogFactCoordinates(t, database, fixture)
+	verifyCatalogSourcePointers(t, database, fixture)
+	verifyCatalogGovernanceReceipts(t, database, fixture)
+	verifyRecoveryAuditOutboxLink(t, database)
+}
+
+func verifyCatalogForeignKeyClosure(t *testing.T, database *pgxpool.Pool) {
+	t.Helper()
 	var brokenReferences int64
 	if err := database.QueryRow(context.Background(), `
 		SELECT
 			(SELECT count(*) FROM asset_sources s LEFT JOIN workspaces w
 			 ON w.tenant_id=s.tenant_id AND w.id=s.workspace_id WHERE w.id IS NULL) +
+			(SELECT count(*) FROM asset_sources s LEFT JOIN asset_source_revisions r
+			 ON r.tenant_id=s.tenant_id AND r.workspace_id=s.workspace_id AND r.source_id=s.id
+			 AND r.revision=s.published_revision AND r.canonical_revision_digest=s.published_revision_digest
+			 WHERE s.published_revision IS NOT NULL AND r.id IS NULL) +
+			(SELECT count(*) FROM asset_sources s LEFT JOIN asset_source_runs r
+			 ON r.tenant_id=s.tenant_id AND r.workspace_id=s.workspace_id AND r.source_id=s.id
+			 AND r.id=s.validated_run_id WHERE s.validated_run_id IS NOT NULL AND r.id IS NULL) +
+			(SELECT count(*) FROM asset_sources s LEFT JOIN asset_source_runs r
+			 ON r.tenant_id=s.tenant_id AND r.workspace_id=s.workspace_id AND r.source_id=s.id
+			 AND r.id=s.last_success_run_id WHERE s.last_success_run_id IS NOT NULL AND r.id IS NULL) +
+			(SELECT count(*) FROM asset_sources s LEFT JOIN asset_source_runs r
+			 ON r.tenant_id=s.tenant_id AND r.workspace_id=s.workspace_id AND r.source_id=s.id
+			 AND r.id=s.last_complete_snapshot_run_id
+			 WHERE s.last_complete_snapshot_run_id IS NOT NULL AND r.id IS NULL) +
 			(SELECT count(*) FROM asset_source_revisions r LEFT JOIN asset_sources s
 			 ON s.tenant_id=r.tenant_id AND s.workspace_id=r.workspace_id AND s.id=r.source_id WHERE s.id IS NULL) +
+			(SELECT count(*) FROM asset_source_revisions r LEFT JOIN integrations i
+			 ON i.tenant_id=r.tenant_id AND i.workspace_id=r.workspace_id AND i.id=r.integration_id
+			 WHERE r.integration_id IS NOT NULL AND i.id IS NULL) +
+			(SELECT count(*) FROM asset_source_revisions r LEFT JOIN asset_source_runs v
+			 ON v.tenant_id=r.tenant_id AND v.workspace_id=r.workspace_id AND v.source_id=r.source_id
+			 AND v.id=r.validation_run_id WHERE r.validation_run_id IS NOT NULL AND v.id IS NULL) +
 			(SELECT count(*) FROM asset_source_runs r LEFT JOIN asset_source_revisions v
 			 ON v.tenant_id=r.tenant_id AND v.workspace_id=r.workspace_id AND v.source_id=r.source_id
 			 AND v.revision=r.source_revision AND v.canonical_revision_digest=r.source_revision_digest WHERE v.id IS NULL) +
+			(SELECT count(*) FROM asset_observations o LEFT JOIN environments e
+			 ON e.tenant_id=o.tenant_id AND e.workspace_id=o.workspace_id AND e.id=o.environment_id
+			 WHERE e.id IS NULL) +
 			(SELECT count(*) FROM asset_observations o LEFT JOIN asset_source_runs r
-			 ON r.tenant_id=o.tenant_id AND r.workspace_id=o.workspace_id AND r.source_id=o.source_id AND r.id=o.run_id WHERE r.id IS NULL) +
+			 ON r.tenant_id=o.tenant_id AND r.workspace_id=o.workspace_id AND r.source_id=o.source_id
+			 AND r.id=o.run_id AND r.source_revision=o.source_revision
+			 AND r.source_revision_digest=o.canonical_revision_digest WHERE r.id IS NULL) +
+			(SELECT count(*) FROM asset_observations o LEFT JOIN asset_sources s
+			 ON s.tenant_id=o.tenant_id AND s.workspace_id=o.workspace_id AND s.id=o.source_id
+			 AND s.provider_kind=o.provider_kind WHERE s.id IS NULL) +
+			(SELECT count(*) FROM asset_observations o LEFT JOIN asset_source_revisions r
+			 ON r.tenant_id=o.tenant_id AND r.workspace_id=o.workspace_id AND r.source_id=o.source_id
+			 AND r.revision=o.source_revision AND r.canonical_revision_digest=o.canonical_revision_digest
+			 WHERE r.id IS NULL) +
+			(SELECT count(*) FROM asset_observations o LEFT JOIN asset_observations previous
+			 ON previous.tenant_id=o.tenant_id AND previous.workspace_id=o.workspace_id
+			 AND previous.environment_id=o.environment_id AND previous.source_id=o.source_id
+			 AND previous.provider_kind=o.provider_kind AND previous.external_id=o.external_id
+			 AND previous.id=o.previous_observation_id
+			 AND previous.observation_chain_sha256=o.previous_chain_sha256
+			 WHERE o.previous_observation_id IS NOT NULL AND previous.id IS NULL) +
+			(SELECT count(*) FROM assets a LEFT JOIN environments e
+			 ON e.tenant_id=a.tenant_id AND e.workspace_id=a.workspace_id AND e.id=a.environment_id
+			 WHERE e.id IS NULL) +
+			(SELECT count(*) FROM assets a LEFT JOIN asset_sources s
+			 ON s.tenant_id=a.tenant_id AND s.workspace_id=a.workspace_id AND s.id=a.source_id
+			 AND s.provider_kind=a.provider_kind WHERE s.id IS NULL) +
 			(SELECT count(*) FROM assets a LEFT JOIN asset_observations o
-			 ON o.tenant_id=a.tenant_id AND o.workspace_id=a.workspace_id AND o.source_id=a.source_id AND o.id=a.last_observation_id WHERE o.id IS NULL) +
+			 ON o.tenant_id=a.tenant_id AND o.workspace_id=a.workspace_id AND o.environment_id=a.environment_id
+			 AND o.source_id=a.source_id AND o.provider_kind=a.provider_kind AND o.external_id=a.external_id
+			 AND o.source_revision=a.last_source_revision AND o.observed_at=a.last_observed_at
+			 AND o.observation_chain_sha256=a.last_observation_chain_sha256
+			 AND o.id=a.last_observation_id WHERE o.id IS NULL) +
+			(SELECT count(*) FROM assets a LEFT JOIN asset_source_revisions r
+			 ON r.tenant_id=a.tenant_id AND r.workspace_id=a.workspace_id AND r.source_id=a.source_id
+			 AND r.revision=a.last_source_revision WHERE r.id IS NULL) +
 			(SELECT count(*) FROM asset_type_details d LEFT JOIN assets a
-			 ON a.tenant_id=d.tenant_id AND a.workspace_id=d.workspace_id AND a.environment_id=d.environment_id AND a.id=d.asset_id WHERE a.id IS NULL) +
+			 ON a.tenant_id=d.tenant_id AND a.workspace_id=d.workspace_id
+			 AND a.environment_id=d.environment_id AND a.source_id=d.source_id
+			 AND a.provider_kind=d.provider_kind AND a.external_id=d.external_id
+			 AND a.id=d.asset_id WHERE a.id IS NULL) +
+			(SELECT count(*) FROM asset_type_details d LEFT JOIN asset_observations o
+			 ON o.tenant_id=d.tenant_id AND o.workspace_id=d.workspace_id
+			 AND o.environment_id=d.environment_id AND o.source_id=d.source_id
+			 AND o.provider_kind=d.provider_kind AND o.external_id=d.external_id
+			 AND o.source_revision=d.source_revision AND o.observed_at=d.source_observed_at
+			 AND o.observation_chain_sha256=d.source_observation_chain_sha256
+			 AND o.id=d.source_observation_id WHERE o.id IS NULL) +
 			(SELECT count(*) FROM asset_conflicts c LEFT JOIN assets a
 			 ON a.tenant_id=c.tenant_id AND a.workspace_id=c.workspace_id AND a.environment_id=c.environment_id AND a.id=c.asset_id WHERE a.id IS NULL) +
+			(SELECT count(*) FROM asset_conflicts c LEFT JOIN assets a
+			 ON a.tenant_id=c.tenant_id AND a.workspace_id=c.workspace_id AND a.environment_id=c.environment_id
+			 AND a.id=c.candidate_asset_id WHERE c.candidate_asset_id IS NOT NULL AND a.id IS NULL) +
+			(SELECT count(*) FROM asset_conflicts c LEFT JOIN asset_observations o
+			 ON o.tenant_id=c.tenant_id AND o.workspace_id=c.workspace_id AND o.environment_id=c.environment_id
+			 AND o.source_id=c.source_id AND o.id=c.observation_id WHERE o.id IS NULL) +
+			(SELECT count(*) FROM asset_conflicts c LEFT JOIN services s
+			 ON s.tenant_id=c.tenant_id AND s.workspace_id=c.workspace_id AND s.id=c.candidate_service_id
+			 WHERE c.candidate_service_id IS NOT NULL AND s.id IS NULL) +
+			(SELECT count(*) FROM asset_relationships r LEFT JOIN asset_source_revisions v
+			 ON v.tenant_id=r.tenant_id AND v.workspace_id=r.workspace_id AND v.source_id=r.source_id
+			 AND v.revision=r.source_revision AND v.canonical_revision_digest=r.canonical_revision_digest
+			 WHERE v.id IS NULL) +
+			(SELECT count(*) FROM asset_relationships r LEFT JOIN asset_source_runs run
+			 ON run.tenant_id=r.tenant_id AND run.workspace_id=r.workspace_id AND run.source_id=r.source_id
+			 AND run.id=r.last_run_id AND run.source_revision=r.source_revision
+			 AND run.source_revision_digest=r.canonical_revision_digest WHERE run.id IS NULL) +
 			(SELECT count(*) FROM asset_relationships r LEFT JOIN assets a
-			 ON a.tenant_id=r.tenant_id AND a.workspace_id=r.workspace_id AND a.environment_id=r.source_environment_id AND a.id=r.source_asset_id WHERE a.id IS NULL) +
+			 ON a.tenant_id=r.tenant_id AND a.workspace_id=r.workspace_id
+			 AND a.environment_id=r.source_environment_id AND a.source_id=r.source_id
+			 AND a.external_id=r.from_external_id AND a.id=r.source_asset_id WHERE a.id IS NULL) +
+			(SELECT count(*) FROM asset_relationships r LEFT JOIN assets a
+			 ON a.tenant_id=r.tenant_id AND a.workspace_id=r.workspace_id
+			 AND a.environment_id=r.target_environment_id AND a.source_id=r.source_id
+			 AND a.external_id=r.to_external_id AND a.id=r.target_asset_id WHERE a.id IS NULL) +
+			(SELECT count(*) FROM asset_relationships r LEFT JOIN asset_sources s
+			 ON s.tenant_id=r.tenant_id AND s.workspace_id=r.workspace_id AND s.id=r.provenance_source_id
+			 WHERE r.provenance_source_id IS NOT NULL AND s.id IS NULL) +
 			(SELECT count(*) FROM service_asset_bindings b LEFT JOIN services s
-			 ON s.tenant_id=b.tenant_id AND s.workspace_id=b.workspace_id AND s.id=b.service_id WHERE s.id IS NULL)
+			 ON s.tenant_id=b.tenant_id AND s.workspace_id=b.workspace_id AND s.id=b.service_id
+			 WHERE s.id IS NULL) +
+			(SELECT count(*) FROM service_asset_bindings b LEFT JOIN service_bindings s
+			 ON s.service_id=b.service_id AND s.environment_id=b.environment_id WHERE s.service_id IS NULL) +
+			(SELECT count(*) FROM service_asset_bindings b LEFT JOIN assets a
+			 ON a.tenant_id=b.tenant_id AND a.workspace_id=b.workspace_id AND a.environment_id=b.environment_id
+			 AND a.id=b.asset_id WHERE a.id IS NULL) +
+			(SELECT count(*) FROM service_asset_bindings b LEFT JOIN assets a
+			 ON a.tenant_id=b.tenant_id AND a.workspace_id=b.workspace_id
+			 AND a.environment_id=b.environment_id AND a.source_id=b.provenance_source_id
+			 AND a.id=b.asset_id WHERE b.provenance_source_id IS NOT NULL AND a.id IS NULL)
 	`).Scan(&brokenReferences); err != nil {
-		t.Fatalf("verify restored foreign-key closure: %v", err)
+		t.Fatalf("verify asset catalog foreign-key closure: %v", err)
 	}
 	if brokenReferences != 0 {
-		t.Fatalf("restored asset catalog has %d broken parent references", brokenReferences)
+		t.Fatalf("asset catalog has %d broken parent references", brokenReferences)
 	}
 
+	var foreignKeys, invalidForeignKeys int64
+	if err := database.QueryRow(context.Background(), `
+		SELECT count(*), count(*) FILTER (WHERE NOT constraint_record.convalidated)
+		FROM pg_catalog.pg_constraint AS constraint_record
+		JOIN pg_catalog.pg_class AS relation ON relation.oid=constraint_record.conrelid
+		JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+		WHERE namespace.nspname='public'
+		  AND relation.relname = ANY($1::text[])
+		  AND constraint_record.contype='f'
+	`, []string{
+		"asset_sources", "asset_source_revisions", "asset_source_runs", "asset_observations",
+		"assets", "asset_type_details", "asset_conflicts", "asset_relationships", "service_asset_bindings",
+	}).Scan(&foreignKeys, &invalidForeignKeys); err != nil {
+		t.Fatalf("verify restored foreign-key validation state: %v", err)
+	}
+	if foreignKeys != 33 || invalidForeignKeys != 0 {
+		t.Fatalf("asset catalog foreign keys=(total:%d unvalidated:%d), want (33,0)",
+			foreignKeys, invalidForeignKeys)
+	}
+}
+
+func verifyRecoveryAuditOutboxLink(t *testing.T, database *pgxpool.Pool) {
+	t.Helper()
+	var auditOutboxLinked bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT EXISTS (
+			SELECT 1
+			FROM audit_records AS audit
+			JOIN outbox_events AS event
+			  ON event.tenant_id = audit.tenant_id
+			 AND event.workspace_id = audit.workspace_id
+			 AND event.aggregate_id::text = audit.resource_id
+			WHERE audit.request_id = 'recovery-audit'
+			  AND event.payload->>'audit_request_id' = audit.request_id
+			  AND audit.payload_hash = encode(sha256(convert_to(event.payload::text,'UTF8')),'hex')
+		)
+	`).Scan(&auditOutboxLinked); err != nil {
+		t.Fatalf("verify restored audit/outbox linkage: %v", err)
+	}
+	if !auditOutboxLinked {
+		t.Fatal("asset catalog audit/outbox proof is not content-linked")
+	}
+}
+
+func verifyCatalogContentHashes(t *testing.T, database *pgxpool.Pool) {
+	t.Helper()
 	var badHashes int64
 	if err := database.QueryRow(context.Background(), `
 		SELECT
@@ -250,74 +400,186 @@ func verifyAssetCatalogClosure(t *testing.T, database *pgxpool.Pool, fixture ass
 			 OR encode(sha256(field_provenance),'hex')<>field_provenance_sha256) +
 			(SELECT count(*) FROM asset_type_details WHERE encode(sha256(details_document),'hex')<>details_sha256) +
 			(SELECT count(*) FROM asset_sources WHERE checkpoint_ciphertext IS NOT NULL
-			 AND encode(sha256(checkpoint_ciphertext),'hex')<>checkpoint_sha256)
+				AND encode(sha256(checkpoint_ciphertext),'hex')<>checkpoint_sha256) +
+			(SELECT count(*) FROM asset_source_runs WHERE
+				(page_digest IS NOT NULL AND NOT asset_catalog_sha256_valid(page_digest)) OR
+				(relation_page_digest IS NOT NULL AND NOT asset_catalog_sha256_valid(relation_page_digest))) +
+			(SELECT count(*) FROM asset_relationships WHERE
+				NOT asset_catalog_sha256_valid(relation_page_sha256) OR
+				NOT asset_catalog_sha256_valid(provider_version_sha256) OR
+				NOT asset_catalog_sha256_valid(relation_fact_sha256))
 	`).Scan(&badHashes); err != nil {
-		t.Fatalf("verify restored SHA-256 equality: %v", err)
+		t.Fatalf("verify asset catalog SHA-256 equality: %v", err)
 	}
 	if badHashes != 0 {
-		t.Fatalf("restored asset catalog has %d invalid content hashes", badHashes)
+		t.Fatalf("asset catalog has %d invalid content hashes", badHashes)
+	}
+}
+
+func verifyCatalogFactCoordinates(t *testing.T, database *pgxpool.Pool, fixture assetCatalogFixture) {
+	t.Helper()
+	var observationFactsValid bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT count(*)=2 AND bool_and(
+			o.freshness_kind='CATALOG_SEQUENCE' AND o.freshness_order_time IS NULL AND
+			o.freshness_order_sequence=1 AND o.accepted_checkpoint_version=1 AND
+			o.run_fence_epoch=1 AND o.run_page_sequence=1 AND o.source_revision=1 AND
+			o.canonical_revision_digest=$2 AND
+			asset_catalog_sha256_valid(o.provider_version_sha256) AND
+			asset_catalog_sha256_valid(o.provider_fact_sha256) AND
+			asset_catalog_sha256_valid(o.fingerprint_sha256) AND
+			asset_catalog_sha256_valid(o.provider_provenance_sha256) AND
+			asset_catalog_sha256_valid(o.observation_chain_sha256)
+		)
+		FROM asset_observations AS o
+		WHERE o.source_id=$1
+	`, fixture.sourceID, fixture.revisionDigest).Scan(&observationFactsValid); err != nil {
+		t.Fatalf("verify restored observation freshness/chain coordinates: %v", err)
+	}
+	if !observationFactsValid {
+		t.Fatal("restored observation freshness/chain coordinates are incomplete")
 	}
 
-	var revision int64
-	var revisionDigest, revisionState, gateStatus, lifecycle string
-	var assetVersion int64
+	var relationshipValid, typeDetailValid bool
 	if err := database.QueryRow(context.Background(), `
-		SELECT s.published_revision,s.published_revision_digest,r.state,s.gate_status,
-			a.lifecycle,a.version
+		SELECT r.last_run_id=$2 AND r.last_page_sequence=1 AND
+			r.relation_page_sha256=repeat('6',64) AND r.freshness_kind='CATALOG_SEQUENCE' AND
+			r.freshness_order_time IS NULL AND r.freshness_order_sequence=1 AND
+			r.accepted_checkpoint_version=1 AND r.run_fence_epoch=1 AND
+			r.source_revision=1 AND r.canonical_revision_digest=$3
+		FROM asset_relationships AS r WHERE r.id=$1
+	`, fixture.relationshipID, fixture.runID, fixture.revisionDigest).Scan(&relationshipValid); err != nil {
+		t.Fatalf("verify restored relationship exact coordinates: %v", err)
+	}
+	if err := database.QueryRow(context.Background(), `
+		SELECT d.asset_id=$2 AND d.source_id=$3 AND d.provider_kind='MANUAL_V1' AND
+			d.external_id='manual-host-a' AND d.source_revision=1 AND
+			d.source_observation_id=$4 AND
+			d.source_observed_at=o.observed_at AND
+			d.source_observation_chain_sha256=o.observation_chain_sha256 AND
+			a.source_id=d.source_id AND a.provider_kind=d.provider_kind AND a.external_id=d.external_id
+		FROM asset_type_details d
+		JOIN asset_observations o ON o.id=d.source_observation_id
+		JOIN assets a ON a.id=d.asset_id
+		WHERE d.id=$1
+	`, fixture.typeDetailID, fixture.assetID, fixture.sourceID, fixture.observationID).Scan(&typeDetailValid); err != nil {
+		t.Fatalf("verify restored type-detail exact identity: %v", err)
+	}
+	if !relationshipValid || !typeDetailValid {
+		t.Fatalf("restored relationship/type-detail coordinates valid=(%v,%v)", relationshipValid, typeDetailValid)
+	}
+}
+
+func verifyCatalogSourcePointers(t *testing.T, database *pgxpool.Pool, fixture assetCatalogFixture) {
+	t.Helper()
+	var pointersValid bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT s.published_revision=1 AND s.published_revision_digest=$3 AND
+			r.state='PUBLISHED' AND s.gate_status='AVAILABLE' AND
+			s.validated_run_id=$4 AND s.validation_digest IS NOT NULL AND
+			s.validated_binding_digest=$3 AND
+			s.last_success_run_id=$5 AND s.last_success_at=success.completed_at AND
+			s.last_complete_snapshot_run_id IS NULL AND
+			s.last_complete_snapshot_at IS NULL AND
+			success.status='SUCCEEDED' AND success.run_kind<>'VALIDATION' AND
+			NOT success.complete_snapshot AND NOT success.effective_complete_snapshot AND
+			a.lifecycle='ACTIVE' AND a.version=2
 		FROM asset_sources s
 		JOIN asset_source_revisions r ON r.tenant_id=s.tenant_id AND r.workspace_id=s.workspace_id
 		 AND r.source_id=s.id AND r.revision=s.published_revision
+		 AND r.canonical_revision_digest=s.published_revision_digest
+		JOIN asset_source_runs success ON success.id=s.last_success_run_id
 		JOIN assets a ON a.id=$2
 		WHERE s.id=$1
-	`, fixture.sourceID, fixture.assetID).Scan(
-		&revision, &revisionDigest, &revisionState, &gateStatus, &lifecycle, &assetVersion,
-	); err != nil {
-		t.Fatalf("verify restored source pointer and asset lifecycle: %v", err)
+	`, fixture.sourceID, fixture.assetID, fixture.revisionDigest,
+		fixture.validationRunID, fixture.runID).Scan(&pointersValid); err != nil {
+		t.Fatalf("verify restored source publication/success pointers: %v", err)
 	}
-	if revision != 1 || revisionDigest != fixture.revisionDigest || revisionState != "PUBLISHED" ||
-		gateStatus != "AVAILABLE" || lifecycle != "ACTIVE" || assetVersion != 2 {
-		t.Fatalf("restored pointer/lifecycle=(%d,%s,%s,%s,%s,%d)",
-			revision, revisionDigest, revisionState, gateStatus, lifecycle, assetVersion)
+	if !pointersValid {
+		t.Fatal("restored source publication/success pointers are not exact")
 	}
 }
 
-func logicalDumpDatabase(t *testing.T, databaseName string) []byte {
+func verifyCatalogGovernanceReceipts(t *testing.T, database *pgxpool.Pool, fixture assetCatalogFixture) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	command := exec.CommandContext(ctx,
-		"docker", "--context", "colima-aiops", "exec", "aiops-postgres18",
-		"pg_dump", "--format=custom", "--no-owner", "--no-acl", "-U", "aiops", "-d", databaseName,
-	)
-	var stderr bytes.Buffer
-	command.Stderr = &stderr
-	backup, err := command.Output()
-	if err != nil {
-		t.Fatalf("pg_dump sanitized recovery database: %v: %s", err, sanitizeToolOutput(stderr.Bytes()))
+	var closureValid bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT
+			(SELECT count(*)=2
+			 FROM asset_source_runs AS run
+			 JOIN audit_records AS audit
+			   ON audit.tenant_id=run.tenant_id
+			  AND audit.workspace_id=run.workspace_id
+			  AND audit.action='TERMINAL_COMMITTED'
+			  AND audit.actor_type='SYSTEM' AND audit.actor_id=run.lease_owner
+			  AND audit.resource_type='ASSET_SOURCE_RUN'
+			  AND audit.resource_id=run.id::text
+			  AND audit.request_id='source-terminal:'||run.id::text
+			  AND audit.payload_hash=run.terminal_command_sha256
+			 WHERE run.id IN ($2::uuid,$3::uuid)
+			   AND run.terminal_command_sha256=
+			       asset_catalog_source_run_terminal_digest(run,run.status,run.failure_code))
+		AND
+			(SELECT count(*)=2
+			 FROM asset_source_runs AS run
+			 JOIN audit_records AS audit
+			   ON audit.tenant_id=run.tenant_id
+			  AND audit.workspace_id=run.workspace_id
+			  AND audit.action='ATTEMPT_CLEANED'
+			  AND audit.actor_type='SYSTEM' AND audit.actor_id=run.lease_owner
+			  AND audit.resource_type='ASSET_SOURCE_RUN'
+			  AND audit.resource_id=run.id::text
+			  AND audit.request_id='source-attempt:'||run.id::text||':0'
+			  AND audit.payload_hash=run.cleanup_digest
+			 WHERE run.id IN ($2::uuid,$3::uuid)
+			   AND run.cleanup_status='NO_CREDENTIAL'
+			   AND run.cleanup_digest=asset_catalog_source_run_no_credential_digest(run))
+		AND EXISTS (
+			SELECT 1
+			FROM asset_source_runs AS run
+			JOIN asset_sources AS source ON source.id=run.source_id
+			JOIN audit_records AS page_audit
+			  ON page_audit.tenant_id=run.tenant_id
+			 AND page_audit.workspace_id=run.workspace_id
+			 AND page_audit.action='PAGE_APPLIED'
+			 AND page_audit.actor_type='SYSTEM' AND page_audit.actor_id=run.lease_owner
+			 AND page_audit.resource_type='ASSET_SOURCE_RUN'
+			 AND page_audit.resource_id=run.id::text
+			 AND page_audit.request_id='source-page:'||run.id::text||':'||run.page_sequence::text
+			 AND page_audit.payload_hash=run.page_digest
+			JOIN audit_records AS relation_audit
+			  ON relation_audit.tenant_id=run.tenant_id
+			 AND relation_audit.workspace_id=run.workspace_id
+			 AND relation_audit.action='RELATION_PAGE_COMMITTED'
+			 AND relation_audit.actor_type='SYSTEM' AND relation_audit.actor_id=run.lease_owner
+			 AND relation_audit.resource_type='ASSET_SOURCE_RUN'
+			 AND relation_audit.resource_id=run.id::text
+			 AND relation_audit.request_id='source-relation-page:'||run.id::text||':'||run.relation_page_sequence::text
+			 AND relation_audit.payload_hash=run.relation_page_digest
+			WHERE run.id=$3
+			  AND source.id=$1
+			  AND run.page_sequence=1 AND run.relation_page_sequence=1
+			  AND run.checkpoint_version=1 AND source.checkpoint_version=1
+			  AND run.observed_count=2
+			  AND (SELECT count(*) FROM asset_observations AS observation
+			       WHERE observation.run_id=run.id
+			         AND observation.run_page_sequence=run.page_sequence
+			         AND observation.accepted_checkpoint_version=run.checkpoint_version)=2
+			  AND EXISTS (
+				SELECT 1 FROM asset_relationships AS relationship
+				WHERE relationship.id=$4
+				  AND relationship.last_run_id=run.id
+				  AND relationship.last_page_sequence=run.relation_page_sequence
+				  AND relationship.relation_page_sha256=run.relation_page_digest
+				  AND relationship.accepted_checkpoint_version=run.checkpoint_version
+				  AND relationship.run_fence_epoch=run.fence_epoch
+			  )
+		)
+	`, fixture.sourceID, fixture.validationRunID, fixture.runID,
+		fixture.relationshipID).Scan(&closureValid); err != nil {
+		t.Fatalf("verify restored terminal/cleanup/page governance receipts: %v", err)
 	}
-	return backup
-}
-
-func restoreLogicalDump(t *testing.T, databaseName string, backup []byte) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	command := exec.CommandContext(ctx,
-		"docker", "--context", "colima-aiops", "exec", "-i", "aiops-postgres18",
-		"pg_restore", "--exit-on-error", "--no-owner", "--no-acl", "-U", "aiops", "-d", databaseName,
-	)
-	command.Stdin = bytes.NewReader(backup)
-	var stderr bytes.Buffer
-	command.Stderr = &stderr
-	if err := command.Run(); err != nil {
-		t.Fatalf("pg_restore sanitized recovery database: %v: %s", err, sanitizeToolOutput(stderr.Bytes()))
+	if !closureValid {
+		t.Fatal("restored terminal/cleanup/page governance receipts are not exact")
 	}
-}
-
-func sanitizeToolOutput(output []byte) string {
-	value := strings.TrimSpace(string(output))
-	if len(value) > 1024 {
-		return value[:1024] + "..."
-	}
-	return value
 }

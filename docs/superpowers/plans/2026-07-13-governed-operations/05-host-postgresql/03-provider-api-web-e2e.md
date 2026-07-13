@@ -128,7 +128,7 @@ PostgreSQLConnectionDraft:
 
 `integration_id` 只接受 Phase 1 canonical installed Integration UUID，服务器重读其 Provider/Workspace；它不是 endpoint 或 Credential。显式 `not`/contract test 禁止 `connection_id/revision/status/url/endpoint/ip/header/body/credential/secret/token/pem/dsn/sql/command/argv/path/script/inventory_id/template_id/extra_vars`。Response 只含 canonical ID/revision、safe endpoint projection、reference IDs/revisions、四类正交状态、digests、timestamps、`effective_actions`。
 
-现有 `createAssetSource` 对 `source_kind=AWX_INVENTORY`、`provider_kind=AWX_API` 继续只接受 `source_kind/provider_kind/name/integration_id/sync_mode`；Manager 从 installed Integration 的 authority scope 逐 Environment 解析恰好一个同 Integration exact `AWX_API` Connection Runtime gate。不存在、重复、非 `AVAILABLE`、revision/digest drift 或 Scope 不匹配返回稳定 `RUNTIME_PUBLICATION_NOT_READY`，不创建 Source。请求不能提交 cursor、schedule payload、endpoint、Credential、inventory/template ID 或 Provider JSON。
+现有 `createAssetSource` 必须复用 Phase 1 完整命令，只接受名称、服务端返回的 opaque `source_profile_id`、允许的 authority Environment 选择与固定 sync/schedule 选项；客户端不得提交 `source_kind/provider_kind/integration_id`。AWX Connection 详情 API 只有在 exact published `AWX_API` Connection Runtime gate 可用时才返回一个 eligible Profile selector；Manager 由该 selector 解析 `AWX_INVENTORY/AWX_READ_V1`、canonical Integration、限流/freshness/mapping 和当前 revision binding，并从 installed Integration authority scope 解析恰好一个 Environment。不存在、重复、非 `AVAILABLE`、revision/digest drift 或 Scope 不匹配返回稳定 `RUNTIME_PUBLICATION_NOT_READY`，不创建 Source。请求不能提交 cursor、schedule payload、endpoint、Credential、inventory/template ID 或 Provider JSON。
 
 - [ ] **Step 4: 实现服务端 Draft → canonical ID/Revision 与授权链**
 
@@ -264,7 +264,7 @@ Provider 字段只使用 select/combobox/radio：Host 选择 Asset-owned network
 
 Validation step 使用持久 Operation 轨道：`目标身份 → TLS/SNI/CA → Network Policy/Realm → 短凭据 → 固定 Probe → Schema/预算/DLP → 凭据吊销`；只显示稳定 code、时间、digest 和 trace ID，不显示上游 body。Review 独立列出 Connection/Validation/Health/Runtime/Gate 状态和 N→N+1 diff。
 
-AWX 发布并精确 `AVAILABLE` 后，详情页显示紧凑“AWX Inventory 来源”区：若尚未绑定且响应 `effective_actions` 含 `CREATE_SOURCE`，可输入来源名称并选择固定 `INCREMENTAL_WITH_FULL_RECONCILE` 模式，实际请求只发送 `source_kind=AWX_INVENTORY`、`provider_kind=AWX_API` 和当前 canonical `integration_id`。创建成功进入既有 `/asset-sources?...&sourceId=...` 页面；卡片展示 cursor digest、最近增量/全量 run、rate-limit/HA takeover/soft-stale 计数，不显示 raw cursor、endpoint、Credential、host variables 或 AWX error。
+AWX 发布并精确 `AVAILABLE` 后，详情页显示紧凑“AWX Inventory 来源”区：若尚未绑定且响应 `effective_actions` 含 `CREATE_SOURCE`，可输入来源名称并选择固定 `INCREMENTAL_WITH_FULL_RECONCILE` 模式；实际请求只发送服务端给出的 opaque `source_profile_id`、名称、唯一 authority Environment 与该固定模式，不发送 SourceKind、ProviderKind 或 Integration ID。创建成功进入既有 `/asset-sources?...&sourceId=...` 页面；卡片展示 cursor digest、最近增量/全量 Run、rate-limit/HA takeover/soft-stale 计数，不显示 raw cursor、endpoint、Credential、host variables 或 AWX error。
 
 - [ ] **Step 5: 完成高保真样式、响应式与 Green/Refactor**
 
@@ -346,7 +346,7 @@ Expected: FAIL，因为真实依赖 compose、bootstrap 与场景尚不存在。
 
 Compose 启动：PostgreSQL 18.4+、Keycloak Server 26.6.3、Control Plane、VALIDATION Gateway、两个 Validation Runner、Runtime distributor/attestor、TLS 1.3 Host Probe、AWX、诊断目标 PostgreSQL。浏览器构建锁定 `keycloak-js` 26.2.4。所有证书由测试 PKI 动态签发；Host/AWX/PostgreSQL 使用不同 Credential Reference、Realm 和 Network Policy。fixture 禁止复用生产 Secret，完成后销毁 volume。
 
-Host Probe binary 只注册两个固定 GET；AWX fixture 使用真实 API route 和只读账号，准备多页 Inventory、可控 429、host 缺失/恢复和两个 Source Runner，audit 证明无 job launch；PostgreSQL 开启 statement log 到隔离测试 volume，断言只有固定只读 transaction。Runtime attestor 回报完整 typed digest closure，不能直接改数据库 gate。
+Host Probe binary 只注册两个固定 GET；AWX fixture 使用真实 API route 和只读账号，准备多页 Inventory、可控 429、host 缺失/恢复，并运行现有 `cmd/discovery-worker` 的两个 Worker 副本，audit 证明无 job launch；PostgreSQL 开启 statement log 到隔离测试 volume，断言只有固定只读 transaction。Runtime attestor 回报完整 typed digest closure，不能直接改数据库 gate。
 
 - [ ] **Step 4: 实现正向、N/N+1 和独立 Gate 场景**
 
@@ -354,7 +354,7 @@ Host Probe binary 只注册两个固定 GET；AWX fixture 使用真实 API route
 
 随后给 Host 发布 N+1，让一条运行固定 N；精确 attestation 后新运行使用 N+1、旧运行完成后 N drain。注入 N+1 attestation digest drift，断言 Host 回滚 N 且 `UNAVAILABLE`/阻塞原因持久化，AWX/PostgreSQL gate 不变化。
 
-AWX gate 可用后创建 `AWX_INVENTORY` Source：第一页后杀死持有 Runner，第二个 Runner 只能以递增 fence 接管且不会重复 Observation；429 保持 cursor 并按 `not_before` 恢复；增量 run 不把缺失 host 标记 STALE；成功全量 run 把缺失资产 soft-stale 并保留历史/关系 provenance；host 恢复只追加 restore 事实且保持 STALE，直到同 AWX Runtime/Capability 重新验证后才激活。浏览器 Source 页面只显示 digest/安全计数。
+AWX gate 可用后创建 `AWX_INVENTORY` Source：第一页后杀死持有 lease 的 `cmd/discovery-worker` 副本，第二个 Worker 副本只能以递增 fence 接管且不会重复 Observation；429 保持 cursor 并按 `not_before` 恢复；增量 Run 不把缺失 host 标记 STALE；成功全量 Run 把缺失资产 soft-stale 并保留历史/关系 provenance；host 恢复只追加 restore 事实且保持 STALE，直到同 AWX Runtime/Capability 重新验证后才激活。浏览器 Source 页面只显示 digest/安全计数。
 
 - [ ] **Step 5: 实现完整负向安全矩阵**
 

@@ -33,13 +33,18 @@
 - Create: `internal/assetcatalog/source_revision_test.go`
 - Create: `internal/discoverysource/contracts.go`
 - Create: `internal/discoverysource/contracts_test.go`
+- Create: `internal/assetcatalog/source_extension.go`
+- Create: `internal/assetcatalog/source_extension_test.go`
 - Create: `internal/assetcatalog/postgres/source_revisions.go`
+- Modify: `internal/assetcatalog/postgres/manual_run.go`
 - Create: `internal/assetcatalog/postgres/source_revisions_test.go`
+- Modify: `internal/assetcatalog/postgres/manual_run_test.go`
 - Create: `internal/assetcatalog/postgres/source_revisions_integration_test.go`
 
 **Interfaces:**
 - Consumes: `asset_sources`, `asset_source_revisions`, `asset_source_runs` schema plus scoped audit/outbox/idempotency ledger from Tasks 1–4; an existing stable Source is required only for subsequent revisions.
 - Produces: `SourceRevisionRepository.CreateSource/CreateRevision/RequestValidation/Publish/Disable/RequestSync` and exact source/revision `ETag` versions. `CreateSource` is the sole production owner of atomic stable Source + immutable revision 1 creation.
+- Produces `TypedSourceExtensionRegistry`；later phases may extend a revision only through its in-transaction `ValidateAndDigestInTx → PreparedExtension.CreateInTx` hook, never through a parallel lifecycle/transaction.
 - Produces events: `asset.source.revision.created.v1`, `asset.source.validation.requested.v1`, `asset.source.revision.published.v1`, `asset.source.disabled.v1`, `asset.source.sync.requested.v1`.
 - Produces the only Provider data-plane contract consumed by every later source pack:
 
@@ -48,27 +53,41 @@ type Provider interface {
 	Kind() assetcatalog.SourceKind
 	ProviderKind() string
 	Validate(context.Context, BoundRuntime, ValidationRequest) (ValidationProof, error)
-	Discover(context.Context, BoundRuntime, DiscoverRequest) (Page, error)
+	Discover(context.Context, BoundRuntime, DiscoverRequest) (DiscoverOutcome, error)
 }
 
 type DiscoverRequest struct {
 	Locator              SourceLocator
 	SourceRevision       int64
 	SourceRevisionDigest string
-	Fence                LeaseFence
 	Checkpoint           Checkpoint
 	Limits               Limits
 }
 
 type Page struct {
-	Items          []assetdiscovery.NormalizedItem
-	NextCheckpoint Checkpoint
-	Complete       bool
-	RetryAfter     time.Duration
+	Items            []assetdiscovery.NormalizedItem
+	Relations        []assetdiscovery.ObservedRelation
+	NextCheckpoint   Checkpoint
+	FinalPage        bool
+	CompleteSnapshot bool
 }
+
+type Delay struct {
+	Reason     DelayReason // PROVIDER_RETRY_AFTER only; Worker owns TRANSPORT_BACKOFF
+	RetryAfter time.Duration
+}
+
+type DiscoverOutcome interface { isDiscoverOutcome() } // closed Page | Delay
+
+func (Page) isDiscoverOutcome()  {}
+func (Delay) isDiscoverOutcome() {}
 ~~~
 
-`BoundRuntime` is created only inside `cmd/discovery-worker` from the exact published revision/profile and workload secret binding; it is deliberately non-serializable and implements `Close/Clear`. `DiscoverRequest`, queue payload, Temporal history, audit and logs contain no endpoint, credential, CA, header or Provider request body.
+`FinalPage` means the bounded Provider run has ended；`CompleteSnapshot` additionally proves authoritative asset **and relation** membership closure and may be true only with `FinalPage=true`. A final incremental/delta page uses `FinalPage=true, CompleteSnapshot=false`；intermediate pages set both false. Provider adapters never infer missing assets/relations from `FinalPage` alone. `Delay` and `Page` are mutually exclusive concrete outcomes: Provider `RetryAfter` must be in `(0,60s]` and a `Delay` has no Items、Relations、checkpoint or final flags by type；transport backoff is created only by the Worker. A `Page` may be relation-only under Pack 02 endpoint-readiness rules but has no retry field.
+
+The return pair is also exact XOR：`err != nil` requires `outcome == nil`，and a non-nil outcome requires `err == nil`；`nil,nil` and outcome+error are both `SOURCE_PROVIDER_CONTRACT_VIOLATION`. A successful dynamic value must be exactly non-pointer `Page` or `Delay`（typed-nil pointers/aliases are rejected）so interface nil tricks cannot bypass the sum type. The Worker discards any violating outcome, never calls `ApplyPage`, prepares a stable failure intent, cleans the attempt and suspends that Source gate. Contract tests cover all four XOR combinations plus typed-nil/pointer rejection for every registered Provider.
+
+`BoundRuntime` is created only inside `cmd/discovery-worker` from the exact published revision/profile and workload secret binding；it is deliberately non-serializable and implements `Close/Clear`. `DiscoverRequest` intentionally contains no `LeaseFence`；the Worker revalidates its fence around the call and only `PageCommitter/Reconciler` consumes the sealed fence. `DiscoverRequest`, queue payload, Temporal history, audit and logs contain no endpoint, credential, CA, header or Provider request body. Every installed Profile fixes one `FreshnessKind` plus `EnvironmentMappingMode`：`EXPLICIT_ITEM_ENVIRONMENT` only for CSV/API inputs that carry a validated Environment ID, or `SINGLE_ENVIRONMENT` for fixed infrastructure adapters. The latter requires exactly one same-Workspace `AuthorityEnvironmentID`；the former validates every item/relation endpoint against the immutable sorted allow-list. Freshness kind and mapping mode/list are included in `authority_scope_digest`/Profile canonical bytes and `BindingDigest`；Provider wire data can never choose another kind or invent/remap a Catalog Environment.
 
 - [ ] **Step 1: Write failing revision immutability and publication-gate tests**
 
@@ -197,15 +216,37 @@ type SourceRevisionMutation struct {
 	Revision SourceRevision
 	Receipt  MutationReceipt
 }
+
+type SourceRevisionTx interface { // sealed repository-owned capability
+	sourceRevisionTx() // unexported marker; only assetcatalog can implement
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+type TypedSourceExtension interface {
+	ValidateAndDigestInTx(context.Context, SourceRevisionTx, SourceRevisionDraft) (PreparedExtension, error)
+}
+
+type PreparedExtension interface {
+	Digest() string
+	CreateInTx(context.Context, SourceRevisionTx, SourceRevision) error
+}
+
+type TypedSourceExtensionRegistry interface {
+	Resolve(extensionCode string) (TypedSourceExtension, error)
+}
 ~~~
 
-The client never supplies `provider_kind`, canonical definition, revision number, Integration ID, rate/backpressure numbers, profile code, binding digest or revision digest. `SourceProfileRegistry.Resolve(SourceProfileID)` returns one installed discriminated profile, provider kind, Integration ID, allowed SourceKind, network zone, credential purpose, trust mode, parser schema, fixed rate/backpressure fields, immutable canonical `ProfileCode`, hard page/byte limits and compatibility class. `SourceProfileID` is only a lookup selector and is not persisted; the resolved `ProfileCode` is persisted in `asset_source_revisions.profile_code` and is the exact profile identity hashed by `BindingDigest`. The server validates every environment against the source Workspace, sorts it, constructs canonical bytes, allocates `max(revision)+1` under a source row lock, and computes `CanonicalRevisionDigest = SourceRevision.BindingDigest()` across the complete immutable binding. `source_definition_digest` remains a separate digest of the Provider definition only.
+The client never supplies `provider_kind`, canonical definition, revision number, Integration ID, rate/backpressure numbers, profile/freshness/typed-extension code, binding digest or revision digest. `SourceProfileRegistry.Resolve(SourceProfileID)` returns one installed discriminated profile, provider kind, Integration ID, allowed SourceKind, network zone, credential purpose, trust mode, parser schema, fixed rate/backpressure fields, immutable canonical `ProfileCode`, optional server-owned `TypedExtensionCode`, hard page/byte limits, compatibility class, exact `FreshnessKind` and `EnvironmentMappingMode`. `SourceProfileID` is only a lookup selector and is not persisted；the resolved `ProfileCode` is persisted in `asset_source_revisions.profile_code` and is the exact profile identity hashed by `BindingDigest`. The server validates every Environment against the Source Workspace, enforces the mode's one-or-explicit-list cardinality, sorts it, constructs canonical bytes, allocates `max(revision)+1` under a Source row lock, and computes `CanonicalRevisionDigest = SourceRevision.BindingDigest()` across the complete immutable binding including the prepared extension digest. `source_definition_digest` remains a separate digest of the Provider definition only. Tests reject a candidate freshness kind different from the installed Profile, zero/multiple Environments for a `SINGLE_ENVIRONMENT` profile, out-of-list CSV/API item/relation Environments, unknown extension code and any mapping/extension change without a newly validated/published canonical revision plus its required checkpoint transition.
 
 - [ ] **Step 3: Implement serializable revision state transitions**
 
-`CreateSource` begins `SERIALIZABLE`, validates Scope/Idempotency/Profile and all opaque references before mutation, locks the Workspace/Profile facts, inserts the stable Source and revision 1, computes and verifies the complete binding digest, writes one audit/outbox pair and returns their persisted receipt in the same transaction. Any invalid Environment/reference/profile/digest or side-effect failure rolls back the Source identity as well as the revision. Matching replay returns the original Source/revision/Audit ID; a changed hash returns `ErrIdempotency`.
+`CreateSource` begins `SERIALIZABLE`, validates Scope/Idempotency/Profile and all opaque references before mutation, and locks the Workspace/Profile facts. If the resolved Profile has a typed extension, the Repository itself resolves it and calls `ValidateAndDigestInTx` inside this transaction before sealing base canonical/binding digests；it then inserts the stable Source and revision 1, calls that exact prepared object's `CreateInTx` after the base row exists, verifies the extension row/digest, writes one audit/outbox pair and returns their persisted receipt before commit. The callback receives only a sealed `SourceRevisionTx` adapter with the three scoped query methods；it has no `Commit/Rollback/Begin/CopyFrom/LargeObjects/Conn` or raw `pgx.Tx` escape, and SQL ownership/allow-list checks prevent touching non-extension tables. The outer Repository alone may retry/commit/rollback. `CreateRevision` uses the same hook/order under the existing Source lock. Any invalid Environment/reference/profile/extension/digest or side-effect failure rolls back both the base identity/revision and extension row. A later phase cannot obtain the transaction, write an extension after commit or own a second Create/Publish lifecycle. Architecture/integration tests compile an adversarial extension and prove it cannot commit、rollback or mutate base/audit rows. Matching replay returns the original Source/revision/Audit ID；a changed hash returns `ErrIdempotency`.
 
-`CreateRevision` inserts one `DRAFT` immutable content row for an existing Source. `RequestValidation` CAS-transitions `DRAFT|REJECTED→VALIDATING`, creates a new append-only `VALIDATION` run bound to the exact revision and canonical binding digest, and closes the source gate. A rejected revision's canonical content remains immutable, and it can never transition directly to `PUBLISHED`. A Worker completion may transition only that exact revision/run to `VALIDATED` or `REJECTED`; safe proof fields are identity/TLS-or-signature/network/credential-open+cleanup/fixed-probe/schema/DLP/budget result codes and a proof digest.
+`CreateRevision` inserts one `DRAFT` immutable content row for an existing Source. `RequestValidation` CAS-transitions `DRAFT|REJECTED→VALIDATING`, creates a new append-only `VALIDATION` Run bound to the exact revision and canonical binding digest, gives it an empty checkpoint input, and closes the Source gate. A rejected revision's canonical content remains immutable, and it can never transition directly to `PUBLISHED`. The Worker must call fenced `ProposeValidationResult` to persist a `VALIDATION_PROOF` and enter `FINALIZING`, then Broker cleanup and `Complete|Fail` atomically transition only that exact revision/run to `VALIDATED|REJECTED`. Safe proof fields are identity/TLS-or-signature/network/credential-open+cleanup/fixed-probe/schema/DLP/budget result codes and a proof digest. Cancellation、drift、reaper or cleanup uncertainty likewise writes the still-bound `VALIDATING` revision to `REJECTED` with a stable proof/code, so no revision can remain stranded and it can be explicitly revalidated.
+
+The installed `MANUAL_V1` profile is the only no-Adapter validation specialization. It is `SINGLE_ENVIRONMENT` and declares explicit `CredentialPurpose=NONE/TrustMode=NONE/NetworkMode=NONE`; its revision must resolve exactly one same-Workspace authority Environment, and every governed MANUAL Asset create must use that exact `AuthorityEnvironmentID` rather than a caller-selected Environment. Creation rejects zero/multiple authority Environments, any different Asset `environment_id` and non-empty external references, and includes the unique Environment plus those `NONE` sentinels in the binding digest. `RequestValidation` synchronously creates, privately claims, finalizes and completes an exact `VALIDATION` Run with `NO_CREDENTIAL`, proving only installed profile digest、Scope/Environment、closed MANUAL schema、DLP/budgets and binding equality—no network/runtime/credential call exists. Every MANUAL mutation uses `CATALOG_SEQUENCE{OrderSequence=n,ProviderVersionSHA256=SHA256(FramedTupleV1("manual-catalog-version.v1",tenant_id,workspace_id,source_id,checkpoint_revision,n))}` with the Pack 01 byte encoding, where `n` is the positive `accepted_checkpoint_version` allocated and CASed by that same transaction; neither client input nor Catalog time participates in the Provider-version digest. On `PublishSourceRevision`, the same transaction revalidates that exact terminal proof and current installed profile and may set this MANUAL Source directly to `AVAILABLE`; it sets `checkpoint_version=0` and `checkpoint_revision` to the exact newly published revision while all checkpoint ciphertext/key/hash fields remain `NULL`. Before the first publication both numeric fields are zero. Every non-MANUAL profile still requires its independent publication reconciliation/canary. This is the sole path that makes a MANUAL Source eligible for Pack 02 create.
 
 `PublishSourceRevision` must require:
 
@@ -213,9 +254,9 @@ The client never supplies `provider_kind`, canonical definition, revision number
 2. revision `VALIDATED`, terminal successful validation run, matching revision/binding/proof digests and current profile compatibility;
 3. current opaque credential/trust/network references are resolvable and not revoked; no secret value is loaded by Control Plane;
 4. recent OIDC authentication and `ASSET_SOURCE_PUBLISH` are already attested by management layer;
-5. atomically supersede the previous published revision, update source pointer/digest, set source gate `UNAVAILABLE` until publication reconciliation, reset an incompatible checkpoint, audit and emit one event.
+5. atomically supersede the previous published revision, update source pointer/digest, set source gate `UNAVAILABLE` until publication reconciliation, clear the prior non-MANUAL sealed checkpoint because canonical-revision-bound AAD changes, audit and emit one event. The `MANUAL_V1` exception has no sealed checkpoint: publication sets `checkpoint_version=0` and `checkpoint_revision` to the newly published revision as specified above.
 
-`DisableSource` CAS-sets stable source `DISABLED`, gate `SUSPENDED`, increments fence epoch for live runs and emits a stop event. It never deletes source, revision, Observation, Asset, relation or checkpoint history. `RequestSync` accepts only `ACTIVE + PUBLISHED + AVAILABLE`, binds the exact revision/gate/checkpoint hashes, and returns the same run on an identical replay.
+`DisableSource` CAS-sets stable Source `DISABLED`, gate `SUSPENDED`, atomically `CANCELLED`s its `QUEUED|DELAYED` Runs through `CancelIneligible`, rejects any exact still-bound `VALIDATING` Revision with stable cancellation proof, and emits a stop event. It does not arbitrarily bump a current `RUNNING|FINALIZING` fence：the holder detects drift, stops Provider work and records cleanup/failure before expiry；an expired holder is replaced only by the cleanup-aware reaper. It never deletes Source, revision, Observation, Asset, relation or checkpoint history. Publication/reference/gate drift invokes the same serializable ineligible-run cancellation so a queued/delayed row cannot permanently occupy the per-Source nonterminal slot. `RequestSync` accepts only `ACTIVE + PUBLISHED + AVAILABLE`, binds the exact revision/gate/checkpoint hashes, and returns the same Run on an identical replay.
 
 - [ ] **Step 4: Verify Scope, concurrency, replay, recovery, and refactor**
 
@@ -228,7 +269,7 @@ TEST_DATABASE_URL="$TEST_DATABASE_URL" \
   go test -race ./internal/assetcatalog/postgres -run SourceRevisionIntegration -count=1
 ~~~
 
-Expected: PASS; two concurrent publishes yield one winner, cross-Workspace revisions/runs fail, replay is stable, disabling fences active runs, restoring PostgreSQL preserves published pointers/digests and no raw credential/cursor/fence appears in rows, audit or outbox.
+Expected: PASS; two concurrent publishes yield one winner, cross-Workspace revisions/runs fail, replay is stable, MANUAL synchronous validation/publication reaches AVAILABLE without external refs, disabling cancels queued/delayed work and causes active work to stop/clean up, drift cannot strand the unique nonterminal slot, restoring PostgreSQL preserves published pointers/digests and no raw credential/cursor/fence appears in rows, audit or outbox.
 
 - [ ] **Step 5: Commit**
 
@@ -236,6 +277,7 @@ Expected: PASS; two concurrent publishes yield one winner, cross-Workspace revis
 git add internal/assetcatalog/types.go internal/assetcatalog/repository.go \
   internal/assetcatalog/source_revision.go internal/assetcatalog/source_revision_test.go \
   internal/discoverysource/contracts.go internal/discoverysource/contracts_test.go \
+  internal/assetcatalog/postgres/manual_run.go internal/assetcatalog/postgres/manual_run_test.go \
   internal/assetcatalog/postgres/source_revisions.go \
   internal/assetcatalog/postgres/source_revisions_test.go \
   internal/assetcatalog/postgres/source_revisions_integration_test.go
@@ -314,7 +356,7 @@ POST /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/imports
 POST /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/ingestion-batches
 ~~~
 
-Every schema is closed with `additionalProperties: false`. Source create makes stable identity plus revision 1; subsequent edits always create a new revision. Validate/sync/import/ingestion return `202` with durable `operation_id/run_id`; publish/disable require `If-Match`, Idempotency-Key, reason and server-verified recent auth. Errors use RFC 9457 and stable codes `SOURCE_REVISION_NOT_VALIDATED`, `SOURCE_BINDING_DRIFT`, `SOURCE_GATE_UNAVAILABLE`, `SOURCE_BACKPRESSURE`, `SOURCE_WORKLOAD_IDENTITY_MISMATCH`, `SOURCE_PAYLOAD_REJECTED`.
+Every schema is closed with `additionalProperties: false`. Source create makes stable identity plus revision 1; subsequent edits always create a new revision. The validate route resolves the installed profile before choosing its closed response: `MANUAL_V1` completes synchronously and returns `200` with the already-terminal durable Run/validation receipt, while every non-MANUAL validation returns `202` with its queued durable `operation_id/run_id`; sync/import/ingestion return `202`. Publish/disable require `If-Match`, Idempotency-Key, reason and server-verified recent auth. Errors use RFC 9457 and stable codes `SOURCE_REVISION_NOT_VALIDATED`, `SOURCE_BINDING_DRIFT`, `SOURCE_GATE_UNAVAILABLE`, `SOURCE_BACKPRESSURE`, `SOURCE_WORKLOAD_IDENTITY_MISMATCH`, `SOURCE_PAYLOAD_REJECTED`.
 
 This task is the sole owner of Source mutation routes deferred by Packs 03–04. Create accepts a server-returned `source_profile_id`, name, opaque Credential/Trust/Network references, allowed Environment IDs, sync mode and schedule; it derives ProviderKind, Integration ID, definition and fixed rate/backpressure/profile fields, then creates the stable Source and immutable revision 1 in one `SERIALIZABLE` transaction. No reduced ProviderKind/Integration form or stable-Source-only insert is permitted.
 
@@ -393,7 +435,7 @@ git commit -m "feat(api): publish governed asset source revisions"
 **Interfaces:**
 - Consumes: exact `CSV_IMPORT` published revision, opaque `CredentialReferenceID` with purpose `IMPORT_SIGNATURE_VERIFY`, fenced Source Run and `assetdiscovery.Reconciler`.
 - Produces: `csvimport.Parse(io.Reader, Limits) (Page, error)` and resumable checkpoint `(file_sha256,row_number,schema_version)` sealed by the common checkpoint codec.
-- CSV header is fixed: `environment_id,provider_kind,external_id,kind,display_name,source_revision,deleted,tombstone_reason,relation_type,relation_target_external_id`.
+- CSV header is fixed: `environment_id,provider_kind,external_id,kind,display_name,object_version,deleted,tombstone_reason,relation_type,relation_target_environment_id,relation_target_external_id`. `object_version` is the CSV Adapter's positive decimal record version and is never mapped to persisted `source_revision`; the server derives the exact Source definition revision from the published Run. A relation row must supply both target fields, and `relation_target_environment_id` must be a same-Workspace Environment in the exact published revision's immutable authority allow-list; a row without a relation must leave both target fields empty.
 
 - [ ] **Step 1: Write failing parser, DLP, tombstone, and resume tests**
 
@@ -425,13 +467,13 @@ Expected: FAIL because CSV source adapter does not exist.
 
 - [ ] **Step 2: Implement the exact bounded parser and field provenance**
 
-Use `encoding/csv` with `FieldsPerRecord=10`, `ReuseRecord=false`, UTF-8 without BOM after the first byte sequence, max file 32 MiB, max 100,000 rows, max field 512 bytes and page 2,000 rows. Reject duplicate headers, blank/duplicate `(environment_id,provider_kind,external_id,source_revision)`, NUL/CR in a field, formula-leading display/external values, unknown enum, secret-shaped token and governance fields not in the schema.
+Use `encoding/csv` with `FieldsPerRecord=11`, `ReuseRecord=false`, UTF-8 without BOM after the first byte sequence, max file 32 MiB, max 100,000 rows, max field 512 bytes and page 2,000 rows. Reject duplicate headers, blank or duplicate `(provider_kind,external_id)` anywhere in the whole file/Run even when Environment or object version differs, non-positive/non-canonical decimal `object_version`, NUL/CR in a field, formula-leading display/external values, unknown enum, secret-shaped token and governance fields not in the schema. Require both source and relation-target Environments to pass the exact revision authority check described above. Each row emits one top-level `Page.Items` entry with `OBJECT_SEQUENCE{OrderSequence=object_version,ProviderVersionSHA256=SHA256(FramedTupleV1("csv-object-version.v1",object_version))}`. If its three relation fields are present, it additionally emits one top-level `Page.Relations` entry—not an embedded Item field—with the same order sequence and `ProviderVersionSHA256=SHA256(FramedTupleV1("csv-relation-version.v1",object_version,relation_type,relation_target_environment_id,relation_target_external_id))`. Repository compares each independent fact with its locked prior projection and injects Source definition revision/Catalog time into asset provenance. Regression/collision fails the whole page/file checkpoint rather than skipping a row.
 
-Each normalized source-owned field receives a closed provenance code such as `CSV_V1_EXTERNAL_ID_COLUMN`; values are never copied into provenance. `deleted=true` requires blank display/relation, non-empty allow-listed tombstone reason and creates a tombstone Observation; it never hard-deletes. File SHA and next row are sealed as checkpoint; a changed file SHA cannot resume and returns `CSV_CHECKPOINT_MISMATCH`.
+Each normalized source-owned field receives a closed provenance code such as `CSV_V1_EXTERNAL_ID_COLUMN`; values are never copied into provenance. `deleted=true` requires blank `display_name`、`relation_type`、`relation_target_environment_id` and `relation_target_external_id`, plus a non-empty allow-listed tombstone reason, and creates a tombstone Observation; it never hard-deletes. File SHA and next row are sealed as checkpoint; a changed file SHA cannot resume and returns `CSV_CHECKPOINT_MISMATCH`.
 
 - [ ] **Step 3: Stream upload to quarantine storage and reconcile under a fence**
 
-`POST .../imports` accepts `multipart/form-data` parts `file` and `detached_signature`, streams once through SHA/DLP into an encrypted quarantine object store, verifies signature through the source's opaque CredentialReference, and returns `202`. The database stores only object reference ID, SHA, byte/row counts and expiry; object credentials never enter the browser or run payload. The Worker claims the Import Run, rechecks source revision/gate/fence, parses pages and atomically reconciles each page/checkpoint. Quarantine objects are deleted after terminal success/failure; cleanup uncertainty sets run `FAILED` with `SOURCE_IMPORT_CLEANUP_UNCERTAIN` and gate `DEGRADED`.
+`POST .../imports` accepts `multipart/form-data` parts `file` and `detached_signature`, streams once through SHA/DLP into an encrypted quarantine object store, verifies signature through the source's opaque CredentialReference, and returns `202`. The database stores only object reference ID, SHA, byte/row counts and expiry；object credentials never enter the browser or Run payload. The Worker claims the Import Run, rechecks source revision/gate/fence, parses pages and atomically reconciles each page/checkpoint. Quarantine objects are deleted after terminal success/failure；cleanup uncertainty sets Run `FAILED` with `SOURCE_IMPORT_CLEANUP_UNCERTAIN` and gate `SUSPENDED`.
 
 Backpressure is fixed at one active CSV run per source, four per Workspace, 100,000 pending rows per Workspace; excess returns `429` plus bounded `Retry-After`. A partial file never performs missing-asset stale detection; only a signed `complete_snapshot=true` manifest may do so.
 
@@ -513,9 +555,9 @@ Expected: FAIL because workload protocol and revision wizard do not exist.
 
 - [ ] **Step 2: Implement closed signed batch protocol**
 
-`IngestionBatchV1` contains only `schema_version`, `sequence`, `previous_batch_digest`, `complete_snapshot`, `observed_at`, `environment_id`, max 1,000 typed items and detached `signature_key_id/signature`. The server derives Tenant/Workspace/Source/Provider from SAN and published revision; verifies signature through the opaque reference; requires sequence exactly `checkpoint+1`, previous digest equality, UTC microsecond time within 5 minutes and authority-scope membership. It canonicalizes and DLP-checks before creating a run; 429/503 are safe to retry because no Observation exists before durable run acceptance.
+`IngestionBatchV1` contains only `schema_version`, `sequence`, `previous_batch_digest`, `complete_snapshot`, Provider `observed_at`, `environment_id`, max 1,000 typed items and detached `signature_key_id/signature`. The server derives Tenant/Workspace/Source/Provider from SAN and published revision；verifies signature through the opaque reference；requires sequence exactly `checkpoint+1`, previous digest equality, finite UTC microsecond Provider time within 5 minutes and authority-scope membership. Before signature verification it computes `signed_payload_sha256` over RFC 8785 canonical unsigned fields（everything except `signature_key_id/signature`）；the accepted checkpoint digest is that same value. Every item maps to `OBJECT_SEQUENCE{OrderSequence=sequence,ProviderVersionSHA256=SHA256(FramedTupleV1("control-plane-api-object-version.v1",sequence,previous_batch_digest,observed_at,environment_id,signed_payload_sha256))}` using the Pack 01 byte encoding and decoded digest bytes. Thus signed Provider time/lineage/payload are indirectly bound into every Observation chain, while semantic `provider_fact_sha256` and Catalog `asset_observations.observed_at` remain time-independent/server-owned. It canonicalizes and DLP-checks before creating a Run；429/503 are safe to retry because no Observation exists before durable Run acceptance.
 
-One source accepts at most two in-flight API batches, eight per Workspace and 20 requests/second with burst 40. Persist `not_before`/queue depth so replica changes do not reset the limit. A valid tombstone creates `STALE`; a later observation records recovery but remains `STALE`. Unknown field, bad signature, replay, sequence gap, oversized page, source/revision/gate drift and wrong client certificate fail before reconciliation.
+One Source accepts at most one durable nonterminal API ingestion Run/batch across `QUEUED|DELAYED|RUNNING|FINALIZING`; an identical idempotent retry returns that original Run, while a distinct second batch returns `429 SOURCE_BACKPRESSURE` with `Retry-After` capped at 60 seconds and creates no second queue row. The Workspace cap remains eight nonterminal batches and 20 requests/second with burst 40. Persist `not_before`/queue depth so replica changes do not reset the limit. A valid tombstone creates `STALE`; a later observation records recovery but remains `STALE`. Unknown field, bad signature, replay, sequence gap, oversized page, source/revision/gate drift and wrong client certificate fail before reconciliation.
 
 - [ ] **Step 3: Implement Source creation and the six-step Source revision workspace**
 
@@ -526,7 +568,7 @@ One source accepts at most two in-flight API batches, eight per Workspace and 20
 3. **Opaque references** — Credential, Trust and Network Policy IDs with safe health metadata only.
 4. **Sync and limits** — on-demand/schedule, page/rate/backpressure profile and deletion semantics.
 5. **Controlled validation** — durable run timeline for identity, trust, network, credential open/cleanup, fixed probe, schema/DLP/budget; stable codes only.
-6. **Review and publish** — immutable diff, full revision/binding/proof digests, checkpoint compatibility, affected assets/runs, reason, recent OIDC and publish.
+6. **Review and publish** — immutable diff, full revision/binding/proof digests, mandatory checkpoint-transition impact, affected assets/runs, reason, recent OIDC and publish.
 
 The list shows Source/Revision/Gate separately, checkpoint hash/version/age, queue pressure and last safe counts. `effective_actions` alone controls buttons. CSV import shows filename locally, SHA/counts and rejected-row codes but never raw rejected rows. URL persists `workspace,sourceId,revision,step,runId`; refresh/back restores the exact safe state. Use the locked dense light console, 38–40px rows, 4–6px radius, no cards-as-layout, chat, AI avatar, gradient, glow or terminal.
 

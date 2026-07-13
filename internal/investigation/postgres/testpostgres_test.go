@@ -24,6 +24,8 @@ type postgresHarness struct {
 	schema string
 }
 
+const latestInvestigationOwnedMigration = "000014_read_evidence_clock_skew.up.sql"
+
 func newPostgresHarness(t *testing.T) *postgresHarness {
 	t.Helper()
 	dsn := os.Getenv("AIOPS_TEST_POSTGRES_DSN")
@@ -123,6 +125,15 @@ func (harness *postgresHarness) applyUpBeforeTen(t *testing.T) {
 	})
 }
 
+func (harness *postgresHarness) applyThroughLatestInvestigationSchema(t *testing.T) {
+	t.Helper()
+	harness.applyMigrations(t, ".up.sql", false, includeLatestInvestigationMigration)
+}
+
+func includeLatestInvestigationMigration(name string) bool {
+	return name <= latestInvestigationOwnedMigration
+}
+
 func (harness *postgresHarness) applyMigration(t *testing.T, name string) {
 	t.Helper()
 	contents := readMigration(t, name)
@@ -137,6 +148,18 @@ func (harness *postgresHarness) applyMigrations(
 	reverse bool,
 	include func(string) bool,
 ) {
+	t.Helper()
+	for _, name := range plannedInvestigationMigrations(t, suffix, reverse, include) {
+		harness.applyMigration(t, name)
+	}
+}
+
+func plannedInvestigationMigrations(
+	t *testing.T,
+	suffix string,
+	reverse bool,
+	include func(string) bool,
+) []string {
 	t.Helper()
 	directory := migrationDirectory(t)
 	entries, err := os.ReadDir(directory)
@@ -155,8 +178,21 @@ func (harness *postgresHarness) applyMigrations(
 			files[left], files[right] = files[right], files[left]
 		}
 	}
+	return files
+}
+
+func TestLatestInvestigationFixtureMigrationPlanStopsAtOwnedBoundary(t *testing.T) {
+	t.Parallel()
+	files := plannedInvestigationMigrations(t, ".up.sql", false, includeLatestInvestigationMigration)
+	if len(files) != 14 || files[0] != "000001_core.up.sql" ||
+		files[len(files)-1] != latestInvestigationOwnedMigration {
+		t.Fatalf("latest investigation migration plan = %v, want exact 000001 through %s",
+			files, latestInvestigationOwnedMigration)
+	}
 	for _, name := range files {
-		harness.applyMigration(t, name)
+		if name >= "000015_assets_catalog.up.sql" {
+			t.Fatalf("latest investigation fixture crossed its owned migration boundary with %s", name)
+		}
 	}
 }
 
