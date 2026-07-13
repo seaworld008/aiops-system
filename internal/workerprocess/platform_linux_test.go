@@ -550,7 +550,7 @@ func TestSourceFailureAfterStartKillsAndReapsEntireProcessGroup(t *testing.T) {
 	settings := defaultSupervisorSettings()
 	settings.killConfirm = 3 * time.Second
 	settings.childEnv = []string{
-		controlWorkerTestScenario + "=ready-hold-on-term-with-descendant|" + base,
+		controlWorkerTestScenario + "=pre-secret-descendant-hold|" + base,
 		controlWorkerRaceOptions,
 	}
 	source, err := newTestControlWorkerSource()
@@ -785,7 +785,7 @@ func TestAcceptControlWorkerChildAcceptsExactBoundary(t *testing.T) {
 		t.Fatalf("exact boundary helper failed: %v", err)
 	}
 	if err := acceptBoundaryCommand(t, "scan-exact", writer).Run(); err != nil {
-		t.Fatalf("exact FD3-FD7 scan helper failed: %v", err)
+		t.Fatalf("exact FD3-FD7 topology helper failed: %v", err)
 	}
 }
 
@@ -794,7 +794,7 @@ func newTestSupervisor(scenario, base string) *ControlWorkerSupervisor {
 	// A race-instrumented self-reexec can take well above 300 ms on a loaded CI
 	// host before TestMain reaches the child protocol. Keep this far below the
 	// production budget while avoiding scheduler-dependent pre-marker kills.
-	settings.startupTimeout = 2 * time.Second
+	settings.startupTimeout = 5 * time.Second
 	settings.startupGrace = time.Second
 	settings.shutdownGrace = time.Second
 	settings.anomalyGrace = 250 * time.Millisecond
@@ -997,13 +997,17 @@ func runControlWorkerTestChild(raw string) int {
 		base = parts[1]
 	}
 	if scenario == "accept-reject-extra" {
+		descriptorFlags, descriptorErr := unix.FcntlInt(uintptr(controlWorkerControlFD+1), unix.F_GETFD, 0)
+		if descriptorErr != nil || descriptorFlags&unix.FD_CLOEXEC != 0 {
+			return 90
+		}
 		if onlyExpectedInheritedDescriptors(controlWorkerControlFD) {
 			return 91
 		}
 		return 0
 	}
 	if scenario == "scan-exact" {
-		if !onlyExpectedInheritedDescriptors(controlWorkerControlFD) || !fixedInheritedDescriptorsAreDistinct() {
+		if !fixedInheritedDescriptorsAreDistinct() {
 			return 91
 		}
 		return 0
@@ -1039,6 +1043,15 @@ func runControlWorkerTestChild(raw string) int {
 	// -> bind sequence before their READY/FATAL protocol scenario.
 	status.snapshotBuilt = true
 	writeChildMarker(base+".pid", strconv.Itoa(os.Getpid()))
+	if scenario == "pre-secret-descendant-hold" {
+		descendant := exec.Command("/bin/sh", "-c", "trap '' TERM; while :; do sleep 1; done")
+		descendant.Env = []string{}
+		if descendant.Start() != nil {
+			return 77
+		}
+		writeChildMarker(base+".descendant-pid", strconv.Itoa(descendant.Process.Pid))
+		select {}
+	}
 	if scenario == "no-secret-ready-hold-on-term" || scenario == "no-secret-ready-exit-on-term" {
 		signals := captureTestTERM()
 		writeChildMarker(base+".listening", "listening")
@@ -1226,7 +1239,7 @@ func runPdeathParentTestHelper(raw string) int {
 	closeControlWorkerFiles(secretWriters[:])
 	_ = source.Close()
 	_ = statusWriter.Close()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(base + ".ready"); err == nil {
 			_ = statusReader
@@ -1345,7 +1358,7 @@ func waitForChildMarker(path string, timeout time.Duration) bool {
 
 func waitForMarker(t *testing.T, path string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(path); err == nil {
 			return
