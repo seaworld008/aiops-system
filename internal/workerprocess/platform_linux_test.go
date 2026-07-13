@@ -496,38 +496,46 @@ func TestSupervisorBoundsOutputAndContainsWithoutTERM(t *testing.T) {
 func TestSupervisorFatalContainmentRaceHundred(t *testing.T) {
 	root := t.TempDir()
 	contained := 0
-	for attempt := 0; attempt < 110 && contained < 100; attempt++ {
+	for attempt := 0; attempt < 120 && contained < 100; attempt++ {
 		base := filepath.Join(root, strconv.Itoa(attempt))
 		err := newTestSupervisor("fatal-and-exit", base).Run(context.Background())
-		if err != errChildFatal && err != errChildStartup && err != errChildExit && err != errChildProtocol {
-			if err == errChildStart {
-				if _, statErr := os.Stat(base + ".pid"); errors.Is(statErr, os.ErrNotExist) {
-					// A loaded race runner may reject self-exec before a child exists.
-					// Retry without counting it as containment evidence.
-					continue
-				}
-			}
+		if err != errChildFatal && err != errChildStart && err != errChildStartup && err != errChildExit && err != errChildProtocol {
 			t.Fatalf("attempt %d: Run() error = %v, want fatal or fixed containment fallback", attempt, err)
+		}
+		if _, statErr := os.Stat(base + ".pid"); errors.Is(statErr, os.ErrNotExist) {
+			// A loaded race runner may reject the helper before it records a
+			// process identity. Retry without counting it as containment proof.
+			continue
+		} else if statErr != nil {
+			t.Fatalf("attempt %d: inspect pid marker: %v", attempt, statErr)
 		}
 		assertMarkerAbsent(t, base+".term")
 		assertRecordedPIDGone(t, base+".pid")
 		contained++
 	}
 	if contained != 100 {
-		t.Fatalf("proved %d contained fatal starts after 110 attempts, want 100", contained)
+		t.Fatalf("proved %d contained fatal starts after 120 attempts, want 100", contained)
 	}
 }
 
 func TestSupervisorConcurrentCancelAndFatalExitRaceHundred(t *testing.T) {
 	root := t.TempDir()
-	for iteration := 0; iteration < 100; iteration++ {
-		base := filepath.Join(root, strconv.Itoa(iteration))
+	contained := 0
+	for attempt := 0; attempt < 120 && contained < 100; attempt++ {
+		base := filepath.Join(root, strconv.Itoa(attempt))
 		ctx, cancel := context.WithCancel(context.Background())
 		result := make(chan error, 1)
 		supervisor := newTestSupervisor("race-fatal-or-term", base)
 		supervisor.settings.startupTimeout = 15 * time.Second
 		go func() { result <- supervisor.Run(ctx) }()
-		waitForMarkerOrEarlyResult(t, base+".ready", result)
+		earlyErr, ready := waitForMarkerOrEarlyResult(t, base+".ready", result)
+		if !ready {
+			cancel()
+			if earlyErr == errChildStart || earlyErr == errChildStartup || earlyErr == errChildProtocol || earlyErr == errChildExit {
+				continue
+			}
+			t.Fatalf("attempt %d: supervisor returned before READY: %v", attempt, earlyErr)
+		}
 		gate := make(chan struct{})
 		var racers sync.WaitGroup
 		racers.Add(2)
@@ -544,9 +552,13 @@ func TestSupervisorConcurrentCancelAndFatalExitRaceHundred(t *testing.T) {
 		close(gate)
 		racers.Wait()
 		if err := receiveResult(t, result); err != errChildFatal {
-			t.Fatalf("iteration %d: Run() error = %v, want %v", iteration, err, errChildFatal)
+			t.Fatalf("attempt %d: Run() error = %v, want %v", attempt, err, errChildFatal)
 		}
 		assertRecordedPIDGone(t, base+".pid")
+		contained++
+	}
+	if contained != 100 {
+		t.Fatalf("proved %d cancel/FATAL containment races after 120 attempts, want 100", contained)
 	}
 }
 
@@ -1674,7 +1686,7 @@ func waitForMarker(t *testing.T, path string) {
 	t.Fatalf("marker %q was not created", path)
 }
 
-func waitForMarkerOrEarlyResult(t *testing.T, path string, result <-chan error) {
+func waitForMarkerOrEarlyResult(t *testing.T, path string, result <-chan error) (error, bool) {
 	t.Helper()
 	deadline := time.NewTimer(20 * time.Second)
 	defer deadline.Stop()
@@ -1683,13 +1695,14 @@ func waitForMarkerOrEarlyResult(t *testing.T, path string, result <-chan error) 
 	for {
 		select {
 		case err := <-result:
-			t.Fatalf("supervisor returned before marker %q: %v", path, err)
+			return err, false
 		case <-ticker.C:
 			if _, err := os.Stat(path); err == nil {
-				return
+				return nil, true
 			}
 		case <-deadline.C:
 			t.Fatalf("marker %q was not created", path)
+			return nil, false
 		}
 	}
 }
