@@ -315,23 +315,27 @@ func startSourceLoaderFailStopReaper(command *exec.Cmd) {
 type childEvent uint8
 
 const (
-	childEventReady childEvent = iota + 1
+	childEventSecretReady childEvent = iota + 1
+	childEventReady
 	childEventFatal
 	childEventProtocol
 	childEventStatusClosed
 )
 
 type controlWorkerProcess struct {
-	command      *exec.Cmd
-	pid          int
-	pidFD        int
-	statusReader *os.File
-	exitDone     chan struct{}
-	exitTrusted  atomic.Bool
-	reapDone     chan struct{}
-	reapOnce     sync.Once
-	waitErr      error
-	closeOnce    sync.Once
+	command       *exec.Cmd
+	pid           int
+	pidFD         int
+	statusReader  *os.File
+	secretMu      sync.Mutex
+	secretWriter  [3]*os.File
+	secretClaimed bool
+	exitDone      chan struct{}
+	exitTrusted   atomic.Bool
+	reapDone      chan struct{}
+	reapOnce      sync.Once
+	waitErr       error
+	closeOnce     sync.Once
 }
 
 type boundedDiscard struct {
@@ -403,7 +407,8 @@ func acceptControlWorkerChildWithSource(
 	if file == nil {
 		return nil, errInvalidStatusChannel
 	}
-	if enforceInheritedDescriptors && !onlyExpectedInheritedDescriptors(controlWorkerSourceFD) {
+	if enforceInheritedDescriptors &&
+		(!onlyExpectedInheritedDescriptors(controlWorkerControlFD) || !fixedInheritedDescriptorsAreDistinct()) {
 		_ = file.Close()
 		return nil, errInvalidChildInvocation
 	}
@@ -413,6 +418,22 @@ func acceptControlWorkerChildWithSource(
 		return nil, errInvalidChildInvocation
 	}
 	return newChildStatus(file, source), nil
+}
+
+func fixedInheritedDescriptorsAreDistinct() bool {
+	seen := make(map[[2]uint64]struct{}, controlWorkerControlFD-int(controlWorkerStatusFD)+1)
+	for descriptor := int(controlWorkerStatusFD); descriptor <= controlWorkerControlFD; descriptor++ {
+		var stat unix.Stat_t
+		if unix.Fstat(descriptor, &stat) != nil {
+			return false
+		}
+		identity := [2]uint64{uint64(stat.Dev), stat.Ino}
+		if _, duplicate := seen[identity]; duplicate {
+			return false
+		}
+		seen[identity] = struct{}{}
+	}
+	return true
 }
 
 func onlyExpectedInheritedDescriptors(maximum int) bool {
@@ -523,7 +544,7 @@ func currentParentDeathSignal() (syscall.Signal, error) {
 }
 
 func runControlWorkerSupervisor(ctx context.Context, settings supervisorSettings) error {
-	startedAt := time.Now()
+	startupDeadline := time.Now().Add(settings.startupTimeout)
 	source, err := invokeControlWorkerSourceOpen(settings.openSource, ctx, settings.startupTimeout)
 	if err != nil || nilControlWorkerSource(source) {
 		return errChildStart
@@ -532,7 +553,7 @@ func runControlWorkerSupervisor(ctx context.Context, settings supervisorSettings
 		_ = invokeControlWorkerSourceClose(source)
 		return errChildStart
 	}
-	remaining := settings.startupTimeout - time.Since(startedAt)
+	remaining := time.Until(startupDeadline)
 	if remaining <= 0 {
 		_ = invokeControlWorkerSourceClose(source)
 		return errChildStart
@@ -541,7 +562,7 @@ func runControlWorkerSupervisor(ctx context.Context, settings supervisorSettings
 	if err != nil {
 		return errChildStart
 	}
-	remaining = settings.startupTimeout - time.Since(startedAt)
+	remaining = time.Until(startupDeadline)
 	if remaining <= 0 {
 		return terminateControlWorker(
 			process, settings, events, outputExceeded,
@@ -550,6 +571,8 @@ func runControlWorkerSupervisor(ctx context.Context, settings supervisorSettings
 	}
 	startup := time.NewTimer(remaining)
 	defer startup.Stop()
+	var secretSupply <-chan error
+	secretSupplied := false
 	for {
 		select {
 		case event, ok := <-events:
@@ -557,7 +580,49 @@ func runControlWorkerSupervisor(ctx context.Context, settings supervisorSettings
 				return rejectAfterContainment(process, settings, errChildProtocol)
 			}
 			switch event {
+			case childEventSecretReady:
+				if secretSupply != nil || secretSupplied {
+					return rejectAfterContainment(process, settings, errChildProtocol)
+				}
+				if ctx.Err() != nil {
+					return terminateControlWorker(
+						process, settings, events, outputExceeded,
+						settings.startupGrace, nil, errChildStartup,
+					)
+				}
+				remaining = time.Until(startupDeadline)
+				if remaining <= 0 {
+					return terminateControlWorker(
+						process, settings, events, outputExceeded,
+						settings.startupGrace, errChildStartup, errChildStartup,
+					)
+				}
+				secretSupply = beginControlWorkerSecretSupply(ctx, remaining, settings.supplySecrets, process)
 			case childEventReady:
+				if time.Until(startupDeadline) <= 0 {
+					return terminateControlWorker(
+						process, settings, events, outputExceeded,
+						settings.startupGrace, errChildStartup, errChildStartup,
+					)
+				}
+				if !secretSupplied {
+					select {
+					case supplyErr := <-secretSupply:
+						secretSupply = nil
+						if supplyErr != nil {
+							return rejectAfterContainment(process, settings, errChildStart)
+						}
+						if time.Until(startupDeadline) <= 0 {
+							return terminateControlWorker(
+								process, settings, events, outputExceeded,
+								settings.startupGrace, errChildStartup, errChildStartup,
+							)
+						}
+						secretSupplied = true
+					default:
+						return rejectAfterContainment(process, settings, errChildProtocol)
+					}
+				}
 				return superviseReadyControlWorker(ctx, settings, process, events, outputExceeded)
 			case childEventFatal:
 				return rejectAfterContainment(process, settings, errChildFatal)
@@ -579,8 +644,37 @@ func runControlWorkerSupervisor(ctx context.Context, settings supervisorSettings
 				process, settings, events, outputExceeded,
 				settings.startupGrace, nil, errChildStartup,
 			)
+		case supplyErr := <-secretSupply:
+			secretSupply = nil
+			if supplyErr != nil {
+				return rejectAfterContainment(process, settings, errChildStart)
+			}
+			if time.Until(startupDeadline) <= 0 {
+				return terminateControlWorker(
+					process, settings, events, outputExceeded,
+					settings.startupGrace, errChildStartup, errChildStartup,
+				)
+			}
+			secretSupplied = true
 		}
 	}
+}
+
+func beginControlWorkerSecretSupply(
+	ctx context.Context,
+	timeout time.Duration,
+	supplier controlWorkerSecretSupplier,
+	process *controlWorkerProcess,
+) <-chan error {
+	result := make(chan error, 1)
+	go func() {
+		result <- process.supplySecrets(ctx, timeout, supplier)
+		// The completion result is buffered before EOF is published. Therefore a
+		// child cannot legitimately report READY before the supervisor can prove
+		// that the supplier returned successfully.
+		process.closeSecretWriters()
+	}()
+	return result
 }
 
 func superviseReadyControlWorker(
@@ -626,22 +720,32 @@ func startControlWorker(
 		_ = invokeControlWorkerSourceClose(source)
 		return nil, nil, nil, errChildStart
 	}
+	secretReaders, secretWriters, err := openControlWorkerSecretPipes()
+	if err != nil {
+		_ = statusReader.Close()
+		_ = statusWriter.Close()
+		_ = invokeControlWorkerSourceClose(source)
+		return nil, nil, nil, errChildStart
+	}
 	output := newBoundedDiscard(settings.outputLimit)
 	pidFD := -1
 	command := buildControlWorkerCommand(settings, output, &pidFD)
-	startErr := invokeControlWorkerSourceStart(source, command, statusWriter)
+	startErr := invokeControlWorkerSourceStart(source, command, statusWriter, secretReaders)
 	closeErr := invokeControlWorkerSourceClose(source)
 	var process *controlWorkerProcess
 	if command.Process != nil && pidFD >= 0 {
-		process = newStartedControlWorkerProcess(command, pidFD, statusReader)
+		process = newStartedControlWorkerProcess(command, pidFD, statusReader, secretWriters)
 	}
+	closeControlWorkerFiles(secretReaders[:])
 	if startErr != nil || closeErr != nil || process == nil {
 		_ = statusWriter.Close()
 		if process != nil {
 			_ = forceKillAndReap(process, settings.killConfirm)
 		} else if command.Process != nil {
+			closeControlWorkerFiles(secretWriters[:])
 			_ = containStartedCommandWithoutPIDFD(command, statusReader, settings.killConfirm)
 		} else {
+			closeControlWorkerFiles(secretWriters[:])
 			_ = statusReader.Close()
 		}
 		return nil, nil, nil, errChildStart
@@ -652,12 +756,18 @@ func startControlWorker(
 	return process, events, output.exceeded, nil
 }
 
-func newStartedControlWorkerProcess(command *exec.Cmd, pidFD int, statusReader *os.File) *controlWorkerProcess {
+func newStartedControlWorkerProcess(
+	command *exec.Cmd,
+	pidFD int,
+	statusReader *os.File,
+	secretWriters [3]*os.File,
+) *controlWorkerProcess {
 	process := &controlWorkerProcess{
 		command:      command,
 		pid:          command.Process.Pid,
 		pidFD:        pidFD,
 		statusReader: statusReader,
+		secretWriter: secretWriters,
 		exitDone:     make(chan struct{}),
 		reapDone:     make(chan struct{}),
 	}
@@ -666,6 +776,35 @@ func newStartedControlWorkerProcess(command *exec.Cmd, pidFD int, statusReader *
 		close(process.exitDone)
 	}()
 	return process
+}
+
+func openControlWorkerSecretPipes() (readers [3]*os.File, writers [3]*os.File, returnedErr error) {
+	defer func() {
+		if returnedErr != nil {
+			closeControlWorkerFiles(readers[:])
+			closeControlWorkerFiles(writers[:])
+			readers = [3]*os.File{}
+			writers = [3]*os.File{}
+		}
+	}()
+	for index := range readers {
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			return readers, writers, errChildStart
+		}
+		readers[index] = reader
+		writers[index] = writer
+	}
+	return readers, writers, nil
+}
+
+func closeControlWorkerFiles(files []*os.File) {
+	for index := range files {
+		if files[index] != nil {
+			_ = files[index].Close()
+			files[index] = nil
+		}
+	}
 }
 
 func buildControlWorkerCommand(
@@ -718,16 +857,69 @@ func invokeControlWorkerSourceStart(
 	source controlWorkerSource,
 	command *exec.Cmd,
 	status *os.File,
+	secrets [3]*os.File,
 ) (returnedErr error) {
 	defer func() {
 		if recover() != nil {
 			returnedErr = errChildStart
 		}
 	}()
-	if nilControlWorkerSource(source) || command == nil || status == nil || source.StartChild(command, status) != nil {
+	if nilControlWorkerSource(source) || command == nil || status == nil ||
+		source.StartChild(command, status, secrets[0], secrets[1], secrets[2]) != nil {
 		return errChildStart
 	}
 	return nil
+}
+
+func (process *controlWorkerProcess) supplySecrets(
+	ctx context.Context,
+	timeout time.Duration,
+	supplier controlWorkerSecretSupplier,
+) (returnedErr error) {
+	writers, ok := process.claimSecretWriters()
+	if !ok || ctx == nil || timeout <= 0 || supplier == nil {
+		return errChildStart
+	}
+	supplyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if supplyCtx.Err() != nil {
+		return errChildStart
+	}
+	defer func() {
+		if recover() != nil {
+			returnedErr = errChildStart
+		}
+	}()
+	if supplier(supplyCtx, timeout, writers[0], writers[1], writers[2]) != nil {
+		return errChildStart
+	}
+	return nil
+}
+
+func (process *controlWorkerProcess) claimSecretWriters() ([3]*os.File, bool) {
+	if process == nil {
+		return [3]*os.File{}, false
+	}
+	process.secretMu.Lock()
+	defer process.secretMu.Unlock()
+	writers := process.secretWriter
+	if process.secretClaimed || writers[0] == nil || writers[1] == nil || writers[2] == nil {
+		return [3]*os.File{}, false
+	}
+	process.secretClaimed = true
+	return writers, true
+}
+
+func (process *controlWorkerProcess) closeSecretWriters() {
+	if process == nil {
+		return
+	}
+	process.secretMu.Lock()
+	writers := process.secretWriter
+	process.secretWriter = [3]*os.File{}
+	process.secretClaimed = true
+	process.secretMu.Unlock()
+	closeControlWorkerFiles(writers[:])
 }
 
 func invokeControlWorkerSourceClose(source controlWorkerSource) (returnedErr error) {
@@ -831,10 +1023,14 @@ func monitorChildStatus(reader io.Reader, events chan<- childEvent) {
 		read, err := reader.Read(buffer)
 		for _, value := range buffer[:read] {
 			switch {
-			case state == childStatusOpen && value == controlWorkerReadyByte:
+			case state == childStatusOpen && value == controlWorkerSecretReadyByte:
+				state = childStatusSecretReady
+				events <- childEventSecretReady
+			case state == childStatusSecretReady && value == controlWorkerReadyByte:
 				state = childStatusReady
 				events <- childEventReady
-			case (state == childStatusOpen || state == childStatusReady) && value == controlWorkerFatalByte:
+			case (state == childStatusOpen || state == childStatusSecretReady || state == childStatusReady) &&
+				value == controlWorkerFatalByte:
 				state = childStatusClosed
 				events <- childEventFatal
 			default:
@@ -867,6 +1063,9 @@ func terminateControlWorker(
 	cleanResult error,
 	exitFallback error,
 ) error {
+	if process != nil {
+		process.closeSecretWriters()
+	}
 	if process == nil || grace <= 0 {
 		_ = forceKillAndReap(process, settings.killConfirm)
 		return errChildStop
@@ -927,7 +1126,7 @@ func terminateControlWorker(
 				return rejectAfterContainment(process, settings, errChildFatal)
 			case childEventProtocol:
 				return rejectAfterContainment(process, settings, errChildProtocol)
-			case childEventReady, childEventStatusClosed:
+			case childEventSecretReady, childEventReady, childEventStatusClosed:
 				// READY can race startup cancellation. Closing the status FD is
 				// expected while a cooperative child exits after TERM. Neither is
 				// sufficient to claim successful process containment.
@@ -960,7 +1159,7 @@ func terminationPreflight(
 				return errChildProtocol, true
 			}
 			switch event {
-			case childEventReady:
+			case childEventSecretReady, childEventReady:
 				// READY can already be queued when startup cancellation or its
 				// deadline wins. Drain it and keep looking for a following FATAL.
 				continue
@@ -996,7 +1195,7 @@ func classifyTerminatedControlWorker(
 				return errChildFatal
 			case childEventProtocol:
 				return errChildProtocol
-			case childEventReady, childEventStatusClosed:
+			case childEventSecretReady, childEventReady, childEventStatusClosed:
 				continue
 			default:
 				return errChildProtocol
@@ -1010,6 +1209,9 @@ func classifyTerminatedControlWorker(
 }
 
 func rejectAfterContainment(process *controlWorkerProcess, settings supervisorSettings, cause error) error {
+	if process != nil {
+		process.closeSecretWriters()
+	}
 	if !containWithoutTerm(process, settings.anomalyGrace, settings.killConfirm) {
 		return errChildStop
 	}
@@ -1032,6 +1234,7 @@ func forceKillAndReap(process *controlWorkerProcess, killConfirm time.Duration) 
 	if process == nil || killConfirm <= 0 {
 		return false
 	}
+	process.closeSecretWriters()
 	killOK := process.signalGroup(syscall.SIGKILL)
 	if !killOK && process.command != nil && process.command.Process != nil {
 		killOK = process.command.Process.Kill() == nil || process.exited()
@@ -1149,6 +1352,7 @@ func (process *controlWorkerProcess) closeStatus() {
 		return
 	}
 	process.closeOnce.Do(func() {
+		process.closeSecretWriters()
 		if process.statusReader != nil {
 			_ = process.statusReader.Close()
 		}

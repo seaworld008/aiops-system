@@ -271,8 +271,9 @@ func (status *processControlChildStatus) Fatal() {
 }
 
 func newControlChildRuntime(snapshot *readassembly.Snapshot) (controlChildRuntime, error) {
-	// C2-4c2b1b1 proves the exact FD4 manifests compile to the reviewed semantic
-	// Snapshot. Secret-ready/PostgreSQL/Temporal assembly remains unavailable.
+	// C2-4c2b1b2a proves the exact FD4 manifests compile and the three fixed
+	// post-barrier secret frames bind to their reviewed client certificates.
+	// PostgreSQL/Temporal client assembly remains unavailable until b1b3.
 	if snapshot == nil || !snapshot.Ready() {
 		return nil, errControlWorkerAssemblyUnavailable
 	}
@@ -293,12 +294,21 @@ func runControlWorkerChildRuntime(ctx context.Context, status *workerprocess.Chi
 		return errControlWorkerAssemblyUnavailable
 	}
 	snapshot, buildErr := workerprocess.BuildControlWorkerSnapshot(ctx, status)
+	snapshotReady := buildErr == nil && snapshot != nil && snapshot.Ready() && ctx.Err() == nil
+	var secretReadyErr error
+	var bindErr error
+	if snapshotReady {
+		secretReadyErr = workerprocess.ReportControlWorkerSecretReady(status)
+	}
+	if snapshotReady && secretReadyErr == nil {
+		bindErr = workerprocess.BindControlWorkerSecrets(ctx, status)
+	}
 	var runtime controlChildRuntime
 	var assemblyErr error
-	if buildErr == nil && snapshot != nil && snapshot.Ready() {
+	if snapshotReady && secretReadyErr == nil && bindErr == nil {
 		runtime, assemblyErr = newControlChildRuntime(snapshot)
 	}
-	if buildErr != nil || snapshot == nil || !snapshot.Ready() || assemblyErr != nil ||
+	if !snapshotReady || secretReadyErr != nil || bindErr != nil || assemblyErr != nil ||
 		nilControlChildDependency(runtime) {
 		_ = workerprocess.CloseControlWorkerChild(status)
 		return errControlWorkerAssemblyUnavailable

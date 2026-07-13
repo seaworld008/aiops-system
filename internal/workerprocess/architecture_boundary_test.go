@@ -26,6 +26,8 @@ var (
 	_ func([]string) bool                                                               = workerprocess.IsControlWorkerChild
 	_ func([]string) (*workerprocess.ChildStatus, error)                                = workerprocess.AcceptControlWorkerChild
 	_ func(context.Context, *workerprocess.ChildStatus) (*readassembly.Snapshot, error) = workerprocess.BuildControlWorkerSnapshot
+	_ func(*workerprocess.ChildStatus) error                                            = workerprocess.ReportControlWorkerSecretReady
+	_ func(context.Context, *workerprocess.ChildStatus) error                           = workerprocess.BindControlWorkerSecrets
 	_ func(*workerprocess.ChildStatus) error                                            = workerprocess.ReportControlWorkerReady
 	_ func(*workerprocess.ChildStatus)                                                  = workerprocess.ExitControlWorkerFatal
 	_ func(*workerprocess.ChildStatus) error                                            = workerprocess.CloseControlWorkerChild
@@ -58,6 +60,8 @@ var guardedWorkerProcessAPI = map[string]struct{}{
 	"IsControlWorkerChild":              {},
 	"AcceptControlWorkerChild":          {},
 	"BuildControlWorkerSnapshot":        {},
+	"ReportControlWorkerSecretReady":    {},
+	"BindControlWorkerSecrets":          {},
 	"ReportControlWorkerReady":          {},
 	"ExitControlWorkerFatal":            {},
 	"CloseControlWorkerChild":           {},
@@ -88,6 +92,8 @@ var expectedProcessBoundaryCalls = map[processBoundaryKey]int{
 	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "ReportControlWorkerReady"}:                             1,
 	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "ExitControlWorkerFatal"}:                               1,
 	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "BuildControlWorkerSnapshot"}:                           1,
+	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "ReportControlWorkerSecretReady"}:                       1,
+	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "BindControlWorkerSecrets"}:                             1,
 	{file: "cmd/worker/control_child.go", source: workerProcessImport, symbol: "CloseControlWorkerChild"}:                              2,
 	{file: "internal/workerprocess/supervisor.go", source: "workerprocess", symbol: "defaultSupervisorSettings"}:                       1,
 	{file: "internal/workerprocess/supervisor.go", source: "workerprocess", symbol: "newControlWorkerSupervisor"}:                      1,
@@ -101,7 +107,7 @@ var expectedProcessBoundaryCalls = map[processBoundaryKey]int{
 	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "loadControlWorkerSourceFromCommand"}:          1,
 	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "loadControlWorkerSourceFromCommandUnchecked"}: 1,
 	{file: "internal/workerprocess/platform_linux.go", source: "workerprocess", symbol: "startControlWorker"}:                          1,
-	{file: "internal/workerprocess/protocol.go", source: "workerprocess", symbol: "writeStatusByte"}:                                   2,
+	{file: "internal/workerprocess/protocol.go", source: "workerprocess", symbol: "writeStatusByte"}:                                   3,
 	{file: "internal/workerprocess/platform_linux.go", source: "os/exec", symbol: "Command"}:                                           2,
 }
 
@@ -112,6 +118,8 @@ var expectedWorkerProcessExports = map[string]int{
 	"func:IsControlWorkerChild":              1,
 	"func:AcceptControlWorkerChild":          1,
 	"func:BuildControlWorkerSnapshot":        1,
+	"func:ReportControlWorkerSecretReady":    1,
+	"func:BindControlWorkerSecrets":          1,
 	"func:ReportControlWorkerReady":          1,
 	"func:ExitControlWorkerFatal":            1,
 	"func:CloseControlWorkerChild":           1,
@@ -235,6 +243,332 @@ func bypassSnapshotProof(status *ChildStatus) {
 	if sameProcessStringCounts(fixtureWrites, want) || fixtureWrites["internal/workerprocess/bypass.go"] < 2 {
 		t.Fatalf("snapshot proof scanner accepted bypass: %#v", fixtureWrites)
 	}
+}
+
+func TestValidatedSecretBindingProofHasOneProductionWrite(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate process-boundary architecture test")
+	}
+	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "../.."))
+	writes, err := scanSecretBoundProofWrites(repositoryRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{"internal/workerprocess/protocol.go": 3}
+	if !sameProcessStringCounts(writes, want) {
+		t.Fatalf("secret-bound production writes = %#v, want %#v", writes, want)
+	}
+
+	fixtureRoot := t.TempDir()
+	writeProcessBoundaryFixture(t, fixtureRoot, "internal/workerprocess/bypass.go", `package workerprocess
+
+func bypassSecretBinding(status *ChildStatus) {
+	proof := childStatusState(childStatusSecretsBound)
+	status.state = proof
+}
+`)
+	fixtureWrites, err := scanSecretBoundProofWrites(fixtureRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fixtureWrites["internal/workerprocess/bypass.go"] != 1 {
+		t.Fatalf("secret-bound proof scanner missed bypass: %#v", fixtureWrites)
+	}
+}
+
+func scanSecretBoundProofWrites(repositoryRoot string) (map[string]int, error) {
+	writes := make(map[string]int)
+	err := filepath.WalkDir(repositoryRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" || entry.Name() == "vendor" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		relative, err := filepath.Rel(repositoryRoot, path)
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(filepath.ToSlash(relative), "internal/workerprocess/") {
+			return nil
+		}
+		parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			return err
+		}
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			identifier, ok := node.(*ast.Ident)
+			if ok && identifier.Name == "childStatusSecretsBound" {
+				writes[relative]++
+			}
+			return true
+		})
+		return nil
+	})
+	return writes, err
+}
+
+func TestSecretBinderHasOneProductionCallsite(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate process-boundary architecture test")
+	}
+	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "../.."))
+	calls, err := scanSecretBinderCalls(repositoryRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{"internal/workerprocess/protocol.go:invokeSecretBinding": 1}
+	if !sameProcessStringCounts(calls, want) {
+		t.Fatalf("secret binder production calls = %#v, want %#v", calls, want)
+	}
+
+	fixtureRoot := t.TempDir()
+	writeProcessBoundaryFixture(t, fixtureRoot, "internal/workerprocess/bypass.go", `package workerprocess
+
+func bypassBinder(binder controlWorkerSecretBinder, ctx context.Context) error {
+	return binder.BindControlWorkerSecrets(ctx)
+}
+`)
+	fixtureCalls, err := scanSecretBinderCalls(fixtureRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fixtureCalls["internal/workerprocess/bypass.go:bypassBinder"] != 1 {
+		t.Fatalf("secret binder scanner missed bypass: %#v", fixtureCalls)
+	}
+}
+
+func TestControlWorkerStartupDeadlineIsRecheckedAtAllAssemblyLinearizationPoints(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate process-boundary architecture test")
+	}
+	path := filepath.Join(filepath.Dir(currentFile), "platform_linux.go")
+	parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var supervisor *ast.FuncDecl
+	for _, declaration := range parsed.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if ok && function.Name.Name == "runControlWorkerSupervisor" {
+			supervisor = function
+			break
+		}
+	}
+	if supervisor == nil {
+		t.Fatal("runControlWorkerSupervisor is missing")
+	}
+	checks := 0
+	ast.Inspect(supervisor.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok || len(call.Args) != 1 {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		qualifier, qualifierOK := selector.X.(*ast.Ident)
+		deadline, deadlineOK := call.Args[0].(*ast.Ident)
+		if qualifierOK && deadlineOK && qualifier.Name == "time" &&
+			selector.Sel.Name == "Until" && deadline.Name == "startupDeadline" {
+			checks++
+		}
+		return true
+	})
+	if checks != 6 {
+		t.Fatalf("startupDeadline checks = %d, want exact reviewed set of 6", checks)
+	}
+}
+
+func TestControlWorkerSecretTransportHasNoDescriptorDuplicationOrRawStatusWriterAlias(t *testing.T) {
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate process-boundary architecture test")
+	}
+	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "../.."))
+	violations, err := scanSecretTransportEscapes(repositoryRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(violations) != 0 {
+		t.Fatalf("secret transport escape violations: %v", violations)
+	}
+
+	fixtureRoot := t.TempDir()
+	writeProcessBoundaryFixture(t, fixtureRoot, "internal/workerprocess/bypass.go", `package workerprocess
+
+import "golang.org/x/sys/unix"
+
+func bypassTransport(status *ChildStatus) {
+	writer := status.file
+	_, _ = writer.Write([]byte{'R'})
+	_, _ = status.file.Write([]byte{'R'})
+	_, _ = unix.Dup(int(writer.Fd()))
+	_ = unix.Dup2
+	_ = unix.Dup3
+	_ = unix.UnixRights
+	_ = unix.F_DUPFD
+	_ = unix.F_DUPFD_CLOEXEC
+	_ = unix.F_SETFD
+	_ = unix.SCM_RIGHTS
+}
+`)
+	fixtureViolations, err := scanSecretTransportEscapes(fixtureRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fixtureViolations) < 10 {
+		t.Fatalf("secret transport scanner missed bypasses: %v", fixtureViolations)
+	}
+}
+
+func scanSecretTransportEscapes(repositoryRoot string) ([]string, error) {
+	var violations []string
+	banned := map[string]struct{}{
+		"Dup": {}, "Dup2": {}, "Dup3": {}, "UnixRights": {},
+		"F_DUPFD": {}, "F_DUPFD_CLOEXEC": {}, "F_SETFD": {}, "SCM_RIGHTS": {},
+	}
+	err := filepath.WalkDir(repositoryRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" || entry.Name() == "vendor" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		relative, err := filepath.Rel(repositoryRoot, path)
+		if err != nil {
+			return err
+		}
+		relative = filepath.ToSlash(relative)
+		if !strings.HasPrefix(relative, "internal/workerprocess/") &&
+			!strings.HasPrefix(relative, "internal/workerbootstrap/") &&
+			!strings.HasPrefix(relative, "cmd/worker/") {
+			return nil
+		}
+		parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			return err
+		}
+		aliases := make(map[string]string)
+		for _, imported := range parsed.Imports {
+			importPath, err := strconv.Unquote(imported.Path.Value)
+			if err != nil {
+				return err
+			}
+			alias := filepath.Base(importPath)
+			if imported.Name != nil {
+				alias = imported.Name.Name
+			}
+			aliases[alias] = importPath
+		}
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			switch typed := node.(type) {
+			case *ast.CallExpr:
+				write, ok := typed.Fun.(*ast.SelectorExpr)
+				if !ok || write.Sel.Name != "Write" {
+					return true
+				}
+				file, ok := write.X.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				status, statusOK := file.X.(*ast.Ident)
+				if statusOK && status.Name == "status" && file.Sel.Name == "file" {
+					violations = append(violations, relative+":raw status.file.Write")
+				}
+			case *ast.SelectorExpr:
+				qualifier, ok := typed.X.(*ast.Ident)
+				if !ok {
+					return true
+				}
+				importPath := aliases[qualifier.Name]
+				if importPath == "syscall" || importPath == "golang.org/x/sys/unix" {
+					if _, rejected := banned[typed.Sel.Name]; rejected {
+						violations = append(violations, relative+":"+typed.Sel.Name)
+					}
+				}
+			case *ast.AssignStmt:
+				for _, expression := range typed.Rhs {
+					selector, ok := expression.(*ast.SelectorExpr)
+					if !ok {
+						continue
+					}
+					status, statusOK := selector.X.(*ast.Ident)
+					if statusOK && status.Name == "status" && selector.Sel.Name == "file" {
+						violations = append(violations, relative+":status.file alias")
+					}
+				}
+			}
+			return true
+		})
+		return nil
+	})
+	return violations, err
+}
+
+func scanSecretBinderCalls(repositoryRoot string) (map[string]int, error) {
+	calls := make(map[string]int)
+	err := filepath.WalkDir(repositoryRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" || entry.Name() == "vendor" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		relative, err := filepath.Rel(repositoryRoot, path)
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(filepath.ToSlash(relative), "internal/workerprocess/") {
+			return nil
+		}
+		parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			return err
+		}
+		for _, declaration := range parsed.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil {
+				continue
+			}
+			key := relative + ":" + function.Name.Name
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				selector, ok := call.Fun.(*ast.SelectorExpr)
+				if ok && selector.Sel.Name == "BindControlWorkerSecrets" {
+					calls[key]++
+				}
+				return true
+			})
+		}
+		return nil
+	})
+	return calls, err
 }
 
 func scanSnapshotProofWrites(repositoryRoot string) (map[string]int, error) {
@@ -726,6 +1060,14 @@ func scanProcessBoundary(repositoryRoot string) (processBoundaryScan, error) {
 				_, guardedExport := guardedWorkerProcessAPI[syntax.Name]
 				if !guardedInternal && !guardedExport {
 					return
+				}
+				if syntax.Name == "BindControlWorkerSecrets" {
+					if _, interfaceMethod := parent.(*ast.Field); interfaceMethod {
+						return
+					}
+					if selector, methodCall := parent.(*ast.SelectorExpr); methodCall && selector.Sel == syntax {
+						return
+					}
 				}
 				if declaration, ok := parent.(*ast.FuncDecl); ok && declaration.Name == syntax {
 					return

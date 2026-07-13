@@ -11,13 +11,17 @@ import (
 )
 
 const (
-	controlWorkerChildArgument  = "--aiops-internal-control-worker-child-v1"
-	controlWorkerLoaderArgument = "--aiops-internal-control-worker-source-loader-v1"
-	controlWorkerStatusFD       = uintptr(3)
-	controlWorkerSourceFD       = 4
-	controlWorkerReadyByte      = byte('R')
-	controlWorkerFatalByte      = byte('F')
-	controlWorkerFatalExitCode  = 70
+	controlWorkerChildArgument   = "--aiops-internal-control-worker-child-v1"
+	controlWorkerLoaderArgument  = "--aiops-internal-control-worker-source-loader-v1"
+	controlWorkerStatusFD        = uintptr(3)
+	controlWorkerSourceFD        = 4
+	controlWorkerPostgresFD      = 5
+	controlWorkerStarterFD       = 6
+	controlWorkerControlFD       = 7
+	controlWorkerSecretReadyByte = byte('S')
+	controlWorkerReadyByte       = byte('R')
+	controlWorkerFatalByte       = byte('F')
+	controlWorkerFatalExitCode   = 70
 )
 
 var (
@@ -79,6 +83,8 @@ type childStatusState uint8
 
 const (
 	childStatusOpen childStatusState = iota
+	childStatusSecretReady
+	childStatusSecretsBound
 	childStatusReady
 	childStatusClosed
 )
@@ -99,6 +105,10 @@ func (status *ChildStatus) structurallyValid() bool {
 
 type controlWorkerSnapshotSource interface {
 	BuildSnapshot(context.Context) (*readassembly.Snapshot, error)
+}
+
+type controlWorkerSecretBinder interface {
+	BindControlWorkerSecrets(context.Context) error
 }
 
 // BuildControlWorkerSnapshot compiles the already accepted FD4 source exactly
@@ -141,8 +151,10 @@ func invokeSnapshotBuild(
 	return builder.BuildSnapshot(ctx)
 }
 
-// ReportControlWorkerReady reports exactly one successful worker start.
-func ReportControlWorkerReady(status *ChildStatus) error {
+// ReportControlWorkerSecretReady reports that the semantic FD4 Snapshot has
+// been built and that the child is ready to receive its fixed secret frames.
+// SECRET_READY is a one-shot barrier and is intentionally distinct from READY.
+func ReportControlWorkerSecretReady(status *ChildStatus) error {
 	if !status.structurallyValid() {
 		return errInvalidStatusChannel
 	}
@@ -151,16 +163,76 @@ func ReportControlWorkerReady(status *ChildStatus) error {
 	if status.state != childStatusOpen || !status.snapshotBuilt || status.file == nil || status.source == nil {
 		return errStatusAlreadyReported
 	}
+	if err := writeStatusByte(status.file, controlWorkerSecretReadyByte); err != nil {
+		failClosedChildStatus(status)
+		return errInvalidStatusChannel
+	}
+	status.state = childStatusSecretReady
+	return nil
+}
+
+// BindControlWorkerSecrets asks the already accepted inherited source to read,
+// validate, and retain its fixed secret capabilities. Secret bytes never cross
+// this API. A failed or panicking binder cannot enable READY.
+func BindControlWorkerSecrets(ctx context.Context, status *ChildStatus) error {
+	if !status.structurallyValid() || ctx == nil {
+		return errInvalidChildInvocation
+	}
+	status.mu.Lock()
+	defer status.mu.Unlock()
+	if status.state != childStatusSecretReady || !status.snapshotBuilt || status.file == nil || status.source == nil {
+		return errStatusAlreadyReported
+	}
+	binder, ok := status.source.(controlWorkerSecretBinder)
+	if !ok || binder == nil {
+		failClosedChildStatus(status)
+		return errInvalidChildInvocation
+	}
+	if err := invokeSecretBinding(ctx, binder); err != nil {
+		failClosedChildStatus(status)
+		return errInvalidChildInvocation
+	}
+	status.state = childStatusSecretsBound
+	return nil
+}
+
+func invokeSecretBinding(ctx context.Context, binder controlWorkerSecretBinder) (returnedErr error) {
+	defer func() {
+		if recover() != nil {
+			returnedErr = errInvalidChildInvocation
+		}
+	}()
+	return binder.BindControlWorkerSecrets(ctx)
+}
+
+// ReportControlWorkerReady reports exactly one successful worker start.
+func ReportControlWorkerReady(status *ChildStatus) error {
+	if !status.structurallyValid() {
+		return errInvalidStatusChannel
+	}
+	status.mu.Lock()
+	defer status.mu.Unlock()
+	if status.state != childStatusSecretsBound || !status.snapshotBuilt || status.file == nil || status.source == nil {
+		return errStatusAlreadyReported
+	}
 	if err := writeStatusByte(status.file, controlWorkerReadyByte); err != nil {
-		status.state = childStatusClosed
-		_ = status.file.Close()
-		status.file = nil
-		_ = status.source.Close()
-		status.source = nil
+		failClosedChildStatus(status)
 		return errInvalidStatusChannel
 	}
 	status.state = childStatusReady
 	return nil
+}
+
+func failClosedChildStatus(status *ChildStatus) {
+	status.state = childStatusClosed
+	if status.file != nil {
+		_ = status.file.Close()
+		status.file = nil
+	}
+	if status.source != nil {
+		_ = status.source.Close()
+		status.source = nil
+	}
 }
 
 // ExitControlWorkerFatal reports an unrecoverable worker failure and

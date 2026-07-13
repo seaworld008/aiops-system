@@ -1,7 +1,7 @@
 // Package workerbootstrap snapshots the fixed, process-owned public control
-// worker source into an immutable Linux capability. Source integrity is not a
-// semantic readassembly Snapshot proof. The package deliberately does not load
-// passwords or private keys and exposes neither paths nor raw bytes.
+// worker source into an immutable Linux capability, then binds bounded secrets
+// from fixed one-shot pipes after the semantic Snapshot gate. It exposes no
+// paths or raw secret bytes outside the sealed child capability.
 package workerbootstrap
 
 import (
@@ -15,7 +15,7 @@ import (
 
 const PublicSourceSchemaVersion = "control-worker-public-source.v1"
 
-var ErrBootstrapRejected = errors.New("control worker public bootstrap rejected")
+var ErrBootstrapRejected = errors.New("control worker bootstrap rejected")
 
 // PublicSourceSummary contains only source-content identities. It does not
 // attest that the captured manifests form a valid readassembly Snapshot.

@@ -18,7 +18,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const inheritedPublicSourceFD = 4
+const (
+	inheritedPublicSourceFD   = 4
+	inheritedPostgresSecretFD = 5
+	inheritedStarterSecretFD  = 6
+	inheritedControlSecretFD  = 7
+)
 
 type inheritedArtifactExpectation struct {
 	role    string
@@ -31,10 +36,21 @@ type inheritedArtifactExpectation struct {
 // It accepts no caller-selected descriptor and fails closed outside the exact
 // source/frame contract.
 func AcceptInheritedSource() (*InheritedSource, error) {
-	return acceptInheritedSourceDescriptor(inheritedPublicSourceFD)
+	return acceptInheritedSourceDescriptors(
+		inheritedPublicSourceFD,
+		[3]int{inheritedPostgresSecretFD, inheritedStarterSecretFD, inheritedControlSecretFD},
+	)
 }
 
 func acceptInheritedSourceDescriptor(fd int) (*InheritedSource, error) {
+	return acceptInheritedSourceDescriptorSet(fd, nil)
+}
+
+func acceptInheritedSourceDescriptors(fd int, secretFDs [3]int) (*InheritedSource, error) {
+	return acceptInheritedSourceDescriptorSet(fd, &secretFDs)
+}
+
+func acceptInheritedSourceDescriptorSet(fd int, secretFDs *[3]int) (*InheritedSource, error) {
 	if fd < 0 {
 		return nil, ErrBootstrapRejected
 	}
@@ -42,11 +58,19 @@ func acceptInheritedSourceDescriptor(fd int) (*InheritedSource, error) {
 	defer func() {
 		if owned {
 			_ = unix.Close(fd)
+			if secretFDs != nil {
+				for _, secretFD := range secretFDs {
+					_ = unix.Close(secretFD)
+				}
+			}
 		}
 	}()
 	unix.CloseOnExec(fd)
 	var before unix.Stat_t
 	if unix.Fstat(fd, &before) != nil || !validInheritedSourceDescriptor(fd, before) {
+		return nil, ErrBootstrapRejected
+	}
+	if secretFDs != nil && !validInheritedSecretDescriptors(before, *secretFDs) {
 		return nil, ErrBootstrapRejected
 	}
 	contents, err := preadExact(fd, int(before.Size))
@@ -63,17 +87,55 @@ func acceptInheritedSourceDescriptor(fd int) (*InheritedSource, error) {
 	if err != nil {
 		return nil, ErrBootstrapRejected
 	}
-	material, err := captureInheritedSnapshotMaterial(contents, summary)
+	material, runtime, err := captureInheritedSnapshotMaterial(contents, summary)
 	if err != nil {
 		return nil, ErrBootstrapRejected
 	}
 	file := os.NewFile(uintptr(fd), memfdName)
 	if file == nil {
 		material.clear()
+		runtime.clear()
 		return nil, ErrBootstrapRejected
 	}
+	if secretFDs != nil {
+		for index, secretFD := range secretFDs {
+			runtime.readers[index] = os.NewFile(uintptr(secretFD), "control-worker-secret")
+			if runtime.readers[index] == nil {
+				_ = file.Close()
+				material.clear()
+				runtime.clear()
+				return nil, ErrBootstrapRejected
+			}
+		}
+	}
 	owned = false
-	return newInheritedSourceWithSnapshot(file, summary, material), nil
+	return newInheritedSourceWithRuntime(file, summary, material, runtime, inheritedSourceLive), nil
+}
+
+func validInheritedSecretDescriptors(publicStat unix.Stat_t, secretFDs [3]int) bool {
+	seen := map[[2]uint64]struct{}{
+		{uint64(publicStat.Dev), publicStat.Ino}: {},
+	}
+	for _, fd := range secretFDs {
+		if fd < 0 {
+			return false
+		}
+		unix.CloseOnExec(fd)
+		var stat unix.Stat_t
+		flags, flagsErr := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+		descriptorFlags, descriptorErr := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+		if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFIFO ||
+			flagsErr != nil || flags&unix.O_ACCMODE != unix.O_RDONLY || descriptorErr != nil ||
+			descriptorFlags&unix.FD_CLOEXEC == 0 {
+			return false
+		}
+		identity := [2]uint64{uint64(stat.Dev), stat.Ino}
+		if _, duplicate := seen[identity]; duplicate {
+			return false
+		}
+		seen[identity] = struct{}{}
+	}
+	return true
 }
 
 func validInheritedSourceDescriptor(fd int, stat unix.Stat_t) bool {
@@ -194,37 +256,37 @@ func validateInheritedSourceFrame(framed []byte) (PublicSourceSummary, error) {
 func captureInheritedSnapshotMaterial(
 	framed []byte,
 	summary PublicSourceSummary,
-) (*inheritedSnapshotMaterial, error) {
+) (*inheritedSnapshotMaterial, *inheritedRuntimeMaterial, error) {
 	minimum := len(envelopeMagicText) + 8 + sha256.Size
 	if len(framed) < minimum || int64(len(framed)) != summary.EnvelopeSize ||
 		!bytes.HasPrefix(framed, []byte(envelopeMagicText)) {
-		return nil, ErrBootstrapRejected
+		return nil, nil, ErrBootstrapRejected
 	}
 	payloadLength := binary.BigEndian.Uint64(framed[len(envelopeMagicText) : len(envelopeMagicText)+8])
 	payloadStart := len(envelopeMagicText) + 8
 	if payloadLength == 0 || payloadLength > uint64(len(framed)-payloadStart-sha256.Size) {
-		return nil, ErrBootstrapRejected
+		return nil, nil, ErrBootstrapRejected
 	}
 	payloadEnd := payloadStart + int(payloadLength)
 	if payloadEnd+sha256.Size != len(framed) {
-		return nil, ErrBootstrapRejected
+		return nil, nil, ErrBootstrapRejected
 	}
 	var envelope publicWireEnvelope
 	if securemanifest.DecodeStrict(framed[payloadStart:payloadEnd], &envelope) != nil ||
 		envelope.SchemaVersion != publicEnvelopeSchemaVersion || len(envelope.Artifacts) < 11 {
-		return nil, ErrBootstrapRejected
+		return nil, nil, ErrBootstrapRejected
 	}
 	defer clearInheritedEnvelope(&envelope)
 	canonical, err := json.Marshal(envelope)
 	if err != nil || !bytes.Equal(canonical, framed[payloadStart:payloadEnd]) {
 		clear(canonical)
-		return nil, ErrBootstrapRejected
+		return nil, nil, ErrBootstrapRejected
 	}
 	clear(canonical)
 	document, err := decodePublicDocument(envelope.Artifacts[0].Contents)
 	if err != nil || envelope.Artifacts[0].SHA256 != summary.ManifestSHA256 ||
 		len(envelope.Artifacts) != 10+len(document.Artifacts.TargetRootBundleSHA256) {
-		return nil, ErrBootstrapRejected
+		return nil, nil, ErrBootstrapRejected
 	}
 	material := &inheritedSnapshotMaterial{
 		connector: bytes.Clone(envelope.Artifacts[1].Contents),
@@ -248,7 +310,55 @@ func captureInheritedSnapshotMaterial(
 			contents: bytes.Clone(artifact.Contents),
 		}
 	}
-	return material, nil
+	runtime, err := captureInheritedRuntimeMaterial(document, envelope.Artifacts, time.Now().UTC())
+	if err != nil {
+		material.clear()
+		return nil, nil, ErrBootstrapRejected
+	}
+	return material, runtime, nil
+}
+
+func captureInheritedRuntimeMaterial(
+	document publicDocument,
+	artifacts []publicWireArtifact,
+	now time.Time,
+) (*inheritedRuntimeMaterial, error) {
+	if len(artifacts) < 10 || now.IsZero() {
+		return nil, ErrBootstrapRejected
+	}
+	postgresRoots, err := parseRootBundle(artifacts[5].Contents, now)
+	if err != nil {
+		return nil, ErrBootstrapRejected
+	}
+	temporalRoots, err := parseRootBundle(artifacts[7].Contents, now)
+	if err != nil {
+		return nil, ErrBootstrapRejected
+	}
+	_, postgresSPKI, err := validateClientCertificateChain(artifacts[6].Contents, postgresRoots, now)
+	if err != nil {
+		return nil, ErrBootstrapRejected
+	}
+	_, starterSPKI, err := validateClientCertificateChain(artifacts[8].Contents, temporalRoots, now)
+	if err != nil {
+		clear(postgresSPKI)
+		return nil, ErrBootstrapRejected
+	}
+	_, controlSPKI, err := validateClientCertificateChain(artifacts[9].Contents, temporalRoots, now)
+	if err != nil {
+		clear(postgresSPKI)
+		clear(starterSPKI)
+		return nil, ErrBootstrapRejected
+	}
+	return &inheritedRuntimeMaterial{
+		expectedSPKI: [3][]byte{postgresSPKI, starterSPKI, controlSPKI},
+		postgres:     document.Postgres,
+		temporal:     document.Temporal,
+		postgresRoot: bytes.Clone(artifacts[5].Contents),
+		postgresCert: bytes.Clone(artifacts[6].Contents),
+		temporalRoot: bytes.Clone(artifacts[7].Contents),
+		starterCert:  bytes.Clone(artifacts[8].Contents),
+		controlCert:  bytes.Clone(artifacts[9].Contents),
+	}, nil
 }
 
 func clearInheritedEnvelope(envelope *publicWireEnvelope) {

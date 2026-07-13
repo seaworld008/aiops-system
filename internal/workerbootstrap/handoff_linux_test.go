@@ -22,9 +22,10 @@ func TestPublicSourceCapabilityStartsOnlyFixedControlWorker(t *testing.T) {
 	}
 	defer reader.Close()
 	defer writer.Close()
+	secretReaders := testSecretReaders(t)
 	pidFD := -1
 	command := fixedControlWorkerCommandForTest(&pidFD)
-	if err := capability.StartChild(command, writer); err != nil {
+	if err := capability.StartChild(command, writer, secretReaders[0], secretReaders[1], secretReaders[2]); err != nil {
 		t.Fatalf("StartChild() error = %v", err)
 	}
 	if len(command.ExtraFiles) != 0 {
@@ -61,10 +62,13 @@ func TestPublicSourceCapabilityRejectsCommandBoundaryDriftWithoutConsumption(t *
 			}
 			defer reader.Close()
 			defer writer.Close()
+			secretReaders := testSecretReaders(t)
 			pidFD := -1
 			command := fixedControlWorkerCommandForTest(&pidFD)
 			mutate(command)
-			if err := capability.StartChild(command, writer); !errors.Is(err, ErrBootstrapRejected) {
+			if err := capability.StartChild(
+				command, writer, secretReaders[0], secretReaders[1], secretReaders[2],
+			); !errors.Is(err, ErrBootstrapRejected) {
 				t.Fatalf("StartChild() error = %v", err)
 			}
 			if _, err := owned.Stat(); err != nil {
@@ -75,6 +79,52 @@ func TestPublicSourceCapabilityRejectsCommandBoundaryDriftWithoutConsumption(t *
 			}
 		})
 	}
+}
+
+func TestPublicSourceCapabilityRejectsSecretPipeBoundaryDrift(t *testing.T) {
+	for name, mutate := range map[string]func([]*os.File){
+		"duplicate role pipe": func(readers []*os.File) { readers[1] = readers[0] },
+		"missing role pipe":   func(readers []*os.File) { readers[2] = nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			capability, _ := testPublicSourceCapability(t)
+			statusReader, statusWriter, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer statusReader.Close()
+			defer statusWriter.Close()
+			secretReaders := testSecretReaders(t)
+			mutate(secretReaders)
+			pidFD := -1
+			command := fixedControlWorkerCommandForTest(&pidFD)
+			if err := capability.StartChild(
+				command, statusWriter, secretReaders[0], secretReaders[1], secretReaders[2],
+			); !errors.Is(err, ErrBootstrapRejected) {
+				t.Fatalf("StartChild() error = %v, want rejection", err)
+			}
+			if command.Process != nil {
+				t.Fatal("rejected secret boundary started child")
+			}
+		})
+	}
+}
+
+func testSecretReaders(t *testing.T) []*os.File {
+	t.Helper()
+	readers := make([]*os.File, 3)
+	for index := range readers {
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		readers[index] = reader
+		t.Cleanup(func() {
+			_ = reader.Close()
+			_ = writer.Close()
+		})
+	}
+	return readers
 }
 
 func fixedControlWorkerCommandForTest(pidFD *int) *exec.Cmd {

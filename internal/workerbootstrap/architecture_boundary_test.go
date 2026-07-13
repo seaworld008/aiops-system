@@ -52,10 +52,12 @@ func TestPublicSourceAPIExposesNoPathDescriptorOrContents(t *testing.T) {
 		}
 	}
 	startChild, ok := reflect.TypeOf((*workerbootstrap.PublicSourceCapability)(nil)).MethodByName("StartChild")
-	if !ok || startChild.Type.NumIn() != 3 || startChild.Type.In(1) != reflect.TypeOf((*exec.Cmd)(nil)) ||
-		startChild.Type.In(2) != reflect.TypeOf((*os.File)(nil)) || startChild.Type.NumOut() != 1 ||
+	fileType := reflect.TypeOf((*os.File)(nil))
+	if !ok || startChild.Type.NumIn() != 6 || startChild.Type.In(1) != reflect.TypeOf((*exec.Cmd)(nil)) ||
+		startChild.Type.In(2) != fileType || startChild.Type.In(3) != fileType ||
+		startChild.Type.In(4) != fileType || startChild.Type.In(5) != fileType || startChild.Type.NumOut() != 1 ||
 		startChild.Type.Out(0) != reflect.TypeOf((*error)(nil)).Elem() {
-		t.Fatalf("StartChild signature = %#v; want fixed command/status inputs and error only", startChild.Type)
+		t.Fatalf("StartChild signature = %#v; want fixed command/status/three secret pipe inputs and error only", startChild.Type)
 	}
 	for index := 0; index < startChild.Type.NumIn(); index++ {
 		if startChild.Type.In(index).Kind() == reflect.Func {
@@ -69,6 +71,11 @@ func TestPublicSourceAPIExposesNoPathDescriptorOrContents(t *testing.T) {
 		buildSnapshot.Type.NumOut() != 2 || buildSnapshot.Type.Out(0) != snapshotType ||
 		buildSnapshot.Type.Out(1) != reflect.TypeOf((*error)(nil)).Elem() {
 		t.Fatalf("BuildSnapshot signature = %#v; want context-only semantic assembly", buildSnapshot.Type)
+	}
+	bindSecrets, ok := reflect.TypeOf((*workerbootstrap.InheritedSource)(nil)).MethodByName("BindControlWorkerSecrets")
+	if !ok || bindSecrets.Type.NumIn() != 2 || bindSecrets.Type.In(1) != contextType ||
+		bindSecrets.Type.NumOut() != 1 || bindSecrets.Type.Out(0) != reflect.TypeOf((*error)(nil)).Elem() {
+		t.Fatalf("BindControlWorkerSecrets signature = %#v; want context-only opaque binding", bindSecrets.Type)
 	}
 }
 
@@ -236,10 +243,11 @@ func TestPublicSourceProductionBoundarySemanticAssemblyIsNonConfigurable(t *test
 		"value:ErrBootstrapRejected": 1, "value:PublicSourceSchemaVersion": 1,
 		"func:OpenProductionSource": 2, "func:AcceptInheritedSource": 2,
 		"func:WriteProductionSourceToLoaderFD": 2, "func:ReceiveProductionSource": 2,
-		"method:Summary": 2, "method:Close": 2, "method:String": 2, "method:GoString": 2,
-		"method:Format": 2, "method:MarshalJSON": 2, "method:UnmarshalJSON": 2,
-		"method:StartChild":    2,
-		"method:BuildSnapshot": 1,
+		"method:Summary": 2, "method:Close": 2, "method:String": 4, "method:GoString": 4,
+		"method:Format": 4, "method:MarshalJSON": 4, "method:UnmarshalJSON": 4,
+		"method:StartChild":               2,
+		"method:BuildSnapshot":            1,
+		"method:BindControlWorkerSecrets": 1,
 	}
 	if !reflect.DeepEqual(exports, wantExports) {
 		t.Errorf("workerbootstrap exports = %#v, want %#v", exports, wantExports)

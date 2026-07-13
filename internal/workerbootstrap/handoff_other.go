@@ -7,6 +7,6 @@ import (
 	"os/exec"
 )
 
-func (*PublicSourceCapability) StartChild(*exec.Cmd, *os.File) error {
+func (*PublicSourceCapability) StartChild(*exec.Cmd, *os.File, *os.File, *os.File, *os.File) error {
 	return ErrBootstrapRejected
 }
