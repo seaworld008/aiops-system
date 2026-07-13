@@ -155,13 +155,104 @@ func TestTerminatedClassificationRequiresStatusMonitorCompletion(t *testing.T) {
 
 func TestStatusMonitorClosesOnlyAfterPublishingBufferedFrames(t *testing.T) {
 	events := make(chan childEvent, 4)
-	go monitorChildStatus(strings.NewReader("RF"), events)
+	go monitorChildStatus(strings.NewReader("SRF"), events)
 	var observed []childEvent
 	for event := range events {
 		observed = append(observed, event)
 	}
-	if len(observed) != 2 || observed[0] != childEventReady || observed[1] != childEventFatal {
-		t.Fatalf("monitorChildStatus(RF) events = %#v, want READY,FATAL before close", observed)
+	if len(observed) != 3 || observed[0] != childEventSecretReady ||
+		observed[1] != childEventReady || observed[2] != childEventFatal {
+		t.Fatalf("monitorChildStatus(SRF) events = %#v, want SECRET_READY,READY,FATAL before close", observed)
+	}
+}
+
+func TestStatusMonitorRejectsSecretBarrierOrderAndReplay(t *testing.T) {
+	t.Parallel()
+	for name, frames := range map[string]string{
+		"ready before secret barrier": "R",
+		"duplicate secret barrier":    "SS",
+		"secret barrier after ready":  "SRS",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			events := make(chan childEvent, 4)
+			go monitorChildStatus(strings.NewReader(frames), events)
+			var observed []childEvent
+			for event := range events {
+				observed = append(observed, event)
+			}
+			if len(observed) == 0 || observed[len(observed)-1] != childEventProtocol {
+				t.Fatalf("monitorChildStatus(%q) events = %#v, want terminal protocol rejection", frames, observed)
+			}
+		})
+	}
+}
+
+func TestSupervisorSecretSupplierRunsOnlyAfterSecretReadyBarrier(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		scenario string
+		want     int32
+	}{
+		{name: "no barrier", scenario: "no-secret-ready-exit-on-term", want: 0},
+		{name: "one barrier", scenario: "no-ready-exit-on-term", want: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base := filepath.Join(t.TempDir(), "secret-barrier")
+			supervisor := newTestSupervisor(test.scenario, base)
+			var calls atomic.Int32
+			supervisor.settings.supplySecrets = func(
+				context.Context,
+				time.Duration,
+				*os.File,
+				*os.File,
+				*os.File,
+			) error {
+				calls.Add(1)
+				return nil
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			result := make(chan error, 1)
+			go func() { result <- supervisor.Run(ctx) }()
+			waitForMarker(t, base+".listening")
+			cancel()
+			_ = receiveResult(t, result)
+			if got := calls.Load(); got != test.want {
+				t.Fatalf("secret supplier calls = %d, want %d", got, test.want)
+			}
+			assertRecordedPIDGone(t, base+".pid")
+		})
+	}
+}
+
+func TestCanceledSecretSupplyNeverInvokesSupplier(t *testing.T) {
+	var readers [3]*os.File
+	var writers [3]*os.File
+	for index := range readers {
+		var err error
+		readers[index], writers[index], err = os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer readers[index].Close()
+	}
+	process := &controlWorkerProcess{secretWriter: writers}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var calls atomic.Int32
+	err := process.supplySecrets(ctx, time.Second, func(
+		context.Context,
+		time.Duration,
+		*os.File,
+		*os.File,
+		*os.File,
+	) error {
+		calls.Add(1)
+		return nil
+	})
+	process.closeSecretWriters()
+	if err != errChildStart || calls.Load() != 0 {
+		t.Fatalf("canceled supply = %v, calls %d; want rejected before supplier", err, calls.Load())
 	}
 }
 
@@ -367,8 +458,9 @@ func TestSupervisorConcurrentCancelAndFatalExitRaceHundred(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		result := make(chan error, 1)
 		supervisor := newTestSupervisor("race-fatal-or-term", base)
+		supervisor.settings.startupTimeout = 15 * time.Second
 		go func() { result <- supervisor.Run(ctx) }()
-		waitForMarker(t, base+".ready")
+		waitForMarkerOrEarlyResult(t, base+".ready", result)
 		gate := make(chan struct{})
 		var racers sync.WaitGroup
 		racers.Add(2)
@@ -459,7 +551,7 @@ func TestSourceFailureAfterStartKillsAndReapsEntireProcessGroup(t *testing.T) {
 	settings := defaultSupervisorSettings()
 	settings.killConfirm = 3 * time.Second
 	settings.childEnv = []string{
-		controlWorkerTestScenario + "=ready-hold-on-term-with-descendant|" + base,
+		controlWorkerTestScenario + "=pre-secret-descendant-hold|" + base,
 		controlWorkerRaceOptions,
 	}
 	source, err := newTestControlWorkerSource()
@@ -693,6 +785,9 @@ func TestAcceptControlWorkerChildAcceptsExactBoundary(t *testing.T) {
 	if err := acceptBoundaryCommand(t, "accept-exact", writer).Run(); err != nil {
 		t.Fatalf("exact boundary helper failed: %v", err)
 	}
+	if err := acceptBoundaryCommand(t, "scan-exact", writer).Run(); err != nil {
+		t.Fatalf("exact FD3-FD7 topology helper failed: %v", err)
+	}
 }
 
 func newTestSupervisor(scenario, base string) *ControlWorkerSupervisor {
@@ -700,7 +795,7 @@ func newTestSupervisor(scenario, base string) *ControlWorkerSupervisor {
 	// A race-instrumented self-reexec can take well above 300 ms on a loaded CI
 	// host before TestMain reaches the child protocol. Keep this far below the
 	// production budget while avoiding scheduler-dependent pre-marker kills.
-	settings.startupTimeout = 2 * time.Second
+	settings.startupTimeout = 5 * time.Second
 	settings.startupGrace = time.Second
 	settings.shutdownGrace = time.Second
 	settings.anomalyGrace = 250 * time.Millisecond
@@ -711,6 +806,15 @@ func newTestSupervisor(scenario, base string) *ControlWorkerSupervisor {
 	}
 	settings.openSource = func(context.Context, time.Duration) (controlWorkerSource, error) {
 		return newTestControlWorkerSource()
+	}
+	settings.supplySecrets = func(
+		context.Context,
+		time.Duration,
+		*os.File,
+		*os.File,
+		*os.File,
+	) error {
+		return nil
 	}
 	return newControlWorkerSupervisor(settings)
 }
@@ -743,8 +847,15 @@ func newTestControlWorkerSource() (controlWorkerSource, error) {
 	return &testControlWorkerSource{file: file}, nil
 }
 
-func (source *testControlWorkerSource) StartChild(command *exec.Cmd, status *os.File) error {
-	if source == nil || command == nil || status == nil {
+func (source *testControlWorkerSource) StartChild(
+	command *exec.Cmd,
+	status *os.File,
+	postgresSecret *os.File,
+	temporalStarterSecret *os.File,
+	temporalControlSecret *os.File,
+) error {
+	if source == nil || command == nil || status == nil || postgresSecret == nil ||
+		temporalStarterSecret == nil || temporalControlSecret == nil {
 		return errChildStart
 	}
 	source.mu.Lock()
@@ -753,7 +864,9 @@ func (source *testControlWorkerSource) StartChild(command *exec.Cmd, status *os.
 		return errChildStart
 	}
 	source.starts++
-	command.ExtraFiles = []*os.File{status, source.file}
+	command.ExtraFiles = []*os.File{
+		status, source.file, postgresSecret, temporalStarterSecret, temporalControlSecret,
+	}
 	defer func() { command.ExtraFiles = nil }()
 	err := command.Start()
 	if err == nil && source.afterStart != nil {
@@ -813,7 +926,27 @@ func acceptTestInheritedControlWorkerSource() (io.Closer, error) {
 	if file == nil {
 		return nil, errInvalidChildInvocation
 	}
-	return file, nil
+	return &testInheritedControlWorkerSource{File: file}, nil
+}
+
+type testInheritedControlWorkerSource struct{ *os.File }
+
+func (source *testInheritedControlWorkerSource) BindControlWorkerSecrets(context.Context) error {
+	if source == nil || source.File == nil {
+		return errInvalidChildInvocation
+	}
+	for descriptor := controlWorkerPostgresFD; descriptor <= controlWorkerControlFD; descriptor++ {
+		reader := os.NewFile(uintptr(descriptor), "control-worker-test-secret")
+		if reader == nil {
+			return errInvalidChildInvocation
+		}
+		contents, err := io.ReadAll(reader)
+		closeErr := reader.Close()
+		if err != nil || closeErr != nil || len(contents) != 0 {
+			return errInvalidChildInvocation
+		}
+	}
+	return nil
 }
 
 func inheritedTestSourceFD() int {
@@ -828,6 +961,18 @@ func inheritedTestSourceFD() int {
 func acceptBoundaryCommand(t *testing.T, scenario string, statusFile *os.File) *exec.Cmd {
 	t.Helper()
 	sourceFile := newTestSourceFile(t)
+	secretReaders := make([]*os.File, 3)
+	for index := range secretReaders {
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		secretReaders[index] = reader
+		t.Cleanup(func() {
+			_ = reader.Close()
+			_ = writer.Close()
+		})
+	}
 	command := exec.Command(controlWorkerExecutable, controlWorkerChildArgument)
 	command.Args = []string{controlWorkerExecutable, controlWorkerChildArgument}
 	command.Env = []string{
@@ -838,7 +983,9 @@ func acceptBoundaryCommand(t *testing.T, scenario string, statusFile *os.File) *
 	command.Stdin = nil
 	command.Stdout = io.Discard
 	command.Stderr = io.Discard
-	command.ExtraFiles = []*os.File{statusFile, sourceFile}
+	command.ExtraFiles = []*os.File{
+		statusFile, sourceFile, secretReaders[0], secretReaders[1], secretReaders[2],
+	}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
 	return command
 }
@@ -851,7 +998,17 @@ func runControlWorkerTestChild(raw string) int {
 		base = parts[1]
 	}
 	if scenario == "accept-reject-extra" {
-		if onlyExpectedInheritedDescriptors(controlWorkerSourceFD) {
+		descriptorFlags, descriptorErr := unix.FcntlInt(uintptr(controlWorkerControlFD+1), unix.F_GETFD, 0)
+		if descriptorErr != nil || descriptorFlags&unix.FD_CLOEXEC != 0 {
+			return 90
+		}
+		if onlyExpectedInheritedDescriptors(controlWorkerControlFD) {
+			return 91
+		}
+		return 0
+	}
+	if scenario == "scan-exact" {
+		if !fixedInheritedDescriptorsAreDistinct() {
 			return 91
 		}
 		return 0
@@ -883,10 +1040,29 @@ func runControlWorkerTestChild(raw string) int {
 		return 90
 	}
 	// These process-containment helpers inject a non-production source. Mark
-	// the semantic gate as proven so they can exercise only the post-assembly
-	// READY/FATAL protocol under test.
+	// the semantic gate as proven, then exercise the real S -> secret pipe EOF
+	// -> bind sequence before their READY/FATAL protocol scenario.
 	status.snapshotBuilt = true
 	writeChildMarker(base+".pid", strconv.Itoa(os.Getpid()))
+	if scenario == "pre-secret-descendant-hold" {
+		descendant := exec.Command("/bin/sh", "-c", "trap '' TERM; while :; do sleep 1; done")
+		descendant.Env = []string{}
+		if descendant.Start() != nil {
+			return 77
+		}
+		writeChildMarker(base+".descendant-pid", strconv.Itoa(descendant.Process.Pid))
+		select {}
+	}
+	if scenario == "no-secret-ready-hold-on-term" || scenario == "no-secret-ready-exit-on-term" {
+		signals := captureTestTERM()
+		writeChildMarker(base+".listening", "listening")
+		waitForTestTERM(status, base, scenario == "no-secret-ready-exit-on-term", signals)
+		return 78
+	}
+	if ReportControlWorkerSecretReady(status) != nil ||
+		BindControlWorkerSecrets(context.Background(), status) != nil {
+		return 79
+	}
 	switch scenario {
 	case "ready-exit-on-term":
 		signals := captureTestTERM()
@@ -1035,6 +1211,11 @@ func runPdeathParentTestHelper(raw string) int {
 		return 104
 	}
 	concreteSource := source.(*testControlWorkerSource)
+	secretReaders, secretWriters, err := openControlWorkerSecretPipes()
+	if err != nil {
+		_ = source.Close()
+		return 105
+	}
 	command := exec.Command(controlWorkerExecutable, controlWorkerChildArgument)
 	command.Args = []string{controlWorkerExecutable, controlWorkerChildArgument}
 	command.Env = []string{
@@ -1045,15 +1226,21 @@ func runPdeathParentTestHelper(raw string) int {
 	command.Stdin = nil
 	command.Stdout = io.Discard
 	command.Stderr = io.Discard
-	command.ExtraFiles = []*os.File{statusWriter, concreteSource.file}
+	command.ExtraFiles = []*os.File{
+		statusWriter, concreteSource.file, secretReaders[0], secretReaders[1], secretReaders[2],
+	}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
 	if err := command.Start(); err != nil {
+		closeControlWorkerFiles(secretReaders[:])
+		closeControlWorkerFiles(secretWriters[:])
 		_ = source.Close()
 		return 102
 	}
+	closeControlWorkerFiles(secretReaders[:])
+	closeControlWorkerFiles(secretWriters[:])
 	_ = source.Close()
 	_ = statusWriter.Close()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(base + ".ready"); err == nil {
 			_ = statusReader
@@ -1172,7 +1359,7 @@ func waitForChildMarker(path string, timeout time.Duration) bool {
 
 func waitForMarker(t *testing.T, path string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(path); err == nil {
 			return
@@ -1180,6 +1367,26 @@ func waitForMarker(t *testing.T, path string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("marker %q was not created", path)
+}
+
+func waitForMarkerOrEarlyResult(t *testing.T, path string, result <-chan error) {
+	t.Helper()
+	deadline := time.NewTimer(20 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-result:
+			t.Fatalf("supervisor returned before marker %q: %v", path, err)
+		case <-ticker.C:
+			if _, err := os.Stat(path); err == nil {
+				return
+			}
+		case <-deadline.C:
+			t.Fatalf("marker %q was not created", path)
+		}
+	}
 }
 
 func assertMarkerAbsent(t *testing.T, path string) {

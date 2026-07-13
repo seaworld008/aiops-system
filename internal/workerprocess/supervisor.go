@@ -43,12 +43,21 @@ type supervisorSettings struct {
 	outputLimit    int64
 	childEnv       []string
 	openSource     func(context.Context, time.Duration) (controlWorkerSource, error)
+	supplySecrets  controlWorkerSecretSupplier
 }
 
 type controlWorkerSource interface {
-	StartChild(*exec.Cmd, *os.File) error
+	StartChild(*exec.Cmd, *os.File, *os.File, *os.File, *os.File) error
 	Close() error
 }
+
+type controlWorkerSecretSupplier func(
+	context.Context,
+	time.Duration,
+	*os.File,
+	*os.File,
+	*os.File,
+) error
 
 func nilControlWorkerSource(value controlWorkerSource) bool {
 	if value == nil {
@@ -77,13 +86,28 @@ func defaultSupervisorSettings() supervisorSettings {
 		outputLimit:    defaultOutputByteLimit,
 		childEnv:       []string{},
 		openSource:     openProductionControlWorkerSource,
+		supplySecrets:  unavailableControlWorkerSecretSupplier,
 	}
 }
 
 func (settings supervisorSettings) valid() bool {
 	return settings.startupTimeout > 0 && settings.startupGrace > 0 &&
 		settings.shutdownGrace > 0 && settings.anomalyGrace > 0 &&
-		settings.killConfirm > 0 && settings.outputLimit > 0 && settings.childEnv != nil && settings.openSource != nil
+		settings.killConfirm > 0 && settings.outputLimit > 0 && settings.childEnv != nil &&
+		settings.openSource != nil && settings.supplySecrets != nil
+}
+
+func unavailableControlWorkerSecretSupplier(
+	context.Context,
+	time.Duration,
+	*os.File,
+	*os.File,
+	*os.File,
+) error {
+	// b1b2a deliberately installs the transport and barrier while keeping the
+	// production secret source unavailable. b1b2b replaces this fixed function
+	// with the contained, post-barrier secret-loader child.
+	return errUnsupported
 }
 
 // ControlWorkerSupervisor owns one fixed-path control worker child process.

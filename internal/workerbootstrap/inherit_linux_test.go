@@ -5,7 +5,9 @@ package workerbootstrap
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -36,6 +38,12 @@ func TestAcceptInheritedSourceUsesFixedFD4AndSetsCLOEXEC(t *testing.T) {
 		if flagsErr != nil || flags&unix.FD_CLOEXEC == 0 {
 			t.Fatalf("inherited FD4 flags = %#x, %v", flags, flagsErr)
 		}
+		for descriptor := inheritedPostgresSecretFD; descriptor <= inheritedControlSecretFD; descriptor++ {
+			descriptorFlags, descriptorErr := unix.FcntlInt(uintptr(descriptor), unix.F_GETFD, 0)
+			if descriptorErr != nil || descriptorFlags&unix.FD_CLOEXEC == 0 {
+				t.Fatalf("inherited secret FD%d flags = %#x, %v", descriptor, descriptorFlags, descriptorErr)
+			}
+		}
 		if err := source.Close(); err != nil {
 			t.Fatalf("Close() error = %v", err)
 		}
@@ -53,9 +61,21 @@ func TestAcceptInheritedSourceUsesFixedFD4AndSetsCLOEXEC(t *testing.T) {
 	}
 	defer statusReader.Close()
 	defer statusWriter.Close()
+	secretReaders := make([]*os.File, 3)
+	for index := range secretReaders {
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		secretReaders[index] = reader
+		defer reader.Close()
+		defer writer.Close()
+	}
 	command := exec.Command(os.Args[0], "-test.run=^TestAcceptInheritedSourceUsesFixedFD4AndSetsCLOEXEC$")
 	command.Env = append(os.Environ(), inheritedSourceHelperEnvironment+"=1")
-	command.ExtraFiles = []*os.File{statusWriter, sourceFile}
+	command.ExtraFiles = []*os.File{
+		statusWriter, sourceFile, secretReaders[0], secretReaders[1], secretReaders[2],
+	}
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("fixed FD4 helper failed: %v: %s", err, output)
 	}
@@ -136,6 +156,145 @@ func TestAcceptInheritedSourceValidatesDescriptorAndFrame(t *testing.T) {
 				t.Fatalf("acceptInheritedSourceDescriptor() = %#v, %v; want rejection", source, err)
 			}
 		})
+	}
+}
+
+func TestAcceptInheritedSourceRequiresThreeDistinctReadOnlySecretPipes(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(t *testing.T, readers *[3]int, writers [3]*os.File)
+		valid  bool
+	}{
+		{name: "exact", valid: true},
+		{name: "duplicate pipe", mutate: func(t *testing.T, readers *[3]int, _ [3]*os.File) {
+			_ = unix.Close(readers[1])
+			duplicate, err := unix.Dup(readers[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			readers[1] = duplicate
+		}},
+		{name: "writer direction", mutate: func(t *testing.T, readers *[3]int, writers [3]*os.File) {
+			_ = unix.Close(readers[2])
+			writer, err := unix.Dup(int(writers[2].Fd()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			readers[2] = writer
+		}},
+		{name: "ordinary file", mutate: func(t *testing.T, readers *[3]int, _ [3]*os.File) {
+			_ = unix.Close(readers[0])
+			ordinary, err := unix.Open(os.DevNull, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			readers[0] = ordinary
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			publicFile, err := createReadOnlySealedMemfd(productionInheritedFrame(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			publicFD, err := unix.Dup(int(publicFile.Fd()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = publicFile.Close()
+			var readers [3]int
+			var writers [3]*os.File
+			for index := range readers {
+				reader, writer, err := os.Pipe()
+				if err != nil {
+					t.Fatal(err)
+				}
+				readers[index], err = unix.Dup(int(reader.Fd()))
+				_ = reader.Close()
+				if err != nil {
+					t.Fatal(err)
+				}
+				writers[index] = writer
+				defer writer.Close()
+			}
+			if test.mutate != nil {
+				test.mutate(t, &readers, writers)
+			}
+			source, err := acceptInheritedSourceDescriptors(publicFD, readers)
+			if test.valid {
+				if err != nil || source == nil {
+					t.Fatalf("acceptInheritedSourceDescriptors() = %#v, %v", source, err)
+				}
+				if closeErr := source.Close(); closeErr != nil {
+					t.Fatal(closeErr)
+				}
+				return
+			}
+			if source != nil || !errors.Is(err, ErrBootstrapRejected) {
+				t.Fatalf("acceptInheritedSourceDescriptors() = %#v, %v; want rejection", source, err)
+			}
+		})
+	}
+}
+
+func TestInheritedSourceBindsSecretFramesToCertificatesCapturedFromFD4(t *testing.T) {
+	framed, fixture := productionInheritedFrameWithFixture(t)
+	publicFile, err := createReadOnlySealedMemfd(framed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicFD, err := unix.Dup(int(publicFile.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = publicFile.Close()
+	var readerFDs [3]int
+	var writers [3]*os.File
+	for index := range readerFDs {
+		reader, writer, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		readerFDs[index], err = unix.Dup(int(reader.Fd()))
+		_ = reader.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		writers[index] = writer
+	}
+	source, err := acceptInheritedSourceDescriptors(publicFD, readerFDs)
+	if err != nil || source == nil {
+		t.Fatalf("acceptInheritedSourceDescriptors() = %#v, %v", source, err)
+	}
+	snapshot, err := source.BuildSnapshot(context.Background())
+	if err != nil || snapshot == nil || !snapshot.Ready() {
+		t.Fatalf("BuildSnapshot() = %#v, %v", snapshot, err)
+	}
+	keys := [3]*ecdsa.PrivateKey{fixture.postgresKey, fixture.starterKey, fixture.controlKey}
+	var encoded [3][]byte
+	for index := range keys {
+		encoded[index], err = x509.MarshalPKCS8PrivateKey(keys[index])
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	frames := testSecretBindingFrames(t, encoded)
+	for index := range writers {
+		if written, err := writers[index].Write(frames[index]); err != nil || written != len(frames[index]) {
+			t.Fatalf("write role frame %d = %d, %v", index, written, err)
+		}
+		if err := writers[index].Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := source.BindControlWorkerSecrets(context.Background()); err != nil {
+		t.Fatalf("BindControlWorkerSecrets() error = %v", err)
+	}
+	if source.state.state != inheritedSourceSecretsBound || source.state.runtime == nil ||
+		source.state.runtime.bundle == nil {
+		t.Fatal("certificate-bound secret bundle was not atomically published")
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -533,6 +692,12 @@ func synchronizeBootstrapArtifactDigests(t *testing.T, envelope *publicWireEnvel
 
 func productionInheritedFrame(t *testing.T) []byte {
 	t.Helper()
+	framed, _ := productionInheritedFrameWithFixture(t)
+	return framed
+}
+
+func productionInheritedFrameWithFixture(t *testing.T) ([]byte, *linuxBootstrapFixture) {
+	t.Helper()
 	fixture := newLinuxBootstrapFixture(t)
 	capability, err := fixture.open()
 	if err != nil {
@@ -557,7 +722,7 @@ func productionInheritedFrame(t *testing.T) []byte {
 	}
 	envelope.Artifacts[0].Contents = encoded
 	envelope.Artifacts[0].SHA256 = sha256Hex(encoded)
-	return marshalWireEnvelopeForTest(t, envelope)
+	return marshalWireEnvelopeForTest(t, envelope), fixture
 }
 
 func decodeWireEnvelopeForTest(t *testing.T, framed []byte) publicWireEnvelope {

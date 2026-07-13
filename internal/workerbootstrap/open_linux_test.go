@@ -287,6 +287,9 @@ type linuxBootstrapFixture struct {
 	components       []string
 	targetRootDigest string
 	privateKeyCanary []byte
+	postgresKey      *ecdsa.PrivateKey
+	starterKey       *ecdsa.PrivateKey
+	controlKey       *ecdsa.PrivateKey
 	document         publicDocument
 }
 
@@ -314,9 +317,9 @@ func newLinuxBootstrapFixture(t *testing.T) *linuxBootstrapFixture {
 	postgresRoot, postgresRootKey := newTestRoot(t, "postgres-root", now)
 	temporalRoot, temporalRootKey := newTestRoot(t, "temporal-root", now)
 	targetRoot, _ := newTestRoot(t, "target-root", now)
-	postgresCertificate := newTestClientCertificate(t, "postgres-client", now, postgresRoot, postgresRootKey)
-	temporalStarter := newTestClientCertificate(t, "temporal-starter", now, temporalRoot, temporalRootKey)
-	temporalControl := newTestClientCertificate(t, "temporal-control", now, temporalRoot, temporalRootKey)
+	postgresCertificate, postgresKey := newTestClientCertificate(t, "postgres-client", now, postgresRoot, postgresRootKey)
+	temporalStarter, starterKey := newTestClientCertificate(t, "temporal-starter", now, temporalRoot, temporalRootKey)
+	temporalControl, controlKey := newTestClientCertificate(t, "temporal-control", now, temporalRoot, temporalRootKey)
 	targetRootPEM := certificatePEM(targetRoot.Raw)
 	targetRootHash := sha256Hex(targetRootPEM)
 	targetRootPath := filepath.Join(rootPath, targetRootsDirectory, targetRootHash+certificateFileSuffix)
@@ -500,7 +503,8 @@ func newLinuxBootstrapFixture(t *testing.T) *linuxBootstrapFixture {
 	return &linuxBootstrapFixture{
 		anchorPath: anchor, rootPath: rootPath, components: components, targetRootDigest: targetRootHash,
 		privateKeyCanary: []byte("-----BEGIN PRIVATE KEY-----\nbootstrap-private-canary\n-----END PRIVATE KEY-----\n"),
-		document:         document,
+		postgresKey:      postgresKey, starterKey: starterKey, controlKey: controlKey,
+		document: document,
 	}
 }
 
@@ -604,7 +608,7 @@ func newTestClientCertificate(
 	now time.Time,
 	root *x509.Certificate,
 	rootKey *ecdsa.PrivateKey,
-) *x509.Certificate {
+) (*x509.Certificate, *ecdsa.PrivateKey) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -623,7 +627,7 @@ func newTestClientCertificate(
 	if err != nil {
 		t.Fatal(err)
 	}
-	return certificate
+	return certificate, key
 }
 
 func newTestSerial(t *testing.T) *big.Int {

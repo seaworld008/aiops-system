@@ -19,15 +19,27 @@ const (
 )
 
 // StartChild validates the complete fixed control-worker command, installs
-// the status pipe as FD3 and the live sealed source as FD4, and starts exactly
-// one child. The source descriptor is never returned to the caller and is
-// removed from ExtraFiles before this method returns.
-func (capability *PublicSourceCapability) StartChild(command *exec.Cmd, status *os.File) error {
-	if !validFixedControlWorkerCommand(command) || !validStatusWriter(status) {
+// the status pipe as FD3, the live sealed source as FD4, and the three empty
+// read-only secret pipes as FD5-FD7. The source descriptor is never returned
+// to the caller and ExtraFiles is cleared before this method returns.
+func (capability *PublicSourceCapability) StartChild(
+	command *exec.Cmd,
+	status *os.File,
+	postgresSecret *os.File,
+	temporalStarterSecret *os.File,
+	temporalControlSecret *os.File,
+) error {
+	secretReaders := []*os.File{postgresSecret, temporalStarterSecret, temporalControlSecret}
+	if !validFixedControlWorkerCommand(command) || !validStatusWriter(status) ||
+		!validSecretReaders(secretReaders) {
 		return ErrBootstrapRejected
 	}
 	return capability.startChild(func(file *os.File) error {
-		command.ExtraFiles = []*os.File{status, file}
+		all := []*os.File{status, file, postgresSecret, temporalStarterSecret, temporalControlSecret}
+		if !distinctDescriptorIdentities(all) {
+			return ErrBootstrapRejected
+		}
+		command.ExtraFiles = all
 		defer func() { command.ExtraFiles = nil }()
 		return command.Start()
 	})
@@ -67,4 +79,51 @@ func validStatusWriter(status *os.File) bool {
 	return unix.Fstat(int(fd), &stat) == nil && stat.Mode&unix.S_IFMT == unix.S_IFIFO &&
 		flagsErr == nil && flags&unix.O_ACCMODE == unix.O_WRONLY && descriptorErr == nil &&
 		descriptorFlags&unix.FD_CLOEXEC != 0
+}
+
+func validSecretReaders(readers []*os.File) bool {
+	if len(readers) != 3 || !distinctDescriptorIdentities(readers) {
+		return false
+	}
+	for _, reader := range readers {
+		if !validFIFODescriptor(reader, unix.O_RDONLY) {
+			return false
+		}
+	}
+	return true
+}
+
+func validFIFODescriptor(file *os.File, accessMode int) bool {
+	if file == nil {
+		return false
+	}
+	fd := file.Fd()
+	var stat unix.Stat_t
+	flags, flagsErr := unix.FcntlInt(fd, unix.F_GETFL, 0)
+	descriptorFlags, descriptorErr := unix.FcntlInt(fd, unix.F_GETFD, 0)
+	return unix.Fstat(int(fd), &stat) == nil && stat.Mode&unix.S_IFMT == unix.S_IFIFO &&
+		flagsErr == nil && flags&unix.O_ACCMODE == accessMode && descriptorErr == nil &&
+		descriptorFlags&unix.FD_CLOEXEC != 0
+}
+
+func distinctDescriptorIdentities(files []*os.File) bool {
+	if len(files) == 0 {
+		return false
+	}
+	seen := make(map[[2]uint64]struct{}, len(files))
+	for _, file := range files {
+		if file == nil {
+			return false
+		}
+		var stat unix.Stat_t
+		if unix.Fstat(int(file.Fd()), &stat) != nil {
+			return false
+		}
+		identity := [2]uint64{uint64(stat.Dev), stat.Ino}
+		if _, duplicate := seen[identity]; duplicate {
+			return false
+		}
+		seen[identity] = struct{}{}
+	}
+	return true
 }

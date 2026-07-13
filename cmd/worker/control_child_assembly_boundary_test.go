@@ -42,6 +42,8 @@ func TestControlWorkerSnapshotGateStillCannotCreateRuntimeOrReportReady(t *testi
 		t.Fatal("runtime factory has no fixed unavailable return")
 	}
 	buildPosition := token.NoPos
+	secretReadyPosition := token.NoPos
+	bindPosition := token.NoPos
 	factoryPosition := token.NoPos
 	unexpectedReadyCalls := 0
 	ast.Inspect(assembly.Body, func(node ast.Node) bool {
@@ -55,6 +57,16 @@ func TestControlWorkerSnapshotGateStillCannotCreateRuntimeOrReportReady(t *testi
 				t.Error("snapshot gate is called more than once")
 			}
 			buildPosition = call.Pos()
+		case "ReportControlWorkerSecretReady":
+			if secretReadyPosition != token.NoPos {
+				t.Error("secret-ready barrier is called more than once")
+			}
+			secretReadyPosition = call.Pos()
+		case "BindControlWorkerSecrets":
+			if bindPosition != token.NoPos {
+				t.Error("secret binding is called more than once")
+			}
+			bindPosition = call.Pos()
 		case "newControlChildRuntime":
 			if factoryPosition != token.NoPos {
 				t.Error("runtime factory is called more than once")
@@ -75,8 +87,14 @@ func TestControlWorkerSnapshotGateStillCannotCreateRuntimeOrReportReady(t *testi
 		}
 		return true
 	})
-	if buildPosition == token.NoPos || factoryPosition == token.NoPos || buildPosition >= factoryPosition {
-		t.Fatalf("production order is snapshot=%s factory=%s", files.Position(buildPosition), files.Position(factoryPosition))
+	if buildPosition == token.NoPos || secretReadyPosition == token.NoPos || bindPosition == token.NoPos ||
+		factoryPosition == token.NoPos || buildPosition >= secretReadyPosition ||
+		secretReadyPosition >= bindPosition || bindPosition >= factoryPosition {
+		t.Fatalf(
+			"production order is snapshot=%s secret-ready=%s bind=%s factory=%s",
+			files.Position(buildPosition), files.Position(secretReadyPosition),
+			files.Position(bindPosition), files.Position(factoryPosition),
+		)
 	}
 	if unexpectedReadyCalls != 0 {
 		t.Fatalf("pre-runtime assembly contains %d status READY calls", unexpectedReadyCalls)
@@ -95,8 +113,8 @@ func TestControlWorkerSnapshotGateStillCannotCreateRuntimeOrReportReady(t *testi
 		}
 		return true
 	})
-	if allReadyCalls != 4 {
-		t.Fatalf("control child production Ready callsites = %d, want exact reviewed set of 4", allReadyCalls)
+	if allReadyCalls != 3 {
+		t.Fatalf("control child production Ready callsites = %d, want exact reviewed set of 3", allReadyCalls)
 	}
 	if readyHelperCalls != 1 {
 		t.Fatalf("control child READY helper callsites = %d, want exact reviewed lifecycle call", readyHelperCalls)

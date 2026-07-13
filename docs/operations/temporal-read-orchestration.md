@@ -1,6 +1,6 @@
 # Temporal READ investigation orchestration
 
-阶段：M5C2-4b / M5C2-4c1a / M5C2-4c1b / M5C2-4c2a / M5C2-4c2b0 / M5C2-4c2b1a / M5C2-4c2b1b0 / M5C2-4c2b1b1（版本化只读编排、
+阶段：M5C2-4b / M5C2-4c1a / M5C2-4c1b / M5C2-4c2a / M5C2-4c2b0 / M5C2-4c2b1a / M5C2-4c2b1b0 / M5C2-4c2b1b1 / M5C2-4c2b1b2a（版本化只读编排、
 Plan-bound Runner 路由、角色隔离的 Temporal 控制边界、fail-closed 子进程 containment 与预装配
 进程逃逸静态门禁；真实 Worker/Outbox/Runner 尚未装配，READ claims 关闭）
 
@@ -15,7 +15,8 @@ Admission，生产代码仍没有打开 READ claims 的构造器；WRITE claims 
 C2-4c2b1a 只新增固定根 public-source snapshot 与 sealed memfd capability。C2-4c2b1b0 将它以唯一固定
 FD4 交给 contained child，并在 child 内重复验证 descriptor、frame、工件闭包与证书。C2-4c2b1b1 再从
 同一次验证捕获的四份 manifest 与 target CA 闭包构造真实语义 Snapshot，完整比较
-`expected_snapshot`；仍不读取秘密、不 Dial、不 READY。
+`expected_snapshot`。C2-4c2b1b2a 再加入非 READY 的 `SECRET_READY`、固定 FD5–FD7 和证书私钥绑定；生产
+secret supplier 仍固定不可用，因此不 Dial、不 READY。
 
 ## C2-4c2a 进程级 containment
 
@@ -124,9 +125,10 @@ tmpfs regular inode、`nlink=0`、owner/mode/size、完整 seals 和只读 acces
 Dial/READY 前失败。Starter/Control/PostgreSQL 的证书不同也不等于企业 PKI profile、Temporal RBAC 或
 数据库授权已经隔离；这些仍是外部 Go/No-Go 门禁。
 
-当前 capability 已进入固定 FD4 并完成语义 Snapshot 比较，但不读取密码、private key 或 DSN，不创建 PostgreSQL pool，不执行任何
-Temporal Dial，不安装 Outbox，也不发送 READY。独立一次性 Starter/Control 私钥与 PostgreSQL secret
-匿名 pipe 必须等待 child 完成语义 Snapshot 并发出非 READY 的 secret-ready 证明后再实现。
+当前 capability 已进入固定 FD4 并完成语义 Snapshot 比较；父进程同时预建空的 FD5–FD7 匿名 pipe，只有
+child 发出非 READY 的 `SECRET_READY` 后才允许调用 supplier。child 对三份有界 role frame 做完整性、精确
+EOF、P-256 PKCS#8 与 FD4 client certificate SPKI 绑定校验，但生产 supplier 仍固定不可用；因此不创建
+PostgreSQL pool，不执行 Temporal Dial、不安装 Outbox，也不发送 READY。
 
 ## C2-4c2b1b0 固定 FD4 与 child 独立复验
 
@@ -181,6 +183,30 @@ expected backing。
 `newControlChildRuntime` 对有效 Snapshot 仍固定返回 assembly unavailable，所以本切片没有密码、private
 key、DSN、PostgreSQL/Temporal Dial、Worker Start、Outbox、Admission 或 claims；下一步是 b1b2 的非
 READY secret-ready barrier 与 FD5/FD6/FD7 一次性秘密协议。
+
+## C2-4c2b1b2a `SECRET_READY` 与固定 FD5–FD7
+
+父监督器在 `Start` 前创建三组空匿名 pipe，并由唯一 `StartChild` 按
+`[FD3 status writer, FD4 sealed public source, FD5 PostgreSQL reader, FD6 Temporal Starter reader, FD7 Temporal Control reader]`
+固定映射给 child；请求、环境、argv 和 payload 都不能选择或替换 descriptor。child 独立要求 FD5–FD7 为
+互不相同的只读 FIFO，并与 FD3/FD4 inode identity 不同；设置 `CLOEXEC` 后拒绝 FD8 以上任何额外
+non-CLOEXEC capability。
+
+状态协议固定为 `Snapshot → S → secret bind → future R`。`S` 不是 READY，只能发送一次；`R` 前置、`SS`、
+`SRS`、未知字节或非终态 EOF 都是协议破坏。父进程只在收到 `S` 后调用固定 supplier，supplier 使用最初
+30 秒启动预算的剩余时间，不能重置 deadline。异常、取消、超时、FATAL、输出洪泛或 child 退出会先关闭
+全部 secret writer，再沿既有 PGID/pidfd 路径终止并 `Wait`/reap。
+
+每条 secret pipe 只接受一个不超过 2104 bytes 的 domain-separated 二进制 frame：固定 magic/version/role、
+reserved zero、big-endian 长度、SHA-256 和精确 EOF。PostgreSQL frame 包含有界密码与 canonical 未加密
+PKCS#8，两个 Temporal frame 各只含对应角色 PKCS#8；三者均只接受 ECDSA P-256，并必须与 FD4 首次捕获的
+对应 client certificate SPKI 常量时间精确匹配。三条全部成功后才原子发布包内 opaque bundle；失败、取消
+与 Close 会清空 owned buffer 并永久消费 capability。Go heap 与加密库内部复制不构成物理内存清零证明，
+部署仍需 dump/ptrace、swap 与节点内存控制。
+
+b1b2a 的生产 supplier 和 `newControlChildRuntime` 都固定 unavailable，用于证明 transport/barrier 而不是伪造
+企业 Secret 集成。因此当前仍是零 PostgreSQL/Temporal Dial、零 Worker Start、零 READY、零 claims；
+b1b2b 才允许在 `S` 之后启动受 containment 的固定 secret-loader，并补齐崩溃/强杀时的 loader 回收证据。
 
 ## 角色隔离的 Temporal 控制边界
 
