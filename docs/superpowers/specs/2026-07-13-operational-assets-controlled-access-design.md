@@ -1,0 +1,1042 @@
+# 可运维资产、受控连接与主动调查设计规范
+
+> 状态：已完成产品与视觉评审，等待书面规范复核
+> 基线：`main@45aa5eb`
+> 日期：2026-07-13
+> 设计方法：Superpowers brainstorming + UI/UX Pro Max
+
+## 1. 摘要
+
+本设计把 AIOps System 从“围绕 Incident 的调查内核”扩展为“以可运维资产为基础的受治理运维控制平面”。系统先建立带来源的资产目录，再把候选连接配置验证并发布为不可变运行能力，最后通过短期、限额、可撤销的 `InvestigationGrant` 授权隔离 Runner 主动排查。
+
+已确认的产品决策：
+
+- 采用混合资产目录：支持手工、CSV/API、云平台、虚拟化平台、Kubernetes、AWX 与外部 CMDB 发现。
+- 平台是运维事实索引和治理覆盖层，不替代外部 CMDB、云平台、Kubernetes 或 VictoriaMetrics Operator 的事实源地位。
+- Agent 使用受控能力代理，不获得原始密码、SSH Key、通用终端、任意命令或任意 SQL。
+- 主动调查由告警、事件或预批准定时策略触发；每次运行生成新的短期授权。
+- 主动调查只执行已发布的类型化只读能力；写操作只能生成 `ActionPlan` 提案，继续使用现有不可变计划、策略、人工审批、短期凭据、执行验证和审计链。
+- 前端采用已确认的企业运维控制台视觉：浅色高密度工作区、克制蓝色操作色、表格与主从详情，不使用聊天框、AI 头像、霓虹、发光或玻璃拟态。
+
+## 2. 当前事实与设计动机
+
+当前仓库具有以下基础：
+
+- `services`、`service_bindings`、`integrations` 可以表达服务、环境和部分 Provider 绑定。
+- `readconnector`、`readtarget`、`readruntime` 与 Runtime Bundle 已建立内容寻址、固定查询、固定 Target、网络策略、凭据引用和执行摘要边界。
+- 正式 READ Runtime 目前只支持 Prometheus 与 VictoriaLogs。
+- Kubernetes、AWX、Argo CD、GitLab、Jenkins、GitHub Actions 存在有界客户端，但尚未接入正式不可变 READ Runtime。
+- `ActionEnvelope` 只支持 Kubernetes、GitOps 与 AWX 固定动作；生产写仍关闭。
+- Runner 身份和作用域当前以 Tenant、Workspace、Environment 为粗粒度边界。
+- Control Worker、正式 READ Runner、Outbox 与启动装配尚未形成完整在线产品链路，不能把现有安全模块等同于后端产品已经全部完成。
+- 仓库尚无面向浏览器的完整 Control Plane API，也没有前端工程骨架；新阶段必须从契约和纵向切片开始同步建设前后端。
+
+现有模型不能表达：
+
+- 虚拟机或数据库作为稳定资产的身份、来源、生命周期、服务关系和最近观测。
+- 同一资产的多个连接方式、连接版本、健康状态、信任材料和网络区域。
+- 哪些已验证能力允许在哪个资产、Runner Realm 和数据等级下执行。
+- Agent 主动调查所使用的资产快照、能力摘要、预算、凭据生命周期和 Kill Switch。
+- VictoriaMetrics Metrics、Logs、Traces 与其采集、鉴权、告警和集群组件之间的区别。
+
+不得继续把这些能力堆入 `integrations.config` 或 `service_bindings` 的无约束 JSONB。管理态数据可以变化，但任何运行中的调查必须固定到不可变版本。
+
+## 3. 核心概念与不变量
+
+### 3.1 五个不同概念
+
+| 概念 | 责任 | 是否可变 | 是否包含秘密 |
+|---|---|---:|---:|
+| `Asset` | 记录可运维对象的身份、来源、归属和生命周期 | 是，带版本 | 否 |
+| `ConnectionProfile` | 描述候选连接方式、信任、凭据引用、网络策略与能力 | 通过新修订变化 | 否 |
+| `PublishedTarget` | 验证后编译出的内容寻址运行 Target | 否 | 否 |
+| `Capability` | Provider 专属的类型化查询、Probe 或固定动作契约 | 版本化、发布后不可变 | 否 |
+| `InvestigationGrant` | 一次调查对资产快照和能力摘要的短期委托授权 | 否，可撤销/过期 | 否 |
+
+### 3.2 最高不变量
+
+1. 模型不是授权 Principal，也不属于可信计算基。
+2. 资产目录、浏览器、Task 和模型不能向 Runner 提交 endpoint、DSN、Secret、命令文本、SQL、任意 Header 或任意请求体。
+3. `ConnectionProfile` 必须经过 Provider Schema 校验和隔离 Runner 验证，才能发布为内容寻址 Target/Capability Snapshot。
+4. 运行中的 Investigation 固定使用 Asset Snapshot、Target、Capability、Runtime Bundle 和 Grant 摘要；后续配置发布不得改变其语义。
+5. 只有 `ACTIVE + EXACT + PUBLISHED + AVAILABLE` 的资产能力可以进入实时调查。
+6. `AMBIGUOUS`、`UNRESOLVED`、`STALE`、`QUARANTINED` 资产只能进入人工治理流程。
+7. 所有凭据均按单资产、单 Capability、单 Task/Attempt 签发；TTL 不得超过 Grant 与 Lease，不可续期。
+8. 结果不确定、目标漂移、授权失效、预算耗尽或 Kill Switch 关闭时必须停止并升级人工。
+
+## 4. 四层架构
+
+```mermaid
+flowchart TD
+    subgraph M["资产管理面"]
+        DS["Discovery Sources"] --> OBS["Asset Observations"]
+        MAN["Manual / CSV / API"] --> OBS
+        OBS --> CAT["Asset Catalog"]
+        CAT --> REL["Relations + Service Bindings"]
+    end
+
+    subgraph P["连接发布面"]
+        CAT --> CR["Connection Revision"]
+        CR --> VAL["Controlled Validation"]
+        VAL --> PUB["Published Target + Capability Snapshot"]
+        PUB --> BUNDLE["Immutable Runtime Bundle"]
+    end
+
+    subgraph G["委托授权面"]
+        EVENT["Alert / Incident"] --> POLICY["Proactive Policy"]
+        SCHEDULE["Approved Schedule"] --> POLICY
+        POLICY --> SNAP["Immutable Asset Snapshot"]
+        SNAP --> GRANT["InvestigationGrant"]
+        BUNDLE --> GRANT
+    end
+
+    subgraph E["隔离执行与证据面"]
+        GRANT --> GW["READ Gateway"]
+        GW --> RUNNER["Runner Realm"]
+        RUNNER --> CRED["Single-task Credential"]
+        RUNNER --> TARGET["Published Target"]
+        TARGET --> RESULT["Bounded Typed Result"]
+        RESULT --> DLP["Schema + DLP + Redaction"]
+        DLP --> EVIDENCE["Evidence + Receipt + Audit"]
+        EVIDENCE --> REVOKE["Durable Credential Revocation"]
+    end
+```
+
+### 4.1 资产管理面
+
+- 保存稳定身份、作用域、外部来源、外部 ID、Owner、关键度、数据等级、标签、版本和最近观测时间。
+- 保存经过验证的关系，不构造未经来源证明的全局拓扑。
+- 外部删除先转为 `STALE`，经过保留期和人工/来源确认后转为 `RETIRED`；不因一次同步缺失物理删除。
+- 人工维护业务归属和服务映射；发现源不得静默覆盖人工锁定字段。
+- 人工创建的资产只是“已登记的可运维引用”，不代表平台接管云资源、虚拟机、数据库或 Kubernetes 对象的期望状态与生命周期。
+
+### 4.2 连接发布面
+
+- Connection 修订主路径为 `DRAFT → VALIDATING → VALIDATED → PUBLISHED`；验证失败进入 `REJECTED`，已发布修订可进入 `SUPERSEDED` 或 `REVOKED`。
+- 任何修改都创建新修订；不支持原地热修改。
+- 发布编译出内容寻址 `TargetRef`、Capability digest 和 Runtime Bundle digest。
+- 活动调查继续固定旧 Bundle；只有新建 Grant 可以引用新版本。
+
+### 4.3 委托授权面
+
+- 人类 OIDC Subject 或已发布 Scheduler Policy 是授权来源。
+- 每次事件或定时运行都重新解析资产选择器、建立不可变资产快照并创建新 Grant。
+- Grant 绑定资产、能力、预算、数据等级、策略版本、Kill Switch 版本、触发源和有效期。
+- 模型只能作为运行归因 Actor，不能签发或扩大 Grant。
+
+### 4.4 隔离执行与证据面
+
+- 控制平面和浏览器不直接访问目标网络。
+- Runner 按 Mode、Adapter Family 和 Network Zone 组成 `RunnerRealm`。
+- Gateway 在 Claim、Start、Heartbeat、Complete 四个边界重新验证身份、Scope Revision、Grant、Asset Snapshot、Runtime 和 Kill Switch。
+- 输出必须先通过 Provider Schema、大小/数量/时间预算、数据分类、DLP 与脱敏，才能成为 Evidence。
+
+## 5. 资产目录
+
+### 5.1 首批资产类型
+
+```text
+SERVICE
+LINUX_VM
+WINDOWS_VM
+BARE_METAL_HOST
+KUBERNETES_CLUSTER
+KUBERNETES_NAMESPACE
+KUBERNETES_WORKLOAD
+DATABASE_INSTANCE
+DATABASE
+METRICS_SOURCE
+LOG_SOURCE
+TRACE_SOURCE
+AWX_INVENTORY
+ARGO_APPLICATION
+CI_PIPELINE
+GIT_REPOSITORY
+CLOUD_RESOURCE
+```
+
+Provider 细分通过严格类型详情表达，不把任意 Provider JSON 直接暴露为运行契约。
+
+### 5.2 来源与合并规则
+
+支持的来源类型：
+
+```text
+MANUAL
+CSV_IMPORT
+CONTROL_PLANE_API
+EXTERNAL_CMDB
+VSPHERE
+PROXMOX
+OPENSTACK
+CLOUD_PROVIDER
+KUBERNETES_OPERATOR
+AWX_INVENTORY
+```
+
+字段所有权规则：
+
+- `external_id`、Provider 类型、来源版本和发现时间由来源拥有，人工不可修改。
+- Service、Owner、关键度、数据等级与人工标签由治理人员拥有，发现同步不可覆盖。
+- 健康、观测版本、组件数量与运行状态由最新有效 Observation 投影。
+- 同一字段出现来源冲突时创建 `AssetConflict`，不按名称或优先级静默合并。
+- 去重键为 `(tenant_id, workspace_id, source_id, provider_kind, external_id)`。
+- 跨来源合并必须产生显式 Merge Decision、版本和审计记录。
+- `MANUAL` 资产只登记稳定身份、Owner、作用域和连接候选，不声明外部系统的期望状态；一旦与权威来源建立映射，来源事实和人工治理字段仍按字段所有权分别维护。
+
+### 5.3 生命周期与关系
+
+资产生命周期不是单向直线，允许的转换固定为：
+
+```text
+DISCOVERED  → ACTIVE | QUARANTINED | RETIRED
+ACTIVE      → STALE | QUARANTINED | RETIRED
+STALE       → ACTIVE | QUARANTINED | RETIRED
+QUARANTINED → ACTIVE | RETIRED
+RETIRED     → （终态）
+```
+
+- `DISCOVERED` 不能执行能力。
+- 只有来源有效、映射 `EXACT`、连接已发布的资产可以进入 `ACTIVE`。
+- `STALE` 禁止新 Grant；活动任务按已固定快照完成或由策略停止。
+- `QUARANTINED` 立即阻止新 Claim，并对活动任务触发复验。
+- `STALE → ACTIVE` 需要来源恢复和重新校验；`QUARANTINED → ACTIVE` 还需要修复证明及治理复核，不能由普通同步自动恢复。
+- 任一非终态转为 `RETIRED` 都必须保存来源或人工决策证据；`RETIRED` 保留历史关系与审计，不出现在默认操作视图。
+
+关系类型：
+
+```text
+RUNS_ON
+CONTAINS
+DEPENDS_ON
+MONITORED_BY
+LOGS_TO
+TRACES_TO
+DELIVERED_BY
+MANAGED_BY
+PRIMARY_RUNTIME_FOR
+```
+
+所有关系边必须保持同 Tenant、Workspace；跨 Environment 边需要显式类型和策略许可。
+
+## 6. VictoriaMetrics 全家桶
+
+产品文案必须区分“虚拟机资产 VM”和“VictoriaMetrics 生态”。代码、API 和 UI 使用完整名称，禁止只写含义不明的 `VM`。
+
+### 6.1 受管组件、配置与工具资产
+
+长时间运行、可观测的组件资产：
+
+```text
+VICTORIAMETRICS_SINGLE
+VICTORIAMETRICS_CLUSTER
+VICTORIAMETRICS_VMSELECT
+VICTORIAMETRICS_VMINSERT
+VICTORIAMETRICS_VMSTORAGE
+VICTORIALOGS_SINGLE
+VICTORIALOGS_CLUSTER
+VICTORIALOGS_VLSELECT
+VICTORIALOGS_VLINSERT
+VICTORIALOGS_VLSTORAGE
+VICTORIATRACES_SINGLE
+VICTORIATRACES_CLUSTER
+VICTORIATRACES_VTSELECT
+VICTORIATRACES_VTINSERT
+VICTORIATRACES_VTSTORAGE
+VMAGENT
+VLAGENT
+VMALERT
+VMAUTH
+VMGATEWAY
+VMALERTMANAGER
+VMANOMALY
+VMOPERATOR
+VMBACKUPMANAGER
+```
+
+受治理的 Operator 配置资产：
+
+```text
+VMRULE
+VMUSER
+VMALERTMANAGER_CONFIG
+VMNODE_SCRAPE
+VMPOD_SCRAPE
+VMPROBE
+VMSERVICE_SCRAPE
+VMSTATIC_SCRAPE
+VMSCRAPE_CONFIG
+```
+
+注册但首版不发布调查 Capability 的工具/作业工件：
+
+```text
+VMCTL
+VMBACKUP
+VMRESTORE
+VMALERT_TOOL
+```
+
+Operator 发现应覆盖其公开资源：`VMAgent`、`VMAnomaly`、`VMAlert`、`VMAlertManager`、`VMAlertManagerConfig`、`VMAuth`、`VMCluster`、`VMNodeScrape`、`VMPodScrape`、`VMProbe`、`VMRule`、`VMServiceScrape`、`VMStaticScrape`、`VMSingle`、`VMUser`、`VMScrapeConfig`、`VLSingle`、`VLAgent`、`VLCluster`、`VTSingle`、`VTCluster`，以及 Operator、其创建的工作负载、Service 和版本关系。
+
+`VMRule`、`VMUser`、Scrape 资源与 Alertmanager 配置是治理配置资产，不是查询 Target。`VMUser` 由 Operator 生成的 Kubernetes Secret 只能登记为 Opaque Credential Reference；平台 API、前端、模型和 Evidence 都不得读取或返回 Secret 内容。`VMAnomaly` 即使暴露读写或监控端点，也默认只作为资产与健康观测，不开放写能力。
+
+### 6.2 Target 分类
+
+| 家族 | 可发布查询 Target | 仅作为受管资产/健康端点 |
+|---|---|---|
+| Metrics | `VMSingle`；`VMCluster/vmselect`；经治理发布的 `vmauth`/`vmgateway` 查询路由 | `vminsert` ingestion、`vmstorage` 内部存储端点 |
+| Logs | `VLSingle`；`VLCluster/vlselect` LogsQL；经治理发布的鉴权路由 | `vlinsert` ingestion、`vlstorage` 内部存储端点、`VLAgent` |
+| Traces | `VTSingle`；`VTCluster/vtselect` 的 Jaeger Query 与受控查询入口 | `vtinsert`/OTLP ingestion、`vtstorage` 内部存储端点 |
+| Shared | 固定健康、版本、容量和告警状态 Probe | `vmagent`、`vmalert`、Alertmanager、VMAnomaly、Operator、`vmbackupmanager` |
+| 配置与工具 | 无 | VMRule、VMUser、Scrape CRD、Alertmanager 配置、`vmctl`、`vmbackup`、`vmrestore`、`vmalert-tool` |
+
+Agent 永不获得 Metrics/Logs/Traces ingestion 权限。`vminsert`、OTLP ingestion 和日志写入端点不能成为调查 Grant 的写 Target。
+
+### 6.3 首批只读 Capability
+
+Metrics：
+
+```text
+VICTORIAMETRICS_INSTANT_QUERY
+VICTORIAMETRICS_RANGE_QUERY
+VICTORIAMETRICS_LABEL_NAMES
+VICTORIAMETRICS_LABEL_VALUES
+VICTORIAMETRICS_CLUSTER_HEALTH
+VICTORIAMETRICS_CAPACITY_SNAPSHOT
+```
+
+Logs：
+
+```text
+VICTORIALOGS_SEARCH
+VICTORIALOGS_HITS
+VICTORIALOGS_FACETS
+VICTORIALOGS_STATS_RANGE
+VICTORIALOGS_FIELD_VALUES
+VICTORIALOGS_CLUSTER_HEALTH
+```
+
+Traces：
+
+```text
+VICTORIATRACES_LIST_SERVICES
+VICTORIATRACES_LIST_OPERATIONS
+VICTORIATRACES_FIND_TRACES
+VICTORIATRACES_GET_TRACE
+VICTORIATRACES_DEPENDENCIES
+VICTORIATRACES_CLUSTER_HEALTH
+```
+
+每个 Capability 固定：
+
+- Provider 和 Schema Version。
+- Server-owned 查询模板或允许参数的判别联合。
+- 最大时间窗、结果项、样本、字节、持续时间、并发和字段集合。
+- 输出 Schema、时间语义、租户身份与 DLP 分类。
+- Target、Credential Role、Network Policy 与 Runner Realm。
+
+官方产品边界参考：
+
+- <https://docs.victoriametrics.com/victoriametrics/>
+- <https://docs.victoriametrics.com/victoriametrics/cluster-victoriametrics/>
+- <https://docs.victoriametrics.com/operator/resources/>
+- <https://docs.victoriametrics.com/operator/resources/vmuser/>
+- <https://docs.victoriametrics.com/operator/resources/vmanomaly/>
+- <https://docs.victoriametrics.com/operator/resources/vmrule/>
+- <https://docs.victoriametrics.com/victorialogs/querying/>
+- <https://docs.victoriametrics.com/victoriatraces/querying/>
+
+## 7. 主机、远程方式与数据库
+
+### 7.1 主机诊断
+
+首版优先级：
+
+1. `HOST_PROBE_MTLS`：固定编译的只读 Probe。
+2. `AWX_API`：固定 Inventory 查询与已审核只读 Job Template。
+3. 不提供交互 SSH、交互 WinRM、PTY、端口转发、SFTP、Agent Forwarding 或任意命令。
+
+首批主机能力示例：
+
+```text
+HOST_SYSTEM_INFO
+HOST_CPU_MEMORY_SNAPSHOT
+HOST_DISK_USAGE
+HOST_NETWORK_LISTENERS
+HOST_SYSTEMD_STATUS
+HOST_WINDOWS_SERVICE_STATUS
+HOST_BOUNDED_LOG_WINDOW
+```
+
+所有参数必须是严格类型化标识、枚举和时间窗，不能包含命令、argv、env、路径通配符或脚本。
+
+未来若必须使用 SSH/WinRM 作为传输，必须另立 ADR 和信任域：
+
+- SSH 只允许每任务短期证书、固定 Principal、`ForceCommand` 指向固定编译二进制。
+- WinRM 只允许签名、内容寻址的固定脚本包与严格输入 Schema。
+- 两者仍不得向 Agent 暴露凭据或自由命令能力。
+
+### 7.2 数据库诊断
+
+首个数据库 Provider 固定为 PostgreSQL，后续 MySQL、SQL Server、Oracle 等逐 Provider 建立独立契约，不提供通用 SQL 控制台。
+
+PostgreSQL Target 固定：
+
+- DNS、端口、TLS、SNI、CA、Database Name、只读副本偏好。
+- Vault READ Issuer/Credential Role Reference。
+- Network Policy 和 `READ_DATABASE` Runner Realm。
+- 固定 `search_path`、只读事务、statement/lock/idle timeout。
+
+SQL 由服务端 `DiagnosticQueryID` 内容寻址模板拥有。模型只能提供符合 Schema 的低风险参数。
+
+首批 Capability：
+
+```text
+POSTGRES_SERVER_HEALTH
+POSTGRES_CONNECTION_SNAPSHOT
+POSTGRES_LOCK_SNAPSHOT
+POSTGRES_REPLICATION_SNAPSHOT
+POSTGRES_DATABASE_SIZE
+POSTGRES_SLOW_QUERY_SUMMARY
+```
+
+明确禁止：多语句、任意函数、写入、DDL、`COPY`、大对象、扩展、隧道和 `EXPLAIN ANALYZE`。输出必须限制行数、字段、字节和时间，并在成为 Evidence 前执行 DLP 与脱敏。
+
+## 8. ConnectionProfile 与发布
+
+### 8.1 Provider 专属修订
+
+`ConnectionProfile` 是稳定身份；`ConnectionRevision` 是不可变候选配置。每种 Provider 使用判别联合 Schema，不提供通用 JSON 编辑器。
+
+公共字段：
+
+```text
+connection_id
+revision
+tenant_id
+workspace_id
+environment_id
+asset_id
+provider_kind
+endpoint_identity
+trust_reference
+credential_reference
+network_policy_reference
+runner_realm_reference
+capability_set_reference
+created_by
+created_at
+```
+
+`endpoint_identity` 必须是 Provider 专属安全结构。Secret、Token、私钥、完整 DSN、Vault URL/Path、CA PEM 和原始 Policy 内容永不返回浏览器。
+
+### 8.2 六步发布流程
+
+1. 选择作用域、资产和 Provider 类型。
+2. 填写 Provider 专属端点与信任配置。
+3. 选择预置的 Opaque Credential Reference。
+4. 选择固定 Capability、预算和 Runner Realm。
+5. 由隔离 Runner 执行异步受控验证。
+6. 审阅差异、Runtime digest、部署影响，最近重新认证后发布。
+
+验证至少包含：
+
+- 目标身份与 DNS/外部 ID 一致性。
+- TLS/SNI/CA 或 Provider 对等身份。
+- Network Policy 和 Runner Realm 可达性。
+- 单任务短凭据签发与吊销。
+- 固定健康和最小查询探测。
+- 输出 Schema、预算、截断与 DLP。
+
+验证失败只返回稳定错误码、阶段和 Trace ID，不透传上游错误正文。
+
+## 9. InvestigationGrant 与主动策略
+
+### 9.1 Grant 内容
+
+`InvestigationGrant` 必须绑定：
+
+```text
+grant_id
+tenant_id / workspace_id / environment_id / service_id
+incident_id nullable
+trigger_type and trigger_id
+requester_subject or scheduler_policy_id
+asset_snapshot_digest
+asset_ids and revisions
+capability_snapshot_digest
+runtime_bundle_digest
+data_classification
+max_tool_calls
+max_concurrency_per_source
+max_duration_seconds
+max_evidence_bytes
+max_model_tokens
+not_before / expires_at
+policy_revision
+kill_switch_revision
+grant_digest
+status / revoked_at / revoke_reason
+```
+
+状态：
+
+```text
+ISSUED → ACTIVE → COMPLETED
+              ↘ EXPIRED
+              ↘ REVOKED
+              ↘ FAILED
+```
+
+Grant 不能转化或复用于 WRITE。ActionPlan 必须重新经过独立 ActionEnvelope、策略、审批和凭据链。
+
+### 9.2 ProactiveInvestigationPolicy
+
+策略修订固定：
+
+- 告警/事件条件或定时表达式。
+- Asset Selector、允许类型和 `EXACT + ACTIVE` 准入要求。
+- Capability Snapshot、调查模板和数据等级。
+- 每资产最小间隔、并发、时间、工具、证据和模型预算。
+- `SHADOW` 或 `READ_ONLY` 模式。
+- 全局、Workspace、Environment、Asset、Connection、Capability 六级 Kill Switch。
+
+生产启用顺序：
+
+1. 人工 Preview。
+2. 非生产 `READ_ONLY`。
+3. 生产 `SHADOW`，只记录本应执行的能力与预算。
+4. 生产 `READ_ONLY`，仍不得执行写操作。
+
+## 10. 持久化模型
+
+新增领域表建议：
+
+| 表 | 核心责任 |
+|---|---|
+| `asset_sources` | 发现来源、Integration、同步模式和状态 |
+| `asset_source_runs` | 每次同步的游标、摘要、计数和结果 |
+| `asset_observations` | 外部不可信、append-only 观测快照 |
+| `assets` | 稳定资产身份与当前治理投影 |
+| `asset_type_details` | Provider 专属的版本化类型详情 |
+| `asset_conflicts` | 来源冲突、候选合并和人工决策 |
+| `asset_relationships` | 版本化、有来源的资产关系边 |
+| `service_asset_bindings` | Service/Environment 与多资产关系 |
+| `connection_profiles` | 连接稳定身份 |
+| `connection_revisions` | Provider 专属不可变候选修订 |
+| `connection_validation_runs` | 受控验证 Operation 与安全结果 |
+| `credential_references` | Opaque Credential/Issuer 引用及安全投影，不保存 Secret |
+| `published_targets` | TargetRef、摘要和发布状态 |
+| `capability_definitions` | Provider 专属版本化能力定义 |
+| `published_capability_sets` | 内容寻址能力集合 |
+| `runtime_publications` | Target/Capability/Policy/Executor Bundle |
+| `runner_realms` | Mode、Adapter Family、Network Zone 和粗粒度作用域 |
+| `runner_capability_bindings` | Realm 可承载的已发布 Target/Capability 摘要 |
+| `asset_snapshots` | 每次调查解析出的不可变资产集合摘要 |
+| `asset_snapshot_items` | 快照内 Asset Revision 与 Mapping/Connection 状态 |
+| `investigation_grants` | 短期委托授权及摘要 |
+| `kill_switch_revisions` | 六级 Kill Switch 的不可变有效状态修订 |
+| `proactive_policy_revisions` | 不可变主动策略修订 |
+| `proactive_runs` | 调度、Grant、Investigation 和结果关联 |
+
+所有跨作用域引用使用 Tenant、Workspace、Environment 复合外键。重要修订表禁止原地更新；状态转换使用版本或数据库锁防止竞争。
+
+## 11. 后端模块边界
+
+继续采用模块化单体，不新建微服务：
+
+```text
+internal/assetcatalog
+internal/assetcatalog/postgres
+internal/assetdiscovery
+internal/connectionprofile
+internal/connectionprofile/postgres
+internal/capability
+internal/runtimepublication
+internal/investigationgrant
+internal/investigationgrant/postgres
+internal/proactivepolicy
+internal/proactivepolicy/postgres
+```
+
+现有模块职责保持：
+
+- `readconnector`：Provider 专属固定 Operation 和 Evidence Schema。
+- `readtarget`：内容寻址、不可变、安全敏感信息私有的 Target。
+- `readruntime`/`readassembly`：原子 Runtime Bundle。
+- `runnergateway`：Runner 身份、Claim 和结果边界。
+- `credential`：WRITE 凭据生命周期；新增独立 READ Issuer/Revoker 接口，不能复用 WRITE 权限路径。
+
+管理数据库中的可变对象不能被 Runner 直接读取。`runtimepublication` 负责把已发布修订编译为现有安全 Manifest/Bundle 结构。
+
+### 11.1 RunnerRealm 授权边界
+
+`RunnerRealm` 的稳定身份是 `Mode × Adapter Family × Network Zone`，并继续继承现有 Tenant、Workspace、Environment 粗粒度隔离。资源级授权不依赖 Runner 自报的 Asset ID，也不把整个 Environment 自动视为可访问目标；Gateway 必须从 Grant 和 Runtime Publication 验证 Target、Capability、Asset Snapshot 与 Realm binding 的摘要交集。
+
+Runner 只能领取与自身 workload identity、证书、Scope Revision 和 Realm binding 同时匹配的任务。它不能动态选择 Connection、请求额外 Credential、改变网络区或把一次成功连接解释为对同网段其他目标的授权。
+
+## 12. 公共 API
+
+浏览器只访问 Control Plane API，不访问内部 mTLS Runner API。
+
+### 12.1 Assets 与发现
+
+```text
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets
+POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets/{asset_id}
+PATCH /api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets/{asset_id}
+POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets/{asset_id}:quarantine
+POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets/{asset_id}:retire
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/asset-relations
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/service-asset-bindings
+POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/service-asset-bindings
+DELETE /api/v1/workspaces/{workspace_id}/environments/{environment_id}/service-asset-bindings/{binding_id}
+GET  /api/v1/workspaces/{workspace_id}/asset-sources
+POST /api/v1/workspaces/{workspace_id}/asset-sources
+GET  /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}
+POST /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}:sync
+GET  /api/v1/workspaces/{workspace_id}/asset-source-runs/{run_id}
+GET  /api/v1/workspaces/{workspace_id}/asset-conflicts
+POST /api/v1/workspaces/{workspace_id}/asset-conflicts/{conflict_id}:resolve
+```
+
+### 12.2 Connections、Target 与 Capability
+
+```text
+GET  /api/v1/workspaces/{workspace_id}/connections
+POST /api/v1/workspaces/{workspace_id}/connections
+GET  /api/v1/workspaces/{workspace_id}/connections/{connection_id}
+POST /api/v1/workspaces/{workspace_id}/connections/{connection_id}/revisions
+POST /api/v1/workspaces/{workspace_id}/connections/{connection_id}/revisions/{revision}:validate
+POST /api/v1/workspaces/{workspace_id}/connections/{connection_id}/revisions/{revision}:publish
+POST /api/v1/workspaces/{workspace_id}/connections/{connection_id}:revoke
+GET  /api/v1/workspaces/{workspace_id}/connections/{connection_id}/health-history
+GET  /api/v1/workspaces/{workspace_id}/published-targets
+GET  /api/v1/workspaces/{workspace_id}/capabilities
+GET  /api/v1/workspaces/{workspace_id}/runtime-publications
+GET  /api/v1/workspaces/{workspace_id}/credential-references
+GET  /api/v1/workspaces/{workspace_id}/credential-references/{reference_id}
+POST /api/v1/workspaces/{workspace_id}/credential-references/{reference_id}:validate
+GET  /api/v1/workspaces/{workspace_id}/runner-realms
+GET  /api/v1/workspaces/{workspace_id}/runner-realms/{realm_id}
+GET  /api/v1/workspaces/{workspace_id}/runner-realms/{realm_id}/capability-bindings
+GET  /api/v1/workspaces/{workspace_id}/operations/{operation_id}
+```
+
+### 12.3 主动调查与 Grant
+
+```text
+GET  /api/v1/workspaces/{workspace_id}/proactive-policies
+POST /api/v1/workspaces/{workspace_id}/proactive-policies
+GET  /api/v1/workspaces/{workspace_id}/proactive-policies/{policy_id}
+POST /api/v1/workspaces/{workspace_id}/proactive-policies/{policy_id}/revisions
+POST /api/v1/workspaces/{workspace_id}/proactive-policies/{policy_id}/revisions/{revision}:preview
+POST /api/v1/workspaces/{workspace_id}/proactive-policies/{policy_id}/revisions/{revision}:publish
+POST /api/v1/workspaces/{workspace_id}/proactive-policies/{policy_id}:disable
+POST /api/v1/workspaces/{workspace_id}/proactive-policies/{policy_id}:run
+GET  /api/v1/workspaces/{workspace_id}/proactive-runs
+GET  /api/v1/workspaces/{workspace_id}/investigation-grants/{grant_id}
+POST /api/v1/workspaces/{workspace_id}/investigation-grants/{grant_id}:revoke
+```
+
+API 通用规则：
+
+- 列表使用不透明 Cursor、稳定排序和作用域强制过滤。
+- 写请求使用 `Idempotency-Key`。
+- 更新与发布使用 `ETag / If-Match`。
+- 错误使用 RFC 9457 Problem Details、稳定 `code` 和 `trace_id`。
+- DTO 返回 `effective_actions`，前端不按角色名推断权限。
+- 连接发布、生产验证、主动策略发布、Grant 撤销要求最近重新认证。
+
+## 13. 权限
+
+新增能力：
+
+```text
+ASSET_READ
+ASSET_MANAGE
+ASSET_BIND
+ASSET_CONFLICT_RESOLVE
+CONNECTION_READ
+CONNECTION_MANAGE
+CONNECTION_VALIDATE
+CONNECTION_PUBLISH
+CREDENTIAL_REFERENCE_READ
+CAPABILITY_READ
+RUNNER_READ
+DIAGNOSTIC_RUN
+INVESTIGATION_GRANT_READ
+INVESTIGATION_GRANT_REVOKE
+PROACTIVE_POLICY_READ
+PROACTIVE_POLICY_MANAGE
+SENSITIVE_EVIDENCE_READ
+```
+
+角色默认：
+
+- `VIEWER`：作用域内安全资产摘要和 Incident 只读。
+- `SRE`：资产/连接/能力读取、连接验证、手动只读诊断和策略运行查看。
+- `SERVICE_OWNER`：所属服务资产与能力摘要、策略提议，不可发布生产连接。
+- `APPROVER`：只读取审批所需资产、Target、Capability 和计划摘要。
+- `AUDITOR`：全量安全投影、Grant 和审计只读。
+- `ADMIN`：资产治理、连接/策略发布、Runner 管理；不自动拥有业务调查或执行权限。
+
+## 14. 前端产品设计
+
+### 14.1 信息架构
+
+顶级导航增加：
+
+```text
+运行
+  总览
+  事件处置
+  调查记录
+  主动调查
+
+资产与连接
+  资产目录
+  映射工作台
+  连接与数据源
+  发现与同步
+  凭据引用
+  Runner 与能力
+
+治理
+  授权与策略
+  审计日志
+```
+
+稳定路由基线：
+
+```text
+/overview
+/incidents
+/incidents/:incidentId
+/investigations
+/proactive-policies
+/proactive-policies/:policyId
+/assets
+/assets/:assetId
+/asset-mappings
+/connections
+/connections/:connectionId
+/connections/:connectionId/revisions/:revision
+/asset-sources
+/credential-references
+/runner-realms
+/capabilities
+/governance/policies
+/audit
+```
+
+所有路由都继承 Workspace/Environment 上下文；不属于当前 Scope 的深链接返回可审计的 `403/404` 安全投影，不泄露对象是否存在。
+
+### 14.2 已确认页面
+
+#### 全局壳层
+
+- 桌面左侧使用约 216–224px 深海军蓝领域导航，顶部保留 44–48px Workspace/Environment 上下文条；内容区以白色面板、1px 边界和高密度表格为主。
+- Workspace、Environment 和当前权限作用域必须始终可见。切换作用域会重新解析权限和查询；存在未保存修订时先显示阻止式确认，不能把草稿静默带入新作用域。
+- 页面标题区包含 Breadcrumb、稳定资源 ID、当前修订/状态与 1 个主操作；低频操作进入明确文字菜单，不堆叠同权重按钮。
+- Scope、筛选、排序、分页、Tab、选中对象与时间窗写入 URL；刷新、后退和分享必须恢复相同安全投影。
+- 不设置全局 AI 对话框、悬浮机器人或“让 AI 帮我”入口。自动调查仅作为具备运行 ID、Grant、预算和审计的领域对象出现。
+
+#### 资产目录
+
+- 桌面采用高密度表格与约 440–480px 详情侧栏。
+- 标题区提供“发现同步”“批量导入”“添加资产”；其中手工添加必须说明只是登记可运维引用，不创建或接管外部资源。
+- 筛选包含关键字、资产类型、Service、Environment、来源、映射、生命周期、连接健康和 Capability；高频筛选直接展示，其余进入可清除的高级筛选区。
+- 表格展示名称/外部 ID、类型、Service/Environment、权威来源、映射、生命周期、连接健康、能力和最近观测；身份列与状态列在中等宽度冻结。
+- 筛选、排序、分页、选中资产写入 URL。
+- 单击行更新详情而不丢失列表上下文；双击或“在完整页打开”进入稳定详情路由。键盘支持上下移动、Enter 打开、Escape 关闭侧栏。
+- 详情标签为概览、连接、能力、关系、审计。概览固定展示身份与字段来源、组件组成、已发布 Target、能力门禁、连接健康、Runtime digest 和绝对观测时间。
+- `STALE`、`QUARANTINED`、`AMBIGUOUS`、`UNRESOLVED` 在详情顶部显示原因、影响和治理入口；不显示可直接调查的主按钮。
+- 窄屏改为独立详情路由，不压缩成不可读侧栏。
+
+#### 映射工作台
+
+- 左侧是按风险、来源、Service 和等待时长筛选的冲突/未解析队列；右侧并排展示权威来源事实、现有资产、候选关系与字段级 Provenance。
+- 系统建议只能作为候选，不得自动把 `AMBIGUOUS` 提升为 `EXACT`。确认操作必须展示比较键、作用域、将受影响的连接/策略数量和审计原因。
+- 支持“确认精确映射”“拒绝候选”“保持未解析”“隔离资产”；批量操作仅适用于比较键和目标完全一致的项目，并逐项产生审计结果。
+
+#### 连接与数据源
+
+- 列表展示 Provider、关联资产、已发布修订、健康、Capability 数量、Runner Realm、最近验证和最近发布者；列表状态不把修订状态与健康状态合并。
+- 详情包含安全连接投影、修订时间线、验证历史、Target/Capability、Runtime Publication、健康历史和审计。页面永不展示 Secret、Token、PEM、完整 DSN、Vault 内部路径或原始上游错误。
+
+#### 连接发布
+
+- 六步垂直步骤条：作用域与类型、端点与信任、凭据引用、能力与预算、受控验证、审阅并发布。
+- 每一步由 Provider 判别联合 Schema 驱动；字段具有持久 Label、约束说明和内联错误，不提供通用 JSON、任意 Header/Body、查询文本或运行时覆盖项。
+- 验证使用可恢复的异步 Operation，逐项展示目标身份、TLS/SNI/CA、Network Policy、短凭据签发/吊销、固定 Probe、输出 Schema、预算和 DLP 的安全结果。
+- 最终页同时展示安全连接投影、验证证据、Capability 与硬预算、修订差异、候选摘要、Runtime digest、受影响 Runner Realm、活动调查保持旧版本的说明和最近认证要求。
+- 发布要求填写变更原因并完成最近重新认证；发布后页面跳转到不可变修订，后续编辑必须明确创建下一修订。
+- 不显示通用 JSON、任意 Header/Body、Secret 或原始上游错误。
+
+#### 发现与同步
+
+- 来源列表展示类型、权威范围、同步方式、最近成功、当前游标、观测/新增/变化/冲突/失联计数与健康。
+- 手动同步创建异步 Source Run；详情以阶段时间线和安全计数展示结果，可进入冲突工作台，但不把外部 Payload 直接渲染到浏览器。
+- 新建来源仅选择已安装的 Provider、作用域、调度和 Opaque Credential Reference；连接测试与发布遵循与 Connection 相同的隔离验证边界。
+
+#### 凭据引用
+
+- 只展示稳定引用 ID、Issuer 类型、安全用途、适用 Scope、允许 Provider/Role、Owner、最近使用、到期/轮换状态和健康。
+- 浏览器不能创建、粘贴、复制或回显 Secret；所有“查看”动作只返回安全元数据。不可用、吊销不确定或越界引用必须提供稳定错误码和人工处置入口。
+
+#### Runner 与能力
+
+- Runner Realm 表展示 Mode、Adapter Family、Network Zone、Workspace/Environment、workload identity、证书到期、Scope Revision、心跳、承载的已发布摘要和 Kill Switch。
+- Capability 目录展示 Provider、Schema Version、输入参数类型、输出 Schema、硬预算、数据等级、支持的 Target/Realm 和门禁状态。
+- 页面只允许治理 Realm binding、证书轮换状态和发布门禁；不得提供任意 endpoint、命令、脚本、SQL、网络转发或临时扩大能力的编辑入口。
+
+#### 主动调查策略
+
+- 顶部摘要展示已发布/启用策略、今日运行、Shadow 数、平均耗时、证据量和预算拒绝；这些是运营统计，不作为装饰性大卡片。
+- 主列表展示策略与修订、事件/定时触发器、`SHADOW`/`READ_ONLY` 模式、最近/下次运行和状态；选中行在右侧打开详情并保留列表上下文。
+- 详情 Tab 为策略定义、运行记录、修订和审计；固定展示“触发 → 解析资产 → 签发 Grant → Runner 调查 → Evidence/ActionPlan 提案”的完整运行链。
+- 资产选择器必须提供 Preview，显示总数、被排除项及原因，并在运行后展示不可变 Snapshot digest；Capability 列表显示模式与摘要。
+- Grant 区同时展示有效期、工具调用、单源并发、证据字节、模型预算和凭据 TTL；六级 Kill Switch 逐级显示有效状态与修订。
+- 最近运行表展示 Grant、触发源、资产快照、调用/证据/凭据吊销摘要、结束时间和独立结果；`PARTIAL`、预算耗尽、DLP、漂移和撤销不确定各有独立详情。
+- 文案使用“主动调查”“系统调查运行”“Runner 与能力”，不显示“Agent 已登录服务器”。
+
+#### 事件处置工作区
+
+- Incident 是调查、Evidence、根因、ActionPlan、审批和执行证明的聚合视图；顶部固定展示严重度、状态、编号、创建时间、Owner 和 Scope。
+- 主 Tab 为调查概览、证据、处置计划和审计。概览采用证据优先的两栏布局：左侧关键指标/日志/Trace 与根因判定，右侧展示不可变计划及门禁。
+- 写操作区域必须同时显示计划摘要、精确目标、策略结果、审批主体、短期凭据状态和执行前校验；计划哈希改变立即使审批失效。
+- 时间线以 Actor 类型区分人类、Scheduler、Control Worker、Runner 和外部系统，不使用聊天气泡；不确定结果以醒目结构提示“已停止并升级人工”。
+
+### 14.3 通用交互与状态
+
+- 首次加载使用保持表格列宽和页面结构的 Skeleton；空状态说明为何为空并给出有权限的下一步；错误状态保留筛选上下文和 Trace ID。
+- 数据陈旧、部分成功、权限不足、重新认证、异步处理中、DLP 拒绝、预算耗尽、Kill Switch、撤销不确定分别使用独立组件，不能退化成一个红色 Toast。
+- Toast 只用于低风险、可撤销的完成反馈；发布、撤销、隔离、停止和策略启停在操作附近展示持久结果与审计 ID。
+- 所有长任务使用 Operation ID、阶段、开始时间、最新心跳和可安全执行的取消/重试动作；页面刷新或重连后继续展示同一 Operation。
+- 生产发布、Grant 撤销、Kill Switch、资产隔离和策略启用要求确认影响范围；需要最近认证时先保存安全草稿，再进入 OIDC 流程。
+- 乐观更新只用于本地筛选、展开和无安全语义的偏好；治理状态以服务端确认结果为准。`ETag` 冲突展示字段差异并要求重新审阅。
+- 时间默认显示本地时区相对值，同时通过 Tooltip/可访问文本提供带时区的绝对时间；ID、Revision、Digest 和 Error Code 支持安全复制。
+
+### 14.4 视觉系统
+
+```css
+--color-bg: #F4F6F8;
+--color-surface: #FFFFFF;
+--color-nav: #17212B;
+--color-text: #17202A;
+--color-muted: #52606D;
+--color-border: #D7DDE3;
+--color-primary: #1F5EA8;
+--color-success: #287A4B;
+--color-warning: #9A5B0A;
+--color-danger: #B42318;
+```
+
+- 4px 间距基线、32px 常规控件、36–40px 表格行、4–6px 圆角。
+- 字体优先使用系统 UI 字体栈：`Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif`；正文 13–14px，表格 12–13px，页面标题 22–24px，行高不低于 1.4。
+- 领域导航宽 216–224px，详情侧栏宽 440–480px，内容最大宽度由数据表决定而非营销页栅格；桌面页面左右留白通常为 20–24px。
+- 阴影仅用于真实浮层；页面分层主要使用边界和背景。
+- 图标使用 16–18px 单色线性图标并带文本；图表采用低饱和序列色、清晰轴线、阈值和事件标记，不使用渐变面积、发光或 3D。
+- ID、Digest、证书指纹、绝对时间使用等宽字体。
+- 状态同时使用文字、图标和结构，颜色不能是唯一载体。
+- Hover、选中、Focus 和禁用状态分别定义；键盘 Focus 使用至少 2px 可见轮廓。过渡控制在 120–180ms，并遵循 Reduced Motion。
+
+### 14.5 响应式与无障碍
+
+- `≥1440px`：完整导航、表格和详情侧栏。
+- `1024–1439px`：折叠次要筛选，表格冻结身份/状态列。
+- `768–1023px`：详情使用独立路由，双栏降为单栏。
+- `<768px`：支持查询、筛选、查看健康、停止与升级人工；高风险治理操作要求桌面完成。
+- 满足 WCAG 2.2 AA、可见焦点、键盘顺序、持久 Label、图标可访问名称、Reduced Motion 和 44px 触控目标。
+
+## 15. 正交状态模型
+
+| 维度 | 状态 |
+|---|---|
+| 映射 | `EXACT / AMBIGUOUS / UNRESOLVED` |
+| 资产生命周期 | `DISCOVERED / ACTIVE / STALE / QUARANTINED / RETIRED` |
+| 连接修订 | `DRAFT / VALIDATING / VALIDATED / REJECTED / PUBLISHED / REVOKED / SUPERSEDED` |
+| 连接健康 | `UNKNOWN / CHECKING / HEALTHY / DEGRADED / UNREACHABLE / AUTH_FAILED / PERMISSION_DENIED / TLS_FAILED / RATE_LIMITED / STALE` |
+| Runtime 发布 | `PENDING / APPLYING / APPLIED / FAILED / DRIFTED / ROLLED_BACK` |
+| Capability | `AVAILABLE / PROPOSAL_ONLY / NON_PRODUCTION_ONLY / CLOSED_BY_GATE / UNSUPPORTED` |
+| Grant | `ISSUED / ACTIVE / COMPLETED / EXPIRED / REVOKED / FAILED` |
+| 主动策略 | `DRAFT / SHADOW / READ_ONLY / DISABLED / SUPERSEDED` |
+| 主动运行 | `QUEUED / RESOLVING / GRANTED / RUNNING / PARTIAL / COMPLETED / FAILED / STOPPED` |
+
+前端不得把这些维度合并成一个“状态”。
+
+## 16. 错误与停止条件
+
+稳定错误码至少包括：
+
+```text
+ASSET_SOURCE_CONFLICT
+ASSET_MAPPING_NOT_EXACT
+ASSET_STALE
+ASSET_QUARANTINED
+CONNECTION_REVISION_NOT_VALIDATED
+CONNECTION_IDENTITY_MISMATCH
+TARGET_DIGEST_MISMATCH
+RUNTIME_PUBLICATION_NOT_READY
+CREDENTIAL_REFERENCE_UNAVAILABLE
+CREDENTIAL_REVOCATION_INCOMPLETE
+GRANT_EXPIRED
+GRANT_REVOKED
+GRANT_SCOPE_MISMATCH
+BUDGET_EXHAUSTED
+KILL_SWITCH_CLOSED
+DLP_REJECTED
+RESULT_SCHEMA_REJECTED
+UPSTREAM_UNAVAILABLE
+```
+
+以下情况必须停止，不允许隐式重试副作用：
+
+- 资产、Target、Capability、Runtime 或 Grant 摘要漂移。
+- 凭据签发、使用或吊销结果不确定。
+- 映射不再 `EXACT` 或资产进入 `STALE/QUARANTINED`。
+- DLP、Schema、大小、时间、调用次数或并发预算拒绝。
+- 任一级 Kill Switch 关闭。
+- Runner 身份、证书、Realm 或 Scope Revision 不匹配。
+
+## 17. 审计与可观测性
+
+每次运行必须关联：
+
+- 人类 Subject 或 Scheduler Policy。
+- Incident/Trigger、Model Run、Prompt/Schema Version。
+- Asset、Connection、Target、Capability、Grant、Runtime digest。
+- Control Worker 与 Runner workload identity、证书摘要和 Scope Revision。
+- 凭据签发、使用、吊销状态。
+- Query/Probe ID、输入 Hash、结果项/字节/截断/DLP 摘要。
+- Evidence、Receipt 与 Audit chain hash。
+
+禁止在审计中存储 Secret、SQL/上游错误正文、完整查询结果、内部 endpoint 或客户敏感数据。
+
+新增平台指标：
+
+```text
+asset_sync_runs_total
+asset_conflicts_total
+assets_by_lifecycle
+connection_validation_total
+connection_health_by_code
+runtime_publication_total
+investigation_grants_total
+grant_denials_by_reason
+proactive_runs_total
+proactive_budget_exhaustions_total
+credential_cleanup_failures_total
+dlp_rejections_total
+```
+
+## 18. 威胁模型重点
+
+1. 资产目录投毒导致跨 Workspace 或生产目标重绑。
+2. 任意 Endpoint、SSH Tunnel 或通用 TCP 形成 SSRF/横向移动。
+3. 日志、Trace 或数据库内容提示注入诱导模型扩大能力。
+4. Secret 经模型、API、Evidence、Temporal History、日志或错误泄露。
+5. 只读数据库角色读取超出数据等级的客户信息或调用有副作用函数。
+6. Host Probe 参数逃逸为命令或脚本。
+7. 主动策略形成长期权限、资源风暴或持续数据外流。
+8. 人类授权、Scheduler 与 workload 身份未同时绑定导致 confused deputy。
+9. 管理态更新与运行时之间发生 TOCTOU。
+10. 无法区分 requester、approver、scheduler、model 与 Runner 的审计归因。
+
+## 19. 测试与验收
+
+### 19.1 领域与数据库
+
+- 所有复合外键拒绝跨 Tenant/Workspace/Environment 关系。
+- 来源重复、冲突、乱序同步、漏报与恢复均确定性处理。
+- 不可变修订、发布和 Grant 拒绝 UPDATE/摘要漂移。
+- 并发发布、ETag 冲突、重复 Idempotency-Key 不产生双发布。
+- `STALE/QUARANTINED` 资产不能获得新 Grant。
+
+### 19.2 连接与 Runner
+
+- 未验证修订、错误 TLS/SNI/CA、错误 Network Policy 和错误 Realm 全部 fail closed。
+- Task/模型/Runner 不能覆盖 endpoint、Target、Capability、租户、查询或预算。
+- Credential TTL 始终不超过 Grant/Lease，完成、取消、超时与崩溃均进入持久吊销。
+- 新发布不改变活动调查；新 Grant 才能引用新 Runtime Bundle。
+- VictoriaMetrics、VictoriaLogs、VictoriaTraces 响应均经过独立 Schema 和预算验证。
+
+### 19.3 主机与数据库负向测试
+
+- 拒绝 Shell 元字符、argv/env、路径逃逸、PTY、转发、任意脚本。
+- 拒绝任意 SQL、多语句、DDL/DML、`COPY`、函数、扩展和超时覆盖。
+- DLP 命中、行/字节/时间上限和只读事务失效均停止调查。
+
+### 19.4 主动调查
+
+- 事件与定时触发均产生独立 Asset Snapshot 和 Grant。
+- 同资产频率限制、并发、工具次数、证据字节、模型预算和总时长准确执行。
+- 六级 Kill Switch 任一级关闭均阻止新 Claim。
+- `SHADOW` 不访问目标；`READ_ONLY` 不产生写执行。
+- ActionPlan 提案不能复用 READ Grant 或 READ Credential。
+
+### 19.5 前端
+
+- OpenAPI 合同、TypeScript、组件、MSW、Playwright 与 axe 全部通过。
+- 1440px、1024px、390px 视觉回归覆盖中文、英文和长文本。
+- URL 保存筛选/排序/分页/选中项，刷新与分享可恢复相同视图。
+- 无权限、重新认证、部分成功、数据陈旧、DLP、预算耗尽、Kill Switch 和撤销不确定均有独立状态。
+- 浏览器响应和日志中不存在 Secret、Token、PEM、DSN 或 Vault 内部路径。
+
+### 19.6 端到端验收场景
+
+1. 从 Kubernetes Operator 发现 `VMCluster`、`VLCluster`、`VTCluster` 及组件。
+2. 治理人员确认来源、Service Binding 和 `EXACT` 映射。
+3. 创建 VictoriaTraces Connection Revision，受控验证通过并发布新的 Runtime Bundle `N+1`。
+4. 已运行的 Investigation 继续固定旧 Bundle `N`；新调查才使用 `N+1`。
+5. 告警或定时策略解析 23 项资产并创建五分钟 Grant。
+6. Runner 执行 Metrics、Logs、Traces、Host 和 PostgreSQL 固定只读能力。
+7. 输出通过 Schema、预算、DLP 后形成 Evidence；凭据完成持久吊销。
+8. 系统只生成 ActionPlan 提案；生产写仍等待独立策略和人工审批。
+9. 任意资产漂移、凭据异常或 `UNCERTAIN` 均停止并进入人工处理。
+
+## 20. 迁移与交付拆分
+
+本设计包含多个可独立验收子系统，不应放入一个超大实现计划。后续按以下顺序分别生成 Superpowers 实施计划：
+
+1. **资产目录与发现投影**：领域、迁移、Repository、OpenAPI、只读页面和映射工作台。
+2. **连接修订与 Runtime 发布**：Connection、Validation、Target/Capability Compiler、凭据安全投影和发布页面。
+3. **VictoriaMetrics 全家桶**：Operator 发现、Metrics/Logs/Traces 类型化 Target、Capability 和 Evidence Schema。
+4. **InvestigationGrant 与主动策略**：授权、Scheduler、Kill Switch、预算、运行页面和审计。
+5. **主机与 PostgreSQL 只读诊断**：Host Probe/AWX、PostgreSQL Target、READ Credential 与 DLP。
+6. **平台治理与试点**：Runner Realm、生产 Shadow、可观测性、备份恢复和安全演练。
+
+每个子计划都必须按“数据库/领域 → Control Plane API → 前端页面 → 审计与安全测试 → 端到端验收”的纵向切片交付，不能先连续建设全部后端再集中补前端。第一个子计划同时建立前端工程骨架、应用壳层、设计 Token、合同生成、MSW 和 Playwright/axe 基线；后续页面复用同一体系，不再创建新的视觉分支。
+
+迁移兼容规则：
+
+- 保留现有 `services`、`service_bindings`、`integrations`；已知字段显式迁移，不解释未知 JSONB 为运行能力。
+- 初期 Runtime 仍可从现有安全 Manifest 文件加载；数据库发布编译器通过相同接口生成等价 Snapshot。
+- 新 API 和页面默认只读启用；发布、主动调查和数据库诊断按门禁逐阶段开放。
+- 任何阶段都不得提前开放生产写。
+
+## 21. 非目标
+
+- 建设第二套全量 CMDB、数字孪生或资产生命周期主控系统。
+- 通用 Web Terminal、交互 SSH/WinRM、PTY、端口转发或 SFTP。
+- 任意 SQL、数据库控制台、动态 DSN 或数据库写入。
+- Agent 获取长期或可续期凭据。
+- 模型选择 Endpoint、Credential、Network、Runner 或任意工具参数。
+- 主动策略直接执行生产变更。
+- 将 VictoriaMetrics ingestion endpoint 暴露为 Agent 写能力。
+
+## 22. 文档持久化要求
+
+实施时同步新增或修订：
+
+- `docs/status/current.md`：项目唯一完成度事实源。
+- `docs/architecture/implementation-blueprint-v4.md`：吸收本设计并明确 V3 的继承/替代关系。
+- `docs/adr/`：资产目录覆盖层、连接编译发布、短期 Grant、远程诊断边界、数据库只读、READ 凭据隔离、主动策略和 Evidence/DLP。
+- `docs/design/frontend/`：资产、连接、主动调查页面、状态、权限、响应式和视觉基线。
+- `api/openapi/control-plane-v1.yaml`：Control Plane 公共契约。
+- `AGENTS.md`：规定未来任务必须先读取状态、V4、ADR、活动计划与前端规范。
+
+本规范在用户完成书面复核后，作为后续分阶段实施计划的产品与架构输入。
