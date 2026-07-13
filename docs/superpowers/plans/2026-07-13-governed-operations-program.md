@@ -60,6 +60,8 @@ The detailed plans own all code-level TDD steps. This program file owns ordering
 
 Cross-plan identifiers are UUIDs on persistence/API boundaries. Content-addressed objects use lowercase 64-character SHA-256 hex digests. Public JSON uses `snake_case`; Go exported fields use `PascalCase`; frontend TypeScript consumes generated OpenAPI types rather than handwritten duplicate DTOs.
 
+Phase 1 的稳定接口进一步锁定：Source/Asset revision 使用 `int64`；`asset_source_revisions.canonical_revision_digest` 就是覆盖完整不可变可用性绑定的 `BindingDigest`，`source_definition_digest` 仅表示 Provider definition；资产类型在 `000015` 以命名闭集约束 `assets_kind_check` 建立并由 `000017` 扩展；跨 Environment Relationship 显式携带 source/target Environment；Binding 软删除状态为 `INACTIVE`；所有 Mapping mutation 都返回持久 `MutationReceipt`。后续任务包只能消费这些定义，不得重定义平行 DTO、摘要语义或软删除状态。
+
 ## Program State Machine
 
 ```text

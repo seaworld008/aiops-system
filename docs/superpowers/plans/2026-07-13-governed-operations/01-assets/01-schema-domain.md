@@ -40,6 +40,9 @@
 - Create: **internal/assetcatalog/postgres/migration_test.go**
 - Create: **internal/assetcatalog/postgres/migration_integration_test.go**
 - Create: **internal/assetcatalog/postgres/migration_recovery_integration_test.go**
+- Create: **internal/assetcatalog/postgres/recovery_container_test.go**
+- Create: **internal/assetcatalog/postgres/schema_admission.go**
+- Create: **internal/assetcatalog/postgres/schema_admission_test.go**
 - Modify: **Makefile**
 
 **Interfaces:**
@@ -119,12 +122,12 @@ Expected: FAIL because both 000015 files are missing.
 
 - [ ] **Step 2: Implement the transactional up migration with this exact schema**
 
-Start with `BEGIN; SET LOCAL lock_timeout='5s';` and lock `tenants, workspaces, environments, integrations, services, audit_records, outbox_events` in access-exclusive order so concurrent schema changes cannot interleave.
+Start with `BEGIN; SET LOCAL lock_timeout='5s';` and lock `tenants, workspaces, environments, integrations, services, service_bindings, audit_records, outbox_events` in access-exclusive order so concurrent schema changes cannot interleave and the new binding-eligibility FK never relies on an implicit referenced-table DDL lock.
 
 | Table | Required columns and exact purpose |
 |---|---|
-| `asset_sources` | 稳定 UUID 身份/Workspace Scope；`source_kind/provider_kind/name/status` 与 `published_revision/published_revision_digest`；正交 `gate_status/gate_reason_code/gate_revision/validated_run_id/validation_digest`；加密当前 checkpoint (`checkpoint_ciphertext/checkpoint_key_id/checkpoint_sha256/checkpoint_version/checkpoint_revision`)；HA backpressure (`next_allowed_at/consecutive_failures`)；创建幂等/hash、version、last success、timestamps |
-| `asset_source_revisions` | 复合 Scope + stable source + monotonically increasing revision；`DRAFT/VALIDATING/VALIDATED/REJECTED/PUBLISHED/SUPERSEDED`；content-addressed canonical provider schema；`integration_id/sync_mode/authority_scope_digest/source_definition_digest`；opaque `credential_reference_id/trust_reference_id/network_policy_reference_id`；固定 rate/backpressure/profile/schedule；validation run/digest；actor/reason/CAS/time；发布后内容不可变 |
+| `asset_sources` | 稳定 UUID 身份/Workspace Scope；`source_kind/provider_kind/name/status` 与 `published_revision/published_revision_digest`；正交 `gate_status/gate_reason_code/gate_revision/validated_run_id/validation_digest/validated_binding_digest`；加密当前 checkpoint (`checkpoint_ciphertext/checkpoint_key_id/checkpoint_sha256/checkpoint_version/checkpoint_revision`)；HA backpressure (`next_allowed_at/consecutive_failures`)；创建幂等/hash、version、last success、timestamps |
+| `asset_source_revisions` | 复合 Scope + stable source + monotonically increasing revision；`DRAFT/VALIDATING/VALIDATED/REJECTED/PUBLISHED/SUPERSEDED`；content-addressed canonical provider schema；`integration_id/sync_mode/authority_scope_digest/source_definition_digest`；opaque `credential_reference_id/trust_reference_id/network_policy_reference_id`；固定 rate/backpressure/profile/schedule；完整 availability binding 的 `canonical_revision_digest`；validation run/digest；actor/reason/CAS/time；创建后 canonical content 不可变 |
 | `asset_source_runs` | source scope + exact source revision/digest; `run_kind/status/trigger_type`; definition/gate revision; idempotency/hash; cursor before/after SHA; page sequence/digest; lease owner/expiry, monotonically increasing `fence_epoch`, token hash, heartbeat sequence and `not_before`; observed/created/changed/unchanged/conflict/missing/rejected counts; stable failure code/trace; start/heartbeat/complete |
 | `asset_observations` | full scope/source/run; provider/external/source revision; observed/schema version; normalized document bytea + SHA; bounded field-provenance bytea + SHA; explicit tombstone flag/reason code; created time |
 | `assets` | full scope/source; provider/external/kind/display; governance fields; lifecycle/mapping; last observation/time/source revision; create idempotency/hash; version/timestamps |
@@ -148,16 +151,18 @@ trigger_type: HUMAN API SCHEDULED
 asset lifecycle: DISCOVERED ACTIVE STALE QUARANTINED RETIRED
 mapping: EXACT AMBIGUOUS UNRESOLVED
 criticality: LOW MEDIUM HIGH CRITICAL
-classification: PUBLIC INTERNAL CONFIDENTIAL RESTRICTED
+data classification: PUBLIC INTERNAL CONFIDENTIAL RESTRICTED
 conflict status: OPEN RESOLVED REJECTED
 resolution: CONFIRM_EXACT REJECT_CANDIDATE KEEP_UNRESOLVED QUARANTINE_ASSET
 relationship: RUNS_ON CONTAINS DEPENDS_ON MONITORED_BY LOGS_TO TRACES_TO
               DELIVERED_BY MANAGED_BY PRIMARY_RUNTIME_FOR
+relationship status: ACTIVE INACTIVE
 binding role: PRIMARY_RUNTIME DEPENDENCY OBSERVABILITY_SOURCE DELIVERY_TARGET MANAGED_TARGET
+binding status: ACTIVE INACTIVE
 provenance: MANUAL DISCOVERED MERGE_DECISION
 ~~~
 
-Use composite foreign keys for every parent. `service_asset_bindings` must additionally verify through Repository that the Service has the selected Environment binding because the legacy `services` candidate key is Workspace-scoped.
+Use composite foreign keys for every parent. `service_asset_bindings` must additionally use `(service_id,environment_id) -> service_bindings(service_id,environment_id)` and Repository validation to prove the Service is bound to the selected Environment; separate Service/Environment Workspace FKs do not replace this eligibility edge. `assets.last_source_revision` references the exact Source Revision, and its current Observation FK includes Environment, Source, Provider and Source Revision so a projection cannot bind cross-Environment or drifted facts.
 
 `asset_conflicts.asset_id` and `candidate_asset_id` reference `(tenant_id,workspace_id,environment_id,id)`; `candidate_service_id` references `(tenant_id,workspace_id,id)`. A shape check requires at least one candidate target or a field-level conflict hash, and an open-partial unique index prevents duplicate `(source_id,observation_id,conflict_type,field_name,candidate_asset_id,candidate_service_id)` queue items.
 
@@ -184,7 +189,7 @@ WHERE resource_type IN (
 
 For asset-management audit rows only, `audit_records.request_id` is the validated Idempotency-Key and `payload_hash` is the canonical request SHA-256. The Repository takes `pg_advisory_xact_lock` on a stable Workspace+key digest, checks this partial-unique ledger before mutation, returns the scoped resource on matching replay, and rejects a reused key/hash or operation. This preserves every historical write key without a ninth table and remains safe across replicas. Transport request ID remains in structured logs; Trace ID remains in `trace_id`.
 
-All idempotency uniqueness is `(workspace_id,idempotency_key)`; request hashes are exactly 64 lowercase hex. JSON labels must be an object ≤16 KiB and ≤64 pairs (application validation enforces pair count); normalized/details bytea are canonical JSON bytes 2–64 KiB with:
+All idempotency uniqueness is `(workspace_id,idempotency_key)`; Idempotency-Key uses `^[a-z0-9][a-z0-9._:/-]{0,127}$`; request hashes are exactly 64 lowercase hex. JSON labels must be an object ≤16 KiB and ≤64 pairs (application validation enforces pair count); normalized/details bytea are RFC 8785 canonical JSON bytes 2–64 KiB with database-enforced UTF-8 object shape and unique keys:
 
 ~~~sql
 CHECK (
@@ -194,13 +199,13 @@ CHECK (
 );
 ~~~
 
-`field_provenance` is canonical JSON ≤32 KiB and contains only allow-listed field codes, `source_id`, `provider_kind`, `source_revision`, observation time, confidence and ownership (`SOURCE|GOVERNANCE|MERGE_DECISION`); it cannot carry raw provider paths or values. `checkpoint_ciphertext` is AES-256-GCM ciphertext only, its AAD is `(tenant_id,workspace_id,source_id,provider_kind,source_definition_digest,checkpoint_version)` and `checkpoint_key_id` is an opaque key reference. The database never stores a plaintext provider cursor, raw lease token, credential material, endpoint, CA PEM or source error body.
+`field_provenance` is canonical JSON ≤32 KiB with unique keys and contains only allow-listed field codes, `source_id`, `provider_kind`, `source_revision`, observation time, confidence and ownership (`SOURCE|GOVERNANCE|MERGE_DECISION`); it cannot carry raw provider paths or values. `checkpoint_ciphertext` is the versioned AES-256-GCM envelope `0x01 || 12-byte non-zero nonce || ciphertext || 16-byte tag`; its AAD is `(tenant_id,workspace_id,source_id,provider_kind,source_definition_digest,checkpoint_version)` and `checkpoint_key_id` is an opaque key reference. The database validates envelope shape/hash while the Repository performs authenticated encryption/decryption and AAD verification. The database never stores a plaintext provider cursor, raw lease token, credential material, endpoint, CA PEM or source error body.
 
-`asset_source_revisions` 的 canonical content 在创建后不可修改；状态只能 `DRAFT→VALIDATING→VALIDATED|REJECTED`、`VALIDATED→PUBLISHED`、`PUBLISHED→SUPERSEDED`。每个 source 最多一个 `PUBLISHED`，发布新修订必须在同一事务更新 stable source pointer、supersede 旧修订、清空不兼容 checkpoint 并关闭 gate。
+`asset_source_revisions` 的 canonical content 在创建后不可修改；状态只能 `DRAFT|REJECTED→VALIDATING→VALIDATED|REJECTED`、`VALIDATED→PUBLISHED`、`PUBLISHED→SUPERSEDED`。每次重试创建新的 append-only Validation Run；`REJECTED` 不能直接发布。Revision insert 必须在锁定 stable Source 后满足 `revision=max+1` 与 `expected_source_version=current source.version`，并原子推进 Source version。每个 source 最多一个 `PUBLISHED`，发布新修订必须在同一事务更新 stable source pointer、supersede 旧修订、清空不兼容 checkpoint 并关闭 gate。
 
-`asset_sources.gate_status='AVAILABLE'` is legal only when `status='ACTIVE'`, the exact published revision has a terminal `SUCCEEDED` validation run, `validation_digest` is lowercase SHA-256, and the validated definition/credential/trust/network/authority binding digest still equals the published revision digest. Any publication/reference drift atomically sets the gate back to `UNAVAILABLE`; ordinary discovery success cannot open it. `MANUAL` is served by the governed Asset API, while `KUBERNETES_OPERATOR` remains unavailable until Phase 3 publishes its provider contract.
+`asset_sources.gate_status='AVAILABLE'` is legal only when `status='ACTIVE'`, the exact published revision has traversed `QUEUED→RUNNING→SUCCEEDED`, `validation_digest` is lowercase SHA-256, and `validated_binding_digest = canonical_revision_digest = published_revision_digest`. The canonical digest covers the definition plus every immutable Integration/sync/Credential/Trust/Network/authority/rate/backpressure/profile/schedule binding; `source_definition_digest` cannot satisfy this comparison. Any publication/reference drift atomically sets the gate back to `UNAVAILABLE`; ordinary discovery success cannot open it. `MANUAL` is served by the governed Asset API, while `KUBERNETES_OPERATOR` remains unavailable until Phase 3 publishes its provider contract.
 
-Every textual identity has non-empty, canonical-character and octet-length constraints: provider ≤64, external ID ≤512, display/name ≤256, owner/actor/reason/revision/schema/idempotency/trace within their domain maxima. Reject NUL/CR/LF. Count checks are non-negative. Run shape requires queued=no times, running=start+heartbeat/no complete, terminal=complete. Conflict shape requires OPEN=no decision and closed=complete decision.
+Every textual identity has non-empty, trimmed canonical-character and octet-length constraints: ProviderKind matches `^[A-Z][A-Z0-9_]{0,63}$`, external ID ≤512, display/name ≤256, owner/actor/reason/revision/schema/idempotency/trace within their domain maxima. Reject NUL/CR/LF. `assets_kind_check` is a named closed constraint containing exactly the 17 Phase 1 Kind values. Count checks are non-negative. Run shape requires queued=no times/results/lease, running=start+heartbeat/no complete, terminal=complete. Conflict shape requires OPEN=no decision and closed=complete decision.
 
 - [ ] **Step 3: Add immutable and lifecycle database guards**
 
@@ -220,7 +225,7 @@ BEFORE UPDATE OR DELETE ON asset_type_details
 FOR EACH ROW EXECUTE FUNCTION reject_asset_catalog_immutable();
 ~~~
 
-`assets_transition_guard` must make tenant/workspace/environment/source/provider/external/kind immutable, require `NEW.version=OLD.version+1`, set `updated_at=statement_timestamp()`, reject leaving RETIRED with message `retired asset is terminal`, and allow only:
+`assets_transition_guard` must reject physical DELETE, make tenant/workspace/environment/source/provider/external/kind immutable, require `NEW.version=OLD.version+1`, set `updated_at=statement_timestamp()`, reject leaving RETIRED with message `retired asset is terminal`, and allow only:
 
 ~~~text
 DISCOVERED -> ACTIVE | QUARANTINED | RETIRED
@@ -231,26 +236,31 @@ QUARANTINED -> ACTIVE | RETIRED
 
 Create indexes for default catalog `(tenant,workspace,environment,lower(display_name),id) WHERE lifecycle<>'RETIRED'`, filters `(kind,lifecycle,mapping_status,id)`, open conflicts `(created_at,id)`, and source runs `(source_id,created_at DESC,id DESC)`. End with `COMMIT`.
 
-Create the HA claim index on queued runs `(not_before,created_at,id) WHERE status='QUEUED'`, the expired-lease reclaim index `(lease_expires_at,id) WHERE status='RUNNING'`, and a partial unique index allowing at most one live run per source. Add guards that reject a raw fence token (`fence_token_hash` must be 64 lowercase hex), reject checkpoint version regression, reject terminal run lease mutation, and require every successful page/checkpoint advance to increase both `page_sequence` and source `checkpoint_version` exactly once.
+Create the HA claim index on queued runs `(not_before,created_at,id) WHERE status='QUEUED'`, the expired-lease reclaim index `(lease_expires_at,id) WHERE status='RUNNING'`, and a partial unique index allowing at most one live run per source. A Validation Run starts with checkpoint version zero; a Discovery/Import/Ingestion Run starts from the Source's exact current checkpoint version/hash. Claim or reclaim that changes lease owner/token must advance `fence_epoch` exactly once and establish a new heartbeat; ordinary heartbeat/lease extension must advance heartbeat sequence/time. QUEUED rows cannot receive counters, proof, pages or completion facts without Claim, terminal rows are immutable, and every successful page/checkpoint advance increases both Run page/checkpoint and Source checkpoint version exactly once. Add row-level `BEFORE DELETE` and statement-level `BEFORE TRUNCATE` rejection to all nine tables; lifecycle/status transitions are the only removal path.
 
 - [ ] **Step 4: Implement guarded down and online-compatibility checks**
 
 Down begins a transaction, locks all nine tables child-first, and raises SQLSTATE `55000` with exact message `unsafe asset catalog rollback: catalog state remains` if any row exists. Only empty tables may drop `asset_management_idempotency_audit_uk`, then the nine tables child-first and their triggers/functions.
 
-Add a test that a binary aware only of 000014 continues health/session reads while 000015 exists, and a new binary returns `503 asset_catalog_unavailable` until migration version 15 is visible. The up migration must not rewrite existing large tables or add a defaulted column to them.
+Add a production `schema_admission.go` probe consumed later by Control Plane assembly. Test that a binary aware only of 000014 continues health/session reads while 000015 exists, while the new production probe returns stable `asset_catalog_unavailable` until all 000015 relations/constraints are visible; Pack 03 maps that sentinel to HTTP 503. The up migration must not rewrite existing large tables or add a defaulted column to them.
 
 - [ ] **Step 5: Add real PostgreSQL scope, immutability, concurrency, and recovery tests**
 
 The integration harness applies 000001–000015 in a temporary database, asserts server major 18, seeds two tenants/workspaces/environments, then proves:
 
 - cross-scope FK insert returns `23503`;
+- unknown Asset Kind, non-canonical Idempotency-Key, untrimmed identity and duplicate-key JSON return `23514`;
+- Observation/Asset Provider, Source Revision and Environment drift plus an unbound Service/Environment return `23503`;
 - Observation/Type Detail update/delete returns `55000`;
+- physical DELETE of every remaining catalog table and TRUNCATE of every catalog table return `55000`;
 - DISCOVERED→STALE returns `23514`; valid transitions increment exactly once;
 - retired recovery and identity reparenting return `55000`;
 - duplicate dedupe/idempotency/active edge/binding are rejected;
 - bad hash/oversized JSON/bad terminal shapes are rejected;
-- plaintext checkpoint, raw fence token, invalid provenance code, stale fence and checkpoint regression are rejected;
-- a source gate cannot become `AVAILABLE` without a matching successful validation run and becomes `UNAVAILABLE` on any bound-reference drift;
+- plaintext checkpoint, raw fence token, invalid/duplicate-key provenance, stale owner/fence and checkpoint regression are rejected;
+- two consecutive discovery runs advance the same Source checkpoint without resetting the second Run to zero;
+- non-monotonic Source Revision, stale Source CAS, direct terminal Run insert and revision/history DELETE are rejected;
+- a source gate cannot become `AVAILABLE` without a matching successful validation run and becomes `UNAVAILABLE` on any Credential/Trust/Network/authority/rate/backpressure/profile/schedule drift;
 - two concurrent lifecycle writes cannot both commit.
 
 Core assertion:
@@ -263,7 +273,7 @@ expectSQLState(t, database, "23514", `
 	WHERE id=$1 AND lifecycle='DISCOVERED'`, assetID)
 ~~~
 
-Recovery test takes a logical backup after inserting representative rows in all nine tables, restores into a clean PostgreSQL 18 instance, reapplies checksum verification, and asserts counts, FK closure, source-revision publication pointers, SHA equality, lifecycle/version and immutable triggers. It must use sanitized fixtures, never production data.
+Recovery test uses `recovery_container_test.go` to start two distinct PostgreSQL 18.4 instances from the same approved digest-pinned image as CI, verifies different `system_identifier` values and enabled data checksums, then streams a sanitized custom-format `pg_dump` archive into `pg_restore --single-transaction` on the clean target. It inserts representative rows in all nine tables plus their scoped Audit/Outbox links, reapplies checksum verification, and asserts counts, complete FK closure, source-revision publication pointers, SHA equality, lifecycle/version, Audit/Outbox linkage and immutable/delete triggers. Docker context is explicitly configurable or deterministically discovers one safe local Unix context; it rejects ambiguous/remote contexts and must not hard-code a developer-specific context, container, DSN host, user or database. During the required zero-Skip invocation, any missing Docker/image/context prerequisite fails rather than skips. It must use sanitized fixtures, never production data.
 
 Run:
 
@@ -290,7 +300,10 @@ Expected: PASS.
 git add migrations/000015_assets_catalog.up.sql migrations/000015_assets_catalog.down.sql \
   internal/assetcatalog/postgres/migration_test.go \
   internal/assetcatalog/postgres/migration_integration_test.go \
-  internal/assetcatalog/postgres/migration_recovery_integration_test.go Makefile
+  internal/assetcatalog/postgres/migration_recovery_integration_test.go \
+  internal/assetcatalog/postgres/recovery_container_test.go \
+  internal/assetcatalog/postgres/schema_admission.go \
+  internal/assetcatalog/postgres/schema_admission_test.go Makefile
 git commit -m "feat(assetcatalog): add production asset schema"
 ~~~
 
@@ -385,7 +398,7 @@ Expected: FAIL because domain types/functions do not exist.
 
 `Kind` constants are exactly: SERVICE、LINUX_VM、WINDOWS_VM、BARE_METAL_HOST、KUBERNETES_CLUSTER、KUBERNETES_NAMESPACE、KUBERNETES_WORKLOAD、DATABASE_INSTANCE、DATABASE、METRICS_SOURCE、LOG_SOURCE、TRACE_SOURCE、AWX_INVENTORY、ARGO_APPLICATION、CI_PIPELINE、GIT_REPOSITORY、CLOUD_RESOURCE.
 
-`SourceKind`、`Lifecycle`、`Criticality`、`DataClassification`、`RelationshipType`、`BindingRole` and `ConflictResolution` exactly match Task 1 vocabularies.
+`SourceKind`、`Lifecycle`、`Criticality`、`DataClassification`、`RelationshipType`、`RelationshipStatus`、`BindingRole`、`BindingStatus`、`Provenance` and `ConflictResolution` exactly match Task 1 vocabularies.
 
 ~~~go
 type Asset struct {
@@ -404,10 +417,28 @@ type Asset struct {
 	Labels             map[string]string
 	LastObservationID  string
 	LastObservedAt     time.Time
-	SourceRevision     string
+	LastSourceRevision int64
 	Version            int64
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
+}
+
+type Relationship struct {
+	ID                              string
+	TenantID                        string
+	WorkspaceID                     string
+	SourceEnvironmentID             string
+	TargetEnvironmentID             string
+	SourceAssetID                    string
+	TargetAssetID                    string
+	Type                            RelationshipType
+	Provenance                      Provenance
+	ProvenanceSourceID              string
+	CrossEnvironmentPolicyReferenceID string
+	Status                          RelationshipStatus
+	Version                         int64
+	CreatedAt                       time.Time
+	UpdatedAt                       time.Time
 }
 
 func (asset Asset) Clone() Asset {
@@ -465,12 +496,18 @@ type SourceRevision struct {
 	Status                   SourceRevisionStatus
 	SourceDefinitionDigest   string
 	CanonicalRevisionDigest  string
+	IntegrationID            string
+	SyncMode                 SyncMode
 	CredentialReferenceID    string
 	TrustReferenceID         string
 	NetworkPolicyReferenceID string
 	AuthorityScopeDigest     string
-	RateLimitProfile         string
-	Schedule                 string
+	RateLimitRequests        int64
+	RateLimitWindowSeconds   int64
+	BackpressureBaseSeconds  int64
+	BackpressureMaxSeconds   int64
+	ProfileCode              string
+	ScheduleExpression       string
 	ValidationRunID          string
 	ValidationDigest         string
 }
@@ -479,7 +516,7 @@ func (revision SourceRevision) BindingDigest() string
 func (source Source) Available(revision SourceRevision) bool
 ~~~
 
-`BindingDigest` hashes canonical Tenant/Workspace, stable source identity, revision, definition digest, opaque Credential/Trust/Network references, authority scope, rate profile and schedule; it never hashes secret values or runtime endpoint text. `Available` requires `ACTIVE + AVAILABLE`, a positive gate revision, the exact `PUBLISHED` revision/digest, a successful validated run, non-empty validation digest and exact binding-digest equality. `SourceRun` adds exact source revision/digest, `RunKind`, definition/gate revision, `PageSequence`, `PageDigest`, `NotBefore`, `LeaseExpiresAt`, `FenceEpoch`, `HeartbeatSequence`, checkpoint hashes and counts; public clones omit lease token hash, checkpoint ciphertext and provider runtime material.
+`BindingDigest` hashes canonical Tenant/Workspace, stable source identity, revision, definition digest, Integration/sync mode, opaque Credential/Trust/Network references, authority scope, all rate/backpressure/profile fields and schedule; it never hashes secret values or runtime endpoint text. Validation requires `revision.BindingDigest() == revision.CanonicalRevisionDigest`. `Available` requires `ACTIVE + AVAILABLE`, a positive gate revision, the exact `PUBLISHED` revision/digest, a successful validated run, non-empty validation digest and `source.ValidatedBindingDigest == revision.CanonicalRevisionDigest`. `SourceRun` adds exact source revision/digest, `RunKind`, definition/gate revision, `PageSequence`, `PageDigest`, `NotBefore`, `LeaseExpiresAt`, `FenceEpoch`, `HeartbeatSequence`, checkpoint hashes and counts; public clones omit lease token hash, checkpoint ciphertext and provider runtime material.
 
 Asset list sorting is a closed enum, not arbitrary SQL:
 
@@ -504,8 +541,9 @@ type AssetCursor struct {
 
 ~~~go
 var safeToken = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$`)
-var providerToken = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,63}$`)
+var providerToken = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 var labelKey = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
+var lowercaseRFC4122UUID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 func (scope Scope) Valid() bool {
 	return validUUID(scope.TenantID) &&
@@ -514,12 +552,11 @@ func (scope Scope) Valid() bool {
 }
 
 func validUUID(value string) bool {
-	parsed, err := uuid.Parse(value)
-	return err == nil && parsed.String() == value && value == strings.ToLower(value)
+	return lowercaseRFC4122UUID.MatchString(value)
 }
 ~~~
 
-Validation must use exhaustive switches (no default acceptance), enforce UTC microsecond time, versions >0, 64 labels/max 8KiB combined, trimmed strings, no NUL/CR/LF, and reject label keys containing normalized secret/token/password/credential/dsn/endpoint. Clone all maps/slices at boundaries.
+Validation must use exhaustive switches (no default acceptance), enforce non-zero UTC microsecond time, versions >0, at most 64 labels/max 16 KiB UTF-8 serialization, trimmed strings, no NUL/CR/LF, and reject label keys containing normalized secret/token/password/credential/dsn/endpoint. New IDs use `internal/ids.NewUUID`; Clone all maps/slices at boundaries.
 
 Stable errors: `ErrInvalidRequest`、`ErrNotFound`、`ErrScopeViolation`、`ErrVersionConflict`、`ErrStateConflict`、`ErrIdempotency`. They contain no database/provider text.
 
@@ -546,11 +583,16 @@ type AssetMutationResult struct {
 	Receipt MutationReceipt
 }
 
+type BindingMutationResult struct {
+	Binding ServiceAssetBinding
+	Receipt MutationReceipt
+}
+
 type MappingRepository interface {
 	ListRelationships(context.Context, ListRelationshipsRequest) (RelationshipPage, error)
 	ListBindings(context.Context, ListBindingsRequest) (BindingPage, error)
-	CreateBinding(context.Context, CreateBindingCommand) (ServiceAssetBinding, error)
-	DeleteBinding(context.Context, DeleteBindingCommand) error
+	CreateBinding(context.Context, CreateBindingCommand) (BindingMutationResult, error)
+	DeleteBinding(context.Context, DeleteBindingCommand) (MutationReceipt, error)
 	ListConflicts(context.Context, ListConflictsRequest) (ConflictPage, error)
 	ResolveConflict(context.Context, MappingDecision) (MappingDecisionResult, error)
 }

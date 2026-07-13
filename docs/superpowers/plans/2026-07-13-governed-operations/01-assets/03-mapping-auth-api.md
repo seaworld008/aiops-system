@@ -65,6 +65,9 @@ func TestResolveConflictConfirmExactCreatesOnlyRequestedBinding(t *testing.T) {
 		binding.MappingStatus != domain.MappingExact || binding.Status != "ACTIVE" {
 		t.Fatalf("binding = %#v", binding)
 	}
+	if result.Receipt.AuditID == "" || result.Receipt.TraceID != decision.TraceID || result.Receipt.IdempotentReplay {
+		t.Fatalf("mutation receipt = %#v", result.Receipt)
+	}
 	assertMappingSideEffects(t, database, fixture.ConflictID, 1, 1, 1)
 }
 
@@ -80,6 +83,18 @@ func TestResolveConflictRejectsCrossScopeServiceAndRollsBack(t *testing.T) {
 	}
 	assertMappingSideEffects(t, database, fixture.ConflictID, 0, 0, 0)
 }
+
+func TestResolveConflictRejectsServiceWithoutEnvironmentBindingAndRollsBack(t *testing.T) {
+	database := openAssetCatalogDatabase(t)
+	fixture := seedOpenConflictWithSameWorkspaceUnboundService(t, database)
+	repository := newAssetRepository(t, database)
+
+	_, err := repository.ResolveConflict(context.Background(), fixture.mappingDecision())
+	if !errors.Is(err, assetcatalog.ErrScopeViolation) {
+		t.Fatalf("ResolveConflict error = %v", err)
+	}
+	assertMappingSideEffects(t, database, fixture.ConflictID, 0, 0, 0)
+}
 ~~~
 
 Run: `go test ./internal/assetcatalog/postgres -run 'TestResolveConflict' -count=1`
@@ -90,16 +105,21 @@ Expected: FAIL because mapping repository methods do not exist.
 
 ~~~go
 type Relationship struct {
-	ID             string
-	Scope          Scope
-	FromAssetID    string
-	ToAssetID      string
-	Type           RelationshipType
-	SourceID       string
-	Confidence     int
-	Status         string
-	Version        int64
-	LastObservedAt time.Time
+	ID                                string
+	TenantID                          string
+	WorkspaceID                       string
+	SourceEnvironmentID               string
+	TargetEnvironmentID               string
+	SourceAssetID                      string
+	TargetAssetID                      string
+	Type                              RelationshipType
+	Provenance                        Provenance
+	ProvenanceSourceID                string
+	CrossEnvironmentPolicyReferenceID string
+	Status                            RelationshipStatus
+	Version                           int64
+	CreatedAt                         time.Time
+	UpdatedAt                         time.Time
 }
 
 type Conflict struct {
@@ -119,15 +139,21 @@ type Conflict struct {
 type MappingRepository interface {
 	ListRelationships(context.Context, ListRelationshipsRequest) (RelationshipPage, error)
 	ListBindings(context.Context, ListBindingsRequest) (BindingPage, error)
-	CreateBinding(context.Context, CreateBindingCommand) (ServiceAssetBinding, error)
-	DeleteBinding(context.Context, DeleteBindingCommand) error
+	CreateBinding(context.Context, CreateBindingCommand) (BindingMutationResult, error)
+	DeleteBinding(context.Context, DeleteBindingCommand) (MutationReceipt, error)
 	ListConflicts(context.Context, ListConflictsRequest) (ConflictPage, error)
 	ResolveConflict(context.Context, MappingDecision) (MappingDecisionResult, error)
+}
+
+type BindingMutationResult struct {
+	Binding ServiceAssetBinding
+	Receipt MutationReceipt
 }
 
 type MappingDecisionResult struct {
 	Conflict Conflict
 	Binding  *ServiceAssetBinding
+	Receipt  MutationReceipt
 }
 ~~~
 
@@ -144,22 +170,24 @@ The corresponding request/page types use the same `Scope`, maximum limit 100, an
 `ResolveConflict` must:
 
 1. Validate the action, binding role, service/asset UUIDs, reason, idempotency key/hash, expected conflict version, actor and UTC decision time.
-2. Begin `SERIALIZABLE`, lock conflict, candidate asset, and same-scope service in deterministic UUID order.
+2. Begin `SERIALIZABLE`, lock conflict, candidate asset, same-scope service and the exact `(service_id, environment_id)` legacy `service_bindings` eligibility row in deterministic UUID order. A same-Workspace Service without that Environment binding is a scope violation and the whole transaction rolls back.
 3. A resolved replay returns its binding only if idempotency key and request hash match; otherwise return `ErrIdempotency`.
-4. `CONFIRM_EXACT` requires a non-empty same-scope service and role, marks conflict `RESOLVED`, changes the asset mapping to `EXACT`, and inserts exactly one `ACTIVE` binding.
+4. `CONFIRM_EXACT` requires a non-empty same-scope service and role plus the locked Environment eligibility edge, marks conflict `RESOLVED`, changes the asset mapping to `EXACT`, and inserts exactly one `ACTIVE` binding.
 5. `REJECT_CANDIDATE` marks conflict `REJECTED`; no binding is created and the asset remains `UNRESOLVED` unless another open candidate exists, in which case it remains `AMBIGUOUS`.
 6. `KEEP_UNRESOLVED` marks the conflict `RESOLVED` with that resolution and sets the asset `UNRESOLVED`.
 7. `QUARANTINE_ASSET` closes the conflict, transitions the asset to `QUARANTINED`, and does not create a binding.
-8. Increment conflict/asset versions, insert an audit event and an `asset.conflict.resolved.v1` outbox event containing only IDs/resolution/version, then commit.
+8. Increment conflict/asset versions, insert an audit event and an `asset.conflict.resolved.v1` outbox event containing only IDs/resolution/version, then commit and return the persisted receipt. Identical replay returns the original Audit ID with `IdempotentReplay=true`; a zero-value or synthesized receipt is invalid.
 
-Standalone `CreateBinding` is permitted only for an already `EXACT` asset and the caller must provide the same explicit service, role, Idempotency-Key, request hash, and actor. It must not infer a primary runtime. `DeleteBinding` is a soft delete (`status=RETIRED`, version+1), requires both Idempotency-Key and If-Match, persists delete idempotency/audit identity, preserves history, and emits `service.asset.binding.removed.v1`.
+Standalone `CreateBinding` is permitted only for an already `EXACT` asset and the caller must provide the same explicit service, role, Idempotency-Key, request hash, and actor. It reuses and locks the same `(service_id,environment_id)` eligibility edge and must not infer a primary runtime. `CreateBinding` returns the Binding plus its durable receipt. `DeleteBinding` is a soft delete (`status=INACTIVE`, version+1), requires both Idempotency-Key and If-Match, persists delete idempotency/audit identity, preserves history, returns its durable receipt, and emits `service.asset.binding.removed.v1`.
+
+Add integration assertions for standalone create, delete and all three identical replays: create/decision results contain the committed Audit ID/Trace ID; delete exposes that same persisted receipt to the HTTP 204 header path; replay returns the original Audit ID with `IdempotentReplay=true` and never writes a second audit/outbox row.
 
 Use this composite-scope statement:
 
 ~~~sql
 INSERT INTO service_asset_bindings (
     id, tenant_id, workspace_id, environment_id, service_id, asset_id,
-    binding_role, mapping_status, provenance_type, status,
+    binding_role, mapping_status, provenance, status,
     idempotency_key, request_hash, version, created_at, updated_at
 )
 SELECT $1::uuid, a.tenant_id, a.workspace_id, a.environment_id,
@@ -307,14 +335,12 @@ type EffectiveAction string
 
 const (
 	ActionCreateAsset    EffectiveAction = "CREATE_ASSET"
-	ActionCreateSource   EffectiveAction = "CREATE_SOURCE"
 	ActionEditGovernance EffectiveAction = "EDIT_GOVERNANCE"
 	ActionQuarantine     EffectiveAction = "QUARANTINE"
 	ActionRetire         EffectiveAction = "RETIRE"
 	ActionCreateBinding  EffectiveAction = "CREATE_BINDING"
 	ActionDeleteBinding  EffectiveAction = "DELETE_BINDING"
 	ActionResolveConflict EffectiveAction = "RESOLVE_CONFLICT"
-	ActionSyncSource     EffectiveAction = "SYNC_SOURCE"
 )
 
 type AssetView struct {
@@ -349,7 +375,7 @@ Implement equivalent narrow interfaces for source, conflict, relation, and bindi
 
 For a principal whose only applicable role is `SERVICE_OWNER`, list/get queries must be constrained to `principal.ServiceIDs` through an ACTIVE Service Binding, and bind operations require the requested Service ID in that same set. Perform this inside the scoped Repository query/transaction, not by filtering an already-loaded cross-service page. Unauthorized direct IDs return the same non-enumerating projection as not-found.
 
-Source creation accepts only provider kind, display name, Integration ID, source kind, and sync mode. It never accepts endpoint, arbitrary headers, credentials, or raw source configuration. `RequestSync` enqueues an operation only; the Control Plane never performs source network I/O.
+This pack's Source manager is read-only (`ListSources/GetSource/GetSourceRun`) and returns no Source mutation action. Stable Source creation must atomically create revision 1 from an installed server-owned `SourceProfile`; validation, publication and `RequestSync` all depend on the complete immutable binding and therefore belong exclusively to Tasks 13–14 in [05-source-ingestion-csv-api.md](./05-source-ingestion-csv-api.md). Pack 03 must not implement a reduced create/sync path or accept ProviderKind/Integration/sync fields directly.
 
 - [ ] **Step 5: Run unit and race tests**
 
@@ -413,7 +439,6 @@ func TestControlPlaneContractHasExactAssetRoutes(t *testing.T) {
 		"/api/v1/workspaces/{workspace_id}/environments/{environment_id}/service-asset-bindings/{binding_id}",
 		"/api/v1/workspaces/{workspace_id}/asset-sources",
 		"/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}",
-		"/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}:sync",
 		"/api/v1/workspaces/{workspace_id}/asset-source-runs/{run_id}",
 		"/api/v1/workspaces/{workspace_id}/asset-conflicts",
 		"/api/v1/workspaces/{workspace_id}/asset-conflicts/{conflict_id}:resolve",
@@ -463,15 +488,15 @@ Expected: FAIL because `control-plane-v1.yaml` does not exist.
 
 Create a valid OpenAPI 3.1 document with `jsonSchemaDialect`, global OIDC security, UUID path parameters, signed Cursor/Limit, required Idempotency-Key/If-Match, RFC 9457 `Problem`, `PageMeta`, and the fixed `EffectiveAction` enum. Every object uses `additionalProperties: false`, explicit `required`, bounded strings/arrays, and no secret-bearing field.
 
-The action enum is exactly `CREATE_ASSET`、`CREATE_SOURCE`、`EDIT_GOVERNANCE`、`QUARANTINE`、`RETIRE`、`CREATE_BINDING`、`DELETE_BINDING`、`RESOLVE_CONFLICT`、`SYNC_SOURCE`.
+The Phase 1 Pack 03 action enum is exactly `CREATE_ASSET`、`EDIT_GOVERNANCE`、`QUARANTINE`、`RETIRE`、`CREATE_BINDING`、`DELETE_BINDING`、`RESOLVE_CONFLICT`. Tasks 13–14 extend the same enum with governed Source/Revision actions only when their production mutation path exists.
 
 Define closed schemas with explicit required arrays for:
 
 - `AssetSummary`、`AssetDetail`、`AssetPage`、`CreateAssetRequest`、`PatchAssetRequest`、`TransitionAssetRequest`;
 - `AssetRelationSummary`、`AssetRelationPage`;
 - `ServiceAssetBindingSummary`、`ServiceAssetBindingPage`、`CreateServiceAssetBindingRequest`;
-- `AssetSourceSummary`、`AssetSourceDetail`、`AssetSourcePage`、`CreateAssetSourceRequest`;
-- `AssetSourceRun`、`SyncOperation`;
+- `AssetSourceSummary`、`AssetSourceDetail`、`AssetSourcePage`;
+- `AssetSourceRun`;
 - `AssetConflictSummary`、`AssetConflictDetail`、`AssetConflictPage`、`ResolveAssetConflictRequest`;
 - `Problem` and page metadata.
 
@@ -483,13 +508,12 @@ Because the confirmed conflict route is Workspace-scoped, `GET .../asset-conflic
 
 `AssetSummary` includes only `id`、`environment_id`、`display_name`、`external_id`、`kind`、`provider_kind`、`source{id,name,kind}`、`service_summaries`、`mapping_status`、`lifecycle`、`owner_group`、`criticality`、`data_classification`、`labels`、`connection_summary.status`、`capability_summary.status/count`、`last_observed_at`、`version`、`effective_actions`. Until 000016/000017 are implemented, both summaries use the explicit neutral state `NOT_CONFIGURED`, never inferred health. `AssetDetail` adds safe field provenance and relation counts; it does not add Provider JSON.
 
-`AssetPage` and `AssetSourcePage` include collection-level `effective_actions` so the frontend can gate `CREATE_ASSET` and `CREATE_SOURCE` without role inference. `AssetConflictPage.items` uses the safe detail projection required by the mapping comparison (field name, source/revision/time, existing/candidate safe values, impact counts) but never returns raw documents or fingerprint values.
+`AssetPage` includes collection-level `effective_actions` so the frontend can gate `CREATE_ASSET` without role inference. Pack 03 returns an empty collection action list for `AssetSourcePage`; Tasks 13–14 add `CREATE_SOURCE` only with the complete Source+revision-1 transaction. `AssetConflictPage.items` uses the safe detail projection required by the mapping comparison (field name, source/revision/time, existing/candidate safe values, impact counts) but never returns raw documents or fingerprint values.
 
 Every write operation references both Idempotency-Key and, for mutation/delete/decision, If-Match. Status codes are fixed:
 
 - list/get `200`;
-- asset/source/binding create `201`;
-- sync `202`;
+- asset/binding create `201`;
 - patch/transition/decision `200`;
 - binding delete `204`;
 - malformed `400`, unauthenticated `401`, forbidden `403`, not found `404`, version/idempotency `409`, unsupported content type `415`, too large `413`, unavailable `503`.
@@ -659,7 +683,7 @@ git commit -m "feat(api): define safe control plane contract"
 
 **Interfaces:**
 - Consumes: manager interfaces from Task 6 and shared HTTP helpers from Task 7.
-- Produces: every route listed in OpenAPI Task 7, with no alternate unscoped route.
+- Produces: every route listed in OpenAPI Task 7, with no alternate unscoped route; Source routes in this pack are GET-only.
 - Assembly: `httpapi.Dependencies` gains `Assets`、`AssetSources`、`AssetConflicts`、`ServiceAssetBindings`; nil managers fail closed with `503`, never panic and never silently expose a partial write route.
 
 - [ ] **Step 1: Write failing route/authentication/DTO tests**
@@ -777,36 +801,11 @@ router.Route("/api/v1", func(api chi.Router) {
 
 Handlers validate all UUIDs before manager calls. List supports only OpenAPI filters and signed cursor; duplicate query keys are rejected. POST/PATCH accept a maximum 64 KiB strict JSON body and compute request hash over canonical typed input plus scoped path. PATCH/quarantine/retire parse If-Match. Create and every state-changing POST parse Idempotency-Key. Successful create emits `Location`; all versioned object responses emit strong ETag.
 
-Manual create body contains an existing `source_id` plus `kind`、`provider_kind=manual`、`external_id`、`display_name`、governance fields and bounded labels. Management locks the source and requires `source_kind=MANUAL`、same Workspace and ACTIVE before creating the asset. The handler constructs a normalized MANUAL Observation server-side; it never accepts observation JSON, endpoint, credential reference, provider payload, service binding, lifecycle, mapping status, or version from the client.
+Manual create body contains an existing `source_id` plus `kind`、`external_id`、`display_name`、governance fields and bounded labels. Management locks the source and requires `source_kind=MANUAL`、`provider_kind=MANUAL`、same Workspace and ACTIVE before creating the asset; ProviderKind is derived from that Source and is not caller-controlled. The handler constructs a normalized MANUAL Observation server-side; it never accepts observation JSON, endpoint, credential reference, provider payload, service binding, lifecycle, mapping status, or version from the client.
 
-- [ ] **Step 4: Implement source/run handlers as asynchronous control-plane requests**
+- [ ] **Step 4: Implement read-only source/run handlers without premature mutation paths**
 
-Register the five source/run routes exactly. Source creation accepts:
-
-~~~go
-type createAssetSourceRequest struct {
-	SourceKind    string  `json:"source_kind"`
-	ProviderKind  string  `json:"provider_kind"`
-	Name          string  `json:"name"`
-	IntegrationID *string `json:"integration_id"`
-	SyncMode      string  `json:"sync_mode"`
-}
-~~~
-
-`MANUAL` requires `integration_id=null` and `sync_mode=MANUAL`; every external source requires a canonical installed Integration UUID and validates that its Provider/Workspace matches. Unknown provider configuration fields are rejected by strict JSON. Sync returns `202` with:
-
-~~~go
-type syncOperationDTO struct {
-	OperationID string    `json:"operation_id"`
-	RunID       string    `json:"run_id"`
-	SourceID    string    `json:"source_id"`
-	Status      string    `json:"status"`
-	CreatedAt   time.Time `json:"created_at"`
-	TraceID     string    `json:"trace_id"`
-}
-~~~
-
-It only calls `SourceManager.RequestSync`; tests must prove no DNS, HTTP, TCP, provider SDK, credential, or Runner interface is present in the handler dependency graph. `MANUAL` 永远不产生 `SYNC_SOURCE`，`RequestSync` 也必须在服务端拒绝它；手工资产只走受治理 Asset API。
+Register only `GET /asset-sources`、`GET /asset-sources/{source_id}` and `GET /asset-source-runs/{run_id}`. They expose safe metadata, orthogonal Source/Revision/Gate status, digest/checkpoint metadata and bounded counts; they never expose canonical bytes, checkpoint ciphertext/key ID, lease identity/token hash or provider text. There is no POST Source or sync handler, no mutation method in the manager, and no DNS/HTTP/TCP/provider SDK/credential/Runner dependency in this pack. Tasks 13–14 add the complete Source+revision create and sync routes atomically; `MANUAL` never receives `SYNC_SOURCE` and manual assets continue to use the governed Asset API.
 
 - [ ] **Step 5: Implement conflict decisions and Service Binding handlers**
 

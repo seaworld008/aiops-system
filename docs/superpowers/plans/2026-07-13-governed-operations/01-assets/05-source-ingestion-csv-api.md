@@ -14,7 +14,7 @@
 - `asset_source_revisions` 属于 `000015_assets_catalog`；本包不得创建 `000016` 或平行修订表。
 - Source 状态、Revision 状态、Validation/Discovery Run 状态与 per-provider Gate 状态正交，前端不得合并成一个绿色状态。
 - 仅 exact `PUBLISHED` revision 且 source `ACTIVE + AVAILABLE` 可创建 Discovery Run；修订、引用、作用域、身份、checkpoint 或 gate 漂移立即停止。
-- 每个 revision 只保存 opaque `CredentialReferenceID`、`TrustReferenceID`、`NetworkPolicyReferenceID` 和 server-owned Source Profile ID；不保存 Secret、Token、私钥、PEM、完整 endpoint 或任意 JSON。
+- 每个 revision 只保存 opaque `CredentialReferenceID`、`TrustReferenceID`、`NetworkPolicyReferenceID` 和 server-owned canonical `ProfileCode`；输入 `SourceProfileID` 只用于 Registry 解析，并将解析结果的 immutable canonical code 持久为 `profile_code`、纳入 `BindingDigest`。不保存 Secret、Token、私钥、PEM、完整 endpoint 或任意 JSON。
 - `MANUAL` 由已有受治理 `POST .../assets` 提供，不进入 Discovery Worker；`KUBERNETES_OPERATOR` 仅由 Phase 3 提供，在此保持 `UNAVAILABLE`。
 - CSV/API 都必须产生 field-level provenance、显式 tombstone、增量 cursor/checkpoint，且恢复只能 `STALE→STALE(pending revalidation)`，不能自动 `ACTIVE`。
 - 写请求需 `Idempotency-Key`，修订转换需 `If-Match`，发布/禁用需服务器校验最近 OIDC 认证；workload ingestion 只用 mTLS 身份，不接受浏览器 Token。
@@ -38,8 +38,8 @@
 - Create: `internal/assetcatalog/postgres/source_revisions_integration_test.go`
 
 **Interfaces:**
-- Consumes: `asset_sources` stable identity, `asset_source_revisions`, `asset_source_runs`, scoped audit/outbox/idempotency ledger from Tasks 1–4.
-- Produces: `SourceRevisionRepository.CreateRevision/RequestValidation/Publish/Disable/RequestSync` and exact source/revision `ETag` versions.
+- Consumes: `asset_sources`, `asset_source_revisions`, `asset_source_runs` schema plus scoped audit/outbox/idempotency ledger from Tasks 1–4; an existing stable Source is required only for subsequent revisions.
+- Produces: `SourceRevisionRepository.CreateSource/CreateRevision/RequestValidation/Publish/Disable/RequestSync` and exact source/revision `ETag` versions. `CreateSource` is the sole production owner of atomic stable Source + immutable revision 1 creation.
 - Produces events: `asset.source.revision.created.v1`, `asset.source.validation.requested.v1`, `asset.source.revision.published.v1`, `asset.source.disabled.v1`, `asset.source.sync.requested.v1`.
 - Produces the only Provider data-plane contract consumed by every later source pack:
 
@@ -98,9 +98,59 @@ func TestPublishedSourceRevisionContentCannotChange(t *testing.T) {
 		WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND revision=$4`,
 		fixture.TenantID, fixture.WorkspaceID, fixture.SourceID, fixture.Revision)
 }
+
+func TestCreateSourceAtomicallyCreatesRevisionOneAndReceipt(t *testing.T) {
+	db := openAssetCatalogDatabase(t)
+	repository := newAssetRepository(t, db)
+	command := validCreateSourceCommand()
+
+	result, err := repository.CreateSource(context.Background(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Source.ID == "" || result.Revision.Revision != 1 ||
+		result.Revision.CanonicalRevisionDigest != result.Revision.BindingDigest() ||
+		result.Receipt.AuditID == "" || result.Receipt.IdempotentReplay {
+		t.Fatalf("source creation result = %#v", result)
+	}
+	assertSourceRevisionCreateSideEffects(t, db, result.Source.ID, 1, 1, 1, 1)
+}
+
+func TestCreateSourceRollsBackStableIdentityWhenRevisionBindingIsInvalid(t *testing.T) {
+	db := openAssetCatalogDatabase(t)
+	repository := newAssetRepository(t, db)
+	command := validCreateSourceCommand()
+	command.SourceProfileID = "incompatible-profile"
+
+	if _, err := repository.CreateSource(context.Background(), command); !errors.Is(err, assetcatalog.ErrInvalidRequest) {
+		t.Fatalf("CreateSource error = %v", err)
+	}
+	assertSourceRevisionCreateSideEffectsByKey(t, db, command.IdempotencyKey, 0, 0, 0, 0)
+}
+
+func TestCreateSourceReplayReturnsOriginalReceiptAndRejectsHashDrift(t *testing.T) {
+	db := openAssetCatalogDatabase(t)
+	repository := newAssetRepository(t, db)
+	command := validCreateSourceCommand()
+
+	first, err := repository.CreateSource(context.Background(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := repository.CreateSource(context.Background(), command)
+	if err != nil || replay.Source.ID != first.Source.ID ||
+		replay.Receipt.AuditID != first.Receipt.AuditID || !replay.Receipt.IdempotentReplay {
+		t.Fatalf("replay = (%#v, %v), first = %#v", replay, err, first)
+	}
+	command.RequestHash = strings.Repeat("f", 64)
+	if _, err := repository.CreateSource(context.Background(), command); !errors.Is(err, assetcatalog.ErrIdempotency) {
+		t.Fatalf("hash-drift replay error = %v", err)
+	}
+	assertSourceRevisionCreateSideEffects(t, db, first.Source.ID, 1, 1, 1, 1)
+}
 ~~~
 
-Run: `go test ./internal/assetcatalog ./internal/assetcatalog/postgres -run 'Test(Publish|PublishedSource)' -count=1`
+Run: `go test ./internal/assetcatalog ./internal/assetcatalog/postgres -run 'Test(CreateSource|Publish|PublishedSource)' -count=1`
 
 Expected: FAIL because source-revision repository and guards do not exist.
 
@@ -108,11 +158,25 @@ Expected: FAIL because source-revision repository and guards do not exist.
 
 ~~~go
 type SourceRevisionRepository interface {
+	CreateSource(context.Context, CreateSourceCommand) (SourceRevisionMutation, error)
 	CreateRevision(context.Context, CreateSourceRevisionCommand) (SourceRevisionMutation, error)
 	RequestValidation(context.Context, ValidateSourceRevisionCommand) (SourceRun, error)
 	PublishSourceRevision(context.Context, PublishSourceRevisionCommand) (SourceRevisionMutation, error)
 	DisableSource(context.Context, DisableSourceCommand) (SourceMutation, error)
 	RequestSync(context.Context, RequestSyncCommand) (SourceRun, error)
+}
+
+type CreateSourceCommand struct {
+	TenantID, WorkspaceID          string
+	Name                           string
+	SourceProfileID                string
+	CredentialReferenceID          string
+	TrustReferenceID               string
+	NetworkPolicyReferenceID       string
+	AuthorityEnvironmentIDs        []string
+	SyncMode, ScheduleExpression   string
+	ActorID, TraceID               string
+	IdempotencyKey, RequestHash    string
 }
 
 type CreateSourceRevisionCommand struct {
@@ -122,8 +186,7 @@ type CreateSourceRevisionCommand struct {
 	TrustReferenceID               string
 	NetworkPolicyReferenceID       string
 	AuthorityEnvironmentIDs        []string
-	SyncMode, Schedule             string
-	RateLimitProfile               string
+	SyncMode, ScheduleExpression   string
 	ExpectedSourceVersion          int64
 	ActorID, TraceID               string
 	IdempotencyKey, RequestHash    string
@@ -136,11 +199,13 @@ type SourceRevisionMutation struct {
 }
 ~~~
 
-The client never supplies `provider_kind`, canonical definition, revision number, binding digest or revision digest. `SourceProfileRegistry.Resolve(SourceProfileID)` returns one installed discriminated profile, provider kind, allowed SourceKind, network zone, credential purpose, trust mode, parser schema, hard page/byte/rate limits and compatibility class. The server validates every environment against the source Workspace, sorts it, constructs canonical bytes, computes lowercase SHA-256 and allocates `max(revision)+1` under a source row lock.
+The client never supplies `provider_kind`, canonical definition, revision number, Integration ID, rate/backpressure numbers, profile code, binding digest or revision digest. `SourceProfileRegistry.Resolve(SourceProfileID)` returns one installed discriminated profile, provider kind, Integration ID, allowed SourceKind, network zone, credential purpose, trust mode, parser schema, fixed rate/backpressure fields, immutable canonical `ProfileCode`, hard page/byte limits and compatibility class. `SourceProfileID` is only a lookup selector and is not persisted; the resolved `ProfileCode` is persisted in `asset_source_revisions.profile_code` and is the exact profile identity hashed by `BindingDigest`. The server validates every environment against the source Workspace, sorts it, constructs canonical bytes, allocates `max(revision)+1` under a source row lock, and computes `CanonicalRevisionDigest = SourceRevision.BindingDigest()` across the complete immutable binding. `source_definition_digest` remains a separate digest of the Provider definition only.
 
 - [ ] **Step 3: Implement serializable revision state transitions**
 
-`CreateRevision` inserts one `DRAFT` immutable content row. `RequestValidation` CAS-transitions `DRAFT|REJECTED→VALIDATING`, creates a `VALIDATION` run bound to the exact revision/digest and closes the source gate. A Worker completion may transition only that revision to `VALIDATED` or `REJECTED`; safe proof fields are identity/TLS-or-signature/network/credential-open+cleanup/fixed-probe/schema/DLP/budget result codes and a proof digest.
+`CreateSource` begins `SERIALIZABLE`, validates Scope/Idempotency/Profile and all opaque references before mutation, locks the Workspace/Profile facts, inserts the stable Source and revision 1, computes and verifies the complete binding digest, writes one audit/outbox pair and returns their persisted receipt in the same transaction. Any invalid Environment/reference/profile/digest or side-effect failure rolls back the Source identity as well as the revision. Matching replay returns the original Source/revision/Audit ID; a changed hash returns `ErrIdempotency`.
+
+`CreateRevision` inserts one `DRAFT` immutable content row for an existing Source. `RequestValidation` CAS-transitions `DRAFT|REJECTED→VALIDATING`, creates a new append-only `VALIDATION` run bound to the exact revision and canonical binding digest, and closes the source gate. A rejected revision's canonical content remains immutable, and it can never transition directly to `PUBLISHED`. A Worker completion may transition only that exact revision/run to `VALIDATED` or `REJECTED`; safe proof fields are identity/TLS-or-signature/network/credential-open+cleanup/fixed-probe/schema/DLP/budget result codes and a proof digest.
 
 `PublishSourceRevision` must require:
 
@@ -251,6 +316,8 @@ POST /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/ingestion-batch
 
 Every schema is closed with `additionalProperties: false`. Source create makes stable identity plus revision 1; subsequent edits always create a new revision. Validate/sync/import/ingestion return `202` with durable `operation_id/run_id`; publish/disable require `If-Match`, Idempotency-Key, reason and server-verified recent auth. Errors use RFC 9457 and stable codes `SOURCE_REVISION_NOT_VALIDATED`, `SOURCE_BINDING_DRIFT`, `SOURCE_GATE_UNAVAILABLE`, `SOURCE_BACKPRESSURE`, `SOURCE_WORKLOAD_IDENTITY_MISMATCH`, `SOURCE_PAYLOAD_REJECTED`.
 
+This task is the sole owner of Source mutation routes deferred by Packs 03–04. Create accepts a server-returned `source_profile_id`, name, opaque Credential/Trust/Network references, allowed Environment IDs, sync mode and schedule; it derives ProviderKind, Integration ID, definition and fixed rate/backpressure/profile fields, then creates the stable Source and immutable revision 1 in one `SERIALIZABLE` transaction. No reduced ProviderKind/Integration form or stable-Source-only insert is permitted.
+
 Safe DTOs expose reference IDs, revision/digests, gate dimensions, checkpoint hash/version/age, counts and Trace IDs. They exclude endpoint, plaintext cursor, source canonical bytes, checkpoint ciphertext/key ID, lease owner/token hash, credential value, PEM, JWS and upstream text.
 
 - [ ] **Step 3: Compute object-state-aware effective actions and strict transport**
@@ -259,9 +326,12 @@ Collection actions are `CREATE_SOURCE`; object/revision actions are exactly `CRE
 
 ~~~go
 func sourceActions(principal authn.Principal, source assetcatalog.Source, revision *assetcatalog.SourceRevision) []string {
+	if source.Status == assetcatalog.SourceStatusDisabled {
+		return []string{}
+	}
 	actions := []string{}
-	if allows(principal, authz.PermissionAssetSourceManage) && source.Status != assetcatalog.SourceStatusDisabled {
-		actions = append(actions, "CREATE_SOURCE_REVISION")
+	if allows(principal, authz.PermissionAssetSourceManage) {
+		actions = append(actions, "CREATE_SOURCE_REVISION", "DISABLE_SOURCE")
 	}
 	if revision != nil && revision.Status.CanValidate() && allows(principal, authz.PermissionAssetSourceValidate) {
 		actions = append(actions, "VALIDATE_SOURCE_REVISION")
@@ -272,9 +342,14 @@ func sourceActions(principal authn.Principal, source assetcatalog.Source, revisi
 	if source.SourceKind != assetcatalog.SourceKindManual && source.AvailablePublishedRevision() && allows(principal, authz.PermissionAssetSourceSync) {
 		actions = append(actions, "SYNC_SOURCE")
 	}
+	if source.SourceKind == assetcatalog.SourceKindCSVImport && source.AvailablePublishedRevision() && allows(principal, authz.PermissionAssetSourceManage) {
+		actions = append(actions, "IMPORT_CSV")
+	}
 	return slices.Sorted(slices.Values(actions))
 }
 ~~~
+
+Add permission/state table tests proving disabled sources expose no mutate/disable/import/sync action, non-CSV sources never expose `IMPORT_CSV`, unavailable or non-published CSV revisions cannot import, MANUAL never syncs, and unauthorized principals receive none of these actions. `PUBLISH_SOURCE_REVISION` and `DISABLE_SOURCE` may be visible from authorization/object state, but execution still requires the server-verified recent authentication contract.
 
 The handler ignores no unknown field, resolves Tenant from OIDC/workload identity plus Workspace DB scope, validates UUID/ETag/idempotency, applies `no-store`, and never logs a request body. Workload ingestion must pass an mTLS SAN binding `(tenant,workspace,source,provider)` and cannot call human revision/publish routes.
 
@@ -442,9 +517,9 @@ Expected: FAIL because workload protocol and revision wizard do not exist.
 
 One source accepts at most two in-flight API batches, eight per Workspace and 20 requests/second with burst 40. Persist `not_before`/queue depth so replica changes do not reset the limit. A valid tombstone creates `STALE`; a later observation records recovery but remains `STALE`. Unknown field, bad signature, replay, sequence gap, oversized page, source/revision/gate drift and wrong client certificate fail before reconciliation.
 
-- [ ] **Step 3: Implement the six-step Source revision workspace**
+- [ ] **Step 3: Implement Source creation and the six-step Source revision workspace**
 
-The vertical steps are exact:
+`CREATE_SOURCE` opens this workspace without a `sourceId`; Step 1 submits the complete safe create command and receives the stable Source plus revision 1 and a durable mutation receipt. Existing Sources enter the same workspace with `sourceId/revision`. The vertical steps are exact:
 
 1. **Scope and installed Provider** — Workspace plus server-returned Source Profile; `KUBERNETES_OPERATOR` says Phase 3/UNAVAILABLE.
 2. **Authority and identity** — allowed Environments and provider-owned identity rules; no endpoint editor.

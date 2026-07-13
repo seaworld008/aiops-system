@@ -159,7 +159,7 @@ a.id::text, a.tenant_id::text, a.workspace_id::text, a.environment_id::text,
 a.source_id::text, a.kind, a.provider_kind, a.external_id, a.display_name,
 a.lifecycle, a.mapping_status, a.owner_group, a.criticality,
 a.data_classification, a.labels, a.last_observation_id::text,
-a.last_observed_at, a.source_revision, a.version, a.created_at, a.updated_at`
+a.last_observed_at, a.last_source_revision, a.version, a.created_at, a.updated_at`
 
 const getAssetSQL = `SELECT ` + assetColumns + `
 FROM assets a
@@ -312,7 +312,7 @@ git commit -m "feat(assetcatalog): persist scoped governed assets"
 
 **Interfaces:**
 - Consumes: normalized source batches produced outside the Control Plane process; this plan does not open target sockets and does not put provider credentials in a job payload.
-- Produces: `assetcatalog.DiscoveryRepository` and `assetdiscovery.Reconciler.Reconcile(context.Context, Batch) (Result, error)`.
+- Produces: read-only `assetcatalog.SourceReadRepository` and `assetdiscovery.Reconciler.Reconcile(context.Context, Batch) (Result, error)`; Source create/sync remains exclusively owned by Tasks 13–14.
 - Event contract: sync requests write `asset.source.sync.requested.v1`; completed reconciliation writes `asset.source.run.completed.v1` or `asset.source.run.failed.v1` with only IDs/counts/status.
 
 - [ ] **Step 1: Add failing reconciliation scenario tests**
@@ -435,7 +435,7 @@ type NormalizedItem struct {
 	ExternalID        string
 	Kind              assetcatalog.Kind
 	DisplayName       string
-	SourceRevision    string
+	SourceRevision    int64
 	SchemaVersion     string
 	Document          json.RawMessage
 	DocumentSHA256    string
@@ -451,7 +451,7 @@ type FieldProvenance struct {
 	FieldCode       string
 	ProviderPathCode string
 	Ownership       string
-	SourceRevision  string
+	SourceRevision  int64
 	ObservedAt      time.Time
 	Confidence      int
 }
@@ -490,7 +490,6 @@ type Result struct {
 
 type Store interface {
 	ReconcileBatch(context.Context, Batch) (Result, error)
-	RequestSync(context.Context, assetcatalog.RequestSyncCommand) (assetcatalog.SourceRun, error)
 }
 
 type Reconciler struct {
@@ -545,26 +544,14 @@ type SourceRun struct {
 	FinishedAt           time.Time
 }
 
-type RequestSyncCommand struct {
-	TenantID      string
-	WorkspaceID   string
-	SourceID      string
-	IdempotencyKey string
-	RequestHash   string
-	ActorID       string
-	TraceID       string
-}
-
-type DiscoveryRepository interface {
-	CreateSource(context.Context, CreateSourceCommand) (Source, error)
+type SourceReadRepository interface {
 	GetSource(context.Context, string, string, string) (Source, error)
 	ListSources(context.Context, ListSourcesRequest) (SourcePage, error)
-	RequestSync(context.Context, RequestSyncCommand) (SourceRun, error)
 	GetSourceRun(context.Context, string, string, string) (SourceRun, error)
 }
 ~~~
 
-`assetdiscovery.Store` owns `ReconcileBatch(context.Context, Batch) (Result, error)` and is implemented by `internal/assetcatalog/postgres.Repository`. Source management remains in `assetcatalog.DiscoveryRepository`. This keeps the final dependency direction `assetdiscovery -> assetcatalog`; `assetcatalog` never imports `assetdiscovery`.
+`assetdiscovery.Store` owns `ReconcileBatch(context.Context, Batch) (Result, error)` and is implemented by `internal/assetcatalog/postgres.Repository`. Safe Source/run reads remain in `assetcatalog.SourceReadRepository`. This keeps the final dependency direction `assetdiscovery -> assetcatalog`; `assetcatalog` never imports `assetdiscovery`. This pack must not create a stable Source without revision 1 or enqueue a run before the complete Source revision gate exists.
 
 - [ ] **Step 3: Implement canonical validation before persistence**
 
@@ -609,7 +596,7 @@ For each canonical batch, `internal/assetcatalog/postgres/discovery.go` must exe
 3. Insert every Observation with `ON CONFLICT (tenant_id, workspace_id, source_id, provider_kind, external_id, source_revision) DO NOTHING`; matching replays verify `document_sha256`.
 4. Match only the fixed dedupe key `(tenant_id, workspace_id, source_id, provider_kind, external_id)`.
 5. New exact-source items create `DISCOVERED` assets with defaults `UNRESOLVED/INTERNAL/MEDIUM`, `owner_group="unassigned"` and empty governance labels, then append Type Detail revision 1. The sentinel renders as “未分配” and is not an inferred owner or Service.
-6. Existing exact-source items update only source-owned projection fields: `display_name`、`last_observation_id`、`last_observed_at`、`source_revision`; append Type Detail only when document hash changes. Persist the allow-listed field-provenance digest with the Observation and preserve governance fields.
+6. Existing exact-source items update only source-owned projection fields: `display_name`、`last_observation_id`、`last_observed_at`、`last_source_revision`; append Type Detail only when document hash changes. Persist the allow-listed field-provenance digest with the Observation and preserve governance fields.
 7. Cross-source fingerprint candidates create or refresh `OPEN` AssetConflict with `AMBIGUOUS`; do not create, merge, bind, or overwrite an Asset.
 8. Only a complete successful run identifies source-owned assets not observed in this run. `ACTIVE` becomes `STALE`; `DISCOVERED` remains `DISCOVERED`; `QUARANTINED/RETIRED` remain unchanged.
 9. A provider tombstone or complete-run absence changes `ACTIVE` to `STALE`, retires only source-owned active relation projections, and preserves Asset/Observation/Type Detail history. A recovered `STALE` asset receives the new Observation and `asset.source.asset.restored.v1` event but remains `STALE`; only the later publication/capability revalidation path may move it to `ACTIVE`.

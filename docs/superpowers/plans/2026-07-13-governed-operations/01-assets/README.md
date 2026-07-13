@@ -51,7 +51,18 @@
 | 契约 | `api/openapi/control-plane-v1.yaml` → `web/src/shared/api/schema.d.ts` |
 | 生产状态 | PostgreSQL + 真实 OIDC + 真实 Discovery Worker/Provider；fake/MSW 仅测试 |
 
-`Source Revision` 内容在创建后不可修改；成功路径固定为 `DRAFT → VALIDATING → VALIDATED → PUBLISHED → SUPERSEDED`，失败路径仅为 `VALIDATING → REJECTED`，被拒修订不能发布。Source 可用需 exact `ACTIVE + PUBLISHED + AVAILABLE`；Asset 进入运行还需 `EXACT + ACTIVE`。来源 gate、Asset lifecycle、Connection publication 和 Capability availability 不得相互代替。
+`Source Revision` 内容在创建后不可修改；成功路径固定为 `DRAFT → VALIDATING → VALIDATED → PUBLISHED → SUPERSEDED`，失败路径为 `VALIDATING → REJECTED`，同一不可变内容可通过新的 Validation Run 重新进入 `VALIDATING`，但 `REJECTED` 不能直接发布。Source 可用需 exact `ACTIVE + PUBLISHED + AVAILABLE`；Asset 进入运行还需 `EXACT + ACTIVE`。来源 gate、Asset lifecycle、Connection publication 和 Capability availability 不得相互代替。
+
+## 阶段内稳定数据契约
+
+- Source/Asset revision 在 PostgreSQL、Go、OpenAPI 和生成 TypeScript 中统一为 `int64`。`Asset.LastSourceRevision` 对应 `assets.last_source_revision`。
+- `SourceRevision.BindingDigest() == CanonicalRevisionDigest`。该摘要覆盖 Tenant/Workspace/Source/Revision、definition、Integration、sync mode、Opaque Credential/Trust/Network references、authority scope、rate/backpressure profile 和 schedule；`source_definition_digest` 不能替代它。`AVAILABLE` 只比较 exact published canonical revision digest。
+- `REJECTED` revision 的 canonical content 仍不可变；允许以新的 append-only Validation Run 执行 `REJECTED → VALIDATING`，但禁止直接 `REJECTED → PUBLISHED`。
+- `assets_kind_check` 在 `000015` 固定 Phase 1 的 17 个 Kind，Phase 3 只能通过 `000017` 显式替换该命名约束后扩展 Victoria taxonomy。
+- ProviderKind 使用大写 profile token `^[A-Z][A-Z0-9_]{0,63}$`；UUID 使用小写 RFC 4122 version 1–5/RFC variant；labels 最多 64 对且 UTF-8 序列化不超过 16 KiB；Idempotency-Key 复用 `domain.ValidIdempotencyKey` 的最多 128 字节小写 grammar。
+- Relationship 显式保存 source/target Environment 与 Asset、Provenance、可空 provenance source/cross-environment policy、状态、版本和时间；不得虚构 Schema 中不存在的 confidence/last-observed 字段。
+- Binding 状态只有 `ACTIVE/INACTIVE`。`CreateBinding`、`DeleteBinding` 与 Conflict decision 都返回持久 `MutationReceipt`；HTTP 204 仍从 receipt 生成 Audit/Replay headers。
+- `service_asset_bindings` 同时由数据库 FK 与 Repository 验证 legacy `service_bindings(service_id,environment_id)` 资格；只验证同 Workspace 不足以创建 Binding。
 
 ## 来源实施与门禁状态表
 

@@ -578,7 +578,7 @@ Top banners for STALE/QUARANTINED/AMBIGUOUS/UNRESOLVED state reason, impact, and
 
 - [ ] **Step 4: Implement governed create/edit/quarantine/retire flows**
 
-“添加资产” is shown only for collection `CREATE_ASSET`. The Radix dialog states: “仅登记可运维引用；不会创建、接管或连接外部资源。” RHF+Zod accepts an ACTIVE `MANUAL` source selected from the real Source API plus kind/provider=`manual`/external ID/display name/owner/criticality/data classification/safe labels. If no MANUAL source exists, show a link to the real source-creation flow rather than inventing one in browser state. It sends a fresh `crypto.randomUUID()` Idempotency-Key; never renders endpoint, credential, raw JSON, command, SQL, Header, or Body fields.
+“添加资产” is shown only for collection `CREATE_ASSET`. The Radix dialog states: “仅登记可运维引用；不会创建、接管或连接外部资源。” RHF+Zod accepts an ACTIVE `MANUAL` source selected from the real Source API plus kind/external ID/display name/owner/criticality/data classification/safe labels；服务端从 Source 固定派生 `provider_kind=MANUAL`，浏览器不提交该字段。If no MANUAL source exists, show a disabled explanation that Source creation becomes available only after Task 16's complete revision/profile flow; do not invent browser state or a reduced create form. It sends a fresh `crypto.randomUUID()` Idempotency-Key; never renders endpoint, credential, raw JSON, command, SQL, Header, or Body fields.
 
 Edit is shown only for `EDIT_GOVERNANCE`, preloads governance fields, and sends the latest ETag. Quarantine/retire use AlertDialog with asset name/ID, impact, required bounded reason, and ETag. A 409 keeps the dialog open and renders old vs server version with “重新加载并审阅”; it never auto-retries a governance mutation. Success renders a persistent inline result with audit/trace ID and refetches.
 
@@ -681,14 +681,13 @@ git add web/src/features/asset-mappings web/src/app/router.tsx \
 git commit -m "feat(web): add explicit asset mapping workbench"
 ~~~
 
-### Task 12: Discovery sources, asynchronous sync, and Source Run timeline
+### Task 12: Discovery source inventory and Source Run timeline
 
 **Files:**
 - Create: **web/src/features/asset-sources/sourceSearch.ts**
 - Create: **web/src/features/asset-sources/api.ts**
 - Create: **web/src/features/asset-sources/AssetSourcesPage.tsx**
 - Create: **web/src/features/asset-sources/AssetSourcesPage.module.css**
-- Create: **web/src/features/asset-sources/CreateSourceDialog.tsx**
 - Create: **web/src/features/asset-sources/SourceRunTimeline.tsx**
 - Create: **web/src/features/asset-sources/AssetSourcesPage.test.tsx**
 - Create: **docs/design/frontend/foundation-assets.md**
@@ -697,20 +696,17 @@ git commit -m "feat(web): add explicit asset mapping workbench"
 - Modify: **web/src/test/msw/handlers.ts**
 
 **Interfaces:**
-- Consumes Source page/detail, SyncOperation and SourceRun safe counts.
+- Consumes Source page/detail and existing SourceRun safe counts.
 - Produces `/asset-sources?workspace&status&kind&cursor&sourceId&runId`; polling is only for the selected non-terminal run.
 
 - [ ] **Step 1: Write failing async-run and payload-safety tests**
 
 ~~~tsx
-it("creates one sync operation and resumes its run after refresh", async () => {
-  const user = userEvent.setup();
-  renderSources("/asset-sources?workspace=w&sourceId=s");
-  await user.click(await screen.findByRole("button", { name: "立即同步" }));
-  expect(await screen.findByText("同步已排队")).toBeVisible();
-  expect(window.location.search).toContain("runId=");
+it("resumes an existing run timeline after refresh without exposing premature actions", async () => {
+  renderSources("/asset-sources?workspace=w&sourceId=s&runId=r");
   expect(await screen.findByText("发现完成")).toBeVisible();
   expect(screen.getByText("新增 2")).toBeVisible();
+  expect(screen.queryByRole("button", { name: /创建来源|立即同步/ })).not.toBeInTheDocument();
   expect(screen.queryByText(/raw_payload|access_token|provider_error/)).not.toBeInTheDocument();
 });
 ~~~
@@ -719,13 +715,13 @@ Run: `corepack pnpm@10.34.0 --dir web test -- AssetSourcesPage.test.tsx`
 
 Expected: FAIL because discovery UI does not exist.
 
-- [ ] **Step 2: Implement source list, safe creation, and run timeline**
+- [ ] **Step 2: Implement source inventory and run timeline**
 
 The list shows source type/provider/name/authority scope/sync mode/status/last success/current cursor digest and observed/new/changed/conflict/stale/rejected counts. Never show raw cursor, payload, credential, endpoint or provider error.
 
-Create is shown only for `CREATE_SOURCE`. Form fields are fixed Provider/source kind/name/sync mode and, for external sources, an opaque installed Integration UUID. `MANUAL` fixes sync mode to MANUAL and sends `integration_id=null`. The form contains no endpoint or credential value. If installed-integration options cannot be obtained from a real API, use a validated UUID field labeled “已安装 Integration 引用”; do not ship fake production options.
+Pack 04 intentionally renders neither Source creation nor “立即同步”: the complete immutable revision/profile contract is not implemented until Pack 05, and the API returns no such `effective_actions` here. Task 16 extends this same page with the six-step Source+revision workspace and governed sync action; it must not revive a reduced Provider/Integration form.
 
-“立即同步” is shown only for `SYNC_SOURCE`；`MANUAL` source 永远没有该 action。触发时发送一个 Idempotency-Key，接受 `202`，把返回的 `runId` 写入 URL，并显示 Operation/Run IDs。Poll `GET asset-source-runs/{runId}` every 2 seconds only while `QUEUED|RUNNING`, pause when the tab is hidden, resume on focus, and stop on `SUCCEEDED|PARTIAL|FAILED|CANCELLED`.
+For a selected existing run, poll `GET asset-source-runs/{runId}` every 2 seconds only while `QUEUED|RUNNING`, pause when the tab is hidden, resume on focus, and stop on `SUCCEEDED|PARTIAL|FAILED|CANCELLED`.
 
 Timeline stages are 请求已接受 → 等待执行 → 读取来源 → 规范化 → 合并投影 → 完成. The server exposes stable stage/status/counts; failed runs show stable error code + Trace ID and a permitted retry action, never upstream text. Completion links conflicts to the mapping workbench while preserving workspace/environment.
 
