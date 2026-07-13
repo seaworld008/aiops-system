@@ -1,6 +1,7 @@
 package readassembly
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -194,6 +195,158 @@ func TestLoadFilesPublishesOnePinnedDetachedPlanningAndRuntimeSnapshot(t *testin
 			t.Fatalf("Snapshot rendering leaked %q through %q", forbidden, rendered)
 		}
 	}
+}
+
+func TestLoadCanonicalManifestsPublishesOnePinnedDetachedSnapshot(t *testing.T) {
+	fixture := newSnapshotFixture(t)
+	connectorManifest := readSnapshotBytes(t, fixture.options.ConnectorManifestFile)
+	planManifest := readSnapshotBytes(t, fixture.options.PlanManifestFile)
+	targetManifest := readSnapshotBytes(t, fixture.options.TargetManifestFile)
+	egressManifest := readSnapshotBytes(t, fixture.options.EgressManifestFile)
+	targetRoots := []CapturedRootBundle{{Path: fixture.caPath, Contents: readSnapshotBytes(t, fixture.caPath)}}
+	original := [][]byte{
+		append([]byte(nil), connectorManifest...), append([]byte(nil), planManifest...),
+		append([]byte(nil), targetManifest...), append([]byte(nil), egressManifest...),
+		append([]byte(nil), targetRoots[0].Contents...),
+	}
+
+	snapshot, err := LoadCanonicalManifests(
+		context.Background(), connectorManifest, planManifest, targetManifest, egressManifest, targetRoots,
+		fixture.options.Expected,
+	)
+	if err != nil || snapshot == nil || !snapshot.Ready() || snapshot.Summary() != fixture.options.Expected {
+		t.Fatalf("LoadCanonicalManifests() = %#v, %v", snapshot, err)
+	}
+	for index, manifest := range [][]byte{
+		connectorManifest, planManifest, targetManifest, egressManifest, targetRoots[0].Contents,
+	} {
+		if !reflect.DeepEqual(manifest, original[index]) {
+			t.Fatalf("manifest %d was modified by LoadCanonicalManifests", index)
+		}
+		clear(manifest)
+	}
+	if !snapshot.Ready() || snapshot.Summary() != fixture.options.Expected {
+		t.Fatal("caller manifest mutation changed the accepted Snapshot")
+	}
+}
+
+func TestLoadCanonicalManifestsRejectsEveryExpectedDigestDrift(t *testing.T) {
+	fixture := newSnapshotFixture(t)
+	connectorManifest := readSnapshotBytes(t, fixture.options.ConnectorManifestFile)
+	planManifest := readSnapshotBytes(t, fixture.options.PlanManifestFile)
+	targetManifest := readSnapshotBytes(t, fixture.options.TargetManifestFile)
+	egressManifest := readSnapshotBytes(t, fixture.options.EgressManifestFile)
+	targetRoots := []CapturedRootBundle{{Path: fixture.caPath, Contents: readSnapshotBytes(t, fixture.caPath)}}
+
+	tests := map[string]func(*Summary){
+		"plan":      func(value *Summary) { value.PlanManifestDigest = strings.Repeat("a", 64) },
+		"connector": func(value *Summary) { value.ConnectorRegistryDigest = strings.Repeat("b", 64) },
+		"target":    func(value *Summary) { value.TargetRegistryDigest = strings.Repeat("c", 64) },
+		"egress":    func(value *Summary) { value.EgressRegistryDigest = strings.Repeat("d", 64) },
+		"executor":  func(value *Summary) { value.ExecutorProfileDigest = strings.Repeat("e", 64) },
+		"bundle":    func(value *Summary) { value.BundleDigest = strings.Repeat("f", 64) },
+	}
+	for name, drift := range tests {
+		t.Run(name, func(t *testing.T) {
+			expected := fixture.options.Expected
+			drift(&expected)
+			snapshot, err := LoadCanonicalManifests(
+				context.Background(), connectorManifest, planManifest, targetManifest, egressManifest, targetRoots, expected,
+			)
+			if snapshot != nil || !errors.Is(err, ErrSnapshotRejected) {
+				t.Fatalf("LoadCanonicalManifests(drift) = %#v, %v", snapshot, err)
+			}
+		})
+	}
+}
+
+func TestLoadCanonicalManifestsRejectsStrictAndSemanticErrorsInEveryManifest(t *testing.T) {
+	const canary = "canonical-manifest-error-canary"
+	fixture := newSnapshotFixture(t)
+	base := [][]byte{
+		readSnapshotBytes(t, fixture.options.ConnectorManifestFile),
+		readSnapshotBytes(t, fixture.options.PlanManifestFile),
+		readSnapshotBytes(t, fixture.options.TargetManifestFile),
+		readSnapshotBytes(t, fixture.options.EgressManifestFile),
+	}
+	targetRoots := []CapturedRootBundle{{Path: fixture.caPath, Contents: readSnapshotBytes(t, fixture.caPath)}}
+	collections := []string{"definitions", "profiles", "targets", "policies"}
+	roles := []string{"connector", "plan", "target", "egress"}
+	for index, role := range roles {
+		for _, mutation := range []struct {
+			name  string
+			apply func([]byte) []byte
+		}{
+			{name: "strict unknown", apply: func(contents []byte) []byte {
+				return bytes.Replace(contents, []byte("{"), []byte(`{"unknown":"`+canary+`",`), 1)
+			}},
+			{name: "semantic empty collection", apply: func(contents []byte) []byte {
+				return emptyManifestCollection(t, contents, collections[index])
+			}},
+		} {
+			t.Run(role+"/"+mutation.name, func(t *testing.T) {
+				manifests := make([][]byte, len(base))
+				for manifestIndex := range base {
+					manifests[manifestIndex] = append([]byte(nil), base[manifestIndex]...)
+				}
+				manifests[index] = mutation.apply(manifests[index])
+				snapshot, err := LoadCanonicalManifests(
+					context.Background(), manifests[0], manifests[1], manifests[2], manifests[3],
+					targetRoots, fixture.options.Expected,
+				)
+				if snapshot != nil || !errors.Is(err, ErrSnapshotRejected) {
+					t.Fatalf("LoadCanonicalManifests() = %#v, %v", snapshot, err)
+				}
+				if strings.Contains(fmt.Sprint(err), canary) {
+					t.Fatalf("LoadCanonicalManifests leaked rejected input: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestLoadCanonicalManifestsRejectsUnboundedCapturedRootSets(t *testing.T) {
+	fixture := newSnapshotFixture(t)
+	connectorManifest := readSnapshotBytes(t, fixture.options.ConnectorManifestFile)
+	planManifest := readSnapshotBytes(t, fixture.options.PlanManifestFile)
+	targetManifest := readSnapshotBytes(t, fixture.options.TargetManifestFile)
+	egressManifest := readSnapshotBytes(t, fixture.options.EgressManifestFile)
+	valid := CapturedRootBundle{Path: fixture.caPath, Contents: readSnapshotBytes(t, fixture.caPath)}
+	tooMany := make([]CapturedRootBundle, maximumCapturedRootBundles+1)
+	for index := range tooMany {
+		tooMany[index] = valid
+	}
+	for name, roots := range map[string][]CapturedRootBundle{
+		"missing":  nil,
+		"too many": tooMany,
+		"oversized": {{
+			Path: fixture.caPath, Contents: bytes.Repeat([]byte{'x'}, maximumCapturedRootBytes+1),
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			snapshot, err := LoadCanonicalManifests(
+				context.Background(), connectorManifest, planManifest, targetManifest, egressManifest,
+				roots, fixture.options.Expected,
+			)
+			if snapshot != nil || !errors.Is(err, ErrSnapshotRejected) {
+				t.Fatalf("LoadCanonicalManifests() = %#v, %v", snapshot, err)
+			}
+		})
+	}
+}
+
+func emptyManifestCollection(t *testing.T, contents []byte, field string) []byte {
+	t.Helper()
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(contents, &document); err != nil {
+		t.Fatal(err)
+	}
+	document[field] = json.RawMessage(`[]`)
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }
 
 func TestLoadFilesDetachesCallerOwnedExpectedDigestBackingStorage(t *testing.T) {
@@ -716,6 +869,15 @@ func writeSnapshotBytes(t *testing.T, path string, value []byte) {
 	if err := os.WriteFile(path, value, 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func readSnapshotBytes(t *testing.T, path string) []byte {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return contents
 }
 
 func snapshotSummary(planDigest string, runtime readruntime.Summary) Summary {

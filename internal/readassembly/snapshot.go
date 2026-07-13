@@ -24,6 +24,13 @@ import (
 
 const SnapshotSchemaVersion = "read-assembly-snapshot.v1"
 
+const (
+	maximumCapturedManifestBytes = 1 << 20
+	maximumCapturedRootBytes     = 256 << 10
+	maximumCapturedRootBundles   = 256
+	maximumCapturedSourceBytes   = 5 << 20
+)
+
 var ErrSnapshotRejected = errors.New("READ assembly snapshot rejected")
 
 // Summary is the reviewed deployment identity for one complete planning and
@@ -68,6 +75,15 @@ type FileOptions struct {
 	Expected              Summary
 }
 
+// CapturedRootBundle is one content-addressed target trust bundle captured in
+// the same reviewed source as the manifests. It is borrowed only for the
+// duration of LoadCanonicalManifests and is never retained by Snapshot.
+// Production callers are restricted by an architecture gate.
+type CapturedRootBundle struct {
+	Path     string
+	Contents []byte
+}
+
 type snapshotSeal struct{ value byte }
 
 var trustedSnapshotSeal = &snapshotSeal{value: 1}
@@ -90,6 +106,119 @@ type Snapshot struct {
 // snapshot; the complete expected Summary turns a mixed rollout read into an
 // exact semantic match or a startup rejection.
 func LoadFiles(ctx context.Context, options FileOptions) (snapshot *Snapshot, returnedErr error) {
+	if err := snapshotContextError(ctx); err != nil {
+		return nil, err
+	}
+	if !validManifestPaths(options) {
+		return nil, ErrSnapshotRejected
+	}
+	return loadSnapshot(ctx, options.Expected, snapshotLoaders{
+		connectors: func() (*readconnector.Registry, error) {
+			return readconnector.LoadFile(options.ConnectorManifestFile)
+		},
+		planner: func(
+			ctx context.Context,
+			authority *investigationplan.ScopeAuthority,
+			connectors *readconnector.Registry,
+		) (*investigationplan.Planner, error) {
+			return investigationplan.LoadFile(ctx, authority, options.PlanManifestFile, connectors)
+		},
+		targets: func() (*readtarget.Registry, error) {
+			return readtarget.LoadFile(options.TargetManifestFile)
+		},
+		egress: func() (*readexecutor.EgressRegistry, error) {
+			return readexecutor.LoadEgressRegistryFile(options.EgressManifestFile)
+		},
+	})
+}
+
+// LoadCanonicalManifests constructs a semantic Snapshot exclusively from
+// manifest and target-root bytes already captured by one reviewed source. The
+// slices are borrowed, never mutated or retained, and there is no filesystem
+// fallback. Its only production caller is locked to workerbootstrap.
+func LoadCanonicalManifests(
+	ctx context.Context,
+	connectorManifest []byte,
+	planManifest []byte,
+	targetManifest []byte,
+	egressManifest []byte,
+	targetRoots []CapturedRootBundle,
+	expected Summary,
+) (*Snapshot, error) {
+	if err := snapshotContextError(ctx); err != nil {
+		return nil, err
+	}
+	if !validCanonicalManifestSet(
+		connectorManifest, planManifest, targetManifest, egressManifest, targetRoots,
+	) {
+		return nil, ErrSnapshotRejected
+	}
+	roots := make([]readtarget.CapturedRootBundle, len(targetRoots))
+	for index := range targetRoots {
+		roots[index] = readtarget.CapturedRootBundle{
+			Path: targetRoots[index].Path, Contents: targetRoots[index].Contents,
+		}
+	}
+	return loadSnapshot(ctx, expected, snapshotLoaders{
+		connectors: func() (*readconnector.Registry, error) {
+			return readconnector.CompileManifest(connectorManifest)
+		},
+		planner: func(
+			ctx context.Context,
+			authority *investigationplan.ScopeAuthority,
+			connectors *readconnector.Registry,
+		) (*investigationplan.Planner, error) {
+			return investigationplan.CompileManifest(ctx, authority, planManifest, connectors)
+		},
+		targets: func() (*readtarget.Registry, error) {
+			return readtarget.CompileCapturedManifest(targetManifest, roots)
+		},
+		egress: func() (*readexecutor.EgressRegistry, error) {
+			return readexecutor.CompileEgressManifest(egressManifest)
+		},
+	})
+}
+
+func validCanonicalManifestSet(
+	connectorManifest []byte,
+	planManifest []byte,
+	targetManifest []byte,
+	egressManifest []byte,
+	targetRoots []CapturedRootBundle,
+) bool {
+	total := 0
+	for _, manifest := range [][]byte{connectorManifest, planManifest, targetManifest, egressManifest} {
+		if len(manifest) == 0 || len(manifest) > maximumCapturedManifestBytes ||
+			total > maximumCapturedSourceBytes-len(manifest) {
+			return false
+		}
+		total += len(manifest)
+	}
+	if len(targetRoots) == 0 || len(targetRoots) > maximumCapturedRootBundles {
+		return false
+	}
+	for _, root := range targetRoots {
+		if len(root.Contents) == 0 || len(root.Contents) > maximumCapturedRootBytes ||
+			total > maximumCapturedSourceBytes-len(root.Contents) {
+			return false
+		}
+		total += len(root.Contents)
+	}
+	return true
+}
+
+type snapshotLoaders struct {
+	connectors func() (*readconnector.Registry, error)
+	planner    func(context.Context, *investigationplan.ScopeAuthority, *readconnector.Registry) (*investigationplan.Planner, error)
+	targets    func() (*readtarget.Registry, error)
+	egress     func() (*readexecutor.EgressRegistry, error)
+}
+
+func loadSnapshot(
+	ctx context.Context,
+	expected Summary,
+	loaders snapshotLoaders,
+) (snapshot *Snapshot, returnedErr error) {
 	defer func() {
 		if recover() != nil {
 			snapshot = nil
@@ -102,44 +231,45 @@ func LoadFiles(ctx context.Context, options FileOptions) (snapshot *Snapshot, re
 	if err := snapshotContextError(ctx); err != nil {
 		return nil, err
 	}
-	if options.Expected.Validate() != nil || !validManifestPaths(options) {
+	if expected.Validate() != nil || loaders.connectors == nil || loaders.planner == nil ||
+		loaders.targets == nil || loaders.egress == nil {
 		return nil, ErrSnapshotRejected
 	}
 
-	connectors, err := readconnector.LoadFile(options.ConnectorManifestFile)
+	connectors, err := loaders.connectors()
 	if err != nil || connectors == nil || !connectors.Ready() ||
-		!sameDigest(connectors.Digest(), options.Expected.ConnectorRegistryDigest) {
+		!sameDigest(connectors.Digest(), expected.ConnectorRegistryDigest) {
 		return nil, snapshotFailure(ctx)
 	}
 	if err := snapshotContextError(ctx); err != nil {
 		return nil, err
 	}
 	authority := investigationplan.NewScopeAuthority()
-	planner, err := investigationplan.LoadFile(ctx, authority, options.PlanManifestFile, connectors)
+	planner, err := loaders.planner(ctx, authority, connectors)
 	if err != nil || planner == nil || !planner.Ready() || !planner.AcceptsAuthority(authority) ||
-		!sameDigest(planner.ManifestDigest(), options.Expected.PlanManifestDigest) ||
-		!sameDigest(planner.RegistryDigest(), options.Expected.ConnectorRegistryDigest) {
+		!sameDigest(planner.ManifestDigest(), expected.PlanManifestDigest) ||
+		!sameDigest(planner.RegistryDigest(), expected.ConnectorRegistryDigest) {
 		return nil, snapshotFailure(ctx)
 	}
 	if err := snapshotContextError(ctx); err != nil {
 		return nil, err
 	}
-	targets, err := readtarget.LoadFile(options.TargetManifestFile)
+	targets, err := loaders.targets()
 	if err != nil || targets == nil || !targets.Ready() ||
-		!sameDigest(targets.Digest(), options.Expected.TargetRegistryDigest) {
+		!sameDigest(targets.Digest(), expected.TargetRegistryDigest) {
 		return nil, snapshotFailure(ctx)
 	}
 	if err := snapshotContextError(ctx); err != nil {
 		return nil, err
 	}
-	egress, err := readexecutor.LoadEgressRegistryFile(options.EgressManifestFile)
+	egress, err := loaders.egress()
 	if err != nil || egress == nil || !egress.Ready() ||
-		!sameDigest(egress.Digest(), options.Expected.EgressRegistryDigest) {
+		!sameDigest(egress.Digest(), expected.EgressRegistryDigest) {
 		return nil, snapshotFailure(ctx)
 	}
 	profile, err := readexecutor.NewProfile()
 	if err != nil || profile == nil || !profile.Ready() ||
-		!sameDigest(profile.Digest(), options.Expected.ExecutorProfileDigest) {
+		!sameDigest(profile.Digest(), expected.ExecutorProfileDigest) {
 		return nil, snapshotFailure(ctx)
 	}
 	if err := snapshotContextError(ctx); err != nil {
@@ -147,11 +277,11 @@ func LoadFiles(ctx context.Context, options FileOptions) (snapshot *Snapshot, re
 	}
 	bundle, err := readruntime.NewBundle(connectors, targets, egress, profile)
 	if err != nil || bundle == nil || !bundle.Ready() ||
-		!sameRuntimeSummary(bundle.Summary(), options.Expected.runtimeSummary()) {
+		!sameRuntimeSummary(bundle.Summary(), expected.runtimeSummary()) {
 		return nil, snapshotFailure(ctx)
 	}
 	actualSummary := newSummary(planner.ManifestDigest(), bundle.Summary())
-	if !sameSummary(actualSummary, options.Expected) {
+	if !sameSummary(actualSummary, expected) {
 		return nil, ErrSnapshotRejected
 	}
 	created := &Snapshot{

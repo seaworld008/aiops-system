@@ -4,6 +4,7 @@ package workerbootstrap
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
@@ -12,8 +13,11 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/seaworld008/aiops-system/internal/readassembly"
 	"github.com/seaworld008/aiops-system/internal/securemanifest"
 	"golang.org/x/sys/unix"
 )
@@ -132,6 +136,309 @@ func TestAcceptInheritedSourceValidatesDescriptorAndFrame(t *testing.T) {
 				t.Fatalf("acceptInheritedSourceDescriptor() = %#v, %v; want rejection", source, err)
 			}
 		})
+	}
+}
+
+func TestInheritedSourceBuildSnapshotConsumesCapturedCanonicalMaterial(t *testing.T) {
+	framed := productionInheritedFrame(t)
+	envelope := decodeWireEnvelopeForTest(t, framed)
+	var expected publicDocument
+	if securemanifest.DecodeStrict(envelope.Artifacts[0].Contents, &expected) != nil {
+		t.Fatal("decode expected semantic snapshot")
+	}
+	file, err := createReadOnlySealedMemfd(framed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd, err := unix.Dup(int(file.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = file.Close()
+	source, err := acceptInheritedSourceDescriptor(fd)
+	if err != nil || source == nil || source.state.material == nil {
+		t.Fatalf("acceptInheritedSourceDescriptor() = %#v, %v", source, err)
+	}
+	material := source.state.material
+	borrowed := [][]byte{material.connector, material.plan, material.target, material.egress}
+	for index := range material.roots {
+		borrowed = append(borrowed, material.roots[index].contents)
+	}
+	snapshot, err := source.BuildSnapshot(context.Background())
+	if err != nil || snapshot == nil || !snapshot.Ready() {
+		t.Fatalf("BuildSnapshot() = %#v, %v", snapshot, err)
+	}
+	actual := snapshot.Summary()
+	if actual.SchemaVersion != expected.ExpectedSnapshot.SchemaVersion ||
+		actual.PlanManifestDigest != expected.ExpectedSnapshot.PlanManifestDigest ||
+		actual.ConnectorRegistryDigest != expected.ExpectedSnapshot.ConnectorRegistryDigest ||
+		actual.TargetRegistryDigest != expected.ExpectedSnapshot.TargetRegistryDigest ||
+		actual.EgressRegistryDigest != expected.ExpectedSnapshot.EgressRegistryDigest ||
+		actual.ExecutorProfileDigest != expected.ExpectedSnapshot.ExecutorProfileDigest ||
+		actual.BundleDigest != expected.ExpectedSnapshot.BundleDigest {
+		t.Fatalf("Snapshot Summary = %#v, want exact bootstrap expected_snapshot", actual)
+	}
+	if source.Summary() != (PublicSourceSummary{}) || source.state.material != nil ||
+		material.connector != nil || material.plan != nil || material.target != nil || material.egress != nil ||
+		material.roots != nil {
+		t.Fatal("BuildSnapshot retained captured manifest material")
+	}
+	for index, contents := range borrowed {
+		if !allZero(contents) {
+			t.Fatalf("captured material %d was not cleared", index)
+		}
+	}
+	if second, secondErr := source.BuildSnapshot(context.Background()); second != nil ||
+		!errors.Is(secondErr, ErrBootstrapRejected) {
+		t.Fatalf("second BuildSnapshot() = %#v, %v", second, secondErr)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+func allZero(contents []byte) bool {
+	for _, value := range contents {
+		if value != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func TestInheritedSourceBuildSnapshotRejectsExpectedDriftAndClosesSource(t *testing.T) {
+	envelope := decodeWireEnvelopeForTest(t, productionInheritedFrame(t))
+	var document publicDocument
+	if securemanifest.DecodeStrict(envelope.Artifacts[0].Contents, &document) != nil {
+		t.Fatal("decode bootstrap document")
+	}
+	document.ExpectedSnapshot.BundleDigest = strings.Repeat("f", 64)
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope.Artifacts[0].Contents = encoded
+	envelope.Artifacts[0].SHA256 = sha256Hex(encoded)
+	file, err := createReadOnlySealedMemfd(marshalWireEnvelopeForTest(t, envelope))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd, err := unix.Dup(int(file.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = file.Close()
+	source, err := acceptInheritedSourceDescriptor(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	material := source.state.material
+	borrowed := capturedMaterialBuffers(material)
+	if snapshot, buildErr := source.BuildSnapshot(context.Background()); snapshot != nil ||
+		!errors.Is(buildErr, ErrBootstrapRejected) {
+		t.Fatalf("BuildSnapshot(drift) = %#v, %v", snapshot, buildErr)
+	}
+	if source.state.file != nil || source.state.state != inheritedSourceClosed || source.state.material != nil {
+		t.Fatal("failed BuildSnapshot did not close and consume source")
+	}
+	if material.expected != (readassembly.Summary{}) {
+		t.Fatal("failed BuildSnapshot retained expected_snapshot")
+	}
+	for index, contents := range borrowed {
+		if !allZero(contents) {
+			t.Fatalf("failed BuildSnapshot did not clear material %d", index)
+		}
+	}
+	if err := source.Close(); err != nil {
+		t.Fatalf("Close(consumed) error = %v", err)
+	}
+}
+
+func TestInheritedSourceBuildSnapshotRacePublishesAtMostOneSnapshot(t *testing.T) {
+	framed := productionInheritedFrame(t)
+	for iteration := range 100 {
+		file, err := createReadOnlySealedMemfd(framed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fd, err := unix.Dup(int(file.Fd()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = file.Close()
+		source, err := acceptInheritedSourceDescriptor(fd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		results := make(chan bool, 2)
+		errorsSeen := make(chan error, 2)
+		var wait sync.WaitGroup
+		wait.Add(2)
+		for range 2 {
+			go func() {
+				defer wait.Done()
+				snapshot, buildErr := source.BuildSnapshot(context.Background())
+				results <- snapshot != nil && snapshot.Ready()
+				errorsSeen <- buildErr
+			}()
+		}
+		wait.Wait()
+		close(results)
+		close(errorsSeen)
+		ready := 0
+		for result := range results {
+			if result {
+				ready++
+			}
+		}
+		rejected := 0
+		for buildErr := range errorsSeen {
+			if errors.Is(buildErr, ErrBootstrapRejected) {
+				rejected++
+			} else if buildErr != nil {
+				t.Fatalf("iteration %d unexpected BuildSnapshot error = %v", iteration, buildErr)
+			}
+		}
+		if ready != 1 || rejected != 1 {
+			t.Fatalf("iteration %d ready/rejected = %d/%d, want 1/1", iteration, ready, rejected)
+		}
+		if err := source.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestInheritedSourceBuildSnapshotHostileContextClearsAndConsumes(t *testing.T) {
+	file, err := createReadOnlySealedMemfd(productionInheritedFrame(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd, err := unix.Dup(int(file.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = file.Close()
+	source, err := acceptInheritedSourceDescriptor(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	material := source.state.material
+	borrowed := capturedMaterialBuffers(material)
+	if snapshot, buildErr := source.BuildSnapshot(panickingInheritedContext{}); snapshot != nil ||
+		!errors.Is(buildErr, ErrBootstrapRejected) {
+		t.Fatalf("BuildSnapshot(hostile context) = %#v, %v", snapshot, buildErr)
+	}
+	for index, contents := range borrowed {
+		if !allZero(contents) {
+			t.Fatalf("hostile context did not clear material %d", index)
+		}
+	}
+	if material.expected != (readassembly.Summary{}) || source.state.state != inheritedSourceClosed {
+		t.Fatal("hostile context retained semantic source state")
+	}
+}
+
+type panickingInheritedContext struct{}
+
+func (panickingInheritedContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (panickingInheritedContext) Done() <-chan struct{}       { return nil }
+func (panickingInheritedContext) Err() error                  { panic("hostile context") }
+func (panickingInheritedContext) Value(any) any               { return nil }
+
+func capturedMaterialBuffers(material *inheritedSnapshotMaterial) [][]byte {
+	if material == nil {
+		return nil
+	}
+	borrowed := [][]byte{material.connector, material.plan, material.target, material.egress}
+	for index := range material.roots {
+		borrowed = append(borrowed, material.roots[index].contents)
+	}
+	return borrowed
+}
+
+func TestInheritedSourceBuildSnapshotCancellationIsOneShot(t *testing.T) {
+	framed := productionInheritedFrame(t)
+	file, err := createReadOnlySealedMemfd(framed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd, err := unix.Dup(int(file.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = file.Close()
+	source, err := acceptInheritedSourceDescriptor(fd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	material := source.state.material
+	borrowed := capturedMaterialBuffers(material)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if snapshot, buildErr := source.BuildSnapshot(ctx); snapshot != nil || !errors.Is(buildErr, context.Canceled) {
+		t.Fatalf("BuildSnapshot(cancelled) = %#v, %v", snapshot, buildErr)
+	}
+	if retry, retryErr := source.BuildSnapshot(context.Background()); retry != nil ||
+		!errors.Is(retryErr, ErrBootstrapRejected) {
+		t.Fatalf("BuildSnapshot(retry) = %#v, %v", retry, retryErr)
+	}
+	for index, contents := range borrowed {
+		if !allZero(contents) {
+			t.Fatalf("cancelled BuildSnapshot did not clear material %d", index)
+		}
+	}
+	if material.expected != (readassembly.Summary{}) || source.state.state != inheritedSourceClosed {
+		t.Fatal("cancelled BuildSnapshot retained semantic source state")
+	}
+}
+
+func TestInheritedSourceBuildSnapshotAndCloseRaceHasOneOwner(t *testing.T) {
+	framed := productionInheritedFrame(t)
+	for iteration := range 100 {
+		file, err := createReadOnlySealedMemfd(framed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fd, err := unix.Dup(int(file.Fd()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = file.Close()
+		source, err := acceptInheritedSourceDescriptor(fd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wait sync.WaitGroup
+		wait.Add(2)
+		var snapshotReady bool
+		var buildErr, closeErr error
+		go func() {
+			defer wait.Done()
+			snapshot, err := source.BuildSnapshot(context.Background())
+			buildErr = err
+			snapshotReady = snapshot != nil && snapshot.Ready()
+		}()
+		go func() {
+			defer wait.Done()
+			closeErr = source.Close()
+		}()
+		wait.Wait()
+		if snapshotReady {
+			if buildErr != nil {
+				t.Fatalf("iteration %d ready Snapshot error = %v", iteration, buildErr)
+			}
+		} else if !errors.Is(buildErr, ErrBootstrapRejected) {
+			t.Fatalf("iteration %d BuildSnapshot error = %v", iteration, buildErr)
+		}
+		if closeErr != nil && !errors.Is(closeErr, ErrBootstrapRejected) {
+			t.Fatalf("iteration %d Close error = %v", iteration, closeErr)
+		}
+		if err := source.Close(); err != nil {
+			t.Fatalf("iteration %d final Close error = %v", iteration, err)
+		}
+		if source.state.file != nil || source.state.material != nil || source.state.state != inheritedSourceClosed {
+			t.Fatalf("iteration %d retained source ownership", iteration)
+		}
 	}
 }
 

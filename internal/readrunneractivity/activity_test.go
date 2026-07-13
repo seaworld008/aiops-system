@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -192,8 +191,16 @@ func TestHeartbeatContinuesWithMonotonicGatewaySequenceAndNoDetailTemporalAPI(t 
 	lease.mu.Lock()
 	sequences := append([]int64(nil), lease.sequences...)
 	lease.mu.Unlock()
-	if !reflect.DeepEqual(sequences, []int64{1, 2}) {
-		t.Fatalf("heartbeat sequences = %v", sequences)
+	// Closing allowExecution at sequence 2 races legitimately with the next
+	// ticker delivery. Assert the protocol invariant instead of scheduler-
+	// dependent exact cardinality.
+	if len(sequences) < 2 {
+		t.Fatalf("heartbeat sequences = %v, want at least immediate plus periodic", sequences)
+	}
+	for index, sequence := range sequences {
+		if sequence != int64(index+1) {
+			t.Fatalf("heartbeat sequences = %v, want contiguous monotonic values", sequences)
+		}
 	}
 	if temporalHeartbeats.Load() < 2 {
 		t.Fatalf("Temporal heartbeats = %d, want immediate plus periodic", temporalHeartbeats.Load())

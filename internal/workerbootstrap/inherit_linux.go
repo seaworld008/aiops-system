@@ -10,8 +10,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"time"
 
+	"github.com/seaworld008/aiops-system/internal/readassembly"
 	"github.com/seaworld008/aiops-system/internal/securemanifest"
 	"golang.org/x/sys/unix"
 )
@@ -61,12 +63,17 @@ func acceptInheritedSourceDescriptor(fd int) (*InheritedSource, error) {
 	if err != nil {
 		return nil, ErrBootstrapRejected
 	}
+	material, err := captureInheritedSnapshotMaterial(contents, summary)
+	if err != nil {
+		return nil, ErrBootstrapRejected
+	}
 	file := os.NewFile(uintptr(fd), memfdName)
 	if file == nil {
+		material.clear()
 		return nil, ErrBootstrapRejected
 	}
 	owned = false
-	return newInheritedSource(file, summary), nil
+	return newInheritedSourceWithSnapshot(file, summary, material), nil
 }
 
 func validInheritedSourceDescriptor(fd int, stat unix.Stat_t) bool {
@@ -115,6 +122,7 @@ func validateInheritedSourceFrame(framed []byte) (PublicSourceSummary, error) {
 		envelope.SchemaVersion != publicEnvelopeSchemaVersion || len(envelope.Artifacts) < 11 {
 		return PublicSourceSummary{}, ErrBootstrapRejected
 	}
+	defer clearInheritedEnvelope(&envelope)
 	canonical, err := json.Marshal(envelope)
 	if err != nil || !bytes.Equal(canonical, framed[payloadStart:payloadEnd]) {
 		clear(canonical)
@@ -181,6 +189,77 @@ func validateInheritedSourceFrame(framed []byte) (PublicSourceSummary, error) {
 		SchemaVersion: PublicSourceSchemaVersion, ManifestSHA256: bootstrap.SHA256,
 		EnvelopeSHA256: hex.EncodeToString(digest), EnvelopeSize: int64(len(framed)),
 	}, nil
+}
+
+func captureInheritedSnapshotMaterial(
+	framed []byte,
+	summary PublicSourceSummary,
+) (*inheritedSnapshotMaterial, error) {
+	minimum := len(envelopeMagicText) + 8 + sha256.Size
+	if len(framed) < minimum || int64(len(framed)) != summary.EnvelopeSize ||
+		!bytes.HasPrefix(framed, []byte(envelopeMagicText)) {
+		return nil, ErrBootstrapRejected
+	}
+	payloadLength := binary.BigEndian.Uint64(framed[len(envelopeMagicText) : len(envelopeMagicText)+8])
+	payloadStart := len(envelopeMagicText) + 8
+	if payloadLength == 0 || payloadLength > uint64(len(framed)-payloadStart-sha256.Size) {
+		return nil, ErrBootstrapRejected
+	}
+	payloadEnd := payloadStart + int(payloadLength)
+	if payloadEnd+sha256.Size != len(framed) {
+		return nil, ErrBootstrapRejected
+	}
+	var envelope publicWireEnvelope
+	if securemanifest.DecodeStrict(framed[payloadStart:payloadEnd], &envelope) != nil ||
+		envelope.SchemaVersion != publicEnvelopeSchemaVersion || len(envelope.Artifacts) < 11 {
+		return nil, ErrBootstrapRejected
+	}
+	defer clearInheritedEnvelope(&envelope)
+	canonical, err := json.Marshal(envelope)
+	if err != nil || !bytes.Equal(canonical, framed[payloadStart:payloadEnd]) {
+		clear(canonical)
+		return nil, ErrBootstrapRejected
+	}
+	clear(canonical)
+	document, err := decodePublicDocument(envelope.Artifacts[0].Contents)
+	if err != nil || envelope.Artifacts[0].SHA256 != summary.ManifestSHA256 ||
+		len(envelope.Artifacts) != 10+len(document.Artifacts.TargetRootBundleSHA256) {
+		return nil, ErrBootstrapRejected
+	}
+	material := &inheritedSnapshotMaterial{
+		connector: bytes.Clone(envelope.Artifacts[1].Contents),
+		plan:      bytes.Clone(envelope.Artifacts[2].Contents),
+		target:    bytes.Clone(envelope.Artifacts[3].Contents),
+		egress:    bytes.Clone(envelope.Artifacts[4].Contents),
+		expected: readassembly.Summary{
+			SchemaVersion:           cloneSnapshotString(document.ExpectedSnapshot.SchemaVersion),
+			PlanManifestDigest:      cloneSnapshotString(document.ExpectedSnapshot.PlanManifestDigest),
+			ConnectorRegistryDigest: cloneSnapshotString(document.ExpectedSnapshot.ConnectorRegistryDigest),
+			TargetRegistryDigest:    cloneSnapshotString(document.ExpectedSnapshot.TargetRegistryDigest),
+			EgressRegistryDigest:    cloneSnapshotString(document.ExpectedSnapshot.EgressRegistryDigest),
+			ExecutorProfileDigest:   cloneSnapshotString(document.ExpectedSnapshot.ExecutorProfileDigest),
+			BundleDigest:            cloneSnapshotString(document.ExpectedSnapshot.BundleDigest),
+		},
+	}
+	material.roots = make([]inheritedSnapshotRoot, len(envelope.Artifacts)-10)
+	for index, artifact := range envelope.Artifacts[10:] {
+		material.roots[index] = inheritedSnapshotRoot{
+			path:     filepath.Join(productionBootstrapRoot, targetRootsDirectory, artifact.Name),
+			contents: bytes.Clone(artifact.Contents),
+		}
+	}
+	return material, nil
+}
+
+func clearInheritedEnvelope(envelope *publicWireEnvelope) {
+	if envelope == nil {
+		return
+	}
+	for index := range envelope.Artifacts {
+		clear(envelope.Artifacts[index].Contents)
+		envelope.Artifacts[index].Contents = nil
+	}
+	envelope.Artifacts = nil
 }
 
 func validInheritedArtifact(artifact publicWireArtifact, role, name string, maximum int) bool {

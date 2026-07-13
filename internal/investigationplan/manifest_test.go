@@ -43,6 +43,43 @@ func TestLoadFileBuildsSameDigestAsTrustedMemoryDefinition(t *testing.T) {
 	}
 }
 
+func TestCompileManifestBuildsDetachedPlannerWithinWireBudget(t *testing.T) {
+	registry, connectorID := testRegistry(t)
+	authority := investigationplan.NewScopeAuthority()
+	valid := manifestBytes(t, testDefinition(registry.Digest(), connectorID))
+	encoded := append(bytes.Repeat([]byte{' '}, investigationplan.MaximumDefinitionBytes-len(valid)), valid...)
+	original := append([]byte(nil), encoded...)
+
+	planner, err := investigationplan.CompileManifest(context.Background(), authority, encoded, registry)
+	if err != nil {
+		t.Fatalf("CompileManifest() error = %v", err)
+	}
+	if planner == nil || planner.ManifestDigest() == "" {
+		t.Fatalf("CompileManifest() planner = %#v", planner)
+	}
+	digest := planner.ManifestDigest()
+	if !bytes.Equal(encoded, original) {
+		t.Fatal("CompileManifest() modified the caller-owned buffer")
+	}
+	clear(encoded)
+	if planner.ManifestDigest() != digest {
+		t.Fatal("caller buffer mutation changed the compiled planner")
+	}
+
+	for name, contents := range map[string][]byte{
+		"empty": nil,
+		"over limit": append(bytes.Repeat([]byte{' '}, investigationplan.MaximumDefinitionBytes+1-len(valid)),
+			valid...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			compiled, compileErr := investigationplan.CompileManifest(context.Background(), authority, contents, registry)
+			if compiled != nil || !errors.Is(compileErr, investigationplan.ErrManifestJSON) {
+				t.Fatalf("CompileManifest() = %#v, %v; want nil, ErrManifestJSON", compiled, compileErr)
+			}
+		})
+	}
+}
+
 func TestLoadFileRejectsStrictJSONAndNeverLeaksManifestMaterial(t *testing.T) {
 	registry, connectorID := testRegistry(t)
 	authority := investigationplan.NewScopeAuthority()

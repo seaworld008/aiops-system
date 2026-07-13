@@ -2,10 +2,14 @@ package workerprocess
 
 import (
 	"context"
+	"errors"
+	"io"
 	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/seaworld008/aiops-system/internal/readassembly"
 )
 
 func TestIsControlWorkerChildRequiresExactPrivateArgument(t *testing.T) {
@@ -58,6 +62,7 @@ func TestChildStatusReadyIsExactlyOnce(t *testing.T) {
 	defer reader.Close()
 	source := &testChildSource{}
 	status := newChildStatus(writer, source)
+	status.snapshotBuilt = true
 	if err := ReportControlWorkerReady(status); err != nil {
 		t.Fatalf("Ready() error = %v", err)
 	}
@@ -79,6 +84,49 @@ func TestChildStatusReadyIsExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestChildStatusCannotReportReadyBeforeSemanticSnapshot(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	status := newChildStatus(writer, &testChildSource{})
+	if err := ReportControlWorkerReady(status); err != errStatusAlreadyReported {
+		t.Fatalf("ReportControlWorkerReady(pre-snapshot) error = %v", err)
+	}
+	if err := CloseControlWorkerChild(status); err != nil {
+		t.Fatalf("CloseControlWorkerChild() error = %v", err)
+	}
+	frame := make([]byte, 1)
+	if read, err := reader.Read(frame); read != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("pre-snapshot status channel = read %d frame %q error %v; want EOF without READY", read, frame, err)
+	}
+}
+
+func TestBuildControlWorkerSnapshotRejectsMissingOrPanickingSourceCapability(t *testing.T) {
+	tests := map[string]ioCloserForSnapshotTest{
+		"missing builder":   &testChildSource{},
+		"panicking builder": &snapshotBuildTestSource{panicBuild: true},
+	}
+	for name, source := range tests {
+		t.Run(name, func(t *testing.T) {
+			reader, writer, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+			status := newChildStatus(writer, source)
+			snapshot, buildErr := BuildControlWorkerSnapshot(context.Background(), status)
+			if snapshot != nil || buildErr != errInvalidChildInvocation {
+				t.Fatalf("BuildControlWorkerSnapshot() = %#v, %v", snapshot, buildErr)
+			}
+			if err := CloseControlWorkerChild(status); err != nil {
+				t.Fatalf("CloseControlWorkerChild() error = %v", err)
+			}
+		})
+	}
+}
+
 func TestChildStatusCopyCannotDuplicateCapability(t *testing.T) {
 	t.Parallel()
 	reader, writer, err := os.Pipe()
@@ -87,6 +135,7 @@ func TestChildStatusCopyCannotDuplicateCapability(t *testing.T) {
 	}
 	defer reader.Close()
 	status := newChildStatus(writer, &testChildSource{})
+	status.snapshotBuilt = true
 	copied := &ChildStatus{
 		file: status.file, state: status.state, seal: status.seal, self: status.self,
 	}
@@ -116,6 +165,7 @@ func TestChildStatusReadyAndCloseRaceKeepsOneLifecycle(t *testing.T) {
 		}
 		source := &countingChildSource{}
 		status := newChildStatus(writer, source)
+		status.snapshotBuilt = true
 		results := make(chan error, 2)
 		var wait sync.WaitGroup
 		wait.Add(2)
@@ -142,6 +192,25 @@ func TestChildStatusReadyAndCloseRaceKeepsOneLifecycle(t *testing.T) {
 }
 
 type testChildSource struct{ closed bool }
+
+type ioCloserForSnapshotTest interface{ Close() error }
+
+type snapshotBuildTestSource struct {
+	panicBuild bool
+	closed     bool
+}
+
+func (source *snapshotBuildTestSource) BuildSnapshot(context.Context) (*readassembly.Snapshot, error) {
+	if source.panicBuild {
+		panic("snapshot build test panic")
+	}
+	return nil, nil
+}
+
+func (source *snapshotBuildTestSource) Close() error {
+	source.closed = true
+	return nil
+}
 
 func (source *testChildSource) Close() error {
 	source.closed = true

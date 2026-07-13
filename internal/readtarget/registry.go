@@ -34,7 +34,13 @@ type Registry struct {
 }
 
 func newRegistry(definitions []Definition, now time.Time) (*Registry, error) {
-	if len(definitions) == 0 || len(definitions) > maximumTargets || now.IsZero() {
+	return newRegistryWithBuilder(definitions, now, buildContract)
+}
+
+type contractBuilder func(Definition, time.Time) (builtContract, error)
+
+func newRegistryWithBuilder(definitions []Definition, now time.Time, build contractBuilder) (*Registry, error) {
+	if len(definitions) == 0 || len(definitions) > maximumTargets || now.IsZero() || build == nil {
 		return nil, ErrInvalidDefinition
 	}
 	registry := &Registry{entries: make(map[registryKey]Target, len(definitions))}
@@ -45,7 +51,7 @@ func newRegistry(definitions []Definition, now time.Time) (*Registry, error) {
 		if len(matches) != 3 || sensitiveReferenceBase(matches[1]) {
 			return nil, ErrInvalidDefinition
 		}
-		contract, err := buildContract(definition, now)
+		contract, err := build(definition, now)
 		if err != nil || matches[2] != contract.digest {
 			return nil, ErrInvalidDefinition
 		}

@@ -8,6 +8,8 @@ import (
 
 const manifestSchemaVersion = "read-connector-registry.v1"
 
+const maximumManifestBytes = 1 << 20
+
 var (
 	// These sentinels intentionally carry only a low-sensitivity category.
 	// Callers must never receive an operating-system, path, query, or target
@@ -23,26 +25,40 @@ type manifestDocument struct {
 	Definitions   []Definition `json:"definitions"`
 }
 
+// CompileManifest compiles one bounded, already-admitted manifest snapshot.
+// It neither modifies nor retains the caller-owned wire buffer.
+func CompileManifest(contents []byte) (*Registry, error) {
+	return compileManifest(contents)
+}
+
+func compileManifest(contents []byte) (*Registry, error) {
+	if len(contents) == 0 || len(contents) > maximumManifestBytes {
+		return nil, ErrManifestJSON
+	}
+	var document manifestDocument
+	if err := securemanifest.DecodeStrict(contents, &document); err != nil ||
+		document.SchemaVersion != manifestSchemaVersion {
+		return nil, ErrManifestJSON
+	}
+	if len(document.Definitions) == 0 || len(document.Definitions) > maxDefinitions {
+		return nil, manifestDefinitionError()
+	}
+	registry, err := New(document.Definitions)
+	if err != nil {
+		return nil, manifestDefinitionError()
+	}
+	return registry, nil
+}
+
 // LoadFile securely loads an immutable, server-owned READ connector registry.
 // It accepts neither inline configuration nor environment expansion: the
 // already-admitted file is the sole source of definitions.
 func LoadFile(path string) (*Registry, error) {
 	var registry *Registry
 	err := securemanifest.Load(path, func(contents []byte) error {
-		var document manifestDocument
-		if err := securemanifest.DecodeStrict(contents, &document); err != nil ||
-			document.SchemaVersion != manifestSchemaVersion {
-			return ErrManifestJSON
-		}
-		if len(document.Definitions) == 0 || len(document.Definitions) > maxDefinitions {
-			return manifestDefinitionError()
-		}
 		var err error
-		registry, err = New(document.Definitions)
-		if err != nil {
-			return manifestDefinitionError()
-		}
-		return nil
+		registry, err = compileManifest(contents)
+		return err
 	})
 	switch {
 	case errors.Is(err, securemanifest.ErrPath):

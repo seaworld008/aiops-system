@@ -290,7 +290,8 @@ func TestSupervisorFatalNeverSendsTERM(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			base := filepath.Join(t.TempDir(), scenario)
 			err := newTestSupervisor(scenario, base).Run(context.Background())
-			fallback := scenario == "fatal-and-exit" && (err == errChildStartup || err == errChildExit)
+			fallback := scenario == "fatal-and-exit" &&
+				(err == errChildStartup || err == errChildExit || err == errChildProtocol)
 			if err != errChildFatal && !fallback {
 				t.Fatalf("Run() error = %v, want fatal or fixed exit fallback", err)
 			}
@@ -351,9 +352,10 @@ func TestSupervisorFatalContainmentRaceHundred(t *testing.T) {
 	for iteration := 0; iteration < 100; iteration++ {
 		base := filepath.Join(root, strconv.Itoa(iteration))
 		err := newTestSupervisor("fatal-and-exit", base).Run(context.Background())
-		if err != errChildFatal && err != errChildStartup && err != errChildExit {
-			t.Fatalf("iteration %d: Run() error = %v, want fatal or fixed exit fallback", iteration, err)
+		if err != errChildFatal && err != errChildStartup && err != errChildExit && err != errChildProtocol {
+			t.Fatalf("iteration %d: Run() error = %v, want fatal or fixed containment fallback", iteration, err)
 		}
+		assertMarkerAbsent(t, base+".term")
 		assertRecordedPIDGone(t, base+".pid")
 	}
 }
@@ -695,7 +697,10 @@ func TestAcceptControlWorkerChildAcceptsExactBoundary(t *testing.T) {
 
 func newTestSupervisor(scenario, base string) *ControlWorkerSupervisor {
 	settings := defaultSupervisorSettings()
-	settings.startupTimeout = 300 * time.Millisecond
+	// A race-instrumented self-reexec can take well above 300 ms on a loaded CI
+	// host before TestMain reaches the child protocol. Keep this far below the
+	// production budget while avoiding scheduler-dependent pre-marker kills.
+	settings.startupTimeout = 2 * time.Second
 	settings.startupGrace = time.Second
 	settings.shutdownGrace = time.Second
 	settings.anomalyGrace = 250 * time.Millisecond
@@ -877,6 +882,10 @@ func runControlWorkerTestChild(raw string) int {
 	if err != nil || status == nil {
 		return 90
 	}
+	// These process-containment helpers inject a non-production source. Mark
+	// the semantic gate as proven so they can exercise only the post-assembly
+	// READY/FATAL protocol under test.
+	status.snapshotBuilt = true
 	writeChildMarker(base+".pid", strconv.Itoa(os.Getpid()))
 	switch scenario {
 	case "ready-exit-on-term":

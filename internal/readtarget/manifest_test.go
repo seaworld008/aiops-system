@@ -1,6 +1,7 @@
 package readtarget_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,91 @@ import (
 	"github.com/seaworld008/aiops-system/internal/readconnector"
 	"github.com/seaworld008/aiops-system/internal/readtarget"
 )
+
+func TestCompileCapturedManifestBuildsDetachedRegistryWithinClosedRootSet(t *testing.T) {
+	definition := validDefinition(t, readconnector.KindPrometheus)
+	definition.TargetRef = mustBuildTargetRef(t, "prometheus-staging", definition)
+	path := writeManifest(t, []readtarget.Definition{definition})
+	valid, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.ReadFile(definition.Endpoint.CABundleFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(definition.Endpoint.CABundleFile, []byte("captured-compiler-must-not-reread"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	encoded := append(bytes.Repeat([]byte{' '}, (1<<20)-len(valid)), valid...)
+	original := append([]byte(nil), encoded...)
+	originalRoot := append([]byte(nil), root...)
+	captured := []readtarget.CapturedRootBundle{{Path: definition.Endpoint.CABundleFile, Contents: root}}
+
+	registry, err := readtarget.CompileCapturedManifest(encoded, captured)
+	if err != nil {
+		t.Fatalf("CompileCapturedManifest() error = %v", err)
+	}
+	if registry == nil || !registry.Ready() || registry.Digest() == "" {
+		t.Fatalf("CompileCapturedManifest() registry = %#v", registry)
+	}
+	digest := registry.Digest()
+	if !bytes.Equal(encoded, original) {
+		t.Fatal("CompileCapturedManifest() modified the caller-owned manifest buffer")
+	}
+	if !bytes.Equal(root, originalRoot) {
+		t.Fatal("CompileCapturedManifest() modified the caller-owned root buffer")
+	}
+	clear(encoded)
+	clear(root)
+	if !registry.Ready() || registry.Digest() != digest {
+		t.Fatal("caller buffer mutation changed the captured registry")
+	}
+
+	for name, contents := range map[string][]byte{
+		"empty":      nil,
+		"over limit": append(bytes.Repeat([]byte{' '}, (1<<20)+1-len(valid)), valid...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			compiled, compileErr := readtarget.CompileCapturedManifest(contents, captured)
+			if compiled != nil || !errors.Is(compileErr, readtarget.ErrManifestJSON) {
+				t.Fatalf("CompileCapturedManifest() = %#v, %v; want nil, ErrManifestJSON", compiled, compileErr)
+			}
+		})
+	}
+}
+
+func TestCompileCapturedManifestRejectsOpenOrAmbiguousRootSets(t *testing.T) {
+	definition := validDefinition(t, readconnector.KindPrometheus)
+	definition.TargetRef = mustBuildTargetRef(t, "prometheus-staging", definition)
+	manifestPath := writeManifest(t, []readtarget.Definition{definition})
+	manifest, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.ReadFile(definition.Endpoint.CABundleFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := readtarget.CapturedRootBundle{Path: definition.Endpoint.CABundleFile, Contents: root}
+	tests := map[string][]readtarget.CapturedRootBundle{
+		"missing":    nil,
+		"wrong path": {{Path: filepath.Join(t.TempDir(), "wrong.pem"), Contents: root}},
+		"duplicate":  {valid, valid},
+		"extra": {
+			valid,
+			{Path: filepath.Join(t.TempDir(), "extra.pem"), Contents: root},
+		},
+	}
+	for name, roots := range tests {
+		t.Run(name, func(t *testing.T) {
+			registry, compileErr := readtarget.CompileCapturedManifest(manifest, roots)
+			if registry != nil || !errors.Is(compileErr, readtarget.ErrManifestDefinition) {
+				t.Fatalf("CompileCapturedManifest() = %#v, %v; want ErrManifestDefinition", registry, compileErr)
+			}
+		})
+	}
+}
 
 func TestLoadFileRejectsUnsafeManifestFilesWithoutLeakingPaths(t *testing.T) {
 	definition := validDefinition(t, readconnector.KindPrometheus)
