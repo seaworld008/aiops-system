@@ -705,8 +705,8 @@ func TestSecretLoaderTimeoutKillsAndReapsEntireProcessGroup(t *testing.T) {
 	); err != errChildStart {
 		t.Fatalf("timed-out secret loader error = %v, want %v", err, errChildStart)
 	}
-	if command.ProcessState == nil || !command.ProcessState.Exited() {
-		t.Fatalf("timed-out secret loader was not synchronously waited/reaped: %#v", command.ProcessState)
+	if !processStateKilledAndReaped(command.ProcessState) {
+		t.Fatalf("timed-out secret loader was not synchronously KILLed and waited/reaped: %#v", command.ProcessState)
 	}
 	assertRecordedPIDGone(t, base+".pid")
 	assertRecordedPIDGone(t, base+".descendant-pid")
@@ -728,8 +728,8 @@ func TestSecretLoaderCancellationKillsAndReapsEntireProcessGroup(t *testing.T) {
 	if err := receiveResult(t, result); err != errChildStart {
 		t.Fatalf("cancelled secret loader error = %v, want %v", err, errChildStart)
 	}
-	if command.ProcessState == nil || !command.ProcessState.Exited() {
-		t.Fatalf("cancelled secret loader was not synchronously waited/reaped: %#v", command.ProcessState)
+	if !processStateKilledAndReaped(command.ProcessState) {
+		t.Fatalf("cancelled secret loader was not synchronously KILLed and waited/reaped: %#v", command.ProcessState)
 	}
 	assertRecordedPIDGone(t, base+".pid")
 	assertRecordedPIDGone(t, base+".descendant-pid")
@@ -1480,6 +1480,14 @@ func openSecretLoaderTestPipes(t *testing.T) ([3]*os.File, [3]*os.File) {
 		closeControlWorkerFiles(writers[:])
 	})
 	return readers, writers
+}
+
+func processStateKilledAndReaped(state *os.ProcessState) bool {
+	if state == nil || state.Success() {
+		return false
+	}
+	waitStatus, ok := state.Sys().(syscall.WaitStatus)
+	return ok && waitStatus.Signaled() && waitStatus.Signal() == syscall.SIGKILL
 }
 
 func runSecretLoaderTestChild(raw string) int {
