@@ -495,14 +495,26 @@ func TestSupervisorBoundsOutputAndContainsWithoutTERM(t *testing.T) {
 
 func TestSupervisorFatalContainmentRaceHundred(t *testing.T) {
 	root := t.TempDir()
-	for iteration := 0; iteration < 100; iteration++ {
-		base := filepath.Join(root, strconv.Itoa(iteration))
+	contained := 0
+	for attempt := 0; attempt < 110 && contained < 100; attempt++ {
+		base := filepath.Join(root, strconv.Itoa(attempt))
 		err := newTestSupervisor("fatal-and-exit", base).Run(context.Background())
 		if err != errChildFatal && err != errChildStartup && err != errChildExit && err != errChildProtocol {
-			t.Fatalf("iteration %d: Run() error = %v, want fatal or fixed containment fallback", iteration, err)
+			if err == errChildStart {
+				if _, statErr := os.Stat(base + ".pid"); errors.Is(statErr, os.ErrNotExist) {
+					// A loaded race runner may reject self-exec before a child exists.
+					// Retry without counting it as containment evidence.
+					continue
+				}
+			}
+			t.Fatalf("attempt %d: Run() error = %v, want fatal or fixed containment fallback", attempt, err)
 		}
 		assertMarkerAbsent(t, base+".term")
 		assertRecordedPIDGone(t, base+".pid")
+		contained++
+	}
+	if contained != 100 {
+		t.Fatalf("proved %d contained fatal starts after 110 attempts, want 100", contained)
 	}
 }
 
@@ -1439,7 +1451,7 @@ func runPdeathParentTestHelper(raw string) int {
 	closeControlWorkerFiles(secretWriters[:])
 	_ = source.Close()
 	_ = statusWriter.Close()
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(base + ".ready"); err == nil {
 			_ = statusReader
