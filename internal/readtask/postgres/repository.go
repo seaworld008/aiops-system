@@ -374,11 +374,12 @@ func (repository *Repository) startRunnerTx(
 	if task.taskStatus == "QUEUED" {
 		updated, updateErr := tx.Exec(ctx, `
 			UPDATE tool_invocations
-			SET status = 'RUNNING', started_at = COALESCE(started_at, clock_timestamp()),
-				updated_at = GREATEST(updated_at, clock_timestamp())
+			SET status = 'RUNNING', started_at = COALESCE(started_at, $5),
+				updated_at = GREATEST(updated_at, $5)
 			WHERE tenant_id = $1 AND workspace_id = $2 AND investigation_id = $3 AND id = $4
 			  AND runtime_schema_version = 'investigation-runtime.v1' AND status = 'QUEUED'
-		`, scope.TenantID(), task.descriptor.WorkspaceID, task.descriptor.InvestigationID, task.descriptor.TaskID)
+		`, scope.TenantID(), task.descriptor.WorkspaceID, task.descriptor.InvestigationID,
+			task.descriptor.TaskID, attempt.StartedAt)
 		if updateErr != nil {
 			return readtask.Attempt{}, persistenceError("start READ task", updateErr)
 		}
@@ -389,11 +390,11 @@ func (repository *Repository) startRunnerTx(
 	if parentStatus == "QUEUED" {
 		updated, updateErr := tx.Exec(ctx, `
 			UPDATE investigations
-			SET status = 'RUNNING', started_at = COALESCE(started_at, clock_timestamp()),
-				updated_at = GREATEST(updated_at, clock_timestamp())
+			SET status = 'RUNNING', started_at = COALESCE(started_at, $4),
+				updated_at = GREATEST(updated_at, $4)
 			WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3
 			  AND runtime_schema_version = 'investigation-runtime.v1' AND status = 'QUEUED'
-		`, scope.TenantID(), task.descriptor.WorkspaceID, task.descriptor.InvestigationID)
+		`, scope.TenantID(), task.descriptor.WorkspaceID, task.descriptor.InvestigationID, attempt.StartedAt)
 		if updateErr != nil {
 			return readtask.Attempt{}, persistenceError("start READ task parent", updateErr)
 		}

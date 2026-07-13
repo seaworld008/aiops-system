@@ -185,10 +185,10 @@ func TestStartRunnerAuthorizedTxLocksTaskAttemptParentAndTransitionsExactlyOnce(
 		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, int64(1)).
 		WillReturnRows(attemptRows(running))
 	database.ExpectExec(`(?s)UPDATE tool_invocations.*SET status = 'RUNNING'.*status = 'QUEUED'`).
-		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, testTaskID, running.StartedAt).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	database.ExpectExec(`(?s)UPDATE investigations.*SET status = 'RUNNING'.*status = 'QUEUED'`).
-		WithArgs(testTenantID, testWorkspaceID, testInvestigationID).
+		WithArgs(testTenantID, testWorkspaceID, testInvestigationID, running.StartedAt).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 
 	got, err := repository.StartRunnerAuthorizedTx(

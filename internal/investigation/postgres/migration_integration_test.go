@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/seaworld008/aiops-system/internal/readtask"
 )
 
 const (
@@ -350,11 +351,98 @@ func TestInvestigationRuntimeMigrationLocksScopeBindingBeforeRegistration(t *tes
 	}
 }
 
+func TestReadEvidenceClockSkewMigrationBoundsSourceTimeAndRefusesUnsafeDown(t *testing.T) {
+	fixture := newRuntimeFixture(t)
+	database := fixture.harness.db
+	fixture.harness.applyMigration(t, "000011_investigation_runner_ingress.up.sql")
+	fixture.harness.applyMigration(t, "000014_read_evidence_clock_skew.up.sql")
+
+	ctx := context.Background()
+	startedAt := fixture.base.Add(5 * time.Second)
+	tx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin clock-skew parent transition: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(ctx, `
+		UPDATE tool_invocations
+		SET status = 'RUNNING', started_at = $2, updated_at = $2
+		WHERE id = $1
+	`, testTaskID, startedAt); err != nil {
+		t.Fatalf("start clock-skew read task: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE investigations
+		SET status = 'RUNNING', started_at = $2, updated_at = $2
+		WHERE id = $1
+	`, testInvestigationID, startedAt); err != nil {
+		t.Fatalf("start clock-skew investigation: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit clock-skew parent transition: %v", err)
+	}
+
+	payload := []byte(`{"clock_skew":"bounded"}`)
+	forgedCreatedAt := fixture.base.Add(8 * time.Second)
+	insertEvidence := `
+		INSERT INTO evidence (
+			id, tenant_id, workspace_id, investigation_id, connector, query_summary,
+			collected_at, redacted_summary, content_hash, trust_level, truncated, created_at,
+			incident_id, task_id, payload_document, attributes, runtime_schema_version
+		) VALUES (
+			$1, $2, $3, $4, 'prometheus-staging-v1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+			'{}', clock_timestamp() + $5::interval, '{}', $6, 'AUTHENTICATED_READ_RUNNER', false, $7,
+			$8, $9, $10, '{}', 'investigation-runtime.v1'
+		)
+	`
+	expectSQLConstraint(t, database, "23514", "evidence_runtime_clock_skew_guard", insertEvidence,
+		"68000000-0000-4000-8000-000000000101", testTenantID, testWorkspaceID, testInvestigationID,
+		"3 seconds", sha256Hex(payload), forgedCreatedAt,
+		testIncidentID, testTaskID, payload)
+	validEvidenceID := "68000000-0000-4000-8000-000000000102"
+	completionTx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin bounded clock-skew completion: %v", err)
+	}
+	defer func() { _ = completionTx.Rollback(context.Background()) }()
+	if _, err := completionTx.Exec(ctx, insertEvidence,
+		validEvidenceID, testTenantID, testWorkspaceID, testInvestigationID,
+		"1 second", sha256Hex(payload), forgedCreatedAt,
+		testIncidentID, testTaskID, payload); err != nil {
+		t.Fatalf("insert bounded clock-skew Evidence: %v", err)
+	}
+	if _, err := completionTx.Exec(ctx, `
+		UPDATE tool_invocations
+		SET status = 'EVIDENCE', evidence_id = $2, output_hash = $3,
+			completed_at = $4, updated_at = $4
+		WHERE id = $1
+	`, testTaskID, validEvidenceID, sha256Hex(payload), forgedCreatedAt); err != nil {
+		t.Fatalf("complete bounded clock-skew task: %v", err)
+	}
+	if err := completionTx.Commit(ctx); err != nil {
+		t.Fatalf("commit bounded clock-skew Evidence: %v", err)
+	}
+	var collectedAt, serverCreatedAt time.Time
+	if err := database.QueryRow(ctx, `
+		SELECT collected_at, created_at FROM evidence WHERE id = $1
+	`, validEvidenceID).Scan(&collectedAt, &serverCreatedAt); err != nil {
+		t.Fatalf("read bounded clock-skew Evidence times: %v", err)
+	}
+	if !serverCreatedAt.After(forgedCreatedAt) || collectedAt.Sub(serverCreatedAt) <= 0 ||
+		collectedAt.Sub(serverCreatedAt) > readtask.MaxEvidenceClockSkew {
+		t.Fatalf("bounded clock-skew Evidence times = collected %s created %s forged %s",
+			collectedAt, serverCreatedAt, forgedCreatedAt)
+	}
+
+	expectMigrationSQLState(t, database, "000014_read_evidence_clock_skew.down.sql", "55000")
+}
+
 func TestInvestigationRuntimeAdmissionRequiresInitialActiveAndAtomicFacts(t *testing.T) {
 	fixture := newRuntimeFixture(t)
 	database := fixture.harness.db
 	base := fixture.base
-	expectSQLState(t, database, "23503", `
+	// PostgreSQL reports an ON DELETE RESTRICT violation as restrict_violation.
+	expectSQLState(t, database, "23001", `
 		DELETE FROM incident_signals
 		WHERE tenant_id = $1 AND workspace_id = $2 AND signal_id = $3
 	`, testTenantID, testWorkspaceID, testSignalID)

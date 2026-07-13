@@ -403,6 +403,12 @@ Temporal heartbeat 在这些检查后立即发送，并由独立 5 秒 superviso
    退出，再返回 `RECOVERY_REQUIRED`；
 6. Complete 最多调用一次。任何 Complete 错误或未知响应都不得重发 Evidence，由 Workflow 查询数据库。
 
+`collected_at` 是连接器/Runner 提交的来源时间，不作为服务端审计时钟。控制面仅允许它相对数据库持有的
+Task `started_at` 与接收时间偏差不超过固定 2 秒；超出即拒绝并把 Runner 视为时钟不健康。
+Evidence `created_at` 与 receipt `received_at` 均由 PostgreSQL 覆盖生成，作为排序和审计的可信时间。
+`000014_read_evidence_clock_skew` 同时在数据库触发器和 CHECK 约束中执行该边界；若仍存在来源时间晚于
+服务端创建时间的 Evidence，down migration 必须拒绝回滚。
+
 bearer、Lease、Start capability、Prepared material、Evidence body 和 completion receipt 均不进入 Activity
 输出或普通格式化。Activity 返回前必须停止 Temporal heartbeat supervisor、销毁本地 Lease bearer，并在
 Start 后确认 executor 已收敛。
@@ -412,7 +418,7 @@ Start 后确认 executor 已收敛。
 C2-4b、C2-4c1a 与 C2-4c1b 只能作为库和 testsuite 契约合并。后续 C2-4c 才能在受监督的常驻进程中
 加载 Snapshot 和 PostgreSQL repository，按固定关闭顺序持有上述 Temporal roles，安装真实 Outbox
 supervisor、`READ_TASK_PENDING` durable-handoff 监控、Gateway callbacks 与 READ Runner，并完成
-PostgreSQL 16 + Temporal + mTLS Gateway + TLS 数据源的本地 Signal→Evidence E2E。
+PostgreSQL 18.4 或更新的 18.x + Temporal + mTLS Gateway + TLS 数据源的本地 Signal→Evidence E2E。
 
 即使 C2-4c 完成，以下证据齐备前 Admission 仍必须关闭：真实 context-compliant Bearer provider、
 Heartbeat 事务内 Bundle 重新授权、企业 PKI/Temporal RBAC、NetworkPolicy/egress、源侧 DLP、无混版

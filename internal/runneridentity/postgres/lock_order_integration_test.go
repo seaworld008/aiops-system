@@ -187,7 +187,7 @@ func newLockOrderPostgresHarness(t *testing.T) *lockOrderPostgresHarness {
 	t.Helper()
 	dsn := os.Getenv("AIOPS_TEST_POSTGRES_DSN")
 	if dsn == "" {
-		t.Skip("AIOPS_TEST_POSTGRES_DSN is not configured; PostgreSQL 16 lock-order regression was not run")
+		t.Skip("AIOPS_TEST_POSTGRES_DSN is not configured; PostgreSQL 18.4 or newer 18.x lock-order regression was not run")
 	}
 	ctx := context.Background()
 	adminConfig, err := pgxpool.ParseConfig(dsn)
@@ -204,9 +204,9 @@ func newLockOrderPostgresHarness(t *testing.T) *lockOrderPostgresHarness {
 		admin.Close()
 		t.Fatalf("read PostgreSQL server version: %v", err)
 	}
-	if serverVersion/10000 != 16 {
+	if serverVersion < 180004 || serverVersion >= 190000 {
 		admin.Close()
-		t.Fatalf("lock-order integration harness requires PostgreSQL 16, got server_version_num=%d", serverVersion)
+		t.Fatalf("lock-order integration harness requires PostgreSQL 18.4 or newer 18.x, got server_version_num=%d", serverVersion)
 	}
 
 	schema := "aiops_runner_lock_" + lockOrderRandomHex(t, 8)

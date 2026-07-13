@@ -21,7 +21,7 @@ make vet
 make build
 ```
 
-Go 1.26.5 is the repository toolchain baseline. PostgreSQL 16+ is required for real migration and repository integration tests.
+Go 1.26.5 is the repository toolchain baseline. PostgreSQL 18.4 or newer 18.x is required for real migration and repository integration tests.
 
 ## Change workflow
 

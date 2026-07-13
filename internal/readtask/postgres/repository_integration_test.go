@@ -52,7 +52,7 @@ const (
 	integrationRunnerID        = "read-runner-repository-integration"
 )
 
-func TestRepositoryPostgres16PersistsAuthenticatedLifecycleAndCompletionReplay(t *testing.T) {
+func TestRepositoryPostgres18PersistsAuthenticatedLifecycleAndCompletionReplay(t *testing.T) {
 	fixture := newRepositoryIntegrationFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -100,6 +100,22 @@ func TestRepositoryPostgres16PersistsAuthenticatedLifecycleAndCompletionReplay(t
 	if err != nil || started.Status != readtask.AttemptRunning {
 		t.Fatalf("StartRunnerAuthorizedTx(real PostgreSQL) = %#v, %v", started, err)
 	}
+	var taskStartedAt, parentStartedAt time.Time
+	if err := fixture.database.QueryRow(ctx, `
+		SELECT task.started_at, investigation.started_at
+		FROM tool_invocations AS task
+		JOIN investigations AS investigation
+		  ON investigation.tenant_id = task.tenant_id
+		 AND investigation.workspace_id = task.workspace_id
+		 AND investigation.id = task.investigation_id
+		WHERE task.tenant_id = $1::uuid AND task.id = $2::uuid
+	`, integrationTenantID, integrationLifecycleTaskID).Scan(&taskStartedAt, &parentStartedAt); err != nil {
+		t.Fatalf("read aligned READ start clocks: %v", err)
+	}
+	if !taskStartedAt.Equal(started.StartedAt) || !parentStartedAt.Equal(started.StartedAt) {
+		t.Fatalf("READ start clocks diverged: attempt=%s task=%s parent=%s",
+			started.StartedAt, taskStartedAt, parentStartedAt)
+	}
 
 	heartbeat, err := repositoryRunnerTransaction(ctx, fixture, func(
 		tx pgx.Tx,
@@ -116,6 +132,8 @@ func TestRepositoryPostgres16PersistsAuthenticatedLifecycleAndCompletionReplay(t
 		t.Fatalf("HeartbeatRunnerAuthorizedTx(real PostgreSQL) = %#v, %v", heartbeat, err)
 	}
 
+	// Exercise the real Runner/connector clock boundary rather than borrowing
+	// the database clock. Colima makes the two clocks genuinely independent.
 	collectedAt := time.Now().UTC().Truncate(time.Microsecond)
 	completion := readtask.Completion{
 		Fence:   claim.Fence(),
@@ -415,6 +433,75 @@ func verifyRecoveryRejectsCrossTenantAndPlanMismatch(
 	}
 }
 
+func TestRepositoryPostgres18EnforcesClockSkewBoundaryAndUnsafeDown(t *testing.T) {
+	fixture := newRepositoryIntegrationFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	claim, err := repositoryRunnerTransaction(ctx, fixture, func(
+		tx pgx.Tx,
+		scope execution.RunnerScope,
+		certificate readtask.CertificateBinding,
+	) (readtask.Claim, error) {
+		return fixture.tasks.ClaimRunnerTx(ctx, tx, scope, certificate, integrationLifecycleTaskID, 30*time.Second)
+	})
+	if err != nil {
+		t.Fatalf("claim clock-skew boundary task: %v", err)
+	}
+	defer claim.Destroy()
+	started, err := repositoryRunnerTransaction(ctx, fixture, func(
+		tx pgx.Tx,
+		scope execution.RunnerScope,
+		certificate readtask.CertificateBinding,
+	) (readtask.Attempt, error) {
+		return fixture.tasks.StartRunnerAuthorizedTx(
+			ctx, tx, scope, certificate, readtask.Start{Fence: claim.Fence()}, trustedReadTaskAuthorizer,
+		)
+	})
+	if err != nil || started.Status != readtask.AttemptRunning {
+		t.Fatalf("start clock-skew boundary task = %#v, %v", started, err)
+	}
+
+	completion := readtask.Completion{
+		Fence: claim.Fence(), Outcome: readtask.CompletionEvidence,
+		Evidence: &readtask.EvidenceCompletion{
+			CollectedAt: started.StartedAt.Add(-readtask.MaxEvidenceClockSkew - time.Microsecond),
+			Items:       []json.RawMessage{json.RawMessage(`{"metric":"clock_skew","value":1}`)},
+		},
+	}
+	if _, err := repositoryRunnerTransaction(ctx, fixture, func(
+		tx pgx.Tx,
+		scope execution.RunnerScope,
+		certificate readtask.CertificateBinding,
+	) (readtask.CompletionResult, error) {
+		return fixture.tasks.CompleteRunnerAuthorizedTx(
+			ctx, tx, scope, certificate, completion, trustedReadTaskCompletionAuthorizer,
+		)
+	}); !errors.Is(err, readtask.ErrProjectionRejected) {
+		t.Fatalf("complete beyond clock-skew boundary error = %v, want ErrProjectionRejected", err)
+	}
+
+	completion.Evidence.CollectedAt = started.StartedAt.Add(-readtask.MaxEvidenceClockSkew)
+	completed, err := repositoryRunnerTransaction(ctx, fixture, func(
+		tx pgx.Tx,
+		scope execution.RunnerScope,
+		certificate readtask.CertificateBinding,
+	) (readtask.CompletionResult, error) {
+		return fixture.tasks.CompleteRunnerAuthorizedTx(
+			ctx, tx, scope, certificate, completion, trustedReadTaskCompletionAuthorizer,
+		)
+	})
+	if err != nil || completed.EvidenceID != integrationEvidenceID || completed.ReceiptID != integrationReceiptID {
+		t.Fatalf("complete exact clock-skew boundary = %#v, %v", completed, err)
+	}
+
+	_, err = fixture.migration.Exec(ctx, readMigration(t, "000014_read_evidence_clock_skew.down.sql"))
+	var postgresError *pgconn.PgError
+	if !errors.As(err, &postgresError) || postgresError.Code != "55000" {
+		t.Fatalf("clock-skew down migration error = %v, want SQLSTATE 55000", err)
+	}
+}
+
 func verifyPostCutoverRejectsUnboundWriters(
 	t *testing.T,
 	ctx context.Context,
@@ -481,7 +568,7 @@ func expectIntegrationConstraint(t *testing.T, err error, sqlState, constraint s
 	}
 }
 
-func TestInvestigationRunnerIngressPostgres16AllowsEmptyDown(t *testing.T) {
+func TestInvestigationRunnerIngressPostgres18AllowsEmptyDown(t *testing.T) {
 	harness := newReadTaskPostgresHarness(t)
 	harness.applyThroughRunnerIngress(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -1151,7 +1238,7 @@ func newReadTaskPostgresHarness(t *testing.T) *readTaskPostgresHarness {
 	t.Helper()
 	dsn := os.Getenv("AIOPS_TEST_POSTGRES_DSN")
 	if dsn == "" {
-		t.Skip("AIOPS_TEST_POSTGRES_DSN is not configured; PostgreSQL 16 READ task repository tests were not run")
+		t.Skip("AIOPS_TEST_POSTGRES_DSN is not configured; PostgreSQL 18.4 or newer 18.x READ task repository tests were not run")
 	}
 	ctx := context.Background()
 	adminConfig, err := pgxpool.ParseConfig(dsn)
@@ -1167,9 +1254,9 @@ func newReadTaskPostgresHarness(t *testing.T) *readTaskPostgresHarness {
 		admin.Close()
 		t.Fatalf("read PostgreSQL server version: %v", err)
 	}
-	if serverVersion/10000 != 16 {
+	if serverVersion < 180004 || serverVersion >= 190000 {
 		admin.Close()
-		t.Fatalf("READ task integration harness requires PostgreSQL 16, got server_version_num=%d", serverVersion)
+		t.Fatalf("READ task integration harness requires PostgreSQL 18.4 or newer 18.x, got server_version_num=%d", serverVersion)
 	}
 	random := make([]byte, 8)
 	if _, err := cryptorand.Read(random); err != nil {
@@ -1240,6 +1327,7 @@ func (harness *readTaskPostgresHarness) applyThroughRuntimeBinding(t *testing.T)
 	for _, name := range []string{
 		"000012_outbox_event_routing.up.sql",
 		"000013_investigation_runtime_binding.up.sql",
+		"000014_read_evidence_clock_skew.up.sql",
 	} {
 		if _, err := harness.migration.Exec(context.Background(), readMigration(t, name)); err != nil {
 			t.Fatalf("apply migration %s: %v", name, err)

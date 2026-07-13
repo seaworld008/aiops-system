@@ -62,8 +62,8 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	if err := database.QueryRow(ctx, `SELECT current_setting('server_version_num')::integer`).Scan(&serverVersion); err != nil {
 		t.Fatalf("read PostgreSQL server version: %v", err)
 	}
-	if serverVersion/10000 != 16 {
-		t.Fatalf("integration harness requires PostgreSQL 16, got server_version_num=%d", serverVersion)
+	if serverVersion < 180004 || serverVersion >= 190000 {
+		t.Fatalf("integration harness requires PostgreSQL 18.4 or newer 18.x, got server_version_num=%d", serverVersion)
 	}
 	if _, err := database.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
 		t.Fatalf("reset test schema: %v", err)
@@ -129,7 +129,7 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 		VALUES ('80000000-0000-4000-8000-000000000001', $1, $2, $3, 'user-1', 'CONFIRM')
 	`, tenant1, workspace1, investigation1)
 
-	// Exercise the real pgx repository against PostgreSQL 16, not only mocks.
+	// Exercise the real pgx repository against PostgreSQL 18.4 or newer 18.x, not only mocks.
 	repository := postgresstore.New(database)
 	const signal2 = "40000000-0000-4000-8000-000000000002"
 	signalRecord := domain.Signal{
@@ -275,6 +275,7 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	}
 	applyMigrationFile(t, ctx, database, outboxRoutingUp)
 	applyMigrationFile(t, ctx, database, filepath.Join(migrationDirectory, "000013_investigation_runtime_binding.up.sql"))
+	applyMigrationFile(t, ctx, database, filepath.Join(migrationDirectory, "000014_read_evidence_clock_skew.up.sql"))
 	applyMigrations(t, ctx, database, migrationDirectory, ".down.sql", true)
 	var relationName *string
 	if err := database.QueryRow(ctx, `SELECT to_regclass('public.tenants')::text`).Scan(&relationName); err != nil {
@@ -2437,7 +2438,8 @@ func exerciseRealRunnerGatewayMigration(
 		WHERE revocation_id = $1 AND heartbeat_seq = 0
 	`, revocationID)
 	execSQL(t, ctx, database, `
-		WITH heartbeat_clock AS (SELECT clock_timestamp() + interval '1 millisecond' AS current_time)
+		SELECT pg_sleep(0.001);
+		WITH heartbeat_clock AS (SELECT clock_timestamp() AS current_time)
 		UPDATE credential_revocations AS revocation
 		SET heartbeat_seq = 1,
 			last_heartbeat_at = heartbeat_clock.current_time,
@@ -2563,7 +2565,8 @@ func exerciseRealRunnerGatewayMigration(
 		t.Fatalf("new M3 claim heartbeat sequence = %d, %v; want 0", retainedSequence, err)
 	}
 	execSQL(t, ctx, database, `
-		WITH heartbeat_clock AS (SELECT clock_timestamp() + interval '1 millisecond' AS current_time)
+		SELECT pg_sleep(0.001);
+		WITH heartbeat_clock AS (SELECT clock_timestamp() AS current_time)
 		UPDATE credential_revocations AS revocation
 		SET heartbeat_seq = 1,
 			last_heartbeat_at = heartbeat_clock.current_time,
@@ -3669,13 +3672,19 @@ func exerciseRealActionQueue(t *testing.T, ctx context.Context, database *pgxpoo
 	case <-lockedClaimContext.Done():
 		t.Fatalf("claim did not reach token source while holding registry lock: %v", lockedClaimContext.Err())
 	}
+	deleteTx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin scope binding delete probe: %v", err)
+	}
+	defer rollbackTestTransaction(deleteTx)
 	deleteContext, cancelDelete := context.WithTimeout(ctx, 250*time.Millisecond)
-	_, deleteErr := database.Exec(deleteContext, `
+	_, deleteErr := deleteTx.Exec(deleteContext, `
 		DELETE FROM runner_scope_bindings
 		WHERE runner_id = 'runner-postgres-1' AND tenant_id = $1 AND workspace_id = $2 AND environment_id = $3
 	`, tenantID, workspaceID, environmentID)
 	deleteContextErr := deleteContext.Err()
 	cancelDelete()
+	rollbackTestTransaction(deleteTx)
 	releaseTokenGate()
 	var lockedClaim lockedClaimResult
 	select {
@@ -4741,12 +4750,18 @@ func exerciseRealRegistrationRaces(
 		close(done)
 	}(operationHeartbeatResults, operationHeartbeatDone)
 	waitForTransactionWaiter(t, ctx, database, actionXID, operationHeartbeatDone, "Heartbeat action lock")
+	disableProbeTx, err := database.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin runner disable probe: %v", err)
+	}
+	defer rollbackTestTransaction(disableProbeTx)
 	updateContext, cancelUpdate := context.WithTimeout(ctx, 250*time.Millisecond)
-	_, disableErr := database.Exec(updateContext, `
+	_, disableErr := disableProbeTx.Exec(updateContext, `
 		UPDATE runner_registrations SET enabled = false, updated_at = statement_timestamp() WHERE runner_id = $1
 	`, runnerID)
 	updateContextErr := updateContext.Err()
 	cancelUpdate()
+	rollbackTestTransaction(disableProbeTx)
 	disableWasBlocked := disableErr != nil && errors.Is(updateContextErr, context.DeadlineExceeded)
 	commitTestTransaction(t, ctx, actionTx, "release Heartbeat action row")
 	heartbeatResult := awaitHeartbeatCall(t, operationHeartbeatResults, "Heartbeat holding registration lock")

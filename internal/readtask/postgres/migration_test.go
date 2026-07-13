@@ -6,6 +6,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/seaworld008/aiops-system/internal/readtask"
 )
 
 func TestInvestigationRunnerIngressMigrationIsAtomicAndPrelocksDependencies(t *testing.T) {
@@ -205,6 +208,50 @@ func TestInvestigationRunnerIngressDownRefusesLossyRollback(t *testing.T) {
 	} {
 		if !strings.Contains(down, required) {
 			t.Errorf("000011 down migration missing %q", required)
+		}
+	}
+}
+
+func TestReadEvidenceClockSkewMigrationMatchesProjectionAndOwnsServerTime(t *testing.T) {
+	if readtask.MaxEvidenceClockSkew != 2*time.Second {
+		t.Fatalf("MaxEvidenceClockSkew = %s, migration contract is fixed at 2s", readtask.MaxEvidenceClockSkew)
+	}
+	up := normalizedMigration(t, "000014_read_evidence_clock_skew.up.sql")
+	for _, required := range []string{
+		"begin",
+		"set local lock_timeout = '5s'",
+		"pg_catalog.set_config",
+		"pg_catalog.quote_ident(current_schema()) || ', pg_catalog, pg_temp'",
+		"from investigation_task_attempts as attempt",
+		"attempt.status = 'running'",
+		"task_clock_floor := coalesce(attempt_clock_floor, task_clock_floor)",
+		"new.collected_at < task_clock_floor - interval '2 seconds'",
+		"new.collected_at > receipt_at + interval '2 seconds'",
+		"constraint = 'evidence_runtime_clock_skew_guard'",
+		"new.created_at := receipt_at",
+		"collected_at <= created_at + interval '2 seconds'",
+		"set search_path from current",
+		"commit",
+	} {
+		if !strings.Contains(up, required) {
+			t.Errorf("000014 up migration missing %q", required)
+		}
+	}
+	down := normalizedMigration(t, "000014_read_evidence_clock_skew.down.sql")
+	for _, required := range []string{
+		"pg_catalog.set_config",
+		"pg_catalog.quote_ident(current_schema()) || ', pg_catalog, pg_temp'",
+		"lock table investigation_task_attempts, evidence, runner_evidence_receipts in access exclusive mode",
+		"collected_at > created_at",
+		"admitted.collected_at < attempt.started_at",
+		"admitted.collected_at > receipt.received_at",
+		"errcode = '55000'",
+		"unsafe read evidence clock-skew rollback: source timestamps outside legacy exact bounds remain",
+		"collected_at <= created_at",
+		"create or replace function validate_runtime_evidence_insert()",
+	} {
+		if !strings.Contains(down, required) {
+			t.Errorf("000014 down migration missing %q", required)
 		}
 	}
 }

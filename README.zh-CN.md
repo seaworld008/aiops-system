@@ -83,7 +83,7 @@ flowchart LR
 开发要求：
 
 - Go 1.26.5
-- PostgreSQL 16+（持久化与真实迁移测试）
+- PostgreSQL 18.4 或更新的 18.x（持久化与真实迁移测试）
 - 目标生产架构还需要 Temporal、Keycloak、Vault 和 S3 兼容对象存储
 
 使用内存仓储启动开发控制面：
