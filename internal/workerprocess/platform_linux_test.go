@@ -458,8 +458,9 @@ func TestSupervisorConcurrentCancelAndFatalExitRaceHundred(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		result := make(chan error, 1)
 		supervisor := newTestSupervisor("race-fatal-or-term", base)
+		supervisor.settings.startupTimeout = 15 * time.Second
 		go func() { result <- supervisor.Run(ctx) }()
-		waitForMarker(t, base+".ready")
+		waitForMarkerOrEarlyResult(t, base+".ready", result)
 		gate := make(chan struct{})
 		var racers sync.WaitGroup
 		racers.Add(2)
@@ -1366,6 +1367,26 @@ func waitForMarker(t *testing.T, path string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("marker %q was not created", path)
+}
+
+func waitForMarkerOrEarlyResult(t *testing.T, path string, result <-chan error) {
+	t.Helper()
+	deadline := time.NewTimer(20 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-result:
+			t.Fatalf("supervisor returned before marker %q: %v", path, err)
+		case <-ticker.C:
+			if _, err := os.Stat(path); err == nil {
+				return
+			}
+		case <-deadline.C:
+			t.Fatalf("marker %q was not created", path)
+		}
+	}
 }
 
 func assertMarkerAbsent(t *testing.T, path string) {
