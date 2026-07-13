@@ -1,13 +1,13 @@
-# 可运维资产、受控连接与主动调查设计规范
+# 可运维资产、受控连接与受治理生产闭环设计规范
 
-> 状态：已完成产品与视觉评审，等待书面规范复核
-> 基线：`main@45aa5eb`
+> 状态：书面规范已确认；已纳入完整生产闭环与小任务包增补
+> 基线：`main@ad50d9f`
 > 日期：2026-07-13
 > 设计方法：Superpowers brainstorming + UI/UX Pro Max
 
 ## 1. 摘要
 
-本设计把 AIOps System 从“围绕 Incident 的调查内核”扩展为“以可运维资产为基础的受治理运维控制平面”。系统先建立带来源的资产目录，再把候选连接配置验证并发布为不可变运行能力，最后通过短期、限额、可撤销的 `InvestigationGrant` 授权隔离 Runner 主动排查。
+本设计把 AIOps System 从“围绕 Incident 的调查内核”扩展为“以可运维资产为基础、能够生产落地的受治理运维控制平面”。系统先建立带来源的资产目录，再把候选连接配置验证并发布为不可变运行能力，通过短期、限额、可撤销的 `InvestigationGrant` 授权隔离 Runner 主动排查；当可信 Evidence 支持处置建议时，再进入与 READ 完全隔离的不可变 ActionPlan、策略、重新认证、人工审批、短凭据、类型化执行、独立验证、对账/安全回滚、Receipt/Audit 生产闭环。
 
 已确认的产品决策：
 
@@ -15,7 +15,7 @@
 - 平台是运维事实索引和治理覆盖层，不替代外部 CMDB、云平台、Kubernetes 或 VictoriaMetrics Operator 的事实源地位。
 - Agent 使用受控能力代理，不获得原始密码、SSH Key、通用终端、任意命令或任意 SQL。
 - 主动调查由告警、事件或预批准定时策略触发；每次运行生成新的短期授权。
-- 主动调查只执行已发布的类型化只读能力；写操作只能生成 `ActionPlan` 提案，继续使用现有不可变计划、策略、人工审批、短期凭据、执行验证和审计链。
+- 主动调查只执行已发布的类型化只读能力，并且最多生成 append-only `PROPOSAL_ONLY` ActionProposal；ActionProposal 本身没有执行权，Phase 4 也不存在 ActionPlan mutation。只有经认证的人另行发起、服务端重新派生并封存独立不可变 ActionPlan，且逐 Action 类型通过当前策略/门禁、最近 OIDC 认证、职责分离审批、一次性短凭据、类型化 WRITE Runner、独立验证和完整审计后，才可在生产 Canary 与发布门内执行。
 - 前端采用已确认的企业运维控制台视觉：浅色高密度工作区、克制蓝色操作色、表格与主从详情，不使用聊天框、AI 头像、霓虹、发光或玻璃拟态。
 
 ## 2. 当前事实与设计动机
@@ -30,6 +30,8 @@
 - Runner 身份和作用域当前以 Tenant、Workspace、Environment 为粗粒度边界。
 - Control Worker、正式 READ Runner、Outbox 与启动装配尚未形成完整在线产品链路，不能把现有安全模块等同于后端产品已经全部完成。
 - 仓库尚无面向浏览器的完整 Control Plane API，也没有前端工程骨架；新阶段必须从契约和纵向切片开始同步建设前后端。
+
+以上是 `main@ad50d9f` 的当前事实，不是本规划的最终产品边界。第 1–6 阶段继续保持生产写关闭；第 7 阶段建立逐类型受治理 Action 闭环并以独立 Canary 开门；第 8 阶段完成分批生产发布、持续 SLO/安全/DR 验收。任何阶段均不得把“已有安全模块”或“测试通过”误写成已经生产上线。
 
 现有模型不能表达：
 
@@ -130,6 +132,8 @@ flowchart TD
 - Runner 按 Mode、Adapter Family 和 Network Zone 组成 `RunnerRealm`。
 - Gateway 在 Claim、Start、Heartbeat、Complete 四个边界重新验证身份、Scope Revision、Grant、Asset Snapshot、Runtime 和 Kill Switch。
 - 输出必须先通过 Provider Schema、大小/数量/时间预算、数据分类、DLP 与脱敏，才能成为 Evidence。
+- READ Runner 只能产生 Evidence/ActionProposal，不能转化 Grant、凭据或 ActionPlan。受治理写入使用不同 Root、Realm、issuer、queue、Action Gate 和 WRITE Runner；模型永远不是 requester、approver 或 credential principal。
+- WRITE 在 queue、claim、admission、credential issue、pre-mutation、verification 边界复验 Phase 6 handoff/READ baseline/current admission、Phase 7 Action platform successor、不可变 Plan、Policy、Approval、Realm、Credential 和 Kill Switch。执行器声明不是验证；结果不确定时停止、吊销、对账，仅执行预批准且可证明安全的补偿，否则升级人工。
 
 ## 5. 资产目录
 
@@ -173,6 +177,8 @@ CLOUD_PROVIDER
 KUBERNETES_OPERATOR
 AWX_INVENTORY
 ```
+
+来源枚举本身不等于已支持。除 `MANUAL` 外，每种来源都必须有独立生产 Adapter、真实验证、opaque `CredentialReference`、最小权限、增量 cursor/checkpoint、durable lease/fencing、限流/退避、字段 provenance、软删除/恢复和真实协议 E2E，并通过自己的 `AVAILABLE` gate 后才能创建权威 Observation。`CONTROL_PLANE_API` 使用有 Scope 的机器身份和幂等批次；`CSV_IMPORT` 使用签名批次、严格 schema 与隔离解析；CMDB、vSphere、Proxmox、OpenStack、Cloud、Kubernetes Operator 和 AWX 各自保持独立 Provider contract，不能退化为任意 endpoint/JSON 采集器。缺 Adapter、身份、验证或 gate 的类型必须明确 `UNAVAILABLE`，不得仅凭 SourceKind 接受数据。
 
 字段所有权规则：
 
@@ -515,7 +521,8 @@ Grant 不能转化或复用于 WRITE。ActionPlan 必须重新经过独立 Actio
 
 | 表 | 核心责任 |
 |---|---|
-| `asset_sources` | 发现来源、Integration、同步模式和状态 |
+| `asset_sources` | 发现来源的稳定身份、当前修订指针和生命周期 |
+| `asset_source_revisions` | Provider 配置、同步模式、凭据引用与发布状态的不可变修订；不保存 Secret |
 | `asset_source_runs` | 每次同步的游标、摘要、计数和结果 |
 | `asset_observations` | 外部不可信、append-only 观测快照 |
 | `assets` | 稳定资产身份与当前治理投影 |
@@ -539,8 +546,11 @@ Grant 不能转化或复用于 WRITE。ActionPlan 必须重新经过独立 Actio
 | `kill_switch_revisions` | 六级 Kill Switch 的不可变有效状态修订 |
 | `proactive_policy_revisions` | 不可变主动策略修订 |
 | `proactive_runs` | 调度、Grant、Investigation 和结果关联 |
+| `action_proposals` | Evidence 派生、append-only、仅 `PROPOSAL_ONLY` 的受治理动作候选；绑定 Catalog/Evidence 摘要且永无执行权 |
 
 所有跨作用域引用使用 Tenant、Workspace、Environment 复合外键。重要修订表禁止原地更新；状态转换使用版本或数据库锁防止竞争。
+
+迁移所有权固定：`asset_source_revisions` 属于 `000015_assets_catalog`，`action_proposals` 属于 `000018_investigation_grants_proactive_policies`。后续 ActionPlan 只能由经认证的人调用 `POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/services/{service_id}/action-plans` 发起；Tenant 来自认证 Principal，Workspace/Environment/Service 来自受信 path。Phase 7 必须在同一个 serializable PostgreSQL transaction 内构造 `HandoffRequest`、调用 Phase 4 Handoff Loader 重载并重新校验 Proposal/Catalog/Evidence/Snapshot，再解析其余可信事实并封存；Loader 前不得预读 Proposal，且不得复制浏览器或模型提交的 Scope、身份、目标、授权窗口、验证或补偿字段。
 
 ## 11. 后端模块边界
 
@@ -596,6 +606,10 @@ DELETE /api/v1/workspaces/{workspace_id}/environments/{environment_id}/service-a
 GET  /api/v1/workspaces/{workspace_id}/asset-sources
 POST /api/v1/workspaces/{workspace_id}/asset-sources
 GET  /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}
+POST /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/revisions
+POST /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/revisions/{revision}:validate
+POST /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/revisions/{revision}:publish
+POST /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}:disable
 POST /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}:sync
 GET  /api/v1/workspaces/{workspace_id}/asset-source-runs/{run_id}
 GET  /api/v1/workspaces/{workspace_id}/asset-conflicts
@@ -603,6 +617,8 @@ POST /api/v1/workspaces/{workspace_id}/asset-conflicts/{conflict_id}:resolve
 ```
 
 ### 12.2 Connections、Target 与 Capability
+
+本组保持 Workspace 级资源路径，但每个请求必须携带并授权 `environment_id` query parameter；Environment 不是可省略的隐式默认值。
 
 ```text
 GET  /api/v1/workspaces/{workspace_id}/connections
@@ -637,8 +653,65 @@ POST /api/v1/workspaces/{workspace_id}/proactive-policies/{policy_id}/revisions/
 POST /api/v1/workspaces/{workspace_id}/proactive-policies/{policy_id}:disable
 POST /api/v1/workspaces/{workspace_id}/proactive-policies/{policy_id}:run
 GET  /api/v1/workspaces/{workspace_id}/proactive-runs
+GET  /api/v1/workspaces/{workspace_id}/proactive-runs/{run_id}
 GET  /api/v1/workspaces/{workspace_id}/investigation-grants/{grant_id}
 POST /api/v1/workspaces/{workspace_id}/investigation-grants/{grant_id}:revoke
+GET  /api/v1/workspaces/{workspace_id}/kill-switches
+POST /api/v1/workspaces/{workspace_id}/kill-switches:revise
+```
+
+这些 Workspace 路径要求唯一非空 `environment_id` query；Tenant 仅来自已验证 OIDC/服务端映射。Kill Switch revise 同时要求 `If-Match`、`Idempotency-Key`、最近认证、固定 reason code 和完整审计，不能通过 body/Header 覆盖 Scope。
+
+### 12.4 Incident、诊断、Evidence 与 Audit
+
+```text
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/incidents
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/incidents/{incident_id}
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/incidents/{incident_id}/investigations
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/investigations/{investigation_id}/evidence
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/investigations/{investigation_id}/action-proposal-catalog
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/investigations/{investigation_id}/action-proposals
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/action-proposals/{proposal_id}
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets/{asset_id}/diagnostic-capabilities
+POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets/{asset_id}/diagnostic-runs
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/diagnostic-runs/{run_id}
+POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/diagnostic-runs/{run_id}:cancel
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/diagnostic-runs/{run_id}/evidence
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/audit-records
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/audit-records/{audit_id}
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/audit-chain-status
+```
+
+### 12.5 受治理 Action 与验证闭环
+
+```text
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/action-definitions
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/action-plans
+POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/services/{service_id}/action-plans
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/action-plans/{plan_id}
+POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/action-plans/{plan_id}:reauthenticate
+POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/action-plans/{plan_id}:approve
+POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/action-plans/{plan_id}:reject
+POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/action-plans/{plan_id}:revoke-approval
+POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/action-plans/{plan_id}:execute
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/action-executions/{execution_id}
+POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/action-executions/{execution_id}:reauthenticate-rollback
+POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/action-executions/{execution_id}:authorize-rollback
+POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/action-executions/{execution_id}:escalate
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/action-executions/{execution_id}/receipt
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/action-gates
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/action-gates/{action_type}/drills
+```
+
+`POST .../services/{service_id}/action-plans` 的 closed body 只允许 `proposal_id`、`expected_proposal_digest`、`expected_intent_digest`、固定 `action_type`、该类型极窄 typed `parameters` 和 bounded `change_reason`。两个 expected digest 仅是并发/漂移条件，不是权威事实；Loader/Service 必须从锁定的数据库可信闭包重新 canonicalize、重算并以固定长度恒时比较。Idempotency-Key 只来自 header，request hash 只由服务端计算。Tenant/Workspace/Environment/Service、requester/subject/role/auth time、目标/Runtime/credential binding、执行窗口、verification、compensation、approval、queue、Runner、`idempotency_key` 或 `request_hash` 字段都不能由浏览器或模型放入 body；服务端从 verified OIDC Principal、完整 T/W/E/S route Scope、Action Definition、Policy 和 trusted facts 重建并封印这些事实。Handler 与 Service 在调用 Handoff Loader 前不得为了获得 Service 或其他绑定而预读 Proposal。
+
+### 12.6 生产发布与持续验收
+
+```text
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/production-releases
+GET  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/production-releases/{release_id}
+POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/production-releases/{release_id}/wave-decisions
+POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/production-releases/{release_id}/acceptance-decisions
 ```
 
 API 通用规则：
@@ -648,7 +721,8 @@ API 通用规则：
 - 更新与发布使用 `ETag / If-Match`。
 - 错误使用 RFC 9457 Problem Details、稳定 `code` 和 `trace_id`。
 - DTO 返回 `effective_actions`，前端不按角色名推断权限。
-- 连接发布、生产验证、主动策略发布、Grant 撤销要求最近重新认证。
+- 连接发布、生产验证、主动策略发布、Grant 撤销、Action 审批/执行/回滚和生产发布决策要求服务器验证的最近重新认证。
+- Action mutation 只返回 durable Operation；浏览器不能提交 Subject/Role/auth_time、Policy facts、Credential、Target endpoint、Runner lease 或 Provider payload。
 
 ## 13. 权限
 
@@ -659,6 +733,11 @@ ASSET_READ
 ASSET_MANAGE
 ASSET_BIND
 ASSET_CONFLICT_RESOLVE
+ASSET_SOURCE_READ
+ASSET_SOURCE_MANAGE
+ASSET_SOURCE_VALIDATE
+ASSET_SOURCE_PUBLISH
+ASSET_SOURCE_SYNC
 CONNECTION_READ
 CONNECTION_MANAGE
 CONNECTION_VALIDATE
@@ -666,22 +745,39 @@ CONNECTION_PUBLISH
 CREDENTIAL_REFERENCE_READ
 CAPABILITY_READ
 RUNNER_READ
-DIAGNOSTIC_RUN
 INVESTIGATION_GRANT_READ
 INVESTIGATION_GRANT_REVOKE
 PROACTIVE_POLICY_READ
 PROACTIVE_POLICY_MANAGE
 SENSITIVE_EVIDENCE_READ
+INCIDENT_READ
+INVESTIGATION_READ
+EVIDENCE_READ
+DIAGNOSTIC_READ
+DIAGNOSTIC_RUN
+DIAGNOSTIC_CANCEL
+AUDIT_READ
+ACTION_READ
+ACTION_PROPOSAL_READ
+ACTION_PROPOSE
+ACTION_APPROVE
+ACTION_EXECUTE
+ACTION_ROLLBACK_AUTHORIZE
+ACTION_ESCALATE
+ACTION_GATE_READ
+PRODUCTION_RELEASE_READ
+PRODUCTION_RELEASE_DECIDE
 ```
 
 角色默认：
 
 - `VIEWER`：作用域内安全资产摘要和 Incident 只读。
-- `SRE`：资产/连接/能力读取、连接验证、手动只读诊断和策略运行查看。
+- `SRE`：资产/连接/能力读取、连接验证、手动只读诊断、策略运行查看和受治理 Action 执行请求；不自动获得审批权。
 - `SERVICE_OWNER`：所属服务资产与能力摘要、策略提议，不可发布生产连接。
-- `APPROVER`：只读取审批所需资产、Target、Capability 和计划摘要。
+- `APPROVER`：只读取审批所需资产、Target、Capability 和计划摘要；仅在 Scope/职责分离/最近认证满足时作出审批，不能审批自己请求的生产 Plan。
 - `AUDITOR`：全量安全投影、Grant 和审计只读。
-- `ADMIN`：资产治理、连接/策略发布、Runner 管理；不自动拥有业务调查或执行权限。
+- `ADMIN`：资产治理、连接/策略发布、Runner 管理；不自动拥有业务调查、Action 审批、执行或生产发布决策权限。
+- 生产发布决策不属于任何宽泛默认角色；`PRODUCTION_RELEASE_DECIDE` 只来自独立、可审计、限定 Scope 的 release-signer group，并要求最近认证以及与 candidate 创建者、Action approver、前序 wave signer 的职责分离。
 
 ## 14. 前端产品设计
 
@@ -695,6 +791,7 @@ SENSITIVE_EVIDENCE_READ
   事件处置
   调查记录
   主动调查
+  受治理动作
 
 资产与连接
   资产目录
@@ -707,6 +804,7 @@ SENSITIVE_EVIDENCE_READ
 治理
   授权与策略
   审计日志
+  生产发布
 ```
 
 稳定路由基线：
@@ -716,23 +814,38 @@ SENSITIVE_EVIDENCE_READ
 /incidents
 /incidents/:incidentId
 /investigations
+/action-plans
+/action-plans/:planId
 /proactive-policies
 /proactive-policies/:policyId
 /assets
 /assets/:assetId
 /asset-mappings
 /connections
+/connections/new
 /connections/:connectionId
 /connections/:connectionId/revisions/:revision
 /asset-sources
+/asset-sources/:sourceId
+/asset-sources/:sourceId/revisions/:revision
 /credential-references
 /runner-realms
 /capabilities
 /governance/policies
+/platform/readiness
+/platform/dependencies
+/platform/realms
+/platform/runtime
+/platform/slo
+/platform/rollouts/:rolloutId
 /audit
+/production/releases
+/production/releases/:releaseId
 ```
 
 所有路由都继承 Workspace/Environment 上下文；不属于当前 Scope 的深链接返回可审计的 `403/404` 安全投影，不泄露对象是否存在。
+
+`/connections/new` 只负责选择 Provider 并调用服务端创建 `DRAFT` revision；成功后立即以 history replace 跳转到 `/connections/:connectionId/revisions/:revision`。连接修订、步骤、Operation 和验证事实只存在于 canonical ID/revision 路由，不能形成第二套浏览器草稿状态源。
 
 ### 14.2 已确认页面
 
@@ -791,13 +904,13 @@ SENSITIVE_EVIDENCE_READ
 
 - Runner Realm 表展示 Mode、Adapter Family、Network Zone、Workspace/Environment、workload identity、证书到期、Scope Revision、心跳、承载的已发布摘要和 Kill Switch。
 - Capability 目录展示 Provider、Schema Version、输入参数类型、输出 Schema、硬预算、数据等级、支持的 Target/Realm 和门禁状态。
-- 页面只允许治理 Realm binding、证书轮换状态和发布门禁；不得提供任意 endpoint、命令、脚本、SQL、网络转发或临时扩大能力的编辑入口。
+- 页面在 Phase 2 只读展示/审阅 Realm binding、证书轮换状态和发布门禁，不提供 binding、扩权、连接或凭据 mutation。未来若开放任一治理变更，必须先有独立 typed API、策略/审批契约和实施计划；任何阶段都不得提供任意 endpoint、命令、脚本、SQL、网络转发或临时扩大能力的编辑入口。
 
 #### 主动调查策略
 
 - 顶部摘要展示已发布/启用策略、今日运行、Shadow 数、平均耗时、证据量和预算拒绝；这些是运营统计，不作为装饰性大卡片。
 - 主列表展示策略与修订、事件/定时触发器、`SHADOW`/`READ_ONLY` 模式、最近/下次运行和状态；选中行在右侧打开详情并保留列表上下文。
-- 详情 Tab 为策略定义、运行记录、修订和审计；固定展示“触发 → 解析资产 → 签发 Grant → Runner 调查 → Evidence/ActionPlan 提案”的完整运行链。
+- 详情 Tab 为策略定义、运行记录、修订和审计；固定展示“触发 → 解析资产 → 签发 Grant → Runner 调查 → Evidence → ActionProposal/Human Review Finding”的完整只读运行链。
 - 资产选择器必须提供 Preview，显示总数、被排除项及原因，并在运行后展示不可变 Snapshot digest；Capability 列表显示模式与摘要。
 - Grant 区同时展示有效期、工具调用、单源并发、证据字节、模型预算和凭据 TTL；六级 Kill Switch 逐级显示有效状态与修订。
 - 最近运行表展示 Grant、触发源、资产快照、调用/证据/凭据吊销摘要、结束时间和独立结果；`PARTIAL`、预算耗尽、DLP、漂移和撤销不确定各有独立详情。
@@ -805,10 +918,24 @@ SENSITIVE_EVIDENCE_READ
 
 #### 事件处置工作区
 
-- Incident 是调查、Evidence、根因、ActionPlan、审批和执行证明的聚合视图；顶部固定展示严重度、状态、编号、创建时间、Owner 和 Scope。
+- Incident 是调查、Evidence、根因、ActionProposal、后续 ActionPlan、审批和执行证明的聚合视图；顶部固定展示严重度、状态、编号、创建时间、Owner 和 Scope。
 - 主 Tab 为调查概览、证据、处置计划和审计。概览采用证据优先的两栏布局：左侧关键指标/日志/Trace 与根因判定，右侧展示不可变计划及门禁。
 - 写操作区域必须同时显示计划摘要、精确目标、策略结果、审批主体、短期凭据状态和执行前校验；计划哈希改变立即使审批失效。
 - 时间线以 Actor 类型区分人类、Scheduler、Control Worker、Runner 和外部系统，不使用聊天气泡；不确定结果以醒目结构提示“已停止并升级人工”。
+
+#### 受治理动作工作区
+
+- 列表顶部以紧凑条带分别展示四种初始 Action 的 Definition/Gate revision、演练数、独立验证率和最近决策；一个类型的 `AVAILABLE` 不能暗示其他类型已开放。
+- 详情固定按 Evidence/根因 → 精确 Asset/Target/Snapshot/Runtime → before/after typed diff → full PlanHash/expiry → Policy/Kill Switch → 职责分离审批/重新认证 → queue/admission/credential/mutation/cleanup → independent verification → reconciliation/rollback/escalation → signed Receipt 的顺序呈现。
+- 审批、执行和回滚控件只来自服务端 `effective_actions`。点击后保存 same-origin return URL 与安全页面状态，再进入真实 OIDC 最近认证；浏览器不持久化 Token 或自行声称认证已完成。
+- `UNKNOWN/HUMAN_REQUIRED` 固定显示“变更结果不确定，已停止并对账；不会自动重试”，同时展示 Owner、containment、审计 ID 和人工升级入口；不得提供“重试原动作”。
+- 桌面使用 40% Evidence / 60% Governance 两列和 440–480px drill-down drawer；小于 768px 只保留查看、停止和升级人工，高风险 mutation 明确要求桌面完成。
+
+#### 审计与生产发布
+
+- Audit Explorer 使用 38px 行表格展示 Time、Actor、Action、Resource、Outcome、Trace、Digest；只允许结构化筛选，不提供任意查询、原始 payload 或审计 mutation。链状态必须区分 `VERIFIED/BROKEN/INCONCLUSIVE`，后两者关闭生产写并升级人工。
+- Production Release 页面展示 immutable candidate、Phase 6 handoff/READ baseline、Phase 7 Action successor、逐类型 Gate、wave evidence、SLO/security/cleanup/verification/rollback/audit 门和双人决策。波次为内部运维 → 单一非关键服务 → 10% → 30% → 全部 eligible scope，任一硬门失败自动 HOLD。
+- 页面不得用一个总绿色状态掩盖 Plan、Credential cleanup、Verification、Audit chain 或 Release gate 的失败；每个维度独立显示证据时间、摘要、Owner 和阻塞原因。
 
 ### 14.3 通用交互与状态
 
@@ -856,6 +983,7 @@ SENSITIVE_EVIDENCE_READ
 
 | 维度 | 状态 |
 |---|---|
+| 发现 Source/Adapter | `DRAFT / VALIDATING / AVAILABLE / DEGRADED / RATE_LIMITED / STALE / REVOKED / UNAVAILABLE` |
 | 映射 | `EXACT / AMBIGUOUS / UNRESOLVED` |
 | 资产生命周期 | `DISCOVERED / ACTIVE / STALE / QUARANTINED / RETIRED` |
 | 连接修订 | `DRAFT / VALIDATING / VALIDATED / REJECTED / PUBLISHED / REVOKED / SUPERSEDED` |
@@ -865,6 +993,17 @@ SENSITIVE_EVIDENCE_READ
 | Grant | `ISSUED / ACTIVE / COMPLETED / EXPIRED / REVOKED / FAILED` |
 | 主动策略 | `DRAFT / SHADOW / READ_ONLY / DISABLED / SUPERSEDED` |
 | 主动运行 | `QUEUED / RESOLVING / GRANTED / RUNNING / PARTIAL / COMPLETED / FAILED / STOPPED` |
+| ActionProposal mode | `PROPOSAL_ONLY`（不可变，永不拥有执行权） |
+| ActionPlan binding | `SEALED / SUPERSEDED / EXPIRED / REVOKED` |
+| 审批轮次 | `PENDING / APPROVED / REJECTED / REVOKED / EXPIRED` |
+| Action Attempt/执行 | `ADMITTING / ADMITTED / RUNNING / FINALIZING / VERIFYING / RECONCILING / ROLLBACK_PENDING / ROLLING_BACK / VERIFIED / FAILED / ROLLED_BACK / HUMAN_REQUIRED` |
+| 凭据清理 | `NOT_ISSUED / ACTIVE / REVOKING / REVOKED / EXPIRED_CONFIRMED / UNCERTAIN` |
+| 独立验证 | `PENDING / RUNNING / PASSED / FAILED / INCONCLUSIVE` |
+| 对账 | `NOT_REQUIRED / PENDING / RUNNING / RESOLVED_APPLIED / RESOLVED_NOT_APPLIED / INCONCLUSIVE / HUMAN_REQUIRED` |
+| 安全回滚 | `NOT_ELIGIBLE / ELIGIBLE / AUTHORIZATION_REQUIRED / AUTHORIZED / RUNNING / VERIFIED / FAILED / HUMAN_REQUIRED` |
+| Receipt/Audit chain | `PENDING / COMPLETE / BROKEN / INCONCLUSIVE` |
+| 生产 Release candidate | `DRAFT / GATES_PENDING / READY / ACTIVE / REJECTED / SUPERSEDED` |
+| 生产 Release wave | `PENDING / RUNNING / SOAKING / HELD / PROMOTED / ROLLING_BACK / ROLLED_BACK / FAILED` |
 
 前端不得把这些维度合并成一个“状态”。
 
@@ -901,6 +1040,9 @@ UPSTREAM_UNAVAILABLE
 - DLP、Schema、大小、时间、调用次数或并发预算拒绝。
 - 任一级 Kill Switch 关闭。
 - Runner 身份、证书、Realm 或 Scope Revision 不匹配。
+- Phase 6 handoff/READ baseline/current admission 或 Phase 7 Action platform successor/accepted surface manifest 缺失、过期、关闭或漂移。
+- ActionPlan、Definition/Gate、Policy、Approval/reauth、credential scope、fence 或 provider precondition 任一不匹配。
+- 写入发送结果、凭据吊销、独立验证、审计链或安全回滚资格为 `UNKNOWN/INCONCLUSIVE`；不得把超时或无错误当作成功，也不得盲重试副作用。
 
 ## 17. 审计与可观测性
 
@@ -913,6 +1055,7 @@ UPSTREAM_UNAVAILABLE
 - 凭据签发、使用、吊销状态。
 - Query/Probe ID、输入 Hash、结果项/字节/截断/DLP 摘要。
 - Evidence、Receipt 与 Audit chain hash。
+- 对生产 Action 还必须关联 Phase 6 handoff/READ baseline/admission、Phase 7 successor/action manifest、Plan/Definition/Gate、Policy/reauth/Approval、Attempt/fence、WRITE Realm、credential cleanup、mutation-step ledger、independent Verification、Reconciliation/Rollback 和最终签名 Receipt。
 
 禁止在审计中存储 Secret、SQL/上游错误正文、完整查询结果、内部 endpoint 或客户敏感数据。
 
@@ -931,6 +1074,15 @@ proactive_runs_total
 proactive_budget_exhaustions_total
 credential_cleanup_failures_total
 dlp_rejections_total
+governed_action_total
+action_admission_denials_total
+action_credential_cleanup_total
+action_verification_total
+action_reconciliation_total
+action_gate_suspensions_total
+audit_chain_status
+production_release_gate_total
+production_release_wave_total
 ```
 
 ## 18. 威胁模型重点
@@ -976,17 +1128,27 @@ dlp_rejections_total
 - 同资产频率限制、并发、工具次数、证据字节、模型预算和总时长准确执行。
 - 六级 Kill Switch 任一级关闭均阻止新 Claim。
 - `SHADOW` 不访问目标；`READ_ONLY` 不产生写执行。
-- ActionPlan 提案不能复用 READ Grant 或 READ Credential。
+- ActionProposal 不能复用 READ Grant 或 READ Credential，也不能自行转成 ActionPlan 或进入 queue。
 
-### 19.5 前端
+### 19.5 受治理生产动作
+
+- V2 PlanHash 对 Scope、Evidence、Asset/Snapshot/Target/Runtime、Phase 6 handoff/READ admission、Phase 7 successor、Definition/Gate、Policy/Kill、typed parameters、verification/compensation 和 credential scope 的逐字段 mutation 全部敏感。
+- requester 自批、审批不足/过期、旧 reauth、Closed/Suspended Gate、跨 Realm/Scope、stale fence、重复 claim/start/complete、任一边界漂移都在 Provider mutation 前拒绝。
+- 每个 catalog mutation step 最多发送一次；Runner crash、network reset、Provider timeout/ambiguous response 进入 UNKNOWN→reconciliation，不重发。
+- WRITE credential 一 Action/Asset/Attempt，TTL ≤5 分钟、不可续期、一次交付；成功必须等待 terminal cleanup。
+- 执行器输出不能满足 Verification；四种初始 Action 均由独立 READ facts 验证。只有 K8S_SCALE 在 exact no-intervening-change 条件下允许预批准恢复，其余升级人工或创建新 Plan。
+- 每类型至少 20 次非生产正向演练、≥19 次独立验证成功、0 未授权、0 重复 mutation，并完成一项 supervised production Canary 后才可单独 `AVAILABLE`。
+
+### 19.6 前端
 
 - OpenAPI 合同、TypeScript、组件、MSW、Playwright 与 axe 全部通过。
 - 1440px、1024px、390px 视觉回归覆盖中文、英文和长文本。
 - URL 保存筛选/排序/分页/选中项，刷新与分享可恢复相同视图。
 - 无权限、重新认证、部分成功、数据陈旧、DLP、预算耗尽、Kill Switch 和撤销不确定均有独立状态。
 - 浏览器响应和日志中不存在 Secret、Token、PEM、DSN 或 Vault 内部路径。
+- Incident、ActionPlan、Audit、Production Release 深链接在刷新/后退后恢复同一 Scope/Operation；审批、执行、验证、UNKNOWN、回滚和 Receipt 均有独立高保真状态且无聊天/终端/AI Actor 隐喻。
 
-### 19.6 端到端验收场景
+### 19.7 端到端验收场景
 
 1. 从 Kubernetes Operator 发现 `VMCluster`、`VLCluster`、`VTCluster` 及组件。
 2. 治理人员确认来源、Service Binding 和 `EXACT` 映射。
@@ -995,8 +1157,14 @@ dlp_rejections_total
 5. 告警或定时策略解析 23 项资产并创建五分钟 Grant。
 6. Runner 执行 Metrics、Logs、Traces、Host 和 PostgreSQL 固定只读能力。
 7. 输出通过 Schema、预算、DLP 后形成 Evidence；凭据完成持久吊销。
-8. 系统只生成 ActionPlan 提案；生产写仍等待独立策略和人工审批。
-9. 任意资产漂移、凭据异常或 `UNCERTAIN` 均停止并进入人工处理。
+8. 系统生成 append-only `PROPOSAL_ONLY` ActionProposal；READ Grant/credential 到此终止并完成吊销，Proposal 永无执行权，也不能转成 WRITE 权限。
+9. 经人通过完整 T/W/E/S 创建路由发起治理流程后，Control Plane 在一个 serializable PostgreSQL transaction 内先以认证 Principal、URL Scope、Proposal ID/expected digest 构造 HandoffRequest，由 Phase 4 Handoff Loader 重载并复验 Proposal/Catalog/Evidence/Snapshot；随后在同一事务解析其余可信 facts、`CreateInTx` 封存 V2 ActionPlan并绑定 Phase 6 handoff/READ baseline/current admission 与 exact ACCEPTED Action platform successor。当前 Policy、Kill Switch 和逐类型 Gate 均通过；Loader 前无 Proposal 预读，任一漂移整笔回滚。请求方只能提供 Proposal 引用、expected digests 和固定类型意图，不能自报 Principal、Scope、Evidence 闭包、授权窗口、验证或补偿字段。
+10. requester 在真实 OIDC 最近认证后请求执行；不同 qualified human 完成职责分离审批，高风险由两名不同审批人完成；任何 hash/事实变化使审批永久不匹配。
+11. mTLS WRITE Runner 领取一个 fenced Attempt，获得一 Action/Asset/Attempt、≤5 分钟、不可续期的一次性 credential，执行 catalog 固定 mutation step，清除内存并持久请求吊销。
+12. 独立 READ Verifier 观察目标后态；成功生成完整签名 Receipt/Audit。写结果不确定时停止后续 mutation、对账事实；仅 K8S_SCALE 在原审批覆盖且无 intervening change 时安全恢复，否则进入 `HUMAN_REQUIRED`。
+13. Audit Explorer 证明从 Trigger、Grant、Evidence、Plan、Policy/Approval、Attempt/Credential、Mutation、Verification 到 Receipt 的链完整性；`BROKEN/INCONCLUSIVE` 关闭生产写。
+14. 每个 Action 类型通过独立非生产 drill 和 supervised production canary 后单独开放；生产发布按内部运维、单一非关键服务、10%、30%、全量 eligible scope 分波，SLO/security/cleanup/verification/audit 任一硬门失败立即 HOLD。
+15. 任意资产、Plan、平台 successor、凭据、Fence、Provider 结果、验证或审计 `UNKNOWN/UNCERTAIN` 均停止、吊销并进入安全回滚或人工处理；系统绝不盲重试副作用。
 
 ## 20. 迁移与交付拆分
 
@@ -1007,16 +1175,18 @@ dlp_rejections_total
 3. **VictoriaMetrics 全家桶**：Operator 发现、Metrics/Logs/Traces 类型化 Target、Capability 和 Evidence Schema。
 4. **InvestigationGrant 与主动策略**：授权、Scheduler、Kill Switch、预算、运行页面和审计。
 5. **主机与 PostgreSQL 只读诊断**：Host Probe/AWX、PostgreSQL Target、READ Credential 与 DLP。
-6. **平台治理与试点**：Runner Realm、生产 Shadow、可观测性、备份恢复和安全演练。
+6. **生产平台与只读路径**：真实 Control Worker/Outbox/Runner 装配、HA、SLO、生产 Shadow/READ_ONLY、备份恢复和安全演练。
+7. **受治理生产动作闭环**：只对逐项审核的 Kubernetes、GitOps、AWX 固定 Action 开放生产执行，完整绑定不可变计划、策略、重新认证、人工审批、短期凭据、执行后验证、对账/回滚和人工升级。
+8. **生产上线与持续运营**：容量与压力、故障与混沌、灾备恢复、安全合规、分批发布、值班归属、SLO 和完整生产验收。
 
-每个子计划都必须按“数据库/领域 → Control Plane API → 前端页面 → 审计与安全测试 → 端到端验收”的纵向切片交付，不能先连续建设全部后端再集中补前端。第一个子计划同时建立前端工程骨架、应用壳层、设计 Token、合同生成、MSW 和 Playwright/axe 基线；后续页面复用同一体系，不再创建新的视觉分支。
+每个子计划都必须按“数据库/领域 → Control Plane API → 前端页面 → 生产装配/运维 → 审计与安全测试 → 端到端验收”的纵向切片交付，不能先连续建设全部后端再集中补前端。第一个子计划同时建立前端工程骨架、应用壳层、设计 Token、合同生成、MSW 和 Playwright/axe 基线；后续页面复用同一体系，不再创建新的视觉分支。实施文档采用“总索引 → 阶段索引 → 小任务包”，避免单个超大文件，同时每个任务包保留完整依赖、TDD、验证和提交边界。
 
 迁移兼容规则：
 
 - 保留现有 `services`、`service_bindings`、`integrations`；已知字段显式迁移，不解释未知 JSONB 为运行能力。
 - 初期 Runtime 仍可从现有安全 Manifest 文件加载；数据库发布编译器通过相同接口生成等价 Snapshot。
-- 新 API 和页面默认只读启用；发布、主动调查和数据库诊断按门禁逐阶段开放。
-- 任何阶段都不得提前开放生产写。
+- 新管理 API 和页面默认以只读/门禁关闭状态上线；发布、主动调查、数据库诊断与每种生产 Action 分别按其证据门逐阶段开放，任何 UI 存在都不等于能力已授权。
+- 第 1–6 阶段不得开放生产写；第 7 阶段也只能逐 Action 类型通过非生产演练、生产 Canary 和 Go/No-Go 后开放，不能形成通用写代理。
 
 ## 21. 非目标
 
@@ -1034,8 +1204,8 @@ dlp_rejections_total
 
 - `docs/status/current.md`：项目唯一完成度事实源。
 - `docs/architecture/implementation-blueprint-v4.md`：吸收本设计并明确 V3 的继承/替代关系。
-- `docs/adr/`：资产目录覆盖层、连接编译发布、短期 Grant、远程诊断边界、数据库只读、READ 凭据隔离、主动策略和 Evidence/DLP。
-- `docs/design/frontend/`：资产、连接、主动调查页面、状态、权限、响应式和视觉基线。
+- `docs/adr/`：资产目录覆盖层、连接编译发布、短期 Grant、远程诊断边界、数据库只读、READ/WRITE 凭据隔离、主动策略、Evidence/DLP、生产 Action 门禁、验证/对账/回滚和发布治理。
+- `docs/design/frontend/`：资产、连接、主动调查、Incident/Evidence、Governed Action、Audit、Production Release 页面及状态、权限、响应式和视觉基线。
 - `api/openapi/control-plane-v1.yaml`：Control Plane 公共契约。
 - `AGENTS.md`：规定未来任务必须先读取状态、V4、ADR、活动计划与前端规范。
 
