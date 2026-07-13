@@ -19,6 +19,10 @@ const (
 	MaxEvidenceItems        = 256
 	MaxEvidenceJSONDepth    = 16
 	MaxEvidencePayloadBytes = 64 << 10
+	// MaxEvidenceClockSkew bounds the untrusted connector timestamp against
+	// server-owned attempt and receipt times. Larger drift is an unhealthy
+	// Runner and fails closed; database received/created times stay authoritative.
+	MaxEvidenceClockSkew = 2 * time.Second
 
 	CompletionRequestHashVersionV3 = "read-task-completion-request.v3"
 	CompletionReceiptHashVersionV3 = "read-task-completion-receipt.v3"
@@ -192,7 +196,8 @@ func (projection ProjectedCompletion) ValidateAgainst(descriptor Descriptor, att
 	}
 	if projection.outcome == CompletionEvidence {
 		if !validTime(projection.collectedAt) || len(projection.payload) == 0 ||
-			projection.collectedAt.After(projection.receipt.ReceivedAt) ||
+			projection.collectedAt.Before(normalizeTime(attempt.StartedAt).Add(-MaxEvidenceClockSkew)) ||
+			projection.collectedAt.After(projection.receipt.ReceivedAt.Add(MaxEvidenceClockSkew)) ||
 			domain.ValidateSafeJSONObject(projection.payload) != nil || domain.ValidateSafeAttributes(projection.attributes) != nil {
 			return ErrInvalidRequest
 		}
@@ -284,7 +289,8 @@ func projectEvidence(
 	}
 	collectedAt := normalizeTime(evidence.CollectedAt)
 	startedAt := normalizeTime(attempt.StartedAt)
-	if !validTime(collectedAt) || collectedAt.Before(startedAt) || collectedAt.After(receivedAt) {
+	if !validTime(collectedAt) || collectedAt.Before(startedAt.Add(-MaxEvidenceClockSkew)) ||
+		collectedAt.After(receivedAt.Add(MaxEvidenceClockSkew)) {
 		return nil, nil, time.Time{}, "", ErrProjectionRejected
 	}
 	items := make([]json.RawMessage, len(evidence.Items))

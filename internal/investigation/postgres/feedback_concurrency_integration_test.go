@@ -162,7 +162,6 @@ func TestPostgresConcurrentHumanConfirmCommitsOneRootCause(t *testing.T) {
 func prepareEvidenceTaskForFeedbackConcurrency(t *testing.T, ctx context.Context, fixture runtimeFixture) {
 	t.Helper()
 	payload := []byte(`{"series_count":3}`)
-	completedAt := fixture.base.Add(10 * time.Second)
 	tx, err := fixture.harness.db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin feedback evidence fixture: %v", err)
@@ -173,6 +172,11 @@ func prepareEvidenceTaskForFeedbackConcurrency(t *testing.T, ctx context.Context
 			_ = tx.Rollback(ctx)
 		}
 	}()
+	var completedAt time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&completedAt); err != nil {
+		t.Fatalf("read feedback evidence fixture clock: %v", err)
+	}
+	completedAt = completedAt.UTC().Truncate(time.Microsecond)
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO evidence (
 			id, tenant_id, workspace_id, investigation_id, connector, query_summary,
@@ -184,7 +188,7 @@ func prepareEvidenceTaskForFeedbackConcurrency(t *testing.T, ctx context.Context
 			'investigation-runtime.v1'
 		)
 	`, testEvidenceID, testTenantID, testWorkspaceID, testInvestigationID,
-		fixture.base.Add(9*time.Second), string(payload), sha256Hex(payload), completedAt,
+		completedAt.Add(-time.Second), string(payload), sha256Hex(payload), completedAt,
 		testIncidentID, testTaskID, payload); err != nil {
 		t.Fatalf("insert feedback evidence fixture: %v", err)
 	}

@@ -28,7 +28,7 @@ func newPostgresHarness(t *testing.T) *postgresHarness {
 	t.Helper()
 	dsn := os.Getenv("AIOPS_TEST_POSTGRES_DSN")
 	if dsn == "" {
-		t.Skip("AIOPS_TEST_POSTGRES_DSN is not configured; real PostgreSQL 16 migration tests were not run")
+		t.Skip("AIOPS_TEST_POSTGRES_DSN is not configured; real PostgreSQL 18.4 or newer 18.x migration tests were not run")
 	}
 	ctx := context.Background()
 	adminConfig, err := pgxpool.ParseConfig(dsn)
@@ -45,9 +45,9 @@ func newPostgresHarness(t *testing.T) *postgresHarness {
 		admin.Close()
 		t.Fatalf("read PostgreSQL server version: %v", err)
 	}
-	if serverVersion/10000 != 16 {
+	if serverVersion < 180004 || serverVersion >= 190000 {
 		admin.Close()
-		t.Fatalf("integration harness requires PostgreSQL 16, got server_version_num=%d", serverVersion)
+		t.Fatalf("integration harness requires PostgreSQL 18.4 or newer 18.x, got server_version_num=%d", serverVersion)
 	}
 
 	schema := "aiops_m5_" + randomHex(t, 8)

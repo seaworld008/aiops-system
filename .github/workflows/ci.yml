@@ -18,11 +18,12 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:18.4-alpine3.24@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
         env:
           POSTGRES_USER: aiops
           POSTGRES_PASSWORD: aiops-test-only
           POSTGRES_DB: aiops_test
+          POSTGRES_INITDB_ARGS: --data-checksums
         ports:
           - 5432:5432
         options: >-

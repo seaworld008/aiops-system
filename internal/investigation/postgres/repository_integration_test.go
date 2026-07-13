@@ -56,7 +56,6 @@ func TestPostgresRepositoryLifecyclePersistsImmutableReplayAndHumanFeedback(t *t
 	fixture := newLatestRuntimeFixture(t)
 	ctx := context.Background()
 	payload := []byte(`{"series_count":3}`)
-	taskCompletedAt := fixture.base.Add(10 * time.Second)
 
 	tx, err := fixture.harness.db.Begin(ctx)
 	if err != nil {
@@ -68,6 +67,11 @@ func TestPostgresRepositoryLifecyclePersistsImmutableReplayAndHumanFeedback(t *t
 			_ = tx.Rollback(ctx)
 		}
 	}()
+	var taskCompletedAt time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&taskCompletedAt); err != nil {
+		t.Fatalf("read task completion fixture clock: %v", err)
+	}
+	taskCompletedAt = taskCompletedAt.UTC().Truncate(time.Microsecond)
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO evidence (
 			id, tenant_id, workspace_id, investigation_id, connector, query_summary,
@@ -79,7 +83,7 @@ func TestPostgresRepositoryLifecyclePersistsImmutableReplayAndHumanFeedback(t *t
 			'investigation-runtime.v1'
 		)
 	`, testEvidenceID, testTenantID, testWorkspaceID, testInvestigationID,
-		fixture.base.Add(9*time.Second), string(payload), sha256Hex(payload), taskCompletedAt,
+		taskCompletedAt.Add(-time.Second), string(payload), sha256Hex(payload), taskCompletedAt,
 		testIncidentID, testTaskID, payload, `{"source":"prometheus"}`); err != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatalf("insert task evidence fixture: %v", err)

@@ -155,8 +155,16 @@ func TestProjectCompletionEnforcesBoundsExpiryAndDatabaseReceiptTime(t *testing.
 	if _, err := readtask.ProjectCompletion(descriptor, attempt, valid, attempt.LeaseExpiresAt); err == nil {
 		t.Fatal("ProjectCompletion() accepted transition exactly at lease expiry")
 	}
-	if _, err := projected.WithReceivedAt(now.Add(-time.Microsecond), descriptor, attempt); err == nil {
-		t.Fatal("WithReceivedAt() accepted database time before collected evidence")
+	ahead := valid
+	ahead.Evidence = &readtask.EvidenceCompletion{
+		CollectedAt: now.Add(readtask.MaxEvidenceClockSkew), Items: []json.RawMessage{},
+	}
+	aheadProjection, err := readtask.ProjectCompletion(descriptor, attempt, ahead, now)
+	if err != nil {
+		t.Fatalf("ProjectCompletion(bounded ahead clock) error = %v", err)
+	}
+	if _, err := aheadProjection.WithReceivedAt(now.Add(-time.Microsecond), descriptor, attempt); err == nil {
+		t.Fatal("WithReceivedAt() accepted source time beyond the clock-skew bound")
 	}
 	completed := attempt
 	completed.Status = readtask.AttemptCompleted
@@ -199,6 +207,42 @@ func TestProjectCompletionEnforcesBoundsExpiryAndDatabaseReceiptTime(t *testing.
 	}
 }
 
+func TestProjectCompletionAllowsOnlyBoundedRunnerClockSkew(t *testing.T) {
+	now := time.Date(2026, 7, 12, 10, 30, 0, 0, time.UTC)
+	descriptor := validDescriptor(t)
+	attempt, fence := runningAttempt(t, descriptor, now)
+
+	for name, collectedAt := range map[string]time.Time{
+		"runner behind database":   attempt.StartedAt.Add(-readtask.MaxEvidenceClockSkew),
+		"runner ahead of database": now.Add(readtask.MaxEvidenceClockSkew),
+	} {
+		t.Run(name, func(t *testing.T) {
+			completion := readtask.Completion{
+				Fence: fence, Outcome: readtask.CompletionEvidence,
+				Evidence: &readtask.EvidenceCompletion{CollectedAt: collectedAt, Items: []json.RawMessage{}},
+			}
+			if _, err := readtask.ProjectCompletion(descriptor, attempt, completion, now); err != nil {
+				t.Fatalf("ProjectCompletion() rejected bounded clock skew: %v", err)
+			}
+		})
+	}
+
+	for name, collectedAt := range map[string]time.Time{
+		"runner too far behind database":   attempt.StartedAt.Add(-readtask.MaxEvidenceClockSkew - time.Microsecond),
+		"runner too far ahead of database": now.Add(readtask.MaxEvidenceClockSkew + time.Microsecond),
+	} {
+		t.Run(name, func(t *testing.T) {
+			completion := readtask.Completion{
+				Fence: fence, Outcome: readtask.CompletionEvidence,
+				Evidence: &readtask.EvidenceCompletion{CollectedAt: collectedAt, Items: []json.RawMessage{}},
+			}
+			if _, err := readtask.ProjectCompletion(descriptor, attempt, completion, now); err == nil {
+				t.Fatal("ProjectCompletion() accepted excessive Runner clock skew")
+			}
+		})
+	}
+}
+
 func TestProjectCompletionRejectsUntrustedShapeAndKeepsFailuresBounded(t *testing.T) {
 	now := time.Date(2026, 7, 12, 9, 0, 0, 0, time.UTC)
 	descriptor := validDescriptor(t)
@@ -207,7 +251,10 @@ func TestProjectCompletionRejectsUntrustedShapeAndKeepsFailuresBounded(t *testin
 	for name, completion := range map[string]readtask.Completion{
 		"collected before start": {
 			Fence: fence, Outcome: readtask.CompletionEvidence,
-			Evidence: &readtask.EvidenceCompletion{CollectedAt: attempt.StartedAt.Add(-time.Nanosecond), Items: []json.RawMessage{}},
+			Evidence: &readtask.EvidenceCompletion{
+				CollectedAt: attempt.StartedAt.Add(-readtask.MaxEvidenceClockSkew - time.Microsecond),
+				Items:       []json.RawMessage{},
+			},
 		},
 		"failure code not allowlisted": {
 			Fence: fence, Outcome: readtask.CompletionFailed,

@@ -116,7 +116,7 @@ func TestVault203IntegrationPostgresDSNRequiresExplicitNumericLoopback(t *testin
 	}
 }
 
-// This test exercises Vault 2.0.3 and PostgreSQL 16 through real HTTP APIs.
+// This test exercises Vault 2.0.3 and PostgreSQL 18.4 or newer 18.x through real HTTP APIs.
 // The raw setup helper is intentionally independent from the production Vault
 // client's private response validators. The production path is exercised only
 // through exported Profile, IssuerClient, and RevocationClient APIs over a TLS

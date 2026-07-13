@@ -83,7 +83,7 @@ See the [security model and implementation blueprint](docs/architecture/implemen
 Requirements:
 
 - Go 1.26.5
-- PostgreSQL 16+ for persistence and migration tests
+- PostgreSQL 18.4 or newer 18.x for persistence and migration tests
 - Temporal, Keycloak, Vault, and S3-compatible storage for the intended production architecture
 
 Run the development control plane with its in-memory repository:
