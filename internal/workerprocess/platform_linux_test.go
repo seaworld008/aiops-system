@@ -39,6 +39,8 @@ func TestMain(testingMain *testing.M) {
 		switch {
 		case len(os.Args) == 2 && os.Args[1] == controlWorkerPdeathParentArgument:
 			os.Exit(runPdeathParentTestHelper(scenario))
+		case IsControlWorkerSecretLoaderChild(os.Args[1:]):
+			os.Exit(runSecretLoaderTestChild(scenario))
 		case IsControlWorkerSourceLoaderChild(os.Args[1:]):
 			os.Exit(runSourceLoaderTestChild(scenario))
 		case IsControlWorkerChild(os.Args[1:]):
@@ -107,6 +109,32 @@ func TestProductionSourceLoaderCommandBoundaryIsFixed(t *testing.T) {
 	want := &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL, PidFD: &pidFD}
 	if !reflect.DeepEqual(command.SysProcAttr, want) {
 		t.Fatalf("loader SysProcAttr = %#v, want %#v", command.SysProcAttr, want)
+	}
+}
+
+func TestProductionSecretLoaderCommandBoundaryIsFixed(t *testing.T) {
+	pidFD := -1
+	command := buildSecretLoaderCommand(&pidFD)
+	if command.Path != controlWorkerExecutable ||
+		!equalStrings(command.Args, []string{controlWorkerExecutable, controlWorkerSecretLoaderArgument}) {
+		t.Fatalf("secret loader path/args = %q/%q", command.Path, command.Args)
+	}
+	if command.Env == nil || len(command.Env) != 0 || command.Dir != "/" || command.Stdin != nil ||
+		command.Stdout != io.Discard || command.Stderr != io.Discard || len(command.ExtraFiles) != 0 ||
+		command.WaitDelay != controlWorkerWaitDelay || command.Cancel != nil {
+		t.Fatal("secret loader process boundary changed")
+	}
+	want := &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL, PidFD: &pidFD}
+	if !reflect.DeepEqual(command.SysProcAttr, want) {
+		t.Fatalf("secret loader SysProcAttr = %#v, want %#v", command.SysProcAttr, want)
+	}
+}
+
+func TestProductionSupervisorUsesContainedSecretLoaderSupplier(t *testing.T) {
+	settings := defaultSupervisorSettings()
+	if got, want := reflect.ValueOf(settings.supplySecrets).Pointer(),
+		reflect.ValueOf(productionControlWorkerSecretSupplier).Pointer(); got != want {
+		t.Fatalf("production secret supplier pointer = %x, want fixed contained loader %x", got, want)
 	}
 }
 
@@ -392,6 +420,33 @@ func TestSupervisorFatalNeverSendsTERM(t *testing.T) {
 	}
 }
 
+func TestSupervisorCancelsAndJoinsSecretSupplyBeforeFatalContainment(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "fatal-during-secret-supply")
+	supervisor := newTestSupervisor("fatal-during-secret-supply", base)
+	supervisor.settings.supplySecrets = func(
+		ctx context.Context,
+		_ time.Duration,
+		_ *os.File,
+		_ *os.File,
+		_ *os.File,
+	) error {
+		writeChildMarker(base+".supplier-started", "started")
+		<-ctx.Done()
+		pidBytes, readErr := os.ReadFile(base + ".pid")
+		pid, parseErr := strconv.Atoi(string(pidBytes))
+		if readErr == nil && parseErr == nil && syscall.Kill(pid, 0) == nil {
+			writeChildMarker(base+".supplier-stopped-child-live", "live")
+		}
+		return ctx.Err()
+	}
+	if err := supervisor.Run(context.Background()); err != errChildFatal {
+		t.Fatalf("Run() error = %v, want %v", err, errChildFatal)
+	}
+	waitForMarker(t, base+".supplier-stopped-child-live")
+	assertMarkerAbsent(t, base+".term")
+	assertRecordedPIDGone(t, base+".pid")
+}
+
 func TestSupervisorStatusAnomaliesNeverSendTERM(t *testing.T) {
 	tests := []string{
 		"malformed-before-ready",
@@ -617,6 +672,142 @@ func TestInvalidSourceLoaderFrameStillKillsSameGroupDescendant(t *testing.T) {
 	}
 	assertRecordedPIDGone(t, base+".pid")
 	assertRecordedPIDGone(t, base+".descendant-pid")
+}
+
+func TestSecretLoaderSuccessWaitsReapsAndMapsExactOutputDescriptors(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "secret-loader-success")
+	command := secretLoaderTestCommand("secret-loader-success", base)
+	readers, writers := openSecretLoaderTestPipes(t)
+	if err := supplyControlWorkerSecretsFromCommandUnchecked(
+		context.Background(), 5*time.Second, command, writers[0], writers[1], writers[2],
+	); err != nil {
+		t.Fatalf("supplyControlWorkerSecretsFromCommandUnchecked() error = %v", err)
+	}
+	if command.ProcessState == nil || !command.ProcessState.Exited() || !command.ProcessState.Success() {
+		t.Fatalf("successful secret loader was not synchronously waited/reaped: %#v", command.ProcessState)
+	}
+	closeControlWorkerFiles(writers[:])
+	for index, want := range []string{"postgres", "starter", "control"} {
+		contents, err := io.ReadAll(readers[index])
+		if err != nil || string(contents) != want {
+			t.Fatalf("secret loader output %d = %q, %v; want %q", index, contents, err, want)
+		}
+	}
+	assertRecordedPIDGone(t, base+".pid")
+}
+
+func TestSecretLoaderTimeoutKillsAndReapsEntireProcessGroup(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "secret-loader-timeout")
+	command := secretLoaderTestCommand("secret-loader-hang", base)
+	_, writers := openSecretLoaderTestPipes(t)
+	if err := supplyControlWorkerSecretsFromCommandUnchecked(
+		context.Background(), 2*time.Second, command, writers[0], writers[1], writers[2],
+	); err != errChildStart {
+		t.Fatalf("timed-out secret loader error = %v, want %v", err, errChildStart)
+	}
+	if command.ProcessState == nil || !command.ProcessState.Exited() {
+		t.Fatalf("timed-out secret loader was not synchronously waited/reaped: %#v", command.ProcessState)
+	}
+	assertRecordedPIDGone(t, base+".pid")
+	assertRecordedPIDGone(t, base+".descendant-pid")
+}
+
+func TestSecretLoaderCancellationKillsAndReapsEntireProcessGroup(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "secret-loader-cancel")
+	command := secretLoaderTestCommand("secret-loader-hang", base)
+	_, writers := openSecretLoaderTestPipes(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- supplyControlWorkerSecretsFromCommandUnchecked(
+			ctx, 10*time.Second, command, writers[0], writers[1], writers[2],
+		)
+	}()
+	waitForMarker(t, base+".descendant-pid")
+	cancel()
+	if err := receiveResult(t, result); err != errChildStart {
+		t.Fatalf("cancelled secret loader error = %v, want %v", err, errChildStart)
+	}
+	if command.ProcessState == nil || !command.ProcessState.Exited() {
+		t.Fatalf("cancelled secret loader was not synchronously waited/reaped: %#v", command.ProcessState)
+	}
+	assertRecordedPIDGone(t, base+".pid")
+	assertRecordedPIDGone(t, base+".descendant-pid")
+}
+
+func TestSecretSupplyOperationCancellationJoinsSupplierAndClosesWriters(t *testing.T) {
+	readers, writers, err := openControlWorkerSecretPipes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeControlWorkerFiles(readers[:])
+	process := &controlWorkerProcess{secretWriter: writers}
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	operation := beginControlWorkerSecretSupply(
+		context.Background(),
+		5*time.Second,
+		func(
+			ctx context.Context,
+			_ time.Duration,
+			_ *os.File,
+			_ *os.File,
+			_ *os.File,
+		) error {
+			close(started)
+			<-ctx.Done()
+			close(stopped)
+			return ctx.Err()
+		},
+		process,
+	)
+	<-started
+	operation.cancelAndWait()
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("cancelAndWait returned before the supplier stopped")
+	}
+	for index, reader := range readers {
+		contents, readErr := io.ReadAll(reader)
+		if readErr != nil || len(contents) != 0 {
+			t.Fatalf("joined secret writer %d = %x, %v; want empty EOF", index, contents, readErr)
+		}
+	}
+}
+
+func TestSecretLoaderRejectsAndKillsSurvivingSameGroupDescendant(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "secret-loader-descendant")
+	command := secretLoaderTestCommand("secret-loader-exit-with-descendant", base)
+	_, writers := openSecretLoaderTestPipes(t)
+	if err := supplyControlWorkerSecretsFromCommandUnchecked(
+		context.Background(), 5*time.Second, command, writers[0], writers[1], writers[2],
+	); err != errChildStart {
+		t.Fatalf("secret loader with surviving descendant error = %v, want %v", err, errChildStart)
+	}
+	if command.ProcessState == nil || !command.ProcessState.Exited() {
+		t.Fatalf("secret loader leader was not synchronously waited/reaped: %#v", command.ProcessState)
+	}
+	assertRecordedPIDGone(t, base+".pid")
+	assertRecordedPIDGone(t, base+".descendant-pid")
+}
+
+func TestSecretLoaderStartRejectsPreexistingExtraDescriptor(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "secret-loader-extra-fd")
+	command := secretLoaderTestCommand("secret-loader-success", base)
+	extra, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer extra.Close()
+	command.ExtraFiles = []*os.File{extra}
+	_, writers := openSecretLoaderTestPipes(t)
+	if err := supplyControlWorkerSecretsFromCommandUnchecked(
+		context.Background(), time.Second, command, writers[0], writers[1], writers[2],
+	); err != errChildStart || command.Process != nil {
+		t.Fatalf("secret loader with preexisting FD rejected as (%v, process %#v)", err, command.Process)
+	}
+	assertMarkerAbsent(t, base+".pid")
 }
 
 func TestUntrustedSourceLoaderPIDFDNeverCallsWait(t *testing.T) {
@@ -1059,6 +1250,14 @@ func runControlWorkerTestChild(raw string) int {
 		waitForTestTERM(status, base, scenario == "no-secret-ready-exit-on-term", signals)
 		return 78
 	}
+	if scenario == "fatal-during-secret-supply" {
+		if ReportControlWorkerSecretReady(status) != nil ||
+			!waitForChildMarker(base+".supplier-started", 5*time.Second) ||
+			writeStatusByte(status.file, controlWorkerFatalByte) != nil {
+			return 98
+		}
+		select {}
+	}
 	if ReportControlWorkerSecretReady(status) != nil ||
 		BindControlWorkerSecrets(context.Background(), status) != nil {
 		return 79
@@ -1249,6 +1448,92 @@ func runPdeathParentTestHelper(raw string) int {
 		time.Sleep(10 * time.Millisecond)
 	}
 	return 103
+}
+
+func secretLoaderTestCommand(scenario, base string) *exec.Cmd {
+	command := exec.Command(controlWorkerExecutable, controlWorkerSecretLoaderArgument)
+	command.Args = []string{controlWorkerExecutable, controlWorkerSecretLoaderArgument}
+	command.Env = []string{
+		controlWorkerTestScenario + "=" + scenario + "|" + base,
+		controlWorkerRaceOptions,
+	}
+	command.Dir = "/"
+	command.Stdin = nil
+	command.Stdout = io.Discard
+	command.Stderr = io.Discard
+	command.WaitDelay = controlWorkerWaitDelay
+	pidFD := -1
+	command.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true, Pdeathsig: syscall.SIGKILL, PidFD: &pidFD,
+	}
+	return command
+}
+
+func openSecretLoaderTestPipes(t *testing.T) ([3]*os.File, [3]*os.File) {
+	t.Helper()
+	readers, writers, err := openControlWorkerSecretPipes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		closeControlWorkerFiles(readers[:])
+		closeControlWorkerFiles(writers[:])
+	})
+	return readers, writers
+}
+
+func runSecretLoaderTestChild(raw string) int {
+	parts := strings.SplitN(raw, "|", 2)
+	if len(parts) != 2 {
+		return 110
+	}
+	scenario, base := parts[0], parts[1]
+	if scenario != "secret-loader-success" && scenario != "secret-loader-hang" &&
+		scenario != "secret-loader-exit-with-descendant" {
+		return 111
+	}
+	writeChildMarker(base+".pid", strconv.Itoa(os.Getpid()))
+	writers := [3]*os.File{}
+	seen := make(map[[2]uint64]struct{}, len(writers))
+	for index, descriptor := range []int{3, 4, 5} {
+		var stat unix.Stat_t
+		statusFlags, statusErr := unix.FcntlInt(uintptr(descriptor), unix.F_GETFL, 0)
+		descriptorFlags, descriptorErr := unix.FcntlInt(uintptr(descriptor), unix.F_GETFD, 0)
+		if unix.Fstat(descriptor, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFIFO ||
+			statusErr != nil || statusFlags&unix.O_ACCMODE != unix.O_WRONLY ||
+			descriptorErr != nil || descriptorFlags&unix.FD_CLOEXEC != 0 {
+			return 112 + index
+		}
+		identity := [2]uint64{uint64(stat.Dev), stat.Ino}
+		if _, duplicate := seen[identity]; duplicate {
+			return 116
+		}
+		seen[identity] = struct{}{}
+		unix.CloseOnExec(descriptor)
+		writers[index] = os.NewFile(uintptr(descriptor), "secret-loader-test-output")
+		if writers[index] == nil {
+			return 117
+		}
+	}
+	defer closeControlWorkerFiles(writers[:])
+	if scenario == "secret-loader-success" {
+		for index, value := range []string{"postgres", "starter", "control"} {
+			if written, err := io.WriteString(writers[index], value); err != nil || written != len(value) {
+				return 118 + index
+			}
+		}
+		return 0
+	}
+	descendant := exec.Command("/bin/sh", "-c", "trap '' HUP TERM; while :; do sleep 1; done")
+	descendant.Env = []string{}
+	if descendant.Start() != nil {
+		return 122
+	}
+	writeChildMarker(base+".descendant-pid", strconv.Itoa(descendant.Process.Pid))
+	if scenario == "secret-loader-exit-with-descendant" {
+		return 0
+	}
+	select {}
 }
 
 func runSourceLoaderTestChild(raw string) int {

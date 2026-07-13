@@ -23,6 +23,7 @@ const workerBootstrapImport = "github.com/seaworld008/aiops-system/internal/work
 
 var (
 	_ func() (*workerbootstrap.PublicSourceCapability, error) = workerbootstrap.OpenProductionSource
+	_ func() error                                            = workerbootstrap.WriteProductionSecretsToLoaderFDs
 	_ interface {
 		Summary() workerbootstrap.PublicSourceSummary
 		Close() error
@@ -88,7 +89,9 @@ func TestPublicSourceProductionBoundarySemanticAssemblyIsNonConfigurable(t *test
 	repositoryRoot := filepath.Clean(filepath.Join(packageDirectory, "../.."))
 	exports := make(map[string]int)
 	rootLiteralCount := 0
+	secretRootLiteralCount := 0
 	openProductionDeclarations := 0
+	writeProductionSecretsDeclarations := 0
 	consumerImports := make(map[string]int)
 	consumerReferences := make(map[string]int)
 	consumerCalls := make(map[string]int)
@@ -186,6 +189,9 @@ func TestPublicSourceProductionBoundarySemanticAssemblyIsNonConfigurable(t *test
 					if unquoteErr == nil && value == "/run/aiops/control-worker/v1" {
 						rootLiteralCount++
 					}
+					if unquoteErr == nil && value == "/run/aiops/control-worker-secrets/v1" {
+						secretRootLiteralCount++
+					}
 				}
 			case *ast.CallExpr:
 				selector, selectorOK := typed.Fun.(*ast.SelectorExpr)
@@ -224,6 +230,12 @@ func TestPublicSourceProductionBoundarySemanticAssemblyIsNonConfigurable(t *test
 						violations = append(violations, relative+" gives OpenProductionSource configurable inputs")
 					}
 				}
+				if typed.Recv == nil && typed.Name.Name == "WriteProductionSecretsToLoaderFDs" {
+					writeProductionSecretsDeclarations++
+					if typed.Type.Params != nil && len(typed.Type.Params.List) != 0 {
+						violations = append(violations, relative+" gives WriteProductionSecretsToLoaderFDs configurable inputs")
+					}
+				}
 				if ast.IsExported(typed.Name.Name) {
 					prefix := "func:"
 					if typed.Recv != nil {
@@ -243,7 +255,8 @@ func TestPublicSourceProductionBoundarySemanticAssemblyIsNonConfigurable(t *test
 		"value:ErrBootstrapRejected": 1, "value:PublicSourceSchemaVersion": 1,
 		"func:OpenProductionSource": 2, "func:AcceptInheritedSource": 2,
 		"func:WriteProductionSourceToLoaderFD": 2, "func:ReceiveProductionSource": 2,
-		"method:Summary": 2, "method:Close": 2, "method:String": 4, "method:GoString": 4,
+		"func:WriteProductionSecretsToLoaderFDs": 2,
+		"method:Summary":                         2, "method:Close": 2, "method:String": 4, "method:GoString": 4,
 		"method:Format": 4, "method:MarshalJSON": 4, "method:UnmarshalJSON": 4,
 		"method:StartChild":               2,
 		"method:BuildSnapshot":            1,
@@ -255,11 +268,16 @@ func TestPublicSourceProductionBoundarySemanticAssemblyIsNonConfigurable(t *test
 	if openProductionDeclarations != 2 || rootLiteralCount != 1 {
 		t.Errorf("OpenProductionSource declarations/root literals = %d/%d, want 2/1", openProductionDeclarations, rootLiteralCount)
 	}
+	if writeProductionSecretsDeclarations != 2 || secretRootLiteralCount != 1 {
+		t.Errorf("WriteProductionSecretsToLoaderFDs declarations/root literals = %d/%d, want 2/1",
+			writeProductionSecretsDeclarations, secretRootLiteralCount)
+	}
 	if !reflect.DeepEqual(consumerImports, map[string]int{"internal/workerprocess/platform_linux.go": 1}) {
 		t.Errorf("workerbootstrap production consumers = %#v, want only workerprocess FD4 handoff", consumerImports)
 	}
 	wantConsumerCalls := map[string]int{
 		"WriteProductionSourceToLoaderFD": 1, "ReceiveProductionSource": 1, "AcceptInheritedSource": 1,
+		"WriteProductionSecretsToLoaderFDs": 1,
 	}
 	if !reflect.DeepEqual(consumerCalls, wantConsumerCalls) || !reflect.DeepEqual(consumerReferences, wantConsumerCalls) {
 		t.Errorf("workerbootstrap consumer calls/references = %#v/%#v, want %#v", consumerCalls, consumerReferences, wantConsumerCalls)

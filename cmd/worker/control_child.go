@@ -271,8 +271,8 @@ func (status *processControlChildStatus) Fatal() {
 }
 
 func newControlChildRuntime(snapshot *readassembly.Snapshot) (controlChildRuntime, error) {
-	// C2-4c2b1b2a proves the exact FD4 manifests compile and the three fixed
-	// post-barrier secret frames bind to their reviewed client certificates.
+	// C2-4c2b1b2b proves the exact FD4 manifests compile and a contained loader
+	// supplies three post-barrier frames bound to the reviewed certificates.
 	// PostgreSQL/Temporal client assembly remains unavailable until b1b3.
 	if snapshot == nil || !snapshot.Ready() {
 		return nil, errControlWorkerAssemblyUnavailable

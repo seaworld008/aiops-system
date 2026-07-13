@@ -11,17 +11,19 @@ import (
 )
 
 const (
-	controlWorkerChildArgument   = "--aiops-internal-control-worker-child-v1"
-	controlWorkerLoaderArgument  = "--aiops-internal-control-worker-source-loader-v1"
-	controlWorkerStatusFD        = uintptr(3)
-	controlWorkerSourceFD        = 4
-	controlWorkerPostgresFD      = 5
-	controlWorkerStarterFD       = 6
-	controlWorkerControlFD       = 7
-	controlWorkerSecretReadyByte = byte('S')
-	controlWorkerReadyByte       = byte('R')
-	controlWorkerFatalByte       = byte('F')
-	controlWorkerFatalExitCode   = 70
+	controlWorkerChildArgument        = "--aiops-internal-control-worker-child-v1"
+	controlWorkerLoaderArgument       = "--aiops-internal-control-worker-source-loader-v1"
+	controlWorkerSecretLoaderArgument = "--aiops-internal-control-worker-secret-loader-v1"
+	controlWorkerStatusFD             = uintptr(3)
+	controlWorkerSourceFD             = 4
+	controlWorkerPostgresFD           = 5
+	controlWorkerStarterFD            = 6
+	controlWorkerControlFD            = 7
+	controlWorkerSecretLoaderMaxFD    = 5
+	controlWorkerSecretReadyByte      = byte('S')
+	controlWorkerReadyByte            = byte('R')
+	controlWorkerFatalByte            = byte('F')
+	controlWorkerFatalExitCode        = 70
 )
 
 var (
@@ -43,6 +45,13 @@ func IsControlWorkerSourceLoaderChild(args []string) bool {
 	return len(args) == 1 && args[0] == controlWorkerLoaderArgument
 }
 
+// IsControlWorkerSecretLoaderChild recognizes only the private, fixed secret
+// loader invocation. It is deliberately distinct from the public source
+// loader and the long-lived control worker child.
+func IsControlWorkerSecretLoaderChild(args []string) bool {
+	return len(args) == 1 && args[0] == controlWorkerSecretLoaderArgument
+}
+
 // RunControlWorkerSourceLoaderChild validates the contained loader boundary,
 // snapshots the fixed production root, writes its public frame to FD3, and
 // exits. It fails closed on non-Linux platforms.
@@ -51,6 +60,16 @@ func RunControlWorkerSourceLoaderChild(args []string) error {
 		return errInvalidChildInvocation
 	}
 	return runControlWorkerSourceLoaderChild()
+}
+
+// RunControlWorkerSecretLoaderChild validates the contained loader boundary,
+// reads the independent fixed secret root, writes role-bound frames directly
+// to FD3-FD5, and exits. It fails closed on non-Linux platforms.
+func RunControlWorkerSecretLoaderChild(args []string) error {
+	if !IsControlWorkerSecretLoaderChild(args) {
+		return errInvalidChildInvocation
+	}
+	return runControlWorkerSecretLoaderChild()
 }
 
 // AcceptControlWorkerChild validates and takes ownership of the anonymous

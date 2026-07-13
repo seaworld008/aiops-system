@@ -86,7 +86,7 @@ func defaultSupervisorSettings() supervisorSettings {
 		outputLimit:    defaultOutputByteLimit,
 		childEnv:       []string{},
 		openSource:     openProductionControlWorkerSource,
-		supplySecrets:  unavailableControlWorkerSecretSupplier,
+		supplySecrets:  productionControlWorkerSecretSupplier,
 	}
 }
 
@@ -95,19 +95,6 @@ func (settings supervisorSettings) valid() bool {
 		settings.shutdownGrace > 0 && settings.anomalyGrace > 0 &&
 		settings.killConfirm > 0 && settings.outputLimit > 0 && settings.childEnv != nil &&
 		settings.openSource != nil && settings.supplySecrets != nil
-}
-
-func unavailableControlWorkerSecretSupplier(
-	context.Context,
-	time.Duration,
-	*os.File,
-	*os.File,
-	*os.File,
-) error {
-	// b1b2a deliberately installs the transport and barrier while keeping the
-	// production secret source unavailable. b1b2b replaces this fixed function
-	// with the contained, post-barrier secret-loader child.
-	return errUnsupported
 }
 
 // ControlWorkerSupervisor owns one fixed-path control worker child process.

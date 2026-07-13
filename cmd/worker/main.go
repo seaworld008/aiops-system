@@ -45,6 +45,9 @@ func runWithSupervisor(
 	if ctx == nil {
 		return errInvalidInvocation
 	}
+	if workerprocess.IsControlWorkerSecretLoaderChild(args) {
+		return workerprocess.RunControlWorkerSecretLoaderChild(args)
+	}
 	if workerprocess.IsControlWorkerSourceLoaderChild(args) {
 		return workerprocess.RunControlWorkerSourceLoaderChild(args)
 	}
@@ -69,8 +72,8 @@ func runWithSupervisor(
 }
 
 func runControlWorkerChild(ctx context.Context, status *workerprocess.ChildStatus) error {
-	// C2-4c2b0 adds only the fatal/normal-stop lifecycle arbiter. The fixed
-	// runtime factory remains unavailable, so production still exits before
-	// READY and cannot activate READ claims or the Outbox dispatcher.
+	// C2-4c2b1b2b adds the post-Snapshot secret-loader only. The fixed runtime
+	// factory remains unavailable, so production still exits before READY and
+	// cannot activate READ claims or the Outbox dispatcher.
 	return runControlWorkerChildRuntime(ctx, status)
 }

@@ -26,7 +26,11 @@ func TestControlWorkerSnapshotGateStillCannotCreateRuntimeOrReportReady(t *testi
 		t.Fatal("control child assembly functions are missing")
 	}
 	returns := 0
+	factoryCalls := make(map[string]int)
 	ast.Inspect(factory.Body, func(node ast.Node) bool {
+		if call, ok := node.(*ast.CallExpr); ok {
+			factoryCalls[calledFunctionName(call.Fun)]++
+		}
 		statement, ok := node.(*ast.ReturnStmt)
 		if !ok {
 			return true
@@ -41,17 +45,23 @@ func TestControlWorkerSnapshotGateStillCannotCreateRuntimeOrReportReady(t *testi
 	if returns == 0 {
 		t.Fatal("runtime factory has no fixed unavailable return")
 	}
+	if len(factoryCalls) != 1 || factoryCalls["Ready"] != 1 {
+		t.Fatalf("runtime factory calls = %#v, want only Snapshot.Ready", factoryCalls)
+	}
 	buildPosition := token.NoPos
 	secretReadyPosition := token.NoPos
 	bindPosition := token.NoPos
 	factoryPosition := token.NoPos
 	unexpectedReadyCalls := 0
+	assemblyCalls := make(map[string]int)
 	ast.Inspect(assembly.Body, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
 		if !ok {
 			return true
 		}
-		switch calledFunctionName(call.Fun) {
+		name := calledFunctionName(call.Fun)
+		assemblyCalls[name]++
+		switch name {
 		case "BuildControlWorkerSnapshot":
 			if buildPosition != token.NoPos {
 				t.Error("snapshot gate is called more than once")
@@ -99,6 +109,21 @@ func TestControlWorkerSnapshotGateStillCannotCreateRuntimeOrReportReady(t *testi
 	if unexpectedReadyCalls != 0 {
 		t.Fatalf("pre-runtime assembly contains %d status READY calls", unexpectedReadyCalls)
 	}
+	wantAssemblyCalls := map[string]int{
+		"Err":                            2,
+		"CloseControlWorkerChild":        2,
+		"BuildControlWorkerSnapshot":     1,
+		"Ready":                          1,
+		"ReportControlWorkerSecretReady": 1,
+		"BindControlWorkerSecrets":       1,
+		"newControlChildRuntime":         1,
+		"nilControlChildDependency":      1,
+		"newControlChild":                1,
+		"Run":                            1,
+	}
+	if !sameControlChildStringCounts(assemblyCalls, wantAssemblyCalls) {
+		t.Fatalf("pre-runtime assembly calls = %#v, want exact reviewed set %#v", assemblyCalls, wantAssemblyCalls)
+	}
 	allReadyCalls := 0
 	readyHelperCalls := 0
 	ast.Inspect(parsed, func(node ast.Node) bool {
@@ -119,6 +144,18 @@ func TestControlWorkerSnapshotGateStillCannotCreateRuntimeOrReportReady(t *testi
 	if readyHelperCalls != 1 {
 		t.Fatalf("control child READY helper callsites = %d, want exact reviewed lifecycle call", readyHelperCalls)
 	}
+}
+
+func sameControlChildStringCounts(left, right map[string]int) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, value := range left {
+		if right[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func findControlChildFunction(file *ast.File, name string) *ast.FuncDecl {
