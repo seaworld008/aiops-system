@@ -1,0 +1,37 @@
+# GitNexus derives its index from first-party source, contracts, and tests.
+# Build products, generated clients, vendored code, and local worktrees add noise.
+.gitnexus/
+.gitnexus-operation.lock
+.gitnexus-refresh.lock/
+.gitnexus-refresh.lock.pending.*/
+.aiops-code-map-snapshot.*/
+.code-map-artifact/
+.worktrees/
+.data/
+tmp/
+.env
+.env.*
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.pem
+*.PEM
+*.p8
+*.P8
+*.ppk
+*.PPK
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+node_modules/
+tools/code-map/node_modules/
+vendor/
+web/dist/
+coverage/
+playwright-report/
+test-results/
+*.map
+web/src/shared/api/schema.d.ts

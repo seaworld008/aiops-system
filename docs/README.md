@@ -6,6 +6,7 @@ This directory separates current architecture, executable delivery plans, and su
 
 - [Architecture overview](architecture/overview.md) — concise English introduction to components and trust boundaries.
 - [2026 V3 implementation blueprint](architecture/implementation-blueprint-v3.md) — authoritative detailed design and safety contract (Chinese).
+- [AI Agent living code map](architecture/agent-code-map.md) — worktree-scoped GitNexus graph, impact-analysis workflow, freshness rules, and its non-authoritative boundary.
 - [AWX host identity enrollment v1](contracts/awx-host-identity-enrollment-v1.md)、[AWX governed launch admission v1](contracts/awx-governed-launch-admission-v1.md) 与 [Host identity attestor v1](contracts/host-identity-attestor-v1.md) — Phase 5 已确认后继安全契约；对应业务实现仍以状态源为准。
 
 ## Delivery and operations

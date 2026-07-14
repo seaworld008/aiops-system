@@ -1,0 +1,64 @@
+name: agent-code-map
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-code-map-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+      - name: Activate pinned pnpm
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@10.34.0 --activate
+          test "$(pnpm --version)" = "10.34.0"
+      - name: Rebuild and verify derived code map
+        shell: bash
+        run: ./scripts/code-map.sh verify
+      - name: Assert verification preserved the exact checkout
+        shell: bash
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - name: Create non-authoritative code-map summary
+        shell: bash
+        run: ./scripts/code-map.sh snapshot "${RUNNER_TEMP}/agent-code-map"
+      - name: Assert snapshot preserved the exact checkout
+        shell: bash
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - name: Upload safe code-map summary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: agent-code-map-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/agent-code-map/manifest.txt
+            ${{ runner.temp }}/agent-code-map/node-count.txt
+            ${{ runner.temp }}/agent-code-map/relationship-count.txt
+            ${{ runner.temp }}/agent-code-map/file-count.txt
+            ${{ runner.temp }}/agent-code-map/process-count.txt
+            ${{ runner.temp }}/agent-code-map/community-count.txt
+            ${{ runner.temp }}/agent-code-map/structural-check.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6

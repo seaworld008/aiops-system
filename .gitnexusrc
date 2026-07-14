@@ -1,0 +1,13 @@
+{
+  "analyze": {
+    "defaultBranch": "main",
+    "skipContextFiles": true,
+    "skipSkills": true,
+    "indexOnly": true,
+    "noStats": true,
+    "embeddings": false,
+    "pdg": false,
+    "maxFileSize": 512,
+    "workerTimeout": 60
+  }
+}
