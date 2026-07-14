@@ -21,8 +21,13 @@
 - No phase ever enables interactive SSH/WinRM, PTY, port forwarding, SFTP, arbitrary shell, arbitrary SQL, unconstrained database writes, or Metrics/Logs/Traces ingestion. Production mutation stays closed through Phase 6; Phase 7 may open only individually reviewed fixed Action/Runbook types bound to an immutable plan, policy decision, human approval, short credential, verification, rollback/reconciliation, and audit chain.
 - Manual assets are registered operational references, not desired-state resource controllers or replacements for external CMDB/cloud/Kubernetes/Operator facts.
 - The frontend uses the approved light, dense enterprise console: navy navigation, restrained blue actions, 4–6px radius, 1px borders, no chat shell, AI avatar, neon, glow, gradient, glassmorphism, or decorative bento layout.
+- The frontend application platform is one React/TypeScript/Vite application with TanStack Router/Query/Table and the enforced dependency direction `app → features → shared`; features cannot import another feature's UI, and only `shared/api` may perform network requests through types generated from the single OpenAPI contract.
+- Frontend state ownership is fixed: validated URL search owns non-sensitive Scope/navigation/filter state, TanStack Query owns Scope-keyed server state, React Hook Form + Zod owns temporary form state, and local React state owns ephemeral UI state. Auth/Scope/theme are the only cross-cutting contexts; Redux, Zustand, microfrontends, and parallel client truth stores are not introduced.
+- Phase 1 owns the shared `DataTable`, `ProblemPanel`, `OperationTimeline`, `EffectiveActionGate`, `ETagConflictReview`, and `ReauthBoundary`. Governed mutations are server-confirmed only, never optimistic or automatically retried/replayed, and use `Idempotency-Key`, `ETag/If-Match`, recent authentication, and durable Operations.
 - Frontend state dimensions remain orthogonal; permissions come from API `effective_actions`, never from frontend role-name inference.
-- Browser OIDC uses `login-required`; access tokens live only in memory, are refreshed before requests, and are never persisted to localStorage, sessionStorage, IndexedDB, or application cookies. Missing production OIDC configuration fails closed.
+- Browser OIDC uses `login-required`; access tokens live only in memory, are refreshed before requests, and are never persisted to localStorage, sessionStorage, IndexedDB, or application cookies. Initialization reads the no-store, closed-schema `GET /api/v1/browser-config`; missing or malformed public configuration fails closed, while secrets and private endpoints are prohibited from the response.
+- Production uses one same-origin Control Plane artifact: Vite builds `web/dist`, the Go HTTP process serves API and SPA from the same image with static files fixed at `/opt/aiops/web`, and the final runtime contains no Node/Vite server. Next.js, Remix, Node BFF, separate Web workload/identity, broad CORS, and `vite preview` are outside the approved architecture.
+- AI UX is evidence-first: Investigation, Evidence, ActionProposal, ActionPlan, Operation, Receipt, and Audit remain governed domain objects; there is no global chat or natural-language execution surface outside that chain.
 - Accessibility target is WCAG 2.2 AA with visible focus, persistent labels, keyboard operation, reduced motion, non-color status cues, and 44px touch targets.
 - All implementation work runs in an isolated worktree whose module root does not contain nested `.worktrees`; do not delete or modify the user's existing worktrees to make architecture-boundary tests pass.
 - Migration ownership is fixed: `000015` assets, `000016` connections/runtime/realms, `000017` VictoriaMetrics, `000018` grants/policies, `000019` host/PostgreSQL, `000020` production platform, `000021` governed actions, `000022` release governance.
@@ -51,12 +56,12 @@ The detailed plans own all code-level TDD steps. This program file owns ordering
 
 | Producer | Stable output consumed later |
 |---|---|
-| Plan 1 | `internal/assetcatalog` domain/repository, immutable AssetSource revisions, CSV/API/CMDB/vSphere/Proxmox/OpenStack/cloud discovery adapters, durable cursor/lease/fence/rate limit, `cmd/discovery-worker`, authoritative lifecycle and mapping eligibility, Overview/source UI, `api/openapi/control-plane-v1.yaml`, `web/` shell and common Problem Details/`effective_actions` handling |
+| Plan 1 | `internal/assetcatalog` domain/repository, immutable AssetSource revisions, CSV/API/CMDB/vSphere/Proxmox/OpenStack/cloud discovery adapters, durable cursor/lease/fence/rate limit, `cmd/discovery-worker`, authoritative lifecycle and mapping eligibility, Overview/source UI, `api/openapi/control-plane-v1.yaml`, runtime Browser Config, Go same-origin SPA handler, `web/` shell with `app → features → shared`, typed `shared/api`, shared Operation/governance UI and common Problem Details/`effective_actions` handling |
 | Plan 2 | `internal/connectionprofile`, `internal/capability`, `internal/runtimepublication`, Opaque `credential_references`, `runner_realms`, Validation Runner protocol, immutable Target/Capability/Runtime digests |
 | Plan 3 | VictoriaMetrics asset taxonomy/details, Operator observation projector, Metrics/Logs/Traces connector contracts, executor profile revision, Evidence schemas, Victoria-specific UI projections |
 | Plan 4 | `asset_snapshots`, `InvestigationGrant`, proactive policy revisions/runs, six-level Kill Switch, budget accounting, Gateway Claim/Start/Heartbeat/Complete grant admission, append-only `PROPOSAL_ONLY` ActionProposal with Evidence/Catalog digests and read-only API |
 | Plan 5 | fixed host-probe/AWX and PostgreSQL adapter families, READ credential issuers/revokers, named diagnostic query registry, DLP-safe evidence |
-| Plan 6 | production HA process assembly, rollout revisions, immutable READ baseline/handoff, SLO/alerts, backup/recovery proof, security drill evidence, production read-only readiness |
+| Plan 6 | production HA process assembly, single Control Plane image containing the Go binary plus `/opt/aiops/web` and no Node runtime, rollout revisions, immutable READ baseline/handoff, SLO/alerts, backup/recovery proof, security drill evidence, production read-only readiness |
 | Plan 7 | accepted Action platform successor/manifest, fixed Action catalog, exact `ActionEnvelope`, approval binding, WRITE credentials/Runner, post-action verification, reconciliation, rollback and human escalation |
 | Plan 8 | load/capacity and chaos evidence, DR exercise, security/compliance sign-off, canary waves, operating ownership, release decision and normative documentation |
 
@@ -144,7 +149,7 @@ Expected: no output. Baseline verification creates no repository mutation.
 
 **Interfaces:**
 - Consumes: Task 1 clean baseline
-- Produces: Plan 1 interfaces listed in the cross-plan contract and frontend command surface `generate:api`, `typecheck`, `lint`, `test`, `build`, `test:e2e`, `check`
+- Produces: Plan 1 interfaces listed in the cross-plan contract, same-origin Browser Config/API/SPA boundary, and frontend command surface `generate:api`, `typecheck`, `lint`, `test`, `build`, `test:e2e`, `check`
 
 - [ ] **Step 1: Execute every unchecked Plan 1 task in order**
 
@@ -177,7 +182,7 @@ Expected: backend packages pass, frontend check exits `0`, and asset/mapping/sou
 
 - [ ] **Step 4: Review the gate evidence**
 
-Confirm that cross-scope foreign keys fail; every non-manual Source type has an implemented adapter and remains `UNAVAILABLE` until its own validation/E2E gate passes; cursor/lease/fence/rate limit and soft-delete/recovery survive worker takeover; discovery cannot silently overwrite manual governance fields; non-`EXACT` assets have no diagnostic action; browser fixtures contain no secret material; and URL state restores Overview, source inventory and asset workbench.
+Confirm that cross-scope foreign keys fail; every non-manual Source type has an implemented adapter and remains `UNAVAILABLE` until its own validation/E2E gate passes; cursor/lease/fence/rate limit and soft-delete/recovery survive worker takeover; discovery cannot silently overwrite manual governance fields; non-`EXACT` assets have no diagnostic action; Browser Config and fixtures contain no secret material; URL state restores Overview, source inventory and asset workbench; import/network boundaries prevent feature-local DTO/fetch; governance mutations have no optimistic update or automatic retry; and Go serves the production SPA/API from one Origin without a Node server.
 
 ### Task 3: Execute and accept connection publication
 
@@ -371,7 +376,7 @@ Confirm that every credential is durably revoked on completion, cancellation, ti
 
 - [ ] **Step 1: Execute every unchecked Plan 6 implementation task in order**
 
-Wire real Control Worker, Discovery Worker, Outbox, Gateway, Validation Runner, READ Runner, runtime publications, metrics, alerts, horizontal scaling, recovery, and runbooks. WRITE claims stay closed until Plan 7.
+Wire real Control Worker, Discovery Worker, Outbox, Gateway, Validation Runner, READ Runner, runtime publications, the single Control Plane image carrying `/opt/aiops/web`, metrics, alerts, horizontal scaling, recovery, and runbooks. The final image has no Node/Vite runtime or separate Web workload. WRITE claims stay closed until Plan 7.
 
 - [ ] **Step 2: Pass repository-wide quality gates**
 
@@ -463,7 +468,7 @@ Each Action type must pass the detailed plan's adversarial suite, at least 20 no
 
 - [ ] **Step 1: Execute every unchecked Plan 8 task in order**
 
-Complete multi-replica deployment, PostgreSQL/Temporal/Keycloak/Vault/PKI production integration, NetworkPolicy, pod/workload identity, backup/restore, zero-downtime migration, capacity/load, chaos, dependency-failure and incident drills.
+Complete multi-replica deployment, same-origin Control Plane Web/API ingress, PostgreSQL/Temporal/Keycloak/Vault/PKI production integration, NetworkPolicy, pod/workload identity, backup/restore, zero-downtime migration, N/N-1 API compatibility, chunk-load safe-refresh behavior, capacity/load, chaos, dependency-failure and incident drills. Do not create a separate Web Deployment, Service, image or identity.
 
 - [ ] **Step 2: Pass full-system release verification**
 

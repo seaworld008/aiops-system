@@ -4,7 +4,7 @@
 
 **Goal:** 建立 `000020` 生产平台事实、严格 production dependency graph、八类核心进程装配及已由 Phase 5 交付的外部 Enrollment control services，并生成首个完整只读 Helm chart，使任何缺失/测试/loopback 依赖都在 readiness 前 fail closed。
 
-**Architecture:** `productionplatform` 领域只保存 revision/digest/gate/decision；PostgreSQL repository 保证 Scope、不可变与阶段前驱。`productionassembly` 从只读配置和 workload identity 构造真实 PostgreSQL/Temporal/Keycloak/Vault/audit/evidence/telemetry adapters，再把窄接口注入各 command。Helm chart 使用独立 ServiceAccount、Deployment、Service、PDB/HPA 与 default-deny NetworkPolicy，不包含 WRITE 资源。
+**Architecture:** `productionplatform` 领域只保存 revision/digest/gate/decision；PostgreSQL repository 保证 Scope、不可变与阶段前驱。`productionassembly` 从只读配置和 workload identity 构造真实 PostgreSQL/Temporal/Keycloak/Vault/audit/evidence/telemetry adapters，再把窄接口注入各 command。Control Plane image 由 Node 24/pnpm 10 的 build stage 生成 `web/dist`、Go stage 生成 binary，最终 non-root/read-only image 只携带 binary 与 `/opt/aiops/web`；同一 Control Plane process/Service/Origin 提供 SPA 和 `/api/*`。Helm chart 使用独立 ServiceAccount、Deployment、Service、PDB/HPA 与 default-deny NetworkPolicy，不包含 WRITE 资源或独立 Web workload。
 
 **Tech Stack:** Go 1.26.5、PostgreSQL 18.4+、pgx/v5、Temporal SDK 1.46.0、Keycloak Server 26.6.3、Vault API/Kubernetes Auth/PKI、Kubernetes 1.36.2、Helm 3、OpenTelemetry、RFC 8785 JCS/SHA-256。
 
@@ -22,6 +22,7 @@
 - graceful shutdown 先关闭 admission/claim，再 drain，最后释放 lease；不得中断后继续以旧 fence 完成。
 - Helm 基础 chart 属于 Phase 6；无 WRITE Runner、Action worker、WRITE ServiceAccount/Realm/NetworkPolicy/credential values。
 - chart 与 production command 不含 `latest`、mutable tag、development mode、hostNetwork、privileged、service account token 自动挂载或 broad RBAC。
+- Production Control Plane artifact 是 Web/API 单镜像、单 Deployment、单 Service、单身份；Vite 不是 production server，最终镜像不得包含 Node、pnpm、MSW、source map、Service Worker、前端源码或开发依赖。
 - fake、memory、MSW 只能位于测试文件/目录，不能被 production import graph 引用。
 - AWX capability 启用时，production graph 还必须验证 Phase 5 的 AWX 24.6.1 governed image、两个 EnrollmentCleanupBroker、Vault 2.0.3 TLS Raft/KV/三把 Transit key、purpose-specific mTLS L7 gateway、authority-keyring Runtime 与 host-local attestor；它们是受治理外部依赖，缺失时只关闭对应 AWX enrollment/diagnostic admission，不能回退 stock launch 或软件导出身份。
 - 新增行为严格 TDD，每个 Task 独立 commit。
@@ -475,7 +476,11 @@ type Config struct {
     TemporalAddress       string        `json:"temporal_address"`
     TemporalNamespace     string        `json:"temporal_namespace"`
     KeycloakIssuer        string        `json:"keycloak_issuer"`
-    KeycloakAudience      string        `json:"keycloak_audience"`
+    KeycloakAPIAudience   string        `json:"keycloak_api_audience"`
+    KeycloakAuthorizedParty string      `json:"keycloak_authorized_party"`
+    BrowserOIDCURL        string        `json:"browser_oidc_url"`
+    BrowserOIDCRealm      string        `json:"browser_oidc_realm"`
+    BrowserOIDCClientID   string        `json:"browser_oidc_client_id"`
     VaultAddress          string        `json:"vault_address"`
     VaultRoleReference    string        `json:"vault_role_reference"`
     AuditSinkReference    string        `json:"audit_sink_reference"`
@@ -486,7 +491,7 @@ type Config struct {
 }
 ```
 
-Strict JSON decoder rejects unknown fields. All addresses are HTTPS/mTLS DNS identities, never loopback/IP literal/credentials-in-URL. FDs must be inherited, non-stdio, close-on-exec managed；config has no password/token/DSN/PEM/path fields.
+Strict JSON decoder rejects unknown fields. Human identity values map without ambiguity to Phase 1 `AIOPS_OIDC_ISSUER`、`AIOPS_OIDC_API_AUDIENCE`、`AIOPS_OIDC_AUTHORIZED_PARTY`、`AIOPS_WEB_OIDC_URL`、`AIOPS_WEB_OIDC_REALM` and `AIOPS_WEB_OIDC_CLIENT_ID`；production requires API audience `aiops-control-plane` and browser public authorized party/client `control-plane-web`. Only the three safe browser values may be projected through `/api/v1/browser-config`. All addresses are HTTPS/mTLS DNS identities, never loopback/IP literal/credentials-in-URL. FDs must be inherited, non-stdio, close-on-exec managed；config has no password/token/DSN/PEM/path fields.
 
 - [ ] **Step 4: Implement role-specific dependency graph**
 
@@ -546,6 +551,8 @@ git commit -m "feat(platform): fail closed production dependencies"
 - Modify: `cmd/validation-runner/main_test.go`
 - Modify: `cmd/read-runner/main.go`
 - Modify: `cmd/read-runner/main_test.go`
+- Create: `build/package/control-plane/Dockerfile`
+- Create: `test/production/control_plane_image_contract_test.go`
 - Create: `deploy/images.lock`
 - Create: `deploy/helm/aiops/Chart.yaml`
 - Create: `deploy/helm/aiops/values.yaml`
@@ -587,8 +594,8 @@ git commit -m "feat(platform): fail closed production dependencies"
 
 **Interfaces:**
 - Consumes: production dependencies, Phase 1–5 real repositories/services/workflows/Gateway/runners and image lock.
-- Produces: eight runnable roles, complete read-only Helm foundation and the reusable real-dependency reference stack required by Packs 02–06.
-- Safety: chart rendering and Go architecture tests prove the observed WRITE set exactly equals the accepted Action manifest and that no READ-owned boundary is weakened；the Phase 6 manifest is empty.
+- Produces: eight runnable roles, one content-addressed Control Plane Web/API image, complete read-only Helm foundation and the reusable real-dependency reference stack required by Packs 02–06.
+- Safety: chart rendering and Go architecture tests prove the observed WRITE set exactly equals the accepted Action manifest and that no READ-owned boundary is weakened；the Phase 6 manifest is empty。Image contract tests prove `/opt/aiops/web` and the Go binary are present while Node、pnpm、MSW、Service Worker、source map、frontend source and development dependencies are absent。
 
 - [ ] **Step 1: Write failing command/chart boundary tests**
 
@@ -603,15 +610,17 @@ func TestPhaseOwnershipAllowsPhaseSevenOnlyAdditiveWriteTemplates(t *testing.T)
 func TestProductionFoundationPinsKubernetes136AndEveryDependencyImage(t *testing.T)
 func TestProductionFoundationScriptsHaveTimeoutCleanupAndSecretGuards(t *testing.T)
 func TestProductionAWXEnrollmentDependenciesAreExactHAAndFailClosed(t *testing.T)
+func TestControlPlaneImagePackagesGoAndWebWithoutNodeRuntime(t *testing.T)
+func TestRenderedChartHasNoIndependentWebImageWorkloadServiceOrIdentity(t *testing.T)
 ```
 
 - [ ] **Step 2: Run tests and verify failure**
 
 ```bash
-go test ./cmd/... ./deploy/helm/aiops ./test/production -run 'Test(EveryProduction|ProductionCommands|RenderedChart|PhaseOwnership|ProductionFoundation)' -count=1
+go test ./cmd/... ./deploy/helm/aiops ./test/production -run 'Test(EveryProduction|ProductionCommands|RenderedChart|PhaseOwnership|ProductionFoundation|ControlPlaneImage)' -count=1
 ```
 
-Expected: FAIL because role binaries/chart foundation are incomplete.
+Expected: FAIL because role binaries/chart foundation and the packaged Control Plane Web/API image are incomplete.
 
 - [ ] **Step 3: Wire each command through one production builder**
 
@@ -619,13 +628,15 @@ Each `main` parses only `--config-fd`, loads/validates role, calls `productionas
 
 `productionassembly.Build` reads the accepted Phase 1–5 revision/digest tuple from each phase's authoritative repository/service, recomputes the closure and binds it into the Platform revision. Missing、rejected、superseded、expired or mismatched input returns a typed startup error before readiness；this runtime check is deliberately separate from the schema-only migration prerequisite.
 
+The Control Plane Dockerfile has three fixed stages: Node 24 with Corepack/pnpm 10.34.0 performs a frozen-lockfile install, generated-API drift check, typecheck/test/build；Go 1.26.5 builds the Control Plane binary；the final distroless-equivalent non-root image copies only the binary and verified `web/dist` to `/opt/aiops/web`. Build labels and `deploy/images.lock` bind source commit、OpenAPI contract digest、Web bundle digest and Go binary digest into the single Control Plane image digest. No independent Web image is produced.
+
 - [ ] **Step 4: Implement locked Helm values/schema and workload templates**
 
-Values schema requires digest image refs、replica min/max、resource requests/limits、topology keys、Realm refs、public dependency refs and FD mounts. It rejects secret values, raw env arrays, arbitrary command/args, extra containers/volumes, host aliases and every undeclared key. The Phase 6 schema exposes READ fields only；Phase 7 may modify it solely by adding closed WRITE/Action branches tied to accepted Action types, while Phase 6 values continue to render no WRITE resource. Templates use non-root UID, read-only root FS, seccomp RuntimeDefault, drop ALL capabilities, no privilege escalation, automount token false plus audience-bound projected token where Vault auth is required.
+Values schema requires digest image refs、replica min/max、resource requests/limits、topology keys、Realm refs、public dependency refs and FD mounts. It rejects secret values, raw env arrays, arbitrary command/args, extra containers/volumes, host aliases and every undeclared key. `images.controlPlane` is the sole Web/API artifact；schema and render tests reject `images.web`、Web Deployment/Service/ServiceAccount、Node sidecar and a second ingress origin. The Phase 6 schema exposes READ fields only；Phase 7 may modify it solely by adding closed WRITE/Action branches tied to accepted Action types, while Phase 6 values continue to render no WRITE resource. Templates use non-root UID, read-only root FS, seccomp RuntimeDefault, drop ALL capabilities, no privilege escalation, automount token false plus audience-bound projected token where Vault auth is required.
 
 - [ ] **Step 5: Add PDB/HPA/spread and services**
 
-Control Plane/Gateway minimum 3 and PDB 2；Worker minimum 3/PDB 2；Outbox/Scheduler/Discovery/Validation/READ minimum 2/PDB 1. Every Deployment spreads over zone and hostname with maxSkew 1, RollingUpdate maxUnavailable 0/maxSurge 1, readiness gate and preStop drain. Only Control Plane and Gateway have Services；Gateway service is cluster-internal mTLS.
+Control Plane/Gateway minimum 3 and PDB 2；Worker minimum 3/PDB 2；Outbox/Scheduler/Discovery/Validation/READ minimum 2/PDB 1. Every Deployment spreads over zone and hostname with maxSkew 1, RollingUpdate maxUnavailable 0/maxSurge 1, readiness gate and preStop drain. Only Control Plane and Gateway have Services；the Control Plane Service exposes same-origin SPA and `/api/*`, while Gateway service is cluster-internal mTLS. Control Plane readiness verifies the binary plus `/opt/aiops/web/index.html`/asset manifest before admitting traffic；missing or mismatched static artifacts fail closed.
 
 - [ ] **Step 6: Create the reusable real-dependency reference foundation**
 
@@ -638,14 +649,16 @@ helm lint deploy/helm/aiops
 helm template aiops deploy/helm/aiops -f deploy/helm/aiops/values.yaml > /tmp/aiops-rendered.yaml
 go test -race ./cmd/... ./deploy/helm/aiops ./test/production -run 'Test(EveryProduction|ProductionCommands|RenderedChart|PhaseOwnership|ProductionFoundation)' -count=1
 go build ./cmd/control-plane ./cmd/worker ./cmd/outbox-dispatcher ./cmd/scheduler ./cmd/discovery-worker ./cmd/runner-gateway ./cmd/validation-runner ./cmd/read-runner
+docker build --file build/package/control-plane/Dockerfile --tag aiops/control-plane:phase6 .
+go test ./test/production -run 'TestControlPlaneImage|TestRenderedChartHasNoIndependentWeb' -count=1
 ```
 
-Expected: all commands exit 0；the Phase 6 render contains eight non-WRITE roles and an empty WRITE manifest, with all images matching the lock. The test remains valid after Phase 7 by comparing successor resources with its accepted manifest rather than banning registered WRITE names globally.
+Expected: all commands exit 0；the Phase 6 render contains eight non-WRITE roles and an empty WRITE manifest, with all images matching the lock. The Control Plane image contains the Go binary and `/opt/aiops/web`, contains no Node runtime/test-only frontend artifact, and is the only Web/API workload. The test remains valid after Phase 7 by comparing successor resources with its accepted manifest rather than banning registered WRITE names globally.
 
 - [ ] **Step 8: Commit production commands/chart and reference foundation**
 
 ```bash
-git add cmd/control-plane cmd/worker cmd/outbox-dispatcher cmd/scheduler cmd/discovery-worker cmd/runner-gateway cmd/validation-runner cmd/read-runner deploy/images.lock deploy/helm/aiops test/production
+git add cmd/control-plane cmd/worker cmd/outbox-dispatcher cmd/scheduler cmd/discovery-worker cmd/runner-gateway cmd/validation-runner cmd/read-runner build/package/control-plane/Dockerfile deploy/images.lock deploy/helm/aiops test/production
 git commit -m "feat(platform): assemble production read platform"
 ```
 
@@ -659,4 +672,4 @@ helm lint deploy/helm/aiops
 git diff --check
 ```
 
-Expected: all commands exit 0；`000020` facts scoped/immutable, production dependencies fail closed, eight non-WRITE roles and complete Phase 6 chart exist, WRITE remains absent.
+Expected: all commands exit 0；`000020` facts scoped/immutable, production dependencies fail closed, eight non-WRITE roles and complete Phase 6 chart exist, the single Control Plane image serves same-origin Web/API without a production Node runtime, and WRITE remains absent.

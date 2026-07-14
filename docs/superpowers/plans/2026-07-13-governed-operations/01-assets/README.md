@@ -2,14 +2,14 @@
 
 本目录把 Phase 1 拆成 11 个可独立执行、审查和提交的生产任务包。它是[受治理运维能力总计划](../../2026-07-13-governed-operations-program.md)的第一阶段，产品、安全和前端语义以[已确认设计规范](../../../specs/2026-07-13-operational-assets-controlled-access-design.md)为准。
 
-本阶段的终点不是枚举、假 Provider、静态页面或 Demo：它建立十表 PostgreSQL 事实（含不可变 Source Revision 权限 Environment 子表）、不可变 Source Revision、真实 CSV/API/CMDB/vSphere/Proxmox/OpenStack/AWS/Azure/GCP 协议适配、独立 Discovery Worker、HA lease/fence、加密 checkpoint、持久背压、逐 Provider gate、真实 OIDC/OpenAPI 前端和 Overview。它仍不开放目标系统写操作；项目最终通过 Phase 7/8 的不可变 ActionPlan、策略、重新认证、人工审批、短凭据、类型化执行、独立验证、对账/回滚/升级与审计形成生产闭环。
+本阶段的终点不是枚举、假 Provider、静态页面或 Demo：它建立十表 PostgreSQL 事实（含不可变 Source Revision 权限 Environment 子表）、不可变 Source Revision、真实 CSV/API/CMDB/vSphere/Proxmox/OpenStack/AWS/Azure/GCP 协议适配、独立 Discovery Worker、HA lease/fence、加密 checkpoint、持久背压、逐 Provider gate，以及真实 OIDC/OpenAPI、Go 同源 SPA、类型化应用平台和 Overview。它仍不开放目标系统写操作；项目最终通过 Phase 7/8 的不可变 ActionPlan、策略、重新认证、人工审批、短凭据、类型化执行、独立验证、对账/回滚/升级与审计形成生产闭环。
 
 ## 固定执行顺序
 
 1. [01-schema-domain.md](./01-schema-domain.md) — 创建 `000015_assets_catalog` 十张表、Source Revision 权限 Environment/Run/Fence/Checkpoint 约束与稳定领域接口。
 2. [02-repository-discovery.md](./02-repository-discovery.md) — 实现 Scope Repository、append-only Observation、provenance、tombstone/恢复和原子 checkpoint 投影。
-3. [03-mapping-auth-api.md](./03-mapping-auth-api.md) — 实现关系/冲突/Service Binding、OIDC 授权、OpenAPI/HTTP 基线和真实 Control Plane 装配。
-4. [04-web-foundation-assets.md](./04-web-foundation-assets.md) — 建立唯一 `web/`、真实浏览器 OIDC、壳层、资产/映射/来源基线和持久前端 Foundation 规范。
+3. [03-mapping-auth-api.md](./03-mapping-auth-api.md) — 实现关系/冲突/Service Binding、Browser/API OIDC 边界、runtime Browser Config、OpenAPI/HTTP 基线和真实 Control Plane 装配。
+4. [04-web-foundation-assets.md](./04-web-foundation-assets.md) — 建立唯一 `web/`、`app → features → shared`、真实浏览器 OIDC、typed API/shared Operation/治理 UI、Go SPA、资产/映射/来源基线和持久前端 Foundation 规范。
 5. [05-source-ingestion-csv-api.md](./05-source-ingestion-csv-api.md) — 实现 Source `draft→canonical revision→validate→publish/disable→sync`、权限/OpenAPI/effective_actions、CSV 与 mTLS API ingestion、六步 Source 向导。
 6. [06-source-external-cmdb.md](./06-source-external-cmdb.md) — 实现固定 External CMDB Catalog v1 协议、增量资产/关系、负向测试与独立 gate。
 7. [07-source-vsphere.md](./07-source-vsphere.md) — 实现 govmomi SOAP/PropertyCollector 全量+增量库存、删除/恢复、非生产 vCenter canary 和 gate。
@@ -33,8 +33,8 @@
 - 稳定 `asset_sources` + append-only/content-addressed `asset_source_revisions`，以及 fenced Run、encrypted checkpoint、Observation/provenance、Asset/Conflict/Relationship/Binding 事实。
 - `source_revision` 唯一表示 Source definition revision；Provider 事实新鲜度用 profile-locked `FreshnessCandidate` 与 append-only Observation chain 持久，不同 Run 可追加同一未变事实，同 Run 漂移重放、时间/序列回退或碰撞整页关闭。
 - `SourceRevisionRepository`、`discoverysource.Provider`、`discoveryqueue.Queue`、`discoveryworker.Worker` 和真实 `cmd/discovery-worker`。
-- 严格 Control Plane OpenAPI、`ASSET_*`/`ASSET_SOURCE_*` 权限、`effective_actions`、签名 Cursor、ETag/Idempotency/RFC 9457 和唯一生成 TypeScript 契约。
-- 唯一 `web/` 壳层、`/overview`、`/assets`、`/asset-mappings`、`/asset-sources` 与 Source revision wizard；持久设计文档 `foundation-assets.md`、`asset-sources.md`、`overview.md`。
+- 严格 Control Plane OpenAPI、no-store closed-schema `GET /api/v1/browser-config`、`ASSET_*`/`ASSET_SOURCE_*` 权限、`effective_actions`、签名 Cursor、ETag/Idempotency/RFC 9457 和唯一生成 TypeScript 契约。
+- 唯一 `web/` 壳层和 `app → features → shared` 模块边界、仅 `shared/api` 的类型化 transport、共享 Operation/治理 UI、Scope-aware 状态所有权、Go 同源 SPA，以及 `/overview`、`/assets`、`/asset-mappings`、`/asset-sources` 与 Source revision wizard；持久设计文档 `foundation-assets.md`、`asset-sources.md`、`overview.md`。
 - 逐 Provider 正向/负向/真实协议/非生产 canary/HA/DLP/rate-limit/checkpoint/delete-recovery 证据和独立 `AVAILABLE` gate。
 - Phase 2 可消费的 exact Asset/Source identity、Scope、lifecycle、mapping、published Source revision 和前端/API 扩展入口。
 
@@ -47,9 +47,11 @@
 | 迁移 | `000015_assets_catalog` |
 | 表归属 | `asset_sources`、`asset_source_revisions`、`asset_source_revision_authorities`、`asset_source_runs`、`asset_observations`、`assets`、`asset_type_details`、`asset_conflicts`、`asset_relationships`、`service_asset_bindings` |
 | 去重键 | `(tenant_id,workspace_id,source_id,provider_kind,external_id)` |
-| 前端 | `web/`；Node 24、pnpm 10.34.0、React 19.2.7、TypeScript 7.0.2、lucide-react 1.24.0 |
-| OIDC | Keycloak Server 26.6.3；`keycloak-js` 26.2.4；Authorization Code + PKCE、`login-required`、Token 仅内存 |
-| 契约 | `api/openapi/control-plane-v1.yaml` → `web/src/shared/api/schema.d.ts` |
+| 前端 | `web/`；Node 24、pnpm 10.34.0、React 19.2.7、TypeScript 7.0.2、Vite 8.1.4、TanStack Router/Query/Table、RHF/Zod、Radix、lucide-react、CSS Modules |
+| OIDC | Keycloak Server 26.6.3；`keycloak-js` 26.2.4；Browser client `control-plane-web`、API audience `aiops-control-plane`；Authorization Code + PKCE、`login-required`、Token 仅内存 |
+| Browser Config | 匿名 `GET /api/v1/browser-config`；closed schema + `no-store`；只含公开 OIDC、API base path 和 build metadata；缺失/畸形 fail closed |
+| 契约 | `api/openapi/control-plane-v1.yaml` → `web/src/shared/api/schema.d.ts`；仅 `shared/api` 发网络请求并使用 generated `paths/operations` |
+| 生产拓扑 | Go 同一进程/Origin 服务 API 与 `/opt/aiops/web`；单 Control Plane 镜像，无 Node/Vite server、独立 Web workload、Next/Remix/BFF/微前端 |
 | 生产状态 | PostgreSQL + 真实 OIDC + 真实 Discovery Worker/Provider；fake/MSW 仅测试 |
 
 `Source Revision` 内容在创建后不可修改；成功路径固定为 `DRAFT → VALIDATING → VALIDATED → PUBLISHED → SUPERSEDED`，失败路径为 `VALIDATING → REJECTED`，同一不可变内容可通过新的 Validation Run 重新进入 `VALIDATING`，但 `REJECTED` 不能直接发布。Source 可用需 exact `ACTIVE + PUBLISHED + AVAILABLE`；Asset 进入运行还需 `EXACT + ACTIVE`。来源 gate、Asset lifecycle、Connection publication 和 Capability availability 不得相互代替。
@@ -96,9 +98,12 @@ Phase 1 只有在以下全部成立时才可记录 `ASSET_CONTROL_PLANE_ACCEPTED
 - 11 个任务包的 checkbox 和 commit 边界全部完成；不得先标记状态再补 Provider。
 - PostgreSQL 18.4 的十表迁移、跨 Scope FK、Source Revision/authority membership 不可变与唯一发布、checkpoint/fence、并发/幂等、Outbox/Audit、备份恢复和应用回滚通过。
 - Source 六步向导、`ASSET_SOURCE_*` 权限、OpenAPI 严格 Schema、ETag/Idempotency/reauth、`effective_actions` 与唯一生成类型通过。
+- Browser Config 无 Secret/私有 Endpoint 且 malformed fail closed；浏览器/API OIDC `iss/aud/azp/auth_time` 分别验证，生产不依赖 `VITE_OIDC_*` 注入身份配置。
 - CSV/API/CMDB/vSphere/Proxmox/OpenStack/AWS/Azure/GCP 均有真实 protocol serialization、negative/DLP/provenance、incremental checkpoint、soft delete/recovery、rate/backpressure、credential cleanup、两副本 HA/fence 与非生产 canary 签名证据。
 - `cmd/discovery-worker` 生产构造器仅使用真实 PostgreSQL、workload identity、secure profile/credential resolver、checkpoint keyring 和 Provider registry；任一依赖缺失 fail closed。
 - `/overview` 和资产/映射/来源页在 1440/1024/390、键盘、axe、真实 Keycloak/PostgreSQL E2E 通过；未实现后续能力显示 `NOT_STARTED/UNAVAILABLE`，无伪绿。
+- 前端静态门证明 `app → features → shared`、仅 `shared/api` 网络访问、generated contract 无漂移、Scope 切换清理 Query；治理 mutation 不 optimistic/自动重试，公共治理组件由各 feature 复用。
+- 生产 Web E2E 从 Go 同源入口加载；`/api/*`/health/readiness 不被 SPA fallback，最终 Control Plane 产物从 `/opt/aiops/web` 服务且无 Node/Vite/MSW/source map/独立 BFF 运行时。
 - `docs/design/frontend/foundation-assets.md`、`asset-sources.md`、`overview.md` 、V4、ADR、Runbook、OpenAPI、status 和 AGENTS 已持久化、链接可达且无平行事实源。
 - secret/DLP、生成类型漂移、代码围栏、本地链接、不完整标记、`git diff --check`、Go/race/vet/build、Web/E2E 和恢复门全部通过。
 
@@ -110,14 +115,19 @@ Phase 1 只有在以下全部成立时才可记录 `ASSET_CONTROL_PLANE_ACCEPTED
 |---|---|
 | Router / Navigation | `web/src/app/router.tsx` / `web/src/app/navigation.ts` |
 | Scope | `workspace`、`environment` 位于 validated URL search；刷新/后退/分享恢复相同安全投影 |
+| 模块边界 | `app → features → shared`；feature 不直接导入其他 feature UI，跨域只传 typed route/稳定 ID；ESLint 强制 |
+| 状态所有权 | URL=Scope/筛选/排序/Cursor/Tab/selection/Operation ID；TanStack Query=Scope-keyed server state；RHF+Zod=form；local React=短期 UI；无 Redux/Zustand |
 | Assets | `web/src/features/assets/AssetCatalogPage.tsx`、`AssetDetailPage.tsx` |
 | Sources | `web/src/features/asset-sources/`；修订向导与 run timeline 不另建工程 |
 | Overview | `web/src/features/overview/OverviewPage.tsx` |
-| Browser auth | `web/src/app/auth/keycloak.ts`；Token 仅内存，high-risk 使用 `reauthenticate(returnURL)` |
-| API | `control-plane-v1.yaml` → `schema.d.ts`；禁止手写重复 DTO |
+| Browser config/auth | 启动先读取 `/api/v1/browser-config`，再由 `web/src/app/auth/keycloak.ts` 初始化；Token 仅内存，high-risk 使用 `reauthenticate(returnURL)` |
+| API | `control-plane-v1.yaml` → `schema.d.ts`；低层 transport 私有且仅 `shared/api` 可访问网络，禁止字符串泛型 path/direct fetch/手写 DTO |
+| Shared operation/UI | Phase 1 建立共享 Operation query/polling 和 `DataTable`、`ProblemPanel`、`OperationTimeline`、`EffectiveActionGate`、`ETagConflictReview`、`ReauthBoundary`；后续只扩展 |
+| Mutation | 服务端确认；无 optimistic update、自动重试或副作用重放；统一 Idempotency-Key、ETag/If-Match、reauth、durable Operation |
+| 生产服务 | Vite 仅开发/构建；Go 从 `/opt/aiops/web` 同源服务 SPA/API，静态缺失 readiness fail closed；无独立 Node/Web/BFF |
 | 持久设计 | `foundation-assets.md`、`asset-sources.md`、`overview.md` |
 
-后续阶段不得重新定义 220px 导航、46px Scope bar、4–6px 圆角、Phase 1 semantic tokens、OIDC 生命周期、URL Scope 语义，也不得建立聊天/终端/AI 隐喻的平行 UI。
+后续阶段不得重新定义 220px 导航、46px Scope bar、4–6px 圆角、Phase 1 semantic tokens、OIDC 生命周期、URL/Query 状态语义、API transport 或 Operation/UI primitives，也不得建立聊天/终端/AI 隐喻的平行 UI。智能体验只通过 Investigation、Evidence、ActionProposal、ActionPlan、Operation、Receipt 和 Audit 呈现。
 
 ## 工作区注意
 

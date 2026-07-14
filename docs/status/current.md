@@ -42,6 +42,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 - 小文档入口：[Governed Operations Production Program](../superpowers/plans/2026-07-13-governed-operations/README.md)
 - 覆盖追踪：[规范到实施计划覆盖矩阵](../superpowers/plans/2026-07-13-governed-operations/coverage-matrix.md)
 - 版本基线：[生产规划版本基线](../superpowers/plans/2026-07-13-governed-operations/version-baseline.md)
+- 前端应用平台架构已纳入确认规划：唯一 `web/` 采用 React 19 + TypeScript 7 + Vite 8 + TanStack，固定 `app → features → shared`、OpenAPI 唯一 DTO、服务端 `effective_actions`、Go 同源 SPA/API 与单 Control Plane 镜像 `/opt/aiops/web`；智能体验只通过 Evidence/Proposal/ActionPlan/Operation/Audit 受治理链呈现。该项仍是规划事实，`web/` 与新 React 业务实现继续为 `NOT_STARTED`。
 - Phase 5 已确认但尚未实施的安全契约：[AWX Host Identity Enrollment](../contracts/awx-host-identity-enrollment-v1.md)、[AWX Governed Launch Admission](../contracts/awx-governed-launch-admission-v1.md)、[Host Identity Attestor](../contracts/host-identity-attestor-v1.md)。它们只修正后继阶段接口，Host/AWX/PostgreSQL 实现仍为 `NOT_STARTED`。
 
 实施阶段固定为：
@@ -83,7 +84,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | HA 生产只读路径 | NOT_STARTED | 等待 Phase 6 |
 | 四类初始受治理生产 Action | CLOSED | 等待 Phase 7 逐类型演练与 Canary |
 | 生产发布与持续运维 | NOT_STARTED | 等待 Phase 8 |
-| 新 React 前端 | NOT_STARTED | Phase 1 建骨架，此后随各阶段纵向交付 |
+| 新 React 前端 | NOT_STARTED | 前端应用平台架构已纳入确认规划；`web/` 与业务实现尚未开始，Phase 1 建骨架，此后随各阶段纵向交付 |
 
 ## 已知基线注意事项
 

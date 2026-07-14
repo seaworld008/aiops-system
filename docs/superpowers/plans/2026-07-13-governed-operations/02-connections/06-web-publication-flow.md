@@ -4,7 +4,7 @@
 
 **Goal:** 交付生产级 Connections 列表、详情、修订和六步验证/发布体验，让授权用户在不接触凭据材料的前提下完成可恢复的 Runtime 发布。
 
-**Architecture:** OpenAPI 生成类型是唯一前端契约；TanStack Router 保存 Scope/filter/selection/wizard/Operation URL 状态，TanStack Query 保存 server state；React Hook Form + Zod 驱动 Provider 判别表单；MSW 只服务测试和本地 UI 测试，不是生产 fallback。
+**Architecture:** OpenAPI 生成类型是唯一前端契约；Connection adapter 只通过 Phase 1 `web/src/shared/api` 的 method/path/operation 类型化 transport 访问同源 API，并复用 `web/src/shared/operations` 的 Operation 投影与轮询 Hook。TanStack Router 保存 Scope/filter/selection/wizard/Operation URL 状态，TanStack Query 保存 server state；React Hook Form + Zod 驱动 Provider 判别表单；MSW 只服务测试和本地 UI 测试，不是生产 fallback。
 
 **Tech Stack:** Node 24、pnpm 10.34.0、React 19.2.7、Vite 8.1.4、TypeScript 7.0.2、TanStack Router 1.170.17、Query 5.101.2、Table 8.21.3、React Hook Form 7.81.0、Zod 4.4.3、radix-ui 1.6.2、lucide-react 1.24.0、CSS Variables/CSS Modules、openapi-typescript 7.13.0、Vitest 4.1.10、Testing Library React 16.3.2、MSW 2.15.0。
 
@@ -12,6 +12,7 @@
 
 - 每个 Task 严格采用 Red → Green → Refactor：先运行并保存预期失败，再做最小生产实现，复跑指定测试后才允许重构和提交。
 - Production build 只调用真实同源 Control Plane API 并使用真实 OIDC session；MSW 只能由 Vitest、Playwright mock project 或显式开发模式加载。
+- Feature 代码不得直接 `fetch`、另建 HTTP client 或复制 Operation polling；只能消费 Phase 1 类型化 `shared/api` transport 与共享 Operation Hook，本阶段只增加 Connection terminal-state mapping 和 query invalidation。
 - 前端不得请求、输入、缓存、展示或记录 secret、token、password、private key、CA PEM、DSN、Vault path；只选择 `CredentialReference` 安全投影。
 - UI 不合并 Connection status、validation status、health status 和 Runtime rollout status；四者分别显示。
 - 所有 mutation 使用 caller-generated 16–128-byte Idempotency-Key；revision/validate/publish/revoke 发送精确 `If-Match`。
@@ -85,15 +86,16 @@ Frontend scripts remain the Phase 1 definitions；the drift check generates into
 - Create: `web/src/features/connections/api/connectionApi.ts`
 - Create: `web/src/features/connections/api/connectionApi.test.ts`
 - Create: `web/src/features/connections/model/connectionKeys.ts`
-- Create: `web/src/features/operations/model/useOperation.ts`
-- Create: `web/src/features/operations/model/useOperation.test.tsx`
+- Modify: `web/src/shared/api/operation.ts`
+- Modify: `web/src/shared/operations/useOperation.ts`
+- Modify: `web/src/shared/operations/useOperation.test.tsx`
 - Modify: `web/src/test/msw/fixtures.ts`
 - Modify: `web/src/test/msw/handlers.ts`
 - Modify: `web/src/test/msw/server.ts`
 
 **Interfaces:**
-- Consumes: package 05 OpenAPI operation IDs；`controlPlaneClient.request<T>`；current Workspace/Environment route context。
-- Produces: typed queries/mutations for Connections、Credential References、Capabilities、Runner Realms、Runtime Publications and Operations；stable query keys；terminal-aware polling。
+- Consumes: package 05 OpenAPI operation IDs；Phase 1 `shared/api` 中由 generated `paths`/`operations` 约束 method、path、parameters、body 与 response 的 `controlPlaneClient`；Phase 1 共享 Operation projection/Hook；current Workspace/Environment route context。
+- Produces: typed queries/mutations for Connections、Credential References、Capabilities、Runner Realms and Runtime Publications；stable scoped query keys；Connection-specific terminal-state mapping and invalidation。不得产生第二个 Operation DTO、transport 或 polling implementation。
 
 OpenAPI `operationId` names are fixed:
 
@@ -151,14 +153,14 @@ describe("connectionApi", () => {
 });
 ```
 
-`useOperation.test.tsx` proves QUEUED→RUNNING→SUCCEEDED polling, terminal stop, retry cap 3, URL reload recovery, and detail/runtime invalidation.
+扩展 Phase 1 `useOperation.test.tsx`，证明 QUEUED→RUNNING→SUCCEEDED polling、terminal stop、visibility/focus-aware pause、`Retry-After`/bounded backoff、URL reload recovery，以及 Connection detail/runtime invalidation；不得让 mutation 或 terminal failure 自动重放。
 
 - [ ] **Step 2: Verify failure**
 
 Run:
 
 ```bash
-corepack pnpm@10.34.0 --dir web test -- src/features/connections/api/connectionApi.test.ts src/features/operations/model/useOperation.test.tsx
+corepack pnpm@10.34.0 --dir web test -- src/features/connections/api/connectionApi.test.ts src/shared/operations/useOperation.test.tsx
 ```
 
 Expected: FAIL because generated operations and data layer do not exist.
@@ -175,16 +177,14 @@ export const connectionKeys = {
     [...connectionKeys.all(scope), "detail", connectionId] as const,
   revision: (scope: ScopeKey, connectionId: string, revision: number) =>
     [...connectionKeys.detail(scope, connectionId), "revision", revision] as const,
-  operation: (scope: ScopeKey, operationId: string) =>
-    ["operations", scope.workspaceId, scope.environmentId, operationId] as const,
 };
 ```
 
-All response/body types are extracted from generated `components`/`operations`. Functions implement list/get/create/revision/validate/publish/revoke and all supporting reference/runtime reads. Request bodies and Authorization are never logged. Mutations take Idempotency-Key explicitly.
+Operation queries use the Phase 1 shared `operationKeys`；Connection keys must not create an `operations` namespace. All response/body types are extracted from generated `paths`/`operations`；feature adapter 不能以无类型的 path-only generic request、手写 DTO 或类型断言绕过 method/path/response 约束。Functions implement list/get/create/revision/validate/publish/revoke and all supporting reference/runtime reads. Request bodies and Authorization are never logged. Mutations take Idempotency-Key explicitly and are never optimistically applied or automatically retried.
 
 - [ ] **Step 4: Implement Operation recovery and deterministic MSW**
 
-`useOperation` polls every 1 second only for `QUEUED|RUNNING` and stops at `SUCCEEDED|FAILED|CANCELLED|EXPIRED`. Operation ID lives in route search and is removed after terminal state plus query invalidation.
+The Phase 1 shared `useOperation` owns polling for `QUEUED|RUNNING`, stops at `SUCCEEDED|FAILED|CANCELLED|EXPIRED`, respects document visibility/focus and server `Retry-After`, and caps transport backoff without replaying a mutation. This task only registers Connection terminal-state mapping and invalidation. Operation ID lives in route search and is removed after terminal state plus query invalidation.
 
 Fixtures use documented UUIDs and fixed `2026-07-13T00:00:00Z`. Credential fixtures always set `redacted: true` and contain no forbidden key. Handlers assert Scope, `If-Match`, Idempotency-Key, cursor and limit; unknown requests fail with `onUnhandledRequest: "error"`. A 412 handler returns current ETag and safe `VERSION_CONFLICT` only.
 
@@ -197,7 +197,7 @@ corepack pnpm@10.34.0 --dir web generate:api
 corepack pnpm@10.34.0 --dir web generate:api:check
 corepack pnpm@10.34.0 --dir web typecheck
 corepack pnpm@10.34.0 --dir web lint
-corepack pnpm@10.34.0 --dir web test -- src/features/connections/api/connectionApi.test.ts src/features/operations/model/useOperation.test.tsx
+corepack pnpm@10.34.0 --dir web test -- src/features/connections/api/connectionApi.test.ts src/shared/operations/useOperation.test.tsx
 ```
 
 Expected: all PASS；generated diff clean；MSW has no unhandled request；terminal Operation stops polling.
@@ -205,7 +205,7 @@ Expected: all PASS；generated diff clean；MSW has no unhandled request；termi
 - [ ] **Step 6: Commit**
 
 ```bash
-git add api/openapi/control-plane-v1.yaml web/src/shared/api/schema.d.ts web/src/features/connections/api web/src/features/connections/model web/src/features/operations web/src/test/msw
+git add api/openapi/control-plane-v1.yaml web/src/shared/api/schema.d.ts web/src/shared/api/operation.ts web/src/shared/operations web/src/features/connections/api web/src/features/connections/model web/src/test/msw
 git commit -m "feat: add typed connection publication client"
 ```
 

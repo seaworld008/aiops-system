@@ -25,7 +25,8 @@
 - Documentation cannot claim approved production READ until the decision row, evidence-set digest and actual commands exist.
 - Final approval is Phase 7 input；WRITE claim/credential/Runner/Action remains unavailable and deployment absent.
 - ADR fixed path `docs/adr/0009-production-read-platform.md`；do not reuse another number.
-- Frontend E2E uses production build and real Keycloak；route interception permits only observation/security assertions, never response mocking.
+- Frontend E2E uses the packaged Control Plane image through the test TLS ingress and real Keycloak；it never starts Vite、`vite preview` or an ad-hoc `web/dist` server. Route interception permits only observation/security assertions, never response mocking.
+- Rolling verification keeps N and N-1 browser/API contracts compatible. If a stale browser cannot load a hashed chunk, it must disable high-risk mutations, show a persistent safe-reload prompt and never automatically replay a mutation.
 - CI Phase 6 jobs cannot use `continue-on-error` or skip because Docker/Kubernetes is absent on required runner.
 - 新增行为严格 TDD，每个 Task 独立 commit。
 
@@ -52,6 +53,7 @@
 - Modify: `test/production/bootstrap-keycloak.sh`
 - Modify: `test/production/bootstrap-vault.sh`
 - Modify: `test/production/stack_contract_test.go`
+- Modify: `test/production/control_plane_image_contract_test.go`
 
 **Interfaces:**
 - Consumes: locked images, Phase 6 Helm chart, migrations 000001..000020 and test-only target seed manifests.
@@ -66,6 +68,8 @@ func TestProductionStackHasThreeZonesAndRequiredReplicaPDBHPA(t *testing.T)
 func TestProductionStackUsesRealPostgresTemporalKeycloakVaultAndObjectStore(t *testing.T)
 func TestProductionStackHasDistinctServiceAccountsAndDefaultDeny(t *testing.T)
 func TestProductionStackContainsNoFakeMemoryMSWLoopbackDevModeOrUnauthorizedWriteWorkload(t *testing.T)
+func TestProductionStackUsesSinglePackagedControlPlaneWebAPIImage(t *testing.T)
+func TestControlPlaneImageContainsNoNodePnpmMSWServiceWorkerOrSourceMap(t *testing.T)
 func TestProductionScriptsHaveTimeoutCleanupAndSensitiveOutputGuards(t *testing.T)
 func TestProductionStackAndDeployImageLocksMatch(t *testing.T)
 ```
@@ -73,20 +77,20 @@ func TestProductionStackAndDeployImageLocksMatch(t *testing.T)
 - [ ] **Step 2: Run stack tests and verify failure**
 
 ```bash
-go test ./test/production -run 'TestProduction' -count=1
+go test ./test/production -run 'Test(Production|ControlPlaneImage)' -count=1
 ```
 
 Expected: FAIL because the Pack 01 foundation does not yet include every final E2E fixture, bootstrap revocation assertion and full-stack readiness check.
 
 - [ ] **Step 3: Extend the deterministic stack setup for final E2E**
 
-`up.sh` verifies Docker/Kind/kubectl/Helm/Go/Node24/pnpm10 and lock digests；creates one control-plane + three zone-labeled workers；installs real HA PostgreSQL with WAL archive, Temporal persistence/visibility, Keycloak Server 26.6.3 production TLS, Vault 3-node Raft auto-unseal test KMS/PKI, versioned locked object store, OTel/Prometheus/Alertmanager/Grafana；then applies test targets and Phase 6 chart with required replicas.
+`up.sh` verifies Docker/Kind/kubectl/Helm/Go/Node24/pnpm10 and lock digests；builds/loads the Phase 6 multi-stage Control Plane image whose application payload consists of the Go binary and `/opt/aiops/web` assets；creates one control-plane + three zone-labeled workers；installs real HA PostgreSQL with WAL archive, Temporal persistence/visibility, Keycloak Server 26.6.3 production TLS, Vault 3-node Raft auto-unseal test KMS/PKI, versioned locked object store, OTel/Prometheus/Alertmanager/Grafana；then applies test targets and Phase 6 chart with required replicas. Node/pnpm are host build/test prerequisites only and never exist in the deployed image.
 
 Bootstrap creates Keycloak realm/users/client/MFA fixture and removes admin bootstrap values；configures Vault Kubernetes auth, exact roles/policies/PKI, then revokes bootstrap token. Seed jobs write deterministic Metrics/Logs/Traces/PostgreSQL/Host fixture data from a separate namespace and terminate before READ Realm policies activate.
 
 - [ ] **Step 4: Implement readiness and safe state output**
 
-Wait for database replication/WAL archive, Temporal namespace/task queue, Keycloak OIDC discovery/login, Vault seal/PKI, object lock, monitoring scrape, migrations, platform revision APPLIED and all application replica readiness. `.state/reference.json` has public TLS host aliases, Scope/Platform IDs/digests and test user alias；password/token/cookie/DSN/Vault path excluded.
+Wait for database replication/WAL archive, Temporal namespace/task queue, Keycloak OIDC discovery/login, Vault seal/PKI, object lock, monitoring scrape, migrations, platform revision APPLIED and all application replica readiness. Control Plane readiness additionally verifies its packaged `/opt/aiops/web` index/asset manifest and public `/api/v1/browser-config`; TLS ingress routes the same origin to the single Control Plane Service. `.state/reference.json` has public TLS host aliases, Scope/Platform IDs/digests and test user alias；password/token/cookie/DSN/Vault path excluded.
 
 - [ ] **Step 5: Bring stack up/down and inspect**
 
@@ -196,7 +200,7 @@ git commit -m "test(platform): verify production read lifecycle"
 - Create: `web/e2e/platform/fixtures.ts`
 
 **Interfaces:**
-- Consumes: production web build, real Keycloak Server 26.6.3/browser keycloak-js 26.2.4 and reference Control Plane APIs.
+- Consumes: immutable packaged Control Plane Web/API image, its exact OpenAPI/Web bundle digests, real Keycloak Server 26.6.3/browser keycloak-js 26.2.4 and TLS-ingress Control Plane origin.
 - Produces: real auth/session/permissions/workflow/viewport/a11y/network-leak evidence.
 - Safety: no API mocking/service-worker interception；HAR/trace/screenshots scanned before artifact upload.
 
@@ -211,6 +215,8 @@ test('renders failure stale unknown and inconclusive as distinct states')
 test('offers only server effective actions and exact three legal decisions')
 test('cannot skip stages or approve when one gate is not pass')
 test('requires typed confirmation and recent authentication for decision')
+test('keeps N and N-1 browser clients compatible with the rolling API')
+test('blocks high-risk mutation and requests safe reload after chunk load failure without replay')
 test('restores URL state and keyboard focus at 1440 1024 and 390')
 test('has no serious axe violations or sensitive network console DOM artifact')
 ```
@@ -225,25 +231,24 @@ Expected: FAIL because real platform browser specs are absent.
 
 - [ ] **Step 3: Configure real production build/auth tests**
 
-Build/serve `web/dist`, navigate TLS ingress, perform Keycloak login/reauth/logout with ephemeral test users. Reject any MSW/service worker, unknown origin, Runner/Temporal/Vault/target request from browser. Capture network/console/storage/cookies and assert token/private fields absent.
+Build the multi-stage Control Plane image once, load/deploy that exact digest through the Phase 6 Helm chart, and navigate its TLS-ingress origin；do not separately serve `web/dist`. Perform Keycloak login/reauth/logout with ephemeral test users and verify `/api/v1/browser-config` is closed、public-only and `no-store`. Reject any MSW/service worker、source map、unknown origin、separate Web/BFF endpoint, or Runner/Temporal/Vault/target request from browser. Capture network/console/storage/cookies and assert token/private fields absent.
 
 - [ ] **Step 4: Implement workflow, responsive, visual and axe assertions**
 
-Exercise all routes, URL state, stage timeline/gates, dependency failure, SLO burn, cleanup uncertain, Realm drift, Shadow zero side effect and legal decision state. Visual baselines cover normal/failure/inconclusive/read-only-approved at desktop/tablet/mobile；mask only timestamps/opaque IDs, never safety/gate status.
+Exercise all routes, URL state, stage timeline/gates, dependency failure, SLO burn, cleanup uncertain, Realm drift, Shadow zero side effect and legal decision state. During a rolling N→N+1 upgrade, keep an N browser session active and prove both N and N-1 API contracts remain accepted. Force a stale hashed-chunk load failure and prove all high-risk mutation controls become disabled, a persistent safe-reload prompt appears, and no mutation request is sent or replayed. Visual baselines cover normal/failure/inconclusive/read-only-approved at desktop/tablet/mobile；mask only timestamps/opaque IDs, never safety/gate status.
 
 - [ ] **Step 5: Run real browser E2E**
 
 ```bash
 ./test/production/up.sh
 pnpm --dir web generate:api:check
-pnpm --dir web build
 pnpm --dir web test:e2e -- --grep 'production readiness|production read platform'
 pnpm --dir web test:a11y -- --grep 'production readiness|production read platform'
 go test ./test/e2e/production -run 'TestProductionArtifactsContainNoSensitiveCanaryE2E' -count=1
 ./test/production/down.sh
 ```
 
-Expected: PASS；real Keycloak, no MSW/token leak, all viewports/keyboard/axe/visual stable.
+Expected: PASS；the browser uses the packaged same-origin Control Plane image through TLS ingress, real Keycloak, no separate Web server/MSW/token leak, N/N-1 compatibility holds, chunk failure fails safe, and all viewports/keyboard/axe/visual are stable.
 
 - [ ] **Step 6: Commit browser E2E**
 
@@ -325,7 +330,7 @@ Every runbook contains owner/trigger/impact/safe signals、decision tree、conta
 
 - [ ] **Step 5: Add mandatory CI**
 
-Jobs: Go unit/race/vet/build；000020 real PostgreSQL；Helm render/schema/write-absence；frontend generate/check/unit/build；real dependency/backend E2E；real Keycloak browser/axe/visual；network/identity/DLP/write closure；load/HA/dependency chaos；backup/clean-room/DR smoke；sensitive artifact scan. No `continue-on-error` or required-job skip.
+Jobs: Go unit/race/vet/build；000020 real PostgreSQL；single packaged Control Plane Web/API image build and filesystem contract；Helm render/schema/write-absence；frontend generate/check/unit/build；real dependency/backend E2E；TLS-ingress real Keycloak browser/axe/visual including N/N-1 and chunk-failure safety；network/identity/DLP/write closure；load/HA/dependency chaos；backup/clean-room/DR smoke；sensitive artifact scan. No `continue-on-error` or required-job skip.
 
 - [ ] **Step 6: Run complete final verification**
 
@@ -370,6 +375,7 @@ test "$(rg -c '"Action":"pass".*"Test":"Test(ProductionWriteSurfacesMatchAccepte
 pnpm --dir web generate:api:check
 pnpm --dir web check
 go test ./test/production -run TestProductionStackContainsNoFakeMemoryMSWLoopbackDevModeOrUnauthorizedWriteWorkload -count=1
+go test ./test/production -run 'Test(ProductionStackUsesSinglePackagedControlPlaneWebAPIImage|ControlPlaneImageContainsNoNodePnpmMSWServiceWorkerOrSourceMap)' -count=1
 test -f docs/adr/0009-production-read-platform.md
 git diff --check
 ```

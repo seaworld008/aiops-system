@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Package every production process as an independently scalable, identity-separated, fail-closed Kubernetes workload with reproducible configuration and availability controls.
+**Goal:** Package every production process as an independently scalable, identity-separated, fail-closed Kubernetes workload with reproducible configuration and availability controls while keeping browser UI and API in one Control Plane image、workload、service and origin.
 
-**Architecture:** Harden the Phase 6 Helm chart and the Phase 7 WRITE-only extensions without renaming their files. It renders separate Control Plane, Control Worker, Outbox Dispatcher, Scheduler, Discovery Worker, Runner Gateway, Validation Runner, READ Runner, Action Worker and WRITE Runner workloads. Configuration references externally managed PostgreSQL, Temporal, Keycloak, Vault and PKI services；AWX-enabled release additionally verifies the Phase 5-owned governed AWX/EnrollmentCleanupBroker/L7/host-attestor deployment bundle rather than cloning it into the core chart. NetworkPolicies, ServiceAccounts, PodDisruptionBudgets, topology spread, health probes and explicit resources make the trust boundaries operationally enforceable.
+**Architecture:** Harden the Phase 6 Helm chart and the Phase 7 WRITE-only extensions without renaming their files. It renders separate Control Plane, Control Worker, Outbox Dispatcher, Scheduler, Discovery Worker, Runner Gateway, Validation Runner, READ Runner, Action Worker and WRITE Runner workloads；the Control Plane workload alone serves both packaged `/opt/aiops/web` and `/api/*` through one Service and TLS-ingress origin, with no independent Web image、Deployment、Service、ServiceAccount、Ingress or Node runtime. Configuration references externally managed PostgreSQL, Temporal, Keycloak, Vault and PKI services；AWX-enabled release additionally verifies the Phase 5-owned governed AWX/EnrollmentCleanupBroker/L7/host-attestor deployment bundle rather than cloning it into the core chart。The chart never deploys development dependencies or embeds credentials. NetworkPolicies, ServiceAccounts, PodDisruptionBudgets, topology spread, health probes and explicit resources make the trust boundaries operationally enforceable.
 
 **Tech Stack:** Helm 3, Kubernetes 1.36.2 APIs, OCI images pinned by digest, Go production binaries, Kubernetes NetworkPolicy, Pod Security Standards, workload identity, Prometheus metrics, and `helm-unittest` or server-side dry-run validation.
 
@@ -16,6 +16,7 @@
 - READ, WRITE and Validation Runner identities, queues, namespaces and egress policies remain distinct.
 - Production processes use PostgreSQL/Temporal/Vault/Keycloak/PKI integrations. In-memory repositories, fake issuers, fake identity, test OIDC and loopback Runner transports must fail startup.
 - Every image is immutable by digest. Mutable tags cannot pass values-schema validation or release gates.
+- `images.controlPlane` is the sole browser Web/API artifact；values/schema/templates must reject an `images.web` branch, Web sidecar/workload/service/identity, a second browser origin, Vite production server or Node runtime.
 - WRITE Runner has no direct browser/model ingress and cannot call observability ingestion, arbitrary database, arbitrary host or control-plane admin endpoints.
 - Deployment changes do not widen the eligible Action manifest; capability availability remains a separate server-side gate.
 - Phase 6 owns the exact base filenames and Phase 7 only adds `write-runner-deployment.yaml`, `write-runner-networkpolicy.yaml` and `action-workers-deployment.yaml`; Phase 8 modifies those paths in place and never creates a second chart or alias template.
@@ -44,7 +45,7 @@
 
 - [ ] **Step 1: Write failing values-contract tests**
 
-Add tests that reject missing image digest, divergence between `deploy/images.lock` and `test/production/images.lock`, a values/image-lock mismatch, HTTP upstreams, embedded DSNs, absent OIDC issuer/audience, overlapping READ/WRITE service accounts, absent resource limits, replica count below availability minimum, and enabled test mode. The accepted Phase 7 successor digest must bind the immutable Phase 6 READ baseline, exact `action-surface-manifest.yaml` and current image-lock digest.
+Add tests that reject missing image digest, divergence between `deploy/images.lock` and `test/production/images.lock`, a values/image-lock mismatch, HTTP upstreams, embedded DSNs, absent OIDC issuer/API audience/authorized party, overlapping READ/WRITE service accounts, absent resource limits, replica count below availability minimum, enabled test mode, any independent Web image/workload/service/identity/origin and a Control Plane image without the bound Web bundle/OpenAPI contract digests. The accepted Phase 7 successor digest must bind the immutable Phase 6 READ baseline, exact `action-surface-manifest.yaml` and current image-lock digest.
 
 ```yaml
 suite: production values contract
@@ -125,6 +126,7 @@ The schema must require:
 - Positive shutdown grace, lease-drain and credential-cleanup deadlines with cleanup shorter than shutdown grace.
 - A nonempty cluster/region identifier and at least three topology zones for full production values.
 - Empty default eligible production Action list.
+- Exactly one `images.controlPlane` digest for packaged Web/API；there is no `images.web` value and no chart switch that can enable an independent Web runtime.
 
 Do not put real endpoint, issuer, tenant, role, namespace or Secret names in `values.yaml`. Use syntactically invalid-safe examples and document an external encrypted values workflow.
 
@@ -229,7 +231,7 @@ securityContext:
 
 Mount a writable `emptyDir` only for bounded temporary files and set `sizeLimit`. Mount trust bundles and credential-agent sockets read-only. Never mount Kubernetes Secret files into a process that does not need them. WRITE Runner receives only its realm trust, workload identity token and broker/issuer endpoint references.
 
-Define startup/readiness as semantic checks: configuration valid, database reachable, Temporal namespace registered, OIDC discovery valid, PKI trust loaded, and required Runner Realm publication present. Liveness must not depend on optional upstreams and must not create a restart storm during a dependency outage.
+Define startup/readiness as semantic checks: configuration valid, database reachable, Temporal namespace registered, OIDC discovery valid, PKI trust loaded, required Runner Realm publication present, and the Control Plane image's `/opt/aiops/web/index.html`/asset manifest matches its locked bundle/contract metadata. Liveness must not depend on optional upstreams and must not create a restart storm during a dependency outage. The Control Plane container exposes Web and API from the same process/port；do not add a Web container、volume-populator or Node sidecar.
 
 - [ ] **Step 3: Implement production configuration validation**
 
@@ -286,9 +288,9 @@ Encode the allowed matrix:
 | Validation Runner | Runner Gateway, DNS/trusted time and exact published validation Targets |
 | READ Runner | Runner Gateway, DNS/trusted time and exact published READ Targets |
 | WRITE Runner | Runner Gateway, DNS/trusted time and exact approved execution Targets |
-| Ingress | edge proxy to Control Plane only; Runner mTLS identities to Runner Gateway only |
+| Ingress | one TLS origin to the Control Plane Service for SPA and `/api/*` only; Runner mTLS identities to Runner Gateway only |
 
-Tests must deny READ-to-WRITE issuer, WRITE-to-READ issuer, browser-to-Runner, Runner-to-PostgreSQL, Broker-to-AWX bypassing the L7 gateway, static control credentials attempting launch/cancel/list/search, cross-Realm Runner traffic, metadata service, Kubernetes API by default, and unrestricted `0.0.0.0/0` egress.
+Tests must deny READ-to-WRITE issuer, WRITE-to-READ issuer, browser-to-Runner, Runner-to-PostgreSQL, Broker-to-AWX bypassing the L7 gateway, static control credentials attempting launch/cancel/list/search, cross-Realm Runner traffic, metadata service, Kubernetes API by default, unrestricted `0.0.0.0/0` egress, a second Web/BFF ingress origin and any browser path that bypasses the Control Plane Service.
 
 Run:
 
@@ -339,7 +341,7 @@ git commit -m "feat(security): isolate production runner realms"
 
 - [ ] **Step 1: Add a failing local verification target**
 
-The script must run strict lint, unit tests, schema validation, deterministic render, Kubernetes schema validation, prohibited-secret scan, mutable-image scan, securityContext assertions, migration ordering, OpenAPI generation cleanliness and backend/frontend quality checks.
+The script must run strict lint, unit tests, schema validation, deterministic render, Kubernetes schema validation, prohibited-secret scan, mutable-image scan, securityContext assertions, migration ordering, OpenAPI generation cleanliness, packaged Control Plane filesystem inspection and backend/frontend quality checks. It rejects any standalone Web/Node workload and proves the final Control Plane image has `/opt/aiops/web` but no Node、pnpm、MSW、Service Worker、source map、frontend source or development dependencies.
 
 Run:
 
@@ -351,9 +353,9 @@ Expected: FAIL until all commands and golden manifests are wired.
 
 - [ ] **Step 2: Implement deterministic verification**
 
-The script uses `set -euo pipefail`, pins tool versions in the release workflow, writes temporary output under `mktemp -d` with a cleanup trap, and rejects these patterns in rendered YAML: `kind: Secret`, `stringData:`, base64-like private-key blocks, `:latest`, unqualified images, privileged containers, host network/PID/IPC, hostPath and wildcard RBAC.
+The script uses `set -euo pipefail`, pins tool versions in the release workflow, writes temporary output under `mktemp -d` with a cleanup trap, and rejects these patterns in rendered YAML: `kind: Secret`, `stringData:`, base64-like private-key blocks, `:latest`, unqualified images, privileged containers, host network/PID/IPC, hostPath, wildcard RBAC, separate Web image/workload/service/ServiceAccount/Ingress and wildcard CORS configuration.
 
-Render twice and compare SHA-256 digests. Run the migration chain against an ephemeral PostgreSQL database, including down/up for `000022`.
+Render twice and compare SHA-256 digests. Run the migration chain against an ephemeral PostgreSQL database, including down/up for `000022`. Run a rolling N→N+1 release with an N browser client and require N/N-1 API compatibility；force a hashed-chunk load failure and prove the UI disables high-risk mutations, displays a persistent safe-reload prompt and sends/replays no mutation.
 
 - [ ] **Step 3: Add CI and signed chart packaging**
 

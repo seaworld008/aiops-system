@@ -163,8 +163,8 @@ Run:
 ~~~bash
 gofmt -w $(rg --files internal/assetcatalog -g '*.go')
 go test -race ./internal/assetcatalog ./internal/assetcatalog/postgres -count=1
-TEST_DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/aiops_test?sslmode=disable' \
-  go test -race ./internal/assetcatalog/postgres -run 'TestMappingIntegration' -count=1
+: "${AIOPS_TEST_POSTGRES_DSN:?inject the PostgreSQL 18.4 TLS test DSN; local development uses scripts/with-local-postgres.sh}"
+go test -race ./internal/assetcatalog/postgres -run 'TestMappingIntegration' -count=1
 ~~~
 
 Expected: PASS. Concurrent decisions produce one committed decision and one version conflict；`ResolveConflictScope` cannot cross Workspace/Tenant；zero/restricted-empty/two-Service/unrestricted constraints are enforced in SQL for relation、binding and conflict lists；no cross-scope or unauthorized relationship/binding/candidate is visible；all list pages have stable, duplicate-free traversal.
@@ -395,13 +395,23 @@ git commit -m "feat(assetcatalog): authorize governed asset operations"
 **Files:**
 - Create: **api/openapi/control-plane-v1.yaml**
 - Create: **api/openapi/control_plane_v1_test.go**
+- Modify: **internal/config/config.go**
+- Modify: **internal/config/config_test.go**
+- Modify: **internal/authn/keycloak.go**
+- Modify: **internal/authn/keycloak_test.go**
 - Create: **internal/httpapi/control_plane_contract.go**
 - Create: **internal/httpapi/control_plane_contract_test.go**
+- Create: **internal/httpapi/browser_config.go**
+- Create: **internal/httpapi/browser_config_test.go**
 - Modify: **internal/httpapi/router.go**
 - Modify: **internal/httpapi/router_test.go**
+- Modify: **cmd/control-plane/main.go**
+- Modify: **cmd/control-plane/main_test.go**
 
 **Interfaces:**
 - Produces: the sole browser contract at `api/openapi/control-plane-v1.yaml`; later frontend generation consumes this exact file.
+- Produces: anonymous `GET /api/v1/browser-config` with public browser OIDC/build metadata only; it is not an authorization or secret-discovery surface.
+- Produces: separate browser public-client and API verifier configuration; the API accepts only exact issuer, audience, authorized party and bounded `auth_time`.
 - Produces these shared symbols for all Control Plane plans:
   - `parseIdempotencyKey(*http.Request) (string, error)`
   - `parseVersionETag(*http.Request, resourceType, resourceID string) (int64, error)`
@@ -428,6 +438,7 @@ import (
 func TestControlPlaneContractHasExactAssetRoutes(t *testing.T) {
 	raw, document := readControlPlaneContract(t)
 	required := []string{
+		"/api/v1/browser-config",
 		"/api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets",
 		"/api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets/{asset_id}",
 		"/api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets/{asset_id}:quarantine",
@@ -484,7 +495,11 @@ Expected: FAIL because `control-plane-v1.yaml` does not exist.
 
 - [ ] **Step 2: Create the exact OpenAPI envelope**
 
-Create a valid OpenAPI 3.1 document with `jsonSchemaDialect`, global OIDC security, UUID path parameters, signed Cursor/Limit, required Idempotency-Key/If-Match, RFC 9457 `Problem`, `PageMeta`, and the fixed `EffectiveAction` enum. Every object uses `additionalProperties: false`, explicit `required`, bounded strings/arrays, and no secret-bearing field.
+Create a valid OpenAPI 3.1 document with `jsonSchemaDialect`, stable unique `operationId` values, global OIDC security, UUID path parameters, signed Cursor/Limit, required Idempotency-Key/If-Match, RFC 9457 `Problem`, `PageMeta`, and the fixed `EffectiveAction` enum. Every object uses `additionalProperties: false`, explicit `required`, bounded strings/arrays, and no secret-bearing field.
+
+`GET /api/v1/browser-config` overrides global authentication with `security: []` and returns `200` closed `BrowserConfig` only: `oidc{url,realm,client_id}`、`api_base_path` and `build{version,commit,contract_digest}`. All nested objects set `additionalProperties: false`; URL/client/build values are bounded public metadata. The response is `no-store`/`nosniff` and must never contain Client Secret、Token、Credential Reference、Vault path、private/internal endpoint、arbitrary Header or deployment environment dump.
+
+Replace ambiguous `AIOPS_OIDC_CLIENT_ID` with `AIOPS_OIDC_ISSUER`、`AIOPS_OIDC_API_AUDIENCE`、`AIOPS_OIDC_AUTHORIZED_PARTY` and public-browser `AIOPS_WEB_OIDC_URL`、`AIOPS_WEB_OIDC_REALM`、`AIOPS_WEB_OIDC_CLIENT_ID`. Production sets browser client `control-plane-web` and API audience `aiops-control-plane`; all six values are explicit and required together. Keycloak verification rejects tokens unless `iss`、`aud`、`azp` and `auth_time` exactly satisfy the configured API/recent-auth contract; the model, role name and browser client are never API authorization principals.
 
 The Phase 1 Pack 03 action enum is exactly `CREATE_ASSET`、`EDIT_GOVERNANCE`、`QUARANTINE`、`RETIRE`、`CREATE_BINDING`、`DELETE_BINDING`、`RESOLVE_CONFLICT`. Tasks 13–14 extend the same enum with governed Source/Revision actions only when their production mutation path exists.
 
@@ -642,24 +657,30 @@ func controlPlaneResponseHeaders(next http.Handler) http.Handler {
 
 Register it after request ID middleware and before routing, replacing the credential-only header middleware with this general one while preserving all existing tests.
 
+Register the browser-config handler outside the authenticated `/api/v1` group but behind request ID and response-header middleware. Construct its immutable DTO from validated config plus build metadata; reject incomplete production configuration at assembly and never reflect request or process-environment values.
+
 - [ ] **Step 5: Validate the contract and helper fuzz/race tests**
 
 Run:
 
 ~~~bash
-gofmt -w $(rg --files api/openapi internal/httpapi -g '*.go')
-go test -race ./api/openapi ./internal/httpapi -count=1
+gofmt -w $(rg --files api/openapi internal/httpapi internal/config internal/authn cmd/control-plane -g '*.go')
+go test -race ./api/openapi ./internal/httpapi ./internal/config ./internal/authn ./cmd/control-plane -count=1
 go test ./internal/httpapi -run Fuzz -fuzz FuzzRejectDuplicateJSONKeys -fuzztime 5s
 ~~~
 
-Expected: PASS; malformed JSON never reaches a manager, all Problems contain the request trace ID, all `/api/v1` success/error responses are no-store/nosniff, and existing health/webhook/session/revocation tests remain green.
+Expected: PASS; malformed JSON never reaches a manager, all Problems contain the request trace ID, browser config is anonymous/closed/no-store, OIDC rejects wrong issuer/audience/authorized-party/session age, all `/api/v1` responses are no-store/nosniff, and existing health/webhook/session/revocation tests remain green.
 
 - [ ] **Step 6: Commit**
 
 ~~~bash
 git add api/openapi/control-plane-v1.yaml api/openapi/control_plane_v1_test.go \
+  internal/config/config.go internal/config/config_test.go \
+  internal/authn/keycloak.go internal/authn/keycloak_test.go \
   internal/httpapi/control_plane_contract.go internal/httpapi/control_plane_contract_test.go \
-  internal/httpapi/router.go internal/httpapi/router_test.go
+  internal/httpapi/browser_config.go internal/httpapi/browser_config_test.go \
+  internal/httpapi/router.go internal/httpapi/router_test.go \
+  cmd/control-plane/main.go cmd/control-plane/main_test.go
 git commit -m "feat(api): define safe control plane contract"
 ~~~
 

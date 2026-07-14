@@ -4,23 +4,24 @@
 
 **Goal:** 建立真实 OIDC 保护的统一 React 前端，并交付资产目录、资产详情、映射工作台和发现同步页面的完整交互与安全状态。
 
-**Architecture:** `web/` 是唯一前端；生产入口只注入 `keycloak-js` 内存 Token Provider，所有 API 类型由 OpenAPI 生成。TanStack Router 将 Scope/筛选/排序/Cursor/Tab/选中项持久化到 URL，TanStack Query 按 Scope 隔离缓存；页面只消费安全 DTO 与 `effective_actions`。
+**Architecture:** `web/` 是唯一前端，遵循 `app → features → shared` 单向依赖；Go Control Plane 同源提供 `/api/*` 与 `web/dist`，生产不运行 Node。入口先读取匿名 `/api/v1/browser-config`，再注入 `keycloak-js` 内存 Token Provider；OpenAPI 生成唯一 API 类型，页面只消费安全 DTO 与 `effective_actions`。
 
 **Tech Stack:** Node.js 24、pnpm 10.34.0、React 19.2.7、Vite 8.1.4、TypeScript 7.0.2、TanStack Router/Query/Table、React Hook Form、Zod、Radix、lucide-react 1.24.0、keycloak-js 26.2.4、CSS Modules、Vitest、MSW。
 
 ## Global Constraints
 
 - 前置任务：按顺序完成 [03-mapping-auth-api.md](./03-mapping-auth-api.md)；前端契约以 `api/openapi/control-plane-v1.yaml` 为唯一事实源。
-- 前端根目录固定 `web/`；不得创建第二套 SPA、手写生成类型或引入 Redux。
-- 生产入口必须真实执行 OIDC Authorization Code + PKCE、`login-required`、请求前 `updateToken(30)`；缺少配置 fail closed。
+- 前端根目录固定 `web/`；不得创建第二套 SPA、Next.js/Remix、Node BFF、微前端、Redux/Zustand 或手写生成类型。
+- 生产入口必须先校验 `/api/v1/browser-config`，再真实执行 OIDC Authorization Code + PKCE、`login-required`、请求前 `updateToken(30)`；任一步失败都 fail closed。
 - Token 只在内存，禁止 localStorage、sessionStorage、IndexedDB、Cookie 或日志。
 - fake/MSW 只能用于 Vitest/Playwright 测试入口，不得进入生产 `main.tsx` 或 production bundle。
-- 所有 API 调用注入 `getAccessToken`，使用 `credentials: omit`、`cache: no-store`，并解析 RFC 9457 Problem/Trace ID。
+- 所有网络访问集中在 `shared/api`；业务模块禁止直接 `fetch`。类型化 transport 注入 `getAccessToken`，使用 `credentials: omit`、`cache: no-store`，并解析 RFC 9457 Problem/Trace ID。
+- URL 保存 Scope/筛选/排序/Cursor/Tab/非敏感选中 ID；TanStack Query 保存含 Scope 的服务端状态，Scope 切换时取消并清理；RHF+Zod 保存临时表单，局部 React state 只保存抽屉、焦点和展开状态，Context 只保存 auth/scope/theme。
 - UI 只使用服务端 `effective_actions`；`STALE`、`QUARANTINED`、`AMBIGUOUS`、`UNRESOLVED` 不显示调查主按钮。
-- 管理状态等待服务端确认；仅筛选/展开可乐观更新。409 必须展示持久差异并要求重新审阅。
+- 管理状态等待服务端确认；仅筛选/展开可乐观更新。治理 Mutation 不自动重试、不自动重放，409 必须展示持久差异并要求重新审阅。
 - WCAG 2.2 AA、2px 焦点、Reduced Motion、键盘完整可达、移动触控目标 44px。
 - 禁止聊天框、AI 头像、霓虹/发光/玻璃拟态、通用终端、任意 SSH/WinRM/SQL/命令/Header/Body 输入。
-- 生产部署必须支持多副本静态资源、不可变带 hash 文件、CSP、OIDC 回调 HA；不得依赖浏览器本地持久状态。
+- Vite 只用于构建和本地开发；生产由 Go 同源服务不可变 hash 静态资源、CSP 和 OIDC 回调，禁止 `vite preview`、独立 Web 运行时和宽泛 CORS。
 - 所有前端写流必须落真实 API/PostgreSQL 并显示服务端审计/Trace 结果；阶段完成仍以 05 的真实 OIDC+PostgreSQL E2E、低基数指标、备份恢复和多副本故障演练为门禁。
 - 当前 UI 是完整生产资产治理入口，不是静态 demo；目标写能力将在后续受治理阶段接入，本包不提前展示。
 - 每个任务严格按 Red → Green → Refactor；任务末尾提交步骤只包含本任务文件。
@@ -32,6 +33,7 @@
 ### Task 9: Unified React toolchain, generated API client, real browser OIDC, and application shell
 
 **Files:**
+- Create: **docs/design/frontend/foundation-assets.md**
 - Create: **web/package.json**
 - Create: **web/pnpm-lock.yaml**
 - Create: **web/index.html**
@@ -54,27 +56,52 @@
 - Create: **web/src/app/styles/tokens.css**
 - Create: **web/src/app/styles/global.css**
 - Create: **web/src/shared/api/schema.d.ts**
+- Create: **web/src/shared/api/browserConfig.ts**
 - Create: **web/src/shared/api/controlPlaneClient.ts**
+- Create: **web/src/shared/api/operation.ts**
 - Create: **web/src/shared/api/problem.ts**
 - Create: **web/src/shared/api/queryKeys.ts**
-- Create: **web/src/shared/components/AsyncState.tsx**
-- Create: **web/src/shared/components/StatusBadge.tsx**
-- Create: **web/src/shared/components/AbsoluteTime.tsx**
+- Create: **web/src/shared/operations/useOperation.ts**
+- Create: **web/src/shared/operations/useOperation.test.tsx**
+- Create: **web/src/shared/ui/DataTable.tsx**
+- Create: **web/src/shared/ui/FilterBar.tsx**
+- Create: **web/src/shared/ui/CursorPagination.tsx**
+- Create: **web/src/shared/ui/Drawer.tsx**
+- Create: **web/src/shared/ui/StatusBadge.tsx**
+- Create: **web/src/shared/ui/ProblemPanel.tsx**
+- Create: **web/src/shared/ui/OperationTimeline.tsx**
+- Create: **web/src/shared/ui/EffectiveActionGate.tsx**
+- Create: **web/src/shared/ui/ETagConflictReview.tsx**
+- Create: **web/src/shared/ui/ReauthBoundary.tsx**
+- Create: **web/src/shared/ui/AbsoluteTime.tsx**
+- Create: **web/src/shared/ui/primitives.test.tsx**
 - Create: **web/src/test/setup.ts**
 - Create: **web/src/test/msw/fixtures.ts**
 - Create: **web/src/test/msw/handlers.ts**
 - Create: **web/src/test/msw/browser.ts**
 - Create: **web/src/test/msw/server.ts**
+- Create: **web/src/shared/api/browserConfig.test.ts**
 - Create: **web/src/app/auth/keycloak.test.ts**
 - Create: **web/src/shared/api/controlPlaneClient.test.ts**
 - Create: **web/src/app/AppShell.test.tsx**
+- Create: **internal/httpapi/webui.go**
+- Create: **internal/httpapi/webui_test.go**
+- Modify: **internal/httpapi/router.go**
+- Modify: **internal/httpapi/router_test.go**
+- Modify: **internal/config/config.go**
+- Modify: **internal/config/config_test.go**
+- Modify: **cmd/control-plane/main.go**
+- Modify: **cmd/control-plane/main_test.go**
 
 **Interfaces:**
-- Consumes: `api/openapi/control-plane-v1.yaml` and existing `/api/v1/session`.
-- Produces: `ControlPlaneClient` with injected `getAccessToken` and generated `paths/components/operations` types.
+- Consumes: `api/openapi/control-plane-v1.yaml`、anonymous `/api/v1/browser-config` and authenticated `/api/v1/session`.
+- Produces: private method/path-aware transport with injected `getAccessToken`, generated `paths/components/operations` types, shared Operation projection/hook and reusable governance UI primitives.
+- Produces: same-origin Go SPA service; `/api/*` and health/readiness paths never enter SPA fallback.
 - Security: production entry has exactly one auth implementation—`keycloak-js` Authorization Code + PKCE, `login-required`, memory-only token.
 
-- [ ] **Step 1: Pin the exact package graph and scripts**
+- [ ] **Step 1: Persist the frontend foundation contract, then pin the exact package graph and scripts**
+
+Before creating code, persist `docs/design/frontend/foundation-assets.md` as the unique Phase 1 application-platform source. It fixes `app → features → shared` boundaries, state ownership, typed API/Problem/Operation flow, shared primitives, route/URL schema, visual/accessibility tokens, runtime Browser Config/OIDC bootstrap, same-origin Go serving/cache/CSP behavior, governance mutation rules, responsive states and the forbidden BFF/chat/AI-avatar/terminal/secret/editor patterns. AI surfaces must render Investigation、Evidence、ActionProposal、ActionPlan、Operation and Audit as governed domain objects rather than a global chat entry. Later tasks may verify and extend domain details but must not create another foundation source.
 
 Create `web/package.json`:
 
@@ -163,6 +190,7 @@ export default defineConfig({
   build: {
     target: "es2024",
     sourcemap: false,
+    manifest: true,
     reportCompressedSize: true,
   },
   test: {
@@ -179,7 +207,7 @@ export default defineConfig({
 });
 ~~~
 
-ESLint must ban `console.*` except `console.error` inside the centralized error reporter, ban explicit `any`, ban non-null assertions, require exhaustive hooks, and ignore only generated API and Playwright snapshots.
+ESLint must ban `console.*` except `console.error` inside the centralized error reporter, explicit `any`, non-null assertions, and direct `fetch` outside `shared/api`; require exhaustive hooks and enforce `app → features → shared`: `shared` imports neither upper layer, `features` imports only itself plus `shared`, and `app` may compose both. Ignore only generated API and Playwright snapshots.
 
 - [ ] **Step 3: Generate and freeze the OpenAPI types**
 
@@ -210,18 +238,22 @@ Expected on first implementation: generation creates the file；the independent 
 - [ ] **Step 4: Write failing browser-auth and client tests**
 
 ~~~ts
-it("fails closed when production OIDC configuration is incomplete", async () => {
-  expect(() =>
-    readOIDCConfig({
-      PROD: true,
-      VITE_OIDC_URL: "",
-      VITE_OIDC_REALM: "aiops",
-      VITE_OIDC_CLIENT_ID: "control-plane-web",
-    }),
-  ).toThrow("OIDC configuration is required");
+it("loads closed runtime browser config before OIDC and fails closed", async () => {
+  const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+    oidc: { url: "https://identity.example.com", realm: "aiops", client_id: "control-plane-web" },
+    api_base_path: "/api/v1",
+    build: { version: "1.0.0", commit: "abc123", contract_digest: `sha256:${"0".repeat(64)}` },
+  })));
+  await expect(loadBrowserConfig(fetcher)).resolves.toMatchObject({ apiBasePath: "/api/v1" });
+  expect(fetcher).toHaveBeenCalledWith("/api/v1/browser-config", expect.objectContaining({
+    cache: "no-store", credentials: "omit", redirect: "error",
+  }));
+  await expect(loadBrowserConfig(malformedConfigFetcher())).rejects.toThrow("Browser configuration unavailable");
 });
 
 it("refreshes the in-memory token before every API request", async () => {
+  const workspaceID = "33333333-3333-4333-8333-333333333333";
+  const environmentID = "44444444-4444-4444-8444-444444444444";
   const getAccessToken = vi.fn().mockResolvedValue("ephemeral-token");
   const fetcher = vi.fn().mockResolvedValue(
     new Response(JSON.stringify(assetPageFixture), {
@@ -231,11 +263,13 @@ it("refreshes the in-memory token before every API request", async () => {
   );
   const client = createControlPlaneClient({ baseURL: "", getAccessToken, fetcher });
 
-  await client.get("/api/v1/workspaces/w/environments/e/assets");
+  await client.execute("listAssets", {
+    parameters: { path: { workspace_id: workspaceID, environment_id: environmentID } },
+  });
 
   expect(getAccessToken).toHaveBeenCalledTimes(1);
   expect(fetcher).toHaveBeenCalledWith(
-    "/api/v1/workspaces/w/environments/e/assets",
+    `/api/v1/workspaces/${workspaceID}/environments/${environmentID}/assets`,
     expect.objectContaining({
       headers: expect.objectContaining({ Authorization: "Bearer ephemeral-token" }),
       cache: "no-store",
@@ -272,7 +306,7 @@ it("forces a fresh login and preserves only a validated same-origin return URL",
 });
 ~~~
 
-Run: `corepack pnpm@10.34.0 --dir web test -- keycloak.test.ts controlPlaneClient.test.ts`
+Run: `corepack pnpm@10.34.0 --dir web test -- browserConfig.test.ts keycloak.test.ts controlPlaneClient.test.ts`
 
 Expected: FAIL because auth and API client modules do not exist.
 
@@ -334,49 +368,23 @@ export async function createKeycloakAccessTokenProvider(
 }
 ~~~
 
-`readOIDCConfig(import.meta.env)` allows only HTTPS issuer URL outside localhost, non-empty realm/client ID, and no client secret. `checkLoginIframe:false` is deliberate：the CSP does not grant a cross-origin frame；logout/session expiry is detected by request-time `updateToken(30)` and the API 401 path. `reauthenticate` always uses `prompt:login + maxAge:0` and a same-origin return URL；the backend still verifies `auth_time` against its configured recent-auth window. The module must contain no `localStorage`、`sessionStorage`、`indexedDB`、cookie or token persistence calls. `main.tsx` blocks rendering until OIDC initializes；error state provides retry/login and a trace-free configuration message, never an anonymous app.
+`loadBrowserConfig` fetches only same-origin `/api/v1/browser-config` with no Authorization, validates the exact closed shape with Zod, accepts HTTPS OIDC URL outside localhost plus non-empty realm/public client/build identity, and rejects extra/secret-like fields. Production reads no build-time OIDC or API-base variables. `main.tsx` blocks rendering until Browser Config and OIDC initialize in that order; failure provides a trace-free retry/login message, never an anonymous app. `checkLoginIframe:false` is deliberate because CSP grants no cross-origin frame; request-time `updateToken(30)` and API 401 detect expiry. Reauthentication always uses `prompt:login + maxAge:0` and validated same-origin return URL; the backend independently verifies `auth_time`. No module calls browser persistence APIs.
 
 - [ ] **Step 6: Implement the typed API transport**
 
-~~~ts
-export type ClientOptions = {
-  baseURL: string;
-  getAccessToken: () => Promise<string>;
-  fetcher?: typeof fetch;
-};
+`operation.ts` derives `OperationID`、path/query/header/body input and success response types exclusively from generated `operations`/`paths`. `controlPlaneClient.ts` exports only `execute<K extends OperationID>(operation: K, input: OperationInput<K>): Promise<OperationResult<K>>`; its fetch transport and operation method/path registry are private and contract-tested against OpenAPI operation IDs. Compile-time tests use `@ts-expect-error` to prove wrong method, path parameter, body or response access cannot compile. Feature adapters expose domain methods and generated aliases, never raw paths or handwritten DTOs.
 
-export function createControlPlaneClient(options: ClientOptions) {
-  const fetcher = options.fetcher ?? fetch;
-  return {
-    async request<T>(
-      path: string,
-      init: RequestInit & { idempotencyKey?: string; ifMatch?: string } = {},
-    ): Promise<{ data: T; etag: string | null }> {
-      const token = await options.getAccessToken();
-      const headers = new Headers(init.headers);
-      headers.set("Accept", "application/json, application/problem+json");
-      headers.set("Authorization", `Bearer ${token}`);
-      if (init.body !== undefined) headers.set("Content-Type", "application/json");
-      if (init.idempotencyKey) headers.set("Idempotency-Key", init.idempotencyKey);
-      if (init.ifMatch) headers.set("If-Match", init.ifMatch);
-      const response = await fetcher(`${options.baseURL}${path}`, {
-        ...init,
-        headers,
-        cache: "no-store",
-        credentials: "omit",
-        redirect: "error",
-      });
-      if (!response.ok) throw await parseProblem(response);
-      const data = response.status === 204 ? undefined : await response.json();
-      return { data: data as T, etag: response.headers.get("ETag") };
-    },
-  };
-}
-~~~
+Every request refreshes the token, sends only declared Idempotency-Key/If-Match headers, uses same-origin Browser Config `api_base_path`, and validates RFC 9457 Problem with Zod. Unknown/malformed errors become `unexpected_response` with the response Trace header. Never log token, request/response body, query values, labels, external ID or raw Problem detail. Query-key factories always include workspace/environment and normalized filters.
 
-Validate every Problem with Zod before showing it. Unknown/malformed error bodies become a generic `unexpected_response` with the response trace header. Never log token, request body, response body, URL query values, labels, external ID, or raw Problem detail. Query keys are factories that always include workspace/environment and normalized filters.
+`web/src/shared/operations/useOperation.ts` accepts a generated safe projection adapter plus `{workspaceId, environmentId, kind, operationId}`. It keeps `operationId` in URL, pauses while hidden/offline, resumes on focus, honors bounded `Retry-After` or capped backoff, and stops on the adapter's terminal states. It never retries or replays the initiating Mutation; feature modules extend adapters/status invalidation instead of creating another polling hook.
 
-- [ ] **Step 7: Implement the application shell and persisted visual tokens**
+- [ ] **Step 7: Implement same-origin Go SPA serving, the application shell, shared UI, and persisted visual tokens**
+
+`internal/httpapi/webui.go` serves the validated `AIOPS_WEB_ROOT` (`/opt/aiops/web` in the production artifact) from the existing Go Control Plane. `/api/*`、`/healthz`、`/readyz` and non-GET/HEAD requests never receive SPA fallback. Only normalized, extensionless browser GET/HEAD routes accepting HTML may fall back to `index.html`; reject traversal, encoded separators and files outside root. `index.html` uses `no-store`; hashed `/assets/*` uses `public,max-age=31536000,immutable`; missing index/manifest fails production startup and readiness fails if assets later disappear.
+
+Static responses set `nosniff`、`no-referrer` and CSP `default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' <OIDC-origin>; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action <OIDC-origin>`. No inline script or permissive CORS is allowed. Vite remains build/dev-only and the Go router is the sole production Web/API process.
+
+Build shared `DataTable`、`FilterBar`、`CursorPagination`、`Drawer`、`StatusBadge`、`ProblemPanel`、`OperationTimeline`、`EffectiveActionGate`、`ETagConflictReview` and `ReauthBoundary` once from Radix, TanStack Table and CSS Modules. Features compose them and may not fork permission, Problem, ETag or Operation behavior.
 
 The shell structure is fixed:
 
@@ -448,11 +456,12 @@ Run:
 ~~~bash
 corepack pnpm@10.34.0 --dir web typecheck
 corepack pnpm@10.34.0 --dir web lint
-corepack pnpm@10.34.0 --dir web test -- AppShell.test.tsx keycloak.test.ts controlPlaneClient.test.ts
+corepack pnpm@10.34.0 --dir web test -- AppShell.test.tsx browserConfig.test.ts keycloak.test.ts controlPlaneClient.test.ts useOperation.test.tsx primitives.test.tsx
 corepack pnpm@10.34.0 --dir web build
+go test -race ./internal/httpapi ./internal/config ./cmd/control-plane -count=1
 ~~~
 
-Expected: PASS. Tests verify skip-link focus, active navigation semantics, scope-switch confirmation, no anonymous production fallback, generated API drift-free build, no persistence API use, and a production bundle with no source maps or embedded token/client secret.
+Expected: PASS. Tests verify runtime-config-before-OIDC, operation/path compile-time safety, shared Operation visibility/terminal behavior, UI primitives, skip-link/focus, Scope cancellation/confirmation, no anonymous fallback or mutation auto-retry, SPA reserved-path/fallback/cache/traversal/readiness/CSP rules, generated API drift, no persistence, and a production bundle without source maps or embedded Token/Client Secret.
 
 - [ ] **Step 9: Commit**
 
@@ -461,7 +470,11 @@ git add web/package.json web/pnpm-lock.yaml web/index.html web/tsconfig.json \
   web/tsconfig.app.json web/tsconfig.node.json web/vite.config.ts web/eslint.config.js \
   web/scripts/check-generated-api.sh \
   web/src/main.tsx web/src/vite-env.d.ts web/src/app web/src/shared \
-  web/src/test/setup.ts web/src/test/msw
+  web/src/test/setup.ts web/src/test/msw docs/design/frontend/foundation-assets.md \
+  internal/httpapi/webui.go internal/httpapi/webui_test.go \
+  internal/httpapi/router.go internal/httpapi/router_test.go \
+  internal/config/config.go internal/config/config_test.go \
+  cmd/control-plane/main.go cmd/control-plane/main_test.go
 git commit -m "feat(web): establish secure control plane shell"
 ~~~
 
@@ -690,7 +703,7 @@ git commit -m "feat(web): add explicit asset mapping workbench"
 - Create: **web/src/features/asset-sources/AssetSourcesPage.module.css**
 - Create: **web/src/features/asset-sources/SourceRunTimeline.tsx**
 - Create: **web/src/features/asset-sources/AssetSourcesPage.test.tsx**
-- Create: **docs/design/frontend/foundation-assets.md**
+- Verify/Modify: **docs/design/frontend/foundation-assets.md**
 - Modify: **web/src/app/router.tsx**
 - Modify: **web/src/test/msw/fixtures.ts**
 - Modify: **web/src/test/msw/handlers.ts**
@@ -721,11 +734,11 @@ The list shows source type/provider/name/authority scope/sync mode/status/last s
 
 Pack 04 intentionally renders neither Source creation nor “立即同步”: the complete immutable revision/profile contract is not implemented until Pack 05, and the API returns no such `effective_actions` here. Task 16 extends this same page with the six-step Source+revision workspace and governed sync action; it must not revive a reduced Provider/Integration form.
 
-For a selected existing run, poll `GET asset-source-runs/{runId}` every 2 seconds only while `QUEUED|DELAYED|RUNNING|FINALIZING`, pause when the tab is hidden, resume on focus, and stop on `SUCCEEDED|PARTIAL|FAILED|CANCELLED`.
+For a selected existing run, persist `runId` in the URL and hand it to Task 9's shared Operation adapter/hook. Poll `GET asset-source-runs/{runId}` every 2 seconds only while `QUEUED|DELAYED|RUNNING|FINALIZING` and the page is visible；pause while hidden/offline，resume on focus，and stop on `SUCCEEDED|PARTIAL|FAILED|CANCELLED`. Pack 04 never initiates or replays the sync Mutation；Task 16 adds that governed action only after the complete Source revision contract exists.
 
 Timeline renders the server-owned closed stage mapping：`WAITING` 请求已接受/等待执行、`DELAYED` 延迟重试、`VALIDATING` 验证来源、`READING` 读取来源、`NORMALIZING` 规范化、`APPLYING` 合并投影、`CLEANING_UP` 清理凭据、`COMPLETED` 完成. It never derives stage from elapsed time or role/status guesses. Failed runs show stable error code + Trace ID and a permitted retry action, never upstream text. Completion links conflicts to the mapping workbench while preserving workspace/environment.
 
-Persist `docs/design/frontend/foundation-assets.md` as the unique Phase 1 shell/asset design source. It records the navigation IA, flat route map and validated URL search schema; 220px navigation, 46px Scope bar, spacing/color/type/radius/focus/motion tokens; Asset table/drawer/detail and Mapping workbench components; loading/empty/403/404/409/503/stale/quarantined/ambiguous/offline states; 1440/1024/768/390 breakpoints; mouse/keyboard behavior; WCAG 2.2 AA; Keycloak Server 26.6.3 with browser `keycloak-js` 26.2.4; API `effective_actions`; and the forbidden chat/AI avatar/gradient/glow/glass/Bento/secret/editor patterns. Later plans may link and extend it but must not create a parallel foundation file.
+Verify and extend the Task 9 `foundation-assets.md` only with Source list/run timeline details. Preserve its application-platform contract, navigation IA, flat routes/URL schemas, exact tokens, full failure states, responsive/keyboard/WCAG behavior, Browser Config/Keycloak flow, `effective_actions`, DTO boundaries and forbidden patterns; do not create a parallel foundation file.
 
 - [ ] **Step 3: Verify polling, visibility, and security**
 

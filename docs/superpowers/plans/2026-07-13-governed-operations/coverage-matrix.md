@@ -16,9 +16,9 @@
 | 9 InvestigationGrant 与主动策略 | [Phase 4](04-proactive-grants/README.md)，[ActionProposal](04-proactive-grants/04-evidence-action-proposal.md)、[Investigation/Policy Hub](04-proactive-grants/06-investigation-policy-hub.md) | 事件/定时触发、短 Grant、预算、六级 Kill Switch、四边界复验、无执行权 Proposal/Finding 与人工 Phase 7 handoff |
 | 10 持久化模型 | Phase 1–8 各自 migration 包 | `000015`–`000022` 顺序迁移、跨 Scope FK、不可变记录与回滚测试 |
 | 11 后端模块与 RunnerRealm | [Phase 2](02-connections/README.md)、[Phase 3](03-victoriametrics/README.md)、[Phase 5](05-host-postgresql/README.md)、[Phase 7](07-governed-actions/README.md) | Validation/READ/WRITE Realm、身份、队列、issuer 和 egress 隔离 |
-| 12 公共 API | Phase 1–5 API 包、[Overview](01-assets/10-overview-control-room.md)、[治理库存](02-connections/07-governance-inventory-web.md)、[ActionProposal](04-proactive-grants/04-evidence-action-proposal.md)、[Incident/Audit](07-governed-actions/05-incident-audit-workspace.md)、[Action API](07-governed-actions/06-api-web-operator-journey.md)、Phase 8 release API | 单一 OpenAPI、Problem Details、幂等/ETag、生成类型无漂移、无平行 DTO/路由；ActionPlan create 固定 full T/W/E/S path + 六字段 closed body + header Idempotency-Key |
+| 12 公共 API | Phase 1 [Auth/API](01-assets/03-mapping-auth-api.md) 与 [Foundation](01-assets/04-web-foundation-assets.md)、Phase 1–5 其余 API 包、[Overview](01-assets/10-overview-control-room.md)、[治理库存](02-connections/07-governance-inventory-web.md)、[ActionProposal](04-proactive-grants/04-evidence-action-proposal.md)、[Incident/Audit](07-governed-actions/05-incident-audit-workspace.md)、[Action API](07-governed-actions/06-api-web-operator-journey.md)、Phase 8 release API | 单一 OpenAPI、no-store closed-schema Browser Config、typed `paths/operations` client、Problem Details、幂等/ETag、生成类型无漂移、无平行 DTO/路由；ActionPlan create 固定 full T/W/E/S path + 六字段 closed body + header Idempotency-Key |
 | 13 权限 | [Phase 1](01-assets/03-mapping-auth-api.md)、[Phase 2 库存](02-connections/07-governance-inventory-web.md)、[Phase 4](04-proactive-grants/03-gateway-api.md)、[Phase 5 Diagnostics](05-host-postgresql/07-api-web.md)、[Incident/Audit](07-governed-actions/05-incident-audit-workspace.md)、[Phase 7](07-governed-actions/02-policy-approval-reauth.md) | API `effective_actions`、Scope 隔离、独立 READ/RUN/CANCEL、reauth、职责分离 |
-| 14 前端产品设计 | [Phase 1 Foundation/Assets](01-assets/04-web-foundation-assets.md)、[Overview](01-assets/10-overview-control-room.md)、[Connections](02-connections/06-web-publication-flow.md)、[凭据/Realm](02-connections/07-governance-inventory-web.md)、[Victoria](03-victoriametrics/05-api-web.md)、[Investigation/Policy](04-proactive-grants/06-investigation-policy-hub.md)、[Diagnostics](05-host-postgresql/07-api-web.md)、[Incident/Audit](07-governed-actions/05-incident-audit-workspace.md)、[Action Workspace](07-governed-actions/06-api-web-operator-journey.md)、[Release Web](08-production-rollout/05-staged-rollout-slos.md) | 低 AI 感高保真控制台、持久设计文档、真实 OIDC、响应式、Playwright/axe |
+| 14 前端产品设计 | [Phase 1 Foundation/Assets](01-assets/04-web-foundation-assets.md)、[Overview](01-assets/10-overview-control-room.md)、[Connections](02-connections/06-web-publication-flow.md)、[凭据/Realm](02-connections/07-governance-inventory-web.md)、[Victoria](03-victoriametrics/05-api-web.md)、[Investigation/Policy](04-proactive-grants/06-investigation-policy-hub.md)、[Diagnostics](05-host-postgresql/07-api-web.md)、[Read Platform](06-production-platform/README.md)、[Incident/Audit](07-governed-actions/05-incident-audit-workspace.md)、[Action Workspace](07-governed-actions/06-api-web-operator-journey.md)、[Release Web](08-production-rollout/05-staged-rollout-slos.md) | `app → features → shared`、明确状态所有权、共享治理组件、evidence-first UX、真实 OIDC、Go 同源单镜像、无 Node 生产运行时、响应式与 Playwright/axe |
 | 15 正交状态模型 | Phase 1–7 领域/API/Web 任务包 | 生命周期、映射、连接、能力、Grant、执行、验证状态独立投影 |
 | 16 错误与停止条件 | [Phase 4](04-proactive-grants/README.md)、[Phase 5](05-host-postgresql/README.md)、[Phase 7](07-governed-actions/README.md)、[Phase 8](08-production-rollout/README.md) | drift/expiry/revocation/uncertainty 均 stop、清理、对账或人工升级 |
 | 17 审计与可观测性 | 每阶段 E2E/Operations 包 | 事务 Outbox、不可变 Evidence/Receipt/Audit、SLO/告警/Runbook |
@@ -81,6 +81,16 @@ Source kind、SDK 或注册表条目本身不是开门证据；Gate 必须绑定
 
 所有页面共享 Phase 1 AppShell/token/OIDC/URL Scope/OpenAPI generated contract；后续阶段只能扩展，不得创建第二套认证、路由、DTO 或视觉系统。
 
+## 前端应用平台契约覆盖
+
+| 契约 | 唯一建立入口 | 后续消费与生产证明 |
+|---|---|---|
+| 模块与状态所有权 | [Phase 1 Foundation](01-assets/04-web-foundation-assets.md) 建立 `app → features → shared`、URL/Query/Form/local state 边界和 ESLint 门 | 所有后续 Web 包复用；静态检查拒绝跨 feature UI 导入、Redux/Zustand 和第二套客户端事实源 |
+| 类型化网络边界 | [Phase 1 Auth/API](01-assets/03-mapping-auth-api.md) 建立唯一 OpenAPI/Browser Config；[Foundation](01-assets/04-web-foundation-assets.md) 建立私有 transport | 仅 `shared/api` 可发请求，feature adapter 消费生成的 `paths/operations`；生成类型漂移、direct `fetch` 和手写 DTO 测试为零容忍 |
+| 共享治理体验 | [Phase 1 Foundation](01-assets/04-web-foundation-assets.md) 建立 DataTable/Problem/Operation/effective-action/ETag/reauth primitives | Connection、Investigation、Diagnostics、Action、Release 页面复用；mutation 无 optimistic/自动重试，失败保持可审计 Operation |
+| 同源单产物 | [Phase 1 Foundation/E2E](01-assets/04-web-foundation-assets.md) 建立 Go SPA 边界；[Phase 6](06-production-platform/README.md) 打包；[Phase 8](08-production-rollout/README.md) 发布验收 | 一个 Control Plane 镜像含 Go binary + `/opt/aiops/web`，同一 Origin 提供 SPA/API；最终镜像无 Node/Vite/MSW/source map，无独立 Web workload/BFF |
+| AI 时代 UX | [Phase 1 Foundation](01-assets/04-web-foundation-assets.md) 固定 evidence-first 语言与视觉 | Phase 4/7/8 只以 Investigation、Evidence、ActionProposal、ActionPlan、Operation、Receipt、Audit 呈现智能能力；无全局聊天或自然语言执行面 |
+
 ## 前后端纵向切片
 
 每个阶段都必须同时交付以下链路，禁止先建完所有后端再补前端：
@@ -97,11 +107,14 @@ Database / Domain
 
 前端共同基线：
 
-- 唯一工程 `web/`；Node 24、pnpm 10、React 19.2.7、TypeScript 7.0.2。
+- 唯一工程 `web/`；Node 24、pnpm 10、React 19.2.7、TypeScript 7.0.2、Vite 8.1.4、TanStack Router/Query/Table；Vite 只用于构建和本地开发。
 - 唯一公共契约 `api/openapi/control-plane-v1.yaml`，唯一生成文件 `web/src/shared/api/schema.d.ts`。
-- Keycloak Authorization Code + PKCE、`login-required`、Token 仅内存，请求前刷新，生产缺配置 fail closed。
-- URL 保存 Scope、筛选、排序、分页、Tab 和选中项；TanStack Query 保存服务端状态，不引入 Redux。
+- Keycloak Authorization Code + PKCE、`login-required`、Token 仅内存，请求前刷新；启动前读取 `/api/v1/browser-config`，缺失、畸形或含非公开字段即 fail closed。
+- `app → features → shared` 单向依赖；仅 `shared/api` 发网络请求并使用 OpenAPI 生成的 operation/path 类型。
+- URL 保存 Scope、筛选、排序、分页、Tab、选中项和 Operation ID；TanStack Query 保存 Scope-keyed 服务端状态，RHF+Zod 保存表单，短期 UI 状态留在组件本地；不引入 Redux/Zustand。
+- 共享 DataTable、ProblemPanel、OperationTimeline、EffectiveActionGate、ETagConflictReview、ReauthBoundary；治理 mutation 不 optimistic、不自动重试或重放。
 - 权限仅消费 API `effective_actions`；浏览器不通过角色名推断。
+- Go 从 `/opt/aiops/web` 同源服务 SPA/API；生产只有一个 Control Plane 镜像和身份，无 Node server、Next/Remix、BFF、微前端或宽泛 CORS。
 - 视觉为轻量、密集、克制的企业控制台，不使用聊天壳、AI 头像、霓虹、光晕、渐变、玻璃或装饰性 Bento。
 - WCAG 2.2 AA、键盘、可见焦点、非颜色状态、reduced motion、44px 目标均进入 Playwright/axe 门。
 

@@ -17,6 +17,9 @@
 - Production images and charts must be built from the accepted commit by the protected release workflow, signed, attested and pinned by digest.
 - Operator identity, workload identity and short-lived target credential are different credentials with different issuers/audiences and may not be exchanged.
 - Browser tokens remain memory-only; production OIDC configuration fails closed and no test identity provider is linked.
+- Human OIDC preserves the Phase 1 contract exactly: HTTPS `iss`, API `aud=aiops-control-plane`, browser public `azp=control-plane-web` and bounded `auth_time`; wildcard/missing claims or the former ambiguous single-client setting fail closed.
+- The signed Control Plane image is the sole browser Web/API artifact and its application payload consists of the Go binary plus `/opt/aiops/web`; production admission rejects Node/pnpm、MSW、Service Worker、source map、frontend source/dev dependencies, a separate Web/BFF workload or a second browser origin.
+- Public `/api/v1/browser-config` is closed-schema、`no-store` and may expose only OIDC URL/realm/public client ID、API base path and build digests；Secret、client secret、Token、Vault path、internal endpoint/header/body and credential references are release-blocking leaks.
 - Audit/evidence retention, legal hold and deletion are policy-controlled. Missing an approved signed retention revision blocks the release.
 - Security evidence contains digests and bounded summaries, not secrets, exploit payload dumps, raw database rows or model prompts.
 
@@ -89,6 +92,7 @@ At minimum cover:
 - Duplicate or uncertain target mutation, verification spoofing and unsafe rollback.
 - Audit deletion/tampering, outbox loss and release-evidence forgery.
 - Supply-chain compromise, mutable images, chart/value tampering and test dependency in production.
+- Browser-config poisoning, wildcard CORS, separate Web/BFF ingress, stale-chunk mutation replay and N/N-1 browser/API incompatibility.
 - Backup theft, restore of active Grants/credentials and DR decision replay.
 - Kill Switch bypass, policy dependency outage and operator emergency misuse.
 
@@ -101,6 +105,8 @@ Tests must prove:
 - Unknown fields and oversized bodies fail before domain dispatch.
 - Scope/tenant IDs come from authenticated context, never request claims alone.
 - Secrets never appear in API/OpenAPI examples, generated TypeScript, logs, traces, audit details, browser storage, workflow payloads or Runner payloads.
+- Browser config rejects unknown fields and sensitive metadata, is served `no-store`, validates environment-specific public OIDC values against the deployment contract, and reports build/OpenAPI digests matching the signed Control Plane image metadata.
+- Rendered production manifests contain one Control Plane Web/API image、Deployment、Service、ServiceAccount and TLS origin；no Web/BFF workload, Node sidecar or wildcard CORS is admitted.
 - Untrusted evidence is rendered as text, not HTML, and cannot create a tool/Action request.
 - All privileged commands require exact `effective_actions` plus server authorization.
 - mTLS subject/issuer/audience/Realm mismatch, expiry and revocation deny Claim/Start/Heartbeat/Complete.
@@ -139,7 +145,7 @@ git commit -m "docs(security): make production invariants executable"
 
 - [ ] **Step 1: Add failing artifact-policy tests**
 
-Reject an unsigned image, mutable tag, untrusted issuer/subject, digest mismatch, missing SBOM/provenance, unexpected base image, privileged/host namespace, root user, writable root filesystem, unbounded resources, added Linux capability and an expired vulnerability exception.
+Reject an unsigned image, mutable tag, untrusted issuer/subject, digest mismatch, missing SBOM/provenance, unexpected base image, privileged/host namespace, root user, writable root filesystem, unbounded resources, added Linux capability, an expired vulnerability exception, an unbound Web bundle/OpenAPI contract digest, Node/pnpm/MSW/Service Worker/source map/frontend source/development dependency in the final Control Plane filesystem, or an independent Web/BFF artifact.
 
 Run:
 
@@ -161,11 +167,11 @@ semgrep scan --config p/golang --config p/owasp-top-ten --json --output "$EVIDEN
 syft "dir:." -o cyclonedx-json="$EVIDENCE_DIR/source-sbom.json"
 ```
 
-Build each image in the protected workflow, then generate image SBOM, scan by digest, and sign/attest with keyless workload identity. Release passes only when there is no unresolved exploitable Critical/High finding. An exception is a signed record bound to CVE/rule, exact digest, owner, compensating control and expiry; expiry or digest change blocks.
+Build each image in the protected workflow, then generate image SBOM, scan by digest, and sign/attest with keyless workload identity. For Control Plane, provenance binds the frozen Node 24/pnpm 10 build stage、OpenAPI contract digest、Web bundle digest and Go binary digest to one final image digest；filesystem inspection requires the binary and `/opt/aiops/web` and rejects Node/pnpm、MSW、Service Worker、source map、frontend source/dev dependencies. No separate Web image is built or signed. Release passes only when there is no unresolved exploitable Critical/High finding. An exception is a signed record bound to CVE/rule, exact digest, owner, compensating control and expiry; expiry or digest change blocks.
 
 - [ ] **Step 3: Implement admission and signature verification**
 
-Kubernetes admission denies mutable/unqualified images, missing digest, unsigned/untrusted provenance, prohibited security contexts, host access, missing resources and service-account-token automount. Signature policy trusts only the protected repository/workflow subject and expected OIDC issuer.
+Kubernetes admission denies mutable/unqualified images, missing digest, unsigned/untrusted provenance, prohibited security contexts, host access, missing resources, service-account-token automount, an independent Web/BFF workload/service/identity/ingress or an unexpected Node sidecar. Signature policy trusts only the protected repository/workflow subject and expected OIDC issuer.
 
 Test in a disposable cluster:
 
@@ -278,7 +284,9 @@ Expected: FAIL until the gate schema is complete.
 
 - [ ] **Step 2: Implement DAST and protocol abuse suites**
 
-Run ZAP against the public API with an allowlisted test identity and passive plus bounded active rules. Browser tests assert CSP, frame denial, MIME protection, Referrer-Policy, strict CORS, memory-only tokens, logout cleanup, no sensitive URL/query state, safe Evidence rendering and no secret in network response.
+Run ZAP against the public API with an allowlisted test identity and passive plus bounded active rules. Browser tests enter through the packaged Control Plane image's TLS ingress and assert CSP, frame denial, MIME protection, Referrer-Policy, exact same-origin CORS with no wildcard, memory-only tokens, logout cleanup, no sensitive URL/query state, safe Evidence rendering and no secret in network response. They verify `/api/v1/browser-config` is anonymous、closed-schema、public-only、`no-store`, and that no Vite/Node server、Service Worker/MSW、source map、separate Web/BFF origin or direct Runner/backend request exists.
+
+Rolling security tests keep an N browser session active during N→N+1 and require N/N-1 API compatibility. A forced stale hashed-chunk failure must disable every high-risk mutation control, show a persistent safe-reload prompt and emit no mutation request；reload recovery must not replay any prior mutation or Idempotency-Key.
 
 Runner/Action abuse tests include replay, invalid certificate chains, wrong Realm/audience, clock skew, oversized frames, malformed protobuf/JSON, slowloris, endpoint/SQL/shell/payload injection, approval hash substitution, target drift, duplicate claim, verifier spoofing and forced crash.
 

@@ -12,7 +12,7 @@
 
 - 每个 Task 严格采用 Red → Green → Refactor：先运行并保存预期失败，再做最小生产实现，复跑指定测试后才允许重构和提交。
 - Human OIDC 与 workload mTLS 是独立 trust domains；人的 bearer 不能调用 Runner routes，workload certificate 不能调用 human management API。
-- Keycloak 使用 production mode、HTTPS、固定 issuer/hostname/audience/client；缺 issuer/JWKS/realm/client 配置立即关闭 human API。
+- Keycloak 使用 production mode、HTTPS 与 Phase 1 固定契约：issuer 精确匹配、API audience `aiops-control-plane`、browser public client/authorized party `control-plane-web`；缺 issuer/JWKS/realm/client/audience/authorized-party 配置立即关闭 human API。
 - 浏览器使用 `login-required` + Authorization Code/PKCE；access/refresh token 只存内存，不进 localStorage/sessionStorage/IndexedDB/cookie/log。
 - 服务不使用共享 static token/AppRole Secret；只用 audience-bound、短期 projected Kubernetes JWT 登录 Vault。
 - mTLS private key 在进程内生成且不可导出，CSR 由 Vault PKI 签名；不得让 Vault 生成并返回 private key。
@@ -237,15 +237,16 @@ git commit -m "feat(identity): issue short production workload certificates"
 - Create: `test/integration/keycloak/oidc_test.go`
 
 **Interfaces:**
-- Consumes: fixed issuer/audience/client/realm, HTTPS JWKS and server-side permission mapping.
+- Consumes: Phase 1 `GET /api/v1/browser-config` safe projection and explicit `AIOPS_OIDC_ISSUER`、`AIOPS_OIDC_API_AUDIENCE`、`AIOPS_OIDC_AUTHORIZED_PARTY`、`AIOPS_WEB_OIDC_URL`、`AIOPS_WEB_OIDC_REALM`、`AIOPS_WEB_OIDC_CLIENT_ID` contract；HTTPS JWKS and server-side permission mapping.
 - Produces: authenticated Subject, `auth_time` recent-auth gate, effective actions and memory-only browser session.
-- Safety: no Keycloak admin credential/runtime role-name inference/token persistence.
+- Safety: browser config contains only public URL/realm/client ID；no Keycloak admin credential、client secret、runtime role-name inference or token persistence.
 
 - [ ] **Step 1: Write failing OIDC/browser tests**
 
 ```go
 func TestKeycloakValidatorRequiresExactIssuerAudienceAZPNonceTimeAndAlgorithm(t *testing.T)
 func TestKeycloakValidatorRejectsJWKSStaleUnknownKIDAndIssuerOutage(t *testing.T)
+func TestKeycloakContractPinsAPIAudienceAndBrowserAuthorizedParty(t *testing.T)
 func TestPlatformDecisionsRequireAuthTimeWithinFiveMinutes(t *testing.T)
 func TestPermissionsAreExplicitAndEffectiveActionsServerComputed(t *testing.T)
 func TestKeycloakRealmUsesProductionTLSStrictHostnameAndNoDirectGrant(t *testing.T)
@@ -253,6 +254,7 @@ func TestKeycloakRealmUsesProductionTLSStrictHostnameAndNoDirectGrant(t *testing
 
 ```tsx
 it('uses keycloak-js 26.2.4 login-required and authorization code PKCE')
+it('loads the closed no-store browser config before Keycloak initialization')
 it('keeps tokens out of every browser persistence API and application cookie')
 it('fails closed when production OIDC configuration is absent')
 ```
@@ -268,11 +270,11 @@ Expected: FAIL because production Keycloak contract is incomplete.
 
 - [ ] **Step 3: Implement strict server validation**
 
-Permit only asymmetric `RS256|ES256` configured algorithm, exact HTTPS issuer, audience and authorized party；validate exp/nbf/iat/auth_time with 60s skew, nonce/state/PKCE at browser boundary and KID from fresh TLS JWKS. JWKS cache max age 5m and cannot serve past key-set validity during outage. Map subject/groups to internal permissions through versioned server policy；never trust token-provided effective actions.
+Permit only asymmetric `RS256|ES256` configured algorithm, exact HTTPS issuer, exact API audience `aiops-control-plane` and exact `azp`/authorized party `control-plane-web`；validate exp/nbf/iat/auth_time with 60s skew, nonce/state/PKCE at browser boundary and KID from fresh TLS JWKS. Reject the former ambiguous single-client configuration and any wildcard/missing `aud` or `azp`. JWKS cache max age 5m and cannot serve past key-set validity during outage. Map subject/groups to internal permissions through versioned server policy；never trust token-provided effective actions.
 
 - [ ] **Step 4: Pin production realm/client and browser flow**
 
-Realm export has access type public, standard flow enabled, implicit/direct grants/password grants disabled, exact redirect/post-logout origins, WebAuthn/MFA policy for operators, brute-force protection, session idle/max, audit events and no embedded user/password. Keycloak starts `kc.sh start`, not dev mode. Browser initializes once with `onLoad:'login-required'`, `pkceMethod:'S256'`, refreshes before API and clears memory on logout/error.
+Realm export defines `control-plane-web` as a public client with standard flow enabled and an audience mapper for `aiops-control-plane`; implicit/direct grants/password grants are disabled, redirect/post-logout URIs and Web Origins are exact, and WebAuthn/MFA policy、brute-force protection、session idle/max、audit events are enabled with no embedded user/password. Keycloak starts `kc.sh start`, not dev mode. Browser first fetches the closed `Cache-Control: no-store` `/api/v1/browser-config`, then initializes once with `onLoad:'login-required'`, `pkceMethod:'S256'`, refreshes before API and clears memory on logout/error；missing/malformed runtime config fails closed.
 
 - [ ] **Step 5: Run real Keycloak tests**
 
@@ -282,7 +284,7 @@ pnpm --dir web test -- --run src/app/auth/keycloak.test.ts
 go test -tags=integration ./test/integration/keycloak -count=1 -timeout=15m
 ```
 
-Expected: PASS using Keycloak Server 26.6.3 production mode and TLS issuer.
+Expected: PASS using Keycloak Server 26.6.3 production mode, TLS issuer, exact `aud=aiops-control-plane`/`azp=control-plane-web`, and the Phase 1 safe browser-config projection.
 
 - [ ] **Step 6: Commit human identity**
 

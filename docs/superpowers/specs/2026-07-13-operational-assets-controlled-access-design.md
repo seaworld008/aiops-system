@@ -17,6 +17,7 @@
 - 主动调查由告警、事件或预批准定时策略触发；每次运行生成新的短期授权。
 - 主动调查只执行已发布的类型化只读能力，并且最多生成 append-only `PROPOSAL_ONLY` ActionProposal；ActionProposal 本身没有执行权，Phase 4 也不存在 ActionPlan mutation。只有经认证的人另行发起、服务端重新派生并封存独立不可变 ActionPlan，且逐 Action 类型通过当前策略/门禁、最近 OIDC 认证、职责分离审批、一次性短凭据、类型化 WRITE Runner、独立验证和完整审计后，才可在生产 Canary 与发布门内执行。
 - 前端采用已确认的企业运维控制台视觉：浅色高密度工作区、克制蓝色操作色、表格与主从详情，不使用聊天框、AI 头像、霓虹、发光或玻璃拟态。
+- 前端应用平台固定为 React/TypeScript/Vite 与 TanStack Router/Query/Table；Go Control Plane 以同一 Origin 提供 API 和编译后的 SPA，并在同一生产镜像中携带 `web/dist`，生产环境不运行 Node、Vite 或独立 BFF。
 
 ## 2. 当前事实与设计动机
 
@@ -598,6 +599,26 @@ Runner 只能领取与自身 workload identity、证书、Scope Revision 和 Rea
 
 浏览器只访问 Control Plane API，不访问内部 mTLS Runner API。
 
+浏览器在初始化 OIDC 之前匿名读取 `GET /api/v1/browser-config`。该响应使用 `Cache-Control: no-store`，所有对象均为 closed schema（`additionalProperties: false`），且只允许以下公开字段：
+
+```json
+{
+  "oidc": {
+    "url": "https://identity.example.com",
+    "realm": "aiops",
+    "client_id": "control-plane-web"
+  },
+  "api_base_path": "/api/v1",
+  "build": {
+    "version": "1.0.0",
+    "commit": "immutable-commit",
+    "contract_digest": "sha256:..."
+  }
+}
+```
+
+Browser Config 不得包含 Client Secret、Token、Credential Reference、Vault 路径、私有 Endpoint、任意 Header 或其他运行时扩权材料；缺失、额外字段或格式错误时前端 fail closed。浏览器公共 Client 固定为 `control-plane-web`，Go API 的 exact audience 固定为 `aiops-control-plane`，服务端必须分别验证 `iss`、`aud`、`azp` 和 `auth_time`，不能把浏览器 Client ID 同时当作模糊 API audience。
+
 ### 12.1 Assets 与发现
 
 ```text
@@ -855,6 +876,15 @@ PRODUCTION_RELEASE_DECIDE
 所有路由都继承 Workspace/Environment 上下文；不属于当前 Scope 的深链接返回可审计的 `403/404` 安全投影，不泄露对象是否存在。
 
 `/connections/new` 只负责选择 Provider 并调用服务端创建 `DRAFT` revision；成功后立即以 history replace 跳转到 `/connections/:connectionId/revisions/:revision`。连接修订、步骤、Operation 和验证事实只存在于 canonical ID/revision 路由，不能形成第二套浏览器草稿状态源。
+
+#### 应用平台与部署契约
+
+- 唯一前端工程为 `web/`，运行时依赖固定为 React 19、TypeScript 7、Vite 8、TanStack Router/Query/Table、React Hook Form、Zod、Radix、lucide-react 与 CSS Modules。应用模块按 `app → features → shared` 单向依赖：`app` 负责 bootstrap/provider/router/AppShell/auth/scope/config，`features` 只实现纵向领域切片，`shared` 只包含 API、UI 和纯工具；feature 之间不得直接导入页面或组件，只能通过 typed route、稳定 ID 和共享契约协作。
+- 所有 HTTP/SSE 访问只能由 `web/src/shared/api/` 发起；低层 transport 保持私有，feature adapter 必须使用唯一 `api/openapi/control-plane-v1.yaml` 生成的 `paths/operations` 类型，禁止直接 `fetch`、字符串路径泛型请求和手写重复 DTO。RFC 9457 Problem、稳定 `code`/`trace_id`、Scope-aware query key 和公共 Operation 投影在 Phase 1 建立，后续页面只能复用或扩展。
+- URL 保存非敏感的 Workspace/Environment、筛选、排序、Cursor、Tab、选中对象、时间窗和 Operation ID；TanStack Query 只保存服务端状态且每个 key 必须含 Scope，切换 Scope 时取消并清除旧查询且不持久化缓存；React Hook Form + Zod 保存临时表单状态；抽屉、焦点和展开等短生命周期状态留在组件本地。Context 只承载 auth、scope 和 theme，不引入 Redux、Zustand 或第二套客户端事实源。
+- 共享 UI 基线必须提供 `DataTable`、`ProblemPanel`、`OperationTimeline`、`EffectiveActionGate`、`ETagConflictReview` 和 `ReauthBoundary`。权限只来自资源 DTO 的 `effective_actions`；治理 mutation 只接受服务端确认，不做 optimistic update，不自动重试或重放副作用，并以 `Idempotency-Key`、`ETag/If-Match`、最近认证和持久 Operation 处理并发与恢复。
+- Vite 只用于本地开发和静态构建。生产镜像同时包含 Go Control Plane 二进制和位于 `/opt/aiops/web` 的 `web/dist`；同一 Go HTTP 进程、同一 Origin 提供 `/api/*` 与 SPA，不部署独立 Web Service/身份，不开放宽泛 CORS，也不运行 Node、`vite preview`、Next.js、Remix 或 Node BFF。`/api/*`、`/healthz`、`/readyz` 永不进入 SPA fallback；仅前端 GET/HEAD 路由回退 `index.html`，入口不缓存、哈希资源使用 immutable 缓存，静态产物缺失时生产 readiness fail closed。
+- 不采用微前端。AI 体验坚持 evidence-first：Investigation、Evidence、ActionProposal、ActionPlan、Operation、Receipt 和 Audit 是可深链、可复核的领域对象；不建立全局聊天入口、AI Actor 隐喻或绕过治理链的自然语言执行面。
 
 ### 14.2 已确认页面
 
@@ -1156,10 +1186,13 @@ production_release_wave_total
 ### 19.6 前端
 
 - OpenAPI 合同、TypeScript、组件、MSW、Playwright 与 axe 全部通过。
+- `app → features → shared` 导入边界、仅 `shared/api` 网络访问、OpenAPI 生成类型无漂移和无手写 DTO 由静态检查强制执行。
+- 生产 E2E 通过 Go 同源入口加载 Browser Config、OIDC、SPA 和 API；最终 Control Plane 镜像包含 `/opt/aiops/web` 且不包含 Node、Vite server、MSW、source map 或独立 BFF 运行时。
 - 1440px、1024px、390px 视觉回归覆盖中文、英文和长文本。
 - URL 保存筛选/排序/分页/选中项，刷新与分享可恢复相同视图。
 - 无权限、重新认证、部分成功、数据陈旧、DLP、预算耗尽、Kill Switch 和撤销不确定均有独立状态。
 - 浏览器响应和日志中不存在 Secret、Token、PEM、DSN 或 Vault 内部路径。
+- 治理 mutation 不 optimistic、不自动重试；Scope 切换清理旧 Query，滚动发布 chunk 加载失败时禁用高风险 mutation、持久提示安全刷新且不重放请求。
 - Incident、ActionPlan、Audit、Production Release 深链接在刷新/后退后恢复同一 Scope/Operation；审批、执行、验证、UNKNOWN、回滚和 Receipt 均有独立高保真状态且无聊天/终端/AI Actor 隐喻。
 
 ### 19.7 端到端验收场景
@@ -1193,7 +1226,7 @@ production_release_wave_total
 7. **受治理生产动作闭环**：只对逐项审核的 Kubernetes、GitOps、AWX 固定 Action 开放生产执行，完整绑定不可变计划、策略、重新认证、人工审批、短期凭据、执行后验证、对账/回滚和人工升级。
 8. **生产上线与持续运营**：容量与压力、故障与混沌、灾备恢复、安全合规、分批发布、值班归属、SLO 和完整生产验收。
 
-每个子计划都必须按“数据库/领域 → Control Plane API → 前端页面 → 生产装配/运维 → 审计与安全测试 → 端到端验收”的纵向切片交付，不能先连续建设全部后端再集中补前端。第一个子计划同时建立前端工程骨架、应用壳层、设计 Token、合同生成、MSW 和 Playwright/axe 基线；后续页面复用同一体系，不再创建新的视觉分支。实施文档采用“总索引 → 阶段索引 → 小任务包”，避免单个超大文件，同时每个任务包保留完整依赖、TDD、验证和提交边界。
+每个子计划都必须按“数据库/领域 → Control Plane API → 前端页面 → 生产装配/运维 → 审计与安全测试 → 端到端验收”的纵向切片交付，不能先连续建设全部后端再集中补前端。第一个子计划同时建立前端工程骨架、应用壳层、设计 Token、runtime Browser Config、类型化合同客户端、共享 Operation/UI、Go SPA 服务、MSW 和 Playwright/axe 基线；后续页面复用同一体系，不再创建新的视觉分支。Phase 6/8 将 `web/dist` 固定装入唯一 Control Plane 生产镜像并验证无 Node 运行时。实施文档采用“总索引 → 阶段索引 → 小任务包”，避免单个超大文件，同时每个任务包保留完整依赖、TDD、验证和提交边界。
 
 迁移兼容规则：
 
@@ -1211,6 +1244,8 @@ production_release_wave_total
 - 模型选择 Endpoint、Credential、Network、Runner 或任意工具参数。
 - 主动策略直接执行生产变更。
 - 将 VictoriaMetrics ingestion endpoint 暴露为 Agent 写能力。
+- 独立 Node Web 生产运行时、Next.js/Remix、Node BFF、微前端或第二套 SPA 工程。
+- Redux/Zustand 等并行客户端事实源，以及绕过 Evidence/Plan/Approval/Audit 的全局 AI 聊天执行入口。
 
 ## 22. 文档持久化要求
 

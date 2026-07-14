@@ -4,7 +4,7 @@
 
 **Goal:** 用真实 OIDC、真实 PostgreSQL、浏览器 E2E、视觉/无障碍/安全测试、指标、备份恢复、HA 演练和持久化文档完成资产阶段的生产验收。
 
-**Architecture:** 单元/组件测试使用 fake/MSW；full-stack Playwright 使用真实 PostgreSQL 18.4、真实 Control Plane 和真实 Keycloak OIDC 流，不拦截业务 API。独立 projection 项目才拦截安全 DTO，以获得确定的视觉/异常投影。CI 串行验证 OpenAPI 生成漂移、Go/数据库、前端、浏览器和构建产物；运维 Runbook 覆盖扩展迁移、滚动发布、指标告警、恢复与应用回滚。
+**Architecture:** 单元/组件测试使用 fake/MSW；full-stack Playwright 通过同一个 Go Control Plane Origin 访问生产 `web/dist`、真实 API/PostgreSQL 18.4 和真实 Keycloak OIDC 流，不拦截业务 API。独立 projection 项目只拦截认证后的安全 DTO，以获得确定的视觉/异常投影。CI 串行验证 OpenAPI 生成漂移、Go/数据库、前端、浏览器和单制品交付；运维 Runbook 覆盖扩展迁移、N/N-1 滚动发布、指标告警、恢复与应用回滚。
 
 **Tech Stack:** Go 1.26.5、PostgreSQL 18.4、Prometheus client_golang 1.23.2、Node 24、pnpm 10.34.0、Keycloak Server 26.6.3 test realm、keycloak-js 26.2.4、Playwright 1.61.1、axe 4.12.1、GitHub Actions。
 
@@ -13,6 +13,7 @@
 - 前置任务：依次完成 [01-schema-domain.md](./01-schema-domain.md)、[02-repository-discovery.md](./02-repository-discovery.md)、[03-mapping-auth-api.md](./03-mapping-auth-api.md)、[04-web-foundation-assets.md](./04-web-foundation-assets.md)、[05-source-ingestion-csv-api.md](./05-source-ingestion-csv-api.md)、[06-source-external-cmdb.md](./06-source-external-cmdb.md)、[07-source-vsphere.md](./07-source-vsphere.md)、[08-source-proxmox-openstack-cloud.md](./08-source-proxmox-openstack-cloud.md)、[09-discovery-worker-ha-e2e.md](./09-discovery-worker-ha-e2e.md) 与 [10-overview-control-room.md](./10-overview-control-room.md)。
 - fake、MSW、测试 Keycloak 用户和业务 fixture 只允许出现在 `_test.go`、`web/src/test`、`web/e2e`、`deploy/test`；production bundle/镜像不得包含。
 - 浏览器生产入口仍使用真实 OIDC login-required + PKCE；E2E 也必须经过真实 Keycloak 授权码流，不能把 Token 写入 storage/cookie 模拟认证。
+- 两个 E2E 项目都先构建 `web/dist`，再由 Go Control Plane 同源服务 Browser Config、SPA 和 API；禁止用 Vite/`vite preview` 代表生产拓扑。
 - Keycloak 自身 OIDC 会话 Cookie 不等于应用 Token 持久化；测试不得保存 Playwright `storageState`，每个上下文重新认证。
 - 集成/E2E 使用合成低敏数据；禁止复制生产备份、Secret、Token、DSN、endpoint、原始 Provider Payload 或错误正文到仓库/快照/日志。
 - 指标、日志、Trace 和截图不得使用租户/Subject/资产/外部 ID 作为标签或文件名。
@@ -151,7 +152,7 @@ git commit -m "feat(assetcatalog): add production telemetry"
 - Modify: **web/package.json**
 
 **Interfaces:**
-- Both E2E projects use production `web/src/main.tsx`, Keycloak Server 26.6.3 and browser `keycloak-js` 26.2.4. `full-stack` reaches the real Control Plane/PostgreSQL and forbids business request interception; `projection` may intercept `/api/v1` only for deterministic visual/error states.
+- Both E2E projects use production `web/src/main.tsx` served by Go, Keycloak Server 26.6.3 and browser `keycloak-js` 26.2.4. `full-stack` reaches the real Control Plane/PostgreSQL and forbids business request interception; `projection` may intercept authenticated business `/api/v1` routes only for deterministic visual/error states and must not intercept Browser Config or OIDC.
 - `realm-export.json` defines a public PKCE client with exact localhost redirect origins and synthetic VIEWER/SRE/SERVICE_OWNER/ADMIN users; `bootstrap-users.sh` reads passwords from CI environment with `set +x`, so credentials are not stored in JSON/logs.
 - No E2E-only authentication branch exists in production code.
 
@@ -179,15 +180,18 @@ Run: `corepack pnpm@10.34.0 --dir web test:e2e`
 
 Expected: FAIL because Playwright/Keycloak fixtures and specs do not exist.
 
-- [ ] **Step 2: Configure deterministic real OIDC and browser fixtures**
+- [ ] **Step 2: Configure deterministic real OIDC and the same-origin production server**
 
-Start the pinned test Keycloak container with imported realm, wait on OIDC discovery health, and launch Vite with:
+Start the pinned test Keycloak container with imported realm and wait on OIDC discovery health. Build `web/dist`, then launch the real Go Control Plane with that directory as `AIOPS_WEB_ROOT`; browser navigation, Browser Config and `/api/v1` use one Control Plane Origin. Configure the explicit browser/API split:
 
 ~~~text
-VITE_OIDC_URL=http://127.0.0.1:18080
-VITE_OIDC_REALM=aiops-e2e
-VITE_OIDC_CLIENT_ID=control-plane-web-e2e
-VITE_API_BASE_URL=
+AIOPS_OIDC_ISSUER=http://127.0.0.1:18080/realms/aiops-e2e
+AIOPS_OIDC_API_AUDIENCE=aiops-control-plane
+AIOPS_OIDC_AUTHORIZED_PARTY=control-plane-web-e2e
+AIOPS_WEB_OIDC_URL=http://127.0.0.1:18080
+AIOPS_WEB_OIDC_REALM=aiops-e2e
+AIOPS_WEB_OIDC_CLIENT_ID=control-plane-web-e2e
+AIOPS_WEB_ROOT=<absolute-path-to-web/dist>
 ~~~
 
 `loginWithOIDC` creates a fresh browser context, navigates through the real login page, fills credentials from process environment, verifies return to the app and deletes the context at test end. Do not use `storageState`, URL Token, app cookie, storage or fake Keycloak object. OIDC IdP cookies may exist only inside that fresh context.
@@ -196,7 +200,7 @@ Playwright defines two projects:
 
 ~~~text
 full-stack: real Keycloak -> production web -> real Control Plane -> PostgreSQL 18.4
-projection: real Keycloak -> production web -> typed Playwright API routes
+projection: real Keycloak -> Go-served production web -> typed authenticated Playwright API routes
 ~~~
 
 `deploy/test/postgres/asset-fixtures.sql` applies constraint-valid synthetic scopes/sources/assets/conflicts. The full-stack project verifies DB/audit/outbox changes after UI mutations and fails if `/api/v1` interception is registered.
@@ -223,6 +227,8 @@ Source E2E: create opaque Integration reference; 202 sync; URL run resume; queue
 
 Negative E2E: 401 re-login; non-enumerating 403/404; malformed Problem; 503 persistent state; offline retry; slow response cancellation on Scope switch; duplicate click produces one Idempotency-Key mutation.
 
+Rolling-release E2E serves an N page with an unavailable hashed chunk and proves the application shows a persistent safe-reload prompt, disables governance/high-risk Mutation entry, preserves a visible uncertain-state explanation, and never automatically reloads or replays a submitted Mutation. The same suite runs N browser assets against N-1 API and N-1 assets against N API for every Phase 1 operation; incompatible OpenAPI changes fail the rollout gate.
+
 - [ ] **Step 4: Add visual and WCAG 2.2 AA gates**
 
 For assets/mapping/sources capture deterministic light-theme snapshots at `1440x1000`、`1024x768`、`390x844`. Freeze clock and mask only server-generated UUID/time values, not layout/status/actions. Commit Linux Chromium snapshots.
@@ -231,7 +237,7 @@ Run axe on shell, table, drawer/dialog, forms, conflict comparison, timeline, em
 
 - [ ] **Step 5: Scan the production bundle**
 
-`check-production-bundle.mjs` fails if `dist/` contains E2E credentials/realm fixture, MSW worker, source map, `localStorage`/`sessionStorage`/`indexedDB`, hard-coded Bearer, client secret, forbidden field labels, or non-hashed JS/CSS names. It also checks `index.html` has no inline script and documents required deployment CSP: `default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' <OIDC-origin>; frame-ancestors 'none'; base-uri 'none'; form-action <OIDC-origin>`.
+`check-production-bundle.mjs` fails if `dist/` contains E2E credentials/realm fixture, MSW/service worker, source map, persistence APIs, hard-coded Bearer, Client Secret, forbidden field labels, non-hashed JS/CSS or inline script. Browser security specs call the Go server and assert Browser Config/index are `no-store`, hashed assets are immutable, reserved paths never SPA-fallback, no wildcard CORS exists, and CSP is `default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' <OIDC-origin>; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action <OIDC-origin>`.
 
 Run:
 
@@ -266,12 +272,13 @@ git commit -m "test(web): verify asset operations end to end"
 **Interfaces:**
 - Produces required commands: `pnpm --dir web generate:api`、`typecheck`、`lint`、`test`、`build`、`test:e2e`、`check`.
 - `web check` serially runs generated API drift, typecheck, lint, unit tests and build.
+- Produces a Phase 1 handoff artifact containing one Control Plane binary plus its `web/dist`; Node/pnpm remain CI build tools and are not runtime contents. Phase 6 later packages this exact topology into the production image.
 - Scripts accept DSNs/credentials only through environment; `set -x` is forbidden and logs are sanitized.
 
 - [ ] **Step 1: Write failing CI/Makefile shape tests**
 
 ~~~bash
-rg -n 'web-check|web-e2e|verify-asset-backup|verify-asset-ha' Makefile
+rg -n 'web-check|web-e2e|control-plane-artifact|verify-asset-backup|verify-asset-ha' Makefile
 rg -n 'node-version: 24|pnpm.*10.34.0|postgres:18|test:e2e|generate:api:check' .github/workflows/ci.yml
 ~~~
 
@@ -288,13 +295,15 @@ Order:
 5. Node 24 + pnpm 10 frozen install;
 6. `pnpm --dir web check`;
 7. Playwright browser install from lock + real Keycloak E2E;
-8. bundle/SBOM/artifact checks.
+8. bundle/SBOM checks and `control-plane-artifact`: package only the Go binary plus verified `web/dist`, then assert the artifact has no Node/pnpm/dev dependency/MSW/source map or second Web process.
 
 Cache only Go modules/build and pnpm store keyed by lockfile; never cache browser storage, Token, DB volume or test credentials. Upload reports/screenshots only on failure after forbidden-string scan; retention is bounded.
 
 - [ ] **Step 3: Exercise rolling and failure behavior**
 
 `verify-asset-ha.sh` starts two Control Plane replicas against PostgreSQL, sends concurrent idempotent create/update/sync/decision requests through a round-robin proxy, kills one replica mid-request, and asserts exactly one domain mutation/audit/outbox result. It then interrupts a Source Run, verifies durable Queue lease/fence、single-nonterminal constraint and transaction row-lock recovery, and confirms no process-local/advisory discovery ownership state is required. Transaction advisory locking remains only inside the Idempotency-Key ledger.
+
+Both replicas serve their own immutable hashed assets and identical Browser Config/API contracts through the same proxy Origin. The rollout test keeps N and N-1 assets available for the drain window, exercises both browser/API pairings, and forbids removal of an old asset or API shape until N-1 clients are outside the supported window.
 
 Compatibility matrix:
 
@@ -304,6 +313,9 @@ new app + schema 000014: health available; asset routes 503 migration_required
 new app + schema 000015: assets enabled
 mixed old/new replicas + schema 000015: legacy and new reads safe; writes route only to ready new replicas
 app rollback + populated 000015: schema retained; no down
+N browser assets + N-1 API: every registered Phase 1 operation remains compatible
+N-1 browser assets + N API: reads and governed writes remain compatible
+missing hashed chunk: persistent safe-reload prompt; high-risk Mutation disabled; no automatic replay
 ~~~
 
 - [ ] **Step 4: Automate backup and restore verification**
