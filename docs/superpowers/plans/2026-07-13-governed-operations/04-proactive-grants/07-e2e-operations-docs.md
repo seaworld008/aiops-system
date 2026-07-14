@@ -414,10 +414,10 @@ Expected: 无 trailing whitespace、冲突标记或 malformed patch。
 
 - [ ] **Step 7: 执行独立 worktree 全量验证并保存事实**
 
-必须在 main@ad50d9f 创建、且模块根下不含嵌套 .worktrees 的独立 worktree 执行。当前共享主目录的用户 worktree 会被架构测试扫描，不能在那里声称全绿，更不能删除它们。
+必须在 commit `ad50d9f`（当时的 `main` 基线）创建、且模块根下不含嵌套 `.worktrees` 的独立 worktree 执行。当前共享主目录的用户 worktree 会被架构测试扫描，不能在那里声称全绿，更不能删除它们。
 
 ~~~bash
-gofmt -w $(git diff --name-only --diff-filter=ACM main@ad50d9f -- '*.go')
+git diff --name-only --diff-filter=ACM -z ad50d9f -- '*.go' | xargs -0 gofmt -w
 go test -race -shuffle=on -count=1 ./...
 go vet ./...
 go build ./cmd/control-plane ./cmd/worker ./cmd/read-runner ./cmd/write-runner ./cmd/executor
@@ -443,7 +443,7 @@ Run: go test ./internal/proactivepolicy ./internal/investigationgrant/... ./inte
 
 Expected: PASS。
 
-Run: git status --short && git diff --stat main@ad50d9f
+Run: git status --short && git diff --stat ad50d9f
 
 Expected: 只有本计划列出的实现、测试、生成类型、截图与文档；无 Secret、临时文件、数据库 dump、Playwright trace/video 或未声明二进制。
 

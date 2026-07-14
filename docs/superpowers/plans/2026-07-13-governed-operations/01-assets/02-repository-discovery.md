@@ -37,15 +37,17 @@
 - Create: **internal/assetcatalog/postgres/repository.go**
 - Create: **internal/assetcatalog/postgres/scope.go**
 - Create: **internal/assetcatalog/postgres/assets.go**
+- Create: **internal/assetcatalog/postgres/read_models.go**
 - Create: **internal/assetcatalog/postgres/manual_run.go**
 - Create: **internal/assetcatalog/postgres/scan.go**
 - Create: **internal/assetcatalog/postgres/assets_test.go**
+- Create: **internal/assetcatalog/postgres/read_models_test.go**
 - Create: **internal/assetcatalog/postgres/manual_run_test.go**
 - Create: **internal/assetcatalog/postgres/assets_integration_test.go**
 
 **Interfaces:**
-- Consumes: `assetcatalog.Repository`、`pgxpool.Pool`、现有 `audit_records` 和 `outbox_events`。
-- Produces: `postgres.New(*pgxpool.Pool, func() time.Time, func() string) (*Repository, error)`；该对象同时实现 `assetcatalog.Reader`、`ScopeResolver` 和资产写仓储，并由私有 `ManualRunExecutor` 构造唯一的同步 MANUAL validation/mutation fence；它不导出任意 token/fence factory。
+- Consumes: `assetcatalog.Repository`、Task 2 immutable `ManualProfileV1()`、`pgxpool.Pool`、现有 `audit_records` 和 `outbox_events`。
+- Produces: `postgres.New(*pgxpool.Pool, func() time.Time, func() string) (*Repository, error)`；该对象同时实现 `assetcatalog.Reader`、`AssetReadRepository`、`ScopeResolver` 和资产写仓储，并由私有 `ManualRunExecutor` 构造唯一的同步 MANUAL validation/mutation fence；它不导出任意 token/fence factory。
 - Transaction rule: 资产、Observation、Type Detail、Audit、Outbox 和幂等结果必须在同一 `SERIALIZABLE` 事务提交；任何一步失败全部回滚。
 
 - [ ] **Step 1: Write failing SQL-shape and repository contract tests**
@@ -92,6 +94,8 @@ func TestAssetListUsesStableKeysetOrder(t *testing.T) {
 	}
 }
 ~~~
+
+The Red suite also asserts `GetReadModel/List` use one scoped query with Source、ACTIVE Service bindings、safe provenance/relation counts and explicit neutral operational summaries；the List statement returns server-owned `ManualCreateEligible` from the exact Task 2 built-in profile + sole authority child + current binding closure in the requested Environment。A zero `AssetReadConstraint` is rejected before SQL，restricted-empty returns zero rows，and two allowed Service IDs return their union without leaking an unbound Asset。Mutating any filter/access/sort/Scope field must change the cursor QueryDigest.
 
 Run: `go test ./internal/assetcatalog/postgres -run 'TestAsset(Queries|List)' -count=1`
 
@@ -154,7 +158,7 @@ func (repository *Repository) ResolveScope(
 
 - [ ] **Step 3: Implement safe Get and keyset List**
 
-Use one explicit column list shared by `scanAsset`; never use `SELECT *`. The filter builder may select only these allow-listed columns: `kind`、`source_id`、`lifecycle`、`mapping_status`、`service_id` and an escaped display-name search. `limit` must be 1–100.
+Use one explicit core column list shared by `scanAsset`; never use `SELECT *`. `owner_group` scans into `*string` and NULL remains a persisted unknown, not a scan error or fabricated owner。The filter builder may select only `kind`、`source_id`、`lifecycle`、`mapping_status`、`service_id`、`criticality`、`data_classification` and escaped display-name search；`limit` is 1–100.
 
 ~~~go
 const assetColumns = `
@@ -162,7 +166,8 @@ a.id::text, a.tenant_id::text, a.workspace_id::text, a.environment_id::text,
 a.source_id::text, a.kind, a.provider_kind, a.external_id, a.display_name,
 a.lifecycle, a.mapping_status, a.owner_group, a.criticality,
 a.data_classification, a.labels, a.last_observation_id::text,
-a.last_observed_at, a.last_source_revision, a.version, a.created_at, a.updated_at`
+a.last_observation_chain_sha256, a.last_observed_at, a.last_source_revision,
+a.version, a.created_at, a.updated_at`
 
 const getAssetSQL = `SELECT ` + assetColumns + `
 FROM assets a
@@ -184,14 +189,27 @@ WHERE a.tenant_id = $1::uuid AND a.workspace_id = $2::uuid
         AND b.environment_id = a.environment_id AND b.asset_id = a.id
         AND b.service_id = $9 AND b.status = 'ACTIVE'
   ))
-  AND ($10::text IS NULL OR (lower(a.display_name), a.id) > ($10, $11::uuid))
+  AND ($10::text[] IS NULL OR a.criticality = ANY($10))
+  AND ($11::text[] IS NULL OR a.data_classification = ANY($11))
+  AND ($12::boolean OR EXISTS (
+      SELECT 1 FROM service_asset_bindings access_binding
+      WHERE access_binding.tenant_id = a.tenant_id
+        AND access_binding.workspace_id = a.workspace_id
+        AND access_binding.environment_id = a.environment_id
+        AND access_binding.asset_id = a.id
+        AND access_binding.service_id = ANY($13::uuid[])
+        AND access_binding.status = 'ACTIVE'
+  ))
+  AND ($14::text IS NULL OR (lower(a.display_name), a.id) > ($14, $15::uuid))
 ORDER BY lower(a.display_name), a.id
-LIMIT $12`
+LIMIT $16`
 ~~~
 
-Add a second constant `listAssetsLastObservedSQL` with the same selected columns, filters, and scope, but keyset predicate `($10::timestamptz IS NULL OR (a.last_observed_at,a.id) < ($10,$11::uuid))` and `ORDER BY a.last_observed_at DESC,a.id DESC`. Select between the two constants with an exhaustive `switch` on `AssetSort`; never interpolate a client sort/direction into SQL.
+Add `listAssetsLastObservedSQL` with identical projection/filters/scope/access but keyset predicate `($14::timestamptz IS NULL OR (a.last_observed_at,a.id) < ($14,$15::uuid))` and order `a.last_observed_at DESC,a.id DESC`. Select by exhaustive `AssetSort` switch；never interpolate client sort/direction。Validate `AssetReadConstraint` before SQL；`$12=true` is only its initialized unrestricted form，while restricted-empty uses `$12=false,$13='{}'` and therefore returns no rows。Client `Filter.ServiceID=$9` never replaces this authorization predicate.
 
-`List` requests `limit+1`, removes the sentinel row, and derives `Next` from either `(strings.ToLower(DisplayName),ID)` or `(LastObservedAt.UTC().Format(time.RFC3339Nano),ID)`. It rejects a cursor whose embedded sort differs from the request, copies every labels map before returning, and supports no offset. Add table tests for both sorts, empty/exact/next pages, equal sort-value UUID tie-breaks, wildcard escaping, maximum limit, and all filter combinations.
+`List` executes one `listAssetReadModelsSQL` statement built on that exact core query and joins same-Scope `asset_sources` plus a `LEFT JOIN LATERAL` aggregate of ACTIVE `service_asset_bindings→services` sorted/deduplicated by `(lower(service.name),service.id,binding_role)`。The same statement computes one collection `manual_create_eligible` bit with `EXISTS` over an exact `MANUAL/MANUAL_V1/MANUAL_V1` Source/Revision, its sole ordered authority child equal to the requested Environment, and `PublishedBindingEligible`-equivalent stored/SQL-recomputed closure；zero matching Sources returns false，one or more independently eligible Sources returns true，because no product/database contract makes MANUAL Source unique per Environment。No browser input participates。The write path still locks and revalidates the caller-selected exact `source_id`; the collection bit never chooses a Source or grants permission。It projects fixed `connection=NOT_CONFIGURED` and `capability=NOT_CONFIGURED,count=0` until their owned migrations extend the query。`GetReadModel` uses the same access predicate and one scoped statement that additionally loads the last Observation's allow-listed canonical field provenance and ACTIVE incoming/outgoing relation counts；Go decodes only the Task 2 safe summary fields and never returns document bytes。Core `Reader.Get` remains the narrow Phase 2 projection。Create/update/transition return `AssetDetailReadModel` from the same serializable transaction, so management needs no second Repository call.
+
+`List` canonicalizes exact Tenant/Workspace/Environment、normalized filters、the server access constraint and sort to Task 2 `QueryDigest`, requests `limit+1`, removes the sentinel row, and derives `Next` from either `(strings.ToLower(DisplayName),ID)` or `(LastObservedAt.UTC().Format(time.RFC3339Nano),ID)` plus that digest. It rejects sort/value-shape or digest mismatch before SQL, deep-copies every nested model, and supports no offset. Tests cover both sorts、equal tie-breaks、wildcard escaping、all filters、two-Service union、restricted-empty and cursor replay across Scope/filter/access/sort.
 
 - [ ] **Step 4: Write failing real-PostgreSQL transaction tests**
 
@@ -206,7 +224,7 @@ func TestCreateAssetIsReplaySafeAndAtomic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Receipt.AuditID == "" || first.Receipt.TraceID != command.TraceID || first.Receipt.IdempotentReplay {
+	if first.Receipt.AuditID == "" || first.Receipt.TraceID != command.Context.TraceID() || first.Receipt.IdempotentReplay {
 		t.Fatalf("first receipt = %#v", first.Receipt)
 	}
 	replay, err := repository.Create(context.Background(), command)
@@ -252,10 +270,10 @@ For every write:
 1. Validate command, canonical UUIDs, SHA-256 lowercase request hash, bounded reason, and UTC microsecond times before opening the transaction.
 2. Begin `pgx.Serializable`; resolve workspace/environment to a tenant within the transaction.
 3. Acquire the Workspace+Idempotency-Key transaction advisory lock, query the partial-unique asset audit ledger, and either return an identical scoped replay or reject a key/hash/operation conflict; then lock the governed asset using `FOR UPDATE`.
-4. On create, lock the existing same-Workspace `MANUAL/MANUAL` Source and its exact revision and require `ACTIVE + PUBLISHED + AVAILABLE` with all revision/gate/binding digests equal. Because `MANUAL_V1` is `SINGLE_ENVIRONMENT`, also resolve the revision's sole `AuthorityEnvironmentID` and require it to equal the command/path Environment exactly；same Workspace alone is insufficient. In this same serializable transaction, create and privately claim one `MANUAL_MUTATION` Run, allocate `CATALOG_SEQUENCE = source.checkpoint_version + 1`, build the allow-listed MANUAL document/provenance/fingerprint/fact/chain using database-owned Catalog time and the exact `manual-catalog-version.v1` Provider-version digest, insert its Observation, append revision `1` Type Detail, insert the `DISCOVERED` Asset, CAS the server-owned MANUAL logical checkpoint version (no ciphertext/key), and complete the Run under a private process-local fence. The command never supplies Observation、ProviderKind、Source revision、freshness、Catalog time、run/fence/checkpoint fields or canonical digests. Matching idempotent replay returns the original Asset/Run receipt without allocating another sequence or Run. Add a cross-Environment negative test proving an otherwise eligible Env-A Source cannot create an Env-B Asset and allocates no Run/sequence/audit row.
+4. On create, lock the existing same-Workspace `MANUAL/MANUAL_V1` Source、its exact revision and sole authority child，then compare every immutable profile semantic to Task 2 `ManualProfileV1()` and revalidate `ACTIVE + PUBLISHED + AVAILABLE` with all revision/gate/binding digests equal；Task 13 is not a dependency. Because the built-in profile is `SINGLE_ENVIRONMENT`, require the child Environment to equal the command/path Environment exactly；same Workspace alone is insufficient. In this same serializable transaction, create and privately claim one `MANUAL_MUTATION` Run, allocate `CATALOG_SEQUENCE = source.checkpoint_version + 1`, build the allow-listed MANUAL document/provenance/fingerprint/fact/chain using database-owned Catalog time and the exact `manual-catalog-version.v1` Provider-version digest, insert its Observation, append revision `1` Type Detail, insert the `DISCOVERED` Asset, CAS the server-owned MANUAL logical checkpoint version (no ciphertext/key), and complete the Run under a private process-local fence. The command never supplies Observation、ProviderKind、Source revision、freshness、Catalog time、run/fence/checkpoint fields or canonical digests. Matching idempotent replay is returned only after current Principal/Scope/state authorization is rechecked and never allocates another sequence or Run. Add cross-Environment、missing/multiple authority child and same-code profile-semantic-drift negatives proving no Run/sequence/audit row is allocated.
 5. On replay, return the scoped resource only when operation and request hashes match; otherwise return `ErrIdempotency`. This rule covers create, governance update, transition, source create/sync, binding and conflict decisions.
 6. On governance update, update only `display_name`、`owner_group`、`criticality`、`data_classification` and `labels`, using `WHERE version = $expected`, then increment version.
-7. `Transition` accepts only `QUARANTINED` or `RETIRED` in this plan. It must call `CanTransition`, use the expected version, persist a bounded reason in audit metadata, and increment version.
+7. `Transition` accepts only `QUARANTINED` or `RETIRED` in this plan. It must call structural `IsLifecycleEdge`, separately enforce this operation allow-list/current authorization, reject self-edges, use the expected version, persist a bounded reason in audit metadata, and increment version.
 8. Insert one low-sensitivity audit row and one outbox row with exact types `asset.created.v1`、`asset.governance.updated.v1`、`asset.quarantined.v1` or `asset.retired.v1`.
 9. Outbox payload contains only IDs, lifecycle, version, and trace ID. It must not contain labels, normalized documents, provider payload, owner, external ID, endpoint, credential, token, DSN, or source error text.
 10. Commit once; retry SQLSTATE `40001` at most twice with context-aware bounded jitter.
@@ -284,19 +302,20 @@ The implementation must differentiate not-found from stale-version using a secon
 Run:
 
 ~~~bash
-gofmt -w internal/assetcatalog/postgres/*.go
+gofmt -w $(rg --files internal/assetcatalog/postgres -g '*.go')
 go test -race ./internal/assetcatalog/postgres -count=1
 TEST_DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/aiops_test?sslmode=disable' \
   go test -race ./internal/assetcatalog/postgres -run Integration -count=1
 ~~~
 
-Expected: both commands PASS; the integration suite proves cross-tenant/workspace/environment reads return not found, two concurrent updates yield exactly one success and one version conflict, and rollback leaves zero partial audit/outbox rows.
+Expected: both commands PASS; the integration suite proves cross-tenant/workspace/environment reads return not found、zero/restricted/multi-Service access semantics、one-query read-model joins and deep clones，two concurrent updates yield exactly one success and one version conflict，and rollback leaves zero partial audit/outbox rows.
 
 - [ ] **Step 7: Commit**
 
 ~~~bash
 git add internal/assetcatalog/postgres/repository.go \
   internal/assetcatalog/postgres/scope.go internal/assetcatalog/postgres/assets.go \
+  internal/assetcatalog/postgres/read_models.go internal/assetcatalog/postgres/read_models_test.go \
   internal/assetcatalog/postgres/manual_run.go internal/assetcatalog/postgres/manual_run_test.go \
   internal/assetcatalog/postgres/scan.go internal/assetcatalog/postgres/assets_test.go \
   internal/assetcatalog/postgres/assets_integration_test.go
@@ -313,6 +332,9 @@ git commit -m "feat(assetcatalog): persist scoped governed assets"
 - Create: **internal/assetcatalog/postgres/discovery.go**
 - Create: **internal/assetcatalog/postgres/discovery_test.go**
 - Create: **internal/assetcatalog/postgres/discovery_integration_test.go**
+- Create: **internal/assetcatalog/postgres/source_reads.go**
+- Create: **internal/assetcatalog/postgres/source_reads_test.go**
+- Create: **internal/assetcatalog/postgres/source_reads_integration_test.go**
 
 **Interfaces:**
 - Consumes: normalized source batches produced outside the Control Plane process; this plan does not open target sockets and does not put provider credentials in a job payload.
@@ -450,7 +472,9 @@ func TestCompleteClosureSeesRelationsFromFinalAndIntermediatePages(t *testing.T)
 }
 ~~~
 
-Run: `go test ./internal/assetdiscovery -count=1`
+The same Red commit adds SQL-shape/scan/integration tests for `ResolveSourceScope`、`GetSource`、`ListSources` and `GetSourceRun`. They require explicit safe columns, ordered authority-child aggregation, one scoped query per read, keyset `(source.id ASC)` with QueryDigest, exact latest/published/current/last-success joins, and no checkpoint ciphertext/key、lease/token、canonical schema bytes or provider payload. A zero SourceReadConstraint rejects before SQL；restricted-empty returns none；a multi-Environment Source is visible only when its complete authority set is a subset of the allowed IDs；manual-create usage requires exactly one authority Environment equal to the requested Environment. `PARTIAL` and aggregate max-completed logic can never become last-success.
+
+Run: `go test ./internal/assetdiscovery ./internal/assetcatalog/postgres -run 'Test(Reconcile|SourceRead)' -count=1`
 
 Expected: FAIL because the reconciler types do not exist.
 
@@ -483,17 +507,8 @@ type NormalizedItem struct {
 	Fingerprints      map[string]string
 }
 
-type FreshnessKind string
-
-const (
-	FreshnessCatalogSequence    FreshnessKind = "CATALOG_SEQUENCE"
-	FreshnessObjectSequence     FreshnessKind = "OBJECT_SEQUENCE"
-	FreshnessObjectTimeSequence FreshnessKind = "OBJECT_TIME_SEQUENCE"
-	FreshnessCheckpointSequence FreshnessKind = "CHECKPOINT_SEQUENCE"
-)
-
 type FreshnessCandidate struct {
-	Kind                  FreshnessKind
+	Kind                  assetcatalog.FreshnessKind
 	OrderTime             *time.Time
 	OrderSequence         int64
 	ProviderVersionSHA256 string
@@ -517,13 +532,8 @@ type ObservedRelation struct {
 	Freshness           FreshnessCandidate
 }
 
-type SourceScope struct {
-	TenantID    string
-	WorkspaceID string
-}
-
 type Batch struct {
-	Scope            SourceScope
+	Scope            assetcatalog.SourceScope
 	SourceID         string
 	RunID            string
 	FinalPage        bool
@@ -573,7 +583,11 @@ func (reconciler *Reconciler) Reconcile(
 	if err := validateBatch(batch); err != nil {
 		return Result{}, err
 	}
-	return reconciler.store.ReconcileBatch(ctx, fence, canonicalizeBatch(batch))
+	canonical, err := canonicalizeBatch(batch)
+	if err != nil {
+		return Result{}, err
+	}
+	return reconciler.store.ReconcileBatch(ctx, fence, canonical)
 }
 ~~~
 
@@ -581,65 +595,9 @@ func (reconciler *Reconciler) Reconcile(
 
 `LeaseFence` is the sealed process-local value defined in Pack 01 and returned by Queue claim: exact Run ID、owner、epoch and a private 32-byte raw token. It rejects JSON/text/log serialization and exposes only constant-time comparison against the already locked PostgreSQL Run coordinates/token hash; raw token never enters `Batch`、Task payload、audit、outbox or errors. Provider items cannot submit Source definition revision or Catalog time. The Repository injects both from the locked Run and database clock, and the Profile Registry fixes the only legal `FreshnessKind` for that canonical revision.
 
-Add to `assetcatalog/repository.go`:
+Consume the exact `assetcatalog.SourceScope`、typed safe `SourceRun` and `SourceReadRepository` definitions from Task 2；this task must not redeclare or widen them. The internal PostgreSQL Run row additionally retains the opaque cleanup attempt ID/epoch and cleanup/terminal receipt digests required by Pack 09, while the public `SourceRun` structurally omits them. `SourceScope` is exactly Tenant+Workspace because Source/Run rows stop at Workspace；every normalized Fact carries its explicit Environment and Repository resolves that Environment inside the Source's immutable authority mapping. `assetdiscovery.Store` owns `ReconcileBatch(context.Context, assetcatalog.LeaseFence, Batch) (Result, error)` and is implemented by `internal/assetcatalog/postgres.Repository`. This keeps the final dependency direction `assetdiscovery -> assetcatalog`; `assetcatalog` never imports `assetdiscovery`. This pack must not create a stable Source without revision 1 or enqueue a run before the complete Source revision gate exists.
 
-~~~go
-type SourceRun struct {
-	ID                   string
-	TenantID             string
-	WorkspaceID          string
-	SourceID             string
-	SourceRevision       int64
-	SourceRevisionDigest string
-	RunKind              string
-	Status               string
-	Stage                string
-	StageChangedAt       time.Time
-	TriggerType          string
-	GateRevision         int64
-	PageSequence         int64
-	PageDigest           string
-	CursorBeforeHash     string
-	CursorAfterHash      string
-	CheckpointVersion    int64
-	NotBefore            time.Time
-	LeaseExpiresAt       time.Time
-	FenceEpoch           int64
-	HeartbeatSequence    int64
-	FinalPageApplied     bool
-	CompleteSnapshot     bool
-	WorkResultKind       string
-	WorkResultStatus     string
-	WorkResultDigest     string
-	WorkResultRecordedAt time.Time
-	ValidationProofDigest string
-	CredentialCleanupStatus string
-	Observed             int
-	Created              int
-	Changed              int
-	Unchanged            int
-	Conflicts            int
-	Missing              int
-	Stale                int
-	Restored             int
-	Tombstoned           int
-	Rejected             int
-	FailureCode          string
-	Version              int64
-	CreatedAt            time.Time
-	StartedAt            time.Time
-	HeartbeatAt          time.Time
-	CompletedAt          time.Time
-}
-
-type SourceReadRepository interface {
-	GetSource(context.Context, string, string, string) (Source, error)
-	ListSources(context.Context, ListSourcesRequest) (SourcePage, error)
-	GetSourceRun(context.Context, string, string, string) (SourceRun, error)
-}
-~~~
-
-The internal Run row additionally retains the opaque cleanup attempt ID/epoch and cleanup/terminal receipt digests required by Pack 09；the public `SourceRun` deliberately omits all of them. `SourceScope` is exactly Tenant+Workspace because Source/Run rows stop at Workspace; every normalized Fact carries its explicit Environment and Repository resolves that Environment inside the Source's immutable authority mapping. `assetdiscovery.Store` owns `ReconcileBatch(context.Context, assetcatalog.LeaseFence, Batch) (Result, error)` and is implemented by `internal/assetcatalog/postgres.Repository`. Safe Source/run reads remain in `assetcatalog.SourceReadRepository`. This keeps the final dependency direction `assetdiscovery -> assetcatalog`; `assetcatalog` never imports `assetdiscovery`. This pack must not create a stable Source without revision 1 or enqueue a run before the complete Source revision gate exists.
+`source_reads.go` implements—rather than redefines—the Task 2 interfaces. `ResolveSourceScope(workspaceID)` reads the canonical Tenant/Workspace pair. `GetSource/ListSources` select exact `asset_sources` safe fields and use LATERAL subqueries for max Revision, exact published pointer, unique current nonterminal Run, and the Source's persisted exact last-success pointer；each Revision aggregates `asset_source_revision_authorities` as a lowercase UUID array ordered by ordinal and rejects zero/noncontiguous/digest-inconsistent results in scan validation. `GetSourceRun` joins its parent Source and that Run's exact Revision/authority rows before applying the same full-subset access rule. Filters are closed enums, limit is 1–100, order is `source.id ASC`, cursor holds `(QueryDigest,SourceID)`, and QueryDigest covers resolved SourceScope、normalized filters、usage、EnvironmentID and sorted server allow-list. No read uses aggregate counts, `MAX(completed_at)` or a caller-supplied visibility flag.
 
 - [ ] **Step 3: Implement canonical validation before persistence**
 
@@ -687,7 +645,7 @@ For each canonical batch, `internal/assetcatalog/postgres/discovery.go` must exe
 4. Use only the transaction-fixed `transaction_timestamp()` read in step 1 as every new `observed_at` and inject that exact canonical UTC microsecond value into provenance/chain bytes. After locking the prior Asset/Observation, if this transaction timestamp is not strictly later than the prior `observed_at`, roll back the whole page and retry from a new serializable transaction with a fresh timestamp；never derive a replacement with `clock_timestamp()`、`statement_timestamp()` or `max(prior+1 microsecond)`. Provider update/event time exists only in freshness/checkpoint proof.
 5. Before allocating any new Observation ID/time/chain or advancing an Asset pointer, query the exact same-Run identity `(tenant_id,workspace_id,source_id,run_id,provider_kind,external_id)`. Existing rows are replay only when **all** belong to the same `page_sequence + page_digest + immutable page receipt`; verify Environment、Source definition revision、accepted checkpoint/fence/page coordinates、freshness、tombstone shape and semantic/document/fingerprint/full-provenance/chain digests and return that receipt. If the key exists on another page of the same Run—even with identical content—fail the whole page as `SOURCE_RUN_OBJECT_DUPLICATE`; mixed present/absent state under a purported receipt is corruption. For a nonterminal immediate replay the Asset must still point to that Observation；for a historical terminal replay, the current pointer must be that Observation or a later immutable chain descendant. Only the absent path allocates database Catalog time/ID/chain and inserts；`ON CONFLICT ... DO NOTHING` remains a final race defense, never the primary replay algorithm. A later Run under the same published revision always appends. The new row's `previous_observation_id/previous_chain_sha256` must match the locked Asset pointer；pointer CAS prevents ABA.
 6. Match only the fixed dedupe key `(tenant_id, workspace_id, source_id, provider_kind, external_id)`.
-7. New exact-source items create `DISCOVERED` assets with defaults `UNRESOLVED/INTERNAL/MEDIUM`, `owner_group="unassigned"` and empty governance labels, then append exact-identity Type Detail revision 1. The sentinel renders as “未分配” and is not an inferred owner or Service.
+7. New exact-source items create `DISCOVERED` assets with defaults `UNRESOLVED/INTERNAL/MEDIUM`, SQL `owner_group=NULL` and empty governance labels, then append exact-identity Type Detail revision 1. API/UI renders NULL as “未分配”；no sentinel is persisted or inferred as an owner/Service.
 8. Existing exact-source items update only source-owned projection fields: `display_name`、exact last Observation/chain、`last_observed_at`、`last_source_revision`; append Type Detail only when normalized detail hash changes. Preserve governance fields.
 9. Cross-source fingerprint candidates create or refresh `OPEN` AssetConflict with the exact candidate Source+Observation and `AMBIGUOUS`; do not create, merge, bind, or overwrite an Asset.
 10. Process top-level relations after same-page Items **before any final membership closure**. Resolve both explicit Environment+external keys only to exact same-Source Assets and require both Environments in the immutable authority scope；an endpoint not yet committed/created is `SOURCE_RELATION_ENDPOINT_NOT_READY`, while an unauthorized/cross-source endpoint is a relation conflict. Before mutation, check the Relationship's last Run/page identity：the same relation identity on another page of this Run is `SOURCE_RUN_RELATION_DUPLICATE`；an exact replay is served only by its immutable page receipt. Compare independent relation freshness/version/fact as in step 3, upsert the current projection and its last exact Run/page/fact coordinates, and include every accepted relation in the immutable page receipt. A later Run with an unchanged relation still advances its last-seen coordinates and appends receipt evidence but does not change semantic relationship fields.
@@ -704,13 +662,13 @@ Do not create a second discovery-ownership mechanism with advisory locks. The du
 Run:
 
 ~~~bash
-gofmt -w internal/assetcatalog internal/assetdiscovery internal/assetcatalog/postgres
+gofmt -w $(rg --files internal/assetcatalog internal/assetdiscovery -g '*.go')
 go test -race ./internal/assetdiscovery ./internal/assetcatalog/postgres -count=1
 TEST_DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/aiops_test?sslmode=disable' \
   go test -race ./internal/assetcatalog/postgres -run 'TestDiscoveryIntegration' -count=1
 ~~~
 
-Expected: PASS. Integration assertions include SQLSTATE `55000` for Observation/Type Detail update or delete, identical counts on replay, no governance overwrite, no stale transition on partial runs, no implicit cross-source merge, field-level provenance integrity, tombstone/recovery soft lifecycle, stale-fence rejection, atomic checkpoint advancement, and deterministic winner/order under concurrent source runs.
+Expected: PASS. Integration assertions include SQLSTATE `55000` for Observation/Type Detail update or delete, identical counts on replay, no governance overwrite, no stale transition on partial runs, no implicit cross-source merge, field-level provenance integrity, tombstone/recovery soft lifecycle, stale-fence rejection, atomic checkpoint advancement, and deterministic winner/order under concurrent source runs；Source reads prove cross-Scope rejection、zero/restricted/full-subset/multi-Environment access、manual sole-authority usage、deep clones、cursor drift rejection、exact pointer joins and structurally safe Run projection.
 
 - [ ] **Step 6: Commit**
 
@@ -718,6 +676,8 @@ Expected: PASS. Integration assertions include SQLSTATE `55000` for Observation/
 git add internal/assetcatalog/types.go internal/assetcatalog/repository.go \
   internal/assetdiscovery/reconciler.go internal/assetdiscovery/reconciler_test.go \
   internal/assetcatalog/postgres/discovery.go internal/assetcatalog/postgres/discovery_test.go \
-  internal/assetcatalog/postgres/discovery_integration_test.go
+  internal/assetcatalog/postgres/discovery_integration_test.go \
+  internal/assetcatalog/postgres/source_reads.go internal/assetcatalog/postgres/source_reads_test.go \
+  internal/assetcatalog/postgres/source_reads_integration_test.go
 git commit -m "feat(assetcatalog): reconcile append-only discovery facts"
 ~~~

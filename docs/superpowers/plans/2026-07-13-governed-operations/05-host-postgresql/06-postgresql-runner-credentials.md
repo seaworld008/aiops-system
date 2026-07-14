@@ -12,8 +12,8 @@
 
 - 每个 Task 严格采用 Red → Green → Refactor：先运行并保存预期失败，再做最小生产实现，复跑指定测试后才允许重构和提交。
 - 新包必须叫 `readcredential`；READ issuer/revoker/profile/repository/worker 与 `credential.DurableBroker` WRITE 类型、Vault token、mount、role、表和配置完全分离。
-- READ issuer 只能签发 `READ_DATABASE`，单 Asset/Capability/Task/Attempt；不得接收 Action、WRITE permission、SQL、role name、mount path 或 endpoint 的 caller override。
-- Credential TTL 为 contract max、Grant expiry、Task lease、Runner certificate、Runtime expiry 五者最小值，最大 5 分钟、最小 30 秒、不可续期。
+- Task10-owned broker supports only exact provider bindings `AWX_API→READ_AUTOMATION` and `POSTGRESQL→READ_DATABASE`；this package adds only the Vault `READ_DATABASE` provider。Both remain single Asset/Capability/Task/Attempt and reject Action、target WRITE permission、SQL、role/mount/endpoint caller override。
+- Vault READ Database role 固定 `default_ttl=max_ttl=30s`；只有最早的 contract/Grant/Task lease/Runner certificate/Runtime deadline 距 durable issue marker 至少 35 秒才允许发起。provider lease 可报告 renewable，但本系统固定 `RenewalAllowed=false`、从不续租，并以实际响应时刻与 `lease_duration` 计算更早的有效截止时间。
 - Secret 永不持久化；username/password 只在 issuer 临时 buffer、加密 Start response 和 Runner 内存出现，用后清零。
 - Accessor/lease ID 只以 AEAD ciphertext + key ID + HMAC 落盘；日志、Trace、Metric label、Audit、Temporal 与公共 API 不显示它。
 - Start 响应单次交付；HTTP 响应丢失、重复 Start 或无法确定 Runner 是否收到时，不再返回 credential，立即 cleanup 并以 `credential_delivery_uncertain` 终止。
@@ -36,12 +36,8 @@
 ### Task 13: 实现独立 READ issuer/revoker、持久 lease 与单次交付
 
 **Files:**
-- Create: `internal/readcredential/types.go`
-- Create: `internal/readcredential/lease.go`
-- Create: `internal/readcredential/broker.go`
-- Create: `internal/readcredential/broker_test.go`
-- Create: `internal/readcredential/postgres/repository.go`
-- Create: `internal/readcredential/postgres/repository_integration_test.go`
+- Modify: `internal/readcredential/types.go`, `internal/readcredential/lease.go`, `internal/readcredential/broker.go`, `internal/readcredential/broker_test.go`
+- Modify: `internal/readcredential/postgres/repository.go`, `internal/readcredential/postgres/repository_integration_test.go`
 - Create: `internal/readcredential/vault/profile.go`
 - Create: `internal/readcredential/vault/issuer.go`
 - Create: `internal/readcredential/vault/revoker.go`
@@ -51,8 +47,8 @@
 - Modify: `internal/config/config_test.go`
 
 **Interfaces:**
-- Consumes: 000019 `read_credential_leases`、Grant/Task/Target/Runtime/Realm 的 trusted snapshot、Vault READ profile。
-- Produces: `readcredential.Broker.PrepareIssue/FinalizeIssue`、`ReadIssuer`、`ReadRevoker`、`Repository`、encrypted `Delivery`。
+- Consumes: Task10 Green 的 generic saga/AWX provider、000019 lease facts、Grant/Task/Target/Runtime/Realm trusted snapshot and Vault READ profile。
+- Produces: provider-discriminated Vault `READ_DATABASE` issuer/revoker and typed database delivery，without changing the accepted AWX state machine or its tests。
 
 - [ ] **Step 1: 写 READ/WRITE 类型隔离、TTL 与 secret persistence 失败测试**
 
@@ -68,16 +64,17 @@ func TestReadCredentialInterfacesCannotUseWriteDurableIssuer(t *testing.T) {
     }
 }
 
-func TestPrepareIssueBindsOneAttemptAndUsesShortestNonRenewableTTL(t *testing.T) {
+func TestClaimIssueBindsOneAttemptAndRequiresFixedLeaseSafetyMargin(t *testing.T) {
     now := fixedTime()
     request := validIssueRequest(now)
     request.ContractExpiresAt = now.Add(4 * time.Minute)
     request.GrantExpiresAt = now.Add(2 * time.Minute)
-    request.LeaseExpiresAt = now.Add(30 * time.Second)
-    prepared, err := broker.PrepareIssue(ctx, request)
+    request.LeaseExpiresAt = now.Add(35 * time.Second)
+    prepared, err := broker.CreateAndClaimIssue(ctx, request)
     if err != nil { t.Fatal(err) }
-    if prepared.ExpiresAt() != now.Add(30*time.Second) || prepared.Renewable() {
-        t.Fatalf("prepared ttl = %s renewable=%t", prepared.ExpiresAt(), prepared.Renewable())
+    if prepared.AuthorizationDeadline() != now.Add(35*time.Second) ||
+        prepared.ProviderLeaseTTL() != 30*time.Second || prepared.RenewalAllowed() {
+        t.Fatalf("prepared = %#v", prepared)
     }
 }
 
@@ -91,13 +88,14 @@ func TestRepositoryPersistsAccessorButNeverCredentialValue(t *testing.T) {
     }
 }
 
-func TestPrepareIssueRejectsSecondDeliveryAndQueuesCleanup(t *testing.T) {
+func TestIssueMarkerRejectsSecondDeliveryAndPostMarkerReclaim(t *testing.T) {
     fixture := newBrokerFixture(t)
-    prepared := fixture.prepare(t)
+    prepared := fixture.createAndClaim(t)
+    fixture.markRequestStarted(t, prepared)
     first, err := fixture.broker.FinalizeIssue(ctx, prepared, fixture.issueRemote(t))
     if err != nil { t.Fatal(err) }
     defer first.Destroy()
-    _, err = fixture.broker.PrepareIssue(ctx, fixture.sameAttemptRequest())
+    _, err = fixture.broker.ReclaimBeforeMarker(ctx, fixture.sameAttemptRequest())
     if !errors.Is(err, readcredential.ErrDeliveryUncertain) { t.Fatalf("error = %v", err) }
     assertCleanupState(t, fixture.repository, prepared.ID(), readcredential.CleanupPending)
 }
@@ -108,10 +106,10 @@ func TestPrepareIssueRejectsSecondDeliveryAndQueuesCleanup(t *testing.T) {
 Run:
 
 ~~~bash
-go test ./internal/readcredential/... ./internal/config -run 'Test(ReadCredential|PrepareIssue|RepositoryPersists)' -count=1
+go test ./internal/readcredential/... ./internal/config -run 'Test(ReadCredential|ClaimIssue|IssueMarker|RepositoryPersists)' -count=1
 ~~~
 
-Expected: FAIL because `internal/readcredential` and dedicated config do not exist.
+Expected: FAIL because the generic package does not yet admit the sealed `READ_DATABASE` material and Vault-only profile/config/client are absent；the existing AWX tests must remain Green。
 
 - [ ] **Step 3: 定义独立、窄且不可序列化的接口**
 
@@ -144,8 +142,8 @@ type IssueRequest struct {
 }
 
 type Issued struct {
-    Username SensitiveValue
-    Password SensitiveValue
+    UsageRole UsageRole
+    Material SensitiveMaterial
     Accessor SensitiveReference
     ExpiresAt time.Time
 }
@@ -153,19 +151,24 @@ type Issued struct {
 type ReadIssuer interface {
     ID() string
     Revision() string
-    IssueReadDatabase(context.Context, IssueRequest) (Issued, error)
+    UsageRole() UsageRole
+    Issue(context.Context, IssueRequest) (Issued, error)
 }
 
 type ReadRevoker interface {
     ID() string
     Revision() string
-    RevokeReadDatabase(context.Context, SensitiveReference) (RevokeResult, error)
+    UsageRole() UsageRole
+    Revoke(context.Context, SensitiveReference) (RevokeResult, error)
 }
 
 type Repository interface {
-    PrepareIssue(context.Context, PrepareInput) (Lease, error)
+    Create(context.Context, CreateInput) (Lease, error)
+    ClaimIssue(context.Context, IssueClaimRequest) (IssueClaim, error)
+    MarkIssueRequestStarted(context.Context, IssueRequestMarker) (IssueClaim, error)
     FinalizeIssue(context.Context, FinalizeInput) (Lease, error)
-    MarkIssueUncertain(context.Context, Scope, string, string) error
+    MarkIssueUncertain(context.Context, IssueUncertainInput) (Lease, error)
+    ReclaimBeforeMarker(context.Context, IssueReclaimRequest) (IssueClaim, error)
     RequestCleanup(context.Context, CleanupRequest) error
     ClaimCleanup(context.Context, ClaimRequest) (CleanupClaim, error)
     CompleteCleanup(context.Context, CleanupCompletion) error
@@ -173,9 +176,11 @@ type Repository interface {
 }
 ~~~
 
-`SensitiveValue`/`SensitiveReference` 在本包自己实现 owner pointer、Destroy、Bytes callback；禁止 JSON/String，复制共享 destroyed state。若复用现有加密原语，只能通过无业务语义的 `AccessorProtector` interface 适配，不能让 READ broker 依赖 WRITE broker/profile/permission。
+`Create` only inserts `NOT_ISSUED/version=1` after trusted-fact validation。`ClaimIssue` performs the one `NOT_ISSUED→ISSUING` CAS and returns an opaque claim capability；`MarkIssueRequestStarted` atomically writes the immutable request digest、safe correlation ref and server time immediately before the remote call。`ReclaimBeforeMarker` can rotate an expired claim only while all three marker fields remain NULL；after a marker exists it returns `ErrIssueUncertain` and the worker must call `MarkIssueUncertain`，never Issue again。`FinalizeIssue` requires the live claim、marker、exact response binding and performs only `ISSUING→ISSUED|NO_CREDENTIAL|UNCERTAIN` while clearing claim fields。Types do not expose setters or raw claim hashes。
 
-Broker 构造器要求 immutable `IssuerRegistry` 和独立 `RevokerRegistry`；ID/revision/provider/usage role/Scope 必须精确匹配。typed nil、panic、timeout 或 unknown error 一律 fail closed。
+`SensitiveMaterial` is sealed to exact `AutomationBearer` (Task10) or `DatabaseUsernamePassword` (this Task) and exposes only one owner callback；`SensitiveValue`/`SensitiveReference` share destroyed state，forbid JSON/String/copy-out。Provider/usage role/material kind must match before delivery。若复用现有加密原语，只能通过无业务语义的 `AccessorProtector` interface 适配，不能让 READ broker 依赖 WRITE broker/profile/permission。
+
+Broker 构造器要求 immutable `IssuerRegistry` 和独立 `RevokerRegistry`；ID/revision/provider/usage role/material/Scope 必须精确匹配。Task13 adds only `POSTGRESQL/READ_DATABASE` entries and must byte-regress Task10's `AWX_API/READ_AUTOMATION` entries；typed nil、panic、timeout or unknown error fail closed。
 
 - [ ] **Step 4: 实现 Vault READ 专用 profile/client**
 
@@ -192,15 +197,15 @@ AIOPS_READ_VAULT_DATABASE_ROLE
 AIOPS_READ_CREDENTIAL_KEYRING_FILE
 ~~~
 
-拒绝与 `AIOPS_WRITE_*` 或现有 manager/revoker token file 相同的 inode、realpath、token source ID 或 mount+role。READ 与 WRITE 可以连接同一受管 Vault cluster/CA，但必须使用不同 token、policy、mount/role 和审计身份；不能要求运营方复制 Vault 集群来伪造隔离。Issuer token policy 只允许目标 READ database role 的 credentials read，Revoker token 只允许 lease revoke；两者互不替代。Vault profile 不接受 HTTP/Task 动态 path，mount/role 在启动时以 `^[a-z0-9][a-z0-9_-]{0,63}$` 验证后固化。
+拒绝与 `AIOPS_WRITE_*` 或现有 manager/revoker token file 相同的 inode、realpath、token source ID 或 mount+role。READ 与 WRITE 可以连接同一受管 Vault cluster/CA，但必须使用不同 token、policy、mount/role 和审计身份；不能要求运营方复制 Vault 集群来伪造隔离。Issuer token policy 只允许 exact `{read_mount}/creds/{read_role}` read，并显式 deny `sys/leases/renew*`。Revoker policy 对 `sys/leases/lookup` 只给 update，要求唯一参数 `lease_id` 且 `allowed_parameters` 限定 `{read_mount}/creds/{read_role}/*`；对 `sys/leases/revoke` 同样限定该 prefix，并要求 `lease_id,sync`、`sync=[true,"true"]`。它没有 prefix list/revoke、renew、sudo、mount/role read 或 issue authority，且 token 创建时禁用 default policy。Vault ACL 只能把 lease_id 缩到固定 role prefix；trusted CleanupBroker 仍必须在解密后以 persisted issuer ID/revision、Scope、HMAC 与 exact lease ID 做单实例授权，绝不能把 prefix 权限误述成 exact-lease ACL。Issuer/revoker tokens never substitute for each other。Vault profile 不接受 HTTP/Task 动态 path，mount/role 在启动时以 `^[a-z0-9][a-z0-9_-]{0,63}$` 验证后固化。
 
-Issue 固定 `GET /v1/{read_mount}/creds/{read_role}`，验证 `lease_id`、`lease_duration`、`renewable=false`、data 中恰好 username/password。实际 TTL 必须不超过请求；超限立即持久 cleanup，不能截断后使用。Revoke 固定 `PUT /v1/sys/leases/revoke`，body 只含解密 accessor；204/200 且后续 lookup 证明不存在才是 REVOKED，明确不存在为 NO_CREDENTIAL，timeout/5xx/协议异常均 UNCERTAIN。
+Issue 固定 `GET /v1/{read_mount}/creds/{read_role}`，但只有在 durable request marker 已提交、且 trusted server time 计算的最早 authorization deadline 至少剩余 35 秒时才发送；READ Database role 固定 `default_ttl=max_ttl=30s`。响应必须含 exact-prefix `lease_id`、`renewable=true`、data 中恰好 username/password，且 `lease_duration` 在 `1..30s`；系统以 `response_received_at + lease_duration` 作为 conservative effective expiry，并要求它不晚于所有 authorization bounds，违反即先持久 cleanup、绝不交付。Vault provider lease 可续租，但本系统映射为 `RenewalAllowed=false`，issuer/revoker policy 与客户端 allowlist 双重拒绝所有 renew endpoint；动态 deadline 不通过 caller TTL 或每请求 child token实现。Vault token、lease ID 与 provider renewability 永不进入 Runner。Vault 没有按本地 correlation 恢复未知 lease ID 的受支持路径；post-marker response loss/crash therefore becomes `UNCERTAIN→MANUAL_REQUIRED` and must never repeat credentials GET。For one broker-authorized known decrypted lease ID only，revoker first performs exact `POST /v1/sys/leases/lookup` with `{"lease_id":"<known>"}` and then fixed `POST /v1/sys/leases/revoke` with `{"lease_id":"<known>","sync":true}`；success plus exact lookup-not-found is REVOKED，an already absent known lease is NO_CREDENTIAL，timeout/5xx/协议异常均 UNCERTAIN。No prefix is ever sent。
 
 - [ ] **Step 5: 实现 PostgreSQL repository 状态机与隔离集成测试**
 
-Prepare 在同一事务复验 Task attempt RUNNING 前置、单 Attempt 唯一、Grant/Asset/Capability/Target/Runtime/Realm digest，插入 `NOT_ISSUED`。Finalize 使用 expected version/fence，AEAD 加密 accessor，写 HMAC 与 `PENDING`，不保存 secret；同一 remote issuance replay 只触发 cleanup，不重新交付。
+`Create` 在同一事务复验 Task attempt RUNNING 前置、单 Attempt 唯一、Grant/Asset/Capability/Target/Runtime/Realm digest，插入 `NOT_ISSUED`。`ClaimIssue→MarkIssueRequestStarted→FinalizeIssue` uses exact expected version/claim；Finalize AEAD-encrypts accessor、writes HMAC and actual bounded expiry，clears claim fields and never saves secret。A pre-marker expired claimant may only `ReclaimBeforeMarker`；any post-marker crash/response loss writes `UNCERTAIN` and never reissues or delivers。
 
-允许状态：`NOT_ISSUED→ISSUED|NO_CREDENTIAL`；正常执行期间保持 `ISSUED`，不会被 cleanup worker 提前 claim；任一终结条件原子执行 `ISSUED→CLEANUP_PENDING` 并写 reason；`CLEANUP_PENDING→CLEANUP_CLAIMED`；`CLEANUP_CLAIMED→REVOKED|NO_CREDENTIAL|CLEANUP_PENDING|UNCERTAIN`；`UNCERTAIN→CLEANUP_CLAIMED|MANUAL_REQUIRED`。禁止 terminal 回退。每次变化同事务写 audit/outbox，payload 仅 lease ID、task ID、state、reason、attempt count。
+允许状态严格复用 `000019`：`NOT_ISSUED→ISSUING→ISSUED|NO_CREDENTIAL|UNCERTAIN`；正常执行期间保持 `ISSUED`，不会被 cleanup worker 提前 claim；任一终结条件原子执行 `ISSUED→CLEANUP_PENDING` 并写 reason；`CLEANUP_PENDING→CLEANUP_CLAIMED`；`CLEANUP_CLAIMED→REVOKED|NO_CREDENTIAL|CLEANUP_PENDING|UNCERTAIN|MANUAL_REQUIRED`；accessor-bearing `UNCERTAIN→CLEANUP_CLAIMED|MANUAL_REQUIRED`，issuance post-marker/no-accessor `UNCERTAIN` only becomes `MANUAL_REQUIRED`。禁止 terminal 回退。每次变化同事务写 audit/outbox，payload 仅 lease ID、task ID、state、reason、attempt count。
 
 Run:
 
@@ -308,7 +313,7 @@ Expected: FAIL because PostgreSQL executor and credential delivery do not exist.
 
 - [ ] **Step 3: 实现 Start 单次加密交付协议**
 
-PostgreSQL Task 的 Runner client 在 Start 内部生成 X25519 ephemeral key pair，request 额外包含 `credential_delivery_public_key`；非 PostgreSQL Task 必须省略。Gateway 根据持久 descriptor 而非 request 判断是否需要 credential，执行 Prepare → external Issue → Finalize saga，并用 ephemeral ECDH + HKDF-SHA256 派生 AES-256-GCM key，AAD 固定 TaskID/attempt epoch/contract digest/input hash。
+PostgreSQL Task 的 Runner client 在 Start 内部生成 X25519 ephemeral key pair，request 额外包含 `credential_delivery_public_key`；非 PostgreSQL Task 必须省略。Gateway 根据持久 descriptor 而非 request 判断是否需要 credential，执行 `Create → ClaimIssue → MarkIssueRequestStarted → external Issue → FinalizeIssue` saga；pre-marker claim expiry alone may `ReclaimBeforeMarker`，post-marker ambiguity atomically `MarkIssueUncertain` and returns no delivery。Only after Finalize does it use ephemeral ECDH + HKDF-SHA256 to derive an AES-256-GCM key，with AAD fixed to TaskID/attempt epoch/contract digest/input hash。
 
 ~~~go
 type EncryptedCredentialDelivery struct {
@@ -428,19 +433,19 @@ Expected: FAIL because worker, recovery binding and production dependencies do n
 
 - [ ] **Step 3: 实现 durable cleanup claim/retry/人工状态**
 
-Worker 使用 `FOR UPDATE SKIP LOCKED` claim，独立 32-byte claim token hash，claim 30 秒；解密 accessor 后调用与 lease 精确 issuer ID/revision 匹配的 ReadRevoker。明确成功/不存在写 terminal；连接前失败可指数退避 `1s,5s,30s,2m`；请求已发出后的 timeout/EOF/5xx 直接 UNCERTAIN，不盲重试。UNCERTAIN 做一次 lookup/reconcile，仍不确定即 MANUAL_REQUIRED、关闭 admission、发 Pager 事件。
+Worker 使用 `FOR UPDATE SKIP LOCKED` claim，独立 32-byte claim token hash，claim 30 秒；解密已知 accessor 后调用与 lease 精确 issuer ID/revision 匹配的 ReadRevoker。明确成功/不存在写 terminal；连接前失败可指数退避 `1s,5s,30s,2m`；request marker 后的 timeout/EOF/5xx 直接 UNCERTAIN，不盲重试。Only an accessor-bearing cleanup UNCERTAIN may perform one exact-lease lookup/reconcile；issuance-time no-accessor UNCERTAIN cannot use correlation lookup and goes to MANUAL_REQUIRED。仍不确定即关闭 admission、发 Pager 事件。
 
 Worker panic、进程 crash 或 claim expiry 由下一实例恢复；cleanup attempt append-only。每次调用清理 accessor buffer。超过 credential expiry 仍必须 revoke/reconcile，不能假定自动过期等于吊销。
 
 - [ ] **Step 4: 把所有终结路径与 Receipt 收敛绑定**
 
-Complete 先在内存完成严格投影/DLP 并计算 request/content hash；第一事务只持久 completion request hash 与 cleanup intent，不写 Evidence 或成功 Receipt。bounded foreground revoke 成功后，第二事务重新复验 Gate/attempt/fence 和同一 request hash，再原子写 Evidence、runner receipt、diagnostic receipt 并终结 Task/Attempt。若进程在两事务之间 crash，Runner 以同一 completion 重放；若 Evidence 已丢失则 cleanup 后安全终结为 FAILED，不能凭 hash 伪造成功。Cancel/Timeout/recovery 不保存 Evidence，cleanup 确认后写 failure Receipt；MANUAL_REQUIRED 可写失败 Receipt，但绝不写成功 Evidence。Gateway crash 在 issuer 返回后、Finalize 前通过 issuer request correlation + Vault lease lookup/reconcile；无法确定是否签发视为 UNCERTAIN。
+Complete 先在内存完成严格投影/DLP 并计算 request/content hash；第一事务只持久 completion request hash 与 cleanup intent，不写 Evidence 或成功 Receipt。bounded foreground revoke 成功后，第二事务重新复验 Gate/attempt/fence 和同一 request hash，再原子写 Evidence、runner receipt、diagnostic receipt 并终结 Task/Attempt。若进程在两事务之间 crash，Runner 以同一 completion 重放；若 Evidence 已丢失则 cleanup 后安全终结为 FAILED，不能凭 hash 伪造成功。Cancel/Timeout/recovery 不保存 Evidence，cleanup 确认后写 failure Receipt；MANUAL_REQUIRED 可写失败 Receipt，但绝不写成功 Evidence。Gateway crash after the issue marker but before durable Finalize always persists issuance `UNCERTAIN→MANUAL_REQUIRED`；correlation metadata is audit-only，there is no automatic Vault lookup or repeated issue。
 
 Sweeper 扫描：过期 Task lease、Runner cert invalid、Grant revoked/expired、Runtime revoked/drifted、Realm disabled、heartbeat stale、credential expires soon。任何命中先取消执行/关闭 heartbeat，再 cleanup。只有无 credential 或已确认 revoke 时 Task 才 terminal；manual required 在 UI/ops 可见但不向 Runner暴露内部原因。
 
 - [ ] **Step 5: 真实装配与端到端生命周期测试**
 
-`cmd/control-plane` production mode 必须装配 PostgreSQL repositories、Vault READ issuer/revoker、keyring protector、cleanup worker、Host/Postgres registries、GrantGate 和 diagnostics admission。不能 fallback 到 in-memory、static password 或现有 WRITE broker。Startup 执行 manager/revoker self-check、role TTL/nonrenewable/read-only preflight；失败退出。
+`cmd/control-plane` production mode 必须装配 PostgreSQL repositories、Vault READ issuer/revoker、keyring protector、cleanup worker、Host/Postgres registries、GrantGate 和 diagnostics admission。不能 fallback 到 in-memory、static password 或现有 WRITE broker。Production startup 只能执行 cluster version/TLS、issuer/revoker 各自可达性与 renew-deny self-check，并验证当前 exact APPLIED PostgreSQL Provider Runtime successor 的既有 `artifact_kind=TRUST_CLOSURE`；该 artifact 的 schema 固定为未过期、内容寻址且签名的 `vault-read-database-readiness.v1`，不新增第五种通用 artifact kind。它必须由隔离的 release validation identity 对固定 `default_ttl=max_ttl=30s` role、issuer/revoker ACL、真实 issue→数据库只读负例→`sync=true` revoke 全链生成，并随 successor Runtime 一次性发布。Issuer/revoker 本身没有读取 mount/role/policy 配置的权限，startup 不得伪称用生产 token 完成该 preflight；artifact 缺失、漂移、过期或任一 self-check 失败均退出。
 
 生产装配通过后只把 `executor binary/READ issuer/revoker/role/cleanup worker/Realm/Network Policy` digests 写为 package 05 exact successor 的 executor-readiness evidence。该写入不可把 capability 改为 `AVAILABLE`；package 08 仍必须以真实 Query E2E、负向安全、credential cleanup、DLP/Evidence 与独立 attestation 完成最后门禁。
 

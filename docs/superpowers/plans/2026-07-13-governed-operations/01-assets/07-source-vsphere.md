@@ -93,7 +93,7 @@ Every source-owned field gets a closed `VSPHERE_V1_*` provenance path code. MoRe
 Run:
 
 ~~~bash
-gofmt -w internal/assetsource/vsphere
+gofmt -w $(rg --files internal/assetsource/vsphere -g '*.go')
 go mod tidy
 go test -race ./internal/assetsource/vsphere -count=1
 govulncheck ./internal/assetsource/vsphere/...

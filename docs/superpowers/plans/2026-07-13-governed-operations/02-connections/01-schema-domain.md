@@ -79,7 +79,7 @@ The migration owns these relations:
 | `published_capability_sets` | Scope + `id` | closed-by-gate immutable set |
 | `published_capability_set_items` | Scope + set + capability | compiled limits/digest |
 | `runtime_publications` | Scope + `id` | bundle/deployment digest and rollout status |
-| `runtime_publication_artifacts` | Scope + publication + kind | canonical bytes/schema/SHA-256 |
+| `runtime_publication_artifacts` | Scope + publication + closed kind | canonical bytes/schema/SHA-256；named `runtime_publication_artifacts_kind_check` initially permits exactly `CONNECTOR_MANIFEST|TARGET_MANIFEST|EGRESS_MANIFEST|TRUST_CLOSURE` |
 
 - [ ] **Step 1: Write failing real-PostgreSQL migration tests**
 

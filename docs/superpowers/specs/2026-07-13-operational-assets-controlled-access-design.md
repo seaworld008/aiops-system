@@ -178,11 +178,11 @@ KUBERNETES_OPERATOR
 AWX_INVENTORY
 ```
 
-来源枚举本身不等于已支持。除 `MANUAL` 外，每种来源都必须有独立生产 Adapter、真实验证、opaque `CredentialReference`、最小权限、增量 cursor/checkpoint、durable lease/fencing、限流/退避、字段 provenance、软删除/恢复和真实协议 E2E，并通过自己的 `AVAILABLE` gate 后才能创建权威 Observation。`CONTROL_PLANE_API` 使用有 Scope 的机器身份和幂等批次；`CSV_IMPORT` 使用签名批次、严格 schema 与隔离解析；CMDB、vSphere、Proxmox、OpenStack、Cloud、Kubernetes Operator 和 AWX 各自保持独立 Provider contract，不能退化为任意 endpoint/JSON 采集器。缺 Adapter、身份、验证或 gate 的类型必须明确 `UNAVAILABLE`，不得仅凭 SourceKind 接受数据。
+来源枚举本身不等于已支持。除 `MANUAL` 外，每种来源都必须有独立生产 Adapter、真实验证、opaque `CredentialReference`、最小权限、增量 cursor/checkpoint、durable lease/fencing、限流/退避、字段 provenance、软删除/恢复和真实协议 E2E，并通过自己的 `AVAILABLE` gate 后才能创建权威 Observation。`CONTROL_PLANE_API` 使用有 Scope 的机器身份和幂等批次；`CSV_IMPORT` 使用签名批次、严格 schema 与隔离解析；CMDB、vSphere、Proxmox、OpenStack、Cloud、Kubernetes Operator 和 AWX 各自保持独立 Provider contract，不能退化为任意 endpoint/JSON 采集器。缺 Adapter、身份、验证或 gate 的类型必须明确 `UNAVAILABLE`，不得仅凭 SourceKind 接受数据。对由后继迁移拥有的 K8S/AWX，Phase 1 默认 hook 还会在 deferred commit 阻止稳定 Source 的初始创建；只有 owned successor 能在同一 serializable transaction 重载 revision/authority/typed-or-runtime facts 后开放该 SourceKind 的 creation branch。Phase 1 INSERT closure 仍强制该事务结束于 exact initial `UNAVAILABLE` + revision-1 `DRAFT` boundary，禁止 create+validate/publish/open 合并提交；后续阶段必须使用新的 serializable transaction。已有 Source 向 `UNAVAILABLE|SUSPENDED` 收敛不受 hook 阻塞。
 
 Source 执行契约同样属于安全边界：每个 Source 最多一个 durable nonterminal Run；Validation 只绑定待验证 Revision 的空 checkpoint shape，不能读取、比较或推进已发布 Source checkpoint。Gate epoch 采用闭合算术：起点 `G` 的首次发布路径为 Validation Run `G`、publication `UNAVAILABLE/G+1`、open `AVAILABLE/G+2`；显式可见验证路径为 Source `VALIDATING/G+1`、publication `UNAVAILABLE/G+2`、open `AVAILABLE/G+3`；稳定 `AVAILABLE` 更新不得改变 epoch/binding；lineage rollover 则固定为 Run `G`、执行期 `DEGRADED/G+1`、terminal `AVAILABLE|SUSPENDED/G+2`。任何 epoch 跳跃、无治理事实的单独递增或旧验证证明复用都拒绝。成功数据页和 Validation 必须分别封存不可变 `DATA_PROJECTION`、`VALIDATION_PROOF` 后进入 `FINALIZING`，再以 Broker-owned opaque cleanup attempt 完成凭据/会话吊销；cleanup 不确定必须 `FAILED + SUSPENDED`，不能覆盖已经封存的 work result 或伪造成功。`Complete/Fail` 持久化由完整 terminal tuple 计算的 `terminal_command_sha256`，并写 exact `ASSET_SOURCE_RUN/TERMINAL_COMMITTED` receipt `request_id="source-terminal:<run_uuid>"`、`payload_hash=terminal_command_sha256` 后才销毁 raw fence；响应丢失只能按该 receipt 只读重放。Terminal Run、其 receipt、Validation Revision `VALIDATED|REJECTED` 或数据 Source success/complete/gate closure 必须在同一 serializable transaction 原子闭合；cleanup `UNCERTAIN` 缺 Source `SUSPENDED` 时整笔回滚。
 
-Observation 只在 live exact lease/fence、published Source definition/gate/checkpoint 与 next page 均匹配时接纳，并由 deferred closure 绑定同事务 `PAGE_APPLIED` receipt。page transaction 先读取固定的服务端 `transaction_timestamp()`，Go 以该值构造唯一 canonical provenance/chain bytes，PostgreSQL 再精确复验；生产 INSERT 不得用 SQL 构造 JSON/canonical bytes，也不得依赖下一语句才确定的 `statement_timestamp()`。Relationship 额外持久 `accepted_checkpoint_version/run_fence_epoch`，使用独立 `RELATION_PAGE_COMMITTED` receipt `request_id="source-relation-page:<run_uuid>:<page_sequence>"`、`payload_hash=relation_page_sha256`，不能借用资产页 receipt。任何 `complete_snapshot=true` 的 final page 必须在同一事务把关系页序号精确推进一次、封存新的关系页 digest 与 exact receipt；关系为空也必须提交 canonical empty relation page。Provider cursor/resourceVersion 失效只能让同一 fenced Run 走受治理 checkpoint-lineage rollover：Run 的原 gate revision 不变，执行期 Source 固定为 `run+1/DEGRADED`，terminal 固定为 `run+2/AVAILABLE|SUSPENDED`；旧 checkpoint 在 successor page CAS 前保持不变，version 单调递增，禁止同修订任意清零/回退或创建旁路 Run。`MANUAL_V1` 是唯一无外部 Adapter 的同步特例；`MANUAL` Source 创建时即必须绑定 `provider_kind=MANUAL_V1`，Revision 必须使用 `profile_code=MANUAL_V1` 且 Credential/Trust/Network references 全为 `NULL`，非 MANUAL 不得声明该 Provider/Profile。它没有 Provider cursor，因此不得进入 checkpoint-lineage rollover；`NO_CREDENTIAL` 必须由 exact Run/Revision/fence 确定性求 digest并有 exact `ATTEMPT_CLEANED` receipt。MANUAL 不能进入 Broker `PENDING|REVOKED|UNCERTAIN`、pending `DELAY`、`DELAYED` 或 cleanup reset；任何非终态 MANUAL Run 在事务提交点都由 deferred guard 拒绝，故 Validation/MANUAL_MUTATION 必须在同一 serializable API transaction 内完成全部 Run/receipt/Revision-or-Source closure，失败整笔回滚且不留下 Run。但它仍须经过 exact Revision/Validation/Run/Observation/Audit 路径，并且其 `SINGLE_ENVIRONMENT` Source 只能在该唯一 authority Environment 创建资产。`MANUAL_MUTATION` 绝不是 authoritative complete snapshot，`complete_snapshot/effective_complete_snapshot` 均为 `false`，成功只推进 `last_success` 而不推进 `last_complete_snapshot`。
+Observation 只在 live exact lease/fence、published Source definition/gate/checkpoint 与 next page 均匹配时接纳，并由 deferred closure 绑定同事务 `PAGE_APPLIED` receipt。page transaction 先读取固定的服务端 `transaction_timestamp()`，Go 以该值构造唯一 canonical provenance/chain bytes，PostgreSQL 再精确复验；生产 INSERT 不得用 SQL 构造 JSON/canonical bytes，也不得依赖下一语句才确定的 `statement_timestamp()`。Relationship 额外持久 `accepted_checkpoint_version/run_fence_epoch`，使用独立 `RELATION_PAGE_COMMITTED` receipt `request_id="source-relation-page:<run_uuid>:<page_sequence>"`、`payload_hash=relation_page_sha256`，不能借用资产页 receipt。任何 `complete_snapshot=true` 的 final page 必须在同一事务把关系页序号精确推进一次、封存新的关系页 digest 与 exact receipt；关系为空也必须提交 canonical empty relation page。Provider cursor/resourceVersion 失效只能让同一 fenced Run 走受治理 checkpoint-lineage rollover：Run 的原 gate revision 不变，执行期 Source 固定为 `run+1/DEGRADED`，terminal 固定为 `run+2/AVAILABLE|SUSPENDED`；旧 checkpoint 在 successor page CAS 前保持不变，version 单调递增，禁止同修订任意清零/回退或创建旁路 Run。`MANUAL_V1` 是唯一无外部 Adapter 的同步特例；`MANUAL` Source 创建时即必须绑定 `provider_kind=MANUAL_V1`，Revision 必须使用 `profile_code=MANUAL_V1` 且 Integration/Credential/Trust/Network/schedule/typed-extension fields 全为 `NULL`，非 MANUAL 不得声明该 Provider/Profile。内建 profile 固定 `CATALOG_SEQUENCE + SINGLE_ENVIRONMENT + 1/1/1/1` 与 closed empty provider schema，不依赖后续可变 Registry。它没有 Provider cursor，因此不得进入 checkpoint-lineage rollover；`NO_CREDENTIAL` 必须由 exact Run/Revision/fence 确定性求 digest并有 exact `ATTEMPT_CLEANED` receipt。MANUAL 不能进入 Broker `PENDING|REVOKED|UNCERTAIN`、pending `DELAY`、`DELAYED` 或 cleanup reset；任何非终态 MANUAL Run 在事务提交点都由 deferred guard 拒绝，故 Validation/MANUAL_MUTATION 必须在同一 serializable API transaction 内完成全部 Run/receipt/Revision-or-Source closure，失败整笔回滚且不留下 Run。但它仍须经过 exact Revision/Validation/Run/Observation/Audit 路径，并且其 `SINGLE_ENVIRONMENT` Source 只能在该唯一 authority Environment 创建资产。`MANUAL_MUTATION` 绝不是 authoritative complete snapshot，`complete_snapshot/effective_complete_snapshot` 均为 `false`，成功只推进 `last_success` 而不推进 `last_complete_snapshot`。
 
 字段所有权规则：
 
@@ -382,6 +382,8 @@ HOST_BOUNDED_LOG_WINDOW
 
 所有参数必须是严格类型化标识、枚举和时间窗，不能包含命令、argv、env、路径通配符或脚本。
 
+AWX 路径还必须遵守三份唯一后继契约：[Host identity enrollment](../../contracts/awx-host-identity-enrollment-v1.md) 只允许 mapping-only bootstrap 后通过完整 cohort enrollment 生成 fingerprint/identity N+1 Runtime；[governed launch admission](../../contracts/awx-governed-launch-admission-v1.md) 在 AWX DB serializable transaction/关系锁内消除 GET→launch 竞态并让 stock launch 恒拒绝；[host identity attestor](../../contracts/host-identity-attestor-v1.md) 只接受 TPM-sealed、platform-attested Ed25519 loopback mTLS 身份，并把 measured attestor process 明确纳入 TCB。任一 Broker、authority keyring、governed image、attestation 或 cleanup proof 漂移都保持对应 capability `UNAVAILABLE`。
+
 未来若必须使用 SSH/WinRM 作为传输，必须另立 ADR 和信任域：
 
 - SSH 只允许每任务短期证书、固定 Principal、`ForceCommand` 指向固定编译二进制。
@@ -527,7 +529,8 @@ Grant 不能转化或复用于 WRITE。ActionPlan 必须重新经过独立 Actio
 | 表 | 核心责任 |
 |---|---|
 | `asset_sources` | 发现来源的稳定身份、当前修订指针和生命周期 |
-| `asset_source_revisions` | Provider 配置、同步模式、凭据引用与发布状态的不可变修订；不保存 Secret |
+| `asset_source_revisions` | Provider canonical schema、不可变 canonical Profile manifest、同步/引用、authority digest、Provider/Profile definition digest、nullable typed-extension code/digest 与固定 20-frame canonical revision digest 的不可变修订；不保存 Secret |
+| `asset_source_revision_authorities` | Revision 的 1–100 个 same-Scope Environment 权威成员；ordinal 连续、按 UUID canonical text 的 `C` 序排列、insert-only |
 | `asset_source_runs` | 每次同步的游标、摘要、计数和结果 |
 | `asset_observations` | 外部不可信、append-only 观测快照 |
 | `assets` | 稳定资产身份与当前治理投影 |
@@ -553,9 +556,9 @@ Grant 不能转化或复用于 WRITE。ActionPlan 必须重新经过独立 Actio
 | `proactive_runs` | 调度、Grant、Investigation 和结果关联 |
 | `action_proposals` | Evidence 派生、append-only、仅 `PROPOSAL_ONLY` 的受治理动作候选；绑定 Catalog/Evidence 摘要且永无执行权 |
 
-所有跨作用域引用使用 Tenant、Workspace、Environment 复合外键。重要修订表禁止原地更新；状态转换使用版本或数据库锁防止竞争。
+所有跨作用域引用使用 Tenant、Workspace、Environment 复合外键。重要修订表禁止原地更新；状态转换使用版本或数据库锁防止竞争。Authority membership 的唯一事实是 `asset_source_revision_authorities` child rows，不接受 digest-only authority。`asset_source_revisions` 同时持久化严格闭集、RFC 8785 canonical Profile manifest 及其 SHA-256；Profile code 不是语义事实的替代。`000015` 在 deferred commit 重载 exact Source/Revision/children，分别重算 `asset-source-authority-scope.v1`、包含 raw Profile-manifest SHA 与 raw Provider-schema SHA 的 `asset-source-definition.v2`，以及固定 20-frame BindingDigest；caller 提交的全部 SHA 只作为期望值，任一成员、manifest/schema byte、顺序、字段或摘要漂移整笔回滚。`typed_extension_code/prepared_extension_digest` 必须同时 NULL 或同时存在；`000015` 只允许 `KUBERNETES_OPERATOR` 使用 present pair，存在本身不证明 extension 已安装，`000017` 仍须在同一 serializable transaction 验证 exact 1:1 typed row。
 
-迁移所有权固定：`asset_source_revisions` 属于 `000015_assets_catalog`，`action_proposals` 属于 `000018_investigation_grants_proactive_policies`。后续 ActionPlan 只能由经认证的人调用 `POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/services/{service_id}/action-plans` 发起；Tenant 来自认证 Principal，Workspace/Environment/Service 来自受信 path。Phase 7 必须在同一个 serializable PostgreSQL transaction 内构造 `HandoffRequest`、调用 Phase 4 Handoff Loader 重载并重新校验 Proposal/Catalog/Evidence/Snapshot，再解析其余可信事实并封存；Loader 前不得预读 Proposal，且不得复制浏览器或模型提交的 Scope、身份、目标、授权窗口、验证或补偿字段。
+迁移所有权固定：`asset_source_revisions` 与 `asset_source_revision_authorities` 属于 `000015_assets_catalog`，`action_proposals` 属于 `000018_investigation_grants_proactive_policies`。后续 ActionPlan 只能由经认证的人调用 `POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/services/{service_id}/action-plans` 发起；Tenant 来自认证 Principal，Workspace/Environment/Service 来自受信 path。Phase 7 必须在同一个 serializable PostgreSQL transaction 内构造 `HandoffRequest`、调用 Phase 4 Handoff Loader 重载并重新校验 Proposal/Catalog/Evidence/Snapshot，再解析其余可信事实并封存；Loader 前不得预读 Proposal，且不得复制浏览器或模型提交的 Scope、身份、目标、授权窗口、验证或补偿字段。
 
 ## 11. 后端模块边界
 
@@ -722,12 +725,13 @@ POST /api/v1/workspaces/{workspace_id}/environments/{environment_id}/production-
 API 通用规则：
 
 - 列表使用不透明 Cursor、稳定排序和作用域强制过滤。
-- 写请求使用 `Idempotency-Key`。
+- 写请求使用只来自受信 Header 的 `Idempotency-Key`；request hash 由服务端对完整 route Scope 加严格类型化输入 canonicalize 后计算。
 - 更新与发布使用 `ETag / If-Match`。
 - 错误使用 RFC 9457 Problem Details、稳定 `code` 和 `trace_id`。
 - DTO 返回 `effective_actions`，前端不按角色名推断权限。
 - 连接发布、生产验证、主动策略发布、Grant 撤销、Action 审批/执行/回滚和生产发布决策要求服务器验证的最近重新认证。
 - Action mutation 只返回 durable Operation；浏览器不能提交 Subject/Role/auth_time、Policy facts、Credential、Target endpoint、Runner lease 或 Provider payload。
+- 所有领域写命令都不是 JSON DTO：Tenant 只来自 verified Principal；Workspace/Environment/Service 只来自完整受信 path 与复合数据库解析；actor/subject/auth time、Trace、授权结果和 canonical request hash 由服务端注入。即使命中幂等 receipt，也必须先重新校验当前 Principal、Scope、对象状态和授权，不能把 replay 变成越权旁路。
 
 ## 13. 权限
 
@@ -988,7 +992,10 @@ PRODUCTION_RELEASE_DECIDE
 
 | 维度 | 状态 |
 |---|---|
-| 发现 Source/Adapter | `DRAFT / VALIDATING / AVAILABLE / DEGRADED / RATE_LIMITED / STALE / REVOKED / UNAVAILABLE` |
+| 发现 Source 稳定身份 | `ACTIVE / PAUSED / DEGRADED / DISABLED` |
+| Source Revision | `DRAFT / VALIDATING / VALIDATED / REJECTED / PUBLISHED / SUPERSEDED` |
+| Source Gate | `UNAVAILABLE / VALIDATING / AVAILABLE / DEGRADED / SUSPENDED` |
+| Source Run | `QUEUED / DELAYED / RUNNING / FINALIZING / SUCCEEDED / PARTIAL / FAILED / CANCELLED` |
 | 映射 | `EXACT / AMBIGUOUS / UNRESOLVED` |
 | 资产生命周期 | `DISCOVERED / ACTIVE / STALE / QUARANTINED / RETIRED` |
 | 连接修订 | `DRAFT / VALIDATING / VALIDATED / REJECTED / PUBLISHED / REVOKED / SUPERSEDED` |
@@ -1011,6 +1018,8 @@ PRODUCTION_RELEASE_DECIDE
 | 生产 Release wave | `PENDING / RUNNING / SOAKING / HELD / PROMOTED / ROLLING_BACK / ROLLED_BACK / FAILED` |
 
 前端不得把这些维度合并成一个“状态”。
+
+`RATE_LIMITED` 是持久 backpressure/delay reason，`STALE` 是资产/事实新鲜度结果，`REVOKED` 是引用或凭据状态；三者不得塞回 Source/Adapter 的单一状态枚举。SourceKind/ProviderKind 枚举只表示类型，不证明对应 Adapter/Profile 已安装或通过生产门；只有 exact Source/Revision/Gate 加已安装 Profile/Adapter 以及所需 Connection/Runtime/Capability 闭包共同复验后，才可把该实例视为可运行。
 
 ## 16. 错误与停止条件
 

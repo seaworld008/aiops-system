@@ -6,7 +6,7 @@
 
 **Architecture:** 多节点 Kind reference stack 验证可重复机制，实际目标环境执行同一 image/chart/platform revision 和 pilot runner。测试通过真实 OIDC/mTLS/Vault dynamic credential/Temporal/Gateway/target 服务，不使用 fake/MSW/loopback dependency。所有演练生成 sanitized evidence digest 写入 `000020`，最后 Decision Service 只在全 gate PASS 与真实 soak 达标时接受三值之一；文档记录事实而非预设批准。
 
-**Tech Stack:** Kubernetes 1.36/Kind、Helm 3、PostgreSQL 18.4 HA/PITR、Temporal、Keycloak Server 26.6.3、browser keycloak-js 26.2.4、Vault HA/PKI、S3-compatible Object Lock、Prometheus/Alertmanager/Grafana/OTel、Go 1.26.5、pnpm 10.34.0、Playwright 1.61.1、axe-core 4.12.1、k6、CI artifact signing/scanning。
+**Tech Stack:** Kubernetes 1.36.2/Kind、Helm 3、PostgreSQL 18.4 HA/PITR、Temporal、Keycloak Server 26.6.3、browser keycloak-js 26.2.4、Vault HA/PKI、S3-compatible Object Lock、Prometheus/Alertmanager/Grafana/OTel、Go 1.26.5、pnpm 10.34.0、Playwright 1.61.1、axe-core 4.12.1、k6、CI artifact signing/scanning。
 
 ## Global Constraints
 

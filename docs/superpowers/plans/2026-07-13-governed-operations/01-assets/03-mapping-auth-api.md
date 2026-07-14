@@ -40,7 +40,7 @@
 
 **Interfaces:**
 - Consumes: existing `services` facts and the conflict/asset rows created by Tasks 3–4.
-- Produces: `MappingRepository` for relation reads, conflict queue/decision, binding list/create/delete.
+- Produces: exact Task 2 `MappingRepository`, including narrow read-only `ResolveConflictScope`, for relation reads, conflict queue/decision, binding list/create/delete.
 - Safety rule: a binding can only become `ACTIVE` with `mapping_status=EXACT` after an explicit decision; a conflict decision and its audit/outbox side effects are atomic.
 
 - [ ] **Step 1: Write failing mapping state and atomicity tests**
@@ -62,10 +62,10 @@ func TestResolveConflictConfirmExactCreatesOnlyRequestedBinding(t *testing.T) {
 	}
 	binding := *result.Binding
 	if binding.ServiceID != decision.ServiceID || binding.AssetID != fixture.AssetID ||
-		binding.MappingStatus != domain.MappingExact || binding.Status != "ACTIVE" {
+		binding.MappingStatus != domain.MappingExact || binding.Status != assetcatalog.BindingStatusActive {
 		t.Fatalf("binding = %#v", binding)
 	}
-	if result.Receipt.AuditID == "" || result.Receipt.TraceID != decision.TraceID || result.Receipt.IdempotentReplay {
+	if result.Receipt.AuditID == "" || result.Receipt.TraceID != decision.Context.TraceID() || result.Receipt.IdempotentReplay {
 		t.Fatalf("mutation receipt = %#v", result.Receipt)
 	}
 	assertMappingSideEffects(t, database, fixture.ConflictID, 1, 1, 1)
@@ -101,61 +101,11 @@ Run: `go test ./internal/assetcatalog/postgres -run 'TestResolveConflict' -count
 
 Expected: FAIL because mapping repository methods do not exist.
 
-- [ ] **Step 2: Define complete mapping read/write contracts**
+The same Red suite covers `ResolveConflictScope(workspaceID,conflictID)` and every mapping list with purpose-named `NewAssetReadConstraint` values：zero rejects before SQL；restricted-empty returns no rows；two allowed Service IDs return the exact union；an Asset or candidate outside those ACTIVE bindings is not disclosed；unrestricted returns the scoped set。Mutating the server constraint changes each relation/binding/conflict QueryDigest and a cursor cannot cross it.
 
-~~~go
-type Relationship struct {
-	ID                                string
-	TenantID                          string
-	WorkspaceID                       string
-	SourceEnvironmentID               string
-	TargetEnvironmentID               string
-	SourceAssetID                      string
-	TargetAssetID                      string
-	Type                              RelationshipType
-	Provenance                        Provenance
-	ProvenanceSourceID                string
-	CrossEnvironmentPolicyReferenceID string
-	Status                            RelationshipStatus
-	Version                           int64
-	CreatedAt                         time.Time
-	UpdatedAt                         time.Time
-}
+- [ ] **Step 2: Implement the exact Task 2 mapping read/write contracts**
 
-type Conflict struct {
-	ID                string
-	Scope             Scope
-	SourceAssetID     string
-	CandidateAssetID  string
-	CandidateServiceID string
-	Kind              string
-	Status            string
-	SummaryCode       string
-	Version           int64
-	CreatedAt         time.Time
-	ResolvedAt        time.Time
-}
-
-type MappingRepository interface {
-	ListRelationships(context.Context, ListRelationshipsRequest) (RelationshipPage, error)
-	ListBindings(context.Context, ListBindingsRequest) (BindingPage, error)
-	CreateBinding(context.Context, CreateBindingCommand) (BindingMutationResult, error)
-	DeleteBinding(context.Context, DeleteBindingCommand) (MutationReceipt, error)
-	ListConflicts(context.Context, ListConflictsRequest) (ConflictPage, error)
-	ResolveConflict(context.Context, MappingDecision) (MappingDecisionResult, error)
-}
-
-type BindingMutationResult struct {
-	Binding ServiceAssetBinding
-	Receipt MutationReceipt
-}
-
-type MappingDecisionResult struct {
-	Conflict Conflict
-	Binding  *ServiceAssetBinding
-	Receipt  MutationReceipt
-}
-~~~
+Consume `assetcatalog.Relationship`、`Conflict`、`MappingRepository`、`BindingMutationResult` and `MappingDecisionResult` exactly as defined and tested by Task 2；this task must not redeclare a reduced DTO. In particular, Relationship reads retain the persisted Source/revision/run/page/checkpoint/fence、freshness、Provider-version and relation-fact coordinates, while Conflict retains exact scoped Source/Observation/candidate/hash/status/resolution coordinates. HTTP projection in Task 7 may omit safe internal fields, but Repository/domain facts cannot lose them.
 
 The corresponding request/page types use the same `Scope`, maximum limit 100, and keyset cursors:
 
@@ -165,11 +115,13 @@ The corresponding request/page types use the same `Scope`, maximum limit 100, an
 
 `Conflict` must expose only stable summary codes and IDs. Raw provider documents and fingerprint values never leave the repository.
 
+`ResolveConflictScope` executes one read-only composite join from `(workspace_id,conflict_id)` to the conflict's exact Tenant/Workspace/Environment and returns no conflict content；management uses it only to obtain Environment before authorization and then performs the authorized repository operation. `ListRelationships` applies the access predicate to both endpoint Assets；`ListBindings` applies it to the bound Asset and requested Service；`ListConflicts` applies it to the primary Asset and every non-NULL candidate Asset/Service reference. Each SQL path validates initialized access before query, keeps the client filter separate, uses ACTIVE bindings only, and includes the sorted server Service IDs/unrestricted bit in QueryDigest. Restricted-empty is represented as a false predicate, never NULL/all.
+
 - [ ] **Step 3: Implement compare-and-swap decisions**
 
 `ResolveConflict` must:
 
-1. Validate the action, binding role, service/asset UUIDs, reason, idempotency key/hash, expected conflict version, actor and UTC decision time.
+1. Validate the closed action、binding role、service/asset UUIDs、`ReasonCode` and expected conflict version；then validate the Task 2 `MutationContext` whose actor/auth time/idempotency/hash were server-derived and cannot be supplied by the caller.
 2. Begin `SERIALIZABLE`, lock conflict, candidate asset, same-scope service and the exact `(service_id, environment_id)` legacy `service_bindings` eligibility row in deterministic UUID order. A same-Workspace Service without that Environment binding is a scope violation and the whole transaction rolls back.
 3. A resolved replay returns its binding only if idempotency key and request hash match; otherwise return `ErrIdempotency`.
 4. `CONFIRM_EXACT` requires a non-empty same-scope service and role plus the locked Environment eligibility edge, marks conflict `RESOLVED`, changes the asset mapping to `EXACT`, and inserts exactly one `ACTIVE` binding.
@@ -178,7 +130,7 @@ The corresponding request/page types use the same `Scope`, maximum limit 100, an
 7. `QUARANTINE_ASSET` closes the conflict, transitions the asset to `QUARANTINED`, and does not create a binding.
 8. Increment conflict/asset versions, insert an audit event and an `asset.conflict.resolved.v1` outbox event containing only IDs/resolution/version, then commit and return the persisted receipt. Identical replay returns the original Audit ID with `IdempotentReplay=true`; a zero-value or synthesized receipt is invalid.
 
-Standalone `CreateBinding` is permitted only for an already `EXACT` asset and the caller must provide the same explicit service, role, Idempotency-Key, request hash, and actor. It reuses and locks the same `(service_id,environment_id)` eligibility edge and must not infer a primary runtime. `CreateBinding` returns the Binding plus its durable receipt. `DeleteBinding` is a soft delete (`status=INACTIVE`, version+1), requires both Idempotency-Key and If-Match, persists delete idempotency/audit identity, preserves history, returns its durable receipt, and emits `service.asset.binding.removed.v1`.
+Standalone `CreateBinding` is permitted only for an already `EXACT` asset；the strict input supplies explicit service、role and `reason_code`，while management derives Idempotency-Key/request hash/actor into the opaque MutationContext after authorization。It reuses and locks the same `(service_id,environment_id)` eligibility edge and must not infer a primary runtime. `CreateBinding` returns the Binding plus its durable receipt. `DeleteBinding` is a soft delete (`status=INACTIVE`, version+1), requires both Idempotency-Key and If-Match, persists delete idempotency/audit identity, preserves history, returns its durable receipt, and emits `service.asset.binding.removed.v1`.
 
 Add integration assertions for standalone create, delete and all three identical replays: create/decision results contain the committed Audit ID/Trace ID; delete exposes that same persisted receipt to the HTTP 204 header path; replay returns the original Audit ID with `IdempotentReplay=true` and never writes a second audit/outbox row.
 
@@ -209,13 +161,13 @@ RETURNING id::text, version, created_at, updated_at;
 Run:
 
 ~~~bash
-gofmt -w internal/assetcatalog internal/assetcatalog/postgres
+gofmt -w $(rg --files internal/assetcatalog -g '*.go')
 go test -race ./internal/assetcatalog ./internal/assetcatalog/postgres -count=1
 TEST_DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/aiops_test?sslmode=disable' \
   go test -race ./internal/assetcatalog/postgres -run 'TestMappingIntegration' -count=1
 ~~~
 
-Expected: PASS. Concurrent decisions produce one committed decision and one version conflict; no cross-scope relationship/binding is visible; all list pages have stable, duplicate-free traversal.
+Expected: PASS. Concurrent decisions produce one committed decision and one version conflict；`ResolveConflictScope` cannot cross Workspace/Tenant；zero/restricted-empty/two-Service/unrestricted constraints are enforced in SQL for relation、binding and conflict lists；no cross-scope or unauthorized relationship/binding/candidate is visible；all list pages have stable, duplicate-free traversal.
 
 - [ ] **Step 5: Commit**
 
@@ -237,8 +189,8 @@ git commit -m "feat(assetcatalog): govern mappings and service bindings"
 - Create: **internal/assetcatalog/management_test.go**
 
 **Interfaces:**
-- Consumes: authenticated `authn.Principal` and the three repository groups from Tasks 3–5.
-- Produces: separate `AssetManager`、`SourceManager`、`ConflictManager`、`BindingManager` interfaces for HTTP; management returns safe view models with `EffectiveActions`.
+- Consumes: authenticated `authn.Principal` with one canonical Tenant ID and the three repository groups from Tasks 3–5.
+- Produces: separate `AssetManager`、`RelationshipManager`、`SourceManager`、`ConflictManager`、`BindingManager` interfaces for HTTP; management returns safe view models with `EffectiveActions`.
 - Role policy: `VIEWER` read; `SRE` read; `SERVICE_OWNER` read and bind only owned services; `APPROVER` read; `AUDITOR` read; `ADMIN` read/manage/bind/resolve. No role receives live investigation from this slice.
 
 - [ ] **Step 1: Write failing role-matrix tests**
@@ -278,7 +230,7 @@ Expected: FAIL because `RoleViewer` and asset permissions do not exist.
 
 - [ ] **Step 2: Extend roles and permissions without weakening existing policy**
 
-Add `RoleViewer Role = "VIEWER"` to `authn`, accept it in `normalizeRoles`, and leave all scope/time normalization unchanged. Add:
+Consume the required canonical `authn.Principal.TenantID` and fixed Keycloak `aiops_tenant_id` mapping already established by Task 2；keep its missing/noncanonical rejection tests green. Add `RoleViewer Role = "VIEWER"` to `authn`, accept it in `normalizeRoles`, and leave the existing bounded tenant/workspace/environment/service and time normalization otherwise unchanged. Add manager tests proving a Workspace claim from another Tenant cannot override Principal identity and Scope resolution must return the same Tenant. Add:
 
 ~~~go
 const (
@@ -298,8 +250,12 @@ func TestManagementDoesNotCallRepositoryWhenUnauthorized(t *testing.T) {
 	repository := &recordingRepository{}
 	manager := mustManagement(repository, fixedAuthorizer())
 	principal := principalWithRole(authn.RoleViewer)
+	request := validCreateRequest()
 
-	_, err := manager.CreateAsset(context.Background(), principal, validCreateRequest())
+	_, err := manager.CreateAsset(
+		context.Background(), principal,
+		request.Collection, request.Input, request.Metadata,
+	)
 	if !errors.Is(err, authz.ErrForbidden) {
 		t.Fatalf("CreateAsset error = %v", err)
 	}
@@ -328,7 +284,7 @@ Run: `go test ./internal/assetcatalog -run 'TestManagement|TestEffectiveActions'
 
 Expected: FAIL because the management service does not exist.
 
-- [ ] **Step 4: Implement four narrow managers**
+- [ ] **Step 4: Implement five narrow managers**
 
 ~~~go
 type EffectiveAction string
@@ -343,35 +299,77 @@ const (
 	ActionResolveConflict EffectiveAction = "RESOLVE_CONFLICT"
 )
 
-type AssetView struct {
-	Asset            Asset
-	EffectiveActions []EffectiveAction
-}
+type AssetSummaryView struct { ReadModel AssetReadModel; EffectiveActions []EffectiveAction }
+type AssetView struct { ReadModel AssetDetailReadModel; EffectiveActions []EffectiveAction }
+type AssetViewPage struct { Items []AssetSummaryView; Next *AssetCursor; EffectiveActions []EffectiveAction }
 
 type AssetMutationView struct {
 	View    AssetView
 	Receipt MutationReceipt
 }
 
+type AssetCollectionRequest struct { WorkspaceID, EnvironmentID string }
+type AssetPathRequest struct { WorkspaceID, EnvironmentID, AssetID string }
+type AssetListInput struct { Filter AssetFilter; Sort AssetSort; Limit int; Cursor *AssetCursor }
+type ServerRequestMetadata struct { TraceID, IdempotencyKey string; ExpectedVersion int64 }
+type CreateAssetInput struct { SourceID string; Kind Kind; ExternalID, DisplayName string; OwnerGroup *string; Criticality Criticality; DataClassification DataClassification; Labels map[string]string }
+type UpdateGovernanceInput struct { DisplayName string; OwnerGroup *string; Criticality Criticality; DataClassification DataClassification; Labels map[string]string }
+type TransitionInput struct { ReasonCode string }
+
 type AssetManager interface {
-	ListAssets(context.Context, authn.Principal, ListAssetsRequest) (AssetViewPage, error)
-	GetAsset(context.Context, authn.Principal, AssetLocator) (AssetView, error)
-	CreateAsset(context.Context, authn.Principal, CreateAssetCommand) (AssetMutationView, error)
-	UpdateAsset(context.Context, authn.Principal, UpdateGovernanceCommand) (AssetMutationView, error)
-	QuarantineAsset(context.Context, authn.Principal, TransitionCommand) (AssetMutationView, error)
-	RetireAsset(context.Context, authn.Principal, TransitionCommand) (AssetMutationView, error)
+	ListAssets(context.Context, authn.Principal, AssetCollectionRequest, AssetListInput) (AssetViewPage, error)
+	GetAsset(context.Context, authn.Principal, AssetPathRequest) (AssetView, error)
+	CreateAsset(context.Context, authn.Principal, AssetCollectionRequest, CreateAssetInput, ServerRequestMetadata) (AssetMutationView, error)
+	UpdateAsset(context.Context, authn.Principal, AssetPathRequest, UpdateGovernanceInput, ServerRequestMetadata) (AssetMutationView, error)
+	QuarantineAsset(context.Context, authn.Principal, AssetPathRequest, TransitionInput, ServerRequestMetadata) (AssetMutationView, error)
+	RetireAsset(context.Context, authn.Principal, AssetPathRequest, TransitionInput, ServerRequestMetadata) (AssetMutationView, error)
 }
+
+type SourceCollectionRequest struct { WorkspaceID string }
+type SourcePathRequest struct { WorkspaceID, SourceID string }
+type SourceRunPathRequest struct { WorkspaceID, RunID string }
+type SourceListInput struct { Kinds []SourceKind; Statuses []SourceStatus; GateStatuses []SourceGateStatus; Usage SourceUsage; EnvironmentID string; Limit int; Cursor *SourceCursor }
+type SourceView struct { ReadModel SourceReadModel; EffectiveActions []EffectiveAction }
+type SourceViewPage struct { Items []SourceView; Next *SourceCursor }
+type SourceRunView struct { Run SourceRun; EffectiveActions []EffectiveAction }
+type SourceManager interface { ListSources(context.Context, authn.Principal, SourceCollectionRequest, SourceListInput) (SourceViewPage, error); GetSource(context.Context, authn.Principal, SourcePathRequest) (SourceView, error); GetSourceRun(context.Context, authn.Principal, SourceRunPathRequest) (SourceRunView, error) }
+
+type RelationshipListInput struct { AssetID, SourceID string; Types []RelationshipType; Statuses []RelationshipStatus; Limit int; Cursor *RelationshipCursor }
+type RelationshipViewPage struct { Items []Relationship; Next *RelationshipCursor }
+type RelationshipManager interface { ListRelationships(context.Context, authn.Principal, AssetCollectionRequest, RelationshipListInput) (RelationshipViewPage, error) }
+
+type ConflictCollectionRequest struct { WorkspaceID, EnvironmentID string }
+type ConflictPathRequest struct { WorkspaceID, ConflictID string }
+type ConflictListInput struct { AssetID, SourceID string; Statuses []ConflictStatus; Limit int; Cursor *ConflictCursor }
+type ResolveConflictInput struct { ServiceID string; Resolution ConflictResolution; BindingRole BindingRole; ReasonCode string }
+type ConflictView struct { ReadModel ConflictReadModel; EffectiveActions []EffectiveAction }
+type ConflictViewPage struct { Items []ConflictView; Next *ConflictCursor }
+type ConflictMutationView struct { View ConflictView; Binding *ServiceAssetBinding; Receipt MutationReceipt }
+type ConflictManager interface { ListConflicts(context.Context, authn.Principal, ConflictCollectionRequest, ConflictListInput) (ConflictViewPage, error); ResolveConflict(context.Context, authn.Principal, ConflictPathRequest, ResolveConflictInput, ServerRequestMetadata) (ConflictMutationView, error) }
+
+type BindingPathRequest struct { WorkspaceID, EnvironmentID, BindingID string }
+type BindingListInput struct { ServiceID, AssetID string; Roles []BindingRole; Statuses []BindingStatus; Limit int; Cursor *BindingCursor }
+type CreateBindingInput struct { ServiceID, AssetID string; Role BindingRole; ReasonCode string }
+type DeleteBindingInput struct { ReasonCode string }
+type BindingView struct { Binding ServiceAssetBinding; EffectiveActions []EffectiveAction }
+type BindingViewPage struct { Items []BindingView; Next *BindingCursor }
+type BindingMutationView struct { View BindingView; Receipt MutationReceipt }
+type BindingManager interface { ListBindings(context.Context, authn.Principal, AssetCollectionRequest, BindingListInput) (BindingViewPage, error); CreateBinding(context.Context, authn.Principal, AssetCollectionRequest, CreateBindingInput, ServerRequestMetadata) (BindingMutationView, error); DeleteBinding(context.Context, authn.Principal, BindingPathRequest, DeleteBindingInput, ServerRequestMetadata) (MutationReceipt, error) }
 ~~~
 
-Implement equivalent narrow interfaces for source, conflict, relation, and binding operations. Every method must:
+The manager inputs above are strict transport-neutral request values and contain only safe body/path conditions plus validated Idempotency-Key/If-Match metadata；they are not Repository domain commands and have no Tenant、actor、subject、auth time or request-hash fields. `ServerRequestMetadata.TraceID` is created by middleware and the manager itself canonicalizes the typed input plus resolved route Scope to compute request hash. After authentication、Scope resolution and authorization, management constructs the opaque Task 2 `MutationContext` and then the Repository command. An AST contract test rejects any production handler that constructs `MutationContext` or passes a domain command into a manager.
 
-1. validate UUIDs/limits/request hashes before authorization;
-2. resolve database scope and compare it with Principal workspace/environment scope;
+These five interfaces are the exact compile-time boundary；handlers and tests may not substitute “equivalent” unnamed managers. Every method must:
+
+1. validate route UUIDs、closed input、limits and server request metadata shape before authorization；there is no caller request hash yet;
+2. resolve database scope and require its Tenant to equal `principal.TenantID`, then compare Workspace/Environment with Principal scope;
 3. call `authz.Authorize` for the exact permission and service ID;
-4. call one repository method only after authorization succeeds;
+4. canonicalize the typed input plus resolved route Scope、compute the domain-separated request hash、construct Task 2 MutationMetadata/MutationContext and call one repository method only after authorization succeeds；an idempotent replay still performs steps 1–4 before Repository receipt lookup;
 5. derive sorted, duplicate-free `effective_actions` from both authorization and current object state;
 6. remove `EDIT_GOVERNANCE` from RETIRED, remove `QUARANTINE` from QUARANTINED/RETIRED, remove `RETIRE` from RETIRED, and expose no mapping decision action on closed conflicts;
 7. return domain errors without database/provider/credential text.
+
+`ResolveConflict` is the sole Workspace-only mutation route：after validating canonical Workspace/Conflict IDs it calls `ConflictScopeResolver.ResolveConflictScope` once, checks the returned Tenant/Workspace/Environment against Principal, authorizes that Environment, computes the request hash, constructs `MutationContext`, then calls `MappingRepository.ResolveConflict` once. No conflict content is returned before authorization and the mutation transaction re-resolves/locks the same Scope. Asset collection `CREATE_ASSET` appears only when both authorization succeeds and the same `AssetPage.ManualCreateEligible` bit is true；management never trusts a client flag or performs a second unscoped Source lookup. Source manager constructs `SourceReadConstraint` from Principal Environment access, and manual-create usage remains a repository-enforced sole-authority subset check.
 
 For a principal whose only applicable role is `SERVICE_OWNER`, list/get queries must be constrained to `principal.ServiceIDs` through an ACTIVE Service Binding, and bind operations require the requested Service ID in that same set. Perform this inside the scoped Repository query/transaction, not by filtering an already-loaded cross-service page. Unauthorized direct IDs return the same non-enumerating projection as not-found.
 
@@ -379,7 +377,7 @@ This pack's Source manager is read-only (`ListSources/GetSource/GetSourceRun`) a
 
 - [ ] **Step 5: Run unit and race tests**
 
-Run: `gofmt -w internal/authn internal/authz internal/assetcatalog && go test -race ./internal/authn ./internal/authz ./internal/assetcatalog -count=1`
+Run: `gofmt -w $(rg --files internal/authn internal/authz internal/assetcatalog -g '*.go') && go test -race ./internal/authn ./internal/authz ./internal/assetcatalog -count=1`
 
 Expected: PASS, including existing auth tests, service-owner ownership checks, forbidden-before-repository checks, deterministic effective actions, and fail-closed missing dependency tests.
 
@@ -408,7 +406,7 @@ git commit -m "feat(assetcatalog): authorize governed asset operations"
   - `parseIdempotencyKey(*http.Request) (string, error)`
   - `parseVersionETag(*http.Request, resourceType, resourceID string) (int64, error)`
   - `writeVersionETag(http.ResponseWriter, resourceType, resourceID string, version int64)`
-  - `controlPlaneCursor{Kind, Sort, Value, ID string}` plus signed encode/decode
+  - `controlPlaneCursor{Kind, QueryDigest, Sort, Value, ID string}` plus signed encode/decode
   - `decodeStrictJSON(http.ResponseWriter, *http.Request, any, int64) error`
   - `writeRequestProblem(http.ResponseWriter, *http.Request, int, string, string)`
 - Produces `NewControlPlaneCursorCodec([]byte) (*ControlPlaneCursorCodec, error)`; `cmd/control-plane` constructs it from a dedicated 32-byte secret and injects it into `httpapi.Dependencies`.
@@ -502,13 +500,13 @@ Define closed schemas with explicit required arrays for:
 
 Every successful write body uses a resource-specific result schema containing the safe resource plus `mutation_receipt{audit_id,trace_id,idempotent_replay}`. Binding delete returns `204` with `X-Audit-ID` and `X-Idempotent-Replay`; all other write receipts are in JSON. Audit IDs are opaque UUIDs and reveal no payload.
 
-The Assets list query defines `sort` as the closed enum `display_name_asc|last_observed_at_desc`; the signed cursor embeds that sort and cannot be replayed with another sort or endpoint.
+The Assets list query defines `sort` as the closed enum `display_name_asc|last_observed_at_desc`; the signed cursor embeds endpoint kind plus the Task 2 canonical digest of exact Tenant/Workspace/Environment、normalized filters and sort, and cannot be replayed with another Scope/filter/sort or endpoint.
 
 Because the confirmed conflict route is Workspace-scoped, `GET .../asset-conflicts` requires an `environment_id` UUID query parameter. Resolve loads the conflict first by Tenant+Workspace+ID, obtains its Environment, then authorizes that Environment without revealing cross-scope existence. Source/source-run routes remain Workspace-scoped and return only environments allowed by the Principal.
 
 `AssetSummary` includes only `id`、`environment_id`、`display_name`、`external_id`、`kind`、`provider_kind`、`source{id,name,kind}`、`service_summaries`、`mapping_status`、`lifecycle`、`owner_group`、`criticality`、`data_classification`、`labels`、`connection_summary.status`、`capability_summary.status/count`、`last_observed_at`、`version`、`effective_actions`. Until 000016/000017 are implemented, both summaries use the explicit neutral state `NOT_CONFIGURED`, never inferred health. `AssetDetail` adds safe field provenance and relation counts; it does not add Provider JSON.
 
-`AssetPage` includes collection-level `effective_actions` so the frontend can gate `CREATE_ASSET` without role inference. Pack 03 returns an empty collection action list for `AssetSourcePage`; Tasks 13–14 add `CREATE_SOURCE` only with the complete Source+revision-1 transaction. `AssetConflictPage.items` uses the safe detail projection required by the mapping comparison (field name, source/revision/time, existing/candidate safe values, impact counts) but never returns raw documents or fingerprint values.
+The API `AssetPage` includes collection-level `effective_actions` derived from authorization plus repository `ManualCreateEligible`, so the frontend can gate `CREATE_ASSET` without role inference. Pack 03 returns an empty collection action list for `AssetSourcePage`; Tasks 13–14 add `CREATE_SOURCE` only with the complete Source+revision-1 transaction. `AssetConflictPage.items` exposes only field name、existing/candidate SHA-256、safe Asset/Service references、Observation source/revision/time and impact counts；raw comparison values、documents and fingerprints are neither stored nor returned.
 
 Every write operation references both Idempotency-Key and, for mutation/delete/decision, If-Match. Status codes are fixed:
 
@@ -535,16 +533,16 @@ headers:
 ~~~go
 func TestDecodeStrictJSONRejectsDuplicateUnknownAndTrailingValues(t *testing.T) {
 	cases := []string{
-		`{"reason":"a","reason":"b"}`,
-		`{"reason":"a","unknown":true}`,
-		`{"reason":"a"}{"reason":"b"}`,
+		`{"reason_code":"A","reason_code":"B"}`,
+		`{"reason_code":"A","unknown":true}`,
+		`{"reason_code":"A"}{"reason_code":"B"}`,
 	}
 	for _, body := range cases {
 		request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
 		request.Header.Set("Content-Type", "application/json")
 		recorder := httptest.NewRecorder()
 		var target struct {
-			Reason string `json:"reason"`
+			ReasonCode string `json:"reason_code"`
 		}
 		if err := decodeStrictJSON(recorder, request, &target, 1024); err == nil {
 			t.Fatalf("body %q was accepted", body)
@@ -649,7 +647,7 @@ Register it after request ID middleware and before routing, replacing the creden
 Run:
 
 ~~~bash
-gofmt -w api/openapi internal/httpapi
+gofmt -w $(rg --files api/openapi internal/httpapi -g '*.go')
 go test -race ./api/openapi ./internal/httpapi -count=1
 go test ./internal/httpapi -run Fuzz -fuzz FuzzRejectDuplicateJSONKeys -fuzztime 5s
 ~~~
@@ -672,6 +670,8 @@ git commit -m "feat(api): define safe control plane contract"
 - Create: **internal/httpapi/assets_test.go**
 - Create: **internal/httpapi/asset_sources.go**
 - Create: **internal/httpapi/asset_sources_test.go**
+- Create: **internal/httpapi/asset_relations.go**
+- Create: **internal/httpapi/asset_relations_test.go**
 - Create: **internal/httpapi/asset_conflicts.go**
 - Create: **internal/httpapi/asset_conflicts_test.go**
 - Create: **internal/httpapi/service_asset_bindings.go**
@@ -684,7 +684,7 @@ git commit -m "feat(api): define safe control plane contract"
 **Interfaces:**
 - Consumes: manager interfaces from Task 6 and shared HTTP helpers from Task 7.
 - Produces: every route listed in OpenAPI Task 7, with no alternate unscoped route; Source routes in this pack are GET-only.
-- Assembly: `httpapi.Dependencies` gains `Assets`、`AssetSources`、`AssetConflicts`、`ServiceAssetBindings`; nil managers fail closed with `503`, never panic and never silently expose a partial write route.
+- Assembly: `httpapi.Dependencies` gains `Assets`、`AssetRelations`、`AssetSources`、`AssetConflicts`、`ServiceAssetBindings`; nil managers fail closed with `503`, never panic and never silently expose a partial write route.
 
 - [ ] **Step 1: Write failing route/authentication/DTO tests**
 
@@ -752,6 +752,8 @@ type assetSummaryDTO struct {
 	ProviderKind       string                   `json:"provider_kind"`
 	Source             sourceReferenceDTO       `json:"source"`
 	Services           []serviceReferenceDTO    `json:"service_summaries"`
+	ConnectionSummary  connectionSummaryDTO     `json:"connection_summary"`
+	CapabilitySummary  capabilitySummaryDTO     `json:"capability_summary"`
 	MappingStatus      string                   `json:"mapping_status"`
 	Lifecycle          string                   `json:"lifecycle"`
 	OwnerGroup         string                   `json:"owner_group"`
@@ -795,13 +797,13 @@ router.Route("/api/v1", func(api chi.Router) {
 	api.Patch("/workspaces/{workspaceID}/environments/{environmentID}/assets/{assetID}", patchAssetHandler(deps.Assets))
 	api.Post("/workspaces/{workspaceID}/environments/{environmentID}/assets/{assetID}:quarantine", quarantineAssetHandler(deps.Assets))
 	api.Post("/workspaces/{workspaceID}/environments/{environmentID}/assets/{assetID}:retire", retireAssetHandler(deps.Assets))
-	api.Get("/workspaces/{workspaceID}/environments/{environmentID}/asset-relations", listAssetRelationsHandler(deps.ServiceAssetBindings, cursorCodec))
+	api.Get("/workspaces/{workspaceID}/environments/{environmentID}/asset-relations", listAssetRelationsHandler(deps.AssetRelations, cursorCodec))
 })
 ~~~
 
-Handlers validate all UUIDs before manager calls. List supports only OpenAPI filters and signed cursor; duplicate query keys are rejected. POST/PATCH accept a maximum 64 KiB strict JSON body and compute request hash over canonical typed input plus scoped path. PATCH/quarantine/retire parse If-Match. Create and every state-changing POST parse Idempotency-Key. Successful create emits `Location`; all versioned object responses emit strong ETag.
+Handlers validate all UUIDs before manager calls. List supports only OpenAPI filters and signed cursor; duplicate query keys are rejected. POST/PATCH accept a maximum 64 KiB strict JSON body, parse Idempotency-Key/If-Match into `ServerRequestMetadata`, and pass only the strict typed input plus route IDs to management；the manager remains the sole request-hash owner after trusted Scope resolution/authorization. Successful create emits `Location`; all versioned object responses emit strong ETag.
 
-Manual create body contains an existing `source_id` plus `kind`、`external_id`、`display_name`、governance fields and bounded labels. Management locks the Source and exact published revision and requires same Workspace、`source_kind=MANUAL`、`provider_kind=MANUAL`、`ACTIVE + PUBLISHED + AVAILABLE` and exact gate/revision/binding digests before creating the Asset. Because `MANUAL_V1` is `SINGLE_ENVIRONMENT`, the path/command Environment must also equal the revision's sole locked `AuthorityEnvironmentID`；same Workspace is not sufficient. ProviderKind is derived from that Source and is not caller-controlled. Repository then performs the private fenced `MANUAL_MUTATION`/`CATALOG_SEQUENCE` transaction defined by Pack 02；the handler never constructs or accepts Observation JSON, Source revision, freshness/time, Run/fence/checkpoint, endpoint, credential reference, provider payload, service binding, lifecycle, mapping status or version. Add a negative handler/integration test proving Env-A's eligible MANUAL Source is invisible/ineligible on Env-B and cannot allocate a mutation Run.
+Manual create body contains an existing `source_id` plus `kind`、`external_id`、`display_name`、governance fields and bounded labels. Management locks the Source、exact published revision and sole authority child, and requires same Workspace、`source_kind=MANUAL`、`provider_kind/profile_code=MANUAL_V1`、exact Task 2 `ManualProfileV1()` semantics、`ACTIVE + PUBLISHED + AVAILABLE` and exact gate/revision/binding digests before creating the Asset. Because `MANUAL_V1` is `SINGLE_ENVIRONMENT`, the path/command Environment must equal that child；same Workspace is not sufficient. ProviderKind is derived from that Source and is not caller-controlled. Repository then performs the private fenced `MANUAL_MUTATION`/`CATALOG_SEQUENCE` transaction defined by Pack 02；the handler never constructs or accepts Observation JSON, Source revision, freshness/time, Run/fence/checkpoint, endpoint, credential reference, provider payload, service binding, lifecycle, mapping status or version. Add a negative handler/integration test proving Env-A's eligible MANUAL Source is invisible/ineligible on Env-B and cannot allocate a mutation Run.
 
 Pack 03 does not bootstrap or silently insert a MANUAL Source. Tests may seed one only in an isolated test database. In production, `CREATE_ASSET` is absent from an Environment collection's `effective_actions` unless an already provisioned MANUAL Source has that exact eligible state **and** its sole authority Environment equals the path Environment；the eligible-source lookup applies the same filter server-side. Task 13/16's complete profile/revision/validation/publication path is the first in-project way to provision it. Before then, the POST route remains fail-closed and the Web UI explains that no eligible MANUAL Source exists rather than inventing a reduced source path.
 
@@ -818,13 +820,13 @@ type resolveAssetConflictRequest struct {
 	Resolution  string `json:"resolution"`
 	ServiceID   string `json:"service_id"`
 	BindingRole string `json:"binding_role"`
-	Reason      string `json:"reason"`
+	ReasonCode  string `json:"reason_code"`
 }
 ~~~
 
 For `REJECT_CANDIDATE`、`KEEP_UNRESOLVED` and `QUARANTINE_ASSET`, service/role must be empty; for `CONFIRM_EXACT`, both are required. Resolution requires Idempotency-Key and If-Match, and returns conflict plus optional binding and their ETags in the body; the primary `ETag` is the conflict ETag.
 
-Binding create requires Idempotency-Key and body `{service_id, asset_id, role, reason}`. Binding delete requires Idempotency-Key plus If-Match, accepts no body, and returns `204` only after server confirmation or an identical replay.
+Binding create requires Idempotency-Key and body `{service_id, asset_id, role, reason_code}`. Binding delete requires Idempotency-Key plus If-Match and a strict `{reason_code}` body, and returns `204` only after server confirmation or an identical replay；the durable receipt supplies replay/audit response headers.
 
 - [ ] **Step 6: Assemble only real dependencies in the Control Plane**
 
@@ -832,7 +834,7 @@ In `cmd/control-plane/main.go`:
 
 1. build the PostgreSQL asset repository after the existing pool is ready;
 2. build `authz.Authorizer` with existing recent-auth configuration;
-3. build asset/source/conflict/binding managers with the repository;
+3. build asset/relation/source/conflict/binding managers with the repository;
 4. load a dedicated 32-byte cursor HMAC secret from environment/config as a secret reference, never log its value;
 5. inject all managers and cursor codec into `httpapi.Dependencies`;
 6. if OIDC verifier, pool, authorizer, or cursor secret is absent/invalid, keep `/healthz` available but asset API requests return fail-closed `503`; startup must not install unauthenticated fallbacks;
@@ -845,7 +847,7 @@ Add an assembly test that calls a real router with in-memory fakes and proves de
 Run:
 
 ~~~bash
-gofmt -w internal/httpapi cmd/control-plane
+gofmt -w $(rg --files internal/httpapi cmd/control-plane -g '*.go')
 go test -race ./internal/httpapi ./cmd/control-plane ./api/openapi -count=1
 go test ./internal/httpapi -run 'TestAsset.*(CrossScope|Duplicate|Unknown|ETag|Idempotency|NoStore)' -count=1
 ~~~
@@ -856,6 +858,7 @@ Expected: PASS. Every OpenAPI operation has a router test; body/request/response
 
 ~~~bash
 git add internal/httpapi/assets.go internal/httpapi/assets_test.go \
+  internal/httpapi/asset_relations.go internal/httpapi/asset_relations_test.go \
   internal/httpapi/asset_sources.go internal/httpapi/asset_sources_test.go \
   internal/httpapi/asset_conflicts.go internal/httpapi/asset_conflicts_test.go \
   internal/httpapi/service_asset_bindings.go internal/httpapi/service_asset_bindings_test.go \

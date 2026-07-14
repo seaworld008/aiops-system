@@ -2,11 +2,11 @@
 
 本目录把 Phase 1 拆成 11 个可独立执行、审查和提交的生产任务包。它是[受治理运维能力总计划](../../2026-07-13-governed-operations-program.md)的第一阶段，产品、安全和前端语义以[已确认设计规范](../../../specs/2026-07-13-operational-assets-controlled-access-design.md)为准。
 
-本阶段的终点不是枚举、假 Provider、静态页面或 Demo：它建立九表 PostgreSQL 事实、不可变 Source Revision、真实 CSV/API/CMDB/vSphere/Proxmox/OpenStack/AWS/Azure/GCP 协议适配、独立 Discovery Worker、HA lease/fence、加密 checkpoint、持久背压、逐 Provider gate、真实 OIDC/OpenAPI 前端和 Overview。它仍不开放目标系统写操作；项目最终通过 Phase 7/8 的不可变 ActionPlan、策略、重新认证、人工审批、短凭据、类型化执行、独立验证、对账/回滚/升级与审计形成生产闭环。
+本阶段的终点不是枚举、假 Provider、静态页面或 Demo：它建立十表 PostgreSQL 事实（含不可变 Source Revision 权限 Environment 子表）、不可变 Source Revision、真实 CSV/API/CMDB/vSphere/Proxmox/OpenStack/AWS/Azure/GCP 协议适配、独立 Discovery Worker、HA lease/fence、加密 checkpoint、持久背压、逐 Provider gate、真实 OIDC/OpenAPI 前端和 Overview。它仍不开放目标系统写操作；项目最终通过 Phase 7/8 的不可变 ActionPlan、策略、重新认证、人工审批、短凭据、类型化执行、独立验证、对账/回滚/升级与审计形成生产闭环。
 
 ## 固定执行顺序
 
-1. [01-schema-domain.md](./01-schema-domain.md) — 创建 `000015_assets_catalog` 九张表、Source Revision/Run/Fence/Checkpoint 约束与稳定领域接口。
+1. [01-schema-domain.md](./01-schema-domain.md) — 创建 `000015_assets_catalog` 十张表、Source Revision 权限 Environment/Run/Fence/Checkpoint 约束与稳定领域接口。
 2. [02-repository-discovery.md](./02-repository-discovery.md) — 实现 Scope Repository、append-only Observation、provenance、tombstone/恢复和原子 checkpoint 投影。
 3. [03-mapping-auth-api.md](./03-mapping-auth-api.md) — 实现关系/冲突/Service Binding、OIDC 授权、OpenAPI/HTTP 基线和真实 Control Plane 装配。
 4. [04-web-foundation-assets.md](./04-web-foundation-assets.md) — 建立唯一 `web/`、真实浏览器 OIDC、壳层、资产/映射/来源基线和持久前端 Foundation 规范。
@@ -45,7 +45,7 @@
 | Go | `go 1.26` / `toolchain go1.26.5` |
 | PostgreSQL | 18.4 或更新 18.x |
 | 迁移 | `000015_assets_catalog` |
-| 表归属 | `asset_sources`、`asset_source_revisions`、`asset_source_runs`、`asset_observations`、`assets`、`asset_type_details`、`asset_conflicts`、`asset_relationships`、`service_asset_bindings` |
+| 表归属 | `asset_sources`、`asset_source_revisions`、`asset_source_revision_authorities`、`asset_source_runs`、`asset_observations`、`assets`、`asset_type_details`、`asset_conflicts`、`asset_relationships`、`service_asset_bindings` |
 | 去重键 | `(tenant_id,workspace_id,source_id,provider_kind,external_id)` |
 | 前端 | `web/`；Node 24、pnpm 10.34.0、React 19.2.7、TypeScript 7.0.2、lucide-react 1.24.0 |
 | OIDC | Keycloak Server 26.6.3；`keycloak-js` 26.2.4；Authorization Code + PKCE、`login-required`、Token 仅内存 |
@@ -57,13 +57,18 @@
 ## 阶段内稳定数据契约
 
 - Source/Asset revision 在 PostgreSQL、Go、OpenAPI 和生成 TypeScript 中统一为 `int64`。`Asset.LastSourceRevision` 对应 `assets.last_source_revision`。
-- `SourceRevision.BindingDigest() == CanonicalRevisionDigest`。该摘要覆盖 Tenant/Workspace/Source/Revision、definition、Integration、sync mode、Opaque Credential/Trust/Network references、authority scope、rate/backpressure profile 和 schedule；`source_definition_digest` 不能替代它。`AVAILABLE` 只比较 exact published canonical revision digest。
+- `SourceRevision.BindingDigest() == CanonicalRevisionDigest`。`.v1` 固定 20 个 `FramedTupleV1` 帧：domain、Tenant/Workspace/Source/Revision、Provider/Profile definition digest、Integration、sync、三个 Opaque Reference、authority digest、四个 rate/backpressure 整数、Profile、schedule、typed-extension code/digest；无 extension 时最后两帧也必须为 `NULL`。`source_definition_digest` 不能吸收或替代 extension/binding digest，所有 SHA-256 以 32 raw bytes 入帧。
+- `asset_source_revision_authorities` 是 1–100 个 same-Scope Environment membership 的唯一事实源；Revision 还持久化 exact RFC 8785 canonical Profile manifest/manifest SHA 与 Provider schema/schema SHA。PostgreSQL deferred closure 从 exact Source/Revision/ordered child rows重算 authority digest、包含两项 raw content SHA 的 `asset-source-definition.v2` digest 和固定 20-frame binding digest。Direct SQL 提供的摘要只是待比对值，不能成为可信事实；任一成员、manifest/schema byte、顺序、字段或摘要漂移整笔回滚。
+- Source enum 只表示领域分类，不表示 Provider 已安装或可用。`PublishedBindingEligible` 只校验已加载 Source/Revision 行闭包；生产 admission 必须重新加载 exact Scope、已安装 Profile/Adapter 以及所需 Connection/Runtime/Capability 事实。
+- `000015` 通过 `asset_catalog_future_source_gate_admitted(asset_sources) IS NOT TRUE` 的默认拒绝同时阻止 K8S/AWX 初始 Source commit 与 `VALIDATING|AVAILABLE|DEGRADED`；false/NULL 都 fail closed，而已有 Source 向 `UNAVAILABLE|SUSPENDED` 收敛始终不依赖 hook。`000017`/`000019` 只替换该同签名 body，分别加入自己 SourceKind 的 same-transaction initial creation closure、进入 VALIDATING 前的 exact typed binding/runtime 与 AVAILABLE/DEGRADED 已发布成功证明，并各自承担 down guard、恢复与 schema-admission 证据，不复制 Phase 1 Source trigger。
 - `REJECTED` revision 的 canonical content 仍不可变；允许以新的 append-only Validation Run 执行 `REJECTED → VALIDATING`，但禁止直接 `REJECTED → PUBLISHED`。
 - `assets_kind_check` 在 `000015` 固定 Phase 1 的 17 个 Kind，Phase 3 只能通过 `000017` 显式替换该命名约束后扩展 Victoria taxonomy。
 - ProviderKind 使用大写 profile token `^[A-Z][A-Z0-9_]{0,63}$`；UUID 使用小写 RFC 4122 version 1–5/RFC variant；labels 最多 64 对且 UTF-8 序列化不超过 16 KiB；Idempotency-Key 复用 `domain.ValidIdempotencyKey` 的最多 128 字节小写 grammar。
 - Relationship 显式保存 source/target Environment 与 Asset、Provenance、可空 provenance source/cross-environment policy、状态、版本和时间；不得虚构 Schema 中不存在的 confidence/last-observed 字段。
 - Binding 状态只有 `ACTIVE/INACTIVE`。`CreateBinding`、`DeleteBinding` 与 Conflict decision 都返回持久 `MutationReceipt`；HTTP 204 仍从 receipt 生成 Audit/Replay headers。
 - `service_asset_bindings` 同时由数据库 FK 与 Repository 验证 legacy `service_bindings(service_id,environment_id)` 资格；只验证同 Workspace 不足以创建 Binding。
+- Task 2 唯一拥有 SourceScope、安全 SourceRun、Relationship/Conflict 与资产/映射基础契约；Pack 02/03 直接消费，不复制 DTO。Source mutation、Profile Registry 与 sealed typed-extension session 仅由 Pack 05 Task 13 拥有，且永不暴露 SQL/pgx/raw transaction。
+- `IsLifecycleEdge` 只表达无 self-edge 的结构图，不代表授权；幂等 replay 先读 receipt，公开 transition 仍由管理层按当前可信事实收窄。任何写命令中的 Tenant/route Scope、actor/auth time、Trace、Idempotency-Key、request hash 与 CAS 都由 verified Principal、完整 path/header 和服务端 canonicalization 注入，不能来自 JSON DTO。
 
 ## 来源实施与门禁状态表
 
@@ -89,7 +94,7 @@
 Phase 1 只有在以下全部成立时才可记录 `ASSET_CONTROL_PLANE_ACCEPTED`：
 
 - 11 个任务包的 checkbox 和 commit 边界全部完成；不得先标记状态再补 Provider。
-- PostgreSQL 18.4 的九表迁移、跨 Scope FK、Source Revision 不可变/唯一发布、checkpoint/fence、并发/幂等、Outbox/Audit、备份恢复和应用回滚通过。
+- PostgreSQL 18.4 的十表迁移、跨 Scope FK、Source Revision/authority membership 不可变与唯一发布、checkpoint/fence、并发/幂等、Outbox/Audit、备份恢复和应用回滚通过。
 - Source 六步向导、`ASSET_SOURCE_*` 权限、OpenAPI 严格 Schema、ETag/Idempotency/reauth、`effective_actions` 与唯一生成类型通过。
 - CSV/API/CMDB/vSphere/Proxmox/OpenStack/AWS/Azure/GCP 均有真实 protocol serialization、negative/DLP/provenance、incremental checkpoint、soft delete/recovery、rate/backpressure、credential cleanup、两副本 HA/fence 与非生产 canary 签名证据。
 - `cmd/discovery-worker` 生产构造器仅使用真实 PostgreSQL、workload identity、secure profile/credential resolver、checkpoint keyring 和 Provider registry；任一依赖缺失 fail closed。

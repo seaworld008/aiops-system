@@ -1,6 +1,6 @@
 # 生产规划版本基线
 
-> 核验日期：2026-07-13。此文件锁定实施计划使用的兼容性基线，不表示可以跳过 lockfile、容器 digest、SBOM、升级演练或阶段验收。
+> 核验日期：2026-07-14。此文件锁定实施计划使用的兼容性基线，不表示可以跳过 lockfile、容器 digest、SBOM、升级演练或阶段验收。
 
 ## 运行时与平台
 
@@ -11,11 +11,13 @@
 | Node.js | `24.x LTS` | [Node.js releases](https://nodejs.org/en/about/previous-releases) |
 | pnpm | `10.34.0` | [pnpm package](https://www.npmjs.com/package/pnpm) |
 | Temporal Go SDK | `1.46.0` | [Temporal Go SDK releases](https://github.com/temporalio/sdk-go/releases) |
+| AWX Controller | `24.6.1` | [AWX 24.6.1 release](https://github.com/ansible/awx/releases/tag/24.6.1) |
+| HashiCorp Vault | `2.0.3` | [Vault 2.0.3 release notes](https://developer.hashicorp.com/vault/docs/updates/release-notes#vault-2-0-3) |
 | Keycloak Server | `26.6.3` | [Keycloak downloads](https://www.keycloak.org/downloads.html) |
 | Browser OIDC client | `keycloak-js 26.2.4` | [keycloak-js package](https://www.npmjs.com/package/keycloak-js) |
 | Kubernetes / Kind node | `1.36.2` | [Kubernetes 1.36 release series](https://kubernetes.io/releases/1.36/) |
 
-Keycloak Server 与 `keycloak-js` 是两个独立发布物，版本号不要求相同。计划、测试栈和文档必须使用上表的明确名称，禁止只写含糊的“Keycloak 26.2.4”。
+Keycloak Server 与 `keycloak-js` 是两个独立发布物，版本号不要求相同。计划、测试栈和文档必须使用上表的明确名称，禁止只写含糊的“Keycloak 26.2.4”。AWX `24.6.1` 固定 Personal Access Token/self-service RBAC、Job Template 与 survey/launch API 的首个真实兼容面；Vault `2.0.3` 固定 KV v2、Transit、Database secrets engine 与 lease lookup/synchronous revoke 的首个兼容面。两者的生产 OCI image 必须在实施时解析并锁定架构对应 digest，禁止只保留 tag 或 `latest`。
 
 ## Web 工程
 
@@ -70,5 +72,5 @@ React 基线可由 [React versions](https://react.dev/versions) 核验，Vite 8.
 
 - 实施任务先按这里的版本创建 manifest、lockfile 与测试环境，不得使用浮动 `latest`、宽松主版本或未固定容器标签。
 - 首次解析依赖后提交 lockfile、Go module 校验、Helm/chart lock、镜像 digest allowlist 和 SBOM；发布证据绑定这些摘要。
-- 任一主版本、Keycloak Server/client 组合、PostgreSQL、Kubernetes 或 Victoria CRD 兼容矩阵变更，必须用独立依赖升级提交、ADR/兼容性说明和真实 E2E/回滚证据更新本文件。
+- 任一主版本、Keycloak Server/client 组合、PostgreSQL、Kubernetes、Victoria CRD、AWX/Vault exact version、governed AWX patch 或其 OCI digest/SBOM 兼容矩阵变更，必须用独立依赖升级提交、ADR/兼容性说明和真实 E2E/回滚证据更新本文件。
 - 发现版本已撤回、存在阻断级漏洞或与目标平台不兼容时，停止阶段实现并先更新基线；不得静默漂移。

@@ -375,9 +375,9 @@ git commit -m "feat(victoria): normalize operator topology"
 - Modify: `cmd/discovery-worker/main_test.go`
 
 **Interfaces:**
-- Consumes: exact published Phase 1 Operator Source Revision plus typed extension, private client factory, Phase 1 durable Queue/`LeaseFence`/`PageCommitter`/typed checkpoint codec.
+- Consumes: exact published Phase 1 Operator Source Revision plus typed extension, `000017`-owned `public.asset_catalog_future_source_gate_admitted(public.asset_sources)` admission, private client factory, Phase 1 durable Queue/`LeaseFence`/`PageCommitter`/typed checkpoint codec.
 - Produces: scheduled and watch-triggered bounded pages, source-run finalization/cleanup proof and bounded operational metrics through the existing `cmd/discovery-worker`.
-- Safety: only the current durable lease/fence reconciles; losing the DB session invalidates the fence and cancels list/watch context; partial discovery never emits a complete snapshot.
+- Safety: only a Source that is simultaneously admitted by the Phase 1 generic gate and the exact `000017` successor hook may claim or continue；only the current durable lease/fence reconciles; losing the DB session invalidates the fence and cancels list/watch context; partial discovery never emits a complete snapshot.
 
 - [ ] **Step 1: Write failing worker lifecycle tests**
 
@@ -392,6 +392,9 @@ func TestSameRunTerminalReplayReturnsReceiptBeforeFenceCheckWithoutMutation(t *t
 func TestLaterRunUnchangedSnapshotAppendsObservationWithoutBusinessProjection(t *testing.T)
 func TestWorkerMetricsUseBoundedLabels(t *testing.T)
 func TestDiscoveryWorkerProductionAssemblyHasNoFakeClient(t *testing.T)
+func TestVictoriaWorkerRequiresExactFutureSourceGateAdmission(t *testing.T)
+func TestVictoriaWorkerStopsBeforeKubernetesOnFutureSourceGateDrift(t *testing.T)
+func TestVictoriaWorkerRecoversOnlyAfterExactRepublishAndRevalidation(t *testing.T)
 ```
 
 - [ ] **Step 2: Run tests and verify failure**
@@ -429,7 +432,9 @@ All 21 mandatory CR resources must list successfully. Workload/service failures 
 
 - [ ] **Step 4: Register with Phase 1 durable Queue and fenced page committer**
 
-Register `VICTORIAMETRICS_OPERATOR_V1` in the existing discovery-worker Profile Registry. Worker claims the Phase 1 durable Run, receives a sealed `LeaseFence`, opens the common typed checkpoint, heartbeats before/after every Kubernetes call, and applies each page only through `PageCommitter.ApplyPage(ctx,fence,batch)`. Final projection enters `FINALIZING`; client/session cleanup proof precedes `Queue.Complete`. Crash/reclaim uses the persisted checkpoint and new fence; the old Worker cannot call list/watch/apply/complete successfully. No advisory-lock-only or process-local ownership path exists. Same-Run page/terminal replay 只有在精确 request/page/result digest 命中已封存 receipt 时，才先于 fence mutation 校验返回原 receipt；该 receipt-first 路径是纯读、无 heartbeat/checkpoint/projection/cleanup 副作用的唯一旧 fence 例外，未命中或 digest 不同仍 fail closed。
+Register `VICTORIAMETRICS_OPERATOR_V1` in the existing discovery-worker Profile Registry. Registry presence is not admission：Source 验证前先由 `000017` hook 的 exact typed-revision/queued-run branch 准入 `VALIDATING`；Queue enqueue/claim、每次 Kubernetes list/watch 前后、每页提交和 terminal closure 则必须使用同一 PostgreSQL truth path 重新确认 Phase 1 generic gate 与 hook 的 exact published/successful-proof branch 同时为 true；不得在 Go 中复制一份较宽松 predicate。`AWX_INVENTORY` 在本阶段始终 false。错误 profile/schema、extension/base digest、revision、validation proof 或 cleanup 漂移时，在任何 Kubernetes 调用、heartbeat、checkpoint 或 projection mutation 前停止并执行 Phase 1 fail-close；hook 不得阻断 `SUSPENDED/UNAVAILABLE`。恢复只能创建新 immutable typed extension revision，重新验证、发布并通过同一 hook，不能切 enum、直接改 gate 或复用旧 receipt。
+
+Worker claims the Phase 1 durable Run, receives a sealed `LeaseFence`, opens the common typed checkpoint, heartbeats before/after every Kubernetes call, and applies each page only through `PageCommitter.ApplyPage(ctx,fence,batch)`. Final projection enters `FINALIZING`; client/session cleanup proof precedes `Queue.Complete`. Crash/reclaim uses the persisted checkpoint and new fence; the old Worker cannot call list/watch/apply/complete successfully. No advisory-lock-only or process-local ownership path exists. Same-Run page/terminal replay 只有在精确 request/page/result digest 命中已封存 receipt 时，才先于 fence mutation 校验返回原 receipt；该 receipt-first 路径是纯读、无 heartbeat/checkpoint/projection/cleanup 副作用的唯一旧 fence 例外，未命中或 digest 不同仍 fail closed。Focused tests must cover positive admission, enum/profile-only negative admission, schema/definition/extension/validation digest drift before the first network call, fail-close of an in-flight Run, and recovery only through exact republish plus revalidation.
 
 - [ ] **Step 5: Expose bounded metrics**
 

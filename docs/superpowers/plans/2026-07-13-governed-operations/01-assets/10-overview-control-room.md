@@ -104,7 +104,7 @@ Require `ASSET_READ` for the overview and include only navigation actions backed
 Run:
 
 ~~~bash
-gofmt -w internal/overview internal/httpapi
+gofmt -w $(rg --files internal/overview internal/httpapi -g '*.go')
 go test -race ./internal/overview/... ./internal/httpapi ./api/openapi -count=1
 corepack pnpm@10.34.0 --dir web generate:api
 corepack pnpm@10.34.0 --dir web generate:api:check

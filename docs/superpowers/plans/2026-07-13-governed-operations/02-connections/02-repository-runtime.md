@@ -329,7 +329,7 @@ type Distributor interface {
         string,
         string,
         []Artifact,
-    ) (deploymentID string, error)
+    ) (deploymentID string, err error)
     Rollout(
         context.Context,
         assetcatalog.Scope,
@@ -360,7 +360,7 @@ type AssetLifecycleActivator interface {
 
 `assetcatalog.ActivateAfterConnectionCommand` carries only Scope、Asset ID/expected version、Connection ID/revision、Runtime Publication ID/digest and activation time. Its PostgreSQL implementation locks the Asset and joins the current source/mapping/Connection/Validation cleanup/Runtime publication facts in the same transaction; it permits only `DISCOVERED|STALE|ACTIVE → ACTIVE`, emits one audit/outbox record, and returns an idempotent replay for the same publication digest.
 
-Publication statuses are `PENDING/APPLYING/APPLIED/FAILED/DRIFTED/ROLLED_BACK`. Artifacts include canonical Connector/Target/Egress manifests and captured trust closure. `Artifact.String`, `GoString` and `MarshalJSON` return only kind/schema/digest/size.
+Publication statuses are `PENDING/APPLYING/APPLIED/FAILED/DRIFTED/ROLLED_BACK`. Artifact kind is a database/domain closed enum with exactly `CONNECTOR_MANIFEST|TARGET_MANIFEST|EGRESS_MANIFEST|TRUST_CLOSURE` under named constraint `runtime_publication_artifacts_kind_check`; successor migrations may replace that named constraint only with an explicitly reviewed additive value and must restore this exact predecessor set on guarded down. `Artifact.String`, `GoString` and `MarshalJSON` return only kind/schema/digest/size.
 
 - [ ] **Step 1: Write failing atomicity, HA, rollout and rollback tests**
 

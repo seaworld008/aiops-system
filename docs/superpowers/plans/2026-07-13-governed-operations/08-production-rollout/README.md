@@ -6,7 +6,7 @@
 
 **Architecture:** Phase 8 消费 Phase 6 的 `000020`/ADR 0009/只读平台与 Phase 7 的 `000021`/逐类型 Action gates，在 `000022_production_release_governance` 中持久化复合 Scope 的 release、wave、evidence、wave decision 与最终 acceptance decision。它只在原路径上 harden Phase 6 Chart 和 Phase 7 WRITE 增量，使用真实多副本基础设施、容量/故障/恢复/安全证据与固定 rollout waves 驱动显式决策；PostgreSQL 仍是领域事实源，Temporal 只编排，浏览器只呈现服务端投影。
 
-**Tech Stack:** Go 1.26.5、PostgreSQL 18.4+、Temporal、Keycloak Server 26.6.3/keycloak-js 26.2.4、Vault/PKI、Kubernetes 1.36、Helm 3、OpenAPI 3.1、React 19.2.7/TanStack、pnpm 10.34.0、Playwright/axe、OpenTelemetry、Prometheus/VictoriaMetrics/VictoriaLogs/VictoriaTraces、k6、Chaos Mesh、Cosign/Syft/Grype、S3-compatible immutable evidence storage。
+**Tech Stack:** Go 1.26.5、PostgreSQL 18.4+、Temporal、Keycloak Server 26.6.3/keycloak-js 26.2.4、Vault/PKI、Kubernetes 1.36.2、Helm 3、OpenAPI 3.1、React 19.2.7/TanStack、pnpm 10.34.0、Playwright/axe、OpenTelemetry、Prometheus/VictoriaMetrics/VictoriaLogs/VictoriaTraces、k6、Chaos Mesh、Cosign/Syft/Grype、S3-compatible immutable evidence storage。
 
 ## Global Constraints
 
@@ -14,9 +14,10 @@
 - migration 固定为 `000022_production_release_governance`；不得改写 `000020_production_platform` 或 `000021_governed_actions`。
 - 所有 release/wave/evidence/decision 主键、唯一键和外键携带 `tenant_id/workspace_id/environment_id`；不能以单一 synthetic Scope ID 替代。
 - ADR 0009 继续拥有生产 READ 平台决策；ADR 0012 只拥有 release governance 与持续运维，不能重写 0009 或 Phase 7 的 ADR 0010/0011。
-- Kubernetes 版本唯一固定为 `1.36`；Helm render、kubeconform、Kind、生产等价集群与正式集群使用相同 API 基线。
+- Kubernetes 版本唯一固定为 `1.36.2`；Helm render、kubeconform、Kind、生产等价集群与正式集群使用相同 API 基线。
 - Phase 6 创建基础 Chart；Phase 7 只增加 WRITE Runner、WRITE NetworkPolicy 和 Action Worker；Phase 8 原路径 Modify/harden，任何新文件必须明确 `Create`。
 - Phase 8 不创建第二个 chart、第二份 OpenAPI、第二个 generated TypeScript 文件、第二套身份根或替代性 production stack。
+- AWX-enabled release 必须消费 Phase 5 唯一 `deploy/awx/governed-admission/` bundle，并把 AWX 24.6.1 governed image、HA EnrollmentCleanupBroker/L7 gateway、Vault 2.0.3 KV/Transit、authority keyring 和 host-attestor evidence 纳入同一 release manifest；不得恢复 stock launch、单副本 Broker 或平行部署事实源。
 - Phase 6 的 `test/production/` 与 `test/recovery/` 脚本是底层机制测试；Phase 8 新建 `scripts/` 只做 release-level orchestration 并复用这些机制。
 - 最终 acceptance 必须进入 append-only `production_release_acceptance_decisions`；状态文档、Git tag、CI 成功或人工口头确认都不能替代。
 - 页面可用或单次 Canary 成功不构成上线完成；完整闭环必须同时证明成功与不确定结果路径。

@@ -35,14 +35,21 @@
 - Create: `internal/discoverysource/contracts_test.go`
 - Create: `internal/assetcatalog/source_extension.go`
 - Create: `internal/assetcatalog/source_extension_test.go`
+- Create: `internal/assetcatalog/source_extension_architecture_test.go`
+- Create: `internal/assetcatalog/internal/revisioncap/session.go`
+- Create: `internal/assetcatalog/internal/revisioncap/session_test.go`
 - Create: `internal/assetcatalog/postgres/source_revisions.go`
+- Create: `internal/assetcatalog/postgres/extension_procedures.go`
+- Create: `internal/assetcatalog/postgres/extension_procedures_test.go`
 - Modify: `internal/assetcatalog/postgres/manual_run.go`
 - Create: `internal/assetcatalog/postgres/source_revisions_test.go`
 - Modify: `internal/assetcatalog/postgres/manual_run_test.go`
 - Create: `internal/assetcatalog/postgres/source_revisions_integration_test.go`
+- Modify: `internal/store/postgres/database_role_admission.go`
+- Modify: `internal/store/postgres/database_role_admission_test.go`
 
 **Interfaces:**
-- Consumes: `asset_sources`, `asset_source_revisions`, `asset_source_runs` schema plus scoped audit/outbox/idempotency ledger from Tasks 1–4; an existing stable Source is required only for subsequent revisions.
+- Consumes: `asset_sources`, `asset_source_revisions`, immutable `asset_source_revision_authorities`, `asset_source_runs` schema plus scoped audit/outbox/idempotency ledger from Tasks 1–4; an existing stable Source is required only for subsequent revisions.
 - Produces: `SourceRevisionRepository.CreateSource/CreateRevision/RequestValidation/Publish/Disable/RequestSync` and exact source/revision `ETag` versions. `CreateSource` is the sole production owner of atomic stable Source + immutable revision 1 creation.
 - Produces `TypedSourceExtensionRegistry`；later phases may extend a revision only through its in-transaction `ValidateAndDigestInTx → PreparedExtension.CreateInTx` hook, never through a parallel lifecycle/transaction.
 - Produces events: `asset.source.revision.created.v1`, `asset.source.validation.requested.v1`, `asset.source.revision.published.v1`, `asset.source.disabled.v1`, `asset.source.sync.requested.v1`.
@@ -83,11 +90,13 @@ func (Page) isDiscoverOutcome()  {}
 func (Delay) isDiscoverOutcome() {}
 ~~~
 
+Additional RED tests are mandatory：`TestDatabaseRoleAdmissionRequiresExactSeparatedRoles`、`TestRuntimeRoleCannotCreateSchemaOrWriteTypedExtensionTable`、`TestExtensionProcedureOwnerCannotReadBaseAuditOrOutbox`、`TestMigrationAndRuntimeConnectionsAreDistinct`。The disposable PostgreSQL integration fixture bootstraps the reviewed roles before migrations and proves direct runtime INSERT/UPDATE/DELETE/TRUNCATE fails while exact procedure EXECUTE succeeds；missing membership、owner inheritance、PUBLIC CREATE/EXECUTE or a runtime owner connection must fail startup admission.
+
 `FinalPage` means the bounded Provider run has ended；`CompleteSnapshot` additionally proves authoritative asset **and relation** membership closure and may be true only with `FinalPage=true`. A final incremental/delta page uses `FinalPage=true, CompleteSnapshot=false`；intermediate pages set both false. Provider adapters never infer missing assets/relations from `FinalPage` alone. `Delay` and `Page` are mutually exclusive concrete outcomes: Provider `RetryAfter` must be in `(0,60s]` and a `Delay` has no Items、Relations、checkpoint or final flags by type；transport backoff is created only by the Worker. A `Page` may be relation-only under Pack 02 endpoint-readiness rules but has no retry field.
 
 The return pair is also exact XOR：`err != nil` requires `outcome == nil`，and a non-nil outcome requires `err == nil`；`nil,nil` and outcome+error are both `SOURCE_PROVIDER_CONTRACT_VIOLATION`. A successful dynamic value must be exactly non-pointer `Page` or `Delay`（typed-nil pointers/aliases are rejected）so interface nil tricks cannot bypass the sum type. The Worker discards any violating outcome, never calls `ApplyPage`, prepares a stable failure intent, cleans the attempt and suspends that Source gate. Contract tests cover all four XOR combinations plus typed-nil/pointer rejection for every registered Provider.
 
-`BoundRuntime` is created only inside `cmd/discovery-worker` from the exact published revision/profile and workload secret binding；it is deliberately non-serializable and implements `Close/Clear`. `DiscoverRequest` intentionally contains no `LeaseFence`；the Worker revalidates its fence around the call and only `PageCommitter/Reconciler` consumes the sealed fence. `DiscoverRequest`, queue payload, Temporal history, audit and logs contain no endpoint, credential, CA, header or Provider request body. Every installed Profile fixes one `FreshnessKind` plus `EnvironmentMappingMode`：`EXPLICIT_ITEM_ENVIRONMENT` only for CSV/API inputs that carry a validated Environment ID, or `SINGLE_ENVIRONMENT` for fixed infrastructure adapters. The latter requires exactly one same-Workspace `AuthorityEnvironmentID`；the former validates every item/relation endpoint against the immutable sorted allow-list. Freshness kind and mapping mode/list are included in `authority_scope_digest`/Profile canonical bytes and `BindingDigest`；Provider wire data can never choose another kind or invent/remap a Catalog Environment.
+`BoundRuntime` is created only inside `cmd/discovery-worker` from the exact published revision/profile and workload secret binding；it is deliberately non-serializable and implements `Close/Clear`. `DiscoverRequest` intentionally contains no `LeaseFence`；the Worker revalidates its fence around the call and only `PageCommitter/Reconciler` consumes the sealed fence. `DiscoverRequest`, queue payload, Temporal history, audit and logs contain no endpoint, credential, CA, header or Provider request body. Every installed Profile fixes one `FreshnessKind` plus `EnvironmentMappingMode`：`EXPLICIT_ITEM_ENVIRONMENT` only for CSV/API inputs that carry a validated Environment ID, or `SINGLE_ENVIRONMENT` for fixed infrastructure adapters. The latter requires exactly one same-Workspace `AuthorityEnvironmentID`；the former validates every item/relation endpoint against the immutable sorted allow-list. Only the sorted Environment allow-list is membership input to `authority_scope_digest`；freshness kind and mapping mode are immutable semantics of the versioned Profile canonical bytes. `BindingDigest` binds that Profile through `source_definition_digest/profile_code` and independently binds `authority_scope_digest`，so changing either semantic requires a new versioned Profile/revision and complete digest closure；Provider wire data can never choose another kind or invent/remap a Catalog Environment.
 
 - [ ] **Step 1: Write failing revision immutability and publication-gate tests**
 
@@ -98,10 +107,9 @@ func TestPublishSourceRevisionRequiresMatchingSuccessfulValidation(t *testing.T)
 	repository := newAssetRepository(t, db)
 
 	_, err := repository.PublishSourceRevision(context.Background(), assetcatalog.PublishSourceRevisionCommand{
-		TenantID: fixture.TenantID, WorkspaceID: fixture.WorkspaceID,
+		Context: fixture.MutationContext,
 		SourceID: fixture.SourceID, Revision: 2, ExpectedSourceVersion: 1,
-		ExpectedRevisionVersion: 1, ActorID: fixture.AdminSubject,
-		IdempotencyKey: fixture.IdempotencyKey, RequestHash: fixture.RequestHash,
+		ExpectedRevisionVersion: 1,
 	})
 	if !errors.Is(err, assetcatalog.ErrSourceRevisionNotValidated) {
 		t.Fatalf("PublishSourceRevision error = %v", err)
@@ -144,7 +152,7 @@ func TestCreateSourceRollsBackStableIdentityWhenRevisionBindingIsInvalid(t *test
 	if _, err := repository.CreateSource(context.Background(), command); !errors.Is(err, assetcatalog.ErrInvalidRequest) {
 		t.Fatalf("CreateSource error = %v", err)
 	}
-	assertSourceRevisionCreateSideEffectsByKey(t, db, command.IdempotencyKey, 0, 0, 0, 0)
+	assertSourceRevisionCreateSideEffectsByKey(t, db, command.Context.IdempotencyKey(), 0, 0, 0, 0)
 }
 
 func TestCreateSourceReplayReturnsOriginalReceiptAndRejectsHashDrift(t *testing.T) {
@@ -161,8 +169,8 @@ func TestCreateSourceReplayReturnsOriginalReceiptAndRejectsHashDrift(t *testing.
 		replay.Receipt.AuditID != first.Receipt.AuditID || !replay.Receipt.IdempotentReplay {
 		t.Fatalf("replay = (%#v, %v), first = %#v", replay, err, first)
 	}
-	command.RequestHash = strings.Repeat("f", 64)
-	if _, err := repository.CreateSource(context.Background(), command); !errors.Is(err, assetcatalog.ErrIdempotency) {
+	conflict := validCreateSourceCommandWithSameKeyAndDifferentCanonicalInput(command)
+	if _, err := repository.CreateSource(context.Background(), conflict); !errors.Is(err, assetcatalog.ErrIdempotency) {
 		t.Fatalf("hash-drift replay error = %v", err)
 	}
 	assertSourceRevisionCreateSideEffects(t, db, first.Source.ID, 1, 1, 1, 1)
@@ -186,7 +194,7 @@ type SourceRevisionRepository interface {
 }
 
 type CreateSourceCommand struct {
-	TenantID, WorkspaceID          string
+	Context                        MutationContext
 	Name                           string
 	SourceProfileID                string
 	CredentialReferenceID          string
@@ -194,12 +202,11 @@ type CreateSourceCommand struct {
 	NetworkPolicyReferenceID       string
 	AuthorityEnvironmentIDs        []string
 	SyncMode, ScheduleExpression   string
-	ActorID, TraceID               string
-	IdempotencyKey, RequestHash    string
 }
 
 type CreateSourceRevisionCommand struct {
-	TenantID, WorkspaceID, SourceID string
+	Context                         MutationContext
+	SourceID                        string
 	SourceProfileID                 string
 	CredentialReferenceID          string
 	TrustReferenceID               string
@@ -207,8 +214,6 @@ type CreateSourceRevisionCommand struct {
 	AuthorityEnvironmentIDs        []string
 	SyncMode, ScheduleExpression   string
 	ExpectedSourceVersion          int64
-	ActorID, TraceID               string
-	IdempotencyKey, RequestHash    string
 }
 
 type SourceRevisionMutation struct {
@@ -217,11 +222,14 @@ type SourceRevisionMutation struct {
 	Receipt  MutationReceipt
 }
 
-type SourceRevisionTx interface { // sealed repository-owned capability
-	sourceRevisionTx() // unexported marker; only assetcatalog can implement
-	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
-	Query(context.Context, string, ...any) (pgx.Rows, error)
-	QueryRow(context.Context, string, ...any) pgx.Row
+type ExtensionFactRequest = revisioncap.FactRequest
+type ExtensionFact = revisioncap.Fact
+type ExtensionDocument = revisioncap.ExtensionDocument
+
+type SourceRevisionTx interface {
+	LookupFact(context.Context, ExtensionFactRequest) (ExtensionFact, error)
+	ReadOwnExtension(context.Context) (ExtensionDocument, bool, error)
+	CreateOwnExtension(context.Context, ExtensionDocument) error
 }
 
 type TypedSourceExtension interface {
@@ -238,15 +246,21 @@ type TypedSourceExtensionRegistry interface {
 }
 ~~~
 
-The client never supplies `provider_kind`, canonical definition, revision number, Integration ID, rate/backpressure numbers, profile/freshness/typed-extension code, binding digest or revision digest. `SourceProfileRegistry.Resolve(SourceProfileID)` returns one installed discriminated profile, provider kind, Integration ID, allowed SourceKind, network zone, credential purpose, trust mode, parser schema, fixed rate/backpressure fields, immutable canonical `ProfileCode`, optional server-owned `TypedExtensionCode`, hard page/byte limits, compatibility class, exact `FreshnessKind` and `EnvironmentMappingMode`. `SourceProfileID` is only a lookup selector and is not persisted；the resolved `ProfileCode` is persisted in `asset_source_revisions.profile_code` and is the exact profile identity hashed by `BindingDigest`. The server validates every Environment against the Source Workspace, enforces the mode's one-or-explicit-list cardinality, sorts it, constructs canonical bytes, allocates `max(revision)+1` under a Source row lock, and computes `CanonicalRevisionDigest = SourceRevision.BindingDigest()` across the complete immutable binding including the prepared extension digest. `source_definition_digest` remains a separate digest of the Provider definition only. Tests reject a candidate freshness kind different from the installed Profile, zero/multiple Environments for a `SINGLE_ENVIRONMENT` profile, out-of-list CSV/API item/relation Environments, unknown extension code and any mapping/extension change without a newly validated/published canonical revision plus its required checkpoint transition.
+`SourceRevisionTx` is the narrow root facade presented to extensions. The concrete nested-internal `revisioncap.Session` implements exactly those three methods and has no controller methods；there is no SQL string、`...any`、pgx type、raw row/connection or transaction-control method. `FactRequest.Kind` is a closed allow-list and Session injects exact Tenant/Workspace/Source/Revision binding. `revisioncap.NewValidationSession` returns a Session plus a separate shared-state `Controller`. Because Go `internal` visibility alone permits the parent subtree, an AST/import allow-list permits `internal/assetcatalog/source_extension.go` to import only the three facade aliases and permits the PostgreSQL owner files to import Session/Controller construction；every other production file, especially later extension packages, is forbidden from importing `revisioncap`. Extensions receive the root interface and cannot type-assert the Session to any controller operation because those methods exist only on the separate Controller type. `ExtensionDocument` contains canonical typed content only and has no extension code、procedure name、manifest selector or SQL selector；Session is already bound to the registry-resolved extension code and its fixed procedure.
+
+The client never supplies `provider_kind`, canonical definition, revision number, Integration ID, rate/backpressure numbers, profile/freshness/typed-extension code, binding digest or revision digest. It also cannot supply `MutationContext` fields：Task 6 management constructs that context from verified Principal、resolved route Scope、server Trace/Header/reauth facts and canonical request hashing. Registry bootstrap first installs the exact immutable Task 2 `ManualProfileV1()` value and rejects any same-code semantic difference；Task 3 therefore has no reverse dependency on this Task 13 registry. `SourceProfileRegistry.Resolve(SourceProfileID)` then returns one installed discriminated profile, provider kind, Integration ID, allowed SourceKind, network zone, credential purpose, trust mode, parser schema, fixed rate/backpressure fields, immutable canonical `ProfileCode`, optional server-owned `TypedExtensionCode`, hard page/byte limits, compatibility class, exact `FreshnessKind` and `EnvironmentMappingMode`. `SourceProfileID` is only a lookup selector and is not persisted；the resolved `ProfileCode` is persisted in `asset_source_revisions.profile_code` and is the exact profile identity hashed by `BindingDigest`. Registry startup canonicalizes the complete Profile semantics and rejects two definitions that reuse one `ProfileCode` with a different freshness kind、mapping mode/allow-list contract、credential/trust/network mode、limits、Provider schema or extension code；semantic changes require a new versioned code. The server validates every Environment against the Source Workspace, enforces the mode's one-or-explicit-list cardinality, sorts it, computes the Task 2 authority and Source-definition digests, allocates `max(revision)+1` under a Source row lock, and computes `CanonicalRevisionDigest = SourceRevision.BindingDigest()` using the fixed 20-frame contract, including the prepared extension code/digest as independent final frames. It inserts one authority child row per sorted Environment with contiguous ordinal in the same outer transaction；PostgreSQL deferred closure independently reloads and recomputes all three digests. With no extension, both final frames are still NULL. Tests use the fixed Task 2 golden digests, reject same-code semantic drift、a candidate freshness kind different from the installed Profile, zero/multiple Environments for a `SINGLE_ENVIRONMENT` profile, absent/late/reordered/duplicate/cross-Scope authority children, out-of-list CSV/API item/relation Environments, unknown/half-present extension binding and any mapping/extension change without a newly validated/published canonical revision plus its required checkpoint transition.
 
 - [ ] **Step 3: Implement serializable revision state transitions**
 
-`CreateSource` begins `SERIALIZABLE`, validates Scope/Idempotency/Profile and all opaque references before mutation, and locks the Workspace/Profile facts. If the resolved Profile has a typed extension, the Repository itself resolves it and calls `ValidateAndDigestInTx` inside this transaction before sealing base canonical/binding digests；it then inserts the stable Source and revision 1, calls that exact prepared object's `CreateInTx` after the base row exists, verifies the extension row/digest, writes one audit/outbox pair and returns their persisted receipt before commit. The callback receives only a sealed `SourceRevisionTx` adapter with the three scoped query methods；it has no `Commit/Rollback/Begin/CopyFrom/LargeObjects/Conn` or raw `pgx.Tx` escape, and SQL ownership/allow-list checks prevent touching non-extension tables. The outer Repository alone may retry/commit/rollback. `CreateRevision` uses the same hook/order under the existing Source lock. Any invalid Environment/reference/profile/extension/digest or side-effect failure rolls back both the base identity/revision and extension row. A later phase cannot obtain the transaction, write an extension after commit or own a second Create/Publish lifecycle. Architecture/integration tests compile an adversarial extension and prove it cannot commit、rollback or mutate base/audit rows. Matching replay returns the original Source/revision/Audit ID；a changed hash returns `ErrIdempotency`.
+`CreateSource` begins `SERIALIZABLE`, validates the trusted MutationContext/Idempotency/Profile and resolves every opaque reference before mutation, and locks Workspace/Profile facts. If the resolved Profile has a typed extension, the Repository creates one `(revisioncap.Session, revisioncap.Controller)` pair bound to the outer transaction and passes only the Session as `SourceRevisionTx` to `ValidateAndDigestInTx` while it is `VALIDATING`；only closed trusted-fact reads are then legal. It obtains the immutable prepared digest, places code/digest into the final two BindingDigest frames, inserts the stable Source、base revision and all ordered authority child rows, then the PostgreSQL owner calls `Controller.ArmCreate`. The exact prepared object may call `Session.CreateOwnExtension` once；no new trusted reads are legal. `Controller.VerifyCreated` reloads that exact 1:1 row and constant-time compares its digest before audit/outbox, then `Controller.Close` invalidates every retained Session copy and clears captured transaction closures. The outer Repository alone retries/commits/rolls back；the deferred database closure rechecks authority、definition and BindingDigest immediately before commit。For `KUBERNETES_OPERATOR/AWX_INVENTORY`, the separate deferred Source INSERT closure also requires the currently installed 000017/000019 hook creation branch；without its owned successor or exact provider facts, the entire stable Source/revision/audit/outbox transaction rolls back. `CreateRevision` uses the same order under the existing Source lock. Any invalid Environment/reference/profile/extension/digest or side-effect failure rolls back base identity/revision、authority children、extension、audit and outbox. A later phase cannot obtain the controller/transaction, write after commit or own a second Create/Publish lifecycle.
+
+This Task consumes the Task 1-owned base database-role ABI and bootstrap/admission files；it neither creates roles nor names a future Provider owner。It extends the initially empty typed manifest with generic `ExtensionProcedureSpec` validation（exact `regprocedure`、definition digest、NOLOGIN owner、typed-table ACL、runtime EXECUTE and no PUBLIC/schema-owner/runtime table write），so later owned migrations can register their concrete role only in their own phase。The application still receives only `AIOPS_DATABASE_URL` for a workload login that is not a member of migrator/schema/extension owners；migration jobs use a separate privileged DSN and reviewed `SET ROLE` path。
+
+Every later owned migration consumes the base checks and, when its manifest is nonempty, additionally checks that concrete extension role before DDL；failure is `55000` and migrations still never `CREATE ROLE`. It explicitly sets object owners, revokes PUBLIC/runtime direct table and routine privileges, and grants only reviewed runtime methods. The PostgreSQL adapter invokes only frozen per-extension procedures selected from the immutable manifest；startup verifies exact `regprocedure` signature、NOLOGIN owner、runtime grantee、ACL with no PUBLIC execute、fixed search path and function-definition SHA-256. An extension procedure is fixed-search-path `SECURITY DEFINER`, uses only schema-qualified SQL, and its owner has no rights on base Source/Audit/Outbox. Architecture/integration tests use adversarial extensions to prove SQL/pgx/transaction symbols are absent, validation-time writes and create-time reads fail, a second write/use-after-close fails, procedure drift closes assembly, and no extension can mutate base/audit rows. Matching replay is returned only after current Principal/Scope/state/profile authorization is rechecked；a changed hash returns `ErrIdempotency`.
 
 `CreateRevision` inserts one `DRAFT` immutable content row for an existing Source. `RequestValidation` CAS-transitions `DRAFT|REJECTED→VALIDATING`, creates a new append-only `VALIDATION` Run bound to the exact revision and canonical binding digest, gives it an empty checkpoint input, and closes the Source gate. A rejected revision's canonical content remains immutable, and it can never transition directly to `PUBLISHED`. The Worker must call fenced `ProposeValidationResult` to persist a `VALIDATION_PROOF` and enter `FINALIZING`, then Broker cleanup and `Complete|Fail` atomically transition only that exact revision/run to `VALIDATED|REJECTED`. Safe proof fields are identity/TLS-or-signature/network/credential-open+cleanup/fixed-probe/schema/DLP/budget result codes and a proof digest. Cancellation、drift、reaper or cleanup uncertainty likewise writes the still-bound `VALIDATING` revision to `REJECTED` with a stable proof/code, so no revision can remain stranded and it can be explicitly revalidated.
 
-The installed `MANUAL_V1` profile is the only no-Adapter validation specialization. It is `SINGLE_ENVIRONMENT` and declares explicit `CredentialPurpose=NONE/TrustMode=NONE/NetworkMode=NONE`; its revision must resolve exactly one same-Workspace authority Environment, and every governed MANUAL Asset create must use that exact `AuthorityEnvironmentID` rather than a caller-selected Environment. Creation rejects zero/multiple authority Environments, any different Asset `environment_id` and non-empty external references, and includes the unique Environment plus those `NONE` sentinels in the binding digest. `RequestValidation` synchronously creates, privately claims, finalizes and completes an exact `VALIDATION` Run with `NO_CREDENTIAL`, proving only installed profile digest、Scope/Environment、closed MANUAL schema、DLP/budgets and binding equality—no network/runtime/credential call exists. Every MANUAL mutation uses `CATALOG_SEQUENCE{OrderSequence=n,ProviderVersionSHA256=SHA256(FramedTupleV1("manual-catalog-version.v1",tenant_id,workspace_id,source_id,checkpoint_revision,n))}` with the Pack 01 byte encoding, where `n` is the positive `accepted_checkpoint_version` allocated and CASed by that same transaction; neither client input nor Catalog time participates in the Provider-version digest. On `PublishSourceRevision`, the same transaction revalidates that exact terminal proof and current installed profile and may set this MANUAL Source directly to `AVAILABLE`; it sets `checkpoint_version=0` and `checkpoint_revision` to the exact newly published revision while all checkpoint ciphertext/key/hash fields remain `NULL`. Before the first publication both numeric fields are zero. Every non-MANUAL profile still requires its independent publication reconciliation/canary. This is the sole path that makes a MANUAL Source eligible for Pack 02 create.
+The installed `MANUAL_V1` profile is the only no-Adapter validation specialization. It is `SINGLE_ENVIRONMENT` and declares explicit `CredentialPurpose=NONE/TrustMode=NONE/NetworkMode=NONE`; its revision must resolve exactly one same-Workspace authority Environment, and every governed MANUAL Asset create must use that exact `AuthorityEnvironmentID` rather than a caller-selected Environment. Creation rejects zero/multiple authority Environments, any different Asset `environment_id` and non-empty external references. The fixed 20-frame BindingDigest binds the unique Environment through `authority_scope_digest`，binds the versioned `MANUAL_V1` Profile through `source_definition_digest/profile_code`，and encodes Credential/Trust/Network references as three SQL-NULL frames；the Profile's `NONE` semantics are not literal sentinel strings in those frames. `RequestValidation` synchronously creates, privately claims, finalizes and completes an exact `VALIDATION` Run with `NO_CREDENTIAL`, proving only installed profile digest、Scope/Environment、closed MANUAL schema、DLP/budgets and binding equality—no network/runtime/credential call exists. Every MANUAL mutation uses `CATALOG_SEQUENCE{OrderSequence=n,ProviderVersionSHA256=SHA256(FramedTupleV1("manual-catalog-version.v1",tenant_id,workspace_id,source_id,checkpoint_revision,n))}` with the Pack 01 byte encoding, where `n` is the positive `accepted_checkpoint_version` allocated and CASed by that same transaction; neither client input nor Catalog time participates in the Provider-version digest. On `PublishSourceRevision`, the same transaction revalidates that exact terminal proof and current installed profile and may set this MANUAL Source directly to `AVAILABLE`; it sets `checkpoint_version=0` and `checkpoint_revision` to the exact newly published revision while all checkpoint ciphertext/key/hash fields remain `NULL`. Before the first publication both numeric fields are zero. Every non-MANUAL profile still requires its independent publication reconciliation/canary. This is the sole path that makes a MANUAL Source eligible for Pack 02 create.
 
 `PublishSourceRevision` must require:
 
@@ -263,7 +277,7 @@ The installed `MANUAL_V1` profile is the only no-Adapter validation specializati
 Run:
 
 ~~~bash
-gofmt -w internal/assetcatalog internal/assetcatalog/postgres
+gofmt -w $(rg --files internal/assetcatalog -g '*.go')
 go test -race ./internal/assetcatalog ./internal/assetcatalog/postgres -count=1
 TEST_DATABASE_URL="$TEST_DATABASE_URL" \
   go test -race ./internal/assetcatalog/postgres -run SourceRevisionIntegration -count=1
@@ -276,11 +290,17 @@ Expected: PASS; two concurrent publishes yield one winner, cross-Workspace revis
 ~~~bash
 git add internal/assetcatalog/types.go internal/assetcatalog/repository.go \
   internal/assetcatalog/source_revision.go internal/assetcatalog/source_revision_test.go \
+  internal/assetcatalog/source_extension.go internal/assetcatalog/source_extension_test.go \
+  internal/assetcatalog/source_extension_architecture_test.go \
+  internal/assetcatalog/internal/revisioncap \
   internal/discoverysource/contracts.go internal/discoverysource/contracts_test.go \
   internal/assetcatalog/postgres/manual_run.go internal/assetcatalog/postgres/manual_run_test.go \
-  internal/assetcatalog/postgres/source_revisions.go \
+  internal/assetcatalog/postgres/source_revisions.go internal/assetcatalog/postgres/extension_procedures.go \
+  internal/assetcatalog/postgres/extension_procedures_test.go \
   internal/assetcatalog/postgres/source_revisions_test.go \
-  internal/assetcatalog/postgres/source_revisions_integration_test.go
+  internal/assetcatalog/postgres/source_revisions_integration_test.go \
+  internal/store/postgres/database_role_admission.go \
+  internal/store/postgres/database_role_admission_test.go
 git commit -m "feat(assetcatalog): govern immutable source revisions"
 ~~~
 
@@ -367,7 +387,14 @@ Safe DTOs expose reference IDs, revision/digests, gate dimensions, checkpoint ha
 Collection actions are `CREATE_SOURCE`; object/revision actions are exactly `CREATE_SOURCE_REVISION`, `VALIDATE_SOURCE_REVISION`, `PUBLISH_SOURCE_REVISION`, `DISABLE_SOURCE`, `SYNC_SOURCE`, `IMPORT_CSV`. Map them only from server permissions and state:
 
 ~~~go
-func sourceActions(principal authn.Principal, source assetcatalog.Source, revision *assetcatalog.SourceRevision) []string {
+type SourceActionAdmission struct { // server-built after exact Profile/fact resolution
+	CanValidate bool
+	CanPublish  bool
+	CanSync     bool
+	CanImport   bool
+}
+
+func sourceActions(principal authn.Principal, source assetcatalog.Source, admission SourceActionAdmission) []string {
 	if source.Status == assetcatalog.SourceStatusDisabled {
 		return []string{}
 	}
@@ -375,23 +402,23 @@ func sourceActions(principal authn.Principal, source assetcatalog.Source, revisi
 	if allows(principal, authz.PermissionAssetSourceManage) {
 		actions = append(actions, "CREATE_SOURCE_REVISION", "DISABLE_SOURCE")
 	}
-	if revision != nil && revision.Status.CanValidate() && allows(principal, authz.PermissionAssetSourceValidate) {
+	if admission.CanValidate && allows(principal, authz.PermissionAssetSourceValidate) {
 		actions = append(actions, "VALIDATE_SOURCE_REVISION")
 	}
-	if revision != nil && revision.Status == assetcatalog.SourceRevisionValidated && allows(principal, authz.PermissionAssetSourcePublish) {
+	if admission.CanPublish && allows(principal, authz.PermissionAssetSourcePublish) {
 		actions = append(actions, "PUBLISH_SOURCE_REVISION")
 	}
-	if source.SourceKind != assetcatalog.SourceKindManual && source.AvailablePublishedRevision() && allows(principal, authz.PermissionAssetSourceSync) {
+	if admission.CanSync && allows(principal, authz.PermissionAssetSourceSync) {
 		actions = append(actions, "SYNC_SOURCE")
 	}
-	if source.SourceKind == assetcatalog.SourceKindCSVImport && source.AvailablePublishedRevision() && allows(principal, authz.PermissionAssetSourceManage) {
+	if admission.CanImport && allows(principal, authz.PermissionAssetSourceManage) {
 		actions = append(actions, "IMPORT_CSV")
 	}
 	return slices.Sorted(slices.Values(actions))
 }
 ~~~
 
-Add permission/state table tests proving disabled sources expose no mutate/disable/import/sync action, non-CSV sources never expose `IMPORT_CSV`, unavailable or non-published CSV revisions cannot import, MANUAL never syncs, and unauthorized principals receive none of these actions. `PUBLISH_SOURCE_REVISION` and `DISABLE_SOURCE` may be visible from authorization/object state, but execution still requires the server-verified recent authentication contract.
+`SourceActionAdmission` is not a transport input. Management builds it only after reloading the exact scoped Source/Revision, resolving the installed Profile/Adapter and its required trusted facts, and applying current object state；unknown Source enum or missing Profile yields all false. Add permission/state table tests proving disabled sources expose no mutate/disable/import/sync action, non-CSV sources never expose `IMPORT_CSV`, unavailable or non-published CSV revisions cannot import, MANUAL never syncs, enum-without-installed-Profile exposes no runtime action, and unauthorized principals receive none of these actions. `PUBLISH_SOURCE_REVISION` and `DISABLE_SOURCE` may be visible from authorization/object state, but execution still requires the server-verified recent authentication contract.
 
 The handler ignores no unknown field, resolves Tenant from OIDC/workload identity plus Workspace DB scope, validates UUID/ETag/idempotency, applies `no-store`, and never logs a request body. Workload ingestion must pass an mTLS SAN binding `(tenant,workspace,source,provider)` and cannot call human revision/publish routes.
 
@@ -482,7 +509,7 @@ Backpressure is fixed at one active CSV run per source, four per Workspace, 100,
 Run:
 
 ~~~bash
-gofmt -w internal/assetsource/csvimport internal/httpapi
+gofmt -w $(rg --files internal/assetsource/csvimport internal/httpapi -g '*.go')
 go test -race ./internal/assetsource/csvimport ./internal/httpapi -count=1
 TEST_DATABASE_URL="$TEST_DATABASE_URL" go test -race ./internal/assetcatalog/postgres -run CSVImport -count=1
 ~~~

@@ -34,7 +34,7 @@ Incident / Schedule / Human
 
 | 顺序 | 任务包 | Task | 完成门槛 |
 |---:|---|---:|---|
-| 1 | [01-host-assets-contracts.md](./01-host-assets-contracts.md) | 1–2 | 000019 六表、Host/AWX/PostgreSQL 契约事实与不可变/回滚保护通过 |
+| 1 | [01-host-assets-contracts.md](./01-host-assets-contracts.md) | 1–2 | 000019 八表、Host/AWX/PostgreSQL 契约事实与不可变/回滚保护通过 |
 | 2 | [02-provider-publication-runtime.md](./02-provider-publication-runtime.md) | 3–5 | 三 Provider schema/Credential/真实验证、typed Runtime N/N+1、独立 gate 与 AWX 增量发现通过 |
 | 3 | [03-provider-api-web-e2e.md](./03-provider-api-web-e2e.md) | 6–8 | OpenAPI/authz、server draft→canonical route、六步三分支向导、真实协议与 AWX Source E2E 通过 |
 | 4 | [04-host-probe-awx.md](./04-host-probe-awx.md) | 9–10 | mTLS Host Probe 与 AWX 预发布模板执行、双层命令封锁和 Evidence 验证通过 |
@@ -45,7 +45,7 @@ Incident / Schedule / Human
 
 ## 000019 精确所有权
 
-迁移名固定为 `000019_host_postgresql_read_diagnostics`，只允许创建以下六张表：
+迁移名固定为 `000019_host_postgresql_read_diagnostics`，只允许创建以下八张表：
 
 | 表 | 责任 | 明确不存储 |
 |---|---|---|
@@ -55,8 +55,10 @@ Incident / Schedule / Human
 | `read_credential_leases` | 单 Task/Attempt 的 READ 凭据签发事实、密文 accessor 与状态 | credential value、password、完整 Vault URL/path |
 | `read_credential_cleanup_attempts` | 可恢复的吊销 claim、尝试、结果和稳定错误码 | secret、原始上游 body/error |
 | `diagnostic_execution_receipts` | probe/query、input hash、计数、字节、截断、DLP、Evidence、cleanup 与审计关联 | 原始命令、SQL、完整结果、内部 endpoint |
+| `awx_host_identity_enrollments` | release-authorized template verification、完整 cohort、seal 与 N+1 Runtime 根状态 | Secret、Token、任意命令、公开 Host identity |
+| `awx_host_identity_enrollment_attempts` | 每 Host fenced enrollment、Job/attestation 摘要与 cleanup 闭包 | stdout、任意 event/fact、Token/accessor、endpoint |
 
-六表都使用 `(tenant_id, workspace_id, environment_id, ...)` 复合作用域键；所有引用必须绑定 Phase 1–4 已发布事实。迁移不得复制 Connection endpoint、Target 内容、Realm 网络策略、Grant 权限或 Evidence 正文。
+八表都使用 `(tenant_id, workspace_id, environment_id, ...)` 复合作用域键；所有引用必须绑定 Phase 1–4 已发布事实。AWX/Host 的唯一后继事实源是 [identity enrollment](../../../../contracts/awx-host-identity-enrollment-v1.md)、[governed launch admission](../../../../contracts/awx-governed-launch-admission-v1.md) 与 [host identity attestor](../../../../contracts/host-identity-attestor-v1.md)；迁移不得复制 Connection endpoint、Target 内容、Realm 网络策略、Grant 权限或 Evidence 正文。
 
 ## 固定能力矩阵
 

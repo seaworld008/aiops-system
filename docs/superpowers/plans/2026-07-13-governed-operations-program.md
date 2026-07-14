@@ -43,6 +43,8 @@
 | 7 | [Governed Production Actions](2026-07-13-governed-operations/07-governed-actions/README.md) | `000021_governed_actions` | Fixed approved actions, short credentials, verification, reconciliation and rollback |
 | 8 | [Production Rollout and Operations](2026-07-13-governed-operations/08-production-rollout/README.md) | `000022_production_release_governance` | Capacity, security, DR, compliance, staged rollout and sustained ownership |
 
+Phase 5 的 AWX/Host 后继接口由 [identity enrollment](../../contracts/awx-host-identity-enrollment-v1.md)、[governed launch admission](../../contracts/awx-governed-launch-admission-v1.md) 与 [host identity attestor](../../contracts/host-identity-attestor-v1.md) 三份确认契约共同拥有；任务包只能消费这些契约，不能另造 stock-launch、导出式 identity 或内存 cleanup 旁路。
+
 The detailed plans own all code-level TDD steps. This program file owns ordering, integration gates, shared names, and the final handoff only; it must not be used to skip a detailed plan.
 
 ## Cross-plan Interface Contract
@@ -60,7 +62,7 @@ The detailed plans own all code-level TDD steps. This program file owns ordering
 
 Cross-plan identifiers are UUIDs on persistence/API boundaries. Content-addressed objects use lowercase 64-character SHA-256 hex digests. Public JSON uses `snake_case`; Go exported fields use `PascalCase`; frontend TypeScript consumes generated OpenAPI types rather than handwritten duplicate DTOs.
 
-Phase 1 的稳定接口进一步锁定：Source/Asset revision 使用 `int64`；`asset_source_revisions.canonical_revision_digest` 就是覆盖完整不可变可用性绑定的 `BindingDigest`，`source_definition_digest` 仅表示 Provider definition；资产类型在 `000015` 以命名闭集约束 `assets_kind_check` 建立并由 `000017` 扩展；跨 Environment Relationship 显式携带 source/target Environment；Binding 软删除状态为 `INACTIVE`；所有 Mapping mutation 都返回持久 `MutationReceipt`。后续任务包只能消费这些定义，不得重定义平行 DTO、摘要语义或软删除状态。
+Phase 1 的稳定接口进一步锁定：Source/Asset revision 使用 `int64`；`asset_source_revisions.canonical_revision_digest` 就是覆盖完整不可变可用性绑定的 `BindingDigest`，`source_definition_digest` 是 `asset-source-definition.v2` 的 Provider/Profile definition（包含持久 canonical Profile manifest 与 Provider schema 的 raw SHA，不包含 source-specific binding 或 typed extension）；资产类型在 `000015` 以命名闭集约束 `assets_kind_check` 建立并由 `000017` 扩展；跨 Environment Relationship 显式携带 source/target Environment；Binding 软删除状态为 `INACTIVE`；所有 Mapping mutation 都返回持久 `MutationReceipt`。后续任务包只能消费这些定义，不得重定义平行 DTO、摘要语义或软删除状态。
 
 ## Program State Machine
 

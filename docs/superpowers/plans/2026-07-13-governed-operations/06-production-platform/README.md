@@ -4,9 +4,9 @@
 
 **Goal:** 把 Phase 1–5 已验收的资产、连接、Runtime、Grant、主动策略、VictoriaMetrics、Host 与 PostgreSQL 固定只读能力装配为真实高可用生产平台，经过 Preview、非生产 READ_ONLY、生产 SHADOW、受监督生产 READ_ONLY 的不可跳级验证，形成唯一生产只读 Go/No-Go 决策。
 
-**Architecture:** PostgreSQL 是授权、rollout、gate evidence 与 decision 的事实源；Temporal 只负责编排 ID/摘要；Keycloak 负责人的 OIDC 身份；Vault/PKI 通过 Kubernetes workload identity 提供短期服务证书与 READ 凭据；独立 Control Plane、Control Worker、Outbox、Scheduler、Discovery Worker、Gateway、Validation Runner、READ Runner 多副本运行。所有组件以内容寻址 platform revision 和 Helm/image lock 部署，Gateway 在四边界继续复验 Grant/Runtime/Realm/Kill Switch；生产写链在代码、配置、chart、网络、身份、凭据和 API 六层关闭。
+**Architecture:** PostgreSQL 是授权、rollout、gate evidence 与 decision 的事实源；Temporal 只负责编排 ID/摘要；Keycloak 负责人的 OIDC 身份；Vault/PKI 通过 Kubernetes workload identity 提供短期服务证书与 READ 凭据；独立 Control Plane、Control Worker、Outbox、Scheduler、Discovery Worker、Gateway、Validation Runner、READ Runner 多副本运行。AWX capability 另消费 Phase 5 已交付的 governed AWX image、HA EnrollmentCleanupBroker/L7 gateway 和 host-local attestor，并以同一 platform revision 锁定其内容摘要。所有组件以内容寻址 platform revision 和 Helm/image lock 部署，Gateway 在四边界继续复验 Grant/Runtime/Realm/Kill Switch；生产写链在代码、配置、chart、网络、身份、凭据和 API 六层关闭。
 
-**Tech Stack:** Go 1.26.5、PostgreSQL 18.4+、Temporal Go SDK 1.46.0、Temporal Service、Keycloak Server 26.6.3/keycloak-js 26.2.4、HashiCorp Vault Kubernetes Auth/PKI/Transit、Kubernetes 1.36、Helm 3、OpenAPI 3.1、OpenTelemetry/Prometheus/Alertmanager/Grafana、S3-compatible immutable evidence/backup store、Node.js 24、pnpm 10.34.0、React 19.2.7、TypeScript 7.0.2、Vite 8.1.4、Playwright 1.61.1、axe-core 4.12.1、k6、RFC 8785 JCS/SHA-256。
+**Tech Stack:** Go 1.26.5、PostgreSQL 18.4+、Temporal Go SDK 1.46.0、Temporal Service、Keycloak Server 26.6.3/keycloak-js 26.2.4、HashiCorp Vault Kubernetes Auth/PKI/Transit、Kubernetes 1.36.2、Helm 3、OpenAPI 3.1、OpenTelemetry/Prometheus/Alertmanager/Grafana、S3-compatible immutable evidence/backup store、Node.js 24、pnpm 10.34.0、React 19.2.7、TypeScript 7.0.2、Vite 8.1.4、Playwright 1.61.1、axe-core 4.12.1、k6、RFC 8785 JCS/SHA-256。
 
 ## Global Constraints
 
@@ -14,7 +14,7 @@
 - 本阶段只消费 Phase 1–5 已通过 gate 的公开接口；任何前序状态未验收、缺表、缺 profile 或摘要不匹配都阻止启动/rollout。
 - Production constructor 缺 PostgreSQL、Temporal、Keycloak、Vault/PKI、audit sink、evidence store、Gateway、Runner Realm 或 telemetry 任一必需依赖即启动失败；不存在 memory/fake/loopback/MSW 降级。
 - PostgreSQL 是领域事实源；Temporal History、Outbox、浏览器和 metric backend 都不能替代授权、lease、fence、decision 或 audit 事实。
-- 真实进程固定为 Control Plane、Control Worker、Outbox Dispatcher、Scheduler、Discovery Worker、Runner Gateway、Validation Runner、READ Runner；职责和 ServiceAccount 分离。
+- 核心进程固定为 Control Plane、Control Worker、Outbox Dispatcher、Scheduler、Discovery Worker、Runner Gateway、Validation Runner、READ Runner；职责和 ServiceAccount 分离。AWX-enabled deployment 还必须把两个 EnrollmentCleanupBroker 与 purpose-specific L7 gateway 作为隔离的外部 integration services 运行，不能并入核心进程或复用其身份。
 - 多副本行为必须依赖 PostgreSQL/Temporal 的 durable lease、fencing、idempotency 和任务历史；不得依赖进程内 leader、sticky session 或本地磁盘状态。
 - SLO 目标为月度 99.9%；PostgreSQL 事实与审计 RPO `<=5m`，清洁环境全路径 RTO `<=30m`，且由真实演练计时证明。
 - Preview → nonproduction READ_ONLY → production SHADOW → supervised production READ_ONLY 顺序不可跳过；每步保存 policy、Asset Snapshot、Grant、Runtime、credential cleanup、Evidence、Receipt、Audit 摘要或显式 `NOT_APPLICABLE` 证明。
@@ -85,6 +85,7 @@ All business identities and FKs include `tenant_id/workspace_id/environment_id`.
 | Runner Gateway | 3 | PostgreSQL task/Grant/fence transaction | PostgreSQL, Vault/PKI, audit/evidence | `RUNNER_GATEWAY` |
 | Validation Runner | 2 per Realm | Gateway mTLS claim/fence | Gateway, validated target only | `VALIDATION` |
 | READ Runner | 2 per Realm/family | Gateway mTLS claim/fence | Gateway, exact Target only | `READ_*` |
+| Enrollment control services | Broker 2 + L7 gateway 2 | Vault KV version/fence + Raft quorum | Vault 2.0.3 KV/Transit、exact AWX self-PAT/revoke paths | `AWX_ENROLLMENT_CONTROL` |
 
 Every Deployment uses zone and hostname topology spread, PDB, rolling surge, readiness gate, graceful drain and bounded termination. No ingress reaches workers/runners. Browser reaches only Control Plane; Runner reaches only Gateway and exact target egress; Gateway does not accept human bearer tokens on Runner routes.
 
@@ -100,6 +101,7 @@ Every Deployment uses zone and hostname topology spread, PDB, rolling surge, rea
 | Audit sink/outbox backlog | production admission closed at threshold | persist local DB audit/outbox, no loss | backlog age/count |
 | Metrics backend | execution may continue safely | rollout approval frozen | missing SLO evidence is INCONCLUSIVE |
 | Gateway/Runner | claim closed/retry fenced | expired RUNNING becomes UNCERTAIN, cleanup required | takeover/fence receipt |
+| Governed AWX/Broker/L7/host attestor | affected AWX enrollment/diagnostic closed | existing attempts converge only through signed cleanup/manual containment | image/route、live-quorum、Transit/keyring、attestor compatibility evidence |
 
 Unknown dependency state is failure, never healthy-by-timeout.
 
@@ -151,7 +153,7 @@ The app shell keeps a permanent “生产写：关闭” safety indicator. Actio
 
 ## Helm Ownership Across Phases
 
-Phase 6 creates the first complete `deploy/helm/aiops/` chart: metadata、locked values/schema、helpers、ServiceAccounts、ConfigMaps、Control Plane/Worker/Outbox/Scheduler/Discovery Worker/Gateway/Validation Runner/READ Runner Deployments and Services、PDB/HPA、default-deny and exact allow NetworkPolicies. It also imports any earlier Victoria discovery RBAC fragment into validated chart structure.
+Phase 6 creates the first complete `deploy/helm/aiops/` chart: metadata、locked values/schema、helpers、ServiceAccounts、ConfigMaps、Control Plane/Worker/Outbox/Scheduler/Discovery Worker/Gateway/Validation Runner/READ Runner Deployments and Services、PDB/HPA、default-deny and exact allow NetworkPolicies. It also imports any earlier Victoria discovery RBAC fragment into validated chart structure. Phase 5-owned `deploy/awx/governed-admission/` remains the sole external enrollment-control deployment bundle；Phase 6 verifies and locks its image/HA/identity/network evidence but does not duplicate it inside the core chart。
 
 Phase 7 may only make WRITE-scoped increments behind separately accepted Action types: extend the closed values/image/identity/PDB/HPA contracts and create the three registered WRITE/Action templates. It must not rename or alter Phase 6 READ workloads, services, recovery, default-deny or READ egress semantics. Phase 8 modifies/hardens the whole chart for release waves, capacity and sustained operations. This ownership sequence is tested by chart file and rendered-resource allowlists.
 
@@ -188,7 +190,7 @@ Exact path ownership is immutable across the three phases:
 | `deploy/helm/aiops/templates/write-runner-networkpolicy.yaml` | absent | Create | Modify/harden |
 | `deploy/helm/aiops/templates/action-workers-deployment.yaml` | absent | Create | Modify/harden |
 
-Phase 8 must not introduce alternate workload、deployment、configuration or pluralized policy/PDB/HPA template aliases. New release-only files such as chart documentation、NOTES、PodMonitor and chart test fixtures must be declared `Create`; every path above must be declared `Modify` when changed. All rendered resources and schema validation target Kubernetes `1.36`.
+Phase 8 must not introduce alternate workload、deployment、configuration or pluralized policy/PDB/HPA template aliases. New release-only files such as chart documentation、NOTES、PodMonitor and chart test fixtures must be declared `Create`; every path above must be declared `Modify` when changed. All rendered resources and schema validation target Kubernetes `1.36.2`.
 
 ## Gate Evidence Registry
 

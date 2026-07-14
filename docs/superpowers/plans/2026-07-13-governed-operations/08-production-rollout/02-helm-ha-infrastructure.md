@@ -4,9 +4,9 @@
 
 **Goal:** Package every production process as an independently scalable, identity-separated, fail-closed Kubernetes workload with reproducible configuration and availability controls.
 
-**Architecture:** Harden the Phase 6 Helm chart and the Phase 7 WRITE-only extensions without renaming their files. It renders separate Control Plane, Control Worker, Outbox Dispatcher, Scheduler, Discovery Worker, Runner Gateway, Validation Runner, READ Runner, Action Worker and WRITE Runner workloads. Configuration references externally managed PostgreSQL, Temporal, Keycloak, Vault and PKI services; the chart never deploys development dependencies or embeds credentials. NetworkPolicies, ServiceAccounts, PodDisruptionBudgets, topology spread, health probes and explicit resources make the trust boundaries operationally enforceable.
+**Architecture:** Harden the Phase 6 Helm chart and the Phase 7 WRITE-only extensions without renaming their files. It renders separate Control Plane, Control Worker, Outbox Dispatcher, Scheduler, Discovery Worker, Runner Gateway, Validation Runner, READ Runner, Action Worker and WRITE Runner workloads. Configuration references externally managed PostgreSQL, Temporal, Keycloak, Vault and PKI services；AWX-enabled release additionally verifies the Phase 5-owned governed AWX/EnrollmentCleanupBroker/L7/host-attestor deployment bundle rather than cloning it into the core chart. NetworkPolicies, ServiceAccounts, PodDisruptionBudgets, topology spread, health probes and explicit resources make the trust boundaries operationally enforceable.
 
-**Tech Stack:** Helm 3, Kubernetes 1.36 APIs, OCI images pinned by digest, Go production binaries, Kubernetes NetworkPolicy, Pod Security Standards, workload identity, Prometheus metrics, and `helm-unittest` or server-side dry-run validation.
+**Tech Stack:** Helm 3, Kubernetes 1.36.2 APIs, OCI images pinned by digest, Go production binaries, Kubernetes NetworkPolicy, Pod Security Standards, workload identity, Prometheus metrics, and `helm-unittest` or server-side dry-run validation.
 
 ## Global Constraints
 
@@ -19,7 +19,8 @@
 - WRITE Runner has no direct browser/model ingress and cannot call observability ingestion, arbitrary database, arbitrary host or control-plane admin endpoints.
 - Deployment changes do not widen the eligible Action manifest; capability availability remains a separate server-side gate.
 - Phase 6 owns the exact base filenames and Phase 7 only adds `write-runner-deployment.yaml`, `write-runner-networkpolicy.yaml` and `action-workers-deployment.yaml`; Phase 8 modifies those paths in place and never creates a second chart or alias template.
-- Kubernetes `1.36` is the sole render、kubeconform、server-side dry-run and production-cluster target. Alpha APIs and version-skew-based conditional security behavior are forbidden.
+- Kubernetes `1.36.2` is the sole render、kubeconform、server-side dry-run and production-cluster target. Alpha APIs and version-skew-based conditional security behavior are forbidden.
+- AWX admission is release-eligible only when the digest-pinned AWX 24.6.1 governed image、two or more Broker replicas、PDB/zone anti-affinity、separate ServiceAccount/mTLS identity、Vault 2.0.3 TLS Raft/KV/three Transit keys、purpose-specific L7 egress and host-attestor compatibility evidence are all current；stock launch、single Broker、shared identity or broad AWX egress fail closed。
 
 ### Task 1: Harden the production chart contract and fail-closed values schema
 
@@ -119,6 +120,7 @@ The schema must require:
 - Secret reference names matching Kubernetes DNS labels.
 - Different service account names for Control Plane, Control Worker, Outbox, Scheduler, Discovery Worker, Gateway, Action Worker, Validation, READ and WRITE.
 - Minimum replicas/PDB: Control Plane 3/2, Control Worker 3/2, Runner Gateway 3/2, Outbox、Scheduler and Discovery Worker 2/1, Validation and READ Runner 2/1 per enabled Realm, Action Worker and WRITE Runner 2/1 when their accepted Action types are enabled.
+- External enrollment-control evidence requires EnrollmentCleanupBroker at least 2 replicas/PDB 1 across zones, L7 gateway at least 2/PDB 1, exact ServiceAccount/SAN/policy bindings, signed readiness/cleanup receipts and immutable image/SBOM/patch digests；these refs are required only when an AWX capability is admitted and contain no Secret or endpoint.
 - Requests and limits for CPU, memory and ephemeral storage.
 - Positive shutdown grace, lease-drain and credential-cleanup deadlines with cleanup shorter than shutdown grace.
 - A nonempty cluster/region identifier and at least three topology zones for full production values.
@@ -279,13 +281,14 @@ Encode the allowed matrix:
 | Scheduler | PostgreSQL, Temporal and audit/telemetry |
 | Discovery Worker | PostgreSQL、audit/telemetry and only the exact endpoints admitted by each accepted source-adapter binding |
 | Runner Gateway | PostgreSQL, Vault/PKI, credential issuers, audit/evidence and telemetry |
+| EnrollmentCleanupBroker | dedicated Vault 2.0.3 KV/Transit, purpose-specific mTLS L7 gateway and telemetry only；no direct AWX or Control API egress |
 | Action Worker | PostgreSQL, Temporal, Runner Gateway and trusted READ verification path; never provider mutation egress |
 | Validation Runner | Runner Gateway, DNS/trusted time and exact published validation Targets |
 | READ Runner | Runner Gateway, DNS/trusted time and exact published READ Targets |
 | WRITE Runner | Runner Gateway, DNS/trusted time and exact approved execution Targets |
 | Ingress | edge proxy to Control Plane only; Runner mTLS identities to Runner Gateway only |
 
-Tests must deny READ-to-WRITE issuer, WRITE-to-READ issuer, browser-to-Runner, Runner-to-PostgreSQL, cross-Realm Runner traffic, metadata service, Kubernetes API by default, and unrestricted `0.0.0.0/0` egress.
+Tests must deny READ-to-WRITE issuer, WRITE-to-READ issuer, browser-to-Runner, Runner-to-PostgreSQL, Broker-to-AWX bypassing the L7 gateway, static control credentials attempting launch/cancel/list/search, cross-Realm Runner traffic, metadata service, Kubernetes API by default, and unrestricted `0.0.0.0/0` egress.
 
 Run:
 
@@ -300,7 +303,7 @@ Expected: FAIL until policies and the probe harness exist.
 
 Render namespace-wide default-deny ingress/egress, then one narrowly selected allow policy per workload. Use explicit namespaces/service-account selectors and named ports. DNS access is UDP/TCP 53 only to the cluster DNS selector. External endpoints use the cluster's approved egress gateway/CIDR set; no template derives CIDRs from ConnectionProfile input.
 
-Set distinct ServiceAccounts and projected workload identity tokens with process-specific audiences and short expiration. Disable legacy token mounting. Map identities to Vault/PKI roles outside Helm and document the required subject/audience contract.
+Set distinct ServiceAccounts and projected workload identity tokens with process-specific audiences and short expiration. Disable legacy token mounting. Map identities to Vault/PKI roles outside Helm and document the required subject/audience contract. The Phase 5-owned enrollment-control bundle must receive the same hardening checks for two-replica Broker/L7 PDB、anti-affinity、readiness metrics、mTLS PKI rotation and exact Vault/AWX egress；Phase 8 modifies that registered bundle in place and does not create a second deployment source。
 
 - [ ] **Step 3: Add production-cluster policy probes**
 

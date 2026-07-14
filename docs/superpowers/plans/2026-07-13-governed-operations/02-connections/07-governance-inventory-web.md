@@ -211,7 +211,7 @@ Every projected text field must pass the existing safe-label/DLP boundary before
 Run:
 
 ```bash
-gofmt -w internal/credentialreference internal/connectionvalidation internal/httpapi internal/authz cmd/control-plane
+rg --files internal/credentialreference internal/connectionvalidation internal/httpapi internal/authz cmd/control-plane -g '*.go' -0 | xargs -0 gofmt -w
 go test ./internal/credentialreference/... ./internal/connectionvalidation/... \
   ./internal/httpapi ./internal/authz ./api/openapi ./cmd/control-plane -count=1
 AIOPS_TEST_POSTGRES_DSN="$AIOPS_TEST_POSTGRES_DSN" \

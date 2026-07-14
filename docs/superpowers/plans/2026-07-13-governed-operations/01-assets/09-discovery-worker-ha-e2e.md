@@ -44,7 +44,7 @@
 - Produces `Queue.Claim/Reclaim/ReclaimFinalizing/ReapDrifted/CancelIneligible/Heartbeat/AdvanceStage/ReserveCleanupAttempt/RecordCleanup/Delay/ProposeValidationResult/PrepareFailureIntent/BeginCheckpointLineageRollover/Complete/Fail` and `PageCommitter.ApplyPage(ctx, LeaseFence, Batch)` with exact sealed `LeaseFence`; raw token is never a Batch field.
 - Produces `CleanupBroker.OpenAttempt/RevokeAttempt`；only the Broker owns the revocation/session handle，while Queue stores a random opaque attempt UUID/epoch and verifies signed cleanup proof.
 - Produces `CheckpointCodec.Seal/Open` and `Limiter.Acquire/Release/Delay` bound to Source/Workspace/Provider.
-- Consumes nine-table `000015` schema; creates no new migration.
+- Consumes ten-table `000015` schema, including immutable `asset_source_revision_authorities`; creates no new migration.
 
 - [ ] **Step 1: Write failing reclaim, stale-fence, checkpoint-tamper, and global-limit tests**
 
@@ -171,7 +171,7 @@ Limiter defaults come from immutable Source Profile and are clamped by server ma
 Run:
 
 ~~~bash
-gofmt -w internal/discoveryqueue internal/discoverycheckpoint internal/discoverylimit internal/discoverycleanup
+gofmt -w $(rg --files internal/discoveryqueue internal/discoverycheckpoint internal/discoverylimit internal/discoverycleanup -g '*.go')
 go test -race ./internal/discoveryqueue/... ./internal/discoverycheckpoint ./internal/discoverylimit/... ./internal/discoverycleanup -count=1
 TEST_DATABASE_URL="$TEST_DATABASE_URL" \
   go test -race ./internal/discoveryqueue/postgres ./internal/discoverylimit/postgres -run Integration -count=1
@@ -263,7 +263,7 @@ The binary does not import `internal/*/memory`, testdata, MSW, Control Plane han
 Run:
 
 ~~~bash
-gofmt -w internal/discoveryworker cmd/discovery-worker internal/config
+gofmt -w $(rg --files internal/discoveryworker cmd/discovery-worker internal/config -g '*.go')
 go test -race ./internal/discoveryworker ./cmd/discovery-worker ./internal/config -count=1
 go build ./cmd/discovery-worker
 go test ./cmd/control-plane ./cmd/discovery-worker -run 'Production|Boundary|Secret' -count=1

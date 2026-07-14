@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 用 `000015_assets_catalog` 建立九张生产级资产目录表、不可变 Source Revision、强作用域/生命周期约束，并定义后续 Connection、Grant 和前端共同消费的稳定 Go 领域接口。
+**Goal:** 用 `000015_assets_catalog` 建立十张生产级资产目录表、不可变 Source Revision 及其 authority membership、强作用域/生命周期约束，并定义后续 Connection、Grant 和前端共同消费的稳定 Go 领域接口。
 
 **Architecture:** PostgreSQL 保存 append-only 外部观测与带版本治理投影；Go 领域层把来源事实、治理事实、生命周期、映射和 Service Binding 分开。数据库约束是最后防线，Repository/HTTP 的校验不能替代复合外键、CAS、不可变触发器和受保护回滚。
 
-**Tech Stack:** Go 1.26.5、PostgreSQL 18.4、pgx v5、`pgcrypto` SHA-256、现有 `audit_records`/`outbox_events`。
+**Tech Stack:** Go 1.26.5、PostgreSQL 18.4、pgx v5、PostgreSQL 18 core `sha256(bytea)`、现有 `audit_records`/`outbox_events`。
 
 ## Global Constraints
 
@@ -14,7 +14,7 @@
 - 实施前用 superpowers:using-git-worktrees 创建仓库目录树之外的独立 worktree；不得删除或修改用户已有 `.worktrees/*`。
 - Go 固定 `go 1.26`、`toolchain go1.26.5`；集成数据库只接受 PostgreSQL 18.4 或更新 18.x。
 - 本包只拥有 `migrations/000015_assets_catalog.{up,down}.sql`；000016 Connection、000017 VictoriaMetrics、000018 Grant、000019 主机/PostgreSQL、000020 治理能力均不得提前实现。
-- 000015 只创建 `asset_sources`、`asset_source_revisions`、`asset_source_runs`、`asset_observations`、`assets`、`asset_type_details`、`asset_conflicts`、`asset_relationships`、`service_asset_bindings`。
+- 000015 只创建 `asset_sources`、`asset_source_revisions`、`asset_source_revision_authorities`、`asset_source_runs`、`asset_observations`、`assets`、`asset_type_details`、`asset_conflicts`、`asset_relationships`、`service_asset_bindings`。
 - 保留 `services`、`service_bindings`、`integrations` 及未知 JSONB；未知 JSONB 不能解释为运行能力。
 - 所有跨作用域引用使用 Tenant + Workspace + Environment（来源级对象止于 Workspace）；不能只信全局 UUID。
 - 去重键固定 `(tenant_id, workspace_id, source_id, provider_kind, external_id)`；跨来源合并必须走 Conflict/Decision。
@@ -35,26 +35,28 @@
 ### Task 1: PostgreSQL 18.4 schema, invariants, rollback guard, and recovery proof
 
 **Files:**
-- Create: **migrations/000015_assets_catalog.up.sql**
-- Create: **migrations/000015_assets_catalog.down.sql**
-- Create: **internal/assetcatalog/postgres/migration_test.go**
-- Create: **internal/assetcatalog/postgres/migration_integration_test.go**
-- Create: **internal/assetcatalog/postgres/migration_shape_integration_test.go**
-- Create: **internal/assetcatalog/postgres/migration_contract_integration_test.go**
-- Create: **internal/assetcatalog/postgres/migration_adversarial_contract_integration_test.go**
-- Create: **internal/assetcatalog/postgres/migration_closure_adversarial_integration_test.go**
-- Create: **internal/assetcatalog/postgres/migration_final_contract_integration_test.go**
-- Create: **internal/assetcatalog/postgres/migration_run_replay_acceptance_integration_test.go**
-- Create: **internal/assetcatalog/postgres/migration_reclaim_acceptance_integration_test.go**
-- Create: **internal/assetcatalog/postgres/migration_scope_shape_acceptance_integration_test.go**
-- Create: **internal/assetcatalog/postgres/migration_scope_remaining_acceptance_integration_test.go**
-- Create: **internal/assetcatalog/postgres/migration_freshness_domain_acceptance_integration_test.go**
-- Create: **internal/assetcatalog/postgres/migration_online_compatibility_integration_test.go**
-- Create: **internal/assetcatalog/postgres/migration_recovery_integration_test.go**
-- Create: **internal/assetcatalog/postgres/recovery_container_test.go**
-- Create: **internal/assetcatalog/postgres/schema_admission.go**
-- Create: **internal/assetcatalog/postgres/schema_admission_test.go**
-- Create: **internal/assetcatalog/postgres/schema_admission_integration_test.go**
+- Modify: **migrations/000015_assets_catalog.up.sql**
+- Modify: **migrations/000015_assets_catalog.down.sql**
+- Modify: **internal/assetcatalog/postgres/migration_test.go**
+- Modify: **internal/assetcatalog/postgres/migration_integration_test.go**
+- Modify: **internal/assetcatalog/postgres/migration_shape_integration_test.go**
+- Modify: **internal/assetcatalog/postgres/migration_contract_integration_test.go**
+- Modify: **internal/assetcatalog/postgres/migration_adversarial_contract_integration_test.go**
+- Modify: **internal/assetcatalog/postgres/migration_closure_adversarial_integration_test.go**
+- Modify: **internal/assetcatalog/postgres/migration_final_contract_integration_test.go**
+- Modify: **internal/assetcatalog/postgres/migration_run_replay_acceptance_integration_test.go**
+- Modify: **internal/assetcatalog/postgres/migration_reclaim_acceptance_integration_test.go**
+- Modify: **internal/assetcatalog/postgres/migration_scope_shape_acceptance_integration_test.go**
+- Modify: **internal/assetcatalog/postgres/migration_scope_remaining_acceptance_integration_test.go**
+- Modify: **internal/assetcatalog/postgres/migration_freshness_domain_acceptance_integration_test.go**
+- Modify: **internal/assetcatalog/postgres/migration_online_compatibility_integration_test.go**
+- Modify: **internal/assetcatalog/postgres/migration_recovery_integration_test.go**
+- Modify: **internal/assetcatalog/postgres/recovery_container_test.go**
+- Modify: **internal/assetcatalog/postgres/schema_admission.go**
+- Modify: **internal/assetcatalog/postgres/schema_admission_test.go**
+- Modify: **internal/assetcatalog/postgres/schema_admission_integration_test.go**
+- Create: **internal/store/postgres/database_role_admission.go**, **internal/store/postgres/database_role_admission_test.go**
+- Create: **docs/operations/database-role-bootstrap.md**; Modify: **.github/workflows/ci.yml**
 - Modify: **internal/store/postgres/migrations_integration_test.go**
 - Modify: **internal/investigation/postgres/testpostgres_test.go**
 - Modify: **internal/investigation/postgres/correlation_create_integration_test.go**
@@ -64,10 +66,12 @@
 **Interfaces:**
 - Consumes candidates from 000002: `workspaces(tenant_id,id)`、`environments(tenant_id,workspace_id,id)`、`integrations(tenant_id,workspace_id,id)`、`services(tenant_id,workspace_id,id)`。
 - Produces `assets UNIQUE (tenant_id,workspace_id,environment_id,id)` for 000016 Connection.
-- Produces Workspace/Environment-scoped candidate keys for the other eight tables.
+- Produces Workspace/Environment-scoped candidate keys for the other nine tables, including the exact Revision/Environment key consumed by `asset_source_revision_authorities`.
+- Produces the deployment-preprovisioned base database-role ABI and its production startup/CI admission; later migrations extend only its reviewed extension-owner manifest.
 - Does not change any 000001–000014 table definition.
 
-- [x] **Step 1: Write failing ownership and invariant shape tests**
+The original nine-table/32-function implementation and its commit remain historical evidence，but the 2026-07-14 Step 8 preflight changed the acceptance contract carried by Steps 1–7（ten tables、profile/authority/definition/binding closure、future hook、opaque references、NOWAIT down and reviewed manifest）。Those steps are therefore reopened below：read Step 8's exact corrective contract before starting Step 1，then execute the RED→implementation→verification→commit sequence in checkbox order。No reopened checkbox is completion evidence until the corrective code and all listed gates are Green.
+- [ ] **Step 1: Write failing ownership and invariant shape tests**
 
 ~~~go
 package postgres_test
@@ -84,7 +88,7 @@ func TestAssetCatalogMigrationOwnsExactTablesAndGuardsData(t *testing.T) {
 	up := strings.ToLower(readMigration(t, "000015_assets_catalog.up.sql"))
 	down := strings.ToLower(readMigration(t, "000015_assets_catalog.down.sql"))
 	owned := []string{
-		"asset_sources", "asset_source_revisions", "asset_source_runs", "asset_observations", "assets",
+		"asset_sources", "asset_source_revisions", "asset_source_revision_authorities", "asset_source_runs", "asset_observations", "assets",
 		"asset_type_details", "asset_conflicts", "asset_relationships",
 		"service_asset_bindings",
 	}
@@ -107,8 +111,8 @@ func TestAssetCatalogMigrationOwnsExactTablesAndGuardsData(t *testing.T) {
 	for _, required := range []string{
 		"unique (tenant_id, workspace_id, source_id, provider_kind, external_id)",
 		"unique (tenant_id, workspace_id, environment_id, id)",
-		"before update or delete on asset_observations",
-		"before update or delete on asset_type_details",
+		"before update on asset_observations", "before delete on asset_observations",
+		"before update on asset_type_details", "before delete on asset_type_details",
 		"retired asset is terminal",
 		"unsafe asset catalog rollback: catalog state remains",
 	} {
@@ -117,6 +121,15 @@ func TestAssetCatalogMigrationOwnsExactTablesAndGuardsData(t *testing.T) {
 		}
 	}
 }
+
+func TestAssetCatalogCorrectiveOwnsExact35RoutineSignaturesAndFutureHook(t *testing.T) { assertCorrectiveExact35RoutineSignaturesAndFutureHook(t) }
+func TestAssetCatalogCorrectiveRejectsNoncanonicalProfileManifestAndDefinitionV2Drift(t *testing.T) { assertCorrectiveProfileManifestAndDefinitionV2(t) }
+func TestAssetCatalogCorrectiveRecomputesAuthorityDefinitionAndBindingDigestsInSQL(t *testing.T) { assertCorrectiveSQLDigestClosure(t) }
+func TestAssetCatalogCorrectiveRejectsOpaqueReferenceAndTypedPairDrift(t *testing.T) { assertCorrectiveOpaqueReferenceAndTypedPair(t) }
+func TestAssetCatalogCorrectiveFutureSourceInsertAndLiveStagesFailClosed(t *testing.T) { assertCorrectiveFutureSourceStages(t) }
+func TestAssetCatalogCorrectiveDownUsesOneShotNowaitAndDropsEveryDependency(t *testing.T) { assertCorrectiveDownLockAndDependencyOrder(t) }
+func TestAssetCatalogCorrectiveManualProfileLiteralAndSQLParity(t *testing.T) { assertCorrectiveManualProfileLiteralAndParity(t) }
+func TestAssetCatalogCorrectiveEnforcesDatabaseRoleSeparation(t *testing.T) { assertCorrectiveDatabaseRoleSeparation(t) }
 
 func readMigration(t *testing.T, name string) string {
 	t.Helper()
@@ -132,18 +145,19 @@ func readMigration(t *testing.T, name string) string {
 }
 ~~~
 
-Run: `go test ./internal/assetcatalog/postgres -run TestAssetCatalogMigrationOwnsExactTablesAndGuardsData -count=1`
+Run: `go test ./internal/assetcatalog/postgres -run 'TestAssetCatalog(MigrationOwnsExactTablesAndGuardsData|Corrective)' -count=1`
 
-Expected: FAIL because both 000015 files are missing.
+Expected: every named corrective test FAILS for its own missing contract（not merely the authority table）：exact 35-signature/39-trigger-caller manifest and hook、direct-SQL noncanonical/duplicate/unknown Profile manifest plus `.v2` parity、three SQL digests、opaque/typed pair、initial/live future stages、one-shot NOWAIT/down dependency order、exact MANUAL literal and base database-role separation。The same RED commit must implement every called helper in the named test files with real fixtures/assertions；undefined helpers、`t.Skip`、compile-only failure or one shared vague substring failure is not a Red。Record each independent Red cause before Step 2。
 
-- [x] **Step 2: Implement the transactional up migration with this exact schema**
+- [ ] **Step 2: Implement the transactional up migration with this exact schema**
 
-Start with `BEGIN; SET LOCAL lock_timeout='5s';` and lock `tenants, workspaces, environments, integrations, services, service_bindings, audit_records, outbox_events` in access-exclusive order so concurrent schema changes cannot interleave and the new binding-eligibility FK never relies on an implicit referenced-table DDL lock.
+Start with `BEGIN; SET LOCAL lock_timeout='5s';`，then acquire every prerequisite relation in one fully qualified statement：`LOCK TABLE public.tenants, public.workspaces, public.environments, public.integrations, public.services, public.service_bindings, public.audit_records, public.outbox_events IN ACCESS EXCLUSIVE MODE NOWAIT`。Any conflicting DDL/DML returns SQLSTATE `55P03` and aborts the whole migration transaction；the migrator retries from `BEGIN` and never waits while holding a partial prerequisite lock set. Only after that single statement succeeds may prerequisite checks or owned DDL run，and all locks remain held through `COMMIT`，so concurrent schema change、binding mutation and implicit referenced-table FK locks cannot interleave.
 
 | Table | Required columns and exact purpose |
 |---|---|
 | `asset_sources` | 稳定 UUID 身份/Workspace Scope；`source_kind/provider_kind/name/status` 与 `published_revision/published_revision_digest`；正交 `gate_status/gate_reason_code/gate_revision/validated_run_id/validation_digest/validated_binding_digest`；当前 checkpoint (`checkpoint_ciphertext/checkpoint_key_id/checkpoint_sha256/checkpoint_version/checkpoint_revision`)；HA backpressure (`next_allowed_at/consecutive_failures`)；创建幂等/hash、version、exact `last_success_run_id/at` 与 `last_complete_snapshot_run_id/at`、timestamps |
-| `asset_source_revisions` | 复合 Scope + stable source + monotonically increasing revision；`DRAFT/VALIDATING/VALIDATED/REJECTED/PUBLISHED/SUPERSEDED`；content-addressed canonical provider schema；`integration_id/sync_mode/authority_scope_digest/source_definition_digest`；opaque `credential_reference_id/trust_reference_id/network_policy_reference_id`（`MANUAL/MANUAL_V1` 三者必须全为 `NULL`）；固定 rate/backpressure/profile/schedule；完整 availability binding 的 `canonical_revision_digest`；validation run/digest；actor/reason/CAS/time；创建后 canonical content 不可变 |
+| `asset_source_revisions` | 复合 Scope + stable source + monotonically increasing revision；`DRAFT/VALIDATING/VALIDATED/REJECTED/PUBLISHED/SUPERSEDED`；safe content-addressed canonical Profile manifest and Provider schema；`integration_id/sync_mode/authority_scope_digest/source_definition_digest`；opaque Credential/Trust/Network references；nullable-pair typed extension code/digest；固定 rate/backpressure/profile/schedule；完整 availability binding digest；validation run/digest；actor/reason/CAS/time；创建后 canonical content 不可变 |
+| `asset_source_revision_authorities` | exact Source Revision + same-Scope Environment composite FKs；1–100 contiguous canonical ordinals；deferred ordered-set digest closure；immutable insert-only authority membership |
 | `asset_source_runs` | source scope + exact source definition revision/canonical digest; `run_kind/status/stage_code/stage_changed_at/trigger_type`; immutable gate revision; idempotency/hash; cursor before/after SHA; page sequence/digest and final/complete-snapshot proof; lease owner/expiry, monotonically increasing `fence_epoch`, token hash and heartbeat sequence; pending `DELAY` transition with reason/`not_before`/attempt-bound intent digest; observed/created/changed/unchanged/conflict/missing/stale/restored/tombstoned/rejected counts; typed work result/digest/recorded time; validation proof; checkpoint-lineage-rollover proof; broker-owned opaque cleanup attempt ID/epoch plus cleanup status/digest; optional immutable terminal-failure override/digest; exact `terminal_command_sha256`; stable failure code/trace; start/heartbeat/complete |
 | `asset_observations` | full scope/source/run; provider/external/exact Source definition revision; server-owned Catalog acceptance `observed_at`; page/checkpoint/fence coordinates; profile-locked freshness order, Provider version/fact/fingerprint digest and previous Observation/chain; schema version; nullable tombstone document + SHA; bounded field-provenance bytea + SHA; explicit tombstone flag/reason code; created time |
 | `assets` | full scope/source; provider/external/kind/display; governance fields; lifecycle/mapping; exact last Observation/chain/time/Source definition revision; create idempotency/hash; version/timestamps |
@@ -251,9 +265,9 @@ A Provider token/resource-version/collector expiry never authorizes an arbitrary
 
 `MANUAL` is the sole checkpoint exception: the Source row itself requires `provider_kind=MANUAL_V1`，its only installed Revision profile is `MANUAL_V1`，and every such Revision requires `credential_reference_id/trust_reference_id/network_policy_reference_id` all `NULL`; non-MANUAL Sources and Revisions cannot claim `MANUAL_V1`. It has no Provider cursor and keeps `checkpoint_ciphertext/checkpoint_key_id/checkpoint_sha256` NULL forever. Its positive `checkpoint_version` is only the server-owned monotonic Catalog sequence, CASed by the synchronous `MANUAL_MUTATION`, and `checkpoint_revision` is the exact published Source definition revision. Before first publication both numeric fields are zero；every publication sets `checkpoint_version=0, checkpoint_revision=<new published revision>`，and each mutation increments only the version. Thus Pack 02 has no forward dependency on the Pack 09 checkpoint codec. `ProviderVersionSHA256` for sequence `n` is exactly `SHA256(FramedTupleV1("manual-catalog-version.v1",tenant_id,workspace_id,source_id,checkpoint_revision,n))`. Its cleanup is exact `NO_CREDENTIAL` with `cleanup_attempt_id=NULL`、`cleanup_attempt_epoch=0` and deterministic `cleanup_digest=SHA256(FramedTupleV1("asset-run-no-credential.v1",run_id,source_revision,source_revision_digest,fence_epoch))`；the same transaction must append `ASSET_SOURCE_RUN/ATTEMPT_CLEANED` receipt `request_id="source-attempt:<run_uuid>:0"`、`payload_hash=cleanup_digest`. MANUAL Run 不得进入 `PENDING|REVOKED|UNCERTAIN` cleanup、pending `DELAY` 或 `DELAYED` 状态，也不得把 `NO_CREDENTIAL` 重置为 `NOT_OPENED`；deferred closure 在提交点拒绝任何仍为 `QUEUED|RUNNING|FINALIZING` 的 MANUAL Run，因此 Validation/MANUAL_MUTATION 必须在创建它的同一 serializable API transaction 内完成 claim、work、exact cleanup receipt、terminal receipt 与 Revision/Source closure，失败则整笔回滚且不留下共享队列条目。A `MANUAL_MUTATION` may close its final page but must persist `complete_snapshot=false/effective_complete_snapshot=false` because manual input cannot prove authoritative membership absence；on success it advances only `last_success_run_id/at`. The database never stores a plaintext provider cursor, raw lease token, credential material, endpoint, CA PEM or source error body.
 
-`asset_source_revisions` 的 canonical content 在创建后不可修改；状态只能 `DRAFT|REJECTED→VALIDATING→VALIDATED|REJECTED`、`VALIDATED→PUBLISHED`、`PUBLISHED→SUPERSEDED`。进入 `VALIDATING` 必须将 `validation_run_id` 替换为新的 exact append-only `QUEUED` Validation Run 并清空 digest；返回 `VALIDATED|REJECTED` 只能消费该同一 Run 的 terminal proof，不得依赖时间比较或复用旧成功 Run。Validation `SUCCEEDED` 原子写 `VALIDATED` 与 exact proof；Validation `FAILED|CANCELLED`（包括漂移、reaper、cleanup uncertainty）必须在终态事务中把仍绑定该 `validation_run_id` 的 `VALIDATING` revision 写为 `REJECTED`，保存稳定 failure code/proof digest，使其可重新进入 Validation，而不是遗留永久 `VALIDATING`。`REJECTED` 不能直接发布。Revision insert 必须在锁定 stable Source 后满足 `revision=max+1` 与 `expected_source_version=current source.version`，并原子推进 Source version。每个 source 最多一个 `PUBLISHED`，发布任何新 canonical 修订必须在同一事务更新 stable source pointer、supersede 旧修订、按前述 Profile 规则初始化新 revision checkpoint 并关闭 gate。
+`asset_source_revisions` 的 canonical content 在创建后不可修改。Authority child rows must number 1..N in canonical-text `C` order and the parent digest is exactly `SHA256(FramedTupleV1("asset-source-authority-scope.v1",N,repeated ordered Environment IDs))`；the deferred parent/child closure rejects missing、extra、cross-Scope or reordered facts。`typed_extension_code/prepared_extension_digest` are both NULL or both present and are immutable。状态只能 `DRAFT|REJECTED→VALIDATING→VALIDATED|REJECTED`、`VALIDATED→PUBLISHED`、`PUBLISHED→SUPERSEDED`。进入 `VALIDATING` 必须将 `validation_run_id` 替换为新的 exact append-only `QUEUED` Validation Run 并清空 digest；返回 `VALIDATED|REJECTED` 只能消费该同一 Run 的 terminal proof，不得依赖时间比较或复用旧成功 Run。Validation `SUCCEEDED` 原子写 `VALIDATED` 与 exact proof；Validation `FAILED|CANCELLED`（包括漂移、reaper、cleanup uncertainty）必须在终态事务中把仍绑定该 `validation_run_id` 的 `VALIDATING` revision 写为 `REJECTED`，保存稳定 failure code/proof digest，使其可重新进入 Validation，而不是遗留永久 `VALIDATING`。`REJECTED` 不能直接发布。Revision insert 必须在锁定 stable Source 后满足 `revision=max+1` 与 `expected_source_version=current source.version`，并原子推进 Source version。每个 source 最多一个 `PUBLISHED`，发布任何新 canonical 修订必须在同一事务更新 stable source pointer、supersede 旧修订、按前述 Profile 规则初始化新 revision checkpoint 并关闭 gate。
 
-`asset_sources.gate_status='AVAILABLE'` is legal only when `status='ACTIVE'`, the exact published revision has traversed `QUEUED→RUNNING→FINALIZING→SUCCEEDED` (the synchronous MANUAL path may do all transitions in one transaction), `validation_digest` is lowercase SHA-256, and `validated_binding_digest = canonical_revision_digest = published_revision_digest`. The canonical digest covers the definition plus every immutable Integration/sync/Credential/Trust/Network/authority/rate/backpressure/profile/schedule binding; `source_definition_digest` cannot satisfy this comparison. Gate epoch arithmetic is closed and exact. With starting epoch `G`, the first-publication path keeps the Source `UNAVAILABLE/G` while its exact Validation Run carries `gate_revision=G`, publication closes to `UNAVAILABLE/G+1`, and the separately admitted open reaches `AVAILABLE/G+2`. If the product exposes validation progress, only `UNAVAILABLE/G→VALIDATING/G+1` may bind that exact newly queued Run；the binding is immutable, publication closes to `UNAVAILABLE/G+2`, and the separately admitted open reaches `AVAILABLE/G+3`. An already `AVAILABLE` Source may retain the gate only when status, reason, epoch and all validation bindings are unchanged. Checkpoint-lineage rollover is the sole runtime exception：the admitted data Run keeps epoch `G`, begin-rollover closes to `DEGRADED/G+1`, and the same Run's serializable terminal closure reaches exactly `AVAILABLE/G+2` for an effective complete success or `SUSPENDED/G+2` for failure/uncertainty. Any publication/reference drift atomically sets the gate back to `UNAVAILABLE`; ordinary discovery success cannot open it, an unexplained epoch-only increment is rejected, and no path may compress or skip these epochs. `MANUAL` is served by the governed Asset API；`KUBERNETES_OPERATOR` remains `UNAVAILABLE` until Phase 3 publishes its provider contract，`AWX_INVENTORY` remains `UNAVAILABLE` until Phase 5 publishes its fixed AWX contract.
+`asset_sources.gate_status='AVAILABLE'` is legal only when `status='ACTIVE'`, the exact published revision has traversed `QUEUED→RUNNING→FINALIZING→SUCCEEDED` (the synchronous MANUAL path may do all transitions in one transaction), `validation_digest` is lowercase SHA-256, and `validated_binding_digest = canonical_revision_digest = published_revision_digest`. The canonical digest covers the definition plus every immutable Integration/sync/Credential/Trust/Network/authority/rate/backpressure/profile/schedule binding and the typed-extension code/digest as two independent frames; `source_definition_digest` cannot satisfy this comparison. Gate epoch arithmetic is closed and exact. With starting epoch `G`, the first-publication path keeps the Source `UNAVAILABLE/G` while its exact Validation Run carries `gate_revision=G`, publication closes to `UNAVAILABLE/G+1`, and the separately admitted open reaches `AVAILABLE/G+2`. If the product exposes validation progress, only `UNAVAILABLE/G→VALIDATING/G+1` may bind that exact newly queued Run；the binding is immutable, publication closes to `UNAVAILABLE/G+2`, and the separately admitted open reaches `AVAILABLE/G+3`. An already `AVAILABLE` Source may retain the gate only when status, reason, epoch and all validation bindings are unchanged. Checkpoint-lineage rollover is the sole runtime exception：the admitted data Run keeps epoch `G`, begin-rollover closes to `DEGRADED/G+1`, and the same Run's serializable terminal closure reaches exactly `AVAILABLE/G+2` for an effective complete success or `SUSPENDED/G+2` for failure/uncertainty. Any publication/reference drift atomically sets the gate back to `UNAVAILABLE`; ordinary discovery success cannot open it, an unexplained epoch-only increment is rejected, and no path may compress or skip these epochs. `MANUAL` is served by the governed Asset API；`KUBERNETES_OPERATOR` remains `UNAVAILABLE` until Phase 3 publishes its provider contract，`AWX_INVENTORY` remains `UNAVAILABLE` until Phase 5 publishes its fixed AWX contract.
 
 Every textual identity has non-empty, trimmed canonical-character and octet-length constraints: ProviderKind matches `^[A-Z][A-Z0-9_]{0,63}$`, external ID ≤512, display/name ≤256, owner/actor/reason/revision/schema/idempotency/trace within their domain maxima. Reject NUL/CR/LF. `assets_kind_check` is a named closed constraint containing exactly the 17 Phase 1 Kind values. Count checks are non-negative. Run shape is exact:
 
@@ -264,7 +278,7 @@ Every textual identity has non-empty, trimmed canonical-character and octet-leng
 
 `stage_code/stage_changed_at` is server-owned. Allowed transitions are `WAITING→VALIDATING|READING`, `WAITING→DELAYED`, `DELAYED→VALIDATING|READING`, data-page cycles `READING→NORMALIZING→APPLYING→READING`, any active stage to `CLEANING_UP`, retry cleanup `CLEANING_UP→DELAYED`, and terminal `CLEANING_UP→COMPLETED`；only `CancelIneligible` may additionally perform no-lease `WAITING|DELAYED→COMPLETED`. Only fenced Queue/Worker methods may advance every other transition. Terminal owner/token-hash/epoch/heartbeat evidence remains immutable after capacity/raw-token release. Conflict shape requires OPEN=no decision and closed=complete decision.
 
-- [x] **Step 3: Add immutable and lifecycle database guards**
+- [ ] **Step 3: Add immutable and lifecycle database guards**
 
 ~~~sql
 CREATE OR REPLACE FUNCTION reject_asset_catalog_immutable() RETURNS trigger AS $$
@@ -299,17 +313,19 @@ Create the claim index `(not_before,created_at,id) WHERE status IN ('QUEUED','DE
 
 Before any credential/session can open, the Worker calls fenced `ReserveCleanupAttempt`, which persists a random broker-owned opaque `cleanup_attempt_id` and its originating fence epoch. Reserve is exact-idempotent for `(run_id,fence_epoch)`：response-loss retry returns the same UUID and can never allocate/overwrite a second attempt. The external Cleanup Broker owns every revoke/session handle；`OpenAttempt(attempt_id)` is idempotent and may create at most one logical session for that ID，while `RevokeAttempt(attempt_id)` is idempotent and returns the same signed safe proof. The database never stores the handle or any credential. If an Open response is lost/ambiguous, the Worker must not retry Provider work or reserve another attempt；it immediately persists `TRANSPORT_BACKOFF`, calls `RevokeAttempt` for the known ID, records cleanup and delays. Before retry cleanup, Queue persists `pending_transition='DELAY'` plus reason/`not_before` and exact `pending_transition_digest = SHA256(FramedTupleV1("asset-run-delay-intent.v1",run_id,cleanup_attempt_id-or-NULL,cleanup_attempt_epoch,delay_reason,not_before))`. `RecordCleanup` verifies the proof and appends immutable `ASSET_SOURCE_RUN/ATTEMPT_CLEANED` audit receipt `request_id="source-attempt:<run_uuid>:<attempt_epoch>"` with `payload_hash` equal to the signed proof digest before updating the current summary. The `NO_CREDENTIAL` specialization is accepted only for exact `MANUAL/MANUAL_V1` Revision with all three external references `NULL`，uses attempt epoch `0` and the deterministic digest defined above, and must have that same exact receipt；an arbitrary caller SHA is never cleanup proof. If an expired `RUNNING` attempt had `PENDING` cleanup, reclaim moves its stage to cleanup-only `CLEANING_UP`, persists/uses a bounded `TRANSPORT_BACKOFF` delay intent, revokes that attempt and may only execute that `Delay` for a fresh claim or fail；it cannot continue Provider work under a replacement fence. If cleanup is already `REVOKED|NO_CREDENTIAL`, reclaim must verify the exact attempt receipt and the intent digest bound to that attempt epoch, then execute it；missing/mismatched intent is corruption and suspends the gate. `ReclaimFinalizing` likewise uses only the opaque attempt ID and Broker proof—never Provider runtime or checkpoint；when cleanup already has a valid receipt, it consumes the persisted work result/failure intent through `Complete|Fail`. A fresh claim atomically clears the consumed pending intent and may reset the current cleanup summary to `NOT_OPENED` only after verifying the prior append-only receipt, so history is never overwritten. A missing/invalid/uncertain Broker proof deterministically fails the Run and suspends the Source gate.
 
-`CancelIneligible` locks the Source and atomically transitions its `QUEUED|DELAYED` Runs to `CANCELLED` when disable/publication/gate/revision/checkpoint drift makes them unclaimable; because those states have no open credential, no cleanup is skipped and the unique nonterminal slot is released. If the Run is the exact Validation bound by a `VALIDATING` Revision, that same transaction writes the Revision `REJECTED` with stable cancellation proof/code. If an expired `RUNNING` Run drifted, a bounded reaper takes the next fence without Provider/checkpoint access: it may fail directly only when cleanup is `NOT_OPENED|NO_CREDENTIAL`; otherwise it enters cleanup-only work and must revoke/close before `Fail` (or persist `UNCERTAIN` and suspend the gate). Before expiry, the current fence may perform cleanup/fail but cannot extend after drift. Terminal rows preserve owner/token-hash/epoch/heartbeat evidence while raw token is destroyed and capacity released. `last_success_at` equals `completed_at` only for the latest terminal `SUCCEEDED` non-VALIDATION data Run, including final delta/API/MANUAL runs；`PARTIAL` does not advance it. `last_complete_snapshot_at` equals `completed_at` only when that `SUCCEEDED` Run persisted effective `complete_snapshot=true`，and `MANUAL_MUTATION` is categorically ineligible. Neither accepts caller time. No terminal Run may commit alone：its `TERMINAL_COMMITTED` receipt and required Source/Revision updates are deferred-validated as one serializable closure；cleanup `UNCERTAIN` without exact Source `SUSPENDED` rolls back the whole transaction. QUEUED rows cannot receive counts/proof/pages, DELAYED rows preserve only committed progress, FINALIZING rows accept only cleanup/terminal facts, terminal rows are immutable, and every successful page/checkpoint advance increases both Run page/checkpoint and Source checkpoint version exactly once. Add row-level `BEFORE DELETE` and statement-level `BEFORE TRUNCATE` rejection to all nine tables; lifecycle/status transitions are the only removal path.
+`CancelIneligible` locks the Source and atomically transitions its `QUEUED|DELAYED` Runs to `CANCELLED` when disable/publication/gate/revision/checkpoint drift makes them unclaimable; because those states have no open credential, no cleanup is skipped and the unique nonterminal slot is released. If the Run is the exact Validation bound by a `VALIDATING` Revision, that same transaction writes the Revision `REJECTED` with stable cancellation proof/code. If an expired `RUNNING` Run drifted, a bounded reaper takes the next fence without Provider/checkpoint access: it may fail directly only when cleanup is `NOT_OPENED|NO_CREDENTIAL`; otherwise it enters cleanup-only work and must revoke/close before `Fail` (or persist `UNCERTAIN` and suspend the gate). Before expiry, the current fence may perform cleanup/fail but cannot extend after drift. Terminal rows preserve owner/token-hash/epoch/heartbeat evidence while raw token is destroyed and capacity released. `last_success_at` equals `completed_at` only for the latest terminal `SUCCEEDED` non-VALIDATION data Run, including final delta/API/MANUAL runs；`PARTIAL` does not advance it. `last_complete_snapshot_at` equals `completed_at` only when that `SUCCEEDED` Run persisted effective `complete_snapshot=true`，and `MANUAL_MUTATION` is categorically ineligible. Neither accepts caller time. No terminal Run may commit alone：its `TERMINAL_COMMITTED` receipt and required Source/Revision updates are deferred-validated as one serializable closure；cleanup `UNCERTAIN` without exact Source `SUSPENDED` rolls back the whole transaction. QUEUED rows cannot receive counts/proof/pages, DELAYED rows preserve only committed progress, FINALIZING rows accept only cleanup/terminal facts, terminal rows are immutable, and every successful page/checkpoint advance increases both Run page/checkpoint and Source checkpoint version exactly once. Add row-level `BEFORE DELETE` and statement-level `BEFORE TRUNCATE` rejection to all ten tables; lifecycle/status transitions are the only removal path. `asset_source_revision_authorities` additionally rejects every `UPDATE` because its ordered membership is immutable content.
 
-- [x] **Step 4: Implement guarded down and online-compatibility checks**
+- [ ] **Step 4: Implement guarded down and online-compatibility checks**
 
-Down begins a transaction, locks all nine tables child-first, and raises SQLSTATE `55000` with exact message `unsafe asset catalog rollback: catalog state remains` if any row exists. Only empty tables may drop `asset_management_idempotency_audit_uk`, then the nine tables child-first and their triggers/functions.
+Down begins one transaction and takes **one** fully qualified non-waiting lock statement over every prerequisite/FK target、both altered shared surfaces and all owned relations：`LOCK TABLE public.tenants, public.workspaces, public.environments, public.integrations, public.services, public.service_bindings, public.audit_records, public.outbox_events, public.asset_sources, public.asset_source_revisions, public.asset_source_revision_authorities, public.asset_source_runs, public.asset_observations, public.assets, public.asset_type_details, public.asset_conflicts, public.asset_relationships, public.service_asset_bindings IN ACCESS EXCLUSIVE MODE NOWAIT`。The six prerequisite targets are mandatory because PostgreSQL 18 FK removal otherwise acquires their `AccessExclusiveLock` after child locks；Audit/Outbox are mandatory because Down restores their reviewed indexes/triggers/ACL/comment surface。Any member conflict returns `55P03` and rolls back before guard；there is no later implicit relation lock that may wait while a partial set is held。After the full set is held，Down raises `55000` with exact message `unsafe asset catalog rollback: catalog state remains` if any owned row exists。Only empty locked state may restore shared surfaces、drop dependent triggers/functions/FKs and then ten tables child-first；this manifest order is not a production row-lock order。
 
-Add a production `schema_admission.go` probe consumed later by Control Plane assembly. Its constructor requires the explicit trusted schema name (`public` in production); it never uses `current_schema`, `search_path` object resolution or a caller-selected schema. Every owned runtime function fixes `search_path=pg_catalog, public` in `proconfig`，不得继承迁移会话、把 `public` 放在 `pg_catalog` 前或包含 `pg_temp`；hostile 同名 function/operator 不能改变门禁求值。The code contains one reviewed hard-coded PostgreSQL-18.4 manifest SHA-256 generated from the migration at build/review time, never derived from the live database or migration file at runtime. The structured manifest covers all nine relations (column order/name/type/typmod/null/default/identity/generated、persistence、RLS), every named/unnamed constraint and exact normalized definition, every required explicit/implicit index and predicate, every trigger event/level/function/deferrability with `tgenabled='O'`, every owned function's exact signature/body/language/volatility/strict/security/search_path, plus the exact affected `audit_records/outbox_events` index/trigger/comment surface. Catalog rows are length-prefixed and sorted before SHA-256; admission succeeds only on exact equality.
+Add production `schema_admission.go` and `database_role_admission.go` probes consumed later by Control Plane assembly. Their constructors require the explicit trusted schema name (`public` in production); they never use `current_schema`, `search_path` object resolution or a caller-selected schema. Task 1 owns four exact base roles；all four are `NOSUPERUSER/NOCREATEDB/NOCREATEROLE/NOREPLICATION/NOBYPASSRLS`：`aiops_migrator` is `LOGIN/NOINHERIT`，`aiops_schema_owner` and `aiops_control_plane_runtime` are `NOLOGIN/NOINHERIT`，and `aiops_control_plane_workload` is `LOGIN/INHERIT`。The only base membership edges are migrator→schema owner with `inherit=false,set=true,admin=false` and workload→runtime with `inherit=true,set=false,admin=false`；neither runtime identity has any edge to migrator/schema owner。The database owner is the NOLOGIN schema owner；PUBLIC has no database `CONNECT|TEMP`，migrator and workload each have only `CONNECT`，runtime has no database privilege，and none of PUBLIC/migrator/runtime/workload has `TEMP` or database/schema `CREATE`；the schema owner is the sole persistent `CREATE` holder on `public`。Environment IaC/bootstrap—not any migration—precreates roles/database/ACL；migration and application DSNs are distinct and CI provisions the identical fixture before `000015`。Migration connection admission requires `session_user=current_user='aiops_migrator'` before `BEGIN`，then `SET LOCAL ROLE aiops_schema_owner` for reviewed DDL/grants and `RESET ROLE` before `COMMIT`；application admission requires `session_user=current_user='aiops_control_plane_workload'` and forbids runtime `SET ROLE`。Runtime has `USAGE` on `public`，`SELECT/INSERT` on all ten Asset relations，and `UPDATE` only on Sources/Revisions/Runs/Assets/Conflicts/Relationships/Service Bindings；it has Audit `SELECT` plus column-level `INSERT(id,tenant_id,workspace_id,actor_type,actor_id,action,resource_type,resource_id,request_id,trace_id,payload_hash,details,created_at)`，and Outbox `SELECT` plus column-level `INSERT(id,tenant_id,workspace_id,aggregate_type,aggregate_id,aggregate_version,event_type,payload,created_at,available_at)` and `UPDATE(available_at,claimed_at,claimed_by,claim_token,claim_expires_at,delivered_at,delivered_claim_token,attempts,last_error_code)`。All Asset/Audit/Outbox `DELETE/TRUNCATE` and every other column privilege are absent。All 35 functions revoke PUBLIC EXECUTE；runtime receives only the exact 17 non-trigger signatures（nine validators、frame encoder、four Run digests、opaque validator、binding digest、future hook），the 18 trigger-returning routines remain OWNER-only，and workload has no direct object ACL but inherits runtime。Successor hooks may add runtime read-only access only to the exact trusted relations they join。The initially empty extension-owner ABI requires `NOLOGIN/NOINHERIT` plus all five negative flags，no base membership/right or committed schema `CREATE`，and permits only reviewed schema `USAGE`、own typed-table rights、own procedure ownership plus exact pure-helper EXECUTE needed by that procedure/CHECK；trigger/transition/base-mutation EXECUTE remains forbidden。`000015` preflights base roles/ACL and the empty extension manifest；IaC adds exactly one migrator SET-only edge before each owned migration。Task 1 does not name a Phase 3 role；the bootstrap runbook is sole truth.
 
-Real negative tests create a shadow schema first in `search_path`, replace one guard function with a no-op, weaken one CHECK/FK, drop/alter one index, set a trigger replica-only/disabled, alter a column/default and change the checkpoint comment; each must return stable `asset_catalog_unavailable`. Test that a binary aware only of 000014 continues health/session reads while 000015 exists, while the new production probe remains closed until the full exact manifest is present; Pack 03 maps that sentinel to HTTP 503. The up migration must not rewrite existing large tables or add a defaulted column to them.
+Every owned runtime function fixes explicit `search_path=pg_catalog, public, pg_temp` in `proconfig`；putting `pg_temp` last prevents PostgreSQL's implicit temporary-schema precedence。Every trusted relation/type is nevertheless `public.`-qualified and security-relevant builtin/operator is `pg_catalog`-qualified；no function inherits the session path or resolves a caller schema，so hostile temporary/public names cannot change admission。The schema code contains one reviewed hard-coded PostgreSQL-18.4 manifest SHA-256 generated from the migration at build/review time, never derived from the live database or migration file at runtime. The structured manifest covers all ten relations, including the authority child (column order/name/type/typmod/null/default/identity/generated、persistence、RLS), every named/unnamed constraint and exact normalized definition, every required explicit/implicit index and predicate, every trigger event/level/function/deferrability with `tgenabled='O'`, every owned function's exact signature/body/language/volatility/strict/security/search_path, plus the exact affected `audit_records/outbox_events` index/trigger/comment surface. Relation owners and ordinary functions must be owned by `aiops_schema_owner`。ACL normalization resolves the preprovisioned role names to each cluster's local OIDs，then serializes only semantic labels `PUBLIC|OWNER|MIGRATOR|SCHEMA_OWNER|RUNTIME|WORKLOAD|<reviewed extension owner>` plus privilege、grantability and multiplicity；an unknown grantee、known role in an unlisted ACL position or duplicate row fails closed，so different-OID restore remains portable without collapsing a rogue principal into `OTHER`。Catalog rows are length-prefixed and sorted before SHA-256; schema and role admission require exact equality，including workload/migrator TEMP denial and every database/schema/relation/function ACL.
 
-- [x] **Step 5: Add real PostgreSQL scope, immutability, concurrency, and recovery tests**
+Real negative tests create a hostile ordinary schema first in `search_path` and，in an isolated non-admission fixture，a dedicated hostile test LOGIN with TEMP plus only the minimum test-call privileges to create same-named temporary relations/types/functions/operators；the production workload itself remains unable to create TEMP。They also replace one guard function with a no-op, weaken one CHECK/FK, alter an index/trigger/column/default/comment；each returns stable `asset_catalog_unavailable` or is rejected before DDL，and neither hostile schema can change a deferred digest/gate result。Test that a binary aware only of 000014 continues health/session reads while 000015 exists, while the new production probe remains closed until the full exact manifest is present; Pack 03 maps that sentinel to HTTP 503. The up migration must not rewrite existing large tables or add a defaulted column to them.
+
+- [ ] **Step 5: Add real PostgreSQL scope, immutability, concurrency, and recovery tests**
 
 The integration harness connects through a separately named safe test control database, asserts PostgreSQL 18.4, creates a randomized physical database named `aiops_assets_test_<hex>` (never merely a schema), reconnects and applies 000001–000015 to `public`, then force-drops that database in cleanup. It rejects non-test control database names and missing CREATE DATABASE authority rather than mutating the supplied database. It seeds two tenants/workspaces/environments, then proves:
 
@@ -332,6 +348,7 @@ The integration harness connects through a separately named safe test control da
 - synchronous MANUAL validation/mutation uses reference-free deterministic `NO_CREDENTIAL` plus logical Catalog sequence, never stores checkpoint ciphertext/key/hash, and a mutation advances last-success but never complete-snapshot state;
 - a source gate cannot become `AVAILABLE` without a matching successful validation run and becomes `UNAVAILABLE` on any Credential/Trust/Network/authority/rate/backpressure/profile/schedule drift;
 - two concurrent lifecycle writes cannot both commit.
+- both up and down locking use one schema-qualified `ACCESS EXCLUSIVE ... NOWAIT` statement；down fixtures independently hold each of six prerequisites、Audit、Outbox and ten owned relations and require `55P03` with zero schema/data change before guard，then prove full retry after release succeeds。A transaction started after successful locking cannot cross preflight/emptiness guard，and catalog observation proves no relation lock is first acquired later by FK/trigger/shared-surface cleanup.
 
 TRUNCATE negative assertions check SQLSTATE `55000` **and** the exact target table guard constraint/trigger name, so `CASCADE` cannot accidentally pass because a child table blocked first. The full migration runner applies 000015 up before including 000015 down in reverse-order tests; it never excludes this migration merely to make legacy integration green.
 
@@ -345,7 +362,7 @@ expectSQLState(t, database, "23514", `
 	WHERE id=$1 AND lifecycle='DISCOVERED'`, assetID)
 ~~~
 
-Recovery test uses `recovery_container_test.go` to start two distinct PostgreSQL 18.4 instances from the same approved digest-pinned image as CI, verifies different `system_identifier` values and enabled data checksums, then streams a sanitized custom-format `pg_dump` archive into `pg_restore --single-transaction` on the clean target. It inserts representative rows in all nine tables plus their scoped Audit/Outbox links, reapplies checksum verification, and asserts counts, every exact FK closure (including conflict Source、Type Detail identity、relationship/binding provenance、Service eligibility), last-success/complete-snapshot exact Run links, freshness/chain SHA equality, source-revision publication pointers, lifecycle/version, Audit/Outbox linkage, immutable/delete triggers and the production schema-admission fingerprint. Docker context is explicitly configurable or deterministically discovers one safe local Unix context; it rejects ambiguous/remote contexts and must not hard-code a developer-specific context, container, DSN host, user or database. During the required zero-Skip invocation, any missing Docker/image/context prerequisite fails rather than skips. It must use sanitized fixtures, never production data.
+Recovery test uses `recovery_container_test.go` to start two distinct digest-pinned PostgreSQL 18.4 instances，prove different `system_identifier` values/data checksums，and preprovision the exact four role graph plus database owner/CONNECT/TEMP and schema ACL fixture by name while role OIDs differ。CI applies `000001..000015` from the migration DSN only after `session_user=current_user=aiops_migrator`，using the SET-only edge so every user relation/function—including Audit/Outbox and predecessor parents—is owned by `aiops_schema_owner`；before dump，catalog plus `pg_restore --list` must prove the allowed archive owner set is exactly that role。Source uses `pg_dump --format=custom --role=aiops_schema_owner`；the clean precreated target database is already owned/ACL'd by IaC and restore first proves migrator session identity，then runs non-superuser `pg_restore --single-transaction --role=aiops_schema_owner` so archive schema/relation/function owner and ACL records are preserved。`--no-owner`、`--no-acl`、`--disable-triggers`、`--use-set-session-authorization`、superuser restore and ownership rewriting are forbidden；database-level ACL is verified from the preprovisioned fixture，not falsely attributed to a non-`--create` archive。Representative ten-table plus scoped Audit/Outbox data is restored，checksummed，then both schema and role admission must pass before FK/digest/lifecycle/immutability assertions；wrong role flag/membership、database/schema owner/ACL、object owner/ACL or TEMP grant must fail even when data hashes match。Docker context is explicitly configurable or safely discovered，rejects ambiguous/remote contexts，and never hard-codes a developer endpoint；required prerequisites fail rather than skip，using only sanitized fixtures.
 
 Run:
 
@@ -358,14 +375,14 @@ AIOPS_TEST_POSTGRES_DSN="$AIOPS_TEST_POSTGRES_DSN" \
 
 Expected: unit and PostgreSQL 18.4+ migration/recovery assertions all PASS with zero required-test skips. A missing `AIOPS_TEST_POSTGRES_DSN` is an unmet task prerequisite: the `test -n` command fails, this checkbox remains incomplete, and the task may not be committed. A diagnostic local invocation may report Skip, but Skip is never completion evidence.
 
-- [x] **Step 6: Wire and verify the integration target**
+- [ ] **Step 6: Wire and verify the integration target**
 
 Append `./internal/assetcatalog/postgres` to `make test-integration`. Legacy package fixtures must stop at their explicit owned migration cutoff；the full migration runner and Asset Catalog harness execute `000015` only inside a 128-bit randomized physical database created from the project-specific `aiops_test` control-database naming family, and may destructively clean up only a database whose creation they confirmed. Package serialization、`IF NOT EXISTS` and a shared destructive `public` schema are not substitutes for isolation.
 
 Run:
 
 ~~~bash
-gofmt -w internal/assetcatalog/postgres/*.go
+gofmt -w $(rg --files internal/assetcatalog/postgres -g '*.go')
 go test ./internal/assetcatalog/postgres -count=1
 test -n "$AIOPS_TEST_POSTGRES_DSN"
 make test-integration
@@ -373,102 +390,88 @@ make test-integration
 
 Expected: PASS with zero required-test skips；the integration target keeps cross-package parallelism so schema/physical-database isolation remains exercised.
 
-- [x] **Step 7: Commit**
+- [ ] **Step 7: Commit**
 
 ~~~bash
 git add migrations/000015_assets_catalog.up.sql migrations/000015_assets_catalog.down.sql \
   internal/assetcatalog/postgres internal/store/postgres/migrations_integration_test.go \
+  internal/store/postgres/database_role_admission.go \
+  internal/store/postgres/database_role_admission_test.go \
   internal/investigation/postgres/testpostgres_test.go \
   internal/investigation/postgres/correlation_create_integration_test.go \
   internal/investigation/postgres/latest_runtime_fixture_integration_test.go \
-  Makefile docs/superpowers docs/status/current.md
+  Makefile .github/workflows/ci.yml docs/operations/database-role-bootstrap.md
 git commit -m "fix(assetcatalog): close production asset schema invariants"
+~~~
+
+- [ ] **Step 8: Independently review and accept the corrective Asset Catalog contract**
+
+Task 2 preflight found that the original `enforce_asset_sources_mutation` body permanently hard-coded `KUBERNETES_OPERATOR/AWX_INVENTORY` as unavailable. The contract below is the corrective acceptance specification that reopened Steps 1–7 must implement and commit first。Step 8 owns no second implementation/Red cycle and may start only after every earlier checkbox and required Green evidence is complete；at the current status it is pending。An independent reviewer must reject acceptance if any item is absent before Task 2 Green work resumes.
+
+Independently inspect the implementation and Green static/PostgreSQL evidence proving:
+
+- `000015` defines exactly `public.asset_catalog_future_source_gate_admitted(candidate public.asset_sources) RETURNS boolean` as `LANGUAGE plpgsql STABLE SECURITY INVOKER`, defaults to `false` and fixes `search_path=pg_catalog, public, pg_temp`。`enforce_asset_sources_mutation` first applies every generic auto-fail-close normalization to the final `NEW` row，then delegates only future-source `VALIDATING|AVAILABLE|DEGRADED` admission with `asset_catalog_future_source_gate_admitted(NEW) IS NOT TRUE` instead of `NOT fn()`；an old live state must never make the hook reject an update whose normalized final destination is `UNAVAILABLE|SUSPENDED`。The existing deferred Source constraint trigger handles `TG_OP='INSERT'` separately：it reloads the exact current Source after revision/authority/typed facts exist, but before calling the hook requires that final row still be the exact initial `UNAVAILABLE` shape（version 2 after revision-1 CAS、one `DRAFT` revision 1、gate/checkpoint revision and version zero、all published/validated/run/checkpoint pointers and checkpoint material NULL）。It invokes the hook with that current composite，never the stale INSERT-time value。Thus Source+revision creation may commit by itself under an owned successor, but Source creation plus `VALIDATING`、publication or live admission in the same transaction always rolls back；a later new serializable transaction owns each next stage。A false/NULL result fails closed；initial future creation and all live/validation paths require `transaction_isolation='serializable'`。Updates that drive an existing Source to `UNAVAILABLE|SUSPENDED` remain legal fail-close destinations and never require a positive hook or serializable precondition;
+- the default implementation rejects initial creation as well as every attempt to validate or open either future Source, including profile substitution, revision/digest drift and direct SQL；therefore a pre-successor K8S/AWX draft cannot become undeletable legacy state。After an owned successor has admitted creation, an ineligible/live future Source can still always be driven to `SUSPENDED`/`UNAVAILABLE` without the hook blocking cleanup;
+- `000017` and `000019` may only `CREATE OR REPLACE` that exact signature, never copy or take ownership of the base Source/deferred trigger。Each successor adds an exact initial `UNAVAILABLE` creation branch for only its owned SourceKind, requiring same-transaction revision/authority and provider facts without pretending validation already succeeded；the Phase 1 INSERT closure—not a hook branch alone—enforces that the transaction ends at this creation boundary。Their down migrations refuse while any owned Provider Source exists and then restore the predecessor body;
+- the schema-admission manifest and dump/restore proof include the hook definition digest plus role-name/OID-portable owner/ACL semantics for every owned function：the ten owned relations resolve to one owner and every ordinary function owner equals it；`pg_catalog.aclexplode(COALESCE(proacl,pg_catalog.acldefault('f',proowner)))` resolves each known role name to the local OID and sorts semantic grantee label、privilege、grantability and multiplicity，while any unknown/unexpected grantee fails closed；body、owner、ACL、overload or search-path drift closes startup admission;
+- `asset_source_revision_authorities` is the immutable child truth for 1–100 Environment IDs，with composite Revision and Environment FKs、canonical ordinal and unique Environment/ordinal keys。A deferred closure trigger requires contiguous ordinals in canonical-text `C` order and an authority digest of exactly `N+2` frames：domain `asset-source-authority-scope.v1`、minimal-decimal `N`、then one present frame per lowercase canonical Environment UUID UTF-8 in `environment_id::text COLLATE "C"` order；`MANUAL/MANUAL_V1` requires exactly one row。Parent/child insert in one transaction succeeds；absent/cross-Scope/unsorted/duplicate/mismatched direct SQL fails at commit，and update/delete/truncate always fails。The exact four new trigger instances reuse existing callers and add no 36th routine：`asset_source_revision_authorities_immutable BEFORE UPDATE ROW→public.reject_asset_catalog_immutable()`、`asset_source_revision_authorities_delete_guard BEFORE DELETE ROW→public.reject_asset_catalog_delete()`、`asset_source_revision_authorities_truncate_guard BEFORE TRUNCATE STATEMENT→public.reject_asset_catalog_truncate()`、`asset_source_revision_authorities_deferred_state_guard CONSTRAINT AFTER INSERT ROW DEFERRABLE INITIALLY DEFERRED→public.validate_asset_source_revision_deferred_state()`；the last caller branches on `TG_TABLE_NAME` and reloads the parent Revision so a later transaction cannot append membership;
+- base `asset_source_revisions` adds nullable-pair `typed_extension_code/prepared_extension_digest` with exact code/SHA checks；the pair is immutable canonical content and BindingDigest frames 19/20 reload directly from it。Under the locked SourceKind set, `KUBERNETES_OPERATOR` requires both non-NULL and `typed_extension_code=profile_code`；every other kind, including all Phase 1 profiles、`MANUAL` and `AWX_INVENTORY`, requires both NULL。A later `000017` typed extension row must bind that exact non-NULL pair and cannot invent a second digest owner；changing this matrix requires an owned migration plus digest/admission updates;
+- `asset_catalog_framed_value_v1(candidate bytea) RETURNS bytea` remains the only SQL frame encoder：`NULL → 0x00`，present → `0x01 || int4send(octet_length(candidate)) || candidate`；it is `LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE SECURITY INVOKER` with fixed `search_path=pg_catalog, public, pg_temp`。The new pure `asset_catalog_source_revision_binding_digest(candidate public.asset_source_revisions) RETURNS text` uses that encoder and returns lowercase SHA-256 of the exact Task 2 20-frame BindingDigest；it is also `LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE SECURITY INVOKER` with that fixed path，is the 35th and final owned function, has no table read and cannot skip the two terminal NULL frames;
+- `asset_source_revisions` persists 1–16,384 UTF-8 RFC 8785 bytes in `canonical_profile_manifest` plus its SHA and the exact Provider-schema bytes/SHA。The deferred SQL closure parses the raw manifest as `json`（not duplicate-collapsing `jsonb`），requires exactly 26 rows/26 distinct closed keys and exact types，then inlines an explicit ASCII-key-order constructor using typed extraction、minimal-decimal integers、JSON-escaped token strings and C-sorted unique arrays；`convert_to(reconstructed,'UTF8')` must byte-equal the stored input。Thus whitespace、key-order、duplicate-key、NULL/type/unknown/oversize drift fails even when caller hashes are self-consistent。It recomputes both content hashes、authority digest、`source_definition_digest=SHA256(FramedTupleV1("asset-source-definition.v2",source_kind,provider_kind,profile_code,raw profile_manifest_sha256,raw provider_schema_sha256))` with six present frames/two decoded raw 32-byte hashes，and BindingDigest；SQL/Go/MANUAL/Victoria/AWX share that formula。Manifest/revision duplicate semantics must also match field-for-field：Source/Provider/Profile/sync、four rate/backpressure integers、typed-extension code and Integration/Credential/Trust/Network/schedule presence modes；mode `NONE` requires SQL NULL and required modes require a present valid reference/expression。For `MANUAL/MANUAL_V1` SQL additionally compares the exact 794-byte literal/SHA and all corresponding Revision fields，not code alone。Go performs the same strict decode/re-encode/parity and deep-clones both byte slices。Validation/publication、Source gate and every successor hook require installed Profile bytes/hash plus duplicate-field parity；late children or any byte/semantic/digest drift rolls back;
+- Credential/Trust/Network/Cross-Environment Policy references use exact `public.asset_catalog_opaque_reference_valid(candidate text) RETURNS boolean` rather than the general code grammar。It is `LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE SECURITY INVOKER` with fixed `search_path=pg_catalog, public, pg_temp` and accepts only `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`；this enforces a bounded single-line no-scheme/no-path lookup token and rejects URL、DSN、Vault path、PEM/Header syntax, but does not claim to recognize every secret-looking alphanumeric value。Authorization requires exact scoped registry resolution and purpose matching；raw Secret prevention remains an independent API/log/payload/scan invariant.
+
+The corrected migration owns the unordered exact set of 35 routine identities（catalog compares argument type OIDs/`regprocedure`，so `timestamptz` deparse spelling cannot create a false drift）：`public.asset_catalog_text_valid(text,integer)`、`public.asset_catalog_code_valid(text,integer)`、`public.asset_catalog_sha256_valid(text)`、`public.asset_catalog_provider_kind_valid(text)`、`public.asset_catalog_idempotency_key_valid(text)`、`public.asset_catalog_json_object_valid(bytea,integer,integer)`、`public.asset_catalog_labels_valid(jsonb)`、`public.asset_catalog_checkpoint_envelope_valid(bytea)`、`public.asset_catalog_field_provenance_valid(bytea)`、`public.asset_catalog_framed_value_v1(bytea)`、`public.asset_catalog_source_run_no_credential_digest(public.asset_source_runs)`、`public.asset_catalog_source_run_delay_intent_digest(public.asset_source_runs,text,timestamp with time zone)`、`public.asset_catalog_source_run_failure_override_digest(public.asset_source_runs,text)`、`public.asset_catalog_source_run_terminal_digest(public.asset_source_runs,text,text)`、`public.asset_catalog_opaque_reference_valid(text)`、`public.asset_catalog_future_source_gate_admitted(public.asset_sources)`、`public.asset_catalog_source_revision_binding_digest(public.asset_source_revisions)`、`public.validate_asset_management_audit_insert()`、`public.reject_asset_catalog_immutable()`、`public.reject_asset_catalog_delete()`、`public.reject_asset_catalog_truncate()`、`public.enforce_assets_transition()`、`public.enforce_asset_conflict_transition()`、`public.enforce_asset_catalog_edge_mutation()`、`public.enforce_asset_relationship_mutation()`、`public.validate_asset_relationship_page_closure()`、`public.enforce_asset_sources_mutation()`、`public.validate_asset_source_deferred_state()`、`public.enforce_asset_source_revision_transition()`、`public.validate_asset_source_revision_deferred_state()`、`public.enforce_asset_source_run_mutation()`、`public.validate_asset_source_run_page_closure()`、`public.validate_asset_source_run_terminal_closure()`、`public.enforce_asset_observation_admission()`、`public.validate_asset_observation_page_closure()`；there is no overload or 36th helper。The reviewed trigger manifest is exactly the existing 35 instances plus the four authority instances above，and freezes relation/name/timing/events/level/deferrability/caller identity and direct `pg_depend` binding；up/postflight/schema admission/down tests compare all 39 and explicitly drop every shared-surface trigger before callers。Down takes the exact 18-relation set（six prerequisites + Audit + Outbox + ten owned）in the one-shot `ACCESS EXCLUSIVE ... NOWAIT` statement above and passes the emptiness guard，restores shared surfaces，drops dependent triggers/callers，then explicitly drops the five cycle-breaking FKs `asset_sources_published_revision_fk`、`asset_sources_validated_run_fk`、`asset_sources_last_success_run_fk`、`asset_sources_last_complete_snapshot_run_fk`、`asset_source_revisions_validation_run_fk` before six composite helpers：`public.asset_catalog_source_run_terminal_digest(public.asset_source_runs,text,text)`、`public.asset_catalog_source_run_failure_override_digest(public.asset_source_runs,text)`、`public.asset_catalog_source_run_delay_intent_digest(public.asset_source_runs,text,timestamptz)`、`public.asset_catalog_source_run_no_credential_digest(public.asset_source_runs)` before Run，binding digest before Revision，future hook before Source。Exact table order is `service_asset_bindings→asset_relationships→asset_conflicts→asset_type_details→assets→asset_observations→asset_source_runs→asset_source_revision_authorities→asset_source_revisions→asset_sources`；only then is opaque validator unreferenced。No `CASCADE`；concurrent DML/DDL on any of 18 returns `55P03` before change，never waits after partial locks。
+
+Across `000015/000017/000019`, “function definition digest” has one byte contract：`SHA256(pg_catalog.convert_to(pg_catalog.pg_get_functiondef(oid),'UTF8'))` on PostgreSQL 18.4，with no normalization。Before every fingerprint/catalog-definition preflight or postflight、schema-admission、dump/restore or predecessor-restoration fingerprint query, the transaction executes `SET LOCAL quote_all_identifiers=off` and `SET LOCAL search_path=pg_catalog,pg_temp`；the read-only minimum-existence check may precede these GUCs。Inspected objects use explicit schema/OID；DDL uses explicit `public.` identities and `SET LOCAL search_path=pg_catalog,public,pg_temp`。Definition、owner、semantic ACL、overload count and `proconfig` are compared separately.
+
+Review only the owned `000015` hook/stage boundary、Profile/schema content hashes、authority/definition/binding closure、typed pair、opaque validator、down cleanup and reviewed manifest；future migration bodies remain in their own packages。Verify the reopened Steps 1–7 recorded the expected Red causes and that all Task 1 unit、PostgreSQL 18.4 TLS/race、online compatibility、dual-instance recovery、schema admission、integration、`go test ./...`、vet、build、diff and secret gates are Green with no required Skip。Only then update `docs/status/current.md` to accepted and check Step 8；any finding reopens its owning earlier step.
+
+~~~bash
+git add docs/status/current.md docs/superpowers/plans/2026-07-13-governed-operations/01-assets/01-schema-domain.md
+git commit -m "docs: accept corrected asset catalog contract"
 ~~~
 
 ### Task 2: Stable domain, validation, lifecycle, and downstream contracts
 
 **Files:**
+- Modify: **internal/authn/authenticator.go**
+- Modify: **internal/authn/authenticator_test.go**
+- Modify: **internal/authn/keycloak.go**
+- Modify: **internal/authn/keycloak_test.go**
 - Create: **internal/assetcatalog/types.go**
 - Create: **internal/assetcatalog/validation.go**
 - Create: **internal/assetcatalog/lifecycle.go**
 - Create: **internal/assetcatalog/repository.go**
 - Create: **internal/assetcatalog/lease_fence.go**
+- Create: **internal/leasefence/fence.go**
+- Create: **internal/leasefence/fence_test.go**
 - Create: **internal/assetcatalog/types_test.go**
+- Create: **internal/assetcatalog/mutation_context_architecture_test.go**
 - Create: **internal/assetcatalog/lifecycle_test.go**
 - Create: **internal/assetcatalog/lease_fence_test.go**
+- Create: **internal/assetcatalog/lease_fence_architecture_test.go**
+- Create: **internal/assetcatalog/postgres/binding_digest_parity_integration_test.go**
 
 **Interfaces:**
 - Produces the locked downstream contract:
 
 ~~~go
-type Scope struct {
-	TenantID      string
-	WorkspaceID   string
-	EnvironmentID string
-}
-type AssetLocator struct {
-	Scope   Scope
-	AssetID string
-}
-type Reader interface {
-	Get(context.Context, AssetLocator) (Asset, error)
-}
+type Scope struct { TenantID, WorkspaceID, EnvironmentID string }
+type SourceScope struct { TenantID, WorkspaceID string }
+type AssetLocator struct { Scope Scope; AssetID string }
+type ScopeResolver interface { ResolveScope(context.Context, string, string) (Scope, error) }
+type SourceScopeResolver interface { ResolveSourceScope(context.Context, string) (SourceScope, error) }
+type ConflictScopeResolver interface { ResolveConflictScope(context.Context, string, string) (Scope, error) }
+type Reader interface { Get(context.Context, AssetLocator) (Asset, error) }
 ~~~
 
 - `assets` keeps `UNIQUE (tenant_id,workspace_id,environment_id,id)` so 000016 may create a composite FK.
 - Domain consumes existing `domain.MappingStatus`; it does not duplicate that enum.
+- Domain consumes `authn.Principal.TenantID`; Task 2 therefore first adds the required fixed Keycloak claim `aiops_tenant_id` as one canonical lowercase UUID to `VerifiedClaims` and `Principal`. Missing/noncanonical Tenant is unauthenticated；Workspace/Environment claims cannot override it.
 
 - [ ] **Step 1: Write failing lifecycle, validation, and operability tests**
 
-~~~go
-func TestLifecycleAllowsOnlyReviewedTransitions(t *testing.T) {
-	allowed := map[Lifecycle][]Lifecycle{
-		LifecycleDiscovered:  {LifecycleActive, LifecycleQuarantined, LifecycleRetired},
-		LifecycleActive:      {LifecycleStale, LifecycleQuarantined, LifecycleRetired},
-		LifecycleStale:       {LifecycleActive, LifecycleQuarantined, LifecycleRetired},
-		LifecycleQuarantined: {LifecycleActive, LifecycleRetired},
-		LifecycleRetired:     {},
-	}
-	for from, destinations := range allowed {
-		for _, to := range allLifecycles() {
-			want := from == to || slices.Contains(destinations, to)
-			if CanTransition(from, to) != want {
-				t.Errorf("CanTransition(%s,%s) mismatch", from, to)
-			}
-		}
-	}
-}
-
-func TestLiveCapabilityRequiresEveryOrthogonalGate(t *testing.T) {
-	asset := validAsset()
-	asset.Lifecycle = LifecycleActive
-	asset.MappingStatus = domain.MappingExact
-	if !asset.LiveCapabilityEligible(true, true) {
-		t.Fatal("fully gated asset is ineligible")
-	}
-	if asset.LiveCapabilityEligible(false, true) || asset.LiveCapabilityEligible(true, false) {
-		t.Fatal("publication/capability gate was bypassed")
-	}
-}
-
-func TestSourceAvailabilityRequiresCurrentValidatedBinding(t *testing.T) {
-	source := validSource()
-	revision := validSourceRevision()
-	source.Status = SourceStatusActive
-	source.GateStatus = SourceGateAvailable
-	source.GateRevision = 7
-	source.PublishedRevision = revision.Revision
-	source.PublishedRevisionDigest = revision.CanonicalRevisionDigest
-	source.ValidatedBindingDigest = revision.BindingDigest()
-	if !source.Available(revision) {
-		t.Fatal("current validated source must be available")
-	}
-	revision.CredentialReferenceID = "cred-ref-rotated"
-	if source.Available(revision) {
-		t.Fatal("credential-reference drift bypassed source gate")
-	}
-}
-~~~
+Write executable table tests named `TestLifecycleAllowsOnlyReviewedTransitions`、`TestCatalogEligibilityIsOnlyTheLocalAssetProjection`、`TestSourceAvailabilityRequiresCurrentValidatedBinding` and `TestAuthenticatedPrincipalRequiresCanonicalTenantID`. They cover every lifecycle pair with no self-edge/terminal RETIRED；local eligibility only for `ACTIVE+EXACT`；one-field Source binding drift；and missing/uppercase/non-RFC4122 `aiops_tenant_id` rejection. Add exact Source-definition/authority/BindingDigest SQL-parity tests, `ManualProfileV1` immutable-clone/semantic tests, Source Revision authority-slice deep-clone tests, FieldOwnership unknown rejection, mutation-context zero/forgery/call-site、every cursor query-digest、read-constraint constructor/call-site、collection manual-admission、conflict-scope resolver shape and fence serialization/redaction/consume/race tables in the same Red commit.
 
 Run: `go test ./internal/assetcatalog -count=1`
 
@@ -478,62 +481,88 @@ Expected: FAIL because domain types/functions do not exist.
 
 `Kind` constants are exactly: SERVICE、LINUX_VM、WINDOWS_VM、BARE_METAL_HOST、KUBERNETES_CLUSTER、KUBERNETES_NAMESPACE、KUBERNETES_WORKLOAD、DATABASE_INSTANCE、DATABASE、METRICS_SOURCE、LOG_SOURCE、TRACE_SOURCE、AWX_INVENTORY、ARGO_APPLICATION、CI_PIPELINE、GIT_REPOSITORY、CLOUD_RESOURCE.
 
-`SourceKind`、`Lifecycle`、`Criticality`、`DataClassification`、`RelationshipType`、`RelationshipStatus`、`BindingRole`、`BindingStatus`、`Provenance` and `ConflictResolution` exactly match Task 1 vocabularies.
+`SourceKind`、`SourceStatus`、`SourceGateStatus`、`SourceRevisionStatus`、`SyncMode`、`RunKind`、`RunStatus`、`RunStage`、`TriggerType`、`WorkResultKind`、`WorkResultStatus`、`ValidationOutcome`、`CredentialCleanupStatus`、`FreshnessKind`、`Lifecycle`、`Criticality`、`DataClassification`、`RelationshipType`、`RelationshipStatus`、`BindingRole`、`BindingStatus`、`Provenance`、`ConflictStatus` and `ConflictResolution` exactly match Task 1 vocabularies.
 
 ~~~go
 type Asset struct {
-	ID                 string
-	Scope              Scope
-	SourceID           string
-	Kind               Kind
-	ProviderKind       string
-	ExternalID         string
-	DisplayName        string
-	Lifecycle          Lifecycle
-	MappingStatus      domain.MappingStatus
-	OwnerGroup         string
-	Criticality        Criticality
+	ID, SourceID, ProviderKind, ExternalID, DisplayName string
+	Scope Scope
+	Kind Kind
+	Lifecycle Lifecycle
+	MappingStatus domain.MappingStatus
+	OwnerGroup *string
+	Criticality Criticality
 	DataClassification DataClassification
-	Labels             map[string]string
-	LastObservationID  string
-	LastObservationChainSHA256 string
-	LastObservedAt     time.Time
-	LastSourceRevision int64
-	Version            int64
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	Labels map[string]string
+	LastObservationID, LastObservationChainSHA256 string
+	LastObservedAt time.Time
+	LastSourceRevision, Version int64
+	CreatedAt, UpdatedAt time.Time
 }
 
 type Relationship struct {
-	ID                              string
-	TenantID                        string
-	WorkspaceID                     string
-	SourceEnvironmentID             string
-	TargetEnvironmentID             string
-	SourceAssetID                    string
-	TargetAssetID                    string
-	Type                            RelationshipType
-	Provenance                      Provenance
-	ProvenanceSourceID              string
-	CrossEnvironmentPolicyReferenceID string
-	Status                          RelationshipStatus
-	Version                         int64
-	CreatedAt                       time.Time
-	UpdatedAt                       time.Time
+	ID, SourceID, CanonicalRevisionDigest, LastRunID string
+	SourceScope SourceScope
+	SourceRevision, LastPageSequence, AcceptedCheckpointVersion, RunFenceEpoch int64
+	RelationPageSHA256 string
+	SourceEnvironmentID, TargetEnvironmentID string
+	SourceAssetID, TargetAssetID, FromExternalID, ToExternalID string
+	Type RelationshipType
+	ProviderPathCode string
+	Confidence int
+	FreshnessKind FreshnessKind
+	FreshnessOrderTime *time.Time
+	FreshnessOrderSequence int64
+	ProviderVersionSHA256, RelationFactSHA256 string
+	Provenance Provenance
+	ProvenanceSourceID string
+	CrossEnvironmentPolicyReferenceID PolicyReferenceID
+	Status RelationshipStatus
+	Version int64
+	CreatedAt, UpdatedAt time.Time
+}
+
+type Conflict struct {
+	ID string
+	Scope Scope
+	AssetID, CandidateAssetID, CandidateServiceID string
+	SourceID, ObservationID, Type, FieldName string
+	ExistingValueSHA256, CandidateValueSHA256 string
+	Status ConflictStatus
+	Resolution ConflictResolution
+	ResolutionReasonCode, ResolvedBy string
+	ResolvedAt *time.Time
+	Version int64
+	CreatedAt, UpdatedAt time.Time
+}
+
+type ServiceAssetBinding struct {
+	ID, ServiceID, AssetID string
+	Scope Scope
+	Role BindingRole
+	MappingStatus domain.MappingStatus
+	Provenance Provenance
+	ProvenanceSourceID string
+	Status BindingStatus
+	Version int64
+	CreatedAt, UpdatedAt time.Time
 }
 
 func (asset Asset) Clone() Asset {
 	asset.Labels = maps.Clone(asset.Labels)
+	if asset.OwnerGroup != nil { value := *asset.OwnerGroup; asset.OwnerGroup = &value }
 	return asset
 }
 
-func (asset Asset) LiveCapabilityEligible(published, available bool) bool {
+func (asset Asset) CatalogEligible() bool {
 	return asset.Validate() == nil && asset.Lifecycle == LifecycleActive &&
-		asset.MappingStatus == domain.MappingExact && published && available
+		asset.MappingStatus == domain.MappingExact
 }
 ~~~
 
-Also define Source、SourceRun、Observation、Relationship、Conflict、ServiceAssetBinding; page/cursor/filter types; create/update/transition/source/sync/mapping/binding commands. Every write command carries Scope, actor, trace, Idempotency-Key and canonical request hash; updates/transitions/delete/decisions also carry expected version for CAS.
+Also define `SourceScope{TenantID,WorkspaceID}`、Source、the structurally safe SourceRun projection、Observation、the complete persisted Relationship above、Conflict、ServiceAssetBinding; page/cursor/filter types; and only the asset/mapping/binding commands owned by Tasks 2–5. Source mutation commands and `SourceRevisionRepository` are owned solely by Task 13；Task 2 must not create a reduced Source lifecycle or transaction callback.
+
+Domain commands are internal service/repository values, never JSON DTOs. They embed an opaque `MutationContext` whose fields are unexported. Its checked constructor requires an authenticated `authn.Principal`、a database-resolved Scope and server request metadata, verifies Tenant/actor/auth time consistency and canonical request hash shape, and is restricted by an AST call-site test to Task 6 management plus `_test.go` fixtures；production handlers can pass only strict request DTOs to management. Tenant comes only from the verified Principal；Workspace/Environment/Service come from the complete trusted route plus composite database resolution；actor/subject/authentication time and Trace ID are server-injected；Idempotency-Key comes only from the validated header；request hash is server-computed over canonical typed input plus route Scope. Repository rejects a zero context, re-resolves Scope and rechecks current state before returning an idempotent replay, and CAS versions come from validated `If-Match`. Tests must reject a transport DTO that can set any of those trusted fields and must prove Repository replay cannot bypass the authorization/state check.
 
 The source-facing model is exact and secret-free:
 
@@ -549,63 +578,155 @@ const (
 )
 
 type Source struct {
-	ID                        string
-	TenantID                  string
-	WorkspaceID               string
-	Kind                      SourceKind
-	ProviderKind              string
-	Status                    SourceStatus
-	PublishedRevision         int64
-	PublishedRevisionDigest   string
-	GateStatus                SourceGateStatus
-	GateReasonCode            string
-	GateRevision              int64
-	ValidatedRunID            string
-	ValidationDigest          string
-	ValidatedBindingDigest    string
-	CheckpointSHA256          string
-	CheckpointVersion         int64
-	CheckpointSourceRevision  int64
-	LastSuccessRunID          string
-	LastSuccessAt             *time.Time
+	ID, TenantID, WorkspaceID, ProviderKind, Name string
+	Kind SourceKind
+	Status SourceStatus
+	PublishedRevision int64
+	PublishedRevisionDigest string
+	GateStatus SourceGateStatus
+	GateReasonCode string
+	GateRevision int64
+	ValidatedRunID, ValidationDigest, ValidatedBindingDigest string
+	CheckpointSHA256 string
+	CheckpointVersion, CheckpointSourceRevision int64
+	NextAllowedAt *time.Time
+	ConsecutiveFailures int
+	LastSuccessRunID string
+	LastSuccessAt *time.Time
 	LastCompleteSnapshotRunID string
-	LastCompleteSnapshotAt    *time.Time
-	Version                   int64
+	LastCompleteSnapshotAt *time.Time
+	Version int64
+	CreatedAt, UpdatedAt time.Time
 }
 
 type SourceRevision struct {
-	SourceID                 string
-	TenantID                 string
-	WorkspaceID              string
-	Revision                 int64
-	Status                   SourceRevisionStatus
-	SourceDefinitionDigest   string
-	CanonicalRevisionDigest  string
-	IntegrationID            string
-	SyncMode                 SyncMode
-	CredentialReferenceID    string
-	TrustReferenceID         string
-	NetworkPolicyReferenceID string
-	AuthorityScopeDigest     string
-	RateLimitRequests        int64
-	RateLimitWindowSeconds   int64
-	BackpressureBaseSeconds  int64
-	BackpressureMaxSeconds   int64
-	ProfileCode              string
-	ScheduleExpression       string
-	ValidationRunID          string
-	ValidationDigest         string
+	ID, SourceID, TenantID, WorkspaceID string
+	Revision int64
+	Status SourceRevisionStatus
+	CanonicalProfileManifest []byte
+	CanonicalProviderSchema []byte
+	ProfileManifestSHA256, CanonicalProviderSchemaSHA256 string
+	SourceDefinitionDigest, CanonicalRevisionDigest, IntegrationID string
+	SyncMode SyncMode
+	CredentialReferenceID CredentialReferenceID
+	TrustReferenceID TrustReferenceID
+	NetworkPolicyReferenceID NetworkPolicyReferenceID
+	AuthorityEnvironmentIDs []string
+	AuthorityScopeDigest string
+	RateLimitRequests, RateLimitWindowSeconds int64
+	BackpressureBaseSeconds, BackpressureMaxSeconds int64
+	ProfileCode ProfileCode
+	ScheduleExpression string
+	TypedExtensionCode ExtensionCode
+	PreparedExtensionDigest, ValidationRunID, ValidationDigest string
+	CreatedBy, ChangeReasonCode string
+	ExpectedSourceVersion, Version int64
+	CreatedAt, UpdatedAt time.Time
 }
 
+type EnvironmentMappingMode string
+const (
+	EnvironmentMappingSingle EnvironmentMappingMode = "SINGLE_ENVIRONMENT"
+	EnvironmentMappingExplicitItem EnvironmentMappingMode = "EXPLICIT_ITEM_ENVIRONMENT"
+)
+type BuiltinSourceProfile struct {
+	SourceKind SourceKind; ProviderKind string; ProfileCode ProfileCode
+	SyncMode SyncMode; FreshnessKind FreshnessKind; EnvironmentMapping EnvironmentMappingMode
+	IntegrationMode, CredentialPurpose, TrustMode, NetworkMode, ScheduleMode string
+	ParserCode, CompatibilityClass, DLPPolicyCode string
+	MaxPageItems, MaxPageRelations, MaxPageBytes, MaxDocumentBytes int64
+	TrustedPathCodes []string; RelationshipTypes []RelationshipType
+	CanonicalProfileManifest, CanonicalProviderSchema []byte
+	ProfileManifestSHA256, CanonicalProviderSchemaSHA256 string
+	IntegrationID string; CredentialReferenceID CredentialReferenceID; TrustReferenceID TrustReferenceID; NetworkPolicyReferenceID NetworkPolicyReferenceID
+	RateLimitRequests, RateLimitWindowSeconds, BackpressureBaseSeconds, BackpressureMaxSeconds int64
+	ScheduleExpression string; TypedExtensionCode ExtensionCode; PreparedExtensionDigest string
+}
+func ManualProfileV1() BuiltinSourceProfile
+type SourceProfileAdmissionResolver interface { ResolveProfileAdmission(context.Context, ProfileCode) (BuiltinSourceProfile, error) }
+func NewBuiltinSourceProfileAdmissionResolver() SourceProfileAdmissionResolver
+
+type Observation struct {
+	ID, SourceID, RunID, ProviderKind, ExternalID string
+	Scope Scope
+	SourceRevision int64
+	CanonicalRevisionDigest, SourceDefinitionDigest string
+	ObservedAt time.Time
+	FreshnessKind FreshnessKind
+	FreshnessOrderTime *time.Time
+	FreshnessOrderSequence int64
+	ProviderVersionSHA256, ProviderFactSHA256, FingerprintSHA256 string
+	ProviderProvenanceSHA256 string
+	PreviousObservationID, PreviousChainSHA256, ObservationChainSHA256 string
+	AcceptedCheckpointVersion int64
+	RunFenceEpoch, RunPageSequence int64
+	SchemaVersion string
+	NormalizedDocument, FieldProvenance []byte
+	DocumentSHA256, FieldProvenanceSHA256 string
+	Tombstone bool
+	TombstoneReasonCode string
+	CreatedAt time.Time
+}
+
+type SourceRun struct {
+	ID, SourceID string
+	Scope SourceScope
+	SourceRevision int64
+	SourceRevisionDigest string
+	Kind RunKind
+	Status RunStatus
+	Stage RunStage
+	StageChangedAt time.Time
+	TriggerType TriggerType
+	GateRevision, PageSequence int64
+	PageDigest string
+	RelationPageSequence int64
+	RelationPageDigest, CursorBeforeSHA256, CursorAfterSHA256 string
+	CheckpointVersion int64
+	NotBefore time.Time
+	LeaseExpiresAt *time.Time
+	FenceEpoch, HeartbeatSequence int64
+	FinalPage, CompleteSnapshot bool
+	EffectiveCompleteSnapshot bool
+	WorkResultKind WorkResultKind
+	WorkResultStatus WorkResultStatus
+	WorkResultDigest string
+	WorkResultRecordedAt *time.Time
+	ValidationOutcome ValidationOutcome
+	ValidationProofDigest string
+	CredentialCleanupStatus CredentialCleanupStatus
+	Observed, Created, Changed, Unchanged, Conflicts int64
+	Missing, Stale, Restored, Tombstoned, Rejected int64
+	FailureCode, TraceID string
+	Version int64
+	CreatedAt time.Time
+	StartedAt, HeartbeatAt, CompletedAt *time.Time
+}
+
+func AuthorityScopeDigest(environmentIDs []string) (string, error)
+func ProfileManifestDigest(canonicalManifest []byte) (string, error)
+func SourceDefinitionDigest(source Source, revision SourceRevision) (string, error)
 func (revision SourceRevision) BindingDigest() string
-func (source Source) Available(revision SourceRevision) bool
+func (source Source) PublishedBindingEligible(revision SourceRevision) bool
 ~~~
 
-`BindingDigest` hashes canonical Tenant/Workspace, stable source identity, revision, definition digest, Integration/sync mode, opaque Credential/Trust/Network references, authority scope, all rate/backpressure/profile fields and schedule; it never hashes secret values or runtime endpoint text. Validation requires `revision.BindingDigest() == revision.CanonicalRevisionDigest`. `Available` requires `ACTIVE + AVAILABLE`, a positive gate revision, the exact `PUBLISHED` revision/digest, a successful validated run, non-empty validation digest and `source.ValidatedBindingDigest == revision.CanonicalRevisionDigest`. `SourceRun` adds exact Source definition revision/canonical digest, `RunKind`, stable `Stage`, gate revision, `PageSequence`, `PageDigest`, `NotBefore`, `LeaseExpiresAt`, `FenceEpoch`, `HeartbeatSequence`, checkpoint hashes, typed work-result summary and the exact persisted count set; public clones omit lease token hash, checkpoint ciphertext, cleanup attempt ID/digest and provider runtime material.
+`ManualProfileV1()` is the Task 2-owned immutable read-only bootstrap contract required before Task 13 exists：`MANUAL/MANUAL_V1/MANUAL_V1`、`MANUAL` sync、`CATALOG_SEQUENCE` freshness、`SINGLE_ENVIRONMENT`、rate/window/backpressure values `1/1/1/1`、page item/relation/bytes/document limits `1/0/65536/65536`，and NULL Integration/Credential/Trust/Network/schedule/typed-extension fields。Its 62-byte Provider schema is `{"additionalProperties":false,"properties":{},"type":"object"}` with SHA `99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa`。The definition is exactly `FramedTupleV1("asset-source-definition.v2",source_kind,provider_kind,profile_code,raw_profile_manifest_sha256,raw_provider_schema_sha256)` in that six-frame order；SQL and Go decode both named hashes to raw 32-byte frames and byte-match the MANUAL/Victoria/AWX fixtures。For MANUAL its framed length is 144 and SHA is `7a0c248c3ebd32dae4e94b516d6f56608d4f1a25cd33d0fe467b54200824984c`。The constructor returns deep clones；digest helpers recompute from bytes and no helper accepts precomputed caller truth。
 
-Later phases may add a typed Source profile only through the Phase 1 `TypedSourceExtensionRegistry`. The Source Revision Repository calls the registered extension's `ValidateAndDigestInTx(ctx,restrictedTx,draft)` inside its own serializable transaction；`restrictedTx` is a sealed repository-owned capability exposing only scoped `Exec/Query/QueryRow`, never commit/rollback/begin/copy/raw connection. The returned immutable `PreparedExtension` supplies `Digest()` before the base digest/row is sealed, then `CreateInTx(ctx,restrictedTx,baseRevision)` persists the exact 1:1 extension after the base insert and before the outer Repository alone commits. Failure or digest mismatch rolls back both rows. There is no later phase-owned Publish/status lifecycle、post-commit extension write or second transaction, and an adversarial architecture/integration test proves Phase 3/5 extensions cannot escape transaction ownership or mutate base/audit tables.
+Profile manifest v1 has exactly these RFC 8785 keys and no others：`version/source_kind/provider_kind/profile_code/sync_mode/freshness_kind/environment_mapping_mode/integration_mode/credential_purpose/trust_mode/network_mode/rate_limit_requests/rate_limit_window_seconds/backpressure_base_seconds/backpressure_max_seconds/schedule_mode/max_page_items/max_page_relations/max_page_bytes/max_document_bytes/parser_code/compatibility_class/dlp_policy_code/trusted_path_codes/relationship_types/typed_extension_code`。Codes are bounded canonical enums/tokens，integers are bounded nonnegative/positive as appropriate，arrays are unique `C`-sorted，extension is string-or-NULL；no reference value、endpoint、secret or runtime locator is legal。The exact `MANUAL_V1` bytes are `{"backpressure_base_seconds":1,"backpressure_max_seconds":1,"compatibility_class":"MANUAL_V1","credential_purpose":"NONE","dlp_policy_code":"ASSET_SAFE_V1","environment_mapping_mode":"SINGLE_ENVIRONMENT","freshness_kind":"CATALOG_SEQUENCE","integration_mode":"NONE","max_document_bytes":65536,"max_page_bytes":65536,"max_page_items":1,"max_page_relations":0,"network_mode":"NONE","parser_code":"MANUAL_ASSET_V1","profile_code":"MANUAL_V1","provider_kind":"MANUAL_V1","rate_limit_requests":1,"rate_limit_window_seconds":1,"relationship_types":[],"schedule_mode":"NONE","source_kind":"MANUAL","sync_mode":"MANUAL","trust_mode":"NONE","trusted_path_codes":["MANUAL_V1_DISPLAY_NAME","MANUAL_V1_EXTERNAL_ID","MANUAL_V1_KIND"],"typed_extension_code":null,"version":"asset-source-profile-manifest.v1"}`（794 bytes，SHA-256 `57d171caef88e859700dde32fda6b9a982b25b50deca47c6246945c8dfb60b96`）。The built-in resolver serves only this profile；Task 13 extends the same interface。Every repository/admission path compares resolver bytes/hash to the persisted Revision before using freshness、mapping、path、purpose or limits；same-code drift is fatal.
 
-`LeaseFence` is a non-serializable process-local value with unexported shared state containing exact Run ID、owner、epoch and a 32-byte raw token. Its only two named production construction paths are PostgreSQL Queue claim/reclaim and PostgreSQL `ManualRunExecutor` (restricted to `MANUAL_V1` synchronous VALIDATION/MANUAL_MUTATION); there is no generic exported raw-token factory, and an architecture test rejects any other call site. Copies share the same state so terminal `Destroy` zeroes the token for every copy; `MarshalJSON`/`MarshalText` fail, `String`/`GoString` return only `[REDACTED_LEASE_FENCE]`, and no accessor returns the token or token hash. It exposes only a constant-time `Matches(runID,owner,epoch,persistedTokenSHA256)` predicate used after the PostgreSQL Repository has locked the Run. A zero/destroyed fence never matches. `Complete/Fail` commands separately carry safe Run ID、terminal status/intent/work-result digest、cleanup status/digest and optional terminal-failure-override digest. Repository computes `terminal_command_sha256 = SHA256(FramedTupleV1("asset-run-terminal.v1",run_id,terminal_status,work_result_kind,work_result_digest,cleanup_status,cleanup_digest,terminal_failure_override-or-NULL,terminal_failure_override_digest-or-NULL,failure_code-or-NULL))`. Their transaction first checks immutable `ASSET_SOURCE_RUN/TERMINAL_COMMITTED` audit receipt `request_id="source-terminal:<run_uuid>"` and exact `payload_hash=terminal_command_sha256`；a matching replay is read-only and returns before fence admission, while any changed tuple hits the same request ID with a different hash and is rejected. Only the first terminal mutation requires `Matches` and writes the receipt before commit/`Destroy`, so response-loss replay remains implementable without reviving a destroyed fence. This type is a misuse barrier, not an authorization source：every new open/use/Provider-call/heartbeat/page/terminal transaction revalidates persisted facts according to Run kind. Validation checks its exact revision/gate/lease plus its own empty checkpoint shape and never reads/compares the published Source checkpoint；data Runs additionally revalidate the exact Source checkpoint.
+`BindingDigest` is the lowercase SHA-256 of exactly 20 `FramedTupleV1` frames in this immutable order: domain `asset-source-revision-binding.v1`, Tenant ID, Workspace ID, Source ID, minimal-decimal revision, 32 raw bytes of `source_definition_digest`, Integration ID-or-NULL, sync mode, Credential Reference-or-NULL, Trust Reference-or-NULL, Network Policy Reference-or-NULL, 32 raw bytes of `authority_scope_digest`, minimal-decimal rate requests/window seconds/backpressure base seconds/backpressure max seconds, Profile Code, schedule-or-NULL, typed-extension-code-or-NULL, and 32 raw bytes prepared-extension-digest-or-NULL. The final two frames are present as `NULL` even for no-extension/MANUAL revisions and may never be appended later under `.v1`; code/digest must be both NULL or both present. In Go, each optional Integration/reference/schedule/extension named-string zero value is the sole SQL-NULL representation；present-empty is invalid and cannot be constructed as a second semantic value. UUID/enum/opaque tokens use canonical UTF-8, integers have no sign/leading zero, and named digests are decoded raw bytes rather than 64-byte hex text. `source_definition_digest` remains the Provider/Profile definition only；it includes exact persisted Profile-manifest/schema hashes but never source-specific binding or typed extension. Status、validation、version、actor and timestamps are deliberately excluded.
+
+The golden present fixture uses Tenant `11111111-1111-4111-8111-111111111111`、Workspace `22222222-2222-4222-8222-222222222222`、Source `33333333-3333-4333-8333-333333333333`、revision `7`、definition bytes `0x11×32`、Integration `44444444-4444-4444-8444-444444444444`、`SCHEDULED`、references `cred-ref-v1/trust-ref-v1/network-ref-v1`、authority bytes `0x22×32`、limits `100/60/5/300`、Profile and extension code `VICTORIAMETRICS_OPERATOR_V1`、schedule `0 */5 * * * *` and extension bytes `0x33×32`; framed length is `495` and SHA-256 is `49f8013b8e3cccdcbeb1d125915b2bf424815306494318ee2d3b7e298f3f6b74`. The all-NULL-optional MANUAL fixture reuses those three IDs, sets revision `1`、definition bytes `0xaa×32`、Integration/three references/schedule/extension code/extension digest all NULL、sync `MANUAL`、authority bytes `0xbb×32`、limits `1/1/1/1` and Profile `MANUAL_V1`; its 20-frame length is `296` and SHA-256 is `88965ba68eb1d6450b1252a0a261bfaa282556e0ec569b6db2c0153d235912b5`. Unit tests distinguish NULL from present-empty, mutate every included field, prove excluded lifecycle fields do not change the digest and fuzz boundary collisions；`internal/assetcatalog/postgres/binding_digest_parity_integration_test.go` sends the exact 20 frames to real PostgreSQL 18.4 `asset_catalog_framed_value_v1` and byte-compares both Go fixtures.
+
+Opaque Credential/Trust/Network/Policy references are distinct named value types with the same dedicated no-scheme/no-path grammar enforced by Task 1；they are only registry lookup IDs. String validity never proves the referenced object exists：the owning service must resolve the exact scoped registry fact and purpose before use.
+
+Validation requires `revision.BindingDigest() == revision.CanonicalRevisionDigest`. `PublishedBindingEligible` is deliberately non-authoritative and proves only the already-loaded Source/Revision row closure: `ACTIVE + AVAILABLE`, positive gate revision, exact `PUBLISHED` revision/digest, successful validated run, non-empty validation digest and exact binding digest. A Source enum is never evidence that a Provider/Profile is installed. Every production admission must reload the exact scoped Source/Revision plus installed Profile/Adapter and all required Connection/Runtime/Capability facts；future K8S/AWX stay unavailable until their owned successor hook and evidence pass. No domain method accepts caller-supplied `published`/`available` booleans or claims full live-capability authorization.
+
+`SourceRun` uses typed `RunKind/RunStatus/RunStage/TriggerType/FreshnessKind` enums and carries exact Source definition revision/canonical digest, gate revision, page/checkpoint hashes, page sequence, safe timing/fence epoch/heartbeat coordinates, typed work-result summary, validation proof digest, cleanup status, stable failure code/trace and the exact persisted counts. Its structure—not a serializer omit-tag—excludes lease owner/token hash, checkpoint ciphertext/key ID, cleanup attempt ID/epoch/digests, terminal private digests and Provider runtime material. Observation and every page/cursor/filter clone likewise deep-copy all byte slices、maps、slices、pointers and nested results.
+
+Task 13 solely owns the typed Source extension transaction contract. It must expose no SQL string、variadic arguments、`pgx.Tx/Rows/Row/Conn`、Begin/Commit/Rollback/Copy or raw connection. A repository-created shared-state session offers only closed scoped trusted-fact lookup, read-own-extension and create-own-extension operations；its `VALIDATING → CREATING → VERIFIED → CLOSED` state prevents writes during validation, new reads after base sealing, more than one extension write or use after the outer serializable transaction. Exact fixed stored-procedure manifests bind signature、owner、ACL、search path and definition digest；extension roles have only their own 1:1 table rights. Failure/digest mismatch rolls back base、extension、audit and outbox together. Task 2 defines none of these mutation interfaces.
+
+`LeaseFence` is a non-serializable process-local value whose root `assetcatalog` type is an alias of `internal/leasefence.Fence`. Its unexported shared state binds exact Run ID、owner、epoch and one 32-byte raw token. The internal package exposes only the two purpose-named constructors `FromManualRun` and `FromQueueClaim`; there is no `New/FromRaw/Token/Bytes/Hash` factory or accessor. An AST/import architecture test allows production constructor calls only in `internal/assetcatalog/postgres/manual_run.go` and `internal/discoveryqueue/postgres/repository.go`, with the latter introduced by Task 27. Both constructors consume a `*[32]byte` and clear the caller buffer on success and every error. Copies share one mutex-protected state, so `Destroy` zeroes coordinates/token and invalidates every copy under race. JSON/Text/Binary marshal/unmarshal fail；`String`/`GoString`/`Format`/`LogValue` return only `[REDACTED_LEASE_FENCE]`. `Matches` locks state, decodes the persisted lowercase SHA-256 and uses constant-time comparison after the Repository locked the Run；zero/destroyed/forged coordinates never match. The type is only a misuse barrier：every transaction still reloads persisted authorization/gate/checkpoint facts. Task 27 owns terminal-command construction plus Go↔SQL digest parity and receipt-first response-loss replay; Task 2 must not create an incomplete public terminal constructor.
 
 Asset list sorting is a closed enum, not arbitrary SQL:
 
@@ -618,18 +739,26 @@ const (
 )
 
 type AssetCursor struct {
-	Sort    AssetSort
-	Value   string
-	AssetID string
+	Sort        AssetSort
+	QueryDigest string
+	Value       string
+	AssetID     string
 }
 ~~~
 
-`ListAssetsRequest` carries one of those sorts, limit 1–100, filters and optional matching cursor. A cursor whose sort differs from the request is invalid.
+`ListAssetsRequest` carries one of those sorts, limit 1–100, filters and optional matching cursor. It computes a canonical query digest over exact Scope、normalized filter set and sort；a cursor whose sort or query digest differs is invalid. Task 7 signs the full cursor payload. Cursor values cannot change filters/Scope during traversal.
 
 - [ ] **Step 3: Implement exhaustive bounded validation**
 
 ~~~go
-var safeToken = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$`)
+type CredentialReferenceID string
+type TrustReferenceID string
+type NetworkPolicyReferenceID string
+type PolicyReferenceID string
+type ProfileCode string
+type ExtensionCode string
+
+var opaqueReference = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 var providerToken = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 var labelKey = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 var lowercaseRFC4122UUID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
@@ -645,67 +774,125 @@ func validUUID(value string) bool {
 }
 ~~~
 
-Validation must use exhaustive switches (no default acceptance), enforce non-zero UTC microsecond time, versions >0, at most 64 labels/max 16 KiB UTF-8 serialization, trimmed strings, no NUL/CR/LF, and reject label keys containing normalized secret/token/password/credential/dsn/endpoint. New IDs use `internal/ids.NewUUID`; Clone all maps/slices at boundaries.
+Validation must use exhaustive switches (no default acceptance), including the exact `SOURCE|GOVERNANCE|MERGE_DECISION` FieldOwnership set, and enforce non-zero finite UTC times with no monotonic component、microsecond precision and a bounded year, versions >0, at most 64 labels/max 16 KiB UTF-8 serialization, trimmed strings, no NUL/CR/LF, and reject label keys containing normalized secret/token/password/credential/dsn/endpoint. The Keycloak verifier maps only the fixed `aiops_tenant_id` string claim, and the Authenticator requires it to pass the same canonical UUID validator before constructing Principal；there is no query/body/configurable alternate tenant claim. New IDs use `internal/ids.NewUUID`; Clone all maps/slices/bytes/pointers/pages/cursors and nested mutation results at boundaries. `IsLifecycleEdge` rejects self-edges and is only the structural graph；receipt-first replay handles idempotency, and management/policy decides which edge is currently authorized. `RETIRED` has no outgoing edge；Task 3 exposes only quarantine/retire while ACTIVE waits for later trusted closure.
 
 Stable errors: `ErrInvalidRequest`、`ErrNotFound`、`ErrScopeViolation`、`ErrVersionConflict`、`ErrStateConflict`、`ErrIdempotency`. They contain no database/provider text.
 
 - [ ] **Step 4: Define repository groups without import cycles**
 
 ~~~go
-type Repository interface {
-	Reader
-	ScopeResolver
-	List(context.Context, ListAssetsRequest) (AssetPage, error)
-	Create(context.Context, CreateAssetCommand) (AssetMutationResult, error)
-	UpdateGovernance(context.Context, UpdateGovernanceCommand) (AssetMutationResult, error)
-	Transition(context.Context, TransitionCommand) (AssetMutationResult, error)
-}
+type MutationMetadata struct { TraceID, IdempotencyKey, RequestHash string }
+type MutationContext struct { scopeKind uint8; sourceScope SourceScope; environmentID, actorID, subjectID string; authenticatedAt time.Time; traceID, idempotencyKey, requestHash string }
+func NewMutationContext(authn.Principal, Scope, MutationMetadata) (MutationContext, error)
+func NewSourceMutationContext(authn.Principal, SourceScope, MutationMetadata) (MutationContext, error)
+func (MutationContext) Validate() error
+func (MutationContext) SourceScope() SourceScope
+func (MutationContext) EnvironmentScope() (Scope, bool)
+func (MutationContext) ActorID() string; func (MutationContext) SubjectID() string
+func (MutationContext) AuthenticatedAt() time.Time; func (MutationContext) TraceID() string
+func (MutationContext) IdempotencyKey() string; func (MutationContext) RequestHash() string
 
-type MutationReceipt struct {
-	AuditID         string
-	TraceID         string
-	IdempotentReplay bool
-}
+type AssetReadConstraint struct { initialized, unrestricted bool; serviceIDs []string }
+type SourceReadConstraint struct { initialized bool; environmentIDs []string }
+func NewAssetReadConstraint(bool, []string) (AssetReadConstraint, error)
+func NewSourceReadConstraint([]string) (SourceReadConstraint, error)
+func (AssetReadConstraint) Validate() error; func (AssetReadConstraint) Unrestricted() bool; func (AssetReadConstraint) ServiceIDs() []string
+func (SourceReadConstraint) Validate() error; func (SourceReadConstraint) EnvironmentIDs() []string
 
-type AssetMutationResult struct {
-	Asset   Asset
-	Receipt MutationReceipt
-}
+type AssetFilter struct { Search, ServiceID string; Kinds []Kind; SourceIDs []string; Lifecycles []Lifecycle; MappingStatuses []domain.MappingStatus; Criticalities []Criticality; DataClassifications []DataClassification }
+type ListAssetsRequest struct { Scope Scope; Filter AssetFilter; Access AssetReadConstraint; Sort AssetSort; Limit int; Cursor *AssetCursor }
+type CreateAssetCommand struct { Context MutationContext; SourceID string; Kind Kind; ExternalID, DisplayName string; OwnerGroup *string; Criticality Criticality; DataClassification DataClassification; Labels map[string]string }
+type UpdateGovernanceCommand struct { Context MutationContext; AssetID, DisplayName string; OwnerGroup *string; Criticality Criticality; DataClassification DataClassification; Labels map[string]string; ExpectedVersion int64 }
+type TransitionCommand struct { Context MutationContext; AssetID string; To Lifecycle; ReasonCode string; ExpectedVersion int64 }
 
-type BindingMutationResult struct {
-	Binding ServiceAssetBinding
-	Receipt MutationReceipt
-}
+type AssetSourceReference struct { ID, Name string; Kind SourceKind }
+type AssetServiceReference struct { ID, Name string; Role BindingRole }
+type OperationalSummaryStatus string
+const OperationalSummaryNotConfigured OperationalSummaryStatus = "NOT_CONFIGURED"
+type ConnectionSummary struct { Status OperationalSummaryStatus }
+type CapabilitySummary struct { Status OperationalSummaryStatus; Count int64 }
+type FieldOwnership string
+const (
+	FieldOwnershipSource FieldOwnership = "SOURCE"
+	FieldOwnershipGovernance FieldOwnership = "GOVERNANCE"
+	FieldOwnershipMergeDecision FieldOwnership = "MERGE_DECISION"
+)
+type FieldProvenanceSummary struct { FieldCode, SourceID, ProviderKind string; SourceRevision int64; ObservedAt time.Time; ProviderPathCode string; Confidence int; Ownership FieldOwnership }
+type AssetRelationCounts struct { Incoming, Outgoing int64 }
+type AssetReadModel struct { Asset; Source AssetSourceReference; Services []AssetServiceReference; Connection ConnectionSummary; Capability CapabilitySummary }
+type AssetDetailReadModel struct { AssetReadModel; FieldProvenance []FieldProvenanceSummary; Relations AssetRelationCounts }
+type AssetPage struct { Items []AssetReadModel; Next *AssetCursor; ManualCreateEligible bool }
 
-type MappingRepository interface {
-	ListRelationships(context.Context, ListRelationshipsRequest) (RelationshipPage, error)
-	ListBindings(context.Context, ListBindingsRequest) (BindingPage, error)
-	CreateBinding(context.Context, CreateBindingCommand) (BindingMutationResult, error)
-	DeleteBinding(context.Context, DeleteBindingCommand) (MutationReceipt, error)
-	ListConflicts(context.Context, ListConflictsRequest) (ConflictPage, error)
-	ResolveConflict(context.Context, MappingDecision) (MappingDecisionResult, error)
-}
+type RelationshipCursor struct { QueryDigest string; Type RelationshipType; SourceAssetID, TargetAssetID, RelationshipID string }
+type ListRelationshipsRequest struct { Scope Scope; Access AssetReadConstraint; AssetID, SourceID string; Types []RelationshipType; Statuses []RelationshipStatus; Limit int; Cursor *RelationshipCursor }
+type RelationshipPage struct { Items []Relationship; Next *RelationshipCursor }
+type BindingCursor struct { QueryDigest, ServiceID, AssetID, BindingID string; Role BindingRole }
+type ListBindingsRequest struct { Scope Scope; Access AssetReadConstraint; ServiceID, AssetID string; Roles []BindingRole; Statuses []BindingStatus; Limit int; Cursor *BindingCursor }
+type BindingPage struct { Items []ServiceAssetBinding; Next *BindingCursor }
+type CreateBindingCommand struct { Context MutationContext; ServiceID, AssetID string; Role BindingRole; ReasonCode string }
+type DeleteBindingCommand struct { Context MutationContext; BindingID, ReasonCode string; ExpectedVersion int64 }
 
-type MappingDecisionResult struct {
-	Conflict Conflict
-	Binding  *ServiceAssetBinding
-	Receipt  MutationReceipt
-}
+type ConflictObservationReference struct { ID, SourceID string; SourceRevision int64; ObservedAt time.Time }
+type ConflictAssetReference struct { ID, DisplayName string; Kind Kind; Lifecycle Lifecycle }
+type ConflictServiceReference struct { ID, Name string }
+type ConflictImpactCounts struct { AssetActiveBindings, AssetActiveRelationships, CandidateAssetActiveBindings, CandidateAssetActiveRelationships, CandidateServiceActiveBindings int64 }
+type ConflictReadModel struct { Conflict; Observation ConflictObservationReference; Asset ConflictAssetReference; CandidateAsset *ConflictAssetReference; CandidateService *ConflictServiceReference; Impact ConflictImpactCounts }
+type ConflictCursor struct { QueryDigest string; CreatedAt time.Time; ConflictID string }
+type ListConflictsRequest struct { Scope Scope; Access AssetReadConstraint; AssetID, SourceID string; Statuses []ConflictStatus; Limit int; Cursor *ConflictCursor }
+type ConflictPage struct { Items []ConflictReadModel; Next *ConflictCursor }
+type MappingDecision struct { Context MutationContext; ConflictID, ServiceID string; Resolution ConflictResolution; BindingRole BindingRole; ReasonCode string; ExpectedVersion int64 }
+
+type SourceUsage string
+const SourceUsageManualAssetCreate SourceUsage = "manual_asset_create"
+type SourceCursor struct { QueryDigest, SourceID string }
+type ListSourcesRequest struct { Scope SourceScope; Access SourceReadConstraint; Kinds []SourceKind; Statuses []SourceStatus; GateStatuses []SourceGateStatus; Usage SourceUsage; EnvironmentID string; Limit int; Cursor *SourceCursor }
+type SourceReadModel struct { Source Source; LatestRevision SourceRevision; PublishedRevision *SourceRevision; CurrentRun, LastSuccessfulRun *SourceRun }
+type SourcePage struct { Items []SourceReadModel; Next *SourceCursor }
+type SourceLocator struct { Scope SourceScope; SourceID string }
+type SourceRunLocator struct { Scope SourceScope; RunID string }
+
+type MutationReceipt struct { AuditID, TraceID string; IdempotentReplay bool }
+type AssetMutationResult struct { Asset AssetDetailReadModel; Receipt MutationReceipt }
+type BindingMutationResult struct { Binding ServiceAssetBinding; Receipt MutationReceipt }
+type MappingDecisionResult struct { Conflict ConflictReadModel; Binding *ServiceAssetBinding; Receipt MutationReceipt }
+
+type AssetReadRepository interface { GetReadModel(context.Context, AssetLocator, AssetReadConstraint) (AssetDetailReadModel, error); List(context.Context, ListAssetsRequest) (AssetPage, error) }
+type Repository interface { Reader; AssetReadRepository; ScopeResolver; Create(context.Context, CreateAssetCommand) (AssetMutationResult, error); UpdateGovernance(context.Context, UpdateGovernanceCommand) (AssetMutationResult, error); Transition(context.Context, TransitionCommand) (AssetMutationResult, error) }
+type MappingRepository interface { ConflictScopeResolver; ListRelationships(context.Context, ListRelationshipsRequest) (RelationshipPage, error); ListBindings(context.Context, ListBindingsRequest) (BindingPage, error); CreateBinding(context.Context, CreateBindingCommand) (BindingMutationResult, error); DeleteBinding(context.Context, DeleteBindingCommand) (MutationReceipt, error); ListConflicts(context.Context, ListConflictsRequest) (ConflictPage, error); ResolveConflict(context.Context, MappingDecision) (MappingDecisionResult, error) }
+type SourceReadRepository interface { SourceScopeResolver; GetSource(context.Context, SourceLocator, SourceReadConstraint) (SourceReadModel, error); ListSources(context.Context, ListSourcesRequest) (SourcePage, error); GetSourceRun(context.Context, SourceRunLocator, SourceReadConstraint) (SourceRun, error) }
 ~~~
 
-Source CRUD/sync/run interfaces remain in `assetcatalog`; reconciliation batch/store interface lives in `assetdiscovery`, whose dependency direction is `assetdiscovery -> assetcatalog`. `assetcatalog` must never import `assetdiscovery`.
+`NewMutationContext` is Environment-scoped；`NewSourceMutationContext` is Workspace-scoped and never fabricates an Environment。Both derive `actorID="oidc:"+principal.Subject`、subject/auth time/Tenant solely from the verified Principal, require the database-resolved scope Tenant to match, and accept only server-built metadata。Their constructors plus the two purpose-named exported-but-opaque read-constraint constructors have AST-allowed production call sites only in `internal/assetcatalog/management.go`（later Task 14 extends that same owner）and `_test.go`；Pack 02 PostgreSQL tests can therefore construct normal values without exposing fields, getters clone slices and zero values fail closed。`AssetFilter.ServiceID` is a client filter, while `AssetReadConstraint.ServiceIDs` is the independent server authorization set；the latter is included in QueryDigest and an initialized restricted-empty set returns no rows, never “all”。`NewSourceReadConstraint` accepts 0–100 unique canonical Environment IDs and always returns an initialized value：an explicit empty input is the legal deny-all constraint，whereas the unconstructed zero value has `initialized=false` and fails validation before SQL。A Source is visible only when its nonempty full authority set is a subset of the initialized allow-list, so a multi-Environment Source is never partially disclosed。`SourceUsageManualAssetCreate` additionally requires the exact sole authority Environment to equal the requested Environment。Tests distinguish zero value、constructed empty、one ID、100 IDs、101 IDs、duplicates and non-canonical UUIDs.
+
+Every cursor QueryDigest covers exact resolved Scope、normalized filters、server read constraint and fixed sort；relation order is `(relationship_type,source_asset_id,target_asset_id,id)`，binding `(service_id,binding_role,asset_id,id)`，conflict `(created_at DESC,id DESC)` and Source `(id ASC)`。`AssetCursor.Value` must match its sort as normalized UTF-8 or canonical UTC time before SQL。Latest Source revision is the exact max revision；published/current/last-success pointers are scope/source-consistent, current is the unique nonterminal Run and last-success is only the exact `SUCCEEDED` pointer（never aggregate or PARTIAL）。Core Conflict exposes hashes only；the read model adds safe candidate references、Observation revision/time and ACTIVE impact counts in one scoped query/decision transaction, never raw values。`AssetReadModel` joins same-Scope Source and sorted/deduplicated ACTIVE Service bindings；before 000016/000017 it returns only explicit `NOT_CONFIGURED`/count `0`, never inferred health。`AssetPage.ManualCreateEligible` is a server-owned collection fact, not a permission：Pack 02 computes it from the exact built-in `ManualProfileV1` Source, its one authority child equal to the requested Environment, and current `ACTIVE + PUBLISHED + AVAILABLE` binding closure；Pack 03 combines it with authorization and never accepts a browser boolean or performs an unscoped second lookup。A nullable persisted OwnerGroup remains `*string`; API projection renders nil as the fixed “未分配” display without changing the database fact.
+
+Safe Source/Run read interfaces remain in `assetcatalog`; Source create/revision/sync mutation interfaces are deferred to Task 13. Reconciliation batch/store lives in `assetdiscovery` with dependency direction `assetdiscovery -> assetcatalog`. Pack 02/03 consume these exact types and never redeclare reduced copies.
 
 - [ ] **Step 5: Run domain tests**
 
-Run: `gofmt -w internal/assetcatalog/*.go && go test -race ./internal/assetcatalog -count=1`
+Run:
 
-Expected: PASS for every enum member, invalid unknowns, canonical IDs, label safety, clone isolation, lifecycle matrix, retired terminal state, all live-capability gates, non-serializable/redacted/destroy-all-copies fence behavior and rejection of zero/forged coordinate matches.
+~~~bash
+gofmt -w $(rg --files internal/authn internal/assetcatalog internal/leasefence -g '*.go')
+go test -race ./internal/authn ./internal/assetcatalog ./internal/leasefence -count=1
+AIOPS_TEST_POSTGRES_DSN="$AIOPS_TEST_POSTGRES_DSN" go test ./internal/assetcatalog/postgres -run TestBindingDigestParity -count=1
+~~~
+
+The PostgreSQL command must execute against the Task 1 PostgreSQL 18.4 TLS harness；an unset/unreachable DSN is a failure, not a skip.
+
+Expected: PASS for every enum member and unknown rejection；canonical Scope/IDs/opaque references/UTC time；every model field mutation；the exact BindingDigest golden/parity/NULL boundary and every included/excluded field；clone isolation；query-bound cursors；structurally safe SourceRun；stable safe errors；lifecycle matrix with no self-edge and terminal RETIRED；local Catalog/binding eligibility without provider-support inference；and non-serializable/redacted/consuming/destroy-all-copies/race-safe fence behavior plus exact constructor-call architecture gates.
 
 - [ ] **Step 6: Commit**
 
 ~~~bash
 git add internal/assetcatalog/types.go internal/assetcatalog/validation.go \
   internal/assetcatalog/lifecycle.go internal/assetcatalog/repository.go \
-  internal/assetcatalog/types_test.go internal/assetcatalog/lifecycle_test.go
+  internal/assetcatalog/lease_fence.go internal/assetcatalog/types_test.go \
+  internal/assetcatalog/mutation_context_architecture_test.go \
+  internal/assetcatalog/lifecycle_test.go internal/assetcatalog/lease_fence_test.go \
+  internal/assetcatalog/lease_fence_architecture_test.go internal/leasefence \
+  internal/assetcatalog/postgres/binding_digest_parity_integration_test.go \
+  internal/authn/authenticator.go internal/authn/authenticator_test.go \
+  internal/authn/keycloak.go internal/authn/keycloak_test.go
 git commit -m "feat(assetcatalog): define governed asset domain"
 ~~~

@@ -228,7 +228,7 @@ Use real SDK serializers against TLS protocol fixtures and assert exact host/pat
 Run:
 
 ~~~bash
-gofmt -w internal/assetsource/cloud
+gofmt -w $(rg --files internal/assetsource/cloud -g '*.go')
 go mod tidy
 go test -race ./internal/assetsource/cloud/... -count=1
 govulncheck ./internal/assetsource/cloud/...

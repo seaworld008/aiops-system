@@ -96,7 +96,7 @@ Map CMDB type codes through a closed table to Asset Kind; unknown types become r
 Run:
 
 ~~~bash
-gofmt -w internal/assetsource/externalcmdb
+gofmt -w $(rg --files internal/assetsource/externalcmdb -g '*.go')
 go test -race ./internal/assetsource/externalcmdb -count=1
 go test ./api/openapi -run ExternalCMDB -count=1
 ~~~

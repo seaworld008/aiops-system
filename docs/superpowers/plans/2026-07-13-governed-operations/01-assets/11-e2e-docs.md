@@ -308,7 +308,7 @@ app rollback + populated 000015: schema retained; no down
 
 - [ ] **Step 4: Automate backup and restore verification**
 
-Create sanitized fixture rows in all nine tables, audits and outbox; take `pg_dump --format=custom` plus WAL/checkpoint metadata; restore into clean PostgreSQL 18; run migrations/checks; compare counts, scoped FK closure, immutable Source Revision/published pointer/checkpoint/fence state, content hashes, versions, conflict/binding state, append-only triggers and pending outbox. The script prints only aggregate counts/checksums and exits nonzero on drift.
+Create sanitized fixture rows in all ten tables, audits and outbox; take `pg_dump --format=custom` plus WAL/checkpoint metadata; restore into clean PostgreSQL 18; run migrations/checks; compare counts, scoped FK closure, immutable Source Revision plus ordered authority membership/digest, typed-extension nullable pair, published pointer/checkpoint/fence state, content hashes, versions, conflict/binding state, append-only triggers and pending outbox. The script prints only aggregate counts/checksums and exits nonzero on drift.
 
 Run:
 
@@ -371,7 +371,7 @@ Expected: FAIL because at least one persistent fact file is missing.
 
 `current.md`: date/commit/environment; completed vs planned; migrations 000001–000022 ownership; current known `.worktrees` test caveat; active risks; next executable package.
 
-`implementation-blueprint-v4.md`: four planes; source/governance field ownership; nine-table Asset/Source Revision/Run/Observation/conflict/relation/binding model; CSV/API/CMDB/vSphere/Proxmox/OpenStack/AWS/Azure/GCP provider registry; discovery-worker lease/fence/checkpoint/backpressure; lifecycle and per-provider gates; source reconciliation sequence; API/auth/ETag/idempotency; Overview truthful readiness; Connection→Runtime→Snapshot→Grant downstream; HA/backup/metrics; explicit eventual governed production-write chain.
+`implementation-blueprint-v4.md`: four planes; source/governance field ownership; ten-table Asset/Source Revision/authority membership/Run/Observation/conflict/relation/binding model; CSV/API/CMDB/vSphere/Proxmox/OpenStack/AWS/Azure/GCP provider registry; discovery-worker lease/fence/checkpoint/backpressure; lifecycle and per-provider gates; source reconciliation sequence; API/auth/ETag/idempotency; Overview truthful readiness; Connection→Runtime→Snapshot→Grant downstream; HA/backup/metrics; explicit eventual governed production-write chain.
 
 `ADR 0001`: context; decision for hybrid catalog/overlay; append-only observations; explicit cross-source merge; composite scope; alternatives rejected (replace CMDB, opaque JSON runtime, name merge, browser target access); consequences; migration/rollback.
 

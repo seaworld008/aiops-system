@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 建立 `000020` 生产平台事实、严格 production dependency graph、八类真实进程装配和首个完整只读 Helm chart，使任何缺失/测试/loopback 依赖都在 readiness 前 fail closed。
+**Goal:** 建立 `000020` 生产平台事实、严格 production dependency graph、八类核心进程装配及已由 Phase 5 交付的外部 Enrollment control services，并生成首个完整只读 Helm chart，使任何缺失/测试/loopback 依赖都在 readiness 前 fail closed。
 
 **Architecture:** `productionplatform` 领域只保存 revision/digest/gate/decision；PostgreSQL repository 保证 Scope、不可变与阶段前驱。`productionassembly` 从只读配置和 workload identity 构造真实 PostgreSQL/Temporal/Keycloak/Vault/audit/evidence/telemetry adapters，再把窄接口注入各 command。Helm chart 使用独立 ServiceAccount、Deployment、Service、PDB/HPA 与 default-deny NetworkPolicy，不包含 WRITE 资源。
 
-**Tech Stack:** Go 1.26.5、PostgreSQL 18.4+、pgx/v5、Temporal SDK 1.46.0、Keycloak Server 26.6.3、Vault API/Kubernetes Auth/PKI、Kubernetes 1.36、Helm 3、OpenTelemetry、RFC 8785 JCS/SHA-256。
+**Tech Stack:** Go 1.26.5、PostgreSQL 18.4+、pgx/v5、Temporal SDK 1.46.0、Keycloak Server 26.6.3、Vault API/Kubernetes Auth/PKI、Kubernetes 1.36.2、Helm 3、OpenTelemetry、RFC 8785 JCS/SHA-256。
 
 ## Global Constraints
 
@@ -23,6 +23,7 @@
 - Helm 基础 chart 属于 Phase 6；无 WRITE Runner、Action worker、WRITE ServiceAccount/Realm/NetworkPolicy/credential values。
 - chart 与 production command 不含 `latest`、mutable tag、development mode、hostNetwork、privileged、service account token 自动挂载或 broad RBAC。
 - fake、memory、MSW 只能位于测试文件/目录，不能被 production import graph 引用。
+- AWX capability 启用时，production graph 还必须验证 Phase 5 的 AWX 24.6.1 governed image、两个 EnrollmentCleanupBroker、Vault 2.0.3 TLS Raft/KV/三把 Transit key、purpose-specific mTLS L7 gateway、authority-keyring Runtime 与 host-local attestor；它们是受治理外部依赖，缺失时只关闭对应 AWX enrollment/diagnostic admission，不能回退 stock launch 或软件导出身份。
 - 新增行为严格 TDD，每个 Task 独立 commit。
 
 ---
@@ -601,6 +602,7 @@ func TestRenderedChartUsesNoPrivilegedHostNetworkOrBroadRBAC(t *testing.T)
 func TestPhaseOwnershipAllowsPhaseSevenOnlyAdditiveWriteTemplates(t *testing.T)
 func TestProductionFoundationPinsKubernetes136AndEveryDependencyImage(t *testing.T)
 func TestProductionFoundationScriptsHaveTimeoutCleanupAndSecretGuards(t *testing.T)
+func TestProductionAWXEnrollmentDependenciesAreExactHAAndFailClosed(t *testing.T)
 ```
 
 - [ ] **Step 2: Run tests and verify failure**
@@ -613,7 +615,7 @@ Expected: FAIL because role binaries/chart foundation are incomplete.
 
 - [ ] **Step 3: Wire each command through one production builder**
 
-Each `main` parses only `--config-fd`, loads/validates role, calls `productionassembly.Build`, constructs the real role service, starts live/ready endpoints, handles SIGTERM via drain and returns nonzero on uncertain cleanup. Outbox uses Phase 1/4 dispatchers with PostgreSQL claim；Scheduler uses Phase 4 `SchedulerPublisher`；Discovery Worker uses only accepted Phase 1/5 source-adapter registrations、durable cursors and lease/fence repositories；Gateway embeds all Phase 2–5 authorizers；runners register exact Realm/capabilities. No command selects role or Provider by arbitrary flag.
+Each `main` parses only `--config-fd`, loads/validates role, calls `productionassembly.Build`, constructs the real role service, starts live/ready endpoints, handles SIGTERM via drain and returns nonzero on uncertain cleanup. Outbox uses Phase 1/4 dispatchers with PostgreSQL claim；Scheduler uses Phase 4 `SchedulerPublisher`；Discovery Worker uses only accepted Phase 1/5 source-adapter registrations、durable cursors and lease/fence repositories；Gateway embeds all Phase 2–5 authorizers；runners register exact Realm/capabilities. AWX-enabled assembly additionally validates the exact governed AWX image/admission route、two-replica Broker live-quorum receipt、Vault/KV/Transit and L7 policy digests、authority-keyring Runtime plus host-attestor compatibility artifact before admitting enrollment or diagnostics；这些外部服务不增加浏览器入口，也不能被 stock AWX launch 替代。No command selects role or Provider by arbitrary flag.
 
 `productionassembly.Build` reads the accepted Phase 1–5 revision/digest tuple from each phase's authoritative repository/service, recomputes the closure and binds it into the Platform revision. Missing、rejected、superseded、expired or mismatched input returns a typed startup error before readiness；this runtime check is deliberately separate from the schema-only migration prerequisite.
 
@@ -627,7 +629,7 @@ Control Plane/Gateway minimum 3 and PDB 2；Worker minimum 3/PDB 2；Outbox/Sche
 
 - [ ] **Step 6: Create the reusable real-dependency reference foundation**
 
-Pin Kubernetes `1.36` Kind node images and immutable PostgreSQL、Temporal、Keycloak Server 26.6.3、Vault、object-store and observability images. `up.sh` creates one control-plane plus three zone-labelled workers, applies TLS-only dependencies and the Phase 6 chart, waits with bounded deadlines and writes only safe IDs/digests to `.state/reference.json`. `down.sh` is idempotent and removes cluster、volumes、temporary trust/credential files. Packs 02–05 extend fixtures through their own declared files but reuse these exact lifecycle scripts；Pack 06 modifies this foundation for final full-path E2E rather than creating a second stack.
+Pin Kubernetes `1.36.2` Kind node images and immutable PostgreSQL、Temporal、Keycloak Server 26.6.3、Vault 2.0.3 TLS Raft、AWX 24.6.1 governed image、two-replica EnrollmentCleanupBroker/L7 gateway、object-store and observability images. `up.sh` creates one control-plane plus three zone-labelled workers, applies TLS-only dependencies and the Phase 6 chart, waits with bounded deadlines and writes only safe IDs/digests to `.state/reference.json`. `down.sh` is idempotent and removes cluster、volumes、temporary trust/credential files. Packs 02–05 extend fixtures through their own declared files but reuse these exact lifecycle scripts；Pack 06 modifies this foundation for final full-path E2E rather than creating a second stack.
 
 - [ ] **Step 7: Render/lint/build and run tests**
 

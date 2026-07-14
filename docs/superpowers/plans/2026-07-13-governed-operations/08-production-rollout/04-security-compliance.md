@@ -6,11 +6,12 @@
 
 **Architecture:** Enforce security in four layers: source/artifact provenance, Kubernetes admission and network identity, runtime authorization/credential boundaries, and append-only compliance evidence. Automated scanners provide inputs rather than self-approval; explicit expiring exceptions and independent sign-off are required where a finding cannot be immediately removed.
 
-**Tech Stack:** Go security tests, OpenAPI contract tests, gitleaks, govulncheck, gosec, Semgrep, Syft, Grype, Cosign, OCI attestations, Kubernetes 1.36 ValidatingAdmissionPolicy, workload identity, Keycloak OIDC, Vault/PKI, mTLS, OWASP ZAP, Playwright/axe, and signed JSON evidence.
+**Tech Stack:** Go security tests, OpenAPI contract tests, gitleaks, govulncheck, gosec, Semgrep, Syft, Grype, Cosign, OCI attestations, Kubernetes 1.36.2 ValidatingAdmissionPolicy, workload identity, Keycloak OIDC, Vault/PKI, mTLS, OWASP ZAP, Playwright/axe, and signed JSON evidence.
 
 ## Global Constraints
 
 - 每个 Task 严格采用 Red → Green → Refactor：先运行并保存预期失败，再做最小生产实现，复跑指定测试后才允许重构和提交。
+- AWX same-user issuer/revoker control credentials、EnrollmentCleanupBroker、purpose-specific L7 gateway、governed AWX patch/image and enrollment authority keyring are explicit TCB。Release evidence must prove only the Broker mounts those sources, direct Broker→AWX is denied, issuer can only self-PAT POST, revoker can only exact token DELETE/detail GET, stock launch is denied, and key/credential rotation preserves cleanup verification；任何 broad egress、共享身份、未签名 patch 或许可/供应链缺口均为 release HOLD。
 - The model remains outside the trusted computing base and can never convert untrusted Evidence, prompt text or UI content into authorization.
 - No scanner suppression, severity downgrade or allowlist entry is accepted without owner, exact finding/artifact, rationale, compensating control, creation time and mandatory expiry.
 - Production images and charts must be built from the accepted commit by the protected release workflow, signed, attested and pinned by digest.

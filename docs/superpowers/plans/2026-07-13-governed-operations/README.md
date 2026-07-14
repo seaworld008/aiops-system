@@ -11,6 +11,7 @@ The current set contains 8 ordered phases, 59 bounded task packs, and 189 checkb
 - [Program implementation plan](../2026-07-13-governed-operations-program.md)
 - [Specification-to-plan coverage matrix](coverage-matrix.md)
 - [Verified production planning version baseline](version-baseline.md)
+- Phase 5 normative successors: [AWX identity enrollment](../../../contracts/awx-host-identity-enrollment-v1.md), [governed launch admission](../../../contracts/awx-governed-launch-admission-v1.md), and [host identity attestor](../../../contracts/host-identity-attestor-v1.md)
 
 If a task pack conflicts with the approved design, the design wins. If two task packs conflict, stop and resolve the contract in the program plan and the affected phase indexes before changing code.
 
