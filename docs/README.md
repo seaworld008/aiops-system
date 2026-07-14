@@ -6,6 +6,7 @@ This directory separates current architecture, executable delivery plans, and su
 
 - [Architecture overview](architecture/overview.md) — concise English introduction to components and trust boundaries.
 - [2026 V3 implementation blueprint](architecture/implementation-blueprint-v3.md) — authoritative detailed design and safety contract (Chinese).
+- [AWX host identity enrollment v1](contracts/awx-host-identity-enrollment-v1.md)、[AWX governed launch admission v1](contracts/awx-governed-launch-admission-v1.md) 与 [Host identity attestor v1](contracts/host-identity-attestor-v1.md) — Phase 5 已确认后继安全契约；对应业务实现仍以状态源为准。
 
 ## Delivery and operations
 
@@ -24,6 +25,7 @@ This directory separates current architecture, executable delivery plans, and su
 - [Temporal READ orchestration](operations/temporal-read-orchestration.md) — v2 digest queues, recovery-first READ Task state machine, strict converter, server-attested role-isolated Starter/Control Worker, Runner Activity boundary, and closed rollout gate.
 - [Investigation runtime binding](operations/investigation-runtime-binding.md) — persistent Plan/Task/Attempt/Receipt runtime fences and migration gates.
 - [Investigation result recovery](operations/investigation-result-recovery.md) — DB-only deterministic recovery after completion-response loss.
+- [Local PostgreSQL 18.4 development](operations/local-postgresql-development.md) — workstation `colima-aiops` mTLS test instance, external Secret paths and stable verification commands.
 
 ## Historical material
 

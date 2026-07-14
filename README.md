@@ -108,9 +108,11 @@ The in-memory mode is for local development only. Production mode fails closed u
 To run real PostgreSQL migration and repository tests:
 
 ```bash
-AIOPS_TEST_POSTGRES_DSN='postgres://aiops:password@127.0.0.1:5432/aiops_test?sslmode=disable' \
-  go test -count=1 ./internal/store/postgres ./internal/execution/postgres
+make postgres-local-check
+make test-integration-local
 ```
+
+These targets use the workstation PostgreSQL 18.4 mTLS deployment without printing or committing its password. See [Local PostgreSQL 18.4 development](docs/operations/local-postgresql-development.md).
 
 With Docker/BuildKit available, build the physically separate Runner images with:
 

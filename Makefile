@@ -1,4 +1,4 @@
-.PHONY: test test-race test-integration vet build runner-images check format run
+.PHONY: test test-race test-integration test-integration-local postgres-local-check vet build runner-images check format run
 
 GO_BUILD_IMAGE ?= docker.io/library/golang:1.26.5-bookworm
 READ_RUNNER_IMAGE ?= aiops-read-runner:dev
@@ -13,6 +13,12 @@ test-race:
 test-integration:
 	@test -n "$$AIOPS_TEST_POSTGRES_DSN" || (echo "AIOPS_TEST_POSTGRES_DSN is required" >&2; exit 1)
 	go test -race -count=1 ./internal/store/postgres ./internal/execution/postgres ./internal/investigation/postgres ./internal/runneridentity/postgres ./internal/readtask/postgres ./internal/assetcatalog/postgres
+
+postgres-local-check:
+	./scripts/with-local-postgres.sh --check
+
+test-integration-local:
+	./scripts/with-local-postgres.sh $(MAKE) test-integration
 
 vet:
 	go vet ./...

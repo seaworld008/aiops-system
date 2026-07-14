@@ -55,9 +55,11 @@ full-version tag is for local and CI verification only.
 If PostgreSQL is available:
 
 ```bash
-AIOPS_TEST_POSTGRES_DSN='postgres://aiops:password@127.0.0.1:5432/aiops_test?sslmode=disable' \
-  go test -race -count=1 ./internal/store/postgres ./internal/execution/postgres
+make postgres-local-check
+make test-integration-local
 ```
+
+The local wrapper reads the workstation password Secret at runtime and enforces PostgreSQL 18.4 with TLS 1.3 and mutual certificate authentication. See [the local PostgreSQL runbook](docs/operations/local-postgresql-development.md).
 
 ## Safety invariants
 

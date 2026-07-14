@@ -108,9 +108,11 @@ GET http://localhost:8080/api/v1/session
 运行真实 PostgreSQL 迁移与仓储测试：
 
 ```bash
-AIOPS_TEST_POSTGRES_DSN='postgres://aiops:password@127.0.0.1:5432/aiops_test?sslmode=disable' \
-  go test -count=1 ./internal/store/postgres ./internal/execution/postgres
+make postgres-local-check
+make test-integration-local
 ```
+
+这些目标使用本机 PostgreSQL 18.4 mTLS 部署，不打印或提交密码。详见[本机 PostgreSQL 18.4 开发与测试实例](docs/operations/local-postgresql-development.md)。
 
 安装 Docker/BuildKit 后，可构建物理拆分的 Runner 镜像：
 
