@@ -24,9 +24,139 @@
 
 ## Fast-build data-plane contract foundation (2026-07-15)
 
-Before Task 13 mutation work, `M1C-discovery-data-plane-contract` freezes the dependency-neutral Provider contract in exactly four files: `internal/assetdiscovery/contracts.go`、`contracts_test.go`、`internal/discoverysource/contracts.go`、`contracts_test.go`. The `assetdiscovery` pair owns only normalized item/relation/freshness/provenance value types. The `discoverysource` pair owns the closed Provider interface, concrete non-serializable checkpoint/request/limits, exact non-pointer `Page|Delay` outcomes and XOR/typed-nil/alias rejection. The Batch contains no Reconciler、SQL、Queue、Worker、Credential Runtime、Source mutation or Provider network implementation.
+Before Task 13 mutation work, `M1C-discovery-data-plane-contract` freezes the dependency-neutral Provider contract in exactly four files: `internal/assetdiscovery/contracts.go`、`contracts_test.go`、`internal/discoverysource/contracts.go`、`contracts_test.go`. The `assetdiscovery` pair owns only normalized item/relation/freshness/provenance value types. `FieldProvenance.Ownership` reuses the already-merged closed `assetcatalog.FieldOwnership`; it is not a free string or a second enum. The `discoverysource` pair owns the closed Provider interface, concrete non-serializable checkpoint/request/limits, exact non-pointer `Page|Delay` outcomes and XOR/typed-nil/pointer/new-defined-wrapper rejection. A Go true alias such as `type Alias = Page` has the same type identity as `Page` and is therefore the same accepted concrete value; only a distinct defined wrapper such as `type Wrapped Page` is rejected. The Batch contains no Reconciler、SQL、Queue、Worker、Credential Runtime、Source mutation or Provider network implementation.
 
 Task 13 consumes this merged foundation and no longer depends on completed Task 4 mutation. It must not redefine or modify the four contract files without a separately reviewed contract Batch. Task 4 mutation, queue/checkpoint and every Provider adapter consume the same merged types. This removes the old cycle in which `discoverysource.Page` referenced Task 4 types that did not yet exist while Task 13 declared Tasks 1–4 as prerequisites.
+
+The M1C public ABI is fixed before implementation as follows; later packs may consume it but cannot infer or add fields:
+
+~~~go
+// package assetdiscovery
+type FactPolicy struct {
+	ProviderKind          string
+	FreshnessKind         assetcatalog.FreshnessKind
+	EnvironmentMapping    assetcatalog.EnvironmentMappingMode
+	AuthorityEnvironmentIDs []string
+	TrustedPathCodes      []string
+	RelationshipTypes     []assetcatalog.RelationshipType
+	AllowedDocumentFields map[assetcatalog.Kind][]string
+}
+
+var ErrFactContractViolation = errors.New("asset discovery fact contract violation")
+
+func (FactPolicy) Clone() FactPolicy
+func ValidateFacts([]NormalizedItem, []ObservedRelation, FactPolicy) error
+
+// package discoverysource
+type DelayReason string
+
+const DelayReasonProviderRetryAfter DelayReason = "PROVIDER_RETRY_AFTER"
+
+type ValidationCheckKind string
+
+const (
+	ValidationCheckIdentity         ValidationCheckKind = "IDENTITY"
+	ValidationCheckTrustOrSignature ValidationCheckKind = "TRUST_OR_SIGNATURE"
+	ValidationCheckNetwork          ValidationCheckKind = "NETWORK"
+	ValidationCheckCredentialOpen   ValidationCheckKind = "CREDENTIAL_OPEN"
+	ValidationCheckFixedProbe       ValidationCheckKind = "FIXED_PROBE"
+	ValidationCheckSchema           ValidationCheckKind = "SCHEMA"
+	ValidationCheckDLP              ValidationCheckKind = "DLP"
+	ValidationCheckBudget           ValidationCheckKind = "BUDGET"
+)
+
+type Limits struct {
+	MaxPageItems     int64
+	MaxPageRelations int64
+	MaxPageBytes     int64
+	MaxDocumentBytes int64
+}
+
+type ValidationRequest struct {
+	Locator              assetcatalog.SourceLocator
+	SourceRevision       int64
+	SourceRevisionDigest string // exact canonical_revision_digest
+	Limits               Limits
+}
+
+type ValidationCheck struct {
+	Kind         ValidationCheckKind
+	Code         string
+	Passed       bool
+	Count        int64
+	DigestSHA256 string
+}
+
+type ValidationProof struct {
+	Outcome assetcatalog.ValidationOutcome
+	Code    string
+	Checks  []ValidationCheck
+}
+
+func (ValidationProof) Digest(ValidationRequest) (string, error)
+
+type DiscoverRequest struct {
+	Locator              assetcatalog.SourceLocator
+	SourceRevision       int64
+	SourceRevisionDigest string // exact canonical_revision_digest
+	Checkpoint           Checkpoint
+	Limits               Limits
+}
+
+type RuntimeBinding struct {
+	Locator              assetcatalog.SourceLocator
+	SourceRevision       int64
+	SourceRevisionDigest string
+	RevisionStatus       assetcatalog.SourceRevisionStatus // VALIDATING | PUBLISHED
+	ProviderKind         string
+	ProfileCode          assetcatalog.ProfileCode
+}
+
+type BoundRuntime struct { /* unexported shared process-local cell */ }
+
+func BindRuntime[T any](binding RuntimeBinding, material *T,
+	close func(*T) error, clear func(*T)) (BoundRuntime, error)
+func WithRuntime[T any](runtime BoundRuntime, expected RuntimeBinding,
+	use func(*T) error) error
+func (BoundRuntime) Binding() RuntimeBinding
+func (BoundRuntime) ProviderKind() string
+func (BoundRuntime) ProfileCode() assetcatalog.ProfileCode
+func (BoundRuntime) Close() error
+func (BoundRuntime) Clear()
+
+const MaxCheckpointCanonicalBytes = 65507
+
+type Checkpoint struct { /* unexported profile code + canonical bytes */ }
+
+func NewCheckpoint(profileCode assetcatalog.ProfileCode, canonical []byte) (Checkpoint, error)
+func (Checkpoint) Clone() Checkpoint
+func (Checkpoint) ProfileCode() assetcatalog.ProfileCode
+func (Checkpoint) IsEmpty() bool
+func WithCheckpointBytes(Checkpoint, assetcatalog.ProfileCode, func([]byte) error) error
+func (Checkpoint) Equal(Checkpoint) bool
+func (*Checkpoint) Clear()
+
+var (
+	ErrProviderContractViolation = errors.New("source provider contract violation")
+	ErrRuntimeBindingMismatch    = errors.New("source runtime binding mismatch")
+	ErrCheckpointContract        = errors.New("source checkpoint contract violation")
+	ErrSensitiveSerialization    = errors.New("sensitive process value is not serializable")
+)
+
+func (Limits) Validate() error
+func (ValidationRequest) Validate() error
+func ValidateValidationResult(ValidationRequest, ValidationProof, error) error
+func (DiscoverRequest) Validate() error
+func ValidateDiscoverResult(DiscoverRequest, assetdiscovery.FactPolicy, DiscoverOutcome, error) error
+~~~
+
+`MaxPageItems`、`MaxPageBytes` and `MaxDocumentBytes` must be positive；`MaxPageRelations` may be zero for Profiles that prohibit relations. All values are already clamped by immutable Profile/server maxima, and page validation enforces them before any commit. `ValidationCheck.Code` and `ValidationProof.Code` are bounded stable uppercase codes, checks are sorted/unique/bounded, counts are non-negative and every non-empty digest is lowercase SHA-256. `assetcatalog.ValidationOutcomeSucceeded` requires the exact eight `ValidationCheckKind` values above, no unknown/duplicate/missing check, every check passed and stable code `VALIDATION_SUCCEEDED`; a controlled Provider incompatibility or authority/schema/DLP rejection returns `assetcatalog.ValidationOutcomeFailed` plus at least the evaluated unique checks and a stable non-success code with `err=nil`. An execution/transport/contract failure returns the zero proof with `err!=nil`. `Available` is deliberately not a Provider-proof field because only Source/Gate governance may own `AVAILABLE`. The Worker validates the proof and recomputes `Digest(request)` from the exact request plus canonical safe fields; it never trusts a Provider-supplied digest and independently owns Broker cleanup evidence. Provider `ValidationProof` never claims that cleanup already occurred.
+
+Validation/check `Code` values are normalized ASCII `[A-Z][A-Z0-9_]{0,63}`. `FieldCode` is one of the exact persisted Catalog field allow-list from Pack 01；`ProviderPathCode` follows the already-merged `asset_catalog_code_valid(...,128)` shape `^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,127}$`. Provider kind/Profile code use their existing closed validators. `ValidationProof.Checks` uses exactly the constant declaration order above for success and the same relative order for evaluated failure checks. Policy Environment IDs、trusted path codes、relationship types and every per-Kind document-field list are canonical-text sorted and duplicate-free；maps/slices are cloned at entry. `ValidateFacts` rejects invalid/cross-authority Environment identity、wrong Provider/Freshness/ownership、unknown Kind/relation/path/document field、invalid or non-canonical JSON/SHA、oversize content、duplicate canonical identity、invalid provenance/freshness and credential/endpoint/header/token/private-key-shaped key or value. It returns only `ErrFactContractViolation` or a wrapped stable subcode without echoing the rejected value.
+
+The methods/functions above are production admission, not test helpers. `ValidateValidationResult` accepts only `(valid proof,nil)` or `(zero proof,non-nil provider error)` and never wraps the Provider error；proof+error and zero-proof+nil are `ErrProviderContractViolation`. `ValidateDiscoverResult` enforces the same XOR, exact non-pointer `Page|Delay` dynamic type, limits/facts/final-snapshot semantics and `PROVIDER_RETRY_AFTER` range；pointer、typed-nil、distinct defined wrapper、unknown outcome、page+delay mixing and `nil,nil` all return the same sentinel. A Go true alias remains the original exact type. Worker code must call request validation before Provider access and the matching result validator immediately afterward, before `ProposeValidationResult` or `ApplyPage`.
+
+`BoundRuntime` shares one idempotently closable/clearable cell across value copies. Its cell binds the complete safe `RuntimeBinding`; `WithRuntime` is the only material accessor, requires every expected Scope/Source/revision/digest/status/Provider/Profile field to match and executes a typed callback without returning the material. Validation uses only `RevisionStatus=VALIDATING`; discovery uses only the exact `PUBLISHED` revision. `Checkpoint` owns at most `MaxCheckpointCanonicalBytes` cloned canonical bytes and `WithCheckpointBytes` supplies only a temporary clone to the exact Profile code, clears that clone after the callback and never exposes an exported cursor field. A zero `Checkpoint` is invalid；an empty initial data checkpoint is explicitly created as `NewCheckpoint(exactProfileCode,nil)`. Both types reject JSON/Text/Binary serialization, redact every `fmt`/`slog` rendering, expose no raw material through errors, and fail access after `Close/Clear`. Architecture tests later confine their constructors/accessors to the discovery-worker/Provider/checkpoint-codec production graph; API、queue、Temporal、audit and log payloads cannot contain either value. `Checkpoint.Equal` performs only constant-time in-memory equality and exposes no plaintext digest；receipt/replay identity remains the checkpoint codec's keyed HMAC. A Provider may decode temporary callback bytes into its own private typed checkpoint view for protocol tests, but must not publish or persist that view.
 
 ---
 
@@ -68,7 +198,7 @@ type Provider interface {
 }
 
 type DiscoverRequest struct {
-	Locator              SourceLocator
+	Locator              assetcatalog.SourceLocator
 	SourceRevision       int64
 	SourceRevisionDigest string
 	Checkpoint           Checkpoint
@@ -98,9 +228,9 @@ Additional RED tests are mandatory：`TestDatabaseRoleAdmissionRequiresExactSepa
 
 `FinalPage` means the bounded Provider run has ended；`CompleteSnapshot` additionally proves authoritative asset **and relation** membership closure and may be true only with `FinalPage=true`. A final incremental/delta page uses `FinalPage=true, CompleteSnapshot=false`；intermediate pages set both false. Provider adapters never infer missing assets/relations from `FinalPage` alone. `Delay` and `Page` are mutually exclusive concrete outcomes: Provider `RetryAfter` must be in `(0,60s]` and a `Delay` has no Items、Relations、checkpoint or final flags by type；transport backoff is created only by the Worker. A `Page` may be relation-only under Pack 02 endpoint-readiness rules but has no retry field.
 
-The return pair is also exact XOR：`err != nil` requires `outcome == nil`，and a non-nil outcome requires `err == nil`；`nil,nil` and outcome+error are both `SOURCE_PROVIDER_CONTRACT_VIOLATION`. A successful dynamic value must be exactly non-pointer `Page` or `Delay`（typed-nil pointers/aliases are rejected）so interface nil tricks cannot bypass the sum type. The Worker discards any violating outcome, never calls `ApplyPage`, prepares a stable failure intent, cleans the attempt and suspends that Source gate. Contract tests cover all four XOR combinations plus typed-nil/pointer rejection for every registered Provider.
+The return pair is also exact XOR：`err != nil` requires `outcome == nil`，and a non-nil outcome requires `err == nil`；`nil,nil` and outcome+error are both `SOURCE_PROVIDER_CONTRACT_VIOLATION`. A successful dynamic value must be exactly non-pointer `Page` or `Delay`（typed-nil pointers and distinct defined wrappers are rejected；a Go true alias is the same type）so interface nil tricks cannot bypass the sum type. The Worker discards any violating outcome, never calls `ApplyPage`, prepares a stable failure intent, cleans the attempt and suspends that Source gate. Contract tests cover all four XOR combinations plus typed-nil/pointer/distinct-wrapper rejection for every registered Provider.
 
-`BoundRuntime` is created only inside `cmd/discovery-worker` from the exact published revision/profile and workload secret binding；it is deliberately non-serializable and implements `Close/Clear`. `DiscoverRequest` intentionally contains no `LeaseFence`；the Worker revalidates its fence around the call and only `PageCommitter/Reconciler` consumes the sealed fence. `DiscoverRequest`, queue payload, Temporal history, audit and logs contain no endpoint, credential, CA, header or Provider request body. Every installed Profile fixes one `FreshnessKind` plus `EnvironmentMappingMode`：`EXPLICIT_ITEM_ENVIRONMENT` only for CSV/API inputs that carry a validated Environment ID, or `SINGLE_ENVIRONMENT` for fixed infrastructure adapters. The latter requires exactly one same-Workspace `AuthorityEnvironmentID`；the former validates every item/relation endpoint against the immutable sorted allow-list. Only the sorted Environment allow-list is membership input to `authority_scope_digest`；freshness kind and mapping mode are immutable semantics of the versioned Profile canonical bytes. `BindingDigest` binds that Profile through `source_definition_digest/profile_code` and independently binds `authority_scope_digest`，so changing either semantic requires a new versioned Profile/revision and complete digest closure；Provider wire data can never choose another kind or invent/remap a Catalog Environment.
+`BoundRuntime` is created only inside `cmd/discovery-worker` from the exact `VALIDATING` or `PUBLISHED` revision/profile and workload secret binding；it follows the fixed process-local typed-access ABI above and implements idempotent `Close/Clear`. `DiscoverRequest` intentionally contains no `LeaseFence`；the Worker revalidates its fence around the call and only `PageCommitter/Reconciler` consumes the sealed fence. `DiscoverRequest`, queue payload, Temporal history, audit and logs contain no endpoint, credential, CA, header or Provider request body. Every installed Profile fixes one `FreshnessKind` plus `EnvironmentMappingMode`：`EXPLICIT_ITEM_ENVIRONMENT` only for CSV/API inputs that carry a validated Environment ID, or `SINGLE_ENVIRONMENT` for fixed infrastructure adapters. The latter requires exactly one same-Workspace `AuthorityEnvironmentID`；the former validates every item/relation endpoint against the immutable sorted allow-list. Only the sorted Environment allow-list is membership input to `authority_scope_digest`；freshness kind and mapping mode are immutable semantics of the versioned Profile canonical bytes. `BindingDigest` binds that Profile through `source_definition_digest/profile_code` and independently binds `authority_scope_digest`，so changing either semantic requires a new versioned Profile/revision and complete digest closure；Provider wire data can never choose another kind or invent/remap a Catalog Environment.
 
 - [ ] **Step 1: Write failing revision immutability and publication-gate tests**
 
@@ -262,7 +392,7 @@ This Task consumes the Task 1-owned base database-role ABI and bootstrap/admissi
 
 Every later owned migration consumes the base checks and, when its manifest is nonempty, additionally checks that concrete extension role before DDL；failure is `55000` and migrations still never `CREATE ROLE`. It explicitly sets object owners, revokes PUBLIC/runtime direct table and routine privileges, and grants only reviewed runtime methods. The PostgreSQL adapter invokes only frozen per-extension procedures selected from the immutable manifest；startup verifies exact `regprocedure` signature、NOLOGIN owner、runtime grantee、ACL with no PUBLIC execute、fixed search path and function-definition SHA-256. An extension procedure is fixed-search-path `SECURITY DEFINER`, uses only schema-qualified SQL, and its owner has no rights on base Source/Audit/Outbox. Architecture/integration tests use adversarial extensions to prove SQL/pgx/transaction symbols are absent, validation-time writes and create-time reads fail, a second write/use-after-close fails, procedure drift closes assembly, and no extension can mutate base/audit rows. Matching replay is returned only after current Principal/Scope/state/profile authorization is rechecked；a changed hash returns `ErrIdempotency`.
 
-`CreateRevision` inserts one `DRAFT` immutable content row for an existing Source. `RequestValidation` CAS-transitions `DRAFT|REJECTED→VALIDATING`, creates a new append-only `VALIDATION` Run bound to the exact revision and canonical binding digest, gives it an empty checkpoint input, and closes the Source gate. A rejected revision's canonical content remains immutable, and it can never transition directly to `PUBLISHED`. The Worker must call fenced `ProposeValidationResult` to persist a `VALIDATION_PROOF` and enter `FINALIZING`, then Broker cleanup and `Complete|Fail` atomically transition only that exact revision/run to `VALIDATED|REJECTED`. Safe proof fields are identity/TLS-or-signature/network/credential-open+cleanup/fixed-probe/schema/DLP/budget result codes and a proof digest. Cancellation、drift、reaper or cleanup uncertainty likewise writes the still-bound `VALIDATING` revision to `REJECTED` with a stable proof/code, so no revision can remain stranded and it can be explicitly revalidated.
+`CreateRevision` inserts one `DRAFT` immutable content row for an existing Source. `RequestValidation` CAS-transitions `DRAFT|REJECTED→VALIDATING`, creates a new append-only `VALIDATION` Run bound to the exact revision and canonical binding digest, gives it an empty checkpoint input, and closes the Source gate. A rejected revision's canonical content remains immutable, and it can never transition directly to `PUBLISHED`. The Worker must call fenced `ProposeValidationResult` to persist a `VALIDATION_PROOF` and enter `FINALIZING`, then Broker cleanup and `Complete|Fail` atomically transition only that exact revision/run to `VALIDATED|REJECTED`. Provider proof fields are bounded identity/TLS-or-signature/network/credential-open/fixed-probe/schema/DLP/budget result codes、counts and digests；Broker-owned cleanup status/proof is a separate later fact and is never claimed by the pre-cleanup Provider proof. Cancellation、drift、reaper or cleanup uncertainty likewise writes the still-bound `VALIDATING` revision to `REJECTED` with a stable proof/code, so no revision can remain stranded and it can be explicitly revalidated.
 
 The installed `MANUAL_V1` profile is the only no-Adapter validation specialization. It is `SINGLE_ENVIRONMENT` and declares explicit `CredentialPurpose=NONE/TrustMode=NONE/NetworkMode=NONE`; its revision must resolve exactly one same-Workspace authority Environment, and every governed MANUAL Asset create must use that exact `AuthorityEnvironmentID` rather than a caller-selected Environment. Creation rejects zero/multiple authority Environments, any different Asset `environment_id` and non-empty external references. The fixed 20-frame BindingDigest binds the unique Environment through `authority_scope_digest`，binds the versioned `MANUAL_V1` Profile through `source_definition_digest/profile_code`，and encodes Credential/Trust/Network references as three SQL-NULL frames；the Profile's `NONE` semantics are not literal sentinel strings in those frames. `RequestValidation` synchronously creates, privately claims, finalizes and completes an exact `VALIDATION` Run with `NO_CREDENTIAL`, proving only installed profile digest、Scope/Environment、closed MANUAL schema、DLP/budgets and binding equality—no network/runtime/credential call exists. Every MANUAL mutation uses `CATALOG_SEQUENCE{OrderSequence=n,ProviderVersionSHA256=SHA256(FramedTupleV1("manual-catalog-version.v1",tenant_id,workspace_id,source_id,checkpoint_revision,n))}` with the Pack 01 byte encoding, where `n` is the positive `accepted_checkpoint_version` allocated and CASed by that same transaction; neither client input nor Catalog time participates in the Provider-version digest. On `PublishSourceRevision`, the same transaction revalidates that exact terminal proof and current installed profile and may set this MANUAL Source directly to `AVAILABLE`; it sets `checkpoint_version=0` and `checkpoint_revision` to the exact newly published revision while all checkpoint ciphertext/key/hash fields remain `NULL`. Before the first publication both numeric fields are zero. Every non-MANUAL profile still requires its independent publication reconciliation/canary. This is the sole path that makes a MANUAL Source eligible for Pack 02 create.
 

@@ -39,7 +39,7 @@
 **Interfaces:**
 - Consumes: `discoverysource.Provider`, exact `VSPHERE_VCENTER_V1` Source Profile and non-serializable `BoundRuntime`.
 - Produces: `vsphere.New(ClientFactory) (discoverysource.Provider, error)` with `Kind()=VSPHERE`, `ProviderKind()=VSPHERE_VCENTER_V1`.
-- Validation proof binds vCenter `about.instanceUuid`, API version, inventory-root digest, TLS peer digest, privilege-set digest, credential cleanup and fixed probe digest.
+- The pre-cleanup Provider validation proof binds vCenter `about.instanceUuid`, API version, inventory-root digest, TLS peer digest, privilege-set digest, `CREDENTIAL_OPEN` and fixed-probe digests. Broker cleanup is a separate later `ATTEMPT_CLEANED`/terminal receipt and never part of this proof.
 
 - [ ] **Step 1: Write failing identity, privilege, and forbidden-method tests**
 
@@ -48,7 +48,7 @@ func TestValidateRejectsDifferentVCenterInstanceUUID(t *testing.T) {
 	server := startVCenterSimulatorTLS(t)
 	provider := newProvider(t, expectedInstanceUUID("42000000-0000-0000-0000-000000000099"))
 	proof, err := provider.Validate(context.Background(), server.Runtime(), validationRequest())
-	if !errors.Is(err, ErrVCenterIdentityMismatch) || proof.Available {
+	if err != nil || proof.Outcome != assetcatalog.ValidationOutcomeFailed || proof.Code != "VCENTER_IDENTITY_MISMATCH" {
 		t.Fatalf("Validate = (%#v, %v)", proof, err)
 	}
 }

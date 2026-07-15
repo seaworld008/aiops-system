@@ -22,6 +22,8 @@ M1A 已通过 PR #38 squash merge 到 `origin/main@f8aec40`：Pack 02 Task 3 的
 
 Pack 02 Task 4 与 Pack 09 Task 27 的 checkpoint/事务所有权冲突仍约束写路径：旧 `Batch` 只有 cursor hash，却要求同事务持久化非 MANUAL checkpoint 密文/key ID/AAD，不能执行。进一步依赖审计确认，把 Task 4 与 Task 27 的 21+ 文件硬合成一个 Batch还会形成 `discoverysource` 合同、queue/fence/codec 与 PageCommitter 的循环依赖并违反快速计划的 L/XL 拆分门。当前并行执行互不重叠的 M1B Source 只读投影和 M1C 纯数据面合同；M1C 同时拥有 `assetdiscovery` 的 normalized fact 类型与引用它们的 `discoverysource` closed outcome，从根上解除 Task 13 反向依赖完整 Task 4 的循环。PageCommitter 写路径继续 `NOT_STARTED`，只有在 M1C 和 queue/checkpoint 基础分别合并后，才按精确 manifest 实施。最终 PageCommitter 仍是唯一 serializable page transaction owner；任何只凭 hash 推进 checkpoint、MANUAL-only 假绿、caller-owned page digest 或嵌套事务实现均被禁止。
 
+M1C 的 pre-RED 合同审计正确阻止了四处未定值/不可实现文字进入代码：opaque checkpoint 与 Pack 06 直接读取 raw cursor、五个 Provider 公共值缺少固定 ABI、Go 真 alias 无法与原 concrete type 区分、provenance ownership 重复为自由字符串；同批还纠正了 Provider proof 在 Broker cleanup 前声称 cleanup 成功的时序矛盾。当前合同修订固定 process-local typed callback access、raw material 全序列化/日志拒绝、安全 checkpoint equality/digest、closed Validation proof/error 语义和已合并 `assetcatalog.FieldOwnership` 复用；M1C 只能在该修订合并后从新 `origin/main` 恢复真实 RED。其余 PageCommitter/Queue/Worker/Provider 能力仍未开始。
+
 ## 当前实施进度
 
 Phase 1 Task 1 首轮 Red → Green → 独立安全复核结果仍是有效证据，范围严格限于生产资产目录的数据库基础：

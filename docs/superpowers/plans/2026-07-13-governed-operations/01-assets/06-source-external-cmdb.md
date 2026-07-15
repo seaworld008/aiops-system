@@ -50,7 +50,7 @@ func TestValidateRequiresPinnedAuthorityAndReadOnlyCapabilities(t *testing.T) {
 	})
 	provider := newProviderForServer(t, server, expectedAuthority("cmdb-production-01"))
 	proof, err := provider.Validate(context.Background(), server.Runtime(), validValidationRequest())
-	if !errors.Is(err, ErrAuthorityMismatch) || proof.Available {
+	if err != nil || proof.Outcome != assetcatalog.ValidationOutcomeFailed || proof.Code != "AUTHORITY_MISMATCH" {
 		t.Fatalf("Validate = (%#v, %v)", proof, err)
 	}
 }
@@ -83,7 +83,7 @@ Relation: external_id, from_external_id, to_external_id, type_code,
 Page: items, next_cursor, snapshot_epoch, final_page, complete_snapshot
 ~~~
 
-No response may include secrets, arbitrary nested objects, executable text, HTML, endpoint, credential or opaque vendor payload. `object_revision` is canonical decimal `1..MaxInt64`, not an opaque token. `CMDB_CATALOG_V1` Source Profile is `SINGLE_ENVIRONMENT`: the immutable authority scope must resolve to exactly one same-Workspace Environment, Adapter assigns that Environment to every item/relation, and the wire protocol cannot choose it. `Validate` performs TLS/SNI/CA and optional client-certificate verification, authority ID equality, clock skew ≤60s, protocol equality, read-only permission exactness, one max-limit asset probe, schema/DLP test and credential cleanup. Proof exposes booleans/stable codes/counts/digests only.
+No response may include secrets, arbitrary nested objects, executable text, HTML, endpoint, credential or opaque vendor payload. `object_revision` is canonical decimal `1..MaxInt64`, not an opaque token. `CMDB_CATALOG_V1` Source Profile is `SINGLE_ENVIRONMENT`: the immutable authority scope must resolve to exactly one same-Workspace Environment, Adapter assigns that Environment to every item/relation, and the wire protocol cannot choose it. `Validate` performs TLS/SNI/CA and optional client-certificate verification, authority ID equality, clock skew ≤60s, protocol equality, read-only permission exactness, one max-limit asset probe and schema/DLP checks. Its pre-cleanup Provider proof exposes only the fixed safe check codes/counts/digests, including `CREDENTIAL_OPEN`; Broker revocation/cleanup is proved later and independently by `ATTEMPT_CLEANED` plus terminal receipts.
 
 - [ ] **Step 3: Implement strict client and normalization**
 
@@ -136,8 +136,13 @@ func TestDiscoverResumesAssetsThenRelationsAtExactCheckpoint(t *testing.T) {
 		t.Fatalf("first = (%#v, %v)", first, err)
 	}
 	second, err := requirePageOutcome(provider.Discover(context.Background(), server.Runtime(), requestAt(first.NextCheckpoint)))
-	if err != nil || second.NextCheckpoint.AssetCursor == first.NextCheckpoint.AssetCursor {
+	if err != nil {
 		t.Fatalf("second = (%#v, %v)", second, err)
+	}
+	firstCursor := requireCMDBCheckpoint(t, first.NextCheckpoint).AssetCursor()
+	secondCursor := requireCMDBCheckpoint(t, second.NextCheckpoint).AssetCursor()
+	if secondCursor == firstCursor {
+		t.Fatalf("asset cursor did not advance: %q", secondCursor)
 	}
 }
 
@@ -148,6 +153,8 @@ func TestPartialCMDBRunNeverMarksMissingAssetStale(t *testing.T) {
 	}
 }
 ~~~
+
+`requireCMDBCheckpoint` is package-private：it calls `discoverysource.WithCheckpointBytes` with the exact `CMDB_CATALOG_V1` Profile code, strictly decodes the temporary canonical bytes into private `cmdbCheckpoint`, and returns only that typed test view. It never adds a raw cursor field to the public checkpoint contract.
 
 Run: `go test ./internal/assetsource/externalcmdb ./internal/assetcatalog/postgres -run CMDB -count=1`
 
@@ -218,7 +225,7 @@ Expected: FAIL because provider gate evaluation does not exist.
 
 - [ ] **Step 2: Implement gate evidence and automatic closure**
 
-`AVAILABLE` requires current source/revision/binding digests, successful identity/trust/credential-cleanup/fixed-probe validation, contract+negative+DLP tests, real TLS protocol receipt, two-replica fence failover receipt, rate/backpressure receipt and a non-production external CMDB canary less than 24 hours old. Any credential/trust/network/profile/revision change, repeated auth/schema failures, checkpoint ambiguity or protocol drift closes the gate before another claim；cleanup uncertainty specifically produces terminal `FAILED + SUSPENDED` and cannot be downgraded to `DEGRADED|UNAVAILABLE`. A plain upstream outage sets `DEGRADED` and applies backoff；it never silently switches endpoint.
+`AVAILABLE` requires current source/revision/binding digests, successful identity/trust/credential-open/fixed-probe Provider validation, the separate exact Broker cleanup receipt, contract+negative+DLP tests, real TLS protocol receipt, two-replica fence failover receipt, rate/backpressure receipt and a non-production external CMDB canary less than 24 hours old. Any credential/trust/network/profile/revision change, repeated auth/schema failures, checkpoint ambiguity or protocol drift closes the gate before another claim；cleanup uncertainty specifically produces terminal `FAILED + SUSPENDED` and cannot be downgraded to `DEGRADED|UNAVAILABLE`. A plain upstream outage sets `DEGRADED` and applies backoff；it never silently switches endpoint.
 
 - [ ] **Step 3: Execute staging canary and UI/E2E verification**
 
