@@ -1,6 +1,6 @@
 # M1C1 — Normalized Fact Contract Corrective
 
-> 状态：`READY_FOR_IMPLEMENTATION / C0 / RUNTIME_CLOSED`。本包只修正已合并 M1C public normalized-fact ABI 与既有 Asset domain、已确认关系规范和 `000015` PostgreSQL schema 的两个闭包缺口；M1E 在本包 squash merge 前保持暂停。
+> 状态：`BUILT_CLOSED / PR #49 MERGED / RUNTIME_CLOSED`。本包已通过三个真实 RED、两包 unit/race、fresh G1/G2 与独立 P0/P1 复核，并 squash merge 到 `origin/main@c427a6b`。它只修正 M1C public normalized-fact ABI 与既有 Asset domain、已确认关系规范和 `000015` PostgreSQL schema 的两个闭包缺口；运行能力继续关闭。
 
 **Goal:** 让 `assetdiscovery.ValidateFacts` 接受的每个非 tombstone Asset 与 Relationship 都能在不猜测授权事实、不截断数据的前提下进入后继 PageCommitter。
 
