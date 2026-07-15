@@ -70,8 +70,8 @@
 - Produces the deployment-preprovisioned base database-role ABI and its production startup/CI admission; later migrations extend only its reviewed extension-owner manifest.
 - Does not change any 000001–000014 table definition.
 
-The original nine-table/32-function implementation remains historical evidence。The 2026-07-14 preflight first reopened Steps 1–7 for the corrective ten-table/profile/authority/definition/binding/future-hook/opaque/NOWAIT/manifest contract；Steps 2–4 were then completed and independently approved in `d557237`。The 2026-07-15 Step 8 review subsequently returned `REJECT/P1` only because the corrective Profile/authority/digest/opaque/typed/future-hook behavior lacked a persistent PostgreSQL 18.4 regression matrix，so Steps 1/5/6/7 are reopened again while Steps 2–4 remain checked unless that matrix exposes a production defect。Execute only the currently open checkboxes in order，persist every reject/reopen decision before implementation resumes，and keep Task 2 closed until Step 8 accepts the follow-up evidence.
-- [ ] **Step 1: Write failing ownership and invariant shape tests**
+The original nine-table/32-function implementation remains historical evidence。The 2026-07-14 preflight first reopened Steps 1–7 for the corrective ten-table/profile/authority/definition/binding/future-hook/opaque/NOWAIT/manifest contract；Steps 2–4 were then completed and independently approved in `d557237`。The first 2026-07-15 Step 8 review returned `REJECT/P1` only because the corrective Profile/authority/digest/opaque/typed/future-hook behavior lacked a persistent PostgreSQL 18.4 regression matrix，so Steps 1/5/6/7 were reopened while Steps 2–4 remained checked。Regression commit `ba99233` closed that evidence gap without exposing a production defect，and the follow-up Step 8 review returned `APPROVE` with no P0–P3 or reopened step。Task 2 remains closed until its own Step 1 is explicitly started.
+- [x] **Step 1: Write failing ownership and invariant shape tests**
 
 ~~~go
 package postgres_test
@@ -325,7 +325,7 @@ Every owned runtime function fixes explicit `search_path=pg_catalog, public, pg_
 
 Real negative tests create a hostile ordinary schema first in `search_path` and，in an isolated non-admission fixture，a dedicated hostile test LOGIN with TEMP plus only the minimum test-call privileges to create same-named temporary relations/types/functions/operators；the production workload itself remains unable to create TEMP。They also replace one guard function with a no-op, weaken one CHECK/FK, alter an index/trigger/column/default/comment；each returns stable `asset_catalog_unavailable` or is rejected before DDL，and neither hostile schema can change a deferred digest/gate result。Test that a binary aware only of 000014 continues health/session reads while 000015 exists, while the new production probe remains closed until the full exact manifest is present; Pack 03 maps that sentinel to HTTP 503. The up migration must not rewrite existing large tables or add a defaulted column to them.
 
-- [ ] **Step 5: Add real PostgreSQL scope, immutability, concurrency, and recovery tests**
+- [x] **Step 5: Add real PostgreSQL scope, immutability, concurrency, and recovery tests**
 
 The integration harness connects through a separately named safe test control database, asserts PostgreSQL 18.4, creates a randomized physical database named `aiops_assets_test_<hex>` (never merely a schema), reconnects and applies 000001–000015 to `public`, then force-drops that database in cleanup. It rejects non-test control database names and missing CREATE DATABASE authority rather than mutating the supplied database. The two persistent corrective matrix tests additionally cover both K8S/AWX kinds and assert exact failure identities：future false/NULL initial/live `23514/asset_sources_future_phase_gate_guard`，read-committed initial `55000/asset_sources_initial_revision_closure_guard`；authority absent/unsorted `23514/asset_source_revision_authorities_order_guard`，duplicate `23505/asset_source_revision_authorities_pkey`，digest mismatch `23514/asset_source_revisions_digest_closure_guard`，late append `55000/asset_source_revision_authorities_parent_guard`；Profile whitespace/key-order `23514/asset_source_revisions_canonical_content_guard`，duplicate key `23514/asset_source_revisions_schema_ck`，unknown key `23514/asset_source_revisions_profile_manifest_guard`，oversize `23514/asset_source_revisions_schema_ck`；typed one-sided `23514/asset_source_revisions_typed_extension_ck` and semantic mismatch `23514/asset_source_revisions_typed_extension_guard`；URL/DSN/Vault/PEM/Header opaque values `23514/asset_source_revisions_reference_ck`。The row-level unique-key JSON/schema check intentionally rejects a duplicate before the deferred closed-key guard，while an otherwise valid unknown-key document reaches the latter；tests must not weaken or reorder either fail-closed layer merely to share an error identity。Positive successor-hook stages and K8S/AWX typed-pair candidates must commit only at their exact legal boundary；SUSPENDED/UNAVAILABLE cleanup must bypass a bomb hook，and every rejected transaction must leave no row or hook drift。The harness then seeds two tenants/workspaces/environments and proves:
 
@@ -375,7 +375,7 @@ AIOPS_LOCAL_POSTGRES_ROOT=/path/to/workstation/postgresql \
 
 Expected: the exact two persistent matrices plus all migration/recovery assertions PASS under PostgreSQL 18.4 TLS with zero required-test skips，all failed transactions roll back and all test-only hooks are restored before cleanup。A missing/unreachable wrapper root or any of its three identity-specific DSNs is an unmet task prerequisite；a diagnostic Skip is never completion evidence。
 
-- [ ] **Step 6: Wire and verify the integration target**
+- [x] **Step 6: Wire and verify the integration target**
 
 Append `./internal/assetcatalog/postgres` to `make test-integration`. Legacy package fixtures must stop at their explicit owned migration cutoff；the full migration runner and Asset Catalog harness execute `000015` only inside a 128-bit randomized physical database created from the project-specific `aiops_test` control-database naming family, and may destructively clean up only a database whose creation they confirmed. Package serialization、`IF NOT EXISTS` and a shared destructive `public` schema are not substitutes for isolation.
 
@@ -390,7 +390,7 @@ make test-integration
 
 Expected: PASS with zero required-test skips；the integration target keeps cross-package parallelism so schema/physical-database isolation remains exercised.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ~~~bash
 git add internal/assetcatalog/postgres/migration_integration_test.go \
@@ -398,9 +398,9 @@ git add internal/assetcatalog/postgres/migration_integration_test.go \
 git commit -m "test(assetcatalog): persist corrective PostgreSQL regression matrix"
 ~~~
 
-- [ ] **Step 8: Independently review and accept the corrective Asset Catalog contract**
+- [x] **Step 8: Independently review and accept the corrective Asset Catalog contract**
 
-Task 2 preflight found that the original `enforce_asset_sources_mutation` body permanently hard-coded `KUBERNETES_OPERATOR/AWX_INVENTORY` as unavailable. The contract below is the corrective acceptance specification。Step 8 owns no implementation/Red cycle，but every finding reopens its owning earlier checkbox and the reject/reopen state must be committed as a dedicated documentation checkpoint before implementation resumes。The 2026-07-15 review is currently `REJECT/P1` and has reopened only Steps 1/5/6/7 for the missing persistent PostgreSQL 18.4 matrix；Steps 2–4 remain accepted unless those tests expose a production defect。Re-review may start only after every open checkbox and required Green evidence is complete，and must reject again if any item remains absent before Task 2 Green resumes.
+Task 2 preflight found that the original `enforce_asset_sources_mutation` body permanently hard-coded `KUBERNETES_OPERATOR/AWX_INVENTORY` as unavailable. The contract below is the corrective acceptance specification。Step 8 owns no implementation/Red cycle，but every finding reopens its owning earlier checkbox and the reject/reopen state must be committed as a dedicated documentation checkpoint before implementation resumes。The first 2026-07-15 review returned `REJECT/P1` and reopened only Steps 1/5/6/7 for the missing persistent PostgreSQL 18.4 matrix；Steps 2–4 remained accepted because the new matrix exposed no production defect。Regression commit `ba99233` and the required Green evidence closed all reopened steps；the follow-up independent review returned `APPROVE` with no P0–P3 and no step to reopen。Task 2 remains closed until its own Step 1 is explicitly started.
 
 Independently inspect the implementation and Green static/PostgreSQL evidence proving:
 
