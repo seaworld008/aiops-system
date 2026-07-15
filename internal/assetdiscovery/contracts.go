@@ -70,14 +70,15 @@ type FieldProvenance struct {
 }
 
 type ObservedRelation struct {
-	SourceEnvironmentID string
-	TargetEnvironmentID string
-	FromExternalID      string
-	ToExternalID        string
-	Type                assetcatalog.RelationshipType
-	ProviderPathCode    string
-	Confidence          int
-	Freshness           FreshnessCandidate
+	SourceEnvironmentID               string
+	TargetEnvironmentID               string
+	FromExternalID                    string
+	ToExternalID                      string
+	Type                              assetcatalog.RelationshipType
+	ProviderPathCode                  string
+	CrossEnvironmentPolicyReferenceID assetcatalog.PolicyReferenceID
+	Confidence                        int
+	Freshness                         FreshnessCandidate
 }
 
 type FactPolicy struct {
@@ -204,7 +205,7 @@ func validateNormalizedItem(item NormalizedItem, policy FactPolicy) error {
 		return validateFieldProvenance(item.FieldProvenance, policy, tombstoneProvenanceFields)
 	}
 
-	if !item.Kind.Valid() || !validSafeText(item.DisplayName, 1, 512) || sensitiveValue(item.DisplayName) ||
+	if !item.Kind.Valid() || !validSafeText(item.DisplayName, 1, 256) || sensitiveValue(item.DisplayName) ||
 		!validTrustedPathCode(item.SchemaVersion) || item.TombstoneReason != "" {
 		return factContractError("INVALID_ITEM_SHAPE")
 	}
@@ -232,6 +233,11 @@ func validateObservedRelation(relation ObservedRelation, policy FactPolicy) erro
 		sensitiveValue(relation.FromExternalID) || sensitiveValue(relation.ToExternalID) ||
 		relation.SourceEnvironmentID == relation.TargetEnvironmentID && relation.FromExternalID == relation.ToExternalID {
 		return factContractError("INVALID_RELATION_IDENTITY")
+	}
+	crossEnvironment := relation.SourceEnvironmentID != relation.TargetEnvironmentID
+	if crossEnvironment != (relation.CrossEnvironmentPolicyReferenceID != "") ||
+		relation.CrossEnvironmentPolicyReferenceID != "" && !relation.CrossEnvironmentPolicyReferenceID.Valid() {
+		return factContractError("INVALID_RELATION_POLICY_REFERENCE")
 	}
 	if !relation.Type.Valid() || !slices.Contains(policy.RelationshipTypes, relation.Type) {
 		return factContractError("RELATION_TYPE_NOT_ALLOWED")

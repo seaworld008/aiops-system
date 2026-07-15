@@ -19,12 +19,13 @@ import (
 )
 
 const (
-	testTenantID      = "11111111-1111-4111-8111-111111111111"
-	testWorkspaceID   = "22222222-2222-4222-8222-222222222222"
-	testSourceID      = "33333333-3333-4333-8333-333333333333"
-	testEnvironmentID = "44444444-4444-4444-8444-444444444444"
-	testProviderKind  = "CMDB_CATALOG_V1"
-	testProfileCode   = assetcatalog.ProfileCode("CMDB_PROFILE_V1")
+	testTenantID            = "11111111-1111-4111-8111-111111111111"
+	testWorkspaceID         = "22222222-2222-4222-8222-222222222222"
+	testSourceID            = "33333333-3333-4333-8333-333333333333"
+	testEnvironmentID       = "44444444-4444-4444-8444-444444444444"
+	testTargetEnvironmentID = "55555555-5555-4555-8555-555555555555"
+	testProviderKind        = "CMDB_CATALOG_V1"
+	testProfileCode         = assetcatalog.ProfileCode("CMDB_PROFILE_V1")
 )
 
 type wrappedPage Page
@@ -480,6 +481,70 @@ func TestValidateDiscoverResultAcceptsClosedPageAndDelayOutcomes(t *testing.T) {
 	itemPage.FinalPage = true
 	if err := ValidateDiscoverResult(request, policy, itemPage, nil); err != nil {
 		t.Fatalf("final incremental page error = %v", err)
+	}
+}
+
+func TestValidateDiscoverResultCountsCrossEnvironmentPolicyReferenceAgainstPageBudget(t *testing.T) {
+	request := validDiscoverRequest(t)
+	policy := validFactPolicy()
+	policy.EnvironmentMapping = assetcatalog.EnvironmentMappingExplicitItem
+	policy.AuthorityEnvironmentIDs = []string{testEnvironmentID, testTargetEnvironmentID}
+
+	relation := validRelation()
+	relation.TargetEnvironmentID = testTargetEnvironmentID
+	relation.CrossEnvironmentPolicyReferenceID = assetcatalog.PolicyReferenceID(strings.Repeat("p", 128))
+	page := Page{Relations: []assetdiscovery.ObservedRelation{relation}, NextCheckpoint: newCheckpoint(t, "next-relation")}
+
+	withoutReference := page
+	withoutReference.Relations = append([]assetdiscovery.ObservedRelation(nil), page.Relations...)
+	withoutReference.Relations[0].CrossEnvironmentPolicyReferenceID = ""
+	limit, ok := pageSemanticBytes(withoutReference)
+	if !ok {
+		t.Fatal("pageSemanticBytes rejected bounded fixture")
+	}
+	request.Limits.MaxPageBytes = limit
+
+	if err := ValidateDiscoverResult(request, policy, page, nil); !errors.Is(err, ErrProviderContractViolation) {
+		t.Fatalf("policy-reference byte budget error = %v, want ErrProviderContractViolation", err)
+	}
+}
+
+func TestPageSemanticBytesFramesEmptySameEnvironmentPolicyReference(t *testing.T) {
+	relation := validRelation()
+	page := Page{
+		Relations:      []assetdiscovery.ObservedRelation{relation},
+		NextCheckpoint: newCheckpoint(t, "next-relation"),
+	}
+	emptySize, ok := pageSemanticBytes(page)
+	if !ok {
+		t.Fatal("pageSemanticBytes rejected empty-reference fixture")
+	}
+	withoutRelation := page
+	withoutRelation.Relations = nil
+	withoutRelationSize, ok := pageSemanticBytes(withoutRelation)
+	if !ok {
+		t.Fatal("pageSemanticBytes rejected relation-free fixture")
+	}
+	expectedRelationBytes := int64(32)
+	for _, value := range []string{
+		relation.SourceEnvironmentID, relation.TargetEnvironmentID, relation.FromExternalID, relation.ToExternalID,
+		string(relation.Type), relation.ProviderPathCode, string(relation.CrossEnvironmentPolicyReferenceID),
+		string(relation.Freshness.Kind), relation.Freshness.ProviderVersionSHA256,
+	} {
+		expectedRelationBytes += int64(len(value) + 5)
+	}
+	if got := emptySize - withoutRelationSize; got != expectedRelationBytes {
+		t.Fatalf("empty-reference relation bytes = %d, want %d with a present zero-length frame", got, expectedRelationBytes)
+	}
+
+	reference := assetcatalog.PolicyReferenceID("policy-ref-v1")
+	page.Relations[0].CrossEnvironmentPolicyReferenceID = reference
+	nonEmptySize, ok := pageSemanticBytes(page)
+	if !ok {
+		t.Fatal("pageSemanticBytes rejected non-empty-reference fixture")
+	}
+	if got, want := nonEmptySize-emptySize, int64(len(reference)); got != want {
+		t.Fatalf("policy-reference payload delta = %d, want %d with a present zero-length frame", got, want)
 	}
 }
 
