@@ -2,7 +2,7 @@
 
 > 更新时间：2026-07-15
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前集成基线：本文件所在的最新 `origin/main` 提交；最近完成 Batch：`M0-asset-domain-contract`（PR #34）；当前 Batch：`M1A-asset-governance-repository`（Pack 02 Task 3）
+> 当前集成基线：本文件所在的最新 `origin/main` 提交；最近完成 Batch：`M1A-asset-governance-repository`（PR #38）；当前并行 Batch：`M1B-asset-source-read-projection`（Pack 02 只读子切片）与 `M1C-discovery-data-plane-contract`（Pack 02/05 纯合同基础）
 
 ## 当前结论
 
@@ -18,7 +18,9 @@ Phase 1 Task 1 的 `000015_assets_catalog` PostgreSQL 安全底座及 `M0-asset-
 
 M0 同批完成 Task 2 的固定 Tenant 身份、Asset domain、validation/lifecycle、稳定 Repository 接口、MANUAL Profile/BindingDigest parity 和进程内 lease/fence 最小正确实现。过度测试约束已删除或改为真实行为契约；最终 reviewer 对 8 个已发现 P1 的修复全部判定 PASS，新增 P0/P1 为 0。受影响 Go/race、PostgreSQL enum up/down/up、Binding parity、schema/role admission、G1 与 G2 均通过；全仓 race、全部 Provider E2E、双实例恢复和重型里程碑门按计划记为 deferred G3/G4，不得解释为已通过。
 
-M1A 入口审计发现 Pack 02 Task 4 与 Pack 09 Task 27 的 checkpoint/事务所有权冲突：旧 Task 4 `Batch` 只有 cursor hash，却要求同事务持久化非 MANUAL checkpoint 密文/key ID/AAD；仅凭 hash 无法生成或验证这些事实。当前执行已拆分为不依赖该缺口的 Task 3，Task 4 保持 `NOT_STARTED`，并与 Task 27 合并为后继 `M1B-discovery-page-commit`。M1B 由 `PageCommitter` 唯一拥有 serializable transaction、checkpoint sealing/验证、projection、receipt 和 checkpoint CAS；任何只凭 hash 推进 checkpoint、MANUAL-only 假绿或嵌套事务实现都被禁止。
+M1A 已通过 PR #38 squash merge 到 `origin/main@f8aec40`：Pack 02 Task 3 的复合 Scope PostgreSQL Repository、MANUAL 原子治理写、receipt-first 幂等 replay、安全读模型以及 Observation/Type Detail/Audit/Outbox/Run 同事务闭包已成为关闭态代码。最终复核发现的一个 P1（冲突重放可借改写 SourceID 形成资格探针）已修复；修复后真实 PostgreSQL 18.4 受影响包、定向 race、G1/G2 重新全绿，同一 reviewer 最终 `APPROVE`。全仓 race、完整恢复、真实 Provider、HA、安全和浏览器/发布资格仍为 deferred G3/G4。
+
+Pack 02 Task 4 与 Pack 09 Task 27 的 checkpoint/事务所有权冲突仍约束写路径：旧 `Batch` 只有 cursor hash，却要求同事务持久化非 MANUAL checkpoint 密文/key ID/AAD，不能执行。进一步依赖审计确认，把 Task 4 与 Task 27 的 21+ 文件硬合成一个 Batch还会形成 `discoverysource` 合同、queue/fence/codec 与 PageCommitter 的循环依赖并违反快速计划的 L/XL 拆分门。当前并行执行互不重叠的 M1B Source 只读投影和 M1C 纯数据面合同；M1C 同时拥有 `assetdiscovery` 的 normalized fact 类型与引用它们的 `discoverysource` closed outcome，从根上解除 Task 13 反向依赖完整 Task 4 的循环。PageCommitter 写路径继续 `NOT_STARTED`，只有在 M1C 和 queue/checkpoint 基础分别合并后，才按精确 manifest 实施。最终 PageCommitter 仍是唯一 serializable page transaction owner；任何只凭 hash 推进 checkpoint、MANUAL-only 假绿、caller-owned page digest 或嵌套事务实现均被禁止。
 
 ## 当前实施进度
 
@@ -83,7 +85,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
 | 现有调查/执行内核 | 基线存在 | 以现有测试、迁移和 V3 文档为准 |
-| 新资产目录与发现 | BUILT_CLOSED（M0）/ UNAVAILABLE | Task 1 数据库底座、环境映射 parity 和 Task 2 Auth/Domain/Validation/Repository interface/LeaseFence 已合并；PostgreSQL Repository、Source mutation、API、前端与真实 Provider 门仍未完成 |
+| 新资产目录与发现 | BUILT_CLOSED（M0/M1A）/ UNAVAILABLE | Task 1 数据库底座、Task 2 领域/接口/LeaseFence 及 Task 3 PostgreSQL Repository/MANUAL 治理闭包已合并；Source read、discovery page commit、Source mutation、API、前端与真实 Provider 门仍未完成 |
 | Connection 修订/验证/发布 | NOT_STARTED | 等待 Phase 2 |
 | VictoriaMetrics/Logs/Traces 全家桶 | NOT_STARTED | 等待 Phase 3 |
 | 事件/定时主动只读调查 | NOT_STARTED | 等待 Phase 4 |
@@ -103,8 +105,10 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 
 ## 下一步
 
-当前从最新 `origin/main` 执行 `M1A-asset-governance-repository`，只完成 Phase 1 Pack 02 Task 3：实现复合 Scope PostgreSQL Repository、MANUAL 原子治理写、幂等 replay、Audit/Outbox 同事务闭包和安全读模型。该 Batch 只消费 M0 已合并的稳定 `Produces`，不得进入 Task 4 discovery、Source mutation、API/OpenAPI、Web 或 Provider 网络能力。
+当前从同一最新 `origin/main` 并行执行两个无文件交集的 Medium/Small Batch。`M1B-asset-source-read-projection` 只实现 M0 已冻结的 `assetcatalog.SourceReadRepository`，文件所有权精确为 `internal/assetcatalog/postgres/source_reads.go`、`source_reads_test.go`、`source_reads_integration_test.go`。它提供复合 Source Scope、完整 authority-set 授权、安全字段投影、稳定 keyset cursor 和 exact current/published/last-success 读取；不得修改领域接口、migration、Source mutation、normalized fact 合同、PageCommitter、queue/checkpoint、OpenAPI/Web 或 Provider 网络能力。
 
-M1A 合并门固定为真实关键行为、受影响包、并发敏感路径定向 race、受影响 PostgreSQL 事务/回滚、G1 与一次 G2；Task 4/M1B 必须等唯一 PageCommitter 契约合并后再实现。全仓 race、全量恢复、真实 Provider、HA、安全、完整浏览器和发布演练继续归入 G3/G4。合并状态最多记为 `BUILT_CLOSED`，运行能力继续 `UNAVAILABLE`。
+`M1C-discovery-data-plane-contract` 只创建 `internal/assetdiscovery/contracts.go`、`contracts_test.go`、`internal/discoverysource/contracts.go`、`contracts_test.go`：前两文件拥有纯 normalized item/relation/freshness/provenance 类型，后两文件拥有 closed Provider `Page|Delay`、concrete checkpoint/request/limit 与 XOR 验证合同。它不创建 Reconciler、SQL、Queue、Worker、Credential/Runtime 实现或网络 Provider，也不修改 M1B 文件。M1B/M1C 只消费已合并接口，彼此不得读取未提交内部实现。
+
+M1B 为 C1，Scope/authority/access/cursor/Secret 排除属于不可延后的 C0 行为；M1C 为 C0 公共合同，必须有 closed outcome/XOR、checkpoint 非序列化安全形状、unknown/oversize/credential-shaped fact 的定向行为测试。两批各自执行受影响测试、G1/G2 和一次最终 P0/P1 复核并独立 PR；任一先完成均可先合并，另一批合并前必须从新 `origin/main` 复验无漂移。两者合并后才进入 queue/fence/checkpoint 基础，之后才创建唯一 PageCommitter 写事务 Batch；完整 queue lifecycle/cleanup/backpressure 可在稳定接口后独立收口。所有这些关闭态代码合并最多记为 `BUILT_CLOSED`，运行能力继续 `UNAVAILABLE`。
 
 任何阶段出现 Scope/身份/计划/Runtime/策略/Kill Switch/credential 漂移、依赖不可用、Secret 风险或结果不确定时，保持在最后已验收状态并停止升级，不得用人工口头确认替代持久证据。

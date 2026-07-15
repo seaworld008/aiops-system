@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- 前置依次为 [01-schema-domain.md](./01-schema-domain.md)、[02-repository-discovery.md](./02-repository-discovery.md)、[03-mapping-auth-api.md](./03-mapping-auth-api.md) 和 [04-web-foundation-assets.md](./04-web-foundation-assets.md)。
+- 最终纵向验收前置依次为 [01-schema-domain.md](./01-schema-domain.md)、[02-repository-discovery.md](./02-repository-discovery.md)、[03-mapping-auth-api.md](./03-mapping-auth-api.md) 和 [04-web-foundation-assets.md](./04-web-foundation-assets.md)；快速构建仅允许下述 M1C 四文件纯合同基础提前，不能据此进入 Source mutation、API/Web 或 Provider 实现。
 - `asset_source_revisions` 属于 `000015_assets_catalog`；本包不得创建 `000016` 或平行修订表。
 - Source 状态、Revision 状态、Validation/Discovery Run 状态与 per-provider Gate 状态正交，前端不得合并成一个绿色状态。
 - 仅 exact `PUBLISHED` revision 且 source `ACTIVE + AVAILABLE` 可创建 Discovery Run；修订、引用、作用域、身份、checkpoint 或 gate 漂移立即停止。
@@ -22,6 +22,12 @@
 - 每个 Task 严格 Red → Green → Refactor；生产实现不得使用 memory repository、MSW 或测试身份。
 - 完成后进入 [06-source-external-cmdb.md](./06-source-external-cmdb.md)。
 
+## Fast-build data-plane contract foundation (2026-07-15)
+
+Before Task 13 mutation work, `M1C-discovery-data-plane-contract` freezes the dependency-neutral Provider contract in exactly four files: `internal/assetdiscovery/contracts.go`、`contracts_test.go`、`internal/discoverysource/contracts.go`、`contracts_test.go`. The `assetdiscovery` pair owns only normalized item/relation/freshness/provenance value types. The `discoverysource` pair owns the closed Provider interface, concrete non-serializable checkpoint/request/limits, exact non-pointer `Page|Delay` outcomes and XOR/typed-nil/alias rejection. The Batch contains no Reconciler、SQL、Queue、Worker、Credential Runtime、Source mutation or Provider network implementation.
+
+Task 13 consumes this merged foundation and no longer depends on completed Task 4 mutation. It must not redefine or modify the four contract files without a separately reviewed contract Batch. Task 4 mutation, queue/checkpoint and every Provider adapter consume the same merged types. This removes the old cycle in which `discoverysource.Page` referenced Task 4 types that did not yet exist while Task 13 declared Tasks 1–4 as prerequisites.
+
 ---
 
 ### Task 13: Immutable source revision repository, validation request, publication, and disable gate
@@ -31,8 +37,6 @@
 - Modify: `internal/assetcatalog/repository.go`
 - Create: `internal/assetcatalog/source_revision.go`
 - Create: `internal/assetcatalog/source_revision_test.go`
-- Create: `internal/discoverysource/contracts.go`
-- Create: `internal/discoverysource/contracts_test.go`
 - Create: `internal/assetcatalog/source_extension.go`
 - Create: `internal/assetcatalog/source_extension_test.go`
 - Create: `internal/assetcatalog/source_extension_architecture_test.go`
@@ -49,11 +53,11 @@
 - Modify: `internal/store/postgres/database_role_admission_test.go`
 
 **Interfaces:**
-- Consumes: `asset_sources`, `asset_source_revisions`, immutable `asset_source_revision_authorities`, `asset_source_runs` schema plus scoped audit/outbox/idempotency ledger from Tasks 1–4; an existing stable Source is required only for subsequent revisions.
+- Consumes: the merged M1C `assetdiscovery`/`discoverysource` data-plane contract、`asset_sources`、`asset_source_revisions`、immutable `asset_source_revision_authorities`、`asset_source_runs` schema plus scoped audit/outbox/idempotency ledger from Tasks 1–3; an existing stable Source is required only for subsequent revisions.
 - Produces: `SourceRevisionRepository.CreateSource/CreateRevision/RequestValidation/Publish/Disable/RequestSync` and exact source/revision `ETag` versions. `CreateSource` is the sole production owner of atomic stable Source + immutable revision 1 creation.
 - Produces `TypedSourceExtensionRegistry`；later phases may extend a revision only through its in-transaction `ValidateAndDigestInTx → PreparedExtension.CreateInTx` hook, never through a parallel lifecycle/transaction.
 - Produces events: `asset.source.revision.created.v1`, `asset.source.validation.requested.v1`, `asset.source.revision.published.v1`, `asset.source.disabled.v1`, `asset.source.sync.requested.v1`.
-- Produces the only Provider data-plane contract consumed by every later source pack:
+- Consumes the only Provider data-plane contract used by every later source pack; the following shape is defined and tested by M1C and must not be redefined here:
 
 ~~~go
 type Provider interface {
@@ -293,7 +297,6 @@ git add internal/assetcatalog/types.go internal/assetcatalog/repository.go \
   internal/assetcatalog/source_extension.go internal/assetcatalog/source_extension_test.go \
   internal/assetcatalog/source_extension_architecture_test.go \
   internal/assetcatalog/internal/revisioncap \
-  internal/discoverysource/contracts.go internal/discoverysource/contracts_test.go \
   internal/assetcatalog/postgres/manual_run.go internal/assetcatalog/postgres/manual_run_test.go \
   internal/assetcatalog/postgres/source_revisions.go internal/assetcatalog/postgres/extension_procedures.go \
   internal/assetcatalog/postgres/extension_procedures_test.go \
