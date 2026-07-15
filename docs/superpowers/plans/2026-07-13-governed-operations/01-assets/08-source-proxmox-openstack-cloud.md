@@ -73,7 +73,7 @@ Expected: FAIL because Proxmox provider is absent.
 
 - [ ] **Step 2: Implement exact validation and bounded inventory**
 
-Pin `go-proxmox v0.8.0`, but wrap it behind the four-method interface and disable its generic retry/mutation/terminal surfaces. Runtime uses pinned CA/SNI, API Token reference, no environment proxy and hard timeouts. Validation checks `/version`, stable cluster identity/quorum, token read privilege and a one-item resource probe; proof binds cluster identity, TLS peer, role digest, definition and credential cleanup.
+Pin `go-proxmox v0.8.0`, but wrap it behind the four-method interface and disable its generic retry/mutation/terminal surfaces. Runtime uses pinned CA/SNI, API Token reference, no environment proxy and hard timeouts. Validation checks `/version`, stable cluster identity/quorum, token read privilege and a one-item resource probe；the pre-cleanup Provider proof binds cluster identity, TLS peer, role digest, definition and `CREDENTIAL_OPEN`. Broker cleanup remains a separate later receipt.
 
 Normalize only node ID/status/capacity and QEMU/LXC ID/name/status/template/capacity/node relation. Exclude config, cloud-init, description, tags outside allow-list, network/disk secrets, VNC/term data and errors. Field provenance uses closed `PROXMOX_V1_*` codes. Sort full inventory and compute digest. An unchanged later Run still emits every membership item and appends an Observation/chain while advancing checkpoint; it suppresses only business projection/Type Detail changes. A rejection-free complete snapshot performs soft-missing; reappearance stays stale pending revalidation.
 
@@ -118,7 +118,7 @@ func TestOpenStackValidationRejectsCatalogProjectMismatch(t *testing.T) {
 	cloud := newOpenStackProtocolServer(t, project("project-b"))
 	provider := newOpenStackProvider(t, expectedProject("project-a"))
 	proof, err := provider.Validate(context.Background(), cloud.Runtime(), validationRequest())
-	if !errors.Is(err, ErrProjectIdentityMismatch) || proof.Available {
+	if err != nil || proof.Outcome != assetcatalog.ValidationOutcomeFailed || proof.Code != "PROJECT_IDENTITY_MISMATCH" {
 		t.Fatalf("Validate = (%#v, %v)", proof, err)
 	}
 }
@@ -139,7 +139,7 @@ Expected: FAIL because OpenStack provider is absent.
 
 - [ ] **Step 2: Implement fixed Keystone and Nova read flow**
 
-Pin `gophercloud/v2 v2.13.0`. Authenticate only with an opaque Application Credential reference; derive Keystone cloud identity, project and Nova endpoint from the trusted service catalog, then compare exact expected IDs/region. Validation lists one server with microversion 2.79, verifies read-only role and token cleanup/expiry. Never return token/catalog endpoint to Run or logs.
+Pin `gophercloud/v2 v2.13.0`. Authenticate only with an opaque Application Credential reference; derive Keystone cloud identity, project and Nova endpoint from the trusted service catalog, then compare exact expected IDs/region. Provider validation lists one server with microversion 2.79 and verifies the read-only role plus token open/TTL/expiry bounds；token cleanup is proved only by the later Broker `ATTEMPT_CLEANED`/terminal receipt. Never return token/catalog endpoint to Run or logs.
 
 Use `changes-since`, `deleted=true`, `marker`, `limit=500` for delta pages where supported, plus scheduled complete snapshots for authoritative absence. Require stable project/region/microversion and monotonic `(updated,server_id)`. Map server ID/name/status/flavor-code/image-ID-safe-code/availability-zone to source fields; exclude addresses, security groups, fault body, user data, metadata except allow-listed safe keys and attached credential hints. Unknown OS remains `CLOUD_RESOURCE`. Deleted server emits tombstone; partial region does not mark missing.
 
@@ -196,7 +196,7 @@ func TestCloudProvidersRejectAuthorityMismatchIndependently(t *testing.T) {
 	}
 	for _, test := range tests {
 		proof, err := test.provider.Validate(context.Background(), test.runtime, validationRequest())
-		if err == nil || proof.Available {
+		if err != nil || proof.Outcome != assetcatalog.ValidationOutcomeFailed || proof.Code != "AUTHORITY_MISMATCH" {
 			t.Errorf("%s validation escaped authority: %#v", test.name, proof)
 		}
 	}
@@ -211,7 +211,7 @@ Expected: FAIL because cloud adapters are absent.
 
 Pin exact modules from Tech Stack. AWS uses workload identity/AssumeRole and `GetCallerIdentity` plus `DescribeInstances` with server-owned regions; no static access-key profile. Azure uses workload identity, exact tenant/subscription and `VirtualMachinesClient` pagers; GCP uses Workload Identity Federation, exact project and `InstancesClient.AggregatedList`. Dedicated transports reject environment proxy/redirect/custom endpoint unless the installed Source Profile explicitly represents an approved sovereign-cloud profile.
 
-Validation binds authority identity, region-set digest, workload subject, SDK/API version, read permission probe, credential TTL/cleanup and DLP result. Over-privileged identities do not gain new methods; missing read permission closes only that Provider/source.
+Validation binds authority identity, region-set digest, workload subject, SDK/API version, read permission probe, credential-open/TTL bounds and DLP result. Provider proof never claims cleanup；Broker revocation is independently proven by the later `ATTEMPT_CLEANED`/terminal receipt. Over-privileged identities do not gain new methods; missing read permission closes only that Provider/source.
 
 - [ ] **Step 3: Implement paged checkpoints, provenance, and soft lifecycle**
 

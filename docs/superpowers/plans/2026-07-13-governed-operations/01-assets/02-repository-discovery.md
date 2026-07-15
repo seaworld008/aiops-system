@@ -531,9 +531,11 @@ type FreshnessCandidate struct {
 type FieldProvenance struct {
 	FieldCode        string
 	ProviderPathCode string
-	Ownership        string
+	Ownership        assetcatalog.FieldOwnership
 	Confidence       int
 }
+
+Provider-normalized facts may use only `assetcatalog.FieldOwnershipSource`; `GOVERNANCE` and `MERGE_DECISION` are created only by their separate governed paths and are rejected at the data-plane contract boundary.
 
 type ObservedRelation struct {
 	SourceEnvironmentID string
