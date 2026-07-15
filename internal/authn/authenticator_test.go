@@ -3,6 +3,7 @@ package authn
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -15,7 +16,7 @@ func TestAuthenticatorBuildsPrincipalOnlyFromVerifiedBearerClaims(t *testing.T) 
 
 	now := time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
 	verifier := &fakeVerifier{claims: VerifiedClaims{
-		Subject: "keycloak-subject-1", Username: "alice", AuthenticatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour),
+		Subject: "keycloak-subject-1", Username: "alice", TenantID: "11111111-1111-4111-8111-111111111111", AuthenticatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour),
 		Roles: []string{"SRE", "UNKNOWN", "SRE"}, WorkspaceIDs: []string{"workspace-b", "workspace-a", "workspace-a"},
 		EnvironmentIDs: []string{"PROD"},
 		ServiceIDs:     []string{"service-payments", "service-payments"},
@@ -32,11 +33,80 @@ func TestAuthenticatorBuildsPrincipalOnlyFromVerifiedBearerClaims(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Authenticate() error = %v", err)
 	}
-	if principal.Subject != "keycloak-subject-1" || principal.Username != "alice" || verifier.token != "signed-token" {
+	if principal.Subject != "keycloak-subject-1" || principal.Username != "alice" || principal.TenantID != "11111111-1111-4111-8111-111111111111" || verifier.token != "signed-token" {
 		t.Fatalf("principal/verifier = %#v/%q", principal, verifier.token)
 	}
 	if !reflect.DeepEqual(principal.Roles, []Role{RoleSRE}) || !reflect.DeepEqual(principal.WorkspaceIDs, []string{"workspace-a", "workspace-b"}) || !reflect.DeepEqual(principal.EnvironmentIDs, []string{"PROD"}) || !reflect.DeepEqual(principal.ServiceIDs, []string{"service-payments"}) {
 		t.Fatalf("normalized principal = %#v", principal)
+	}
+}
+
+func TestAuthenticatedPrincipalRequiresCanonicalTenantID(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 15, 9, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name     string
+		tenantID string
+		wantOK   bool
+	}{
+		{name: "missing", tenantID: ""},
+		{name: "uppercase", tenantID: "11111111-1111-4111-8111-AAAAAAAAAAAA"},
+		{name: "braced", tenantID: "{11111111-1111-4111-8111-111111111111}"},
+		{name: "trailing whitespace", tenantID: "11111111-1111-4111-8111-111111111111 "},
+		{name: "newline", tenantID: "11111111-1111-4111-8111-111111111111\n"},
+		{name: "NUL", tenantID: "11111111-1111-4111-8111-111111111111\x00"},
+	}
+	for _, version := range "12345" {
+		for _, variant := range "89ab" {
+			tests = append(tests, struct {
+				name     string
+				tenantID string
+				wantOK   bool
+			}{
+				name:     fmt.Sprintf("canonical version %c RFC variant %c UUID", version, variant),
+				tenantID: fmt.Sprintf("11111111-1111-%c111-%c111-111111111111", version, variant),
+				wantOK:   true,
+			})
+		}
+	}
+	for _, version := range "06789abcdef" {
+		tests = append(tests, struct {
+			name     string
+			tenantID string
+			wantOK   bool
+		}{name: fmt.Sprintf("invalid version nibble %c", version), tenantID: fmt.Sprintf("11111111-1111-%c111-8111-111111111111", version)})
+	}
+	for _, variant := range "01234567cdef" {
+		tests = append(tests, struct {
+			name     string
+			tenantID string
+			wantOK   bool
+		}{name: fmt.Sprintf("invalid variant nibble %c", variant), tenantID: fmt.Sprintf("11111111-1111-4111-%c111-111111111111", variant)})
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			claims := validClaims(now)
+			claims.TenantID = test.tenantID
+			authenticator, err := NewAuthenticator(&fakeVerifier{claims: claims}, Options{MaxSessionAge: 12 * time.Hour}, func() time.Time { return now })
+			if err != nil {
+				t.Fatalf("NewAuthenticator() error = %v", err)
+			}
+			request := httptest.NewRequest(http.MethodGet, "/", nil)
+			request.Header.Set("Authorization", "Bearer signed-token")
+			principal, err := authenticator.Authenticate(request)
+			if test.wantOK {
+				if err != nil || principal.TenantID != test.tenantID {
+					t.Fatalf("Authenticate() = (%#v, %v), want canonical tenant", principal, err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrUnauthenticated) || !reflect.DeepEqual(principal, Principal{}) {
+				t.Fatalf("Authenticate() = (%#v, %v), want zero Principal and ErrUnauthenticated", principal, err)
+			}
+		})
 	}
 }
 
@@ -87,7 +157,7 @@ func TestAuthenticatorRejectsMalformedExpiredOrStaleIdentity(t *testing.T) {
 func TestPrincipalContextRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	principal := Principal{Subject: "subject-1"}
+	principal := Principal{Subject: "subject-1", TenantID: "11111111-1111-4111-8111-111111111111"}
 	ctx := WithPrincipal(context.Background(), principal)
 	got, ok := PrincipalFromContext(ctx)
 	if !ok || got.Subject != principal.Subject {
@@ -108,7 +178,7 @@ func (verifier *fakeVerifier) Verify(_ context.Context, token string) (VerifiedC
 
 func validClaims(now time.Time) VerifiedClaims {
 	return VerifiedClaims{
-		Subject: "subject-1", AuthenticatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour),
+		Subject: "subject-1", TenantID: "11111111-1111-4111-8111-111111111111", AuthenticatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour),
 		Roles: []string{"SRE"}, WorkspaceIDs: []string{"workspace-1"}, EnvironmentIDs: []string{"PROD"}, ServiceIDs: []string{"service-1"},
 	}
 }
