@@ -48,6 +48,19 @@ func TestValidateFactsAcceptsCanonicalSourceOwnedFacts(t *testing.T) {
 	}
 }
 
+func TestValidateFactsLimitsNonTombstoneDisplayNameTo256Bytes(t *testing.T) {
+	item := validNormalizedItem()
+	item.DisplayName = strings.Repeat("a", 256)
+	if err := ValidateFacts([]NormalizedItem{item}, nil, validFactPolicy()); err != nil {
+		t.Fatalf("256-byte DisplayName error = %v", err)
+	}
+
+	item.DisplayName += "a"
+	if err := ValidateFacts([]NormalizedItem{item}, nil, validFactPolicy()); !errors.Is(err, ErrFactContractViolation) {
+		t.Fatalf("257-byte DisplayName error = %v, want ErrFactContractViolation", err)
+	}
+}
+
 func TestValidateFactsAcceptsExplicitEmptyAuthoritativeSnapshot(t *testing.T) {
 	if err := ValidateFacts(nil, nil, validFactPolicy()); err != nil {
 		t.Fatalf("ValidateFacts(empty) error = %v", err)
@@ -76,6 +89,53 @@ func TestValidateFactsAcceptsCanonicalObjectTimeFreshnessAndTombstone(t *testing
 	tombstone.Freshness.OrderTime = &observedAt
 	if err := ValidateFacts([]NormalizedItem{tombstone}, nil, policy); err != nil {
 		t.Fatalf("ValidateFacts(tombstone) error = %v", err)
+	}
+}
+
+func TestValidateFactsRejectsCrossEnvironmentRelationWithoutPolicyReference(t *testing.T) {
+	relation := validObservedRelation()
+	relation.CrossEnvironmentPolicyReferenceID = ""
+	if err := ValidateFacts(nil, []ObservedRelation{relation}, validFactPolicy()); !errors.Is(err, ErrFactContractViolation) {
+		t.Fatalf("missing cross-environment policy reference error = %v, want ErrFactContractViolation", err)
+	}
+}
+
+func TestValidateFactsRejectsInvalidCrossEnvironmentPolicyReferenceWithoutEchoingIt(t *testing.T) {
+	relation := validObservedRelation()
+	rejected := assetcatalog.PolicyReferenceID("policy/reference-canary")
+	relation.CrossEnvironmentPolicyReferenceID = rejected
+
+	err := ValidateFacts(nil, []ObservedRelation{relation}, validFactPolicy())
+	if !errors.Is(err, ErrFactContractViolation) {
+		t.Fatalf("invalid cross-environment policy reference error = %v, want ErrFactContractViolation", err)
+	}
+	if strings.Contains(err.Error(), string(rejected)) {
+		t.Fatalf("error leaked rejected policy reference: %v", err)
+	}
+}
+
+func TestValidateFactsRequiresEmptyPolicyReferenceForSameEnvironmentRelation(t *testing.T) {
+	relation := validObservedRelation()
+	relation.TargetEnvironmentID = relation.SourceEnvironmentID
+	relation.CrossEnvironmentPolicyReferenceID = ""
+	if err := ValidateFacts(nil, []ObservedRelation{relation}, validFactPolicy()); err != nil {
+		t.Fatalf("same-environment empty policy reference error = %v", err)
+	}
+
+	relation.CrossEnvironmentPolicyReferenceID = assetcatalog.PolicyReferenceID("policy-ref-v1")
+	if err := ValidateFacts(nil, []ObservedRelation{relation}, validFactPolicy()); !errors.Is(err, ErrFactContractViolation) {
+		t.Fatalf("same-environment non-empty policy reference error = %v, want ErrFactContractViolation", err)
+	}
+}
+
+func TestValidateFactsKeepsPolicyReferenceOutsideDuplicateRelationIdentity(t *testing.T) {
+	first := validObservedRelation()
+	second := validObservedRelation()
+	second.CrossEnvironmentPolicyReferenceID = assetcatalog.PolicyReferenceID("policy-ref-v2")
+
+	err := ValidateFacts(nil, []ObservedRelation{first, second}, validFactPolicy())
+	if !errors.Is(err, ErrFactContractViolation) || !strings.Contains(err.Error(), "DUPLICATE_RELATION_IDENTITY") {
+		t.Fatalf("different-reference duplicate identity error = %v, want DUPLICATE_RELATION_IDENTITY", err)
 	}
 }
 
@@ -273,6 +333,7 @@ func TestValidateFactsRejectsEveryClosedContractGate(t *testing.T) {
 			mutate: func(_ *[]NormalizedItem, relations *[]ObservedRelation, _ *FactPolicy) {
 				(*relations)[0].TargetEnvironmentID = (*relations)[0].SourceEnvironmentID
 				(*relations)[0].ToExternalID = (*relations)[0].FromExternalID
+				(*relations)[0].CrossEnvironmentPolicyReferenceID = ""
 			},
 		},
 		{
@@ -311,6 +372,7 @@ func TestValidateFactsRequiresSingleEnvironmentPolicyToBindEveryFact(t *testing.
 	item := validNormalizedItem()
 	relation := validObservedRelation()
 	relation.TargetEnvironmentID = testEnvironmentA
+	relation.CrossEnvironmentPolicyReferenceID = ""
 	if err := ValidateFacts([]NormalizedItem{item}, []ObservedRelation{relation}, policy); err != nil {
 		t.Fatalf("ValidateFacts(single environment) error = %v", err)
 	}
@@ -395,13 +457,14 @@ func validTombstone() NormalizedItem {
 
 func validObservedRelation() ObservedRelation {
 	return ObservedRelation{
-		SourceEnvironmentID: testEnvironmentA,
-		TargetEnvironmentID: testEnvironmentB,
-		FromExternalID:      "vm-1",
-		ToExternalID:        "vm-2",
-		Type:                assetcatalog.RelationshipContains,
-		ProviderPathCode:    "CMDB_V1_RELATION",
-		Confidence:          100,
+		SourceEnvironmentID:               testEnvironmentA,
+		TargetEnvironmentID:               testEnvironmentB,
+		FromExternalID:                    "vm-1",
+		ToExternalID:                      "vm-2",
+		Type:                              assetcatalog.RelationshipContains,
+		ProviderPathCode:                  "CMDB_V1_RELATION",
+		CrossEnvironmentPolicyReferenceID: assetcatalog.PolicyReferenceID("policy-ref-v1"),
+		Confidence:                        100,
 		Freshness: FreshnessCandidate{
 			Kind:                  assetcatalog.FreshnessObjectSequence,
 			OrderSequence:         9,

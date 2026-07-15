@@ -646,7 +646,8 @@ func pageSemanticBytes(page Page) (int64, bool) {
 	for _, relation := range page.Relations {
 		for _, value := range []string{
 			relation.SourceEnvironmentID, relation.TargetEnvironmentID, relation.FromExternalID, relation.ToExternalID,
-			string(relation.Type), relation.ProviderPathCode, string(relation.Freshness.Kind), relation.Freshness.ProviderVersionSHA256,
+			string(relation.Type), relation.ProviderPathCode, string(relation.CrossEnvironmentPolicyReferenceID),
+			string(relation.Freshness.Kind), relation.Freshness.ProviderVersionSHA256,
 		} {
 			if !addFramed(len(value)) {
 				return 0, false
