@@ -20,6 +20,8 @@ const correctiveManualProfileManifestV1 = `{"backpressure_base_seconds":1,"backp
 
 const correctiveManualProviderSchemaV1 = `{"additionalProperties":false,"properties":{},"type":"object"}`
 
+const correctiveCanonicalEmptyRelationPageSHA256 = "b89ad607e709ef2ea85f7fc6eb0f80e32ae3ecf234220907a0fe718825f7c151"
+
 func TestAssetCatalogCorrectiveOwnsExact35RoutineSignaturesAndFutureHook(t *testing.T) {
 	up := readMigration(t, "000015_assets_catalog.up.sql")
 	correctiveAssertTopLevelParserSemantics(t)
@@ -33,6 +35,38 @@ func TestAssetCatalogCorrectiveOwnsExact35RoutineSignaturesAndFutureHook(t *test
 	body := correctiveNormalizeSQL(hook.body)
 	if body != "begin return false; end;" {
 		t.Errorf("default future Source hook body = %q, want exact fail-closed RETURN false body", body)
+	}
+}
+
+func TestAssetCatalogCorrectiveAllowsOnlyCanonicalEmptyRepeatedRelationPageDigest(t *testing.T) {
+	if got := assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-relation-page.v1"), []byte("0"),
+	); got != correctiveCanonicalEmptyRelationPageSHA256 {
+		t.Fatalf("canonical empty relation-page digest = %q, want %q", got, correctiveCanonicalEmptyRelationPageSHA256)
+	}
+
+	up := readMigration(t, "000015_assets_catalog.up.sql")
+	body := correctiveStripSQLComments(
+		correctiveRequireFunction(t, up, "public.enforce_asset_source_run_mutation").body,
+	)
+	equalityPattern := regexp.MustCompile(
+		`(?is)new\s*\.\s*relation_page_digest\s+is\s+not\s+distinct\s+from\s+old\s*\.\s*relation_page_digest`,
+	)
+	guardedPattern := regexp.MustCompile(
+		`(?is)new\s*\.\s*relation_page_digest\s+is\s+not\s+distinct\s+from\s+old\s*\.\s*relation_page_digest\s+and\s+new\s*\.\s*relation_page_digest\s+is\s+distinct\s+from\s+'` +
+			correctiveCanonicalEmptyRelationPageSHA256 + `'`,
+	)
+	equalityCount := len(equalityPattern.FindAllString(body, -1))
+	guardedCount := len(guardedPattern.FindAllString(body, -1))
+	if equalityCount != 2 {
+		t.Errorf("relation-page equality rejection count = %d, want exact snapshot and page-advance predicates", equalityCount)
+	}
+	if guardedCount != 2 {
+		t.Errorf("canonical-empty guarded equality count = %d, want 2; %d equality rejections remain unconditional",
+			guardedCount, equalityCount-guardedCount)
+	}
+	if literalCount := strings.Count(body, correctiveCanonicalEmptyRelationPageSHA256); literalCount != 2 {
+		t.Errorf("canonical empty relation-page literal count = %d, want exact two guarded predicates", literalCount)
 	}
 }
 

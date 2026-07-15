@@ -3743,7 +3743,8 @@ BEGIN
        (NEW.complete_snapshot AND (
             NEW.relation_page_sequence <> OLD.relation_page_sequence + 1 OR
             NEW.relation_page_digest IS NULL OR
-            NEW.relation_page_digest IS NOT DISTINCT FROM OLD.relation_page_digest
+            (NEW.relation_page_digest IS NOT DISTINCT FROM OLD.relation_page_digest AND
+             NEW.relation_page_digest IS DISTINCT FROM 'b89ad607e709ef2ea85f7fc6eb0f80e32ae3ecf234220907a0fe718825f7c151')
        )) OR
        (NEW.run_kind = 'MANUAL_MUTATION' AND (NEW.complete_snapshot OR NEW.effective_complete_snapshot)) OR
        (NEW.run_kind <> 'MANUAL_MUTATION' AND
@@ -3793,7 +3794,8 @@ BEGIN
                 NEW.relation_page_digest IS DISTINCT FROM OLD.relation_page_digest) OR
            (NEW.relation_page_sequence = OLD.relation_page_sequence + 1 AND
                 (NEW.relation_page_digest IS NULL OR
-                 NEW.relation_page_digest IS NOT DISTINCT FROM OLD.relation_page_digest)) THEN
+                 (NEW.relation_page_digest IS NOT DISTINCT FROM OLD.relation_page_digest AND
+                  NEW.relation_page_digest IS DISTINCT FROM 'b89ad607e709ef2ea85f7fc6eb0f80e32ae3ecf234220907a0fe718825f7c151'))) THEN
             RAISE EXCEPTION USING
                 ERRCODE = '55000', MESSAGE = 'accepted page requires exact source CAS and item/relation coordinates',
                 CONSTRAINT = 'asset_source_runs_checkpoint_page_guard';

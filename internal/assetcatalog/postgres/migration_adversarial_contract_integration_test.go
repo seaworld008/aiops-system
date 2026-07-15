@@ -218,6 +218,200 @@ func TestAssetCatalogRunPageRequiresExactReceiptActorAndObservationCount(t *test
 	}
 }
 
+func TestAssetCatalogAllowsConsecutiveCanonicalEmptyRelationPages(t *testing.T) {
+	harness, fixture, run := prepareAdversarialExternalDataRun(t)
+
+	if err := commitAdversarialRelationPage(
+		harness.db, fixture, run, 1, strings.Repeat("1", 64),
+		correctiveCanonicalEmptyRelationPageSHA256, false,
+	); err != nil {
+		t.Fatalf("commit first canonical empty relation page: %v", err)
+	}
+	if err := commitAdversarialRelationPage(
+		harness.db, fixture, run, 2, strings.Repeat("2", 64),
+		correctiveCanonicalEmptyRelationPageSHA256, true,
+	); err != nil {
+		t.Fatalf("commit second canonical empty relation page as final complete snapshot: %v", err)
+	}
+
+	var pageSequence, relationSequence, checkpointVersion int64
+	var relationDigest string
+	var finalPage, completeSnapshot, effectiveCompleteSnapshot bool
+	if err := harness.db.QueryRow(context.Background(), `
+		SELECT page_sequence,relation_page_sequence,relation_page_digest,checkpoint_version,
+			final_page,complete_snapshot,effective_complete_snapshot
+		FROM asset_source_runs WHERE id=$1
+	`, run.id).Scan(&pageSequence, &relationSequence, &relationDigest, &checkpointVersion,
+		&finalPage, &completeSnapshot, &effectiveCompleteSnapshot); err != nil {
+		t.Fatalf("read consecutive empty relation-page coordinates: %v", err)
+	}
+	if pageSequence != 2 || relationSequence != 2 || checkpointVersion != run.checkpointVersion+2 ||
+		relationDigest != correctiveCanonicalEmptyRelationPageSHA256 ||
+		!finalPage || !completeSnapshot || !effectiveCompleteSnapshot {
+		t.Fatalf("consecutive empty relation-page closure = page:%d relation:%d checkpoint:%d digest:%q final:%t complete:%t effective:%t",
+			pageSequence, relationSequence, checkpointVersion, relationDigest,
+			finalPage, completeSnapshot, effectiveCompleteSnapshot)
+	}
+
+	var requestIDs []string
+	var payloads []string
+	if err := harness.db.QueryRow(context.Background(), `
+		SELECT array_agg(request_id ORDER BY request_id),array_agg(payload_hash ORDER BY request_id)
+		FROM audit_records
+		WHERE resource_type='ASSET_SOURCE_RUN' AND resource_id=$1
+		  AND action='RELATION_PAGE_COMMITTED'
+	`, run.id).Scan(&requestIDs, &payloads); err != nil {
+		t.Fatalf("read consecutive empty relation-page receipts: %v", err)
+	}
+	wantRequest1 := "source-relation-page:" + run.id + ":1"
+	wantRequest2 := "source-relation-page:" + run.id + ":2"
+	if len(requestIDs) != 2 || requestIDs[0] != wantRequest1 || requestIDs[1] != wantRequest2 ||
+		len(payloads) != 2 || payloads[0] != correctiveCanonicalEmptyRelationPageSHA256 ||
+		payloads[1] != correctiveCanonicalEmptyRelationPageSHA256 {
+		t.Fatalf("consecutive empty relation-page receipts = ids:%v payloads:%v, want distinct sequence identities and one canonical digest",
+			requestIDs, payloads)
+	}
+}
+
+func TestAssetCatalogRejectsInvalidSuccessorRelationPagesWithoutResidue(t *testing.T) {
+	nonemptyDigest := strings.Repeat("a", 64)
+	for _, test := range []struct {
+		name                  string
+		firstRelationDigest   string
+		relationDigest        any
+		relationReceiptMode   string
+		relationReceiptDigest string
+		relationSequenceDelta int64
+		checkpointDelta       int64
+		staleFence            bool
+		state                 string
+		constraint            string
+	}{
+		{
+			name: "same nonempty relation digest", firstRelationDigest: nonemptyDigest,
+			relationDigest: nonemptyDigest, relationReceiptMode: "exact",
+			relationReceiptDigest: nonemptyDigest, relationSequenceDelta: 1, checkpointDelta: 1,
+			state: "55000", constraint: "asset_source_runs_checkpoint_page_guard",
+		},
+		{
+			name: "missing relation receipt", firstRelationDigest: correctiveCanonicalEmptyRelationPageSHA256,
+			relationDigest: correctiveCanonicalEmptyRelationPageSHA256, relationReceiptMode: "missing",
+			relationSequenceDelta: 1, checkpointDelta: 1,
+			state: "55000", constraint: "asset_source_runs_page_closure_guard",
+		},
+		{
+			name: "changed relation receipt payload", firstRelationDigest: correctiveCanonicalEmptyRelationPageSHA256,
+			relationDigest: correctiveCanonicalEmptyRelationPageSHA256, relationReceiptMode: "changed",
+			relationReceiptDigest: strings.Repeat("f", 64), relationSequenceDelta: 1, checkpointDelta: 1,
+			state: "55000", constraint: "asset_source_runs_page_closure_guard",
+		},
+		{
+			name: "null relation digest", firstRelationDigest: correctiveCanonicalEmptyRelationPageSHA256,
+			relationDigest: nil, relationReceiptMode: "exact",
+			relationReceiptDigest: correctiveCanonicalEmptyRelationPageSHA256,
+			relationSequenceDelta: 1, checkpointDelta: 1,
+			state: "55000", constraint: "asset_source_runs_checkpoint_page_guard",
+		},
+		{
+			name: "invalid relation digest", firstRelationDigest: correctiveCanonicalEmptyRelationPageSHA256,
+			relationDigest: "not-a-sha256", relationReceiptMode: "exact",
+			relationReceiptDigest: "not-a-sha256",
+			relationSequenceDelta: 1, checkpointDelta: 1,
+			state: "23514", constraint: "asset_management_audit_shape_guard",
+		},
+		{
+			name: "relation sequence jump", firstRelationDigest: correctiveCanonicalEmptyRelationPageSHA256,
+			relationDigest: correctiveCanonicalEmptyRelationPageSHA256, relationReceiptMode: "exact",
+			relationReceiptDigest: correctiveCanonicalEmptyRelationPageSHA256,
+			relationSequenceDelta: 2, checkpointDelta: 1,
+			state: "55000", constraint: "asset_source_runs_progress_guard",
+		},
+		{
+			name: "stale fence", firstRelationDigest: correctiveCanonicalEmptyRelationPageSHA256,
+			relationDigest: correctiveCanonicalEmptyRelationPageSHA256, relationReceiptMode: "exact",
+			relationReceiptDigest: correctiveCanonicalEmptyRelationPageSHA256,
+			relationSequenceDelta: 1, checkpointDelta: 1, staleFence: true,
+			state: "55000", constraint: "asset_source_runs_fence_guard",
+		},
+		{
+			name: "wrong checkpoint", firstRelationDigest: correctiveCanonicalEmptyRelationPageSHA256,
+			relationDigest: correctiveCanonicalEmptyRelationPageSHA256, relationReceiptMode: "exact",
+			relationReceiptDigest: correctiveCanonicalEmptyRelationPageSHA256,
+			relationSequenceDelta: 1, checkpointDelta: 0,
+			state: "55000", constraint: "asset_source_runs_source_admission_guard",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			harness, fixture, run := prepareAdversarialExternalDataRun(t)
+			if err := commitAdversarialRelationPage(
+				harness.db, fixture, run, 1, strings.Repeat("1", 64),
+				test.firstRelationDigest, false,
+			); err != nil {
+				t.Fatalf("commit predecessor relation page: %v", err)
+			}
+			err := attemptAdversarialSuccessorRelationPage(harness.db, fixture, run,
+				test.relationDigest, test.relationReceiptMode, test.relationReceiptDigest,
+				test.relationSequenceDelta, test.checkpointDelta, test.staleFence)
+			assertAdversarialPostgreSQLError(t, err, test.state, test.constraint)
+			assertAdversarialSuccessorPageRolledBack(t, harness.db, fixture, run)
+		})
+	}
+}
+
+func TestAssetCatalogRejectsNonserializableTerminalAfterConsecutiveEmptyRelationPages(t *testing.T) {
+	harness, fixture, run := prepareAdversarialExternalDataRun(t)
+	if err := commitAdversarialRelationPage(
+		harness.db, fixture, run, 1, strings.Repeat("1", 64),
+		correctiveCanonicalEmptyRelationPageSHA256, false,
+	); err != nil {
+		t.Fatalf("commit first canonical empty relation page: %v", err)
+	}
+	if err := commitAdversarialRelationPage(
+		harness.db, fixture, run, 2, strings.Repeat("2", 64),
+		correctiveCanonicalEmptyRelationPageSHA256, true,
+	); err != nil {
+		t.Fatalf("commit final canonical empty relation page: %v", err)
+	}
+	revokeClosureAttempt(t, harness.db, fixture, run.id, strings.Repeat("9", 64))
+
+	tx, err := harness.db.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatalf("begin nonserializable terminal closure: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	terminalDigest := sourceRunTerminalDigest(t, tx, run.id, "SUCCEEDED", nil)
+	insertTerminalAudit(t, tx, fixture, run.id, terminalDigest)
+	_, mutationErr := tx.Exec(context.Background(), `
+		UPDATE asset_source_runs
+		SET status='SUCCEEDED',stage_code='COMPLETED',terminal_command_sha256=$2,
+			version=version+1
+		WHERE id=$1
+	`, run.id, terminalDigest)
+	if mutationErr == nil {
+		mutationErr = tx.Commit(context.Background())
+	} else {
+		_ = tx.Rollback(context.Background())
+	}
+	assertAdversarialPostgreSQLError(t, mutationErr, "55000", "asset_source_runs_terminal_isolation_guard")
+
+	var status string
+	var terminalCommand *string
+	var receiptCount int
+	if err := harness.db.QueryRow(context.Background(), `
+		SELECT run.status,run.terminal_command_sha256,
+			(SELECT count(*) FROM audit_records AS audit
+			 WHERE audit.resource_type='ASSET_SOURCE_RUN' AND audit.resource_id=run.id::text
+			   AND audit.action='TERMINAL_COMMITTED')
+		FROM asset_source_runs AS run WHERE run.id=$1
+	`, run.id).Scan(&status, &terminalCommand, &receiptCount); err != nil {
+		t.Fatalf("read nonserializable terminal rollback: %v", err)
+	}
+	if status != "FINALIZING" || terminalCommand != nil || receiptCount != 0 {
+		t.Fatalf("nonserializable terminal residue = status:%q command:%v receipts:%d",
+			status, terminalCommand, receiptCount)
+	}
+}
+
 func TestAssetCatalogRejectsPreplantedPageReceipts(t *testing.T) {
 	harness := newAssetCatalogHarness(t)
 	harness.applyThroughAssetCatalog(t)
@@ -547,6 +741,189 @@ func insertAdversarialPageReceipts(
 		return err
 	}
 	return nil
+}
+
+func prepareAdversarialExternalDataRun(
+	t *testing.T,
+) (*assetCatalogHarness, assetCatalogFixture, runtimeContractRun) {
+	t.Helper()
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	fixture := seedDraftAssetCatalog(t, harness.db)
+	fixture = seedClosureExternalValidationOnFixture(t, harness.db, fixture)
+	finishClosureExternalValidation(t, harness.db, fixture, 1, strings.Repeat("7", 64))
+	run := startRuntimeContractManualRun(t, harness.db, fixture)
+	return harness, fixture, run
+}
+
+func commitAdversarialRelationPage(
+	database *pgxpool.Pool,
+	fixture assetCatalogFixture,
+	run runtimeContractRun,
+	sequence int64,
+	pageDigest string,
+	relationDigest string,
+	finalCompleteSnapshot bool,
+) error {
+	tx, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if err := insertClosurePageReceipt(tx, fixture, run.id, sequence, pageDigest); err != nil {
+		return err
+	}
+	if err := insertClosureRelationPageReceipt(tx, fixture, run.id, sequence, relationDigest); err != nil {
+		return err
+	}
+	nonceByte, ciphertextByte := "05", "06"
+	if sequence != 1 {
+		nonceByte, ciphertextByte = "07", "08"
+	}
+	envelope := "01" + strings.Repeat(nonceByte, 12) + strings.Repeat(ciphertextByte, 16)
+	if _, err := tx.Exec(context.Background(), `
+		UPDATE asset_sources
+		SET checkpoint_ciphertext=decode($2,'hex'),checkpoint_key_id='opaque-relation-page-key',
+			checkpoint_sha256=encode(sha256(decode($2,'hex')),'hex'),
+			checkpoint_version=checkpoint_version+1,version=version+1
+		WHERE id=$1
+	`, fixture.sourceID, envelope); err != nil {
+		return err
+	}
+	if finalCompleteSnapshot {
+		if _, err := tx.Exec(context.Background(), `
+			UPDATE asset_source_runs
+			SET status='FINALIZING',stage_code='CLEANING_UP',
+				page_sequence=page_sequence+1,page_digest=$2,
+				relation_page_sequence=relation_page_sequence+1,relation_page_digest=$3,
+				checkpoint_version=checkpoint_version+1,
+				cursor_after_sha256=(SELECT checkpoint_sha256 FROM asset_sources WHERE id=$4),
+				final_page=true,complete_snapshot=true,effective_complete_snapshot=true,
+				heartbeat_sequence=heartbeat_sequence+1,heartbeat_at=statement_timestamp(),
+				lease_expires_at=lease_expires_at+interval '1 minute',
+				work_result_kind='DATA_PROJECTION',work_result_status='SUCCEEDED',
+				work_result_digest=repeat('c',64),work_result_recorded_at=statement_timestamp(),
+				cleanup_status='PENDING',cleanup_attempt_id=gen_random_uuid(),
+				cleanup_attempt_epoch=fence_epoch,version=version+1
+			WHERE id=$1
+		`, run.id, pageDigest, relationDigest, fixture.sourceID); err != nil {
+			return err
+		}
+	} else if _, err := tx.Exec(context.Background(), `
+		UPDATE asset_source_runs
+		SET stage_code='APPLYING',page_sequence=page_sequence+1,page_digest=$2,
+			relation_page_sequence=relation_page_sequence+1,relation_page_digest=$3,
+			checkpoint_version=checkpoint_version+1,
+			cursor_after_sha256=(SELECT checkpoint_sha256 FROM asset_sources WHERE id=$4),
+			heartbeat_sequence=heartbeat_sequence+1,heartbeat_at=statement_timestamp(),
+			lease_expires_at=lease_expires_at+interval '1 minute',version=version+1
+		WHERE id=$1
+	`, run.id, pageDigest, relationDigest, fixture.sourceID); err != nil {
+		return err
+	}
+	return tx.Commit(context.Background())
+}
+
+func attemptAdversarialSuccessorRelationPage(
+	database *pgxpool.Pool,
+	fixture assetCatalogFixture,
+	run runtimeContractRun,
+	relationDigest any,
+	relationReceiptMode string,
+	relationReceiptDigest string,
+	relationSequenceDelta int64,
+	checkpointDelta int64,
+	staleFence bool,
+) error {
+	tx, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if err := insertClosurePageReceipt(tx, fixture, run.id, 2, strings.Repeat("2", 64)); err != nil {
+		return err
+	}
+	if relationReceiptMode != "missing" {
+		if err := insertClosureRelationPageReceipt(
+			tx, fixture, run.id, 1+relationSequenceDelta, relationReceiptDigest,
+		); err != nil {
+			return err
+		}
+	}
+	envelope := "01" + strings.Repeat("09", 12) + strings.Repeat("0a", 16)
+	if _, err := tx.Exec(context.Background(), `
+		UPDATE asset_sources
+		SET checkpoint_ciphertext=decode($2,'hex'),checkpoint_key_id='opaque-relation-page-key',
+			checkpoint_sha256=encode(sha256(decode($2,'hex')),'hex'),
+			checkpoint_version=checkpoint_version+1,version=version+1
+		WHERE id=$1
+	`, fixture.sourceID, envelope); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(context.Background(), `
+		UPDATE asset_source_runs
+		SET page_sequence=page_sequence+1,page_digest=$2,
+			relation_page_sequence=relation_page_sequence+$3,relation_page_digest=$4,
+			checkpoint_version=checkpoint_version+$5,
+			cursor_after_sha256=(SELECT checkpoint_sha256 FROM asset_sources WHERE id=$6),
+			fence_epoch=CASE WHEN $7 THEN fence_epoch-1 ELSE fence_epoch END,
+			heartbeat_sequence=heartbeat_sequence+1,heartbeat_at=statement_timestamp(),
+			lease_expires_at=lease_expires_at+interval '1 minute',version=version+1
+		WHERE id=$1
+	`, run.id, strings.Repeat("2", 64), relationSequenceDelta, relationDigest,
+		checkpointDelta, fixture.sourceID, staleFence); err != nil {
+		return err
+	}
+	return tx.Commit(context.Background())
+}
+
+func assertAdversarialPostgreSQLError(t *testing.T, err error, state string, constraint string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("transaction committed; want SQLSTATE %s constraint %s", state, constraint)
+	}
+	var databaseError *pgconn.PgError
+	if !errors.As(err, &databaseError) {
+		t.Fatalf("transaction error=%v, want PostgreSQL %s/%s", err, state, constraint)
+	}
+	if databaseError.Code != state || databaseError.ConstraintName != constraint {
+		t.Fatalf("transaction error=%s/%s (%v), want %s/%s",
+			databaseError.Code, databaseError.ConstraintName, err, state, constraint)
+	}
+}
+
+func assertAdversarialSuccessorPageRolledBack(
+	t *testing.T,
+	database *pgxpool.Pool,
+	fixture assetCatalogFixture,
+	run runtimeContractRun,
+) {
+	t.Helper()
+	var pageSequence, relationSequence, runCheckpoint, sourceCheckpoint, pageReceipts, relationReceipts int64
+	var fenceEpoch int64
+	if err := database.QueryRow(context.Background(), `
+		SELECT run.page_sequence,run.relation_page_sequence,run.checkpoint_version,
+			run.fence_epoch,source.checkpoint_version,
+			(SELECT count(*) FROM audit_records AS audit
+			 WHERE audit.resource_type='ASSET_SOURCE_RUN' AND audit.resource_id=run.id::text
+			   AND audit.action='PAGE_APPLIED'),
+			(SELECT count(*) FROM audit_records AS audit
+			 WHERE audit.resource_type='ASSET_SOURCE_RUN' AND audit.resource_id=run.id::text
+			   AND audit.action='RELATION_PAGE_COMMITTED')
+		FROM asset_source_runs AS run
+		JOIN asset_sources AS source ON source.id=run.source_id
+		WHERE run.id=$1 AND source.id=$2
+	`, run.id, fixture.sourceID).Scan(&pageSequence, &relationSequence, &runCheckpoint,
+		&fenceEpoch, &sourceCheckpoint, &pageReceipts, &relationReceipts); err != nil {
+		t.Fatalf("read rejected successor page rollback: %v", err)
+	}
+	if pageSequence != 1 || relationSequence != 1 ||
+		runCheckpoint != run.checkpointVersion+1 || sourceCheckpoint != run.checkpointVersion+1 ||
+		fenceEpoch != run.fenceEpoch || pageReceipts != 1 || relationReceipts != 1 {
+		t.Fatalf("rejected successor page residue = page:%d relation:%d run-checkpoint:%d source-checkpoint:%d fence:%d page-receipts:%d relation-receipts:%d",
+			pageSequence, relationSequence, runCheckpoint, sourceCheckpoint, fenceEpoch,
+			pageReceipts, relationReceipts)
+	}
 }
 
 func assertAdversarialObservationAcceptedInPage(
