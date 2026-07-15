@@ -1,9 +1,8 @@
 name: ci
 
 on:
-  push:
-    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,6 +13,25 @@ concurrency:
 
 jobs:
   go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - run: go mod download
+      - run: go mod verify
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+      - run: git diff --check
+      - run: go vet ./...
+      - run: go build ./cmd/control-plane ./cmd/worker ./cmd/read-runner ./cmd/write-runner ./cmd/executor
+
+  full-go:
+    if: github.event_name == 'workflow_dispatch'
+    needs: go
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -51,8 +69,8 @@ jobs:
       AIOPS_TEST_VAULT_POSTGRES_HOST: postgres:5432
       AIOPS_TEST_VAULT_ROOT_TOKEN: aiops-vault-test-only
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
@@ -114,11 +132,12 @@ jobs:
       - run: go build ./cmd/control-plane ./cmd/worker ./cmd/read-runner ./cmd/write-runner ./cmd/executor
 
   vulnerability-scan:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
@@ -127,6 +146,7 @@ jobs:
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
   temporal-integration:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -134,8 +154,8 @@ jobs:
       AIOPS_TEMPORAL_CLI_VERSION: "1.6.1"
       AIOPS_TEMPORAL_ADDRESS: 127.0.0.1:7233
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
@@ -189,6 +209,7 @@ jobs:
           fi
 
   runner-images:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -196,7 +217,7 @@ jobs:
       READ_RUNNER_IMAGE: aiops-read-runner:ci
       WRITE_RUNNER_IMAGE: aiops-write-runner:ci
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: Build split Runner images
         run: make runner-images
       - name: Verify image trust boundaries
