@@ -25,6 +25,7 @@ const (
 type VerifiedClaims struct {
 	Subject         string
 	Username        string
+	TenantID        string
 	AuthenticatedAt time.Time
 	ExpiresAt       time.Time
 	Roles           []string
@@ -40,6 +41,7 @@ type TokenVerifier interface {
 type Principal struct {
 	Subject         string
 	Username        string
+	TenantID        string
 	AuthenticatedAt time.Time
 	ExpiresAt       time.Time
 	Roles           []Role
@@ -58,7 +60,10 @@ type Authenticator struct {
 	clock    func() time.Time
 }
 
-var scopePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$`)
+var (
+	scopePattern             = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$`)
+	canonicalTenantIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+)
 
 func NewAuthenticator(verifier TokenVerifier, options Options, clock func() time.Time) (*Authenticator, error) {
 	if verifier == nil || options.MaxSessionAge < time.Minute || options.MaxSessionAge > 24*time.Hour {
@@ -84,7 +89,10 @@ func (authenticator *Authenticator) Authenticate(request *http.Request) (Princip
 		return Principal{}, ErrUnauthenticated
 	}
 	now := authenticator.clock().UTC()
-	if !validClaimsTime(claims, now, authenticator.options.MaxSessionAge) || !scopePattern.MatchString(claims.Subject) || len(claims.Username) > 256 {
+	if !validClaimsTime(claims, now, authenticator.options.MaxSessionAge) ||
+		!scopePattern.MatchString(claims.Subject) ||
+		!canonicalTenantIDPattern.MatchString(claims.TenantID) ||
+		len(claims.Username) > 256 {
 		return Principal{}, ErrUnauthenticated
 	}
 	roles := normalizeRoles(claims.Roles)
@@ -101,7 +109,7 @@ func (authenticator *Authenticator) Authenticate(request *http.Request) (Princip
 		return Principal{}, ErrUnauthenticated
 	}
 	return Principal{
-		Subject: claims.Subject, Username: claims.Username,
+		Subject: claims.Subject, Username: claims.Username, TenantID: claims.TenantID,
 		AuthenticatedAt: claims.AuthenticatedAt.UTC(), ExpiresAt: claims.ExpiresAt.UTC(),
 		Roles: roles, WorkspaceIDs: workspaces, EnvironmentIDs: environments, ServiceIDs: services,
 	}, nil

@@ -1,9 +1,13 @@
 package authn
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -49,6 +53,10 @@ func (verifier *KeycloakVerifier) Verify(ctx context.Context, rawToken string) (
 	if err != nil {
 		return VerifiedClaims{}, ErrUnauthenticated
 	}
+	tenantID, err := decodeFixedTenantClaim(rawToken)
+	if err != nil {
+		return VerifiedClaims{}, ErrUnauthenticated
+	}
 	var claims struct {
 		PreferredUsername string   `json:"preferred_username"`
 		AuthTime          int64    `json:"auth_time"`
@@ -68,10 +76,58 @@ func (verifier *KeycloakVerifier) Verify(ctx context.Context, rawToken string) (
 	roles := append([]string(nil), claims.RealmAccess.Roles...)
 	roles = append(roles, claims.ResourceAccess[verifier.clientID].Roles...)
 	return VerifiedClaims{
-		Subject: token.Subject, Username: claims.PreferredUsername,
+		Subject: token.Subject, Username: claims.PreferredUsername, TenantID: tenantID,
 		AuthenticatedAt: unixTime(claims.AuthTime), ExpiresAt: token.Expiry,
 		Roles: roles, WorkspaceIDs: claims.WorkspaceIDs, EnvironmentIDs: claims.EnvironmentIDs, ServiceIDs: claims.ServiceIDs,
 	}, nil
+}
+
+func decodeFixedTenantClaim(rawToken string) (string, error) {
+	parts := strings.Split(rawToken, ".")
+	if len(parts) != 3 {
+		return "", ErrUnauthenticated
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil || len(payload) == 0 || len(payload) > 64<<10 {
+		return "", ErrUnauthenticated
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return "", ErrUnauthenticated
+	}
+	seen := make(map[string]struct{})
+	tenantID := ""
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		key, ok := keyToken.(string)
+		if err != nil || !ok {
+			return "", ErrUnauthenticated
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return "", ErrUnauthenticated
+		}
+		seen[key] = struct{}{}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return "", ErrUnauthenticated
+		}
+		if key == "aiops_tenant_id" {
+			if err := json.Unmarshal(value, &tenantID); err != nil {
+				return "", ErrUnauthenticated
+			}
+		}
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') || decoder.More() {
+		return "", ErrUnauthenticated
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return "", ErrUnauthenticated
+	}
+	return tenantID, nil
 }
 
 func unixTime(seconds int64) time.Time {
