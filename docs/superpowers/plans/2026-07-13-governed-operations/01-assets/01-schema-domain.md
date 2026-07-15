@@ -1,6 +1,6 @@
 # Asset Catalog Schema and Domain Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans. 本包的 Files/Interfaces/安全契约/最终证据继续有效；当前 `M0-asset-domain-contract` 的实施顺序与验证频率以[快速开发与真实验收计划](../../2026-07-15-fast-development-validation-program.md)为准。
 
 **Goal:** 用 `000015_assets_catalog` 建立十张生产级资产目录表、不可变 Source Revision 及其 authority membership、强作用域/生命周期约束，并定义后续 Connection、Grant 和前端共同消费的稳定 Go 领域接口。
 
@@ -27,8 +27,8 @@
 - 指标仅用低基数标签：migration/version/result、repository operation/result；不得使用租户/资产/Subject/外部 ID。
 - Schema/领域完成不代表生产验收；03–04 必须接入真实 OIDC、闭合 OpenAPI 和生成类型前端，05 必须以真实 PostgreSQL/Keycloak E2E、指标、备份恢复和 HA 演练收口，fake 只能存在于测试。
 - 这是完整生产闭环的基础，不是 demo/read-only pilot；最终路线会进入受治理生产写，本包不提前开放目标写能力。
-- 每个任务按 Red → Green → Refactor；每个任务末尾提交步骤只包含本任务文件。
-- 完成本包后进入 [02-repository-discovery.md](./02-repository-discovery.md)。
+- C0 枚举/摘要/身份/fence 契约保留定向 Red → Green；其余 Task 2 实现与关键行为测试在同一 Batch 完成，不要求 test-only commit 或逐 checkbox 重跑完整 Task 1 恢复矩阵。
+- `M0` 通过 G2 后可进入 [02-repository-discovery.md](./02-repository-discovery.md)；本包完整真库/恢复/安全矩阵作为 G3/G4 最终验收证据保留。
 
 ---
 
@@ -70,7 +70,7 @@
 - Produces the deployment-preprovisioned base database-role ABI and its production startup/CI admission; later migrations extend only its reviewed extension-owner manifest.
 - Does not change any 000001–000014 table definition.
 
-The original nine-table/32-function implementation remains historical evidence。The 2026-07-14 preflight first reopened Steps 1–7 for the corrective ten-table/profile/authority/definition/binding/future-hook/opaque/NOWAIT/manifest contract；Steps 2–4 were then completed and independently approved in `d557237`。The first 2026-07-15 Step 8 review returned `REJECT/P1` only because the corrective Profile/authority/digest/opaque/typed/future-hook behavior lacked a persistent PostgreSQL 18.4 regression matrix，so Steps 1/5/6/7 were reopened while Steps 2–4 remained checked。Regression commit `ba99233` closed that evidence gap without exposing a production defect，and the follow-up Step 8 review returned `APPROVE` with no P0–P3 or reopened step。Task 2 remains closed until its own Step 1 is explicitly started.
+The original nine-table/32-function implementation remains historical evidence。The 2026-07-14 preflight first reopened Steps 1–7 for the corrective ten-table/profile/authority/definition/binding/future-hook/opaque/NOWAIT/manifest contract；Steps 2–4 were then completed and independently approved in `d557237`。The first 2026-07-15 Step 8 review returned `REJECT/P1` only because the corrective Profile/authority/digest/opaque/typed/future-hook behavior lacked a persistent PostgreSQL 18.4 regression matrix，so Steps 1/5/6/7 were reopened while Steps 2–4 remained checked。Regression commit `ba99233` closed that evidence gap without exposing a production defect，and the follow-up Step 8 review returned `APPROVE` with no P0–P3 or reopened step。Task 2 has since entered `BUILDING_CLOSED` under Batch `M0-asset-domain-contract`.
 - [x] **Step 1: Write failing ownership and invariant shape tests**
 
 ~~~go
@@ -400,7 +400,7 @@ git commit -m "test(assetcatalog): persist corrective PostgreSQL regression matr
 
 - [x] **Step 8: Independently review and accept the corrective Asset Catalog contract**
 
-Task 2 preflight found that the original `enforce_asset_sources_mutation` body permanently hard-coded `KUBERNETES_OPERATOR/AWX_INVENTORY` as unavailable. The contract below is the corrective acceptance specification。Step 8 owns no implementation/Red cycle，but every finding reopens its owning earlier checkbox and the reject/reopen state must be committed as a dedicated documentation checkpoint before implementation resumes。The first 2026-07-15 review returned `REJECT/P1` and reopened only Steps 1/5/6/7 for the missing persistent PostgreSQL 18.4 matrix；Steps 2–4 remained accepted because the new matrix exposed no production defect。Regression commit `ba99233` and the required Green evidence closed all reopened steps；the follow-up independent review returned `APPROVE` with no P0–P3 and no step to reopen。Task 2 remains closed until its own Step 1 is explicitly started.
+Task 2 preflight found that the original `enforce_asset_sources_mutation` body permanently hard-coded `KUBERNETES_OPERATOR/AWX_INVENTORY` as unavailable. The contract below is the corrective acceptance specification。Step 8 owns no implementation/Red cycle，but every finding reopens its owning earlier checkbox and the reject/reopen state must be committed as a dedicated documentation checkpoint before implementation resumes。The first 2026-07-15 review returned `REJECT/P1` and reopened only Steps 1/5/6/7 for the missing persistent PostgreSQL 18.4 matrix；Steps 2–4 remained accepted because the new matrix exposed no production defect。Regression commit `ba99233` and the required Green evidence closed all reopened steps；the follow-up independent review returned `APPROVE` with no P0–P3 and no step to reopen。Task 2 has now started in `BUILDING_CLOSED`; the new environment-mapping enum parity finding reopens only its owning Task 1 slice.
 
 Independently inspect the implementation and Green static/PostgreSQL evidence proving:
 

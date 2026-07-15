@@ -1,10 +1,10 @@
 # 01 — 资产目录、真实发现来源与 Control Plane
 
-本目录把 Phase 1 拆成 11 个可独立执行、审查和提交的生产任务包。它是[受治理运维能力总计划](../../2026-07-13-governed-operations-program.md)的第一阶段，产品、安全和前端语义以[已确认设计规范](../../../specs/2026-07-13-operational-assets-controlled-access-design.md)为准。
+本目录把 Phase 1 拆成 11 个生产任务包。它是[受治理运维能力总计划](../../2026-07-13-governed-operations-program.md)的第一阶段，产品、安全和前端语义以[已确认设计规范](../../../specs/2026-07-13-operational-assets-controlled-access-design.md)为准；快速构建的 Batch、并发和验证时机由[快速开发与真实验收计划](../../2026-07-15-fast-development-validation-program.md)统一覆盖。
 
 本阶段的终点不是枚举、假 Provider、静态页面或 Demo：它建立十表 PostgreSQL 事实（含不可变 Source Revision 权限 Environment 子表）、不可变 Source Revision、真实 CSV/API/CMDB/vSphere/Proxmox/OpenStack/AWS/Azure/GCP 协议适配、独立 Discovery Worker、HA lease/fence、加密 checkpoint、持久背压、逐 Provider gate，以及真实 OIDC/OpenAPI、Go 同源 SPA、类型化应用平台和 Overview。它仍不开放目标系统写操作；项目最终通过 Phase 7/8 的不可变 ActionPlan、策略、重新认证、人工审批、短凭据、类型化执行、独立验证、对账/回滚/升级与审计形成生产闭环。
 
-## 固定执行顺序
+## 产品依赖与最终验收顺序
 
 1. [01-schema-domain.md](./01-schema-domain.md) — 创建 `000015_assets_catalog` 十张表、Source Revision 权限 Environment/Run/Fence/Checkpoint 约束与稳定领域接口。
 2. [02-repository-discovery.md](./02-repository-discovery.md) — 实现 Scope Repository、append-only Observation、provenance、tombstone/恢复和原子 checkpoint 投影。
@@ -18,7 +18,7 @@
 10. [10-overview-control-room.md](./10-overview-control-room.md) — 闭合 `/overview` 安全聚合 API/UI，分维显示 Assets/Sources/Connections/Investigations/Actions/Releases，未实现项显式 `NOT_STARTED/UNAVAILABLE`。
 11. [11-e2e-docs.md](./11-e2e-docs.md) — 完成指标、真实 Keycloak/PostgreSQL/Playwright、视觉/axe/安全、CI、备份恢复、HA、持久文档和 Phase 1 签名验收。
 
-不得并行实现存在前置依赖的任务包。每包按 checkbox 顺序 Red → Green → Refactor，完成指定验证和 commit 后才进入下一包。
+存在前置依赖的代码只能消费已合并的稳定 `Produces` 接口。快速构建可按覆盖计划聚合 2–4 个相关旧 Task，并在接口冻结后并行 Provider/Web 轨道；任务包顺序继续约束 Phase 1 最终验收，不再强制每个 checkbox 独立 Red/Green/commit。C0 契约保留定向 RED，所有延后的真库、HA、恢复、安全、真实 Provider 与 E2E 证据必须在 G3/G4 补齐，补齐前能力保持 `UNAVAILABLE`。
 
 ## Consumes
 

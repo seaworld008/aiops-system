@@ -1,6 +1,6 @@
 # 规范到实施计划覆盖矩阵
 
-本矩阵用于证明[已确认设计规范](../../specs/2026-07-13-operational-assets-controlled-access-design.md)的每项要求都有唯一实施入口和生产验收出口。它只做追踪，不替代[总实施计划](../2026-07-13-governed-operations-program.md)、[版本基线](version-baseline.md)或各任务包。
+本矩阵用于证明[已确认设计规范](../../specs/2026-07-13-operational-assets-controlled-access-design.md)的每项要求都有唯一实施入口和生产验收出口。它只做追踪，不替代[总实施计划](../2026-07-13-governed-operations-program.md)、[快速开发与真实验收计划](../2026-07-15-fast-development-validation-program.md)、[版本基线](version-baseline.md)或各任务包。快速计划只改变证据执行时机和聚合粒度，不删除本矩阵任何覆盖项。
 
 ## 规范章节覆盖
 
@@ -23,7 +23,7 @@
 | 16 错误与停止条件 | [Phase 4](04-proactive-grants/README.md)、[Phase 5](05-host-postgresql/README.md)、[Phase 7](07-governed-actions/README.md)、[Phase 8](08-production-rollout/README.md) | drift/expiry/revocation/uncertainty 均 stop、清理、对账或人工升级 |
 | 17 审计与可观测性 | 每阶段 E2E/Operations 包 | 事务 Outbox、不可变 Evidence/Receipt/Audit、SLO/告警/Runbook |
 | 18 威胁模型 | 各阶段负向套件、[Phase 8 安全合规](08-production-rollout/04-security-compliance.md) | 机密面、越权、重放、Realm 混淆、供应链、恢复与发布滥用测试 |
-| 19 测试与验收 | 每个任务包的 TDD/commit 步骤 | Go/race/PostgreSQL/OpenAPI/Web/E2E/安全/恢复/灰度证据 |
+| 19 测试与验收 | 任务包最终证据 + 快速计划 G1/G2/G3/G4 | PR 快速门、批次集成、里程碑闭环，以及代码完成后的 Go/race/PostgreSQL/OpenAPI/Web/E2E/安全/恢复/真实依赖/灰度证据 |
 | 20 迁移与交付拆分 | [总实施计划](../2026-07-13-governed-operations-program.md) | 八个阶段门和 `SPEC_APPROVED → PRODUCTION_CLOSED_LOOP_ACCEPTED` 状态机 |
 | 21 非目标 | 各任务包 Global Constraints | 任意 shell/SQL/endpoint/payload、交互终端、ingestion、通用写代理均不存在 |
 | 22 文档持久化 | [Phase 8 最终交接](08-production-rollout/06-ownership-runbooks-final-e2e.md) | status、V4 小章节、ADR、frontend、OpenAPI、AGENTS、Runbook 合同测试 |

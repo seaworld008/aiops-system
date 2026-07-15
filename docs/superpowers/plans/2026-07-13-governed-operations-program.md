@@ -1,6 +1,6 @@
 # Governed Operations Program Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans. The checkbox Tasks preserve scope and final evidence; the fast-development overlay owns construction Batch order and validation cadence.
 
 **Goal:** Deliver the approved governed-operations control plane as a complete, supportable production closed loop spanning governed investigation, approved execution, verification, recovery, audit, and staged rollout.
 
@@ -8,7 +8,9 @@
 
 **Tech Stack:** Go 1.26.5, PostgreSQL 18.4, Temporal Go SDK 1.46.0, Keycloak Server 26.6.3/keycloak-js 26.2.4, Vault, mTLS Runner protocols, OpenAPI 3.1, Node.js 24 LTS, pnpm 10.34.0, React 19.2.7, TypeScript 7.0.2, Vite 8.1.4, TanStack Router/Query/Table, CSS Modules, Vitest, MSW, Playwright, and axe. Exact planning pins and verification sources live in the [version baseline](2026-07-13-governed-operations/version-baseline.md).
 
-**Navigation:** [current status](../../status/current.md) · [small-document index](2026-07-13-governed-operations/README.md) · [specification coverage](2026-07-13-governed-operations/coverage-matrix.md) · [version baseline](2026-07-13-governed-operations/version-baseline.md) · [approved design](../specs/2026-07-13-operational-assets-controlled-access-design.md)
+**Navigation:** [current status](../../status/current.md) · [fast development and real qualification](2026-07-15-fast-development-validation-program.md) · [small-document index](2026-07-13-governed-operations/README.md) · [specification coverage](2026-07-13-governed-operations/coverage-matrix.md) · [version baseline](2026-07-13-governed-operations/version-baseline.md) · [approved design](../specs/2026-07-13-operational-assets-controlled-access-design.md)
+
+> **Execution policy:** The approved product/security design and all final evidence remain unchanged. During fast construction, [2026-07-15-fast-development-validation-program.md](2026-07-15-fast-development-validation-program.md) supersedes this file's old phase-wide serial order, per-Task commit/TDD cadence, and requirement to rerun release-grade validation after each small Task. It does not supersede safety invariants, stable interfaces, migration ownership, production gates, or acceptance decisions.
 
 ## Global Constraints
 
@@ -31,7 +33,7 @@
 - Accessibility target is WCAG 2.2 AA with visible focus, persistent labels, keyboard operation, reduced motion, non-color status cues, and 44px touch targets.
 - All implementation work runs in an isolated worktree whose module root does not contain nested `.worktrees`; do not delete or modify the user's existing worktrees to make architecture-boundary tests pass.
 - Migration ownership is fixed: `000015` assets, `000016` connections/runtime/realms, `000017` VictoriaMetrics, `000018` grants/policies, `000019` host/PostgreSQL, `000020` production platform, `000021` governed actions, `000022` release governance.
-- Each phase follows TDD, ends in a reviewable commit sequence, and must leave `go test ./...`, `go vet ./...`, `go build ./cmd/...`, and `pnpm --dir web check` green before the next phase starts.
+- Every implementation PR passes G1 and every 2–4-Task Batch passes G2. Vertical Milestones pass G3; full repository, real dependency, HA, recovery, security and release qualification runs in G4 after system code is closed-complete. C0 safety/public-contract changes retain targeted fail-first proof; closed later-phase code may begin once its stable `Consumes` interfaces are merged.
 
 ---
 
@@ -50,7 +52,7 @@
 
 Phase 5 的 AWX/Host 后继接口由 [identity enrollment](../../contracts/awx-host-identity-enrollment-v1.md)、[governed launch admission](../../contracts/awx-governed-launch-admission-v1.md) 与 [host identity attestor](../../contracts/host-identity-attestor-v1.md) 三份确认契约共同拥有；任务包只能消费这些契约，不能另造 stock-launch、导出式 identity 或内存 cleanup 旁路。
 
-The detailed plans own all code-level TDD steps. This program file owns ordering, integration gates, shared names, and the final handoff only; it must not be used to skip a detailed plan.
+The detailed plans own scope, files, interfaces, safety contracts and final acceptance evidence. The fast-development overlay owns implementation ordering, Batch boundaries, concurrency and G1–G4 timing. A Batch may aggregate related checkbox Tasks, but it cannot omit their required behavior or convert deferred qualification into PASS.
 
 ## Cross-plan Interface Contract
 
@@ -70,6 +72,8 @@ Cross-plan identifiers are UUIDs on persistence/API boundaries. Content-addresse
 Phase 1 的稳定接口进一步锁定：Source/Asset revision 使用 `int64`；`asset_source_revisions.canonical_revision_digest` 就是覆盖完整不可变可用性绑定的 `BindingDigest`，`source_definition_digest` 是 `asset-source-definition.v2` 的 Provider/Profile definition（包含持久 canonical Profile manifest 与 Provider schema 的 raw SHA，不包含 source-specific binding 或 typed extension）；资产类型在 `000015` 以命名闭集约束 `assets_kind_check` 建立并由 `000017` 扩展；跨 Environment Relationship 显式携带 source/target Environment；Binding 软删除状态为 `INACTIVE`；所有 Mapping mutation 都返回持久 `MutationReceipt`。后续任务包只能消费这些定义，不得重定义平行 DTO、摘要语义或软删除状态。
 
 ## Program State Machine
+
+Construction state is tracked orthogonally as `NOT_STARTED → BUILDING_CLOSED → BUILT_CLOSED → INTEGRATING_CLOSED → SYSTEM_CODE_COMPLETE_CLOSED → QUALIFYING`. None of these construction states changes the runtime acceptance state below. References later in this historical plan such as “do not begin the next Plan” apply to production acceptance and availability; fast construction may advance closed code only through merged stable `Produces` interfaces and the overlay gates.
 
 ```text
 SPEC_APPROVED
@@ -153,7 +157,7 @@ Expected: no output. Baseline verification creates no repository mutation.
 
 - [ ] **Step 1: Execute every unchecked Plan 1 task in order**
 
-Use the task-level tests and commits from the detailed plan. Do not begin Plan 2 while any Plan 1 checkbox remains unchecked.
+Use the task-level requirements as final evidence inputs. Production acceptance cannot advance to Plan 2 while Plan 1's acceptance evidence is incomplete; fast construction may build closed Plan 2 slices after the required Plan 1 `Produces` interfaces are stable and merged, under the overlay's Batch ownership rules.
 
 - [ ] **Step 2: Verify migration and API ownership**
 
