@@ -21,6 +21,13 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Install required repository tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ripgrep
+          rg --version
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24
