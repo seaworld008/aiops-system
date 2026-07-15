@@ -58,6 +58,54 @@ jobs:
           cache-dependency-path: go.sum
       - run: go mod download
       - run: go mod verify
+      - name: Provision exact PostgreSQL role ABI
+        shell: bash
+        env:
+          PGPASSWORD: aiops-test-only
+        run: |
+          set -euo pipefail
+          postgres_image='docker.io/library/postgres:18.4-alpine3.24@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15'
+          migration_password="$(openssl rand -hex 32)"
+          application_password="$(openssl rand -hex 32)"
+          test "${migration_password}" != "${application_password}"
+          echo "::add-mask::${migration_password}"
+          echo "::add-mask::${application_password}"
+
+          export AIOPS_BOOTSTRAP_MIGRATION_PASSWORD="${migration_password}"
+          export AIOPS_BOOTSTRAP_APPLICATION_PASSWORD="${application_password}"
+          docker run --rm --network host --interactive \
+            --env PGPASSWORD \
+            --env AIOPS_BOOTSTRAP_MIGRATION_PASSWORD \
+            --env AIOPS_BOOTSTRAP_APPLICATION_PASSWORD \
+            "${postgres_image}" \
+            psql -X --set ON_ERROR_STOP=1 \
+              --host 127.0.0.1 --port 5432 --username aiops --dbname aiops_test <<'SQL'
+          \getenv migration_password AIOPS_BOOTSTRAP_MIGRATION_PASSWORD
+          \getenv application_password AIOPS_BOOTSTRAP_APPLICATION_PASSWORD
+          BEGIN;
+          CREATE ROLE aiops_migrator
+            LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+            PASSWORD :'migration_password';
+          CREATE ROLE aiops_schema_owner
+            NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+          CREATE ROLE aiops_control_plane_runtime
+            NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+          CREATE ROLE aiops_control_plane_workload
+            LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+            PASSWORD :'application_password';
+          GRANT aiops_schema_owner TO aiops_migrator
+            WITH ADMIN FALSE, INHERIT FALSE, SET TRUE;
+          GRANT aiops_control_plane_runtime TO aiops_control_plane_workload
+            WITH ADMIN FALSE, INHERIT TRUE, SET FALSE;
+          COMMIT;
+          SQL
+
+          {
+            printf 'AIOPS_TEST_POSTGRES_MIGRATION_DSN=postgres://aiops_migrator:%s@127.0.0.1:5432/aiops_test?sslmode=disable\n' "${migration_password}"
+            printf 'AIOPS_TEST_POSTGRES_APPLICATION_DSN=postgres://aiops_control_plane_workload:%s@127.0.0.1:5432/aiops_test?sslmode=disable\n' "${application_password}"
+          } >> "${GITHUB_ENV}"
+          unset migration_password application_password \
+            AIOPS_BOOTSTRAP_MIGRATION_PASSWORD AIOPS_BOOTSTRAP_APPLICATION_PASSWORD
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
       - run: git diff --check

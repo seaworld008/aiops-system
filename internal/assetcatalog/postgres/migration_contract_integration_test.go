@@ -277,23 +277,25 @@ func TestAssetCatalogRuntimeRejectsPhysicalDeleteAndTruncate(t *testing.T) {
 	fixture := seedGovernedManualCatalog(t, harness.db)
 
 	rows := []struct {
-		table string
-		id    string
+		table     string
+		predicate string
+		id        string
 	}{
-		{"asset_sources", fixture.sourceID},
-		{"asset_source_revisions", fixture.revisionID},
-		{"asset_source_runs", fixture.runID},
-		{"asset_observations", fixture.observationID},
-		{"assets", fixture.assetID},
-		{"asset_type_details", fixture.typeDetailID},
-		{"asset_conflicts", fixture.conflictID},
-		{"asset_relationships", fixture.relationshipID},
-		{"service_asset_bindings", fixture.bindingID},
+		{"asset_sources", "id=$1", fixture.sourceID},
+		{"asset_source_revisions", "id=$1", fixture.revisionID},
+		{"asset_source_revision_authorities", "source_id=$1", fixture.sourceID},
+		{"asset_source_runs", "id=$1", fixture.runID},
+		{"asset_observations", "id=$1", fixture.observationID},
+		{"assets", "id=$1", fixture.assetID},
+		{"asset_type_details", "id=$1", fixture.typeDetailID},
+		{"asset_conflicts", "id=$1", fixture.conflictID},
+		{"asset_relationships", "id=$1", fixture.relationshipID},
+		{"service_asset_bindings", "id=$1", fixture.bindingID},
 	}
 	for _, row := range rows {
 		t.Run("delete "+row.table, func(t *testing.T) {
 			expectRuntimeContractError(t, harness.db, "55000", row.table+"_delete_guard",
-				fmt.Sprintf("DELETE FROM %s WHERE id=$1", row.table), row.id)
+				fmt.Sprintf("DELETE FROM %s WHERE %s", row.table, row.predicate), row.id)
 		})
 		t.Run("truncate "+row.table, func(t *testing.T) {
 			expectRuntimeContractError(t, harness.db, "55000", row.table+"_truncate_guard",
@@ -307,40 +309,70 @@ func TestAssetCatalogRuntimeLifecycleAndRetirement(t *testing.T) {
 	harness.applyThroughAssetCatalog(t)
 	fixture := seedGovernedManualCatalog(t, harness.db)
 
-	var lifecycle string
-	if err := harness.db.QueryRow(context.Background(), `
-		SELECT lifecycle FROM assets WHERE id=$1
-	`, fixture.assetID).Scan(&lifecycle); err != nil {
-		t.Fatalf("read asset lifecycle: %v", err)
+	pathTo := map[string][]string{
+		"DISCOVERED":  nil,
+		"ACTIVE":      {"ACTIVE"},
+		"STALE":       {"ACTIVE", "STALE"},
+		"QUARANTINED": {"QUARANTINED"},
+		"RETIRED":     {"RETIRED"},
 	}
-	invalidTarget := map[string]string{
-		"DISCOVERED":  "STALE",
-		"ACTIVE":      "DISCOVERED",
-		"STALE":       "DISCOVERED",
-		"QUARANTINED": "STALE",
-		"RETIRED":     "ACTIVE",
-	}[lifecycle]
-	if invalidTarget == "" {
-		t.Fatalf("unexpected fixture lifecycle %q", lifecycle)
+	allowed := map[string][]string{
+		"DISCOVERED":  {"ACTIVE", "QUARANTINED", "RETIRED"},
+		"ACTIVE":      {"STALE", "QUARANTINED", "RETIRED"},
+		"STALE":       {"ACTIVE", "QUARANTINED", "RETIRED"},
+		"QUARANTINED": {"ACTIVE", "RETIRED"},
 	}
-	invalidState := "23514"
-	invalidConstraint := "assets_lifecycle_guard"
-	if lifecycle == "RETIRED" {
-		invalidState = "55000"
-		invalidConstraint = "assets_retired_terminal_guard"
+	for source, targets := range allowed {
+		for _, target := range targets {
+			t.Run("allows "+source+" to "+target, func(t *testing.T) {
+				transaction, err := harness.db.Begin(context.Background())
+				if err != nil {
+					t.Fatalf("begin allowed lifecycle transition: %v", err)
+				}
+				defer func() { _ = transaction.Rollback(context.Background()) }()
+				for _, state := range pathTo[source] {
+					execAssetSQL(t, transaction, `
+						UPDATE assets SET lifecycle=$1,version=version+1 WHERE id=$2
+					`, state, fixture.assetID)
+				}
+				execAssetSQL(t, transaction, `
+					UPDATE assets SET lifecycle=$1,version=version+1 WHERE id=$2
+				`, target, fixture.assetID)
+			})
+		}
 	}
-	expectRuntimeContractError(t, harness.db, invalidState, invalidConstraint, `
-		UPDATE assets SET lifecycle=$1,version=version+1 WHERE id=$2
-	`, invalidTarget, fixture.assetID)
 
-	if lifecycle != "RETIRED" {
-		execAssetSQL(t, harness.db, `
-			UPDATE assets SET lifecycle='RETIRED',version=version+1 WHERE id=$1
-		`, fixture.assetID)
+	forbidden := map[string][]string{
+		"DISCOVERED":  {"STALE"},
+		"ACTIVE":      {"DISCOVERED"},
+		"STALE":       {"DISCOVERED"},
+		"QUARANTINED": {"DISCOVERED", "STALE"},
+		"RETIRED":     {"DISCOVERED", "ACTIVE", "STALE", "QUARANTINED"},
 	}
-	expectRuntimeContractError(t, harness.db, "55000", "assets_retired_terminal_guard", `
-		UPDATE assets SET lifecycle='ACTIVE',version=version+1 WHERE id=$1
-	`, fixture.assetID)
+	for source, targets := range forbidden {
+		for _, target := range targets {
+			t.Run("rejects "+source+" to "+target, func(t *testing.T) {
+				transaction, err := harness.db.Begin(context.Background())
+				if err != nil {
+					t.Fatalf("begin forbidden lifecycle transition: %v", err)
+				}
+				defer func() { _ = transaction.Rollback(context.Background()) }()
+				for _, state := range pathTo[source] {
+					execAssetSQL(t, transaction, `
+						UPDATE assets SET lifecycle=$1,version=version+1 WHERE id=$2
+					`, state, fixture.assetID)
+				}
+				_, mutationErr := transaction.Exec(context.Background(), `
+					UPDATE assets SET lifecycle=$1,version=version+1 WHERE id=$2
+				`, target, fixture.assetID)
+				if source == "RETIRED" {
+					assertRuntimePostgresError(t, mutationErr, "55000", "assets_retired_terminal_guard")
+					return
+				}
+				assertRuntimePostgresError(t, mutationErr, "23514", "assets_lifecycle_guard")
+			})
+		}
+	}
 }
 
 func TestAssetCatalogRuntimeConcurrentCASAllowsOneWriter(t *testing.T) {

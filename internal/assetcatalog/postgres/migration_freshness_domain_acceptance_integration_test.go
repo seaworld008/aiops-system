@@ -390,7 +390,7 @@ func TestAssetCatalogCanonicalSuccessorResetsObservationAndRelationshipFreshness
 	oldRevisionObservation.freshnessSequence = 101
 	oldRevisionObservation.previousID = baselineObservation.id
 	oldRevisionObservation.previousChain = baselineObservation.observationChain
-	oldRevisionObservation.sourceDefinitionDigest = strings.Repeat("3", 64)
+	oldRevisionObservation.sourceDefinitionDigest = fixture.sourceDefinitionDigest
 	oldArguments := runtimeObservationArguments(oldRevisionObservation)
 	oldArguments[13] = strings.Repeat("1", 64)
 	oldArguments[14] = strings.Repeat("2", 64)
@@ -459,7 +459,7 @@ func TestAssetCatalogCanonicalSuccessorResetsObservationAndRelationshipFreshness
 		t.Fatalf("read canonical successor freshness projections: %v", err)
 	}
 	if observationRevision != 2 || relationshipRevision != 2 ||
-		observationDigest != strings.Repeat("d", 64) || relationshipDigest != strings.Repeat("d", 64) ||
+		observationDigest != successorRun.revisionDigest || relationshipDigest != successorRun.revisionDigest ||
 		observationKind != "CHECKPOINT_SEQUENCE" || relationshipKind != "CHECKPOINT_SEQUENCE" ||
 		observationOrder != 1 || relationshipOrder != 1 ||
 		observationFact != strings.Repeat("4", 64) || relationshipFact != strings.Repeat("5", 64) ||

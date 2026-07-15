@@ -48,12 +48,7 @@ func TestAssetCatalogMigrationKeepsLegacyHTTPProcessLive(t *testing.T) {
 	legacyClient := legacyProcess.Client()
 
 	assertLegacyHTTPProcessReads(t, legacyClient, legacyProcess.URL, "before 000015")
-	if _, err := harness.db.Exec(
-		context.Background(),
-		readMigration(t, "000015_assets_catalog.up.sql"),
-	); err != nil {
-		t.Fatalf("apply 000015 while legacy HTTP process is live: %v", err)
-	}
+	harness.applyMigration(t, "000015_assets_catalog.up.sql")
 	assertLegacyHTTPProcessReads(t, legacyClient, legacyProcess.URL, "after 000015")
 }
 
@@ -65,12 +60,7 @@ func TestAssetCatalogMigrationDoesNotRewriteOrAlterLegacyHeaps(t *testing.T) {
 	if len(before) == 0 {
 		t.Fatal("000014 schema has no public heaps to protect")
 	}
-	if _, err := harness.db.Exec(
-		context.Background(),
-		readMigration(t, "000015_assets_catalog.up.sql"),
-	); err != nil {
-		t.Fatalf("apply 000015 while legacy heap snapshots are retained: %v", err)
-	}
+	harness.applyMigration(t, "000015_assets_catalog.up.sql")
 	after := snapshotLegacyPublicHeaps(t, harness.db)
 
 	for relation, beforeSnapshot := range before {
@@ -135,7 +125,7 @@ func snapshotLegacyPublicHeaps(
 			)::bigint,
 			COALESCE(
 				jsonb_agg(
-					to_jsonb(attribute) || jsonb_build_object(
+					(to_jsonb(attribute) - 'attacl') || jsonb_build_object(
 						'default_node_tree', definition.adbin::text,
 						'default_expression', pg_catalog.pg_get_expr(
 							definition.adbin,

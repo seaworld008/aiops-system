@@ -42,13 +42,19 @@ import (
 
 var safeMigrationControlDatabase = regexp.MustCompile(`^aiops_test(_[a-z0-9]+)*$`)
 
+type migrationIntegrationDatabase struct {
+	db        *pgxpool.Pool
+	migration *pgxpool.Pool
+}
+
 func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	dsn := os.Getenv("AIOPS_TEST_POSTGRES_DSN")
 	if dsn == "" {
 		t.Skip("AIOPS_TEST_POSTGRES_DSN is not configured")
 	}
 	ctx := context.Background()
-	database := newMigrationIntegrationDatabase(t, dsn)
+	harness := newMigrationIntegrationDatabase(t, dsn)
+	database := harness.db
 
 	migrationDirectory := migrationPath(t)
 	applyMigrationsBefore(t, ctx, database, migrationDirectory, ".up.sql", "000007_runner_execution_hardening.up.sql")
@@ -257,8 +263,8 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	applyMigrationFile(t, ctx, database, outboxRoutingUp)
 	applyMigrationFile(t, ctx, database, filepath.Join(migrationDirectory, "000013_investigation_runtime_binding.up.sql"))
 	applyMigrationFile(t, ctx, database, filepath.Join(migrationDirectory, "000014_read_evidence_clock_skew.up.sql"))
-	applyMigrationFile(t, ctx, database, filepath.Join(migrationDirectory, "000015_assets_catalog.up.sql"))
-	applyMigrations(t, ctx, database, migrationDirectory, ".down.sql", true)
+	applyMigrationFile(t, ctx, harness.migration, filepath.Join(migrationDirectory, "000015_assets_catalog.up.sql"))
+	applyMigrations(t, ctx, database, harness.migration, migrationDirectory, ".down.sql", true)
 	var relationName *string
 	if err := database.QueryRow(ctx, `SELECT to_regclass('public.tenants')::text`).Scan(&relationName); err != nil {
 		t.Fatalf("check down migration: %v", err)
@@ -295,7 +301,7 @@ func TestMigrationIntegrationDatabaseNameGuard(t *testing.T) {
 	}
 }
 
-func newMigrationIntegrationDatabase(t *testing.T, dsn string) *pgxpool.Pool {
+func newMigrationIntegrationDatabase(t *testing.T, dsn string) *migrationIntegrationDatabase {
 	t.Helper()
 	ctx := context.Background()
 	adminConfig, err := pgxpool.ParseConfig(dsn)
@@ -320,12 +326,29 @@ func newMigrationIntegrationDatabase(t *testing.T, dsn string) *pgxpool.Pool {
 		admin.Close()
 		t.Fatalf("integration harness requires PostgreSQL 18.4 or newer 18.x, got server_version_num=%d", serverVersion)
 	}
+	migrationDSN := strings.TrimSpace(os.Getenv("AIOPS_TEST_POSTGRES_MIGRATION_DSN"))
+	if migrationDSN == "" {
+		admin.Close()
+		t.Fatal("AIOPS_TEST_POSTGRES_MIGRATION_DSN is required when the full migration harness is enabled")
+	}
+	migrationConfig, err := pgxpool.ParseConfig(migrationDSN)
+	if err != nil {
+		admin.Close()
+		t.Fatal("parse PostgreSQL migration identity DSN: invalid configuration")
+	}
+	if migrationConfig.ConnConfig.Database != controlName || migrationConfig.ConnConfig.User != "aiops_migrator" {
+		admin.Close()
+		t.Fatal("PostgreSQL migration identity DSN must name the same safe control database as aiops_migrator")
+	}
 
 	databaseName := "aiops_migrations_test_" + randomMigrationHex(t, 16)
 	identifier := pgx.Identifier{databaseName}.Sanitize()
-	var database *pgxpool.Pool
+	var database, migration *pgxpool.Pool
 	created := false
 	t.Cleanup(func() {
+		if migration != nil {
+			migration.Close()
+		}
 		if database != nil {
 			database.Close()
 		}
@@ -336,31 +359,86 @@ func newMigrationIntegrationDatabase(t *testing.T, dsn string) *pgxpool.Pool {
 		}
 		admin.Close()
 	})
-	if _, err := admin.Exec(ctx, "CREATE DATABASE "+identifier+" WITH TEMPLATE template0"); err != nil {
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+identifier+" WITH TEMPLATE template0 OWNER aiops_schema_owner"); err != nil {
 		t.Fatalf("create isolated PostgreSQL migration database %s; ownership unconfirmed, refusing destructive cleanup: %v", databaseName, err)
 	}
 	created = true
-	config, err := pgxpool.ParseConfig(dsn)
+	if _, err := admin.Exec(ctx, `SET ROLE aiops_schema_owner;
+REVOKE ALL ON DATABASE `+identifier+` FROM PUBLIC;
+REVOKE ALL ON DATABASE `+identifier+` FROM aiops_control_plane_runtime;
+GRANT CONNECT ON DATABASE `+identifier+` TO aiops_migrator;
+GRANT CONNECT ON DATABASE `+identifier+` TO aiops_control_plane_workload;
+RESET ROLE;`); err != nil {
+		t.Fatalf("preprovision isolated PostgreSQL migration database ACL: %v", err)
+	}
+
+	migrationConfig.ConnConfig.Database = databaseName
+	migrationConfig.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	if migrationConfig.ConnConfig.RuntimeParams == nil {
+		migrationConfig.ConnConfig.RuntimeParams = make(map[string]string)
+	}
+	migrationConfig.ConnConfig.RuntimeParams["search_path"] = "pg_catalog,public,pg_temp"
+	if migrationConfig.MaxConns < 6 {
+		migrationConfig.MaxConns = 6
+	}
+	migration, err = pgxpool.NewWithConfig(ctx, migrationConfig)
 	if err != nil {
-		t.Fatalf("parse isolated PostgreSQL migration config: %v", err)
+		t.Fatal("connect isolated PostgreSQL migration identity: unavailable")
 	}
-	config.ConnConfig.Database = databaseName
-	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
-	if config.ConnConfig.RuntimeParams == nil {
-		config.ConnConfig.RuntimeParams = make(map[string]string)
+	if err := migration.Ping(ctx); err != nil {
+		t.Fatal("ping isolated PostgreSQL migration identity: unavailable")
 	}
-	config.ConnConfig.RuntimeParams["search_path"] = "public"
-	if config.MaxConns < 6 {
-		config.MaxConns = 6
+	assertMigrationIntegrationIdentity(t, migration, "aiops_migrator", "aiops_migrator")
+
+	ownerConfig := migrationConfig.Copy()
+	ownerConfig.AfterConnect = func(ctx context.Context, connection *pgx.Conn) error {
+		var sessionUser, currentUser string
+		if err := connection.QueryRow(ctx, `SELECT session_user, current_user`).Scan(&sessionUser, &currentUser); err != nil {
+			return errors.New("inspect full migration owner-context identity")
+		}
+		if sessionUser != "aiops_migrator" || currentUser != "aiops_migrator" {
+			return errors.New("full migration owner-context login identity drifted")
+		}
+		if _, err := connection.Exec(ctx, `SET ROLE aiops_schema_owner`); err != nil {
+			return errors.New("enter full migration schema-owner context")
+		}
+		return nil
 	}
-	database, err = pgxpool.NewWithConfig(ctx, config)
+	ownerConfig.ConnConfig.RuntimeParams["search_path"] = "public"
+	database, err = pgxpool.NewWithConfig(ctx, ownerConfig)
 	if err != nil {
-		t.Fatalf("connect isolated PostgreSQL migration database: %v", err)
+		t.Fatal("connect isolated PostgreSQL schema-owner context: unavailable")
 	}
 	if err := database.Ping(ctx); err != nil {
-		t.Fatalf("ping isolated PostgreSQL migration database: %v", err)
+		t.Fatal("ping isolated PostgreSQL schema-owner context: unavailable")
 	}
-	return database
+	assertMigrationIntegrationIdentity(t, database, "aiops_migrator", "aiops_schema_owner")
+	if _, err := database.Exec(ctx, `ALTER SCHEMA public OWNER TO aiops_schema_owner;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON SCHEMA public FROM aiops_migrator;
+REVOKE ALL ON SCHEMA public FROM aiops_control_plane_workload;
+GRANT CREATE, USAGE ON SCHEMA public TO aiops_schema_owner;
+GRANT USAGE ON SCHEMA public TO aiops_control_plane_runtime;`); err != nil {
+		t.Fatalf("preprovision isolated PostgreSQL migration schema ACL: %v", err)
+	}
+	return &migrationIntegrationDatabase{db: database, migration: migration}
+}
+
+func assertMigrationIntegrationIdentity(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	wantSession string,
+	wantCurrent string,
+) {
+	t.Helper()
+	var sessionUser, currentUser string
+	if err := pool.QueryRow(context.Background(), `SELECT session_user, current_user`).Scan(&sessionUser, &currentUser); err != nil {
+		t.Fatalf("read full migration PostgreSQL identity: %v", err)
+	}
+	if sessionUser != wantSession || currentUser != wantCurrent {
+		t.Fatalf("full migration identity=session:%q current:%q, want session:%q current:%q",
+			sessionUser, currentUser, wantSession, wantCurrent)
+	}
 }
 
 func migrationControlDatabaseNameSafe(name string) bool {
@@ -5457,7 +5535,15 @@ func expectMigrationConstraint(
 	}
 }
 
-func applyMigrations(t *testing.T, ctx context.Context, database *pgxpool.Pool, directory, suffix string, reverse bool) {
+func applyMigrations(
+	t *testing.T,
+	ctx context.Context,
+	database *pgxpool.Pool,
+	assetMigration *pgxpool.Pool,
+	directory string,
+	suffix string,
+	reverse bool,
+) {
 	t.Helper()
 	entries, err := os.ReadDir(directory)
 	if err != nil {
@@ -5476,7 +5562,11 @@ func applyMigrations(t *testing.T, ctx context.Context, database *pgxpool.Pool, 
 		}
 	}
 	for _, filename := range files {
-		applyMigrationFile(t, ctx, database, filename)
+		migrationDatabase := database
+		if filepath.Base(filename) == "000015_assets_catalog.down.sql" {
+			migrationDatabase = assetMigration
+		}
+		applyMigrationFile(t, ctx, migrationDatabase, filename)
 	}
 }
 

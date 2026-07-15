@@ -3,12 +3,40 @@ BEGIN;
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '30s';
 
-SET LOCAL search_path = public, pg_catalog, pg_temp;
+SET LOCAL search_path = pg_catalog, public, pg_temp;
 
-LOCK TABLE tenants, workspaces, environments, integrations, services, service_bindings,
-    audit_records, outbox_events IN ACCESS EXCLUSIVE MODE;
+SET LOCAL ROLE aiops_schema_owner;
 
-CREATE OR REPLACE FUNCTION asset_catalog_text_valid(candidate text, maximum_bytes integer)
+LOCK TABLE public.tenants, public.workspaces, public.environments, public.integrations,
+    public.services, public.service_bindings, public.audit_records, public.outbox_events
+    IN ACCESS EXCLUSIVE MODE NOWAIT;
+
+DO $$
+DECLARE
+    missing_role text;
+BEGIN
+    SELECT required.role_name
+    INTO missing_role
+    FROM unnest(ARRAY[
+        'aiops_migrator',
+        'aiops_schema_owner',
+        'aiops_control_plane_runtime',
+        'aiops_control_plane_workload'
+    ]::text[]) AS required(role_name)
+    LEFT JOIN pg_catalog.pg_roles AS role
+      ON role.rolname = required.role_name
+    WHERE role.oid IS NULL
+    ORDER BY required.role_name COLLATE "C"
+    LIMIT 1;
+    IF missing_role IS NOT NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '42704',
+            MESSAGE = 'required database role is missing: ' || missing_role;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION public.asset_catalog_text_valid(candidate text, maximum_bytes integer)
 RETURNS boolean AS $$
 BEGIN
     RETURN candidate IS NOT NULL
@@ -17,9 +45,9 @@ BEGIN
        AND candidate COLLATE "C" !~ '[[:cntrl:]]';
 END;
 $$ LANGUAGE plpgsql IMMUTABLE
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
-CREATE OR REPLACE FUNCTION asset_catalog_code_valid(candidate text, maximum_bytes integer)
+CREATE OR REPLACE FUNCTION public.asset_catalog_code_valid(candidate text, maximum_bytes integer)
 RETURNS boolean AS $$
 BEGIN
     RETURN asset_catalog_text_valid(candidate, maximum_bytes)
@@ -27,9 +55,9 @@ BEGIN
        AND candidate COLLATE "C" !~ '[^A-Za-z0-9_.:/@+-]';
 END;
 $$ LANGUAGE plpgsql IMMUTABLE
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
-CREATE OR REPLACE FUNCTION asset_catalog_sha256_valid(candidate text)
+CREATE OR REPLACE FUNCTION public.asset_catalog_sha256_valid(candidate text)
 RETURNS boolean AS $$
 BEGIN
     RETURN candidate IS NOT NULL
@@ -37,9 +65,9 @@ BEGIN
        AND candidate COLLATE "C" !~ '[^a-f0-9]';
 END;
 $$ LANGUAGE plpgsql IMMUTABLE
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
-CREATE OR REPLACE FUNCTION asset_catalog_provider_kind_valid(candidate text)
+CREATE OR REPLACE FUNCTION public.asset_catalog_provider_kind_valid(candidate text)
 RETURNS boolean AS $$
 BEGIN
     RETURN candidate IS NOT NULL
@@ -47,9 +75,9 @@ BEGIN
        AND candidate COLLATE "C" ~ '^[A-Z][A-Z0-9_]{0,63}$';
 END;
 $$ LANGUAGE plpgsql IMMUTABLE
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
-CREATE OR REPLACE FUNCTION asset_catalog_idempotency_key_valid(candidate text)
+CREATE OR REPLACE FUNCTION public.asset_catalog_idempotency_key_valid(candidate text)
 RETURNS boolean AS $$
 BEGIN
     RETURN candidate IS NOT NULL
@@ -57,9 +85,18 @@ BEGIN
        AND candidate COLLATE "C" ~ '^[a-z0-9][a-z0-9._:/-]{0,127}$';
 END;
 $$ LANGUAGE plpgsql IMMUTABLE
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
-CREATE OR REPLACE FUNCTION asset_catalog_json_object_valid(
+CREATE OR REPLACE FUNCTION public.asset_catalog_opaque_reference_valid(candidate text)
+RETURNS boolean AS $$
+BEGIN
+    RETURN candidate IS NOT NULL
+       AND candidate COLLATE "C" ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$';
+END;
+$$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE SECURITY INVOKER
+SET search_path = pg_catalog, public, pg_temp;
+
+CREATE OR REPLACE FUNCTION public.asset_catalog_json_object_valid(
     document bytea,
     minimum_bytes integer,
     maximum_bytes integer
@@ -77,9 +114,9 @@ EXCEPTION
         RETURN false;
 END;
 $$ LANGUAGE plpgsql IMMUTABLE
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
-CREATE OR REPLACE FUNCTION asset_catalog_labels_valid(document jsonb)
+CREATE OR REPLACE FUNCTION public.asset_catalog_labels_valid(document jsonb)
 RETURNS boolean AS $$
 BEGIN
     RETURN document IS NOT NULL
@@ -88,9 +125,9 @@ BEGIN
        AND octet_length(convert_to(document::text, 'UTF8')) <= 16384;
 END;
 $$ LANGUAGE plpgsql IMMUTABLE
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
-CREATE OR REPLACE FUNCTION asset_catalog_checkpoint_envelope_valid(envelope bytea)
+CREATE OR REPLACE FUNCTION public.asset_catalog_checkpoint_envelope_valid(envelope bytea)
 RETURNS boolean AS $$
 BEGIN
     RETURN envelope IS NOT NULL
@@ -99,9 +136,9 @@ BEGIN
        AND substring(envelope FROM 2 FOR 12) <> decode(repeat('00', 12), 'hex');
 END;
 $$ LANGUAGE plpgsql IMMUTABLE
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
-CREATE OR REPLACE FUNCTION asset_catalog_field_provenance_valid(document bytea)
+CREATE OR REPLACE FUNCTION public.asset_catalog_field_provenance_valid(document bytea)
 RETURNS boolean AS $$
 DECLARE
     parsed jsonb;
@@ -157,9 +194,9 @@ EXCEPTION
         RETURN false;
 END;
 $$ LANGUAGE plpgsql IMMUTABLE
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
-CREATE TABLE asset_sources (
+CREATE TABLE public.asset_sources (
     id uuid PRIMARY KEY,
     tenant_id uuid NOT NULL,
     workspace_id uuid NOT NULL,
@@ -199,7 +236,7 @@ CREATE TABLE asset_sources (
     UNIQUE (tenant_id, workspace_id, id),
     UNIQUE (tenant_id, workspace_id, id, provider_kind),
     UNIQUE (workspace_id, create_idempotency_key),
-    FOREIGN KEY (tenant_id, workspace_id) REFERENCES workspaces (tenant_id, id) ON DELETE RESTRICT,
+    FOREIGN KEY (tenant_id, workspace_id) REFERENCES public.workspaces (tenant_id, id) ON DELETE RESTRICT,
     CONSTRAINT asset_sources_published_pointer_ck CHECK ((
         (published_revision IS NULL AND published_revision_digest IS NULL) OR
         (published_revision > 0 AND asset_catalog_sha256_valid(published_revision_digest))
@@ -220,7 +257,7 @@ CREATE TABLE asset_sources (
             asset_catalog_checkpoint_envelope_valid(checkpoint_ciphertext) AND
             asset_catalog_code_valid(checkpoint_key_id, 256) AND
             asset_catalog_sha256_valid(checkpoint_sha256) AND
-            encode(sha256(checkpoint_ciphertext), 'hex') = checkpoint_sha256 AND
+            pg_catalog.encode(pg_catalog.sha256(checkpoint_ciphertext), 'hex') = checkpoint_sha256 AND
             checkpoint_revision > 0 AND checkpoint_version > 0
         )
     ),
@@ -241,11 +278,19 @@ CREATE TABLE asset_sources (
     )
 );
 
-COMMENT ON COLUMN asset_sources.checkpoint_ciphertext IS
+COMMENT ON COLUMN public.asset_sources.checkpoint_ciphertext IS
     'AES-256-GCM ciphertext only; exact AAD is asset-source-checkpoint.v1 over tenant, workspace, source, provider, checkpoint revision, canonical revision digest, source definition digest, checkpoint key id, and checkpoint version';
-COMMENT ON COLUMN asset_sources.checkpoint_key_id IS 'Opaque encryption key identifier; never a key, secret, endpoint, or Vault path';
+COMMENT ON COLUMN public.asset_sources.checkpoint_key_id IS 'Opaque encryption key identifier; never a key, secret, endpoint, or Vault path';
 
-CREATE TABLE asset_source_revisions (
+CREATE OR REPLACE FUNCTION public.asset_catalog_future_source_gate_admitted(candidate public.asset_sources)
+RETURNS boolean AS $$
+BEGIN
+    RETURN false;
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY INVOKER
+SET search_path = pg_catalog, public, pg_temp;
+
+CREATE TABLE public.asset_source_revisions (
     id uuid PRIMARY KEY,
     tenant_id uuid NOT NULL,
     workspace_id uuid NOT NULL,
@@ -254,6 +299,8 @@ CREATE TABLE asset_source_revisions (
     state text NOT NULL DEFAULT 'DRAFT' CHECK (state IN (
         'DRAFT', 'VALIDATING', 'VALIDATED', 'REJECTED', 'PUBLISHED', 'SUPERSEDED'
     )),
+    canonical_profile_manifest bytea NOT NULL,
+    profile_manifest_sha256 text NOT NULL,
     canonical_provider_schema bytea NOT NULL,
     canonical_provider_schema_sha256 text NOT NULL,
     integration_id uuid,
@@ -274,6 +321,8 @@ CREATE TABLE asset_source_revisions (
     ),
     profile_code text NOT NULL CHECK (asset_catalog_code_valid(profile_code, 128)),
     schedule_expression text,
+    typed_extension_code text,
+    prepared_extension_digest text,
     validation_run_id uuid,
     validation_digest text,
     created_by text NOT NULL CHECK (asset_catalog_text_valid(created_by, 256)),
@@ -286,19 +335,29 @@ CREATE TABLE asset_source_revisions (
     UNIQUE (tenant_id, workspace_id, source_id, revision),
     UNIQUE (tenant_id, workspace_id, source_id, revision, canonical_revision_digest),
     FOREIGN KEY (tenant_id, workspace_id, source_id)
-        REFERENCES asset_sources (tenant_id, workspace_id, id) ON DELETE RESTRICT,
+        REFERENCES public.asset_sources (tenant_id, workspace_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (tenant_id, workspace_id, integration_id)
-        REFERENCES integrations (tenant_id, workspace_id, id) ON DELETE RESTRICT,
+        REFERENCES public.integrations (tenant_id, workspace_id, id) ON DELETE RESTRICT,
     CONSTRAINT asset_source_revisions_schema_ck CHECK (
+        asset_catalog_json_object_valid(canonical_profile_manifest, 2, 16384) AND
+        public.asset_catalog_sha256_valid(profile_manifest_sha256) AND
+        pg_catalog.encode(pg_catalog.sha256(canonical_profile_manifest), 'hex') = profile_manifest_sha256 AND
         asset_catalog_json_object_valid(canonical_provider_schema, 2, 65536) AND
-        asset_catalog_sha256_valid(canonical_provider_schema_sha256) AND
-        encode(sha256(canonical_provider_schema), 'hex') = canonical_provider_schema_sha256
+        public.asset_catalog_sha256_valid(canonical_provider_schema_sha256) AND
+        pg_catalog.encode(pg_catalog.sha256(canonical_provider_schema), 'hex') = canonical_provider_schema_sha256
     ),
     CONSTRAINT asset_source_revisions_reference_ck CHECK (
-        (credential_reference_id IS NULL OR asset_catalog_code_valid(credential_reference_id, 256)) AND
-        (trust_reference_id IS NULL OR asset_catalog_code_valid(trust_reference_id, 256)) AND
-        (network_policy_reference_id IS NULL OR asset_catalog_code_valid(network_policy_reference_id, 256)) AND
+        (credential_reference_id IS NULL OR public.asset_catalog_opaque_reference_valid(credential_reference_id)) AND
+        (trust_reference_id IS NULL OR public.asset_catalog_opaque_reference_valid(trust_reference_id)) AND
+        (network_policy_reference_id IS NULL OR public.asset_catalog_opaque_reference_valid(network_policy_reference_id)) AND
         (schedule_expression IS NULL OR asset_catalog_text_valid(schedule_expression, 256))
+    ),
+    CONSTRAINT asset_source_revisions_typed_extension_ck CHECK (
+        (typed_extension_code IS NULL) = (prepared_extension_digest IS NULL) AND
+        (typed_extension_code IS NULL OR (
+            asset_catalog_code_valid(typed_extension_code, 128) AND
+            public.asset_catalog_sha256_valid(prepared_extension_digest)
+        ))
     ),
     CONSTRAINT asset_source_revisions_validation_ck CHECK (
         (state = 'DRAFT' AND validation_run_id IS NULL AND validation_digest IS NULL) OR
@@ -309,10 +368,29 @@ CREATE TABLE asset_source_revisions (
 );
 
 CREATE UNIQUE INDEX asset_source_revisions_published_uk
-    ON asset_source_revisions (tenant_id, workspace_id, source_id)
+    ON public.asset_source_revisions (tenant_id, workspace_id, source_id)
     WHERE state = 'PUBLISHED';
 
-CREATE TABLE asset_source_runs (
+CREATE TABLE public.asset_source_revision_authorities (
+    tenant_id uuid NOT NULL,
+    workspace_id uuid NOT NULL,
+    source_id uuid NOT NULL,
+    source_revision bigint NOT NULL CHECK (source_revision > 0),
+    environment_id uuid NOT NULL,
+    canonical_ordinal integer NOT NULL CHECK (canonical_ordinal BETWEEN 1 AND 100),
+    created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+    PRIMARY KEY (tenant_id, workspace_id, source_id, source_revision, environment_id),
+    UNIQUE (tenant_id, workspace_id, source_id, source_revision, canonical_ordinal),
+    FOREIGN KEY (tenant_id, workspace_id, source_id, source_revision)
+        REFERENCES public.asset_source_revisions (
+            tenant_id, workspace_id, source_id, revision
+        ) ON DELETE RESTRICT,
+    FOREIGN KEY (tenant_id, workspace_id, environment_id)
+        REFERENCES public.environments (tenant_id, workspace_id, id) ON DELETE RESTRICT,
+    CONSTRAINT asset_source_revision_authorities_created_at_ck CHECK (isfinite(created_at))
+);
+
+CREATE TABLE public.asset_source_runs (
     id uuid PRIMARY KEY,
     tenant_id uuid NOT NULL,
     workspace_id uuid NOT NULL,
@@ -402,7 +480,7 @@ CREATE TABLE asset_source_runs (
     UNIQUE (tenant_id, workspace_id, source_id, id, source_revision, source_revision_digest),
     UNIQUE (workspace_id, idempotency_key),
     FOREIGN KEY (tenant_id, workspace_id, source_id, source_revision, source_revision_digest)
-        REFERENCES asset_source_revisions (tenant_id, workspace_id, source_id, revision, canonical_revision_digest) ON DELETE RESTRICT,
+        REFERENCES public.asset_source_revisions (tenant_id, workspace_id, source_id, revision, canonical_revision_digest) ON DELETE RESTRICT,
     CONSTRAINT asset_source_runs_hash_ck CHECK (
         (cursor_before_sha256 IS NULL OR asset_catalog_sha256_valid(cursor_before_sha256)) AND
         (cursor_after_sha256 IS NULL OR asset_catalog_sha256_valid(cursor_after_sha256)) AND
@@ -499,10 +577,10 @@ CREATE TABLE asset_source_runs (
     )
 );
 
-COMMENT ON COLUMN asset_source_runs.fence_token_hash IS 'Lowercase SHA-256 hash only; raw lease or fence tokens are forbidden';
-COMMENT ON COLUMN asset_source_runs.terminal_command_sha256 IS 'Exact FramedTupleV1 digest bound to the immutable TERMINAL_COMMITTED audit receipt';
+COMMENT ON COLUMN public.asset_source_runs.fence_token_hash IS 'Lowercase SHA-256 hash only; raw lease or fence tokens are forbidden';
+COMMENT ON COLUMN public.asset_source_runs.terminal_command_sha256 IS 'Exact FramedTupleV1 digest bound to the immutable TERMINAL_COMMITTED audit receipt';
 
-CREATE OR REPLACE FUNCTION asset_catalog_framed_value_v1(candidate bytea)
+CREATE OR REPLACE FUNCTION public.asset_catalog_framed_value_v1(candidate bytea)
 RETURNS bytea AS $$
 BEGIN
     IF candidate IS NULL THEN
@@ -512,10 +590,134 @@ BEGIN
         pg_catalog.int4send(pg_catalog.octet_length(candidate)) OPERATOR(pg_catalog.||)
         candidate;
 END;
-$$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
-SET search_path = pg_catalog, public;
+$$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE SECURITY INVOKER
+SET search_path = pg_catalog, public, pg_temp;
 
-CREATE OR REPLACE FUNCTION asset_catalog_source_run_no_credential_digest(candidate asset_source_runs)
+CREATE OR REPLACE FUNCTION public.asset_catalog_source_revision_binding_digest(
+    candidate public.asset_source_revisions
+) RETURNS text AS $$
+DECLARE
+    framed bytea;
+BEGIN
+    IF candidate.tenant_id IS NULL OR candidate.workspace_id IS NULL OR
+       candidate.source_id IS NULL OR candidate.revision IS NULL OR candidate.revision < 1 OR
+       candidate.source_definition_digest IS NULL OR
+       pg_catalog.octet_length(candidate.source_definition_digest) <> 64 OR
+       candidate.source_definition_digest COLLATE "C" ~ '[^a-f0-9]' OR
+       candidate.sync_mode IS NULL OR candidate.sync_mode NOT IN ('MANUAL', 'ON_DEMAND', 'SCHEDULED') OR
+       candidate.authority_scope_digest IS NULL OR
+       pg_catalog.octet_length(candidate.authority_scope_digest) <> 64 OR
+       candidate.authority_scope_digest COLLATE "C" ~ '[^a-f0-9]' OR
+       candidate.rate_limit_requests IS NULL OR candidate.rate_limit_window_seconds IS NULL OR
+       candidate.backpressure_base_seconds IS NULL OR candidate.backpressure_max_seconds IS NULL OR
+       candidate.rate_limit_requests NOT BETWEEN 1 AND 1000000 OR
+       candidate.rate_limit_window_seconds NOT BETWEEN 1 AND 86400 OR
+       candidate.backpressure_base_seconds NOT BETWEEN 1 AND 86400 OR
+       candidate.backpressure_max_seconds NOT BETWEEN candidate.backpressure_base_seconds AND 604800 OR
+       candidate.profile_code IS NULL OR
+       pg_catalog.octet_length(candidate.profile_code) NOT BETWEEN 1 AND 128 OR
+       candidate.profile_code <> pg_catalog.btrim(candidate.profile_code) OR
+       candidate.profile_code COLLATE "C" ~ '[[:cntrl:]]' OR
+       pg_catalog.left(candidate.profile_code, 1) COLLATE "C" !~ '^[A-Za-z0-9]$' OR
+       candidate.profile_code COLLATE "C" ~ '[^A-Za-z0-9_.:/@+-]' OR
+       (candidate.credential_reference_id IS NOT NULL AND
+            candidate.credential_reference_id COLLATE "C" !~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') OR
+       (candidate.trust_reference_id IS NOT NULL AND
+            candidate.trust_reference_id COLLATE "C" !~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') OR
+       (candidate.network_policy_reference_id IS NOT NULL AND
+            candidate.network_policy_reference_id COLLATE "C" !~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') OR
+       (candidate.schedule_expression IS NOT NULL AND
+            (pg_catalog.octet_length(candidate.schedule_expression) NOT BETWEEN 1 AND 256 OR
+             candidate.schedule_expression <> pg_catalog.btrim(candidate.schedule_expression) OR
+             candidate.schedule_expression COLLATE "C" ~ '[[:cntrl:]]')) OR
+       (candidate.typed_extension_code IS NULL) <> (candidate.prepared_extension_digest IS NULL) OR
+       (candidate.typed_extension_code IS NOT NULL AND
+            (pg_catalog.octet_length(candidate.typed_extension_code) NOT BETWEEN 1 AND 128 OR
+             candidate.typed_extension_code <> pg_catalog.btrim(candidate.typed_extension_code) OR
+             candidate.typed_extension_code COLLATE "C" ~ '[[:cntrl:]]' OR
+             pg_catalog.left(candidate.typed_extension_code, 1) COLLATE "C" !~ '^[A-Za-z0-9]$' OR
+             candidate.typed_extension_code COLLATE "C" ~ '[^A-Za-z0-9_.:/@+-]')) OR
+       (candidate.prepared_extension_digest IS NOT NULL AND
+            (pg_catalog.octet_length(candidate.prepared_extension_digest) <> 64 OR
+             candidate.prepared_extension_digest COLLATE "C" ~ '[^a-f0-9]')) THEN
+        RETURN NULL;
+    END IF;
+
+    framed :=
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.convert_to('asset-source-revision-binding.v1', 'UTF8')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.convert_to(candidate.tenant_id::text, 'UTF8')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.convert_to(candidate.workspace_id::text, 'UTF8')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.convert_to(candidate.source_id::text, 'UTF8')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.convert_to(candidate.revision::text, 'UTF8')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.decode(candidate.source_definition_digest, 'hex')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            CASE WHEN candidate.integration_id IS NULL THEN NULL
+                 ELSE pg_catalog.convert_to(candidate.integration_id::text, 'UTF8') END
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.convert_to(candidate.sync_mode, 'UTF8')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            CASE WHEN candidate.credential_reference_id IS NULL THEN NULL
+                 ELSE pg_catalog.convert_to(candidate.credential_reference_id, 'UTF8') END
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            CASE WHEN candidate.trust_reference_id IS NULL THEN NULL
+                 ELSE pg_catalog.convert_to(candidate.trust_reference_id, 'UTF8') END
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            CASE WHEN candidate.network_policy_reference_id IS NULL THEN NULL
+                 ELSE pg_catalog.convert_to(candidate.network_policy_reference_id, 'UTF8') END
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.decode(candidate.authority_scope_digest, 'hex')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.convert_to(candidate.rate_limit_requests::text, 'UTF8')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.convert_to(candidate.rate_limit_window_seconds::text, 'UTF8')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.convert_to(candidate.backpressure_base_seconds::text, 'UTF8')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.convert_to(candidate.backpressure_max_seconds::text, 'UTF8')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.convert_to(candidate.profile_code, 'UTF8')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            CASE WHEN candidate.schedule_expression IS NULL THEN NULL
+                 ELSE pg_catalog.convert_to(candidate.schedule_expression, 'UTF8') END
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            CASE WHEN candidate.typed_extension_code IS NULL THEN NULL
+                 ELSE pg_catalog.convert_to(candidate.typed_extension_code, 'UTF8') END
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            CASE WHEN candidate.prepared_extension_digest IS NULL THEN NULL
+                 ELSE pg_catalog.decode(candidate.prepared_extension_digest, 'hex') END
+        );
+
+    RETURN pg_catalog.encode(pg_catalog.sha256(framed), 'hex');
+END;
+$$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE SECURITY INVOKER
+SET search_path = pg_catalog, public, pg_temp;
+
+CREATE OR REPLACE FUNCTION public.asset_catalog_source_run_no_credential_digest(candidate public.asset_source_runs)
 RETURNS text AS $$
 DECLARE
     framed bytea;
@@ -530,13 +732,13 @@ BEGIN
         asset_catalog_framed_value_v1(convert_to(candidate.source_revision::text, 'UTF8')) OPERATOR(pg_catalog.||)
         asset_catalog_framed_value_v1(decode(candidate.source_revision_digest, 'hex')) OPERATOR(pg_catalog.||)
         asset_catalog_framed_value_v1(convert_to(candidate.fence_epoch::text, 'UTF8'));
-    RETURN encode(sha256(framed), 'hex');
+    RETURN pg_catalog.encode(pg_catalog.sha256(framed), 'hex');
 END;
 $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
-CREATE OR REPLACE FUNCTION asset_catalog_source_run_delay_intent_digest(
-    candidate asset_source_runs,
+CREATE OR REPLACE FUNCTION public.asset_catalog_source_run_delay_intent_digest(
+    candidate public.asset_source_runs,
     desired_reason text,
     desired_not_before timestamptz
 ) RETURNS text AS $$
@@ -557,13 +759,13 @@ BEGIN
             to_char(desired_not_before AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
             'UTF8'
         ));
-    RETURN encode(sha256(framed), 'hex');
+    RETURN pg_catalog.encode(pg_catalog.sha256(framed), 'hex');
 END;
 $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
-CREATE OR REPLACE FUNCTION asset_catalog_source_run_failure_override_digest(
-    candidate asset_source_runs,
+CREATE OR REPLACE FUNCTION public.asset_catalog_source_run_failure_override_digest(
+    candidate public.asset_source_runs,
     desired_failure_code text
 ) RETURNS text AS $$
 DECLARE
@@ -583,13 +785,13 @@ BEGIN
         asset_catalog_framed_value_v1(convert_to(candidate.cleanup_status, 'UTF8')) OPERATOR(pg_catalog.||)
         asset_catalog_framed_value_v1(decode(candidate.cleanup_digest, 'hex')) OPERATOR(pg_catalog.||)
         asset_catalog_framed_value_v1(convert_to(desired_failure_code, 'UTF8'));
-    RETURN encode(sha256(framed), 'hex');
+    RETURN pg_catalog.encode(pg_catalog.sha256(framed), 'hex');
 END;
 $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
-CREATE OR REPLACE FUNCTION asset_catalog_source_run_terminal_digest(
-    candidate asset_source_runs,
+CREATE OR REPLACE FUNCTION public.asset_catalog_source_run_terminal_digest(
+    candidate public.asset_source_runs,
     desired_status text,
     desired_failure_code text
 ) RETURNS text AS $$
@@ -637,43 +839,43 @@ BEGIN
         asset_catalog_framed_value_v1(CASE WHEN candidate.terminal_failure_override IS NULL THEN NULL ELSE convert_to(candidate.terminal_failure_override, 'UTF8') END) OPERATOR(pg_catalog.||)
         asset_catalog_framed_value_v1(CASE WHEN candidate.terminal_failure_override_digest IS NULL THEN NULL ELSE decode(candidate.terminal_failure_override_digest, 'hex') END) OPERATOR(pg_catalog.||)
         asset_catalog_framed_value_v1(CASE WHEN desired_failure_code IS NULL THEN NULL ELSE convert_to(desired_failure_code, 'UTF8') END);
-    RETURN encode(sha256(framed), 'hex');
+    RETURN pg_catalog.encode(pg_catalog.sha256(framed), 'hex');
 END;
 $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
 CREATE INDEX asset_source_runs_history_idx
-    ON asset_source_runs (tenant_id, workspace_id, source_id, created_at DESC, id DESC);
+    ON public.asset_source_runs (tenant_id, workspace_id, source_id, created_at DESC, id DESC);
 CREATE INDEX asset_source_runs_queued_claim_idx
-    ON asset_source_runs (not_before, created_at, id) WHERE status IN ('QUEUED', 'DELAYED');
+    ON public.asset_source_runs (not_before, created_at, id) WHERE status IN ('QUEUED', 'DELAYED');
 CREATE INDEX asset_source_runs_expired_lease_idx
-    ON asset_source_runs (lease_expires_at, id) WHERE status = 'RUNNING';
+    ON public.asset_source_runs (lease_expires_at, id) WHERE status = 'RUNNING';
 CREATE INDEX asset_source_runs_cleanup_reclaim_idx
-    ON asset_source_runs (lease_expires_at, id) WHERE status = 'FINALIZING';
+    ON public.asset_source_runs (lease_expires_at, id) WHERE status = 'FINALIZING';
 CREATE UNIQUE INDEX asset_source_runs_nonterminal_uk
-    ON asset_source_runs (tenant_id, workspace_id, source_id)
+    ON public.asset_source_runs (tenant_id, workspace_id, source_id)
     WHERE status IN ('QUEUED', 'DELAYED', 'RUNNING', 'FINALIZING');
 
-ALTER TABLE asset_source_revisions
+ALTER TABLE public.asset_source_revisions
     ADD CONSTRAINT asset_source_revisions_validation_run_fk
         FOREIGN KEY (tenant_id, workspace_id, source_id, validation_run_id)
-        REFERENCES asset_source_runs (tenant_id, workspace_id, source_id, id) ON DELETE RESTRICT;
+        REFERENCES public.asset_source_runs (tenant_id, workspace_id, source_id, id) ON DELETE RESTRICT;
 
-ALTER TABLE asset_sources
+ALTER TABLE public.asset_sources
     ADD CONSTRAINT asset_sources_published_revision_fk
         FOREIGN KEY (tenant_id, workspace_id, id, published_revision, published_revision_digest)
-        REFERENCES asset_source_revisions (tenant_id, workspace_id, source_id, revision, canonical_revision_digest) ON DELETE RESTRICT,
+        REFERENCES public.asset_source_revisions (tenant_id, workspace_id, source_id, revision, canonical_revision_digest) ON DELETE RESTRICT,
     ADD CONSTRAINT asset_sources_validated_run_fk
         FOREIGN KEY (tenant_id, workspace_id, id, validated_run_id)
-        REFERENCES asset_source_runs (tenant_id, workspace_id, source_id, id) ON DELETE RESTRICT,
+        REFERENCES public.asset_source_runs (tenant_id, workspace_id, source_id, id) ON DELETE RESTRICT,
     ADD CONSTRAINT asset_sources_last_success_run_fk
         FOREIGN KEY (tenant_id, workspace_id, id, last_success_run_id)
-        REFERENCES asset_source_runs (tenant_id, workspace_id, source_id, id) ON DELETE RESTRICT,
+        REFERENCES public.asset_source_runs (tenant_id, workspace_id, source_id, id) ON DELETE RESTRICT,
     ADD CONSTRAINT asset_sources_last_complete_snapshot_run_fk
         FOREIGN KEY (tenant_id, workspace_id, id, last_complete_snapshot_run_id)
-        REFERENCES asset_source_runs (tenant_id, workspace_id, source_id, id) ON DELETE RESTRICT;
+        REFERENCES public.asset_source_runs (tenant_id, workspace_id, source_id, id) ON DELETE RESTRICT;
 
-CREATE TABLE asset_observations (
+CREATE TABLE public.asset_observations (
     id uuid PRIMARY KEY,
     tenant_id uuid NOT NULL,
     workspace_id uuid NOT NULL,
@@ -719,26 +921,26 @@ CREATE TABLE asset_observations (
         external_id, source_revision, observed_at, observation_chain_sha256, id
     ),
     FOREIGN KEY (tenant_id, workspace_id, environment_id)
-        REFERENCES environments (tenant_id, workspace_id, id) ON DELETE RESTRICT,
+        REFERENCES public.environments (tenant_id, workspace_id, id) ON DELETE RESTRICT,
     CONSTRAINT asset_observations_source_provider_fk FOREIGN KEY (
         tenant_id, workspace_id, source_id, provider_kind
-    ) REFERENCES asset_sources (
+    ) REFERENCES public.asset_sources (
         tenant_id, workspace_id, id, provider_kind
     ) ON DELETE RESTRICT,
     CONSTRAINT asset_observations_source_revision_fk FOREIGN KEY (
         tenant_id, workspace_id, source_id, source_revision, canonical_revision_digest
-    ) REFERENCES asset_source_revisions (
+    ) REFERENCES public.asset_source_revisions (
         tenant_id, workspace_id, source_id, revision, canonical_revision_digest
     ) ON DELETE RESTRICT,
     CONSTRAINT asset_observations_run_revision_fk FOREIGN KEY (
         tenant_id, workspace_id, source_id, run_id, source_revision, canonical_revision_digest
-    ) REFERENCES asset_source_runs (
+    ) REFERENCES public.asset_source_runs (
         tenant_id, workspace_id, source_id, id, source_revision, source_revision_digest
     ) ON DELETE RESTRICT,
     CONSTRAINT asset_observations_previous_exact_fk FOREIGN KEY (
         tenant_id, workspace_id, environment_id, source_id, provider_kind, external_id,
         previous_observation_id, previous_chain_sha256
-    ) REFERENCES asset_observations (
+    ) REFERENCES public.asset_observations (
         tenant_id, workspace_id, environment_id, source_id, provider_kind, external_id,
         id, observation_chain_sha256
     ) MATCH SIMPLE ON DELETE RESTRICT,
@@ -746,14 +948,14 @@ CREATE TABLE asset_observations (
         (NOT tombstone AND normalized_document IS NOT NULL AND
             asset_catalog_json_object_valid(normalized_document, 2, 65536) AND
             asset_catalog_sha256_valid(document_sha256) AND
-            encode(sha256(normalized_document), 'hex') = document_sha256 AND tombstone_reason_code IS NULL) OR
+            pg_catalog.encode(pg_catalog.sha256(normalized_document), 'hex') = document_sha256 AND tombstone_reason_code IS NULL) OR
         (tombstone AND normalized_document IS NULL AND document_sha256 IS NULL AND
             asset_catalog_code_valid(tombstone_reason_code, 128))
     ),
     CONSTRAINT asset_observations_provenance_ck CHECK (
         asset_catalog_field_provenance_valid(field_provenance) AND
         asset_catalog_sha256_valid(field_provenance_sha256) AND
-        encode(sha256(field_provenance), 'hex') = field_provenance_sha256
+        pg_catalog.encode(pg_catalog.sha256(field_provenance), 'hex') = field_provenance_sha256
     ),
     CONSTRAINT asset_observations_previous_pair_ck CHECK (
         (previous_observation_id IS NULL AND previous_chain_sha256 IS NULL) OR
@@ -773,7 +975,7 @@ CREATE TABLE asset_observations (
     )
 );
 
-CREATE TABLE assets (
+CREATE TABLE public.assets (
     id uuid PRIMARY KEY,
     tenant_id uuid NOT NULL,
     workspace_id uuid NOT NULL,
@@ -805,23 +1007,23 @@ CREATE TABLE assets (
     UNIQUE (tenant_id, workspace_id, environment_id, source_id, provider_kind, external_id, id),
     UNIQUE (workspace_id, create_idempotency_key),
     FOREIGN KEY (tenant_id, workspace_id, environment_id)
-        REFERENCES environments (tenant_id, workspace_id, id) ON DELETE RESTRICT,
+        REFERENCES public.environments (tenant_id, workspace_id, id) ON DELETE RESTRICT,
     CONSTRAINT assets_source_provider_fk FOREIGN KEY (
         tenant_id, workspace_id, source_id, provider_kind
-    ) REFERENCES asset_sources (
+    ) REFERENCES public.asset_sources (
         tenant_id, workspace_id, id, provider_kind
     ) ON DELETE RESTRICT,
     CONSTRAINT assets_last_observation_exact_fk FOREIGN KEY (
         tenant_id, workspace_id, environment_id, source_id, provider_kind,
         external_id, last_source_revision, last_observed_at,
         last_observation_chain_sha256, last_observation_id
-    ) REFERENCES asset_observations (
+    ) REFERENCES public.asset_observations (
         tenant_id, workspace_id, environment_id, source_id, provider_kind,
         external_id, source_revision, observed_at, observation_chain_sha256, id
     ) ON DELETE RESTRICT,
     CONSTRAINT assets_last_source_revision_fk FOREIGN KEY (
         tenant_id, workspace_id, source_id, last_source_revision
-    ) REFERENCES asset_source_revisions (
+    ) REFERENCES public.asset_source_revisions (
         tenant_id, workspace_id, source_id, revision
     ) ON DELETE RESTRICT,
     CONSTRAINT assets_kind_check CHECK (kind IN (
@@ -840,12 +1042,12 @@ CREATE TABLE assets (
 );
 
 CREATE INDEX assets_catalog_idx
-    ON assets (tenant_id, workspace_id, environment_id, lower(display_name), id)
+    ON public.assets (tenant_id, workspace_id, environment_id, lower(display_name), id)
     WHERE lifecycle <> 'RETIRED';
 CREATE INDEX assets_filter_idx
-    ON assets (tenant_id, workspace_id, environment_id, kind, lifecycle, mapping_status, id);
+    ON public.assets (tenant_id, workspace_id, environment_id, kind, lifecycle, mapping_status, id);
 
-CREATE TABLE asset_type_details (
+CREATE TABLE public.asset_type_details (
     id uuid PRIMARY KEY,
     tenant_id uuid NOT NULL,
     workspace_id uuid NOT NULL,
@@ -868,27 +1070,27 @@ CREATE TABLE asset_type_details (
     UNIQUE (tenant_id, workspace_id, environment_id, asset_id, revision),
     CONSTRAINT asset_type_details_asset_identity_fk FOREIGN KEY (
         tenant_id, workspace_id, environment_id, source_id, provider_kind, external_id, asset_id
-    ) REFERENCES assets (
+    ) REFERENCES public.assets (
         tenant_id, workspace_id, environment_id, source_id, provider_kind, external_id, id
     ) ON DELETE RESTRICT,
     CONSTRAINT asset_type_details_observation_fact_fk FOREIGN KEY (
         tenant_id, workspace_id, environment_id, source_id, provider_kind, external_id,
         source_revision, source_observed_at, source_observation_chain_sha256, source_observation_id
-    ) REFERENCES asset_observations (
+    ) REFERENCES public.asset_observations (
         tenant_id, workspace_id, environment_id, source_id, provider_kind, external_id,
         source_revision, observed_at, observation_chain_sha256, id
     ) ON DELETE RESTRICT,
     CONSTRAINT asset_type_details_document_ck CHECK (
         asset_catalog_json_object_valid(details_document, 2, 65536) AND
         asset_catalog_sha256_valid(details_sha256) AND
-        encode(sha256(details_document), 'hex') = details_sha256
+        pg_catalog.encode(pg_catalog.sha256(details_document), 'hex') = details_sha256
     ),
     CONSTRAINT asset_type_details_time_ck CHECK (
         isfinite(source_observed_at) AND isfinite(created_at)
     )
 );
 
-CREATE TABLE asset_conflicts (
+CREATE TABLE public.asset_conflicts (
     id uuid PRIMARY KEY,
     tenant_id uuid NOT NULL,
     workspace_id uuid NOT NULL,
@@ -917,14 +1119,14 @@ CREATE TABLE asset_conflicts (
     UNIQUE (tenant_id, workspace_id, environment_id, id),
     UNIQUE (workspace_id, resolution_idempotency_key),
     FOREIGN KEY (tenant_id, workspace_id, environment_id, asset_id)
-        REFERENCES assets (tenant_id, workspace_id, environment_id, id) ON DELETE RESTRICT,
+        REFERENCES public.assets (tenant_id, workspace_id, environment_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (tenant_id, workspace_id, environment_id, candidate_asset_id)
-        REFERENCES assets (tenant_id, workspace_id, environment_id, id) ON DELETE RESTRICT,
+        REFERENCES public.assets (tenant_id, workspace_id, environment_id, id) ON DELETE RESTRICT,
     FOREIGN KEY (tenant_id, workspace_id, candidate_service_id)
-        REFERENCES services (tenant_id, workspace_id, id) ON DELETE RESTRICT,
+        REFERENCES public.services (tenant_id, workspace_id, id) ON DELETE RESTRICT,
     CONSTRAINT asset_conflicts_source_observation_fk FOREIGN KEY (
         tenant_id, workspace_id, environment_id, source_id, observation_id
-    ) REFERENCES asset_observations (
+    ) REFERENCES public.asset_observations (
         tenant_id, workspace_id, environment_id, source_id, id
     ) ON DELETE RESTRICT,
     CONSTRAINT asset_conflicts_candidate_ck CHECK (
@@ -947,15 +1149,15 @@ CREATE TABLE asset_conflicts (
 );
 
 CREATE UNIQUE INDEX asset_conflicts_open_queue_uk
-    ON asset_conflicts (
+    ON public.asset_conflicts (
         tenant_id, workspace_id, source_id, observation_id, conflict_type,
         field_name, candidate_asset_id, candidate_service_id
     ) NULLS NOT DISTINCT WHERE status = 'OPEN';
 CREATE INDEX asset_conflicts_open_idx
-    ON asset_conflicts (tenant_id, workspace_id, environment_id, created_at, id)
+    ON public.asset_conflicts (tenant_id, workspace_id, environment_id, created_at, id)
     WHERE status = 'OPEN';
 
-CREATE TABLE asset_relationships (
+CREATE TABLE public.asset_relationships (
     id uuid PRIMARY KEY,
     tenant_id uuid NOT NULL,
     workspace_id uuid NOT NULL,
@@ -1000,30 +1202,31 @@ CREATE TABLE asset_relationships (
     )),
     CONSTRAINT asset_relationships_source_revision_fk FOREIGN KEY (
         tenant_id, workspace_id, source_id, source_revision, canonical_revision_digest
-    ) REFERENCES asset_source_revisions (
+    ) REFERENCES public.asset_source_revisions (
         tenant_id, workspace_id, source_id, revision, canonical_revision_digest
     ) ON DELETE RESTRICT,
     CONSTRAINT asset_relationships_last_run_fk FOREIGN KEY (
         tenant_id, workspace_id, source_id, last_run_id, source_revision, canonical_revision_digest
-    ) REFERENCES asset_source_runs (
+    ) REFERENCES public.asset_source_runs (
         tenant_id, workspace_id, source_id, id, source_revision, source_revision_digest
     ) ON DELETE RESTRICT,
     CONSTRAINT asset_relationships_source_asset_fk FOREIGN KEY (
         tenant_id, workspace_id, source_environment_id, source_id, from_external_id, source_asset_id
-    ) REFERENCES assets (
+    ) REFERENCES public.assets (
         tenant_id, workspace_id, environment_id, source_id, external_id, id
     ) ON DELETE RESTRICT,
     CONSTRAINT asset_relationships_target_asset_fk FOREIGN KEY (
         tenant_id, workspace_id, target_environment_id, source_id, to_external_id, target_asset_id
-    ) REFERENCES assets (
+    ) REFERENCES public.assets (
         tenant_id, workspace_id, environment_id, source_id, external_id, id
     ) ON DELETE RESTRICT,
     FOREIGN KEY (tenant_id, workspace_id, provenance_source_id)
-        REFERENCES asset_sources (tenant_id, workspace_id, id) ON DELETE RESTRICT,
+        REFERENCES public.asset_sources (tenant_id, workspace_id, id) ON DELETE RESTRICT,
     CONSTRAINT asset_relationships_distinct_ck CHECK (source_asset_id <> target_asset_id),
     CONSTRAINT asset_relationships_cross_environment_ck CHECK (
         (source_environment_id = target_environment_id AND cross_environment_policy_reference_id IS NULL) OR
-        (source_environment_id <> target_environment_id AND asset_catalog_code_valid(cross_environment_policy_reference_id, 256))
+        (source_environment_id <> target_environment_id AND
+            public.asset_catalog_opaque_reference_valid(cross_environment_policy_reference_id))
     ),
     CONSTRAINT asset_relationships_freshness_ck CHECK (
         (freshness_kind IN ('CATALOG_SEQUENCE', 'OBJECT_SEQUENCE', 'CHECKPOINT_SEQUENCE') AND
@@ -1040,9 +1243,9 @@ CREATE TABLE asset_relationships (
     )
 );
 
-CREATE UNIQUE INDEX asset_relationships_active_edge_uk ON asset_relationships (tenant_id, workspace_id, source_asset_id, target_asset_id, relationship_type) WHERE status = 'ACTIVE';
+CREATE UNIQUE INDEX asset_relationships_active_edge_uk ON public.asset_relationships (tenant_id, workspace_id, source_asset_id, target_asset_id, relationship_type) WHERE status = 'ACTIVE';
 
-CREATE TABLE service_asset_bindings (
+CREATE TABLE public.service_asset_bindings (
     id uuid PRIMARY KEY,
     tenant_id uuid NOT NULL,
     workspace_id uuid NOT NULL,
@@ -1064,15 +1267,15 @@ CREATE TABLE service_asset_bindings (
     UNIQUE (tenant_id, workspace_id, environment_id, id),
     UNIQUE (workspace_id, idempotency_key),
     FOREIGN KEY (tenant_id, workspace_id, service_id)
-        REFERENCES services (tenant_id, workspace_id, id) ON DELETE RESTRICT,
+        REFERENCES public.services (tenant_id, workspace_id, id) ON DELETE RESTRICT,
     CONSTRAINT service_asset_bindings_service_environment_fk
         FOREIGN KEY (service_id, environment_id)
-        REFERENCES service_bindings (service_id, environment_id) ON DELETE RESTRICT,
+        REFERENCES public.service_bindings (service_id, environment_id) ON DELETE RESTRICT,
     FOREIGN KEY (tenant_id, workspace_id, environment_id, asset_id)
-        REFERENCES assets (tenant_id, workspace_id, environment_id, id) ON DELETE RESTRICT,
+        REFERENCES public.assets (tenant_id, workspace_id, environment_id, id) ON DELETE RESTRICT,
     CONSTRAINT service_asset_bindings_provenance_asset_fk FOREIGN KEY (
         tenant_id, workspace_id, environment_id, provenance_source_id, asset_id
-    ) REFERENCES assets (
+    ) REFERENCES public.assets (
         tenant_id, workspace_id, environment_id, source_id, id
     ) ON DELETE RESTRICT,
     CONSTRAINT service_asset_bindings_provenance_ck CHECK (
@@ -1081,11 +1284,11 @@ CREATE TABLE service_asset_bindings (
     )
 );
 
-CREATE UNIQUE INDEX service_asset_bindings_active_uk ON service_asset_bindings (tenant_id, workspace_id, environment_id, service_id, asset_id, binding_role) WHERE status = 'ACTIVE';
+CREATE UNIQUE INDEX service_asset_bindings_active_uk ON public.service_asset_bindings (tenant_id, workspace_id, environment_id, service_id, asset_id, binding_role) WHERE status = 'ACTIVE';
 
-CREATE UNIQUE INDEX asset_management_idempotency_audit_uk ON audit_records (workspace_id, request_id) WHERE resource_type IN ('ASSET', 'ASSET_SOURCE', 'ASSET_SOURCE_RUN', 'ASSET_CONFLICT', 'SERVICE_ASSET_BINDING');
+CREATE UNIQUE INDEX asset_management_idempotency_audit_uk ON public.audit_records (workspace_id, request_id) WHERE resource_type IN ('ASSET', 'ASSET_SOURCE', 'ASSET_SOURCE_RUN', 'ASSET_CONFLICT', 'SERVICE_ASSET_BINDING');
 
-CREATE OR REPLACE FUNCTION validate_asset_management_audit_insert() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.validate_asset_management_audit_insert() RETURNS trigger AS $$
 BEGIN
     IF NEW.resource_type IN ('ASSET', 'ASSET_SOURCE', 'ASSET_SOURCE_RUN', 'ASSET_CONFLICT', 'SERVICE_ASSET_BINDING')
        AND (NOT asset_catalog_idempotency_key_valid(NEW.request_id) OR NOT asset_catalog_sha256_valid(NEW.payload_hash)) THEN
@@ -1097,13 +1300,13 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
 CREATE TRIGGER asset_management_audit_insert_guard
-    BEFORE INSERT ON audit_records
-    FOR EACH ROW EXECUTE FUNCTION validate_asset_management_audit_insert();
+    BEFORE INSERT ON public.audit_records
+    FOR EACH ROW EXECUTE FUNCTION public.validate_asset_management_audit_insert();
 
-CREATE OR REPLACE FUNCTION reject_asset_catalog_immutable() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.reject_asset_catalog_immutable() RETURNS trigger AS $$
 BEGIN
     RAISE EXCEPTION USING
         ERRCODE = '55000',
@@ -1111,17 +1314,21 @@ BEGIN
         CONSTRAINT = TG_TABLE_NAME || '_immutable';
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
 CREATE TRIGGER asset_observations_immutable
-    BEFORE UPDATE ON asset_observations
-    FOR EACH ROW EXECUTE FUNCTION reject_asset_catalog_immutable();
+    BEFORE UPDATE ON public.asset_observations
+    FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_immutable();
 
 CREATE TRIGGER asset_type_details_immutable
-    BEFORE UPDATE ON asset_type_details
-    FOR EACH ROW EXECUTE FUNCTION reject_asset_catalog_immutable();
+    BEFORE UPDATE ON public.asset_type_details
+    FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_immutable();
 
-CREATE OR REPLACE FUNCTION reject_asset_catalog_delete() RETURNS trigger AS $$
+CREATE TRIGGER asset_source_revision_authorities_immutable
+    BEFORE UPDATE ON public.asset_source_revision_authorities
+    FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_immutable();
+
+CREATE OR REPLACE FUNCTION public.reject_asset_catalog_delete() RETURNS trigger AS $$
 BEGIN
     RAISE EXCEPTION USING
         ERRCODE = '55000',
@@ -1129,9 +1336,9 @@ BEGIN
         CONSTRAINT = TG_TABLE_NAME || '_delete_guard';
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
-CREATE OR REPLACE FUNCTION reject_asset_catalog_truncate() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.reject_asset_catalog_truncate() RETURNS trigger AS $$
 BEGIN
     RAISE EXCEPTION USING
         ERRCODE = '55000',
@@ -1139,65 +1346,71 @@ BEGIN
         CONSTRAINT = TG_TABLE_NAME || '_truncate_guard';
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
 CREATE TRIGGER asset_sources_delete_guard
-    BEFORE DELETE ON asset_sources
-    FOR EACH ROW EXECUTE FUNCTION reject_asset_catalog_delete();
+    BEFORE DELETE ON public.asset_sources
+    FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_delete();
 CREATE TRIGGER asset_source_revisions_delete_guard
-    BEFORE DELETE ON asset_source_revisions
-    FOR EACH ROW EXECUTE FUNCTION reject_asset_catalog_delete();
+    BEFORE DELETE ON public.asset_source_revisions
+    FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_delete();
+CREATE TRIGGER asset_source_revision_authorities_delete_guard
+    BEFORE DELETE ON public.asset_source_revision_authorities
+    FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_delete();
 CREATE TRIGGER asset_source_runs_delete_guard
-    BEFORE DELETE ON asset_source_runs
-    FOR EACH ROW EXECUTE FUNCTION reject_asset_catalog_delete();
+    BEFORE DELETE ON public.asset_source_runs
+    FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_delete();
 CREATE TRIGGER asset_observations_delete_guard
-    BEFORE DELETE ON asset_observations
-    FOR EACH ROW EXECUTE FUNCTION reject_asset_catalog_delete();
+    BEFORE DELETE ON public.asset_observations
+    FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_delete();
 CREATE TRIGGER assets_delete_guard
-    BEFORE DELETE ON assets
-    FOR EACH ROW EXECUTE FUNCTION reject_asset_catalog_delete();
+    BEFORE DELETE ON public.assets
+    FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_delete();
 CREATE TRIGGER asset_type_details_delete_guard
-    BEFORE DELETE ON asset_type_details
-    FOR EACH ROW EXECUTE FUNCTION reject_asset_catalog_delete();
+    BEFORE DELETE ON public.asset_type_details
+    FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_delete();
 CREATE TRIGGER asset_conflicts_delete_guard
-    BEFORE DELETE ON asset_conflicts
-    FOR EACH ROW EXECUTE FUNCTION reject_asset_catalog_delete();
+    BEFORE DELETE ON public.asset_conflicts
+    FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_delete();
 CREATE TRIGGER asset_relationships_delete_guard
-    BEFORE DELETE ON asset_relationships
-    FOR EACH ROW EXECUTE FUNCTION reject_asset_catalog_delete();
+    BEFORE DELETE ON public.asset_relationships
+    FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_delete();
 CREATE TRIGGER service_asset_bindings_delete_guard
-    BEFORE DELETE ON service_asset_bindings
-    FOR EACH ROW EXECUTE FUNCTION reject_asset_catalog_delete();
+    BEFORE DELETE ON public.service_asset_bindings
+    FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_delete();
 
 CREATE TRIGGER asset_sources_truncate_guard
-    BEFORE TRUNCATE ON asset_sources
-    FOR EACH STATEMENT EXECUTE FUNCTION reject_asset_catalog_truncate();
+    BEFORE TRUNCATE ON public.asset_sources
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_asset_catalog_truncate();
 CREATE TRIGGER asset_source_revisions_truncate_guard
-    BEFORE TRUNCATE ON asset_source_revisions
-    FOR EACH STATEMENT EXECUTE FUNCTION reject_asset_catalog_truncate();
+    BEFORE TRUNCATE ON public.asset_source_revisions
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_asset_catalog_truncate();
+CREATE TRIGGER asset_source_revision_authorities_truncate_guard
+    BEFORE TRUNCATE ON public.asset_source_revision_authorities
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_asset_catalog_truncate();
 CREATE TRIGGER asset_source_runs_truncate_guard
-    BEFORE TRUNCATE ON asset_source_runs
-    FOR EACH STATEMENT EXECUTE FUNCTION reject_asset_catalog_truncate();
+    BEFORE TRUNCATE ON public.asset_source_runs
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_asset_catalog_truncate();
 CREATE TRIGGER asset_observations_truncate_guard
-    BEFORE TRUNCATE ON asset_observations
-    FOR EACH STATEMENT EXECUTE FUNCTION reject_asset_catalog_truncate();
+    BEFORE TRUNCATE ON public.asset_observations
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_asset_catalog_truncate();
 CREATE TRIGGER assets_truncate_guard
-    BEFORE TRUNCATE ON assets
-    FOR EACH STATEMENT EXECUTE FUNCTION reject_asset_catalog_truncate();
+    BEFORE TRUNCATE ON public.assets
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_asset_catalog_truncate();
 CREATE TRIGGER asset_type_details_truncate_guard
-    BEFORE TRUNCATE ON asset_type_details
-    FOR EACH STATEMENT EXECUTE FUNCTION reject_asset_catalog_truncate();
+    BEFORE TRUNCATE ON public.asset_type_details
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_asset_catalog_truncate();
 CREATE TRIGGER asset_conflicts_truncate_guard
-    BEFORE TRUNCATE ON asset_conflicts
-    FOR EACH STATEMENT EXECUTE FUNCTION reject_asset_catalog_truncate();
+    BEFORE TRUNCATE ON public.asset_conflicts
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_asset_catalog_truncate();
 CREATE TRIGGER asset_relationships_truncate_guard
-    BEFORE TRUNCATE ON asset_relationships
-    FOR EACH STATEMENT EXECUTE FUNCTION reject_asset_catalog_truncate();
+    BEFORE TRUNCATE ON public.asset_relationships
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_asset_catalog_truncate();
 CREATE TRIGGER service_asset_bindings_truncate_guard
-    BEFORE TRUNCATE ON service_asset_bindings
-    FOR EACH STATEMENT EXECUTE FUNCTION reject_asset_catalog_truncate();
+    BEFORE TRUNCATE ON public.service_asset_bindings
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_asset_catalog_truncate();
 
-CREATE OR REPLACE FUNCTION enforce_assets_transition() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.enforce_assets_transition() RETURNS trigger AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
         IF NEW.lifecycle <> 'DISCOVERED' OR NEW.version <> 1 THEN
@@ -1274,13 +1487,13 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
 CREATE TRIGGER assets_transition_guard
-    BEFORE INSERT OR UPDATE ON assets
-    FOR EACH ROW EXECUTE FUNCTION enforce_assets_transition();
+    BEFORE INSERT OR UPDATE ON public.assets
+    FOR EACH ROW EXECUTE FUNCTION public.enforce_assets_transition();
 
-CREATE OR REPLACE FUNCTION enforce_asset_conflict_transition() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.enforce_asset_conflict_transition() RETURNS trigger AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
         IF NEW.status <> 'OPEN' OR NEW.version <> 1 THEN
@@ -1323,13 +1536,13 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
 CREATE TRIGGER asset_conflicts_transition_guard
-    BEFORE INSERT OR UPDATE ON asset_conflicts
-    FOR EACH ROW EXECUTE FUNCTION enforce_asset_conflict_transition();
+    BEFORE INSERT OR UPDATE ON public.asset_conflicts
+    FOR EACH ROW EXECUTE FUNCTION public.enforce_asset_conflict_transition();
 
-CREATE OR REPLACE FUNCTION enforce_asset_catalog_edge_mutation() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.enforce_asset_catalog_edge_mutation() RETURNS trigger AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
         IF NEW.version <> 1 THEN
@@ -1356,9 +1569,9 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
-CREATE OR REPLACE FUNCTION enforce_asset_relationship_mutation() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.enforce_asset_relationship_mutation() RETURNS trigger AS $$
 DECLARE
     bound_run asset_source_runs%ROWTYPE;
     bound_source asset_sources%ROWTYPE;
@@ -1479,13 +1692,13 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
 CREATE TRIGGER asset_relationships_mutation_guard
-    BEFORE INSERT OR UPDATE ON asset_relationships
-    FOR EACH ROW EXECUTE FUNCTION enforce_asset_relationship_mutation();
+    BEFORE INSERT OR UPDATE ON public.asset_relationships
+    FOR EACH ROW EXECUTE FUNCTION public.enforce_asset_relationship_mutation();
 
-CREATE OR REPLACE FUNCTION validate_asset_relationship_page_closure() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.validate_asset_relationship_page_closure() RETURNS trigger AS $$
 DECLARE
     committed_run asset_source_runs%ROWTYPE;
     committed_source asset_sources%ROWTYPE;
@@ -1553,18 +1766,18 @@ BEGIN
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
 CREATE CONSTRAINT TRIGGER asset_relationships_page_closure_guard
-    AFTER INSERT OR UPDATE ON asset_relationships
+    AFTER INSERT OR UPDATE ON public.asset_relationships
     DEFERRABLE INITIALLY DEFERRED
-    FOR EACH ROW EXECUTE FUNCTION validate_asset_relationship_page_closure();
+    FOR EACH ROW EXECUTE FUNCTION public.validate_asset_relationship_page_closure();
 
 CREATE TRIGGER service_asset_bindings_mutation_guard
-    BEFORE INSERT OR UPDATE ON service_asset_bindings
-    FOR EACH ROW EXECUTE FUNCTION enforce_asset_catalog_edge_mutation();
+    BEFORE INSERT OR UPDATE ON public.service_asset_bindings
+    FOR EACH ROW EXECUTE FUNCTION public.enforce_asset_catalog_edge_mutation();
 
-CREATE OR REPLACE FUNCTION enforce_asset_sources_mutation() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.enforce_asset_sources_mutation() RETURNS trigger AS $$
 DECLARE
     gate_is_valid boolean;
     validation_gate_is_valid boolean;
@@ -1852,12 +2065,6 @@ BEGIN
             ERRCODE = '55000', MESSAGE = 'asset source gate transition is outside the closed state graph',
             CONSTRAINT = 'asset_sources_gate_transition_guard';
     END IF;
-    IF NEW.source_kind IN ('KUBERNETES_OPERATOR', 'AWX_INVENTORY') AND
-       NEW.gate_status <> 'UNAVAILABLE' THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '23514', MESSAGE = 'future-phase source remains unavailable until its production adapter is accepted',
-            CONSTRAINT = 'asset_sources_future_phase_gate_guard';
-    END IF;
     IF NEW.gate_status = 'AVAILABLE' THEN
         SELECT EXISTS (
             SELECT 1
@@ -2038,23 +2245,65 @@ BEGIN
         END IF;
     END IF;
     NEW.updated_at := statement_timestamp();
+    IF NEW.source_kind IN ('KUBERNETES_OPERATOR', 'AWX_INVENTORY') AND
+       NEW.gate_status IN ('VALIDATING', 'AVAILABLE', 'DEGRADED') AND (
+            current_setting('transaction_isolation') IS DISTINCT FROM 'serializable' OR
+            public.asset_catalog_future_source_gate_admitted(NEW) IS NOT TRUE
+       ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514', MESSAGE = 'future-phase source live gate is not admitted by its accepted successor hook',
+            CONSTRAINT = 'asset_sources_future_phase_gate_guard';
+    END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
 CREATE TRIGGER asset_sources_mutation_guard
-    BEFORE INSERT OR UPDATE ON asset_sources
-    FOR EACH ROW EXECUTE FUNCTION enforce_asset_sources_mutation();
+    BEFORE INSERT OR UPDATE ON public.asset_sources
+    FOR EACH ROW EXECUTE FUNCTION public.enforce_asset_sources_mutation();
 
-CREATE OR REPLACE FUNCTION validate_asset_source_deferred_state() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.validate_asset_source_deferred_state() RETURNS trigger AS $$
 DECLARE
-    current_source asset_sources%ROWTYPE;
+    current_source public.asset_sources%ROWTYPE;
 BEGIN
     SELECT * INTO current_source
-    FROM asset_sources
+    FROM public.asset_sources
     WHERE tenant_id = NEW.tenant_id AND workspace_id = NEW.workspace_id AND id = NEW.id;
     IF NOT FOUND THEN
+        RETURN NULL;
+    END IF;
+    IF TG_OP = 'INSERT' THEN
+        IF current_setting('transaction_isolation') IS DISTINCT FROM 'serializable' OR
+           current_source.version <> 2 OR
+           current_source.gate_status <> 'UNAVAILABLE' OR
+           current_source.gate_revision <> 0 OR
+           current_source.checkpoint_revision <> 0 OR
+           current_source.checkpoint_version <> 0 OR
+           current_source.published_revision IS NOT NULL OR
+           current_source.validated_run_id IS NOT NULL OR
+           current_source.checkpoint_ciphertext IS NOT NULL OR
+           NOT EXISTS (
+                SELECT 1
+                FROM public.asset_source_revisions AS revision
+                WHERE revision.tenant_id = current_source.tenant_id
+                  AND revision.workspace_id = current_source.workspace_id
+                  AND revision.source_id = current_source.id
+                  AND revision.revision = 1
+                  AND revision.state = 'DRAFT'
+                  AND revision.expected_source_version = 1
+                  AND revision.xmin = pg_catalog.pg_current_xact_id()::xid
+           ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000', MESSAGE = 'asset source insert requires its exact same-transaction initial DRAFT revision',
+                CONSTRAINT = 'asset_sources_initial_revision_closure_guard';
+        END IF;
+        IF current_source.source_kind IN ('KUBERNETES_OPERATOR', 'AWX_INVENTORY') AND
+           public.asset_catalog_future_source_gate_admitted(current_source) IS NOT TRUE THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23514', MESSAGE = 'future-phase source insert is not admitted by its accepted successor hook',
+                CONSTRAINT = 'asset_sources_future_phase_gate_guard';
+        END IF;
         RETURN NULL;
     END IF;
     IF current_source.published_revision IS NOT NULL AND NOT EXISTS (
@@ -2156,14 +2405,14 @@ BEGIN
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
 CREATE CONSTRAINT TRIGGER asset_sources_deferred_state_guard
-    AFTER INSERT OR UPDATE ON asset_sources
+    AFTER INSERT OR UPDATE ON public.asset_sources
     DEFERRABLE INITIALLY DEFERRED
-    FOR EACH ROW EXECUTE FUNCTION validate_asset_source_deferred_state();
+    FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state();
 
-CREATE OR REPLACE FUNCTION enforce_asset_source_revision_transition() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.enforce_asset_source_revision_transition() RETURNS trigger AS $$
 DECLARE
     validation_is_valid boolean;
     current_source_version bigint;
@@ -2197,7 +2446,9 @@ BEGIN
         IF (current_source_kind = 'MANUAL' AND (
                 current_provider_kind <> 'MANUAL_V1' OR NEW.profile_code <> 'MANUAL_V1' OR
                 NEW.sync_mode <> 'MANUAL' OR NEW.credential_reference_id IS NOT NULL OR
-                NEW.trust_reference_id IS NOT NULL OR NEW.network_policy_reference_id IS NOT NULL
+                NEW.trust_reference_id IS NOT NULL OR NEW.network_policy_reference_id IS NOT NULL OR
+                NEW.schedule_expression IS NOT NULL OR NEW.typed_extension_code IS NOT NULL OR
+                NEW.prepared_extension_digest IS NOT NULL
             )) OR
            (current_source_kind <> 'MANUAL' AND (
                 current_provider_kind = 'MANUAL_V1' OR NEW.profile_code = 'MANUAL_V1'
@@ -2235,6 +2486,8 @@ BEGIN
     IF OLD.tenant_id IS DISTINCT FROM NEW.tenant_id OR OLD.workspace_id IS DISTINCT FROM NEW.workspace_id OR
        OLD.id IS DISTINCT FROM NEW.id OR OLD.source_id IS DISTINCT FROM NEW.source_id OR
        OLD.revision IS DISTINCT FROM NEW.revision OR
+       OLD.canonical_profile_manifest IS DISTINCT FROM NEW.canonical_profile_manifest OR
+       OLD.profile_manifest_sha256 IS DISTINCT FROM NEW.profile_manifest_sha256 OR
        OLD.canonical_provider_schema IS DISTINCT FROM NEW.canonical_provider_schema OR
        OLD.canonical_provider_schema_sha256 IS DISTINCT FROM NEW.canonical_provider_schema_sha256 OR
        OLD.integration_id IS DISTINCT FROM NEW.integration_id OR OLD.sync_mode IS DISTINCT FROM NEW.sync_mode OR
@@ -2250,6 +2503,8 @@ BEGIN
        OLD.backpressure_max_seconds IS DISTINCT FROM NEW.backpressure_max_seconds OR
        OLD.profile_code IS DISTINCT FROM NEW.profile_code OR
        OLD.schedule_expression IS DISTINCT FROM NEW.schedule_expression OR
+       OLD.typed_extension_code IS DISTINCT FROM NEW.typed_extension_code OR
+       OLD.prepared_extension_digest IS DISTINCT FROM NEW.prepared_extension_digest OR
        OLD.created_by IS DISTINCT FROM NEW.created_by OR
        OLD.change_reason_code IS DISTINCT FROM NEW.change_reason_code OR
        OLD.expected_source_version IS DISTINCT FROM NEW.expected_source_version OR
@@ -2385,28 +2640,386 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
 CREATE TRIGGER asset_source_revisions_transition_guard
-    BEFORE INSERT OR UPDATE ON asset_source_revisions
-    FOR EACH ROW EXECUTE FUNCTION enforce_asset_source_revision_transition();
+    BEFORE INSERT OR UPDATE ON public.asset_source_revisions
+    FOR EACH ROW EXECUTE FUNCTION public.enforce_asset_source_revision_transition();
 
-CREATE OR REPLACE FUNCTION validate_asset_source_revision_deferred_state() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.validate_asset_source_revision_deferred_state() RETURNS trigger AS $$
 DECLARE
-    current_revision asset_source_revisions%ROWTYPE;
-    current_source asset_sources%ROWTYPE;
+    current_revision public.asset_source_revisions%ROWTYPE;
+    current_source public.asset_sources%ROWTYPE;
+    profile_document json;
+    profile_row_count bigint;
+    profile_distinct_count bigint;
+    reconstructed_profile text;
+    trusted_path_values text;
+    relationship_values text;
+    authority_count bigint;
+    authority_digest text;
+    definition_digest text;
+    binding_digest text;
 BEGIN
-    SELECT * INTO current_revision
-    FROM asset_source_revisions
-    WHERE tenant_id = NEW.tenant_id AND workspace_id = NEW.workspace_id AND id = NEW.id;
+    IF TG_TABLE_NAME = 'asset_source_revision_authorities' THEN
+        SELECT revision.* INTO current_revision
+        FROM public.asset_source_revisions AS revision
+        WHERE revision.tenant_id = NEW.tenant_id
+          AND revision.workspace_id = NEW.workspace_id
+          AND revision.source_id = NEW.source_id
+          AND revision.revision = NEW.source_revision
+          AND revision.state = 'DRAFT'
+          AND revision.version = 1
+          AND revision.xmin = pg_catalog.pg_current_xact_id()::xid;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000', MESSAGE = 'authority membership may be appended only with its same-transaction parent revision',
+                CONSTRAINT = 'asset_source_revision_authorities_parent_guard';
+        END IF;
+    ELSE
+        SELECT revision.* INTO current_revision
+        FROM public.asset_source_revisions AS revision
+        WHERE revision.tenant_id = NEW.tenant_id
+          AND revision.workspace_id = NEW.workspace_id
+          AND revision.id = NEW.id;
+    END IF;
     IF NOT FOUND THEN
         RETURN NULL;
     END IF;
-    SELECT * INTO current_source
-    FROM asset_sources
-    WHERE tenant_id = current_revision.tenant_id
-      AND workspace_id = current_revision.workspace_id
-      AND id = current_revision.source_id;
+
+    SELECT source.* INTO current_source
+    FROM public.asset_sources AS source
+    WHERE source.tenant_id = current_revision.tenant_id
+      AND source.workspace_id = current_revision.workspace_id
+      AND source.id = current_revision.source_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23503', MESSAGE = 'source revision closure requires its exact scoped source',
+            CONSTRAINT = 'asset_source_revisions_source_fk';
+    END IF;
+
+    profile_document := pg_catalog.convert_from(current_revision.canonical_profile_manifest, 'UTF8')::json;
+    SELECT count(*), count(DISTINCT profile_entry.key)
+    INTO profile_row_count, profile_distinct_count
+    FROM pg_catalog.json_each(profile_document) AS profile_entry(key, value);
+    IF profile_row_count <> 26 OR profile_distinct_count <> 26 OR EXISTS (
+        SELECT 1
+        FROM pg_catalog.json_each(profile_document) AS profile_entry(key, value)
+        WHERE profile_entry.key NOT IN (
+            'version', 'source_kind', 'provider_kind', 'profile_code', 'sync_mode',
+            'freshness_kind', 'environment_mapping_mode', 'integration_mode',
+            'credential_purpose', 'trust_mode', 'network_mode', 'rate_limit_requests',
+            'rate_limit_window_seconds', 'backpressure_base_seconds', 'backpressure_max_seconds',
+            'schedule_mode', 'max_page_items', 'max_page_relations', 'max_page_bytes',
+            'max_document_bytes', 'parser_code', 'compatibility_class', 'dlp_policy_code',
+            'trusted_path_codes', 'relationship_types', 'typed_extension_code'
+        )
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514', MESSAGE = 'source Profile manifest must contain the exact closed 26-key set',
+            CONSTRAINT = 'asset_source_revisions_profile_manifest_guard';
+    END IF;
+
+    IF pg_catalog.json_typeof(profile_document->'version') <> 'string' OR
+       pg_catalog.json_typeof(profile_document->'source_kind') <> 'string' OR
+       pg_catalog.json_typeof(profile_document->'provider_kind') <> 'string' OR
+       pg_catalog.json_typeof(profile_document->'profile_code') <> 'string' OR
+       pg_catalog.json_typeof(profile_document->'sync_mode') <> 'string' OR
+       pg_catalog.json_typeof(profile_document->'freshness_kind') <> 'string' OR
+       pg_catalog.json_typeof(profile_document->'environment_mapping_mode') <> 'string' OR
+       pg_catalog.json_typeof(profile_document->'integration_mode') <> 'string' OR
+       pg_catalog.json_typeof(profile_document->'credential_purpose') <> 'string' OR
+       pg_catalog.json_typeof(profile_document->'trust_mode') <> 'string' OR
+       pg_catalog.json_typeof(profile_document->'network_mode') <> 'string' OR
+       pg_catalog.json_typeof(profile_document->'schedule_mode') <> 'string' OR
+       pg_catalog.json_typeof(profile_document->'parser_code') <> 'string' OR
+       pg_catalog.json_typeof(profile_document->'compatibility_class') <> 'string' OR
+       pg_catalog.json_typeof(profile_document->'dlp_policy_code') <> 'string' OR
+       pg_catalog.json_typeof(profile_document->'rate_limit_requests') <> 'number' OR
+       pg_catalog.json_typeof(profile_document->'rate_limit_window_seconds') <> 'number' OR
+       pg_catalog.json_typeof(profile_document->'backpressure_base_seconds') <> 'number' OR
+       pg_catalog.json_typeof(profile_document->'backpressure_max_seconds') <> 'number' OR
+       pg_catalog.json_typeof(profile_document->'max_page_items') <> 'number' OR
+       pg_catalog.json_typeof(profile_document->'max_page_relations') <> 'number' OR
+       pg_catalog.json_typeof(profile_document->'max_page_bytes') <> 'number' OR
+       pg_catalog.json_typeof(profile_document->'max_document_bytes') <> 'number' OR
+       pg_catalog.json_typeof(profile_document->'trusted_path_codes') <> 'array' OR
+       pg_catalog.json_typeof(profile_document->'relationship_types') <> 'array' OR
+       pg_catalog.json_typeof(profile_document->'typed_extension_code') NOT IN ('string', 'null') OR
+       profile_document->>'source_kind' NOT IN (
+            'MANUAL', 'CSV_IMPORT', 'CONTROL_PLANE_API', 'EXTERNAL_CMDB', 'VSPHERE',
+            'PROXMOX', 'OPENSTACK', 'CLOUD_PROVIDER', 'KUBERNETES_OPERATOR', 'AWX_INVENTORY'
+       ) OR
+       profile_document->>'sync_mode' NOT IN ('MANUAL', 'ON_DEMAND', 'SCHEDULED') OR
+       profile_document->>'freshness_kind' NOT IN (
+            'CATALOG_SEQUENCE', 'OBJECT_SEQUENCE', 'OBJECT_TIME_SEQUENCE', 'CHECKPOINT_SEQUENCE'
+       ) OR
+       profile_document->>'environment_mapping_mode' NOT IN ('SINGLE_ENVIRONMENT', 'MULTI_ENVIRONMENT') OR
+       profile_document->>'integration_mode' NOT IN ('NONE', 'REQUIRED') OR
+       profile_document->>'trust_mode' NOT IN ('NONE', 'REQUIRED') OR
+       profile_document->>'network_mode' NOT IN ('NONE', 'REQUIRED') OR
+       profile_document->>'schedule_mode' NOT IN ('NONE', 'REQUIRED') OR
+       (profile_document->>'provider_kind') COLLATE "C" !~ '^[A-Z][A-Z0-9_]{0,63}$' OR
+       (profile_document->>'profile_code') COLLATE "C" !~ '^[A-Z][A-Z0-9_]{0,127}$' OR
+       (profile_document->>'credential_purpose') COLLATE "C" !~ '^[A-Z][A-Z0-9_]{0,127}$' OR
+       (profile_document->>'parser_code') COLLATE "C" !~ '^[A-Z][A-Z0-9_]{0,127}$' OR
+       (profile_document->>'compatibility_class') COLLATE "C" !~ '^[A-Z][A-Z0-9_]{0,127}$' OR
+       (profile_document->>'dlp_policy_code') COLLATE "C" !~ '^[A-Z][A-Z0-9_]{0,127}$' OR
+       (pg_catalog.json_typeof(profile_document->'typed_extension_code') = 'string' AND
+            (profile_document->>'typed_extension_code') COLLATE "C" !~ '^[A-Z][A-Z0-9_]{0,127}$') OR
+       (profile_document->>'rate_limit_requests') COLLATE "C" !~ '^(0|[1-9][0-9]*)$' OR
+       (profile_document->>'rate_limit_window_seconds') COLLATE "C" !~ '^(0|[1-9][0-9]*)$' OR
+       (profile_document->>'backpressure_base_seconds') COLLATE "C" !~ '^(0|[1-9][0-9]*)$' OR
+       (profile_document->>'backpressure_max_seconds') COLLATE "C" !~ '^(0|[1-9][0-9]*)$' OR
+       (profile_document->>'max_page_items') COLLATE "C" !~ '^(0|[1-9][0-9]*)$' OR
+       (profile_document->>'max_page_relations') COLLATE "C" !~ '^(0|[1-9][0-9]*)$' OR
+       (profile_document->>'max_page_bytes') COLLATE "C" !~ '^(0|[1-9][0-9]*)$' OR
+       (profile_document->>'max_document_bytes') COLLATE "C" !~ '^(0|[1-9][0-9]*)$' OR
+       pg_catalog.octet_length(profile_document->>'rate_limit_requests') > 18 OR
+       pg_catalog.octet_length(profile_document->>'rate_limit_window_seconds') > 18 OR
+       pg_catalog.octet_length(profile_document->>'backpressure_base_seconds') > 18 OR
+       pg_catalog.octet_length(profile_document->>'backpressure_max_seconds') > 18 OR
+       pg_catalog.octet_length(profile_document->>'max_page_items') > 18 OR
+       pg_catalog.octet_length(profile_document->>'max_page_relations') > 18 OR
+       pg_catalog.octet_length(profile_document->>'max_page_bytes') > 18 OR
+       pg_catalog.octet_length(profile_document->>'max_document_bytes') > 18 OR
+       (profile_document->>'max_page_items')::bigint < 1 OR
+       (profile_document->>'max_page_relations')::bigint < 0 OR
+       (profile_document->>'max_page_bytes')::bigint < 1 OR
+       (profile_document->>'max_document_bytes')::bigint < 1 OR
+       (profile_document->>'max_document_bytes')::bigint > (profile_document->>'max_page_bytes')::bigint THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514', MESSAGE = 'source Profile manifest has an invalid closed-key type or non-minimal integer',
+            CONSTRAINT = 'asset_source_revisions_profile_manifest_guard';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM pg_catalog.json_array_elements(profile_document->'trusted_path_codes') AS item(value)
+        WHERE pg_catalog.json_typeof(item.value) <> 'string'
+           OR (item.value #>> '{}') COLLATE "C" !~ '^[A-Z][A-Z0-9_]{0,127}$'
+    ) OR EXISTS (
+        SELECT 1 FROM pg_catalog.json_array_elements(profile_document->'relationship_types') AS item(value)
+        WHERE pg_catalog.json_typeof(item.value) <> 'string'
+           OR (item.value #>> '{}') COLLATE "C" !~ '^[A-Z][A-Z0-9_]{0,127}$'
+    ) OR (
+        SELECT count(*) FROM pg_catalog.json_array_elements(profile_document->'trusted_path_codes') AS item(value)
+    ) NOT BETWEEN 1 AND 128 OR (
+        SELECT count(*) FROM pg_catalog.json_array_elements(profile_document->'relationship_types') AS item(value)
+    ) > 128 OR (
+        SELECT count(*) FROM pg_catalog.json_array_elements(profile_document->'trusted_path_codes') AS item(value)
+    ) <> (
+        SELECT count(DISTINCT item.value #>> '{}')
+        FROM pg_catalog.json_array_elements(profile_document->'trusted_path_codes') AS item(value)
+    ) OR (
+        SELECT count(*) FROM pg_catalog.json_array_elements(profile_document->'relationship_types') AS item(value)
+    ) <> (
+        SELECT count(DISTINCT item.value #>> '{}')
+        FROM pg_catalog.json_array_elements(profile_document->'relationship_types') AS item(value)
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514', MESSAGE = 'source Profile arrays must contain unique canonical string codes',
+            CONSTRAINT = 'asset_source_revisions_profile_manifest_guard';
+    END IF;
+
+    SELECT COALESCE(
+        pg_catalog.string_agg(pg_catalog.to_json(item.value #>> '{}')::text, ','
+            ORDER BY (item.value #>> '{}') COLLATE "C"),
+        ''
+    ) INTO trusted_path_values
+    FROM pg_catalog.json_array_elements(profile_document->'trusted_path_codes') AS item(value);
+    SELECT COALESCE(
+        pg_catalog.string_agg(pg_catalog.to_json(item.value #>> '{}')::text, ','
+            ORDER BY (item.value #>> '{}') COLLATE "C"),
+        ''
+    ) INTO relationship_values
+    FROM pg_catalog.json_array_elements(profile_document->'relationship_types') AS item(value);
+
+    reconstructed_profile :=
+        '{"backpressure_base_seconds":' || (profile_document->>'backpressure_base_seconds')::bigint::text ||
+        ',"backpressure_max_seconds":' || (profile_document->>'backpressure_max_seconds')::bigint::text ||
+        ',"compatibility_class":' || pg_catalog.to_json(profile_document->>'compatibility_class')::text ||
+        ',"credential_purpose":' || pg_catalog.to_json(profile_document->>'credential_purpose')::text ||
+        ',"dlp_policy_code":' || pg_catalog.to_json(profile_document->>'dlp_policy_code')::text ||
+        ',"environment_mapping_mode":' || pg_catalog.to_json(profile_document->>'environment_mapping_mode')::text ||
+        ',"freshness_kind":' || pg_catalog.to_json(profile_document->>'freshness_kind')::text ||
+        ',"integration_mode":' || pg_catalog.to_json(profile_document->>'integration_mode')::text ||
+        ',"max_document_bytes":' || (profile_document->>'max_document_bytes')::bigint::text ||
+        ',"max_page_bytes":' || (profile_document->>'max_page_bytes')::bigint::text ||
+        ',"max_page_items":' || (profile_document->>'max_page_items')::bigint::text ||
+        ',"max_page_relations":' || (profile_document->>'max_page_relations')::bigint::text ||
+        ',"network_mode":' || pg_catalog.to_json(profile_document->>'network_mode')::text ||
+        ',"parser_code":' || pg_catalog.to_json(profile_document->>'parser_code')::text ||
+        ',"profile_code":' || pg_catalog.to_json(profile_document->>'profile_code')::text ||
+        ',"provider_kind":' || pg_catalog.to_json(profile_document->>'provider_kind')::text ||
+        ',"rate_limit_requests":' || (profile_document->>'rate_limit_requests')::bigint::text ||
+        ',"rate_limit_window_seconds":' || (profile_document->>'rate_limit_window_seconds')::bigint::text ||
+        ',"relationship_types":[' || relationship_values || ']' ||
+        ',"schedule_mode":' || pg_catalog.to_json(profile_document->>'schedule_mode')::text ||
+        ',"source_kind":' || pg_catalog.to_json(profile_document->>'source_kind')::text ||
+        ',"sync_mode":' || pg_catalog.to_json(profile_document->>'sync_mode')::text ||
+        ',"trust_mode":' || pg_catalog.to_json(profile_document->>'trust_mode')::text ||
+        ',"trusted_path_codes":[' || trusted_path_values || ']' ||
+        ',"typed_extension_code":' || CASE
+            WHEN pg_catalog.json_typeof(profile_document->'typed_extension_code') = 'null' THEN 'null'
+            ELSE pg_catalog.to_json(profile_document->>'typed_extension_code')::text
+        END ||
+        ',"version":' || pg_catalog.to_json(profile_document->>'version')::text || '}';
+
+    IF pg_catalog.convert_to(reconstructed_profile, 'UTF8') IS DISTINCT FROM current_revision.canonical_profile_manifest OR
+       pg_catalog.encode(pg_catalog.sha256(current_revision.canonical_profile_manifest), 'hex')
+            IS DISTINCT FROM current_revision.profile_manifest_sha256 OR
+       pg_catalog.encode(pg_catalog.sha256(current_revision.canonical_provider_schema), 'hex')
+            IS DISTINCT FROM current_revision.canonical_provider_schema_sha256 THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514', MESSAGE = 'source Profile or Provider schema bytes are not exact canonical content',
+            CONSTRAINT = 'asset_source_revisions_canonical_content_guard';
+    END IF;
+
+    SELECT count(*) INTO authority_count
+    FROM public.asset_source_revision_authorities AS authority
+    WHERE authority.tenant_id = current_revision.tenant_id
+      AND authority.workspace_id = current_revision.workspace_id
+      AND authority.source_id = current_revision.source_id
+      AND authority.source_revision = current_revision.revision;
+    IF authority_count NOT BETWEEN 1 AND 100 OR EXISTS (
+        SELECT 1
+        FROM (
+            SELECT authority.canonical_ordinal,
+                   pg_catalog.row_number() OVER (
+                       ORDER BY authority.environment_id::text COLLATE "C"
+                   ) AS expected_ordinal
+            FROM public.asset_source_revision_authorities AS authority
+            WHERE authority.tenant_id = current_revision.tenant_id
+              AND authority.workspace_id = current_revision.workspace_id
+              AND authority.source_id = current_revision.source_id
+              AND authority.source_revision = current_revision.revision
+        ) AS ordered_authority
+        WHERE ordered_authority.canonical_ordinal <> ordered_authority.expected_ordinal
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514', MESSAGE = 'source revision authorities must be contiguous in canonical Environment UUID order',
+            CONSTRAINT = 'asset_source_revision_authorities_order_guard';
+    END IF;
+
+    authority_digest := pg_catalog.encode(pg_catalog.sha256(
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.convert_to('asset-source-authority-scope.v1', 'UTF8')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.convert_to(authority_count::text, 'UTF8')
+        ) ||
+        (
+            SELECT pg_catalog.string_agg(
+                public.asset_catalog_framed_value_v1(
+                    pg_catalog.convert_to(authority.environment_id::text, 'UTF8')
+                ),
+                ''::bytea ORDER BY authority.environment_id::text COLLATE "C"
+            )
+            FROM public.asset_source_revision_authorities AS authority
+            WHERE authority.tenant_id = current_revision.tenant_id
+              AND authority.workspace_id = current_revision.workspace_id
+              AND authority.source_id = current_revision.source_id
+              AND authority.source_revision = current_revision.revision
+        )
+    ), 'hex');
+
+    definition_digest := pg_catalog.encode(pg_catalog.sha256(
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.convert_to('asset-source-definition.v2', 'UTF8')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.convert_to(current_source.source_kind, 'UTF8')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.convert_to(current_source.provider_kind, 'UTF8')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.convert_to(current_revision.profile_code, 'UTF8')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.decode(current_revision.profile_manifest_sha256, 'hex')
+        ) ||
+        public.asset_catalog_framed_value_v1(
+            pg_catalog.decode(current_revision.canonical_provider_schema_sha256, 'hex')
+        )
+    ), 'hex');
+
+    binding_digest := public.asset_catalog_source_revision_binding_digest(current_revision);
+    IF authority_digest IS DISTINCT FROM current_revision.authority_scope_digest OR
+       definition_digest IS DISTINCT FROM current_revision.source_definition_digest OR
+       binding_digest IS DISTINCT FROM current_revision.canonical_revision_digest THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514', MESSAGE = 'source revision authority, definition, or binding digest drifted from canonical facts',
+            CONSTRAINT = 'asset_source_revisions_digest_closure_guard';
+    END IF;
+
+    IF profile_document->>'version' <> 'asset-source-profile-manifest.v1' OR
+       profile_document->>'source_kind' IS DISTINCT FROM current_source.source_kind OR
+       profile_document->>'provider_kind' IS DISTINCT FROM current_source.provider_kind OR
+       profile_document->>'profile_code' IS DISTINCT FROM current_revision.profile_code OR
+       profile_document->>'sync_mode' IS DISTINCT FROM current_revision.sync_mode OR
+       (profile_document->>'rate_limit_requests')::bigint <> current_revision.rate_limit_requests::bigint OR
+       (profile_document->>'rate_limit_window_seconds')::bigint <> current_revision.rate_limit_window_seconds::bigint OR
+       (profile_document->>'backpressure_base_seconds')::bigint <> current_revision.backpressure_base_seconds::bigint OR
+       (profile_document->>'backpressure_max_seconds')::bigint <> current_revision.backpressure_max_seconds::bigint OR
+       ((profile_document->>'integration_mode') = 'NONE') IS DISTINCT FROM (current_revision.integration_id IS NULL) OR
+       ((profile_document->>'credential_purpose') = 'NONE') IS DISTINCT FROM (current_revision.credential_reference_id IS NULL) OR
+       ((profile_document->>'trust_mode') = 'NONE') IS DISTINCT FROM (current_revision.trust_reference_id IS NULL) OR
+       ((profile_document->>'network_mode') = 'NONE') IS DISTINCT FROM (current_revision.network_policy_reference_id IS NULL) OR
+       ((profile_document->>'schedule_mode') = 'NONE') IS DISTINCT FROM (current_revision.schedule_expression IS NULL) OR
+       (profile_document->>'environment_mapping_mode' = 'SINGLE_ENVIRONMENT' AND authority_count <> 1) OR
+       (profile_document->>'typed_extension_code') IS DISTINCT FROM current_revision.typed_extension_code THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514', MESSAGE = 'source Profile semantics drift from their persisted revision binding',
+            CONSTRAINT = 'asset_source_revisions_profile_parity_guard';
+    END IF;
+
+    IF current_source.source_kind = 'KUBERNETES_OPERATOR' AND (
+        current_revision.typed_extension_code IS NULL OR
+        current_revision.prepared_extension_digest IS NULL OR
+        current_revision.typed_extension_code IS DISTINCT FROM current_revision.profile_code
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514', MESSAGE = 'KUBERNETES_OPERATOR requires its exact prepared typed-extension pair',
+            CONSTRAINT = 'asset_source_revisions_typed_extension_guard';
+    ELSIF current_source.source_kind <> 'KUBERNETES_OPERATOR' AND (
+        current_revision.typed_extension_code IS NOT NULL OR
+        current_revision.prepared_extension_digest IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514', MESSAGE = 'non-KUBERNETES_OPERATOR sources cannot bind a typed extension',
+            CONSTRAINT = 'asset_source_revisions_typed_extension_guard';
+    END IF;
+
+    IF current_source.source_kind = 'MANUAL' AND (
+       current_source.provider_kind <> 'MANUAL_V1' OR
+       current_revision.profile_code <> 'MANUAL_V1' OR
+       current_revision.sync_mode <> 'MANUAL' OR
+       current_revision.rate_limit_requests <> 1 OR
+       current_revision.rate_limit_window_seconds <> 1 OR
+       current_revision.backpressure_base_seconds <> 1 OR
+       current_revision.backpressure_max_seconds <> 1 OR
+       current_revision.integration_id IS NOT NULL OR
+       current_revision.credential_reference_id IS NOT NULL OR
+       current_revision.trust_reference_id IS NOT NULL OR
+       current_revision.network_policy_reference_id IS NOT NULL OR
+       current_revision.schedule_expression IS NOT NULL OR
+       current_revision.typed_extension_code IS NOT NULL OR
+       current_revision.prepared_extension_digest IS NOT NULL OR
+       authority_count <> 1 OR
+       pg_catalog.octet_length(current_revision.canonical_profile_manifest) <> 794 OR
+       current_revision.canonical_profile_manifest IS DISTINCT FROM pg_catalog.convert_to('{"backpressure_base_seconds":1,"backpressure_max_seconds":1,"compatibility_class":"MANUAL_V1","credential_purpose":"NONE","dlp_policy_code":"ASSET_SAFE_V1","environment_mapping_mode":"SINGLE_ENVIRONMENT","freshness_kind":"CATALOG_SEQUENCE","integration_mode":"NONE","max_document_bytes":65536,"max_page_bytes":65536,"max_page_items":1,"max_page_relations":0,"network_mode":"NONE","parser_code":"MANUAL_ASSET_V1","profile_code":"MANUAL_V1","provider_kind":"MANUAL_V1","rate_limit_requests":1,"rate_limit_window_seconds":1,"relationship_types":[],"schedule_mode":"NONE","source_kind":"MANUAL","sync_mode":"MANUAL","trust_mode":"NONE","trusted_path_codes":["MANUAL_V1_DISPLAY_NAME","MANUAL_V1_EXTERNAL_ID","MANUAL_V1_KIND"],"typed_extension_code":null,"version":"asset-source-profile-manifest.v1"}', 'UTF8') OR
+       current_revision.profile_manifest_sha256 <> '57d171caef88e859700dde32fda6b9a982b25b50deca47c6246945c8dfb60b96' OR
+       pg_catalog.octet_length(current_revision.canonical_provider_schema) <> 62 OR
+       current_revision.canonical_provider_schema IS DISTINCT FROM pg_catalog.convert_to('{"additionalProperties":false,"properties":{},"type":"object"}', 'UTF8') OR
+       current_revision.canonical_provider_schema_sha256 <> '99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa' OR
+       current_revision.source_definition_digest <> '7a0c248c3ebd32dae4e94b516d6f56608d4f1a25cd33d0fe467b54200824984c'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514', MESSAGE = 'MANUAL revision must equal the exact built-in asset-source-definition.v2 Profile contract',
+            CONSTRAINT = 'asset_source_revisions_manual_profile_guard';
+    END IF;
+
     IF current_revision.state = 'PUBLISHED' AND (
        current_source.published_revision IS DISTINCT FROM current_revision.revision OR
        current_source.published_revision_digest IS DISTINCT FROM current_revision.canonical_revision_digest) THEN
@@ -2417,7 +3030,7 @@ BEGIN
     IF current_revision.state = 'SUPERSEDED' AND (
        current_source.published_revision IS NOT DISTINCT FROM current_revision.revision OR
        NOT EXISTS (
-            SELECT 1 FROM asset_source_revisions AS successor
+            SELECT 1 FROM public.asset_source_revisions AS successor
             WHERE successor.tenant_id = current_revision.tenant_id
               AND successor.workspace_id = current_revision.workspace_id
               AND successor.source_id = current_revision.source_id
@@ -2431,14 +3044,19 @@ BEGIN
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
 CREATE CONSTRAINT TRIGGER asset_source_revisions_deferred_state_guard
-    AFTER INSERT OR UPDATE ON asset_source_revisions
+    AFTER INSERT OR UPDATE ON public.asset_source_revisions
     DEFERRABLE INITIALLY DEFERRED
-    FOR EACH ROW EXECUTE FUNCTION validate_asset_source_revision_deferred_state();
+    FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_revision_deferred_state();
 
-CREATE OR REPLACE FUNCTION enforce_asset_source_run_mutation() RETURNS trigger AS $$
+CREATE CONSTRAINT TRIGGER asset_source_revision_authorities_deferred_state_guard
+    AFTER INSERT ON public.asset_source_revision_authorities
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_revision_deferred_state();
+
+CREATE OR REPLACE FUNCTION public.enforce_asset_source_run_mutation() RETURNS trigger AS $$
 DECLARE
     current_source asset_sources%ROWTYPE;
     current_revision asset_source_revisions%ROWTYPE;
@@ -3347,13 +3965,13 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
 CREATE TRIGGER asset_source_runs_mutation_guard
-    BEFORE INSERT OR UPDATE ON asset_source_runs
-    FOR EACH ROW EXECUTE FUNCTION enforce_asset_source_run_mutation();
+    BEFORE INSERT OR UPDATE ON public.asset_source_runs
+    FOR EACH ROW EXECUTE FUNCTION public.enforce_asset_source_run_mutation();
 
-CREATE OR REPLACE FUNCTION validate_asset_source_run_page_closure() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.validate_asset_source_run_page_closure() RETURNS trigger AS $$
 DECLARE
     current_run asset_source_runs%ROWTYPE;
     current_source asset_sources%ROWTYPE;
@@ -3432,14 +4050,14 @@ BEGIN
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
 CREATE CONSTRAINT TRIGGER asset_source_runs_page_closure_guard
-    AFTER UPDATE ON asset_source_runs
+    AFTER UPDATE ON public.asset_source_runs
     DEFERRABLE INITIALLY DEFERRED
-    FOR EACH ROW EXECUTE FUNCTION validate_asset_source_run_page_closure();
+    FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_run_page_closure();
 
-CREATE OR REPLACE FUNCTION validate_asset_source_run_terminal_closure() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.validate_asset_source_run_terminal_closure() RETURNS trigger AS $$
 DECLARE
     current_run asset_source_runs%ROWTYPE;
     current_source asset_sources%ROWTYPE;
@@ -3627,15 +4245,15 @@ BEGIN
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
 CREATE CONSTRAINT TRIGGER asset_source_runs_terminal_closure_guard
-    AFTER INSERT OR UPDATE ON asset_source_runs
+    AFTER INSERT OR UPDATE ON public.asset_source_runs
     DEFERRABLE INITIALLY DEFERRED
-    FOR EACH ROW EXECUTE FUNCTION validate_asset_source_run_terminal_closure();
+    FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_run_terminal_closure();
 
 
-CREATE OR REPLACE FUNCTION enforce_asset_observation_admission() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.enforce_asset_observation_admission() RETURNS trigger AS $$
 DECLARE
     current_run asset_source_runs%ROWTYPE;
     current_source asset_sources%ROWTYPE;
@@ -3825,13 +4443,13 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
 CREATE TRIGGER asset_observations_admission_guard
-    BEFORE INSERT ON asset_observations
-    FOR EACH ROW EXECUTE FUNCTION enforce_asset_observation_admission();
+    BEFORE INSERT ON public.asset_observations
+    FOR EACH ROW EXECUTE FUNCTION public.enforce_asset_observation_admission();
 
-CREATE OR REPLACE FUNCTION validate_asset_observation_page_closure() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION public.validate_asset_observation_page_closure() RETURNS trigger AS $$
 DECLARE
     committed_run asset_source_runs%ROWTYPE;
     committed_source asset_sources%ROWTYPE;
@@ -3897,11 +4515,107 @@ BEGIN
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql
-SET search_path = pg_catalog, public;
+SET search_path = pg_catalog, public, pg_temp;
 
 CREATE CONSTRAINT TRIGGER asset_observations_page_closure_guard
-    AFTER INSERT ON asset_observations
+    AFTER INSERT ON public.asset_observations
     DEFERRABLE INITIALLY DEFERRED
-    FOR EACH ROW EXECUTE FUNCTION validate_asset_observation_page_closure();
+    FOR EACH ROW EXECUTE FUNCTION public.validate_asset_observation_page_closure();
+
+REVOKE EXECUTE ON FUNCTION
+    public.asset_catalog_text_valid(text, integer),
+    public.asset_catalog_code_valid(text, integer),
+    public.asset_catalog_sha256_valid(text),
+    public.asset_catalog_provider_kind_valid(text),
+    public.asset_catalog_idempotency_key_valid(text),
+    public.asset_catalog_json_object_valid(bytea, integer, integer),
+    public.asset_catalog_labels_valid(jsonb),
+    public.asset_catalog_checkpoint_envelope_valid(bytea),
+    public.asset_catalog_field_provenance_valid(bytea),
+    public.asset_catalog_framed_value_v1(bytea),
+    public.asset_catalog_source_run_no_credential_digest(public.asset_source_runs),
+    public.asset_catalog_source_run_delay_intent_digest(public.asset_source_runs, text, timestamp with time zone),
+    public.asset_catalog_source_run_failure_override_digest(public.asset_source_runs, text),
+    public.asset_catalog_source_run_terminal_digest(public.asset_source_runs, text, text),
+    public.asset_catalog_opaque_reference_valid(text),
+    public.asset_catalog_future_source_gate_admitted(public.asset_sources),
+    public.asset_catalog_source_revision_binding_digest(public.asset_source_revisions),
+    public.validate_asset_management_audit_insert(),
+    public.reject_asset_catalog_immutable(),
+    public.reject_asset_catalog_delete(),
+    public.reject_asset_catalog_truncate(),
+    public.enforce_assets_transition(),
+    public.enforce_asset_conflict_transition(),
+    public.enforce_asset_catalog_edge_mutation(),
+    public.enforce_asset_relationship_mutation(),
+    public.validate_asset_relationship_page_closure(),
+    public.enforce_asset_sources_mutation(),
+    public.validate_asset_source_deferred_state(),
+    public.enforce_asset_source_revision_transition(),
+    public.validate_asset_source_revision_deferred_state(),
+    public.enforce_asset_source_run_mutation(),
+    public.validate_asset_source_run_page_closure(),
+    public.validate_asset_source_run_terminal_closure(),
+    public.enforce_asset_observation_admission(),
+    public.validate_asset_observation_page_closure()
+    FROM PUBLIC;
+
+GRANT USAGE ON SCHEMA public TO aiops_control_plane_runtime;
+GRANT SELECT ON TABLE public.workspaces, public.environments, public.services,
+    public.service_bindings TO aiops_control_plane_runtime;
+GRANT SELECT, INSERT ON TABLE
+    public.asset_sources,
+    public.asset_source_revisions,
+    public.asset_source_revision_authorities,
+    public.asset_source_runs,
+    public.asset_observations,
+    public.assets,
+    public.asset_type_details,
+    public.asset_conflicts,
+    public.asset_relationships,
+    public.service_asset_bindings
+    TO aiops_control_plane_runtime;
+GRANT UPDATE ON TABLE
+    public.asset_sources,
+    public.asset_source_revisions,
+    public.asset_source_runs,
+    public.assets,
+    public.asset_conflicts,
+    public.asset_relationships,
+    public.service_asset_bindings
+    TO aiops_control_plane_runtime;
+GRANT SELECT ON TABLE public.audit_records TO aiops_control_plane_runtime;
+GRANT INSERT (id, tenant_id, workspace_id, actor_type, actor_id, action, resource_type,
+    resource_id, request_id, trace_id, payload_hash, details, created_at)
+    ON public.audit_records TO aiops_control_plane_runtime;
+GRANT SELECT ON TABLE public.outbox_events TO aiops_control_plane_runtime;
+GRANT INSERT (id, tenant_id, workspace_id, aggregate_type, aggregate_id,
+    aggregate_version, event_type, payload, created_at, available_at)
+    ON public.outbox_events TO aiops_control_plane_runtime;
+GRANT UPDATE (available_at, claimed_at, claimed_by, claim_token, claim_expires_at,
+    delivered_at, delivered_claim_token, attempts, last_error_code)
+    ON public.outbox_events TO aiops_control_plane_runtime;
+
+GRANT EXECUTE ON FUNCTION
+    public.asset_catalog_text_valid(text, integer),
+    public.asset_catalog_code_valid(text, integer),
+    public.asset_catalog_sha256_valid(text),
+    public.asset_catalog_provider_kind_valid(text),
+    public.asset_catalog_idempotency_key_valid(text),
+    public.asset_catalog_json_object_valid(bytea, integer, integer),
+    public.asset_catalog_labels_valid(jsonb),
+    public.asset_catalog_checkpoint_envelope_valid(bytea),
+    public.asset_catalog_field_provenance_valid(bytea),
+    public.asset_catalog_framed_value_v1(bytea),
+    public.asset_catalog_source_run_no_credential_digest(public.asset_source_runs),
+    public.asset_catalog_source_run_delay_intent_digest(public.asset_source_runs, text, timestamp with time zone),
+    public.asset_catalog_source_run_failure_override_digest(public.asset_source_runs, text),
+    public.asset_catalog_source_run_terminal_digest(public.asset_source_runs, text, text),
+    public.asset_catalog_opaque_reference_valid(text),
+    public.asset_catalog_future_source_gate_admitted(public.asset_sources),
+    public.asset_catalog_source_revision_binding_digest(public.asset_source_revisions)
+    TO aiops_control_plane_runtime;
+
+RESET ROLE;
 
 COMMIT;

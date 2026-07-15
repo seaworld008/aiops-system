@@ -15,13 +15,14 @@ type schemaAdmissionQueryStub struct {
 	row           schemaAdmissionRowStub
 	beginErr      error
 	execErr       error
+	execErrAt     int
 	rollbackErr   error
 	beginCalls    int
 	execCalls     int
 	calls         int
 	rollbackCalls int
 	lastOptions   pgx.TxOptions
-	lastExecSQL   string
+	execSQLs      []string
 	lastSQL       string
 	lastArgs      []any
 	callOrder     []string
@@ -42,9 +43,16 @@ func (stub *schemaAdmissionQueryStub) BeginTx(
 
 func (stub *schemaAdmissionQueryStub) Exec(_ context.Context, sql string, _ ...any) error {
 	stub.execCalls++
-	stub.lastExecSQL = sql
-	stub.callOrder = append(stub.callOrder, "set-local")
-	return stub.execErr
+	stub.execSQLs = append(stub.execSQLs, sql)
+	if stub.execCalls == 1 {
+		stub.callOrder = append(stub.callOrder, "set-search-path")
+	} else {
+		stub.callOrder = append(stub.callOrder, "set-quote-identifiers")
+	}
+	if stub.execErr != nil && (stub.execErrAt == 0 || stub.execErrAt == stub.execCalls) {
+		return stub.execErr
+	}
+	return nil
 }
 
 func (stub *schemaAdmissionQueryStub) QueryRow(_ context.Context, sql string, args ...any) schemaAdmissionRow {
@@ -164,6 +172,7 @@ func TestSchemaAdmissionFailsClosedAcrossTransactionBoundary(t *testing.T) {
 	tests := []struct {
 		name          string
 		configure     func(*schemaAdmissionQueryStub)
+		wantExecs     int
 		wantQueries   int
 		wantRollbacks int
 	}{
@@ -172,14 +181,27 @@ func TestSchemaAdmissionFailsClosedAcrossTransactionBoundary(t *testing.T) {
 			configure: func(stub *schemaAdmissionQueryStub) {
 				stub.beginErr = errors.New("secret begin failure")
 			},
+			wantExecs:     0,
 			wantQueries:   0,
 			wantRollbacks: 0,
 		},
 		{
-			name: "set local",
+			name: "set local search path",
 			configure: func(stub *schemaAdmissionQueryStub) {
+				stub.execErrAt = 1
 				stub.execErr = errors.New("secret set-local failure")
 			},
+			wantExecs:     1,
+			wantQueries:   0,
+			wantRollbacks: 1,
+		},
+		{
+			name: "set local quote identifiers",
+			configure: func(stub *schemaAdmissionQueryStub) {
+				stub.execErrAt = 2
+				stub.execErr = errors.New("secret set-local failure")
+			},
+			wantExecs:     2,
 			wantQueries:   0,
 			wantRollbacks: 1,
 		},
@@ -188,6 +210,7 @@ func TestSchemaAdmissionFailsClosedAcrossTransactionBoundary(t *testing.T) {
 			configure: func(stub *schemaAdmissionQueryStub) {
 				stub.row.err = errors.New("secret manifest failure")
 			},
+			wantExecs:     2,
 			wantQueries:   1,
 			wantRollbacks: 1,
 		},
@@ -196,6 +219,7 @@ func TestSchemaAdmissionFailsClosedAcrossTransactionBoundary(t *testing.T) {
 			configure: func(stub *schemaAdmissionQueryStub) {
 				stub.rollbackErr = errors.New("secret rollback failure")
 			},
+			wantExecs:     2,
 			wantQueries:   1,
 			wantRollbacks: 1,
 		},
@@ -213,6 +237,9 @@ func TestSchemaAdmissionFailsClosedAcrossTransactionBoundary(t *testing.T) {
 			}
 			if got := err.Error(); strings.Contains(got, "secret") {
 				t.Fatalf("Check() leaked transaction error text: %q", got)
+			}
+			if query.execCalls != test.wantExecs {
+				t.Fatalf("Check() exec calls = %d, want %d", query.execCalls, test.wantExecs)
 			}
 			if query.calls != test.wantQueries {
 				t.Fatalf("Check() query calls = %d, want %d", query.calls, test.wantQueries)
@@ -284,18 +311,28 @@ func TestSchemaAdmissionUsesOnlyExplicitTrustedSchema(t *testing.T) {
 	if got, want := query.lastArgs[0], any("control_plane"); got != want {
 		t.Fatalf("Check() trusted schema argument = %v, want %v", got, want)
 	}
-	if got, want := strings.Join(query.callOrder, ","), "begin,set-local,manifest,rollback"; got != want {
+	if got, want := strings.Join(query.callOrder, ","), "begin,set-search-path,set-quote-identifiers,manifest,rollback"; got != want {
 		t.Fatalf("Check() call order = %q, want %q", got, want)
+	}
+	if query.lastOptions.IsoLevel != pgx.RepeatableRead {
+		t.Fatalf("Check() transaction isolation = %q, want %q", query.lastOptions.IsoLevel, pgx.RepeatableRead)
 	}
 	if query.lastOptions.AccessMode != pgx.ReadOnly {
 		t.Fatalf("Check() transaction access mode = %q, want %q", query.lastOptions.AccessMode, pgx.ReadOnly)
 	}
-	if query.lastExecSQL != schemaAdmissionSetLocalSearchPathSQL {
-		t.Fatalf("Check() SET LOCAL SQL = %q, want %q", query.lastExecSQL, schemaAdmissionSetLocalSearchPathSQL)
+	if got, want := query.execSQLs, []string{
+		schemaAdmissionSetLocalSearchPathSQL,
+		schemaAdmissionSetLocalQuoteIdentifiersSQL,
+	}; strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("Check() SET LOCAL SQL = %q, want %q", got, want)
 	}
 	if got, want := strings.ToLower(schemaAdmissionSetLocalSearchPathSQL),
 		"set local search_path = pg_catalog, pg_temp"; got != want {
 		t.Fatalf("schema admission SET LOCAL SQL = %q, want %q", got, want)
+	}
+	if got, want := strings.ToLower(schemaAdmissionSetLocalQuoteIdentifiersSQL),
+		"set local quote_all_identifiers = off"; got != want {
+		t.Fatalf("schema admission quote identifiers SQL = %q, want %q", got, want)
 	}
 	lowerSQL := strings.ToLower(query.lastSQL)
 	for _, forbidden := range []string{
@@ -319,6 +356,7 @@ func TestSchemaAdmissionManifestCoversExactCatalogSurface(t *testing.T) {
 	for _, required := range []string{
 		"asset_sources",
 		"asset_source_revisions",
+		"asset_source_revision_authorities",
 		"asset_source_runs",
 		"asset_observations",
 		"assets",
@@ -333,8 +371,12 @@ func TestSchemaAdmissionManifestCoversExactCatalogSurface(t *testing.T) {
 		"pg_catalog.pg_constraint",
 		"pg_catalog.pg_index",
 		"pg_catalog.pg_trigger",
+		"pg_catalog.pg_depend",
 		"pg_catalog.pg_proc",
 		"pg_catalog.pg_description",
+		"pg_catalog.pg_roles",
+		"pg_catalog.aclexplode",
+		"pg_catalog.acldefault",
 		"pg_catalog.format_type",
 		"pg_catalog.pg_get_expr",
 		"pg_catalog.pg_get_constraintdef",
@@ -356,15 +398,27 @@ func TestSchemaAdmissionManifestCoversExactCatalogSurface(t *testing.T) {
 		"tgenabled",
 		"tgdeferrable",
 		"tginitdeferred",
+		"direct_function_dependency_count",
+		"direct_function_dependencies",
+		"dependency.deptype",
 		"trigger_record.tgisinternal then null",
 		"constraint_surface",
 		"provolatile",
 		"proisstrict",
 		"prosecdef",
 		"proconfig",
+		"authorization-owner",
+		"authorization-acl",
+		"owner_oid",
+		"grantee",
+		"grantor",
+		"privilege_type",
+		"is_grantable",
+		"multiplicity",
 		"int8send",
 		"int4send",
-		"order by record_kind, sort_key",
+		"record_kind collate \"c\"",
+		"sort_key collate \"c\"",
 	} {
 		if !strings.Contains(lowerSQL, required) {
 			t.Errorf("schema admission manifest is missing %q", required)
@@ -373,7 +427,12 @@ func TestSchemaAdmissionManifestCoversExactCatalogSurface(t *testing.T) {
 	if strings.Contains(lowerSQL, "and not trigger_record.tgisinternal") {
 		t.Error("schema admission excludes internal constraint triggers")
 	}
-	if strings.Contains(lowerSQL, "and not attribute.attisdropped") {
+	columnRecordsStart := strings.Index(lowerSQL, "column_records as (")
+	constraintRecordsStart := strings.Index(lowerSQL, "constraint_records as (")
+	if columnRecordsStart < 0 || constraintRecordsStart <= columnRecordsStart {
+		t.Fatal("schema admission structural column record region is missing")
+	}
+	if strings.Contains(lowerSQL[columnRecordsStart:constraintRecordsStart], "and not attribute.attisdropped") {
 		t.Error("schema admission excludes dropped-column drift")
 	}
 }

@@ -3,6 +3,8 @@ package postgres_test
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -13,35 +15,55 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	assetpostgres "github.com/seaworld008/aiops-system/internal/assetcatalog/postgres"
+	storepostgres "github.com/seaworld008/aiops-system/internal/store/postgres"
 )
 
 type assetCatalogHarness struct {
-	admin *pgxpool.Pool
-	db    *pgxpool.Pool
-	name  string
+	admin       *pgxpool.Pool
+	db          *pgxpool.Pool
+	migration   *pgxpool.Pool
+	application *pgxpool.Pool
+	name        string
 }
 
 var safeAssetCatalogControlDatabase = regexp.MustCompile(`^aiops_test(_[a-z0-9]+)*$`)
 
 func newAssetCatalogHarness(t *testing.T) *assetCatalogHarness {
 	t.Helper()
-	dsn := strings.TrimSpace(os.Getenv("AIOPS_TEST_POSTGRES_DSN"))
-	if dsn == "" {
+	adminDSN := strings.TrimSpace(os.Getenv("AIOPS_TEST_POSTGRES_DSN"))
+	if adminDSN == "" {
 		t.Skip("AIOPS_TEST_POSTGRES_DSN is not configured; real PostgreSQL 18.4 migration tests were not run")
 	}
+	migrationDSN := strings.TrimSpace(os.Getenv("AIOPS_TEST_POSTGRES_MIGRATION_DSN"))
+	applicationDSN := strings.TrimSpace(os.Getenv("AIOPS_TEST_POSTGRES_APPLICATION_DSN"))
+	if migrationDSN == "" || applicationDSN == "" {
+		t.Fatal("AIOPS_TEST_POSTGRES_MIGRATION_DSN and AIOPS_TEST_POSTGRES_APPLICATION_DSN are required when the real PostgreSQL harness is enabled")
+	}
+	if adminDSN == migrationDSN || adminDSN == applicationDSN || migrationDSN == applicationDSN {
+		t.Fatal("test-control, migration, and application PostgreSQL DSNs must be distinct")
+	}
 	ctx := context.Background()
-	adminConfig, err := pgxpool.ParseConfig(dsn)
+	adminConfig, err := pgxpool.ParseConfig(adminDSN)
 	if err != nil {
-		t.Fatalf("parse PostgreSQL test DSN: %v", err)
+		t.Fatal("parse PostgreSQL test-control DSN: invalid configuration")
 	}
 	controlName := adminConfig.ConnConfig.Database
 	if !assetCatalogControlDatabaseNameSafe(controlName) {
 		t.Fatalf("AIOPS_TEST_POSTGRES_DSN must name a dedicated safe test control database, got %q", controlName)
+	}
+	migrationConfig, err := assetCatalogRolePoolConfig(migrationDSN, controlName, "aiops_migrator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	applicationConfig, err := assetCatalogRolePoolConfig(applicationDSN, controlName, "aiops_control_plane_workload")
+	if err != nil {
+		t.Fatal(err)
 	}
 	adminConfig.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 	admin, err := pgxpool.NewWithConfig(ctx, adminConfig)
@@ -60,9 +82,15 @@ func newAssetCatalogHarness(t *testing.T) *assetCatalogHarness {
 
 	databaseName := "aiops_assets_test_" + randomAssetHex(t, 16)
 	identifier := pgx.Identifier{databaseName}.Sanitize()
-	var database *pgxpool.Pool
+	var database, migration, application *pgxpool.Pool
 	created := false
 	t.Cleanup(func() {
+		if application != nil {
+			application.Close()
+		}
+		if migration != nil {
+			migration.Close()
+		}
 		if database != nil {
 			database.Close()
 		}
@@ -73,13 +101,22 @@ func newAssetCatalogHarness(t *testing.T) *assetCatalogHarness {
 		}
 		admin.Close()
 	})
-	if _, err := admin.Exec(ctx, "CREATE DATABASE "+identifier+" WITH TEMPLATE template0"); err != nil {
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+identifier+" WITH TEMPLATE template0 OWNER aiops_schema_owner"); err != nil {
 		t.Fatalf("create isolated physical PostgreSQL test database %s; ownership unconfirmed, refusing destructive cleanup: %v", databaseName, err)
 	}
 	created = true
-	config, err := pgxpool.ParseConfig(dsn)
+	if _, err := admin.Exec(ctx, `SET ROLE aiops_schema_owner;
+REVOKE ALL ON DATABASE `+identifier+` FROM PUBLIC;
+REVOKE ALL ON DATABASE `+identifier+` FROM aiops_control_plane_runtime;
+GRANT CONNECT ON DATABASE `+identifier+` TO aiops_migrator;
+GRANT CONNECT ON DATABASE `+identifier+` TO aiops_control_plane_workload;
+RESET ROLE;`); err != nil {
+		t.Fatalf("preprovision isolated PostgreSQL database ACL: %v", err)
+	}
+
+	config, err := pgxpool.ParseConfig(adminDSN)
 	if err != nil {
-		t.Fatalf("parse isolated PostgreSQL config: %v", err)
+		t.Fatal("parse isolated PostgreSQL test-control config: invalid configuration")
 	}
 	config.ConnConfig.Database = databaseName
 	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
@@ -97,8 +134,72 @@ func newAssetCatalogHarness(t *testing.T) *assetCatalogHarness {
 	if err := database.Ping(ctx); err != nil {
 		t.Fatalf("ping isolated physical PostgreSQL database: %v", err)
 	}
-	harness := &assetCatalogHarness{admin: admin, db: database, name: databaseName}
+	if _, err := database.Exec(ctx, `ALTER SCHEMA public OWNER TO aiops_schema_owner;
+SET ROLE aiops_schema_owner;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON SCHEMA public FROM aiops_migrator;
+REVOKE ALL ON SCHEMA public FROM aiops_control_plane_workload;
+GRANT CREATE, USAGE ON SCHEMA public TO aiops_schema_owner;
+GRANT USAGE ON SCHEMA public TO aiops_control_plane_runtime;
+RESET ROLE;`); err != nil {
+		t.Fatalf("preprovision isolated PostgreSQL trusted schema ACL: %v", err)
+	}
+
+	migrationConfig.ConnConfig.Database = databaseName
+	migration, err = pgxpool.NewWithConfig(ctx, migrationConfig)
+	if err != nil {
+		t.Fatal("connect isolated PostgreSQL migration identity: unavailable")
+	}
+	if err := migration.Ping(ctx); err != nil {
+		t.Fatal("ping isolated PostgreSQL migration identity: unavailable")
+	}
+	applicationConfig.ConnConfig.Database = databaseName
+	application, err = pgxpool.NewWithConfig(ctx, applicationConfig)
+	if err != nil {
+		t.Fatal("connect isolated PostgreSQL application identity: unavailable")
+	}
+	if err := application.Ping(ctx); err != nil {
+		t.Fatal("ping isolated PostgreSQL application identity: unavailable")
+	}
+	assertAssetCatalogPoolIdentity(t, migration, "aiops_migrator")
+	assertAssetCatalogPoolIdentity(t, application, "aiops_control_plane_workload")
+	harness := &assetCatalogHarness{
+		admin: admin, db: database, migration: migration, application: application, name: databaseName,
+	}
 	return harness
+}
+
+func assetCatalogRolePoolConfig(dsn, controlName, expectedUser string) (*pgxpool.Config, error) {
+	config, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s PostgreSQL DSN: invalid configuration", expectedUser)
+	}
+	if config.ConnConfig.Database != controlName {
+		return nil, fmt.Errorf("%s PostgreSQL DSN must name the same safe test control database", expectedUser)
+	}
+	if config.ConnConfig.User != expectedUser {
+		return nil, fmt.Errorf("PostgreSQL DSN identity must be %s", expectedUser)
+	}
+	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	if config.ConnConfig.RuntimeParams == nil {
+		config.ConnConfig.RuntimeParams = make(map[string]string)
+	}
+	config.ConnConfig.RuntimeParams["search_path"] = "pg_catalog,public,pg_temp"
+	if config.MaxConns < 12 {
+		config.MaxConns = 12
+	}
+	return config, nil
+}
+
+func assertAssetCatalogPoolIdentity(t *testing.T, pool *pgxpool.Pool, expected string) {
+	t.Helper()
+	var sessionUser, currentUser string
+	if err := pool.QueryRow(context.Background(), `SELECT session_user, current_user`).Scan(&sessionUser, &currentUser); err != nil {
+		t.Fatalf("read %s PostgreSQL identity: %v", expected, err)
+	}
+	if sessionUser != expected || currentUser != expected {
+		t.Fatalf("PostgreSQL identity = session:%q current:%q, want %q", sessionUser, currentUser, expected)
+	}
 }
 
 func (h *assetCatalogHarness) applyThroughAssetCatalog(t *testing.T) {
@@ -127,35 +228,124 @@ func (h *assetCatalogHarness) applyUpThrough(t *testing.T, cutoff string) {
 		t.Fatalf("migration set through %s has %d files, want %d", cutoff, len(files), want)
 	}
 	for _, name := range files {
-		if _, err := h.db.Exec(context.Background(), readMigration(t, name)); err != nil {
-			if databaseError, ok := err.(*pgconn.PgError); ok {
-				t.Fatalf("apply migration %s: %s (SQLSTATE %s, position %d, where %s)",
-					name, databaseError.Message, databaseError.Code, databaseError.Position, databaseError.Where)
-			}
-			t.Fatalf("apply migration %s: %v", name, err)
-		}
+		h.applyMigration(t, name)
 	}
 }
 
+func (h *assetCatalogHarness) applyMigration(t *testing.T, name string) {
+	t.Helper()
+	source := readMigration(t, name)
+	if strings.HasPrefix(name, "000012_outbox_event_routing.") {
+		h.applyNontransactionalMigration(t, name, source)
+		return
+	}
+	connection, err := h.migration.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire dedicated migration connection for %s: %v", name, err)
+	}
+	defer connection.Release()
+	assertAssetCatalogConnectionIdentity(t, connection, "aiops_migrator")
+	if !strings.HasPrefix(name, "000015_assets_catalog.") {
+		source = assetCatalogMigrationWithLocalOwner(t, name, source)
+	}
+	if _, err := connection.Exec(context.Background(), source); err != nil {
+		_ = connection.Conn().Close(context.Background())
+		failAssetCatalogMigration(t, name, err)
+	}
+	if _, err := connection.Exec(context.Background(), `RESET ROLE`); err != nil {
+		_ = connection.Conn().Close(context.Background())
+		t.Fatalf("reset migration role after %s: %v", name, err)
+	}
+	assertAssetCatalogConnectionIdentity(t, connection, "aiops_migrator")
+}
+
+func (h *assetCatalogHarness) applyNontransactionalMigration(t *testing.T, name, source string) {
+	t.Helper()
+	config := h.migration.Config().ConnConfig.Copy()
+	connection, err := pgx.ConnectConfig(context.Background(), config)
+	if err != nil {
+		t.Fatalf("open fresh nontransactional migration connection for %s: %v", name, err)
+	}
+	defer func() { _ = connection.Close(context.Background()) }()
+	assertAssetCatalogPGXIdentity(t, connection, "aiops_migrator")
+	if _, err := connection.Exec(context.Background(), `SET search_path = pg_catalog, public, pg_temp`); err != nil {
+		t.Fatalf("pin nontransactional migration search_path for %s: %v", name, err)
+	}
+	if _, err := connection.Exec(context.Background(), `SET ROLE aiops_schema_owner`); err != nil {
+		t.Fatalf("set nontransactional migration owner for %s: %v", name, err)
+	}
+	if _, err := connection.Exec(context.Background(), source); err != nil {
+		failAssetCatalogMigration(t, name, err)
+	}
+	if _, err := connection.Exec(context.Background(), `RESET ROLE`); err != nil {
+		t.Fatalf("reset nontransactional migration role after %s: %v", name, err)
+	}
+	assertAssetCatalogPGXIdentity(t, connection, "aiops_migrator")
+}
+
+func assetCatalogMigrationWithLocalOwner(t *testing.T, name, source string) string {
+	t.Helper()
+	trimmed := strings.TrimLeft(source, " \t\r\n")
+	if !strings.HasPrefix(trimmed, "BEGIN;") {
+		t.Fatalf("transactional migration %s does not start with BEGIN", name)
+	}
+	offset := strings.Index(source, "BEGIN;") + len("BEGIN;")
+	return source[:offset] + `
+SET LOCAL ROLE aiops_schema_owner;
+SET LOCAL search_path = public, pg_catalog, pg_temp;` + source[offset:]
+}
+
+func assertAssetCatalogConnectionIdentity(t *testing.T, connection *pgxpool.Conn, expected string) {
+	t.Helper()
+	var sessionUser, currentUser string
+	if err := connection.QueryRow(context.Background(), `SELECT session_user, current_user`).Scan(&sessionUser, &currentUser); err != nil {
+		t.Fatalf("read %s migration connection identity: %v", expected, err)
+	}
+	if sessionUser != expected || currentUser != expected {
+		t.Fatalf("migration connection identity = session:%q current:%q, want %q", sessionUser, currentUser, expected)
+	}
+}
+
+func assertAssetCatalogPGXIdentity(t *testing.T, connection *pgx.Conn, expected string) {
+	t.Helper()
+	var sessionUser, currentUser string
+	if err := connection.QueryRow(context.Background(), `SELECT session_user, current_user`).Scan(&sessionUser, &currentUser); err != nil {
+		t.Fatalf("read %s nontransactional identity: %v", expected, err)
+	}
+	if sessionUser != expected || currentUser != expected {
+		t.Fatalf("nontransactional identity = session:%q current:%q, want %q", sessionUser, currentUser, expected)
+	}
+}
+
+func failAssetCatalogMigration(t *testing.T, name string, err error) {
+	t.Helper()
+	if databaseError, ok := err.(*pgconn.PgError); ok {
+		t.Fatalf("apply migration %s: %s (SQLSTATE %s, position %d, where %s)",
+			name, databaseError.Message, databaseError.Code, databaseError.Position, databaseError.Where)
+	}
+	t.Fatalf("apply migration %s: %v", name, err)
+}
+
 type assetCatalogFixture struct {
-	tenantID            string
-	workspaceID         string
-	environmentID       string
-	integrationID       string
-	serviceID           string
-	sourceID            string
-	revisionID          string
-	validationRunID     string
-	runID               string
-	observationID       string
-	secondObservationID string
-	assetID             string
-	secondAssetID       string
-	typeDetailID        string
-	conflictID          string
-	relationshipID      string
-	bindingID           string
-	revisionDigest      string
+	tenantID               string
+	workspaceID            string
+	environmentID          string
+	integrationID          string
+	serviceID              string
+	sourceID               string
+	revisionID             string
+	validationRunID        string
+	runID                  string
+	observationID          string
+	secondObservationID    string
+	assetID                string
+	secondAssetID          string
+	typeDetailID           string
+	conflictID             string
+	relationshipID         string
+	bindingID              string
+	revisionDigest         string
+	sourceDefinitionDigest string
 }
 
 func newAssetCatalogFixture() assetCatalogFixture {
@@ -169,33 +359,90 @@ func newAssetCatalogFixture() assetCatalogFixture {
 		secondAssetID: "64000000-0000-4000-8000-000000000202", typeDetailID: "65000000-0000-4000-8000-000000000201",
 		conflictID: "66000000-0000-4000-8000-000000000201", relationshipID: "67000000-0000-4000-8000-000000000201",
 		bindingID: "68000000-0000-4000-8000-000000000201", revisionDigest: strings.Repeat("d", 64),
+		sourceDefinitionDigest: strings.Repeat("c", 64),
 	}
 }
 
 func seedDraftAssetCatalog(t *testing.T, database *pgxpool.Pool) assetCatalogFixture {
 	t.Helper()
 	fixture := newAssetCatalogFixture()
-	execAssetSQL(t, database, `INSERT INTO tenants (id,name) VALUES ($1,'fixture-tenant')`, fixture.tenantID)
-	execAssetSQL(t, database, `INSERT INTO workspaces (id,tenant_id,name) VALUES ($1,$2,'fixture-workspace')`, fixture.workspaceID, fixture.tenantID)
-	execAssetSQL(t, database, `INSERT INTO environments (id,tenant_id,workspace_id,name,kind) VALUES ($1,$2,$3,'fixture-production','PROD')`, fixture.environmentID, fixture.tenantID, fixture.workspaceID)
-	execAssetSQL(t, database, `INSERT INTO integrations (id,tenant_id,workspace_id,provider,name,secret_ref,config) VALUES ($1,$2,$3,'manual','fixture-integration','opaque://sanitized','{"future":"preserve"}')`, fixture.integrationID, fixture.tenantID, fixture.workspaceID)
-	execAssetSQL(t, database, `INSERT INTO services (id,tenant_id,workspace_id,name,owner_group,labels) VALUES ($1,$2,$3,'fixture-service','fixture-sre','{"future":"preserve"}')`, fixture.serviceID, fixture.tenantID, fixture.workspaceID)
-	execAssetSQL(t, database, `INSERT INTO service_bindings (id,tenant_id,workspace_id,service_id,environment_id,mapping_status) VALUES ('51000000-0000-4000-8000-000000000201',$1,$2,$3,$4,'EXACT')`, fixture.tenantID, fixture.workspaceID, fixture.serviceID, fixture.environmentID)
-	execAssetSQL(t, database, `
+	profile := []byte(correctiveManualProfileManifestV1)
+	providerSchema := []byte(`{"additionalProperties":false,"properties":{},"type":"object"}`)
+	profileDigest := sha256.Sum256(profile)
+	providerSchemaDigest := sha256.Sum256(providerSchema)
+	authorityDigest := assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-authority-scope.v1"),
+		[]byte("1"),
+		[]byte(fixture.environmentID),
+	)
+	fixture.sourceDefinitionDigest = assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-definition.v2"),
+		[]byte("MANUAL"),
+		[]byte("MANUAL_V1"),
+		[]byte("MANUAL_V1"),
+		profileDigest[:],
+		providerSchemaDigest[:],
+	)
+	fixture.revisionDigest = assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-revision-binding.v1"),
+		[]byte(fixture.tenantID),
+		[]byte(fixture.workspaceID),
+		[]byte(fixture.sourceID),
+		[]byte("1"),
+		assetCatalogCorrectiveDecodeDigest(t, fixture.sourceDefinitionDigest),
+		nil,
+		[]byte("MANUAL"),
+		nil,
+		nil,
+		nil,
+		assetCatalogCorrectiveDecodeDigest(t, authorityDigest),
+		[]byte("1"),
+		[]byte("1"),
+		[]byte("1"),
+		[]byte("1"),
+		[]byte("MANUAL_V1"),
+		nil,
+		nil,
+		nil,
+	)
+
+	transaction, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatalf("begin draft asset catalog fixture: %v", err)
+	}
+	defer func() { _ = transaction.Rollback(context.Background()) }()
+	execAssetSQL(t, transaction, `INSERT INTO tenants (id,name) VALUES ($1,'fixture-tenant')`, fixture.tenantID)
+	execAssetSQL(t, transaction, `INSERT INTO workspaces (id,tenant_id,name) VALUES ($1,$2,'fixture-workspace')`, fixture.workspaceID, fixture.tenantID)
+	execAssetSQL(t, transaction, `INSERT INTO environments (id,tenant_id,workspace_id,name,kind) VALUES ($1,$2,$3,'fixture-production','PROD')`, fixture.environmentID, fixture.tenantID, fixture.workspaceID)
+	execAssetSQL(t, transaction, `INSERT INTO integrations (id,tenant_id,workspace_id,provider,name,secret_ref,config) VALUES ($1,$2,$3,'manual','fixture-integration','opaque://sanitized','{"future":"preserve"}')`, fixture.integrationID, fixture.tenantID, fixture.workspaceID)
+	execAssetSQL(t, transaction, `INSERT INTO services (id,tenant_id,workspace_id,name,owner_group,labels) VALUES ($1,$2,$3,'fixture-service','fixture-sre','{"future":"preserve"}')`, fixture.serviceID, fixture.tenantID, fixture.workspaceID)
+	execAssetSQL(t, transaction, `INSERT INTO service_bindings (id,tenant_id,workspace_id,service_id,environment_id,mapping_status) VALUES ('51000000-0000-4000-8000-000000000201',$1,$2,$3,$4,'EXACT')`, fixture.tenantID, fixture.workspaceID, fixture.serviceID, fixture.environmentID)
+	execAssetSQL(t, transaction, `
 		INSERT INTO asset_sources (id,tenant_id,workspace_id,source_kind,provider_kind,name,create_idempotency_key,create_request_hash)
 		VALUES ($1,$2,$3,'MANUAL','MANUAL_V1','fixture-source','fixture-source-create',repeat('a',64))
 	`, fixture.sourceID, fixture.tenantID, fixture.workspaceID)
-	canonicalSchema := []byte(`{"type":"object"}`)
-	execAssetSQL(t, database, `
+	execAssetSQL(t, transaction, `
 		INSERT INTO asset_source_revisions (
-			id,tenant_id,workspace_id,source_id,revision,canonical_provider_schema,canonical_provider_schema_sha256,
-			integration_id,sync_mode,authority_scope_digest,source_definition_digest,canonical_revision_digest,
-		credential_reference_id,trust_reference_id,network_policy_reference_id,rate_limit_requests,
+			id,tenant_id,workspace_id,source_id,revision,
+			canonical_profile_manifest,profile_manifest_sha256,
+			canonical_provider_schema,canonical_provider_schema_sha256,
+			sync_mode,authority_scope_digest,source_definition_digest,canonical_revision_digest,
+			credential_reference_id,trust_reference_id,network_policy_reference_id,rate_limit_requests,
 			rate_limit_window_seconds,backpressure_base_seconds,backpressure_max_seconds,profile_code,
 			created_by,change_reason_code,expected_source_version
-		) VALUES ($1,$2,$3,$4,1,$5,encode(sha256($5),'hex'),$6,'MANUAL',repeat('b',64),repeat('c',64),$7,
-			NULL,NULL,NULL,100,60,1,60,'MANUAL_V1','fixture-human','INITIAL_CREATE',1)
-	`, fixture.revisionID, fixture.tenantID, fixture.workspaceID, fixture.sourceID, canonicalSchema, fixture.integrationID, fixture.revisionDigest)
+		) VALUES ($1,$2,$3,$4,1,$5,$6,$7,$8,'MANUAL',$9,$10,$11,
+			NULL,NULL,NULL,1,1,1,1,'MANUAL_V1','fixture-human','INITIAL_CREATE',1)
+	`, fixture.revisionID, fixture.tenantID, fixture.workspaceID, fixture.sourceID,
+		profile, hex.EncodeToString(profileDigest[:]), providerSchema, hex.EncodeToString(providerSchemaDigest[:]),
+		authorityDigest, fixture.sourceDefinitionDigest, fixture.revisionDigest)
+	execAssetSQL(t, transaction, `
+		INSERT INTO asset_source_revision_authorities (
+			tenant_id,workspace_id,source_id,source_revision,environment_id,canonical_ordinal
+		) VALUES ($1,$2,$3,1,$4,1)
+	`, fixture.tenantID, fixture.workspaceID, fixture.sourceID, fixture.environmentID)
+	if err := transaction.Commit(context.Background()); err != nil {
+		t.Fatalf("commit draft asset catalog fixture: %v", err)
+	}
 	return fixture
 }
 
@@ -361,7 +608,7 @@ func insertManualObservation(t *testing.T, database assetSQLExecutor, fixture as
 				provider_provenance_sha256,observation_chain_sha256,accepted_checkpoint_version,
 				run_fence_epoch,run_page_sequence,schema_version,normalized_document,document_sha256,
 				field_provenance,field_provenance_sha256
-			) SELECT $1,$2,$3,$5,$4,$6,'MANUAL_V1',$8,1,$9,repeat('c',64),observed_at,'CATALOG_SEQUENCE',1,
+		) SELECT $1,$2,$3,$5,$4,$6,'MANUAL_V1',$8,1,$9,$12,observed_at,'CATALOG_SEQUENCE',1,
 				repeat('1',64),repeat('2',64),repeat('3',64),repeat('4',64),$10,1,1,1,'asset.v1',document,
 				encode(sha256(document),'hex'),provenance,encode(sha256(provenance),'hex') FROM payload
 			RETURNING observed_at
@@ -373,7 +620,8 @@ func insertManualObservation(t *testing.T, database assetSQLExecutor, fixture as
 		) SELECT $11,$2,$3,$5,$4,'MANUAL_V1',$8,'LINUX_VM',$7,$1,$10,observed_at,1,
 			'create-'||$8,repeat('5',64) FROM inserted
 	`, observationID, fixture.tenantID, fixture.workspaceID, fixture.sourceID, fixture.environmentID,
-		fixture.runID, displayName, externalID, fixture.revisionDigest, chain, assetID)
+		fixture.runID, displayName, externalID, fixture.revisionDigest, chain, assetID,
+		fixture.sourceDefinitionDigest)
 }
 
 func seedManualProjectionEdges(t *testing.T, database assetSQLExecutor, fixture assetCatalogFixture) {
@@ -535,25 +783,178 @@ func TestAssetCatalogMigration(t *testing.T) {
 	if err := harness.db.QueryRow(context.Background(), `
 		SELECT count(*) FROM information_schema.tables
 		WHERE table_schema='public' AND table_name = ANY($1)
-	`, []string{"asset_sources", "asset_source_revisions", "asset_source_runs", "asset_observations", "assets",
+	`, []string{"asset_sources", "asset_source_revisions", "asset_source_revision_authorities", "asset_source_runs", "asset_observations", "assets",
 		"asset_type_details", "asset_conflicts", "asset_relationships", "service_asset_bindings"}).Scan(&tableCount); err != nil {
 		t.Fatal(err)
 	}
-	if tableCount != 9 {
-		t.Fatalf("asset catalog table count=%d, want 9", tableCount)
+	if tableCount != 10 {
+		t.Fatalf("asset catalog table count=%d, want 10", tableCount)
 	}
+	roleAdmission := storepostgres.NewDatabaseRoleAdmission(harness.application, "public")
+	if err := roleAdmission.Check(context.Background()); err != nil {
+		t.Fatalf("application database-role admission: %v", err)
+	}
+}
+
+func TestAssetCatalogMigrationDigestClosure(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+
+	const (
+		tenantID      = "10000000-0000-4000-8000-000000000151"
+		workspaceID   = "20000000-0000-4000-8000-000000000151"
+		environmentID = "30000000-0000-4000-8000-000000000151"
+		sourceID      = "60000000-0000-4000-8000-000000000151"
+		revisionID    = "61000000-0000-4000-8000-000000000151"
+	)
+	profile := []byte(correctiveManualProfileManifestV1)
+	providerSchema := []byte(`{"additionalProperties":false,"properties":{},"type":"object"}`)
+	profileDigest := sha256.Sum256(profile)
+	providerSchemaDigest := sha256.Sum256(providerSchema)
+	if got, want := hex.EncodeToString(profileDigest[:]), "57d171caef88e859700dde32fda6b9a982b25b50deca47c6246945c8dfb60b96"; got != want {
+		t.Fatalf("MANUAL profile digest = %s, want %s", got, want)
+	}
+	if got, want := hex.EncodeToString(providerSchemaDigest[:]), "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa"; got != want {
+		t.Fatalf("MANUAL provider schema digest = %s, want %s", got, want)
+	}
+
+	authorityDigest := assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-authority-scope.v1"),
+		[]byte("1"),
+		[]byte(environmentID),
+	)
+	definitionDigest := assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-definition.v2"),
+		[]byte("MANUAL"),
+		[]byte("MANUAL_V1"),
+		[]byte("MANUAL_V1"),
+		profileDigest[:],
+		providerSchemaDigest[:],
+	)
+	if got, want := definitionDigest, "7a0c248c3ebd32dae4e94b516d6f56608d4f1a25cd33d0fe467b54200824984c"; got != want {
+		t.Fatalf("MANUAL definition digest = %s, want %s", got, want)
+	}
+	bindingDigest := assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-revision-binding.v1"),
+		[]byte(tenantID),
+		[]byte(workspaceID),
+		[]byte(sourceID),
+		[]byte("1"),
+		assetCatalogCorrectiveDecodeDigest(t, definitionDigest),
+		nil,
+		[]byte("MANUAL"),
+		nil,
+		nil,
+		nil,
+		assetCatalogCorrectiveDecodeDigest(t, authorityDigest),
+		[]byte("1"),
+		[]byte("1"),
+		[]byte("1"),
+		[]byte("1"),
+		[]byte("MANUAL_V1"),
+		nil,
+		nil,
+		nil,
+	)
+
+	transaction, err := harness.db.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatalf("begin corrective digest fixture: %v", err)
+	}
+	defer func() { _ = transaction.Rollback(context.Background()) }()
+	execAssetSQL(t, transaction, `INSERT INTO tenants (id,name) VALUES ($1,'digest-tenant')`, tenantID)
+	execAssetSQL(t, transaction, `INSERT INTO workspaces (id,tenant_id,name) VALUES ($1,$2,'digest-workspace')`, workspaceID, tenantID)
+	execAssetSQL(t, transaction, `
+		INSERT INTO environments (id,tenant_id,workspace_id,name,kind)
+		VALUES ($1,$2,$3,'digest-production','PROD')
+	`, environmentID, tenantID, workspaceID)
+	execAssetSQL(t, transaction, `
+		INSERT INTO asset_sources (
+			id,tenant_id,workspace_id,source_kind,provider_kind,name,
+			create_idempotency_key,create_request_hash
+		) VALUES ($1,$2,$3,'MANUAL','MANUAL_V1','digest-source','digest-source-create',repeat('a',64))
+	`, sourceID, tenantID, workspaceID)
+	execAssetSQL(t, transaction, `
+		INSERT INTO asset_source_revisions (
+			id,tenant_id,workspace_id,source_id,revision,
+			canonical_profile_manifest,profile_manifest_sha256,
+			canonical_provider_schema,canonical_provider_schema_sha256,
+			sync_mode,authority_scope_digest,source_definition_digest,canonical_revision_digest,
+			rate_limit_requests,rate_limit_window_seconds,backpressure_base_seconds,
+			backpressure_max_seconds,profile_code,created_by,change_reason_code,
+			expected_source_version
+		) VALUES (
+			$1,$2,$3,$4,1,$5,$6,$7,$8,'MANUAL',$9,$10,$11,
+			1,1,1,1,'MANUAL_V1','digest-reviewer','INITIAL_CREATE',1
+		)
+	`, revisionID, tenantID, workspaceID, sourceID, profile, hex.EncodeToString(profileDigest[:]),
+		providerSchema, hex.EncodeToString(providerSchemaDigest[:]), authorityDigest, definitionDigest, bindingDigest)
+	execAssetSQL(t, transaction, `
+		INSERT INTO asset_source_revision_authorities (
+			tenant_id,workspace_id,source_id,source_revision,environment_id,canonical_ordinal
+		) VALUES ($1,$2,$3,1,$4,1)
+	`, tenantID, workspaceID, sourceID, environmentID)
+	if err := transaction.Commit(context.Background()); err != nil {
+		t.Fatalf("commit corrective digest closure: %v", err)
+	}
+
+	var actualAuthority, actualDefinition, actualBinding, recomputedBinding string
+	if err := harness.application.QueryRow(context.Background(), `
+		SELECT candidate.authority_scope_digest,
+			candidate.source_definition_digest,
+			candidate.canonical_revision_digest,
+			public.asset_catalog_source_revision_binding_digest(candidate)
+		FROM public.asset_source_revisions AS candidate
+		WHERE candidate.id=$1
+	`, revisionID).Scan(&actualAuthority, &actualDefinition, &actualBinding, &recomputedBinding); err != nil {
+		t.Fatalf("read corrective digest closure through application identity: %v", err)
+	}
+	if actualAuthority != authorityDigest || actualDefinition != definitionDigest ||
+		actualBinding != bindingDigest || recomputedBinding != bindingDigest {
+		t.Fatalf(
+			"digest closure authority=%s definition=%s binding=%s recomputed=%s",
+			actualAuthority,
+			actualDefinition,
+			actualBinding,
+			recomputedBinding,
+		)
+	}
+}
+
+func assetCatalogCorrectiveFramedDigest(fields ...[]byte) string {
+	framed := make([]byte, 0, len(fields)*8)
+	var size [4]byte
+	for _, field := range fields {
+		if field == nil {
+			framed = append(framed, 0)
+			continue
+		}
+		framed = append(framed, 1)
+		binary.BigEndian.PutUint32(size[:], uint32(len(field)))
+		framed = append(framed, size[:]...)
+		framed = append(framed, field...)
+	}
+	digest := sha256.Sum256(framed)
+	return hex.EncodeToString(digest[:])
+}
+
+func assetCatalogCorrectiveDecodeDigest(t *testing.T, encoded string) []byte {
+	t.Helper()
+	decoded, err := hex.DecodeString(encoded)
+	if err != nil || len(decoded) != sha256.Size {
+		t.Fatalf("decode corrective SHA-256 %q: %v", encoded, err)
+	}
+	return decoded
 }
 
 func TestAssetCatalogMigrationCompatibility(t *testing.T) {
 	harness := newAssetCatalogHarness(t)
 	harness.applyUpThrough(t, "000014_read_evidence_clock_skew.up.sql")
-	admission := assetpostgres.NewSchemaAdmission(harness.db, "public")
+	admission := assetpostgres.NewSchemaAdmission(harness.application, "public")
 	if err := admission.Check(context.Background()); !errors.Is(err, assetpostgres.ErrAssetCatalogUnavailable) {
 		t.Fatalf("pre-000015 admission error=%v", err)
 	}
-	if _, err := harness.db.Exec(context.Background(), readMigration(t, "000015_assets_catalog.up.sql")); err != nil {
-		t.Fatalf("apply 000015 online: %v", err)
-	}
+	harness.applyMigration(t, "000015_assets_catalog.up.sql")
 	if err := admission.Check(context.Background()); err != nil {
 		t.Fatalf("post-000015 admission: %v", err)
 	}
@@ -562,8 +963,441 @@ func TestAssetCatalogMigrationCompatibility(t *testing.T) {
 func TestAssetCatalogMigrationEmptyRollback(t *testing.T) {
 	harness := newAssetCatalogHarness(t)
 	harness.applyThroughAssetCatalog(t)
-	if _, err := harness.db.Exec(context.Background(), readMigration(t, "000015_assets_catalog.down.sql")); err != nil {
-		t.Fatalf("empty 000015 rollback failed: %v", err)
+	harness.applyMigration(t, "000015_assets_catalog.down.sql")
+}
+
+func TestAssetCatalogMigrationEmptyRollbackRestoresPredecessorCatalog(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyUpThrough(t, "000014_read_evidence_clock_skew.up.sql")
+	before := assetCatalogPredecessorFingerprint(t, harness.db)
+	harness.applyMigration(t, "000015_assets_catalog.up.sql")
+	harness.applyMigration(t, "000015_assets_catalog.down.sql")
+	after := assetCatalogPredecessorFingerprint(t, harness.db)
+	if after != before {
+		t.Fatalf("000015 empty rollback predecessor fingerprint=%s, want %s", after, before)
+	}
+}
+
+func assetCatalogPredecessorFingerprint(t *testing.T, database *pgxpool.Pool) string {
+	t.Helper()
+	transaction, err := database.BeginTx(context.Background(), pgx.TxOptions{
+		IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("begin 000015 predecessor catalog fingerprint: %v", err)
+	}
+	defer func() { _ = transaction.Rollback(context.Background()) }()
+	if _, err := transaction.Exec(context.Background(), `SET LOCAL quote_all_identifiers = off`); err != nil {
+		t.Fatalf("pin predecessor catalog identifier deparse: %v", err)
+	}
+	if _, err := transaction.Exec(context.Background(), `SET LOCAL search_path = pg_catalog, pg_temp`); err != nil {
+		t.Fatalf("pin predecessor catalog search path: %v", err)
+	}
+	var fingerprint string
+	if err := transaction.QueryRow(context.Background(), `
+		WITH trusted_namespace AS MATERIALIZED (
+			SELECT namespace.oid, namespace.nspname, namespace.nspowner AS owner_oid,
+				COALESCE(namespace.nspacl, pg_catalog.acldefault('n', namespace.nspowner)) AS acl
+			FROM pg_catalog.pg_namespace AS namespace
+			WHERE namespace.nspname='public'
+		),
+		relation_names(name) AS (
+			SELECT pg_catalog.unnest($1::text[])
+		),
+		relations AS MATERIALIZED (
+			SELECT relation.oid, relation.relname, relation.relowner AS owner_oid,
+				COALESCE(relation.relacl, pg_catalog.acldefault('r', relation.relowner)) AS acl,
+				relation.relkind, relation.relpersistence, relation.reloptions,
+				relation.relrowsecurity, relation.relforcerowsecurity, relation.relreplident
+			FROM pg_catalog.pg_class AS relation
+			JOIN trusted_namespace AS namespace ON namespace.oid=relation.relnamespace
+			JOIN relation_names AS expected ON expected.name=relation.relname
+		),
+		authorization_objects AS MATERIALIZED (
+			SELECT 'schema'::text AS object_kind, namespace.nspname AS object_name,
+				namespace.owner_oid, namespace.acl
+			FROM trusted_namespace AS namespace
+			UNION ALL
+			SELECT 'relation', relation.relname, relation.owner_oid, relation.acl
+			FROM relations AS relation
+			UNION ALL
+			SELECT 'column', relation.relname || '.' || attribute.attname,
+				relation.owner_oid,
+				COALESCE(attribute.attacl, pg_catalog.acldefault('c', relation.owner_oid))
+			FROM relations AS relation
+			JOIN pg_catalog.pg_attribute AS attribute
+			  ON attribute.attrelid=relation.oid
+			 AND attribute.attnum > 0
+			 AND NOT attribute.attisdropped
+		),
+		owner_records AS (
+			SELECT object_record.object_kind || pg_catalog.chr(31) || object_record.object_name ||
+				pg_catalog.chr(31) || pg_catalog.pg_get_userbyid(object_record.owner_oid) AS payload
+			FROM authorization_objects AS object_record
+			WHERE object_record.object_kind <> 'column'
+		),
+		acl_records AS (
+			SELECT object_record.object_kind || pg_catalog.chr(31) || object_record.object_name ||
+				pg_catalog.chr(31) ||
+				CASE WHEN entry.grantee=0::oid THEN 'PUBLIC'
+					ELSE pg_catalog.pg_get_userbyid(entry.grantee) END ||
+				pg_catalog.chr(31) || pg_catalog.pg_get_userbyid(entry.grantor) ||
+				pg_catalog.chr(31) || entry.privilege_type || pg_catalog.chr(31) ||
+				entry.is_grantable::text || pg_catalog.chr(31) || pg_catalog.count(*)::text AS payload
+			FROM authorization_objects AS object_record
+			CROSS JOIN LATERAL pg_catalog.aclexplode(object_record.acl) AS entry
+			GROUP BY object_record.object_kind, object_record.object_name,
+				entry.grantee, entry.grantor, entry.privilege_type, entry.is_grantable
+		),
+		surface_records AS (
+			SELECT pg_catalog.jsonb_build_array(
+				'relation-surface',
+				table_record.relname,
+				table_record.relkind::text,
+				table_record.relpersistence::text,
+				table_record.reloptions,
+				table_record.relrowsecurity,
+				table_record.relforcerowsecurity,
+				table_record.relreplident::text
+			)::text AS payload
+			FROM relations AS table_record
+			WHERE table_record.relname IN ('audit_records','outbox_events')
+			UNION ALL
+			SELECT pg_catalog.jsonb_build_array(
+				'index-surface',
+				table_record.relname,
+				index_record.relname,
+				index_metadata.indisunique,
+				index_metadata.indisprimary,
+				index_metadata.indisexclusion,
+				index_metadata.indimmediate,
+				index_metadata.indisvalid,
+				index_metadata.indisready,
+				index_metadata.indislive,
+				index_metadata.indisreplident,
+				index_metadata.indnullsnotdistinct,
+				index_record.reloptions,
+				pg_catalog.pg_get_expr(index_metadata.indexprs, index_metadata.indrelid, false),
+				pg_catalog.pg_get_expr(index_metadata.indpred, index_metadata.indrelid, false),
+				pg_catalog.pg_get_indexdef(index_record.oid, 0, false)
+			)::text
+			FROM relations AS table_record
+			JOIN pg_catalog.pg_index AS index_metadata ON index_metadata.indrelid=table_record.oid
+			JOIN pg_catalog.pg_class AS index_record ON index_record.oid=index_metadata.indexrelid
+			WHERE table_record.relname IN ('audit_records','outbox_events')
+			UNION ALL
+			SELECT pg_catalog.jsonb_build_array(
+				'trigger-surface',
+				table_record.relname,
+				trigger_record.tgname,
+				trigger_record.tgenabled::text,
+				trigger_record.tgisinternal,
+				trigger_record.tgtype,
+				trigger_record.tgdeferrable,
+				trigger_record.tginitdeferred,
+				trigger_record.tgattr::text,
+				pg_catalog.encode(trigger_record.tgargs, 'hex'),
+				pg_catalog.pg_get_expr(trigger_record.tgqual, trigger_record.tgrelid, false),
+				pg_catalog.pg_get_triggerdef(trigger_record.oid, false)
+			)::text
+			FROM relations AS table_record
+			JOIN pg_catalog.pg_trigger AS trigger_record ON trigger_record.tgrelid=table_record.oid
+			WHERE table_record.relname IN ('audit_records','outbox_events')
+			UNION ALL
+			SELECT pg_catalog.jsonb_build_array(
+				'relation-comment',
+				table_record.relname,
+				description.objsubid,
+				attribute.attname,
+				description.description
+			)::text
+			FROM relations AS table_record
+			JOIN pg_catalog.pg_description AS description
+			  ON description.classoid='pg_catalog.pg_class'::pg_catalog.regclass
+			 AND description.objoid=table_record.oid
+			LEFT JOIN pg_catalog.pg_attribute AS attribute
+			  ON attribute.attrelid=table_record.oid
+			 AND attribute.attnum=description.objsubid
+			WHERE table_record.relname IN ('audit_records','outbox_events')
+			UNION ALL
+			SELECT pg_catalog.jsonb_build_array(
+				'index-comment',
+				table_record.relname,
+				index_record.relname,
+				description.description
+			)::text
+			FROM relations AS table_record
+			JOIN pg_catalog.pg_index AS index_metadata ON index_metadata.indrelid=table_record.oid
+			JOIN pg_catalog.pg_class AS index_record ON index_record.oid=index_metadata.indexrelid
+			JOIN pg_catalog.pg_description AS description
+			  ON description.classoid='pg_catalog.pg_class'::pg_catalog.regclass
+			 AND description.objoid=index_record.oid
+			 AND description.objsubid=0
+			WHERE table_record.relname IN ('audit_records','outbox_events')
+			UNION ALL
+			SELECT pg_catalog.jsonb_build_array(
+				'trigger-comment',
+				table_record.relname,
+				trigger_record.tgname,
+				description.description
+			)::text
+			FROM relations AS table_record
+			JOIN pg_catalog.pg_trigger AS trigger_record ON trigger_record.tgrelid=table_record.oid
+			JOIN pg_catalog.pg_description AS description
+			  ON description.classoid='pg_catalog.pg_trigger'::pg_catalog.regclass
+			 AND description.objoid=trigger_record.oid
+			 AND description.objsubid=0
+			WHERE table_record.relname IN ('audit_records','outbox_events')
+			UNION ALL
+			SELECT pg_catalog.jsonb_build_array(
+				'constraint-comment',
+				table_record.relname,
+				constraint_record.conname,
+				description.description
+			)::text
+			FROM relations AS table_record
+			JOIN pg_catalog.pg_constraint AS constraint_record ON constraint_record.conrelid=table_record.oid
+			JOIN pg_catalog.pg_description AS description
+			  ON description.classoid='pg_catalog.pg_constraint'::pg_catalog.regclass
+			 AND description.objoid=constraint_record.oid
+			 AND description.objsubid=0
+			WHERE table_record.relname IN ('audit_records','outbox_events')
+		),
+		records AS (
+			SELECT payload FROM owner_records
+			UNION ALL SELECT payload FROM acl_records
+			UNION ALL SELECT payload FROM surface_records
+		)
+		SELECT pg_catalog.encode(
+			pg_catalog.sha256(
+				pg_catalog.convert_to(
+					COALESCE(
+						pg_catalog.string_agg(payload, E'\n' ORDER BY payload COLLATE "C"),
+						''
+					),
+					'UTF8'
+				)
+			),
+			'hex'
+		)
+		FROM records
+	`, []string{
+		"workspaces", "environments", "services", "service_bindings",
+		"audit_records", "outbox_events",
+	}).Scan(&fingerprint); err != nil {
+		t.Fatalf("fingerprint 000015 predecessor catalog: %v", err)
+	}
+	if err := transaction.Rollback(context.Background()); err != nil {
+		t.Fatalf("rollback 000015 predecessor catalog fingerprint: %v", err)
+	}
+	return fingerprint
+}
+
+func TestAssetCatalogMigrationDownNowaitConflictRollsBack(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	for _, relation := range assetCatalogDownLockTableNames() {
+		t.Run(relation, func(t *testing.T) {
+			holder, err := harness.db.Begin(context.Background())
+			if err != nil {
+				t.Fatalf("begin down conflict holder: %v", err)
+			}
+			defer func() { _ = holder.Rollback(context.Background()) }()
+			if _, err := holder.Exec(context.Background(), "LOCK TABLE "+
+				pgx.Identifier{"public", relation}.Sanitize()+" IN ACCESS SHARE MODE"); err != nil {
+				t.Fatalf("hold down-lock member %s: %v", relation, err)
+			}
+
+			_, downErr := harness.migration.Exec(
+				context.Background(),
+				readMigration(t, "000015_assets_catalog.down.sql"),
+			)
+			var postgresError *pgconn.PgError
+			if !errors.As(downErr, &postgresError) || postgresError.Code != "55P03" {
+				t.Fatalf("conflicting one-shot down error=%v, want SQLSTATE 55P03", downErr)
+			}
+			assertAssetCatalogOwnedTableCount(t, harness.db, 10)
+			if err := assetpostgres.NewSchemaAdmission(harness.application, "public").Check(context.Background()); err != nil {
+				t.Fatalf("schema admission after conflicting down rollback: %v", err)
+			}
+
+			if err := holder.Rollback(context.Background()); err != nil {
+				t.Fatalf("release down conflict holder: %v", err)
+			}
+			harness.applyMigration(t, "000015_assets_catalog.down.sql")
+			assertAssetCatalogOwnedTableCount(t, harness.db, 0)
+			harness.applyMigration(t, "000015_assets_catalog.up.sql")
+			if err := assetpostgres.NewSchemaAdmission(harness.application, "public").Check(context.Background()); err != nil {
+				t.Fatalf("schema admission after released-lock retry: %v", err)
+			}
+		})
+	}
+}
+
+func TestAssetCatalogMigrationDownHoldsCompleteLockSetBeforeCleanup(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+
+	const advisoryKey int64 = 15000180015
+	execAssetSQL(t, harness.db, `
+		CREATE SCHEMA asset_catalog_test_hooks;
+		CREATE FUNCTION asset_catalog_test_hooks.pause_down_after_lock()
+		RETURNS event_trigger
+		LANGUAGE plpgsql
+		SET search_path = pg_catalog, pg_temp
+		AS $function$
+		BEGIN
+			PERFORM pg_catalog.pg_advisory_xact_lock(15000180015::bigint);
+		END
+		$function$;
+		CREATE EVENT TRIGGER asset_catalog_test_pause_down
+		ON ddl_command_start
+		EXECUTE FUNCTION asset_catalog_test_hooks.pause_down_after_lock();
+	`)
+
+	holder, err := harness.db.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire advisory-lock holder: %v", err)
+	}
+	defer holder.Release()
+	if _, err := holder.Exec(context.Background(), `
+		SELECT pg_catalog.pg_advisory_lock($1::bigint)
+	`, advisoryKey); err != nil {
+		t.Fatalf("hold down observation advisory lock: %v", err)
+	}
+	advisoryHeld := true
+
+	downResult := make(chan error, 1)
+	downPending := true
+	t.Cleanup(func() {
+		if advisoryHeld {
+			_, _ = holder.Exec(context.Background(), `SELECT pg_catalog.pg_advisory_unlock($1::bigint)`, advisoryKey)
+		}
+		if downPending {
+			select {
+			case <-downResult:
+			case <-time.After(6 * time.Second):
+			}
+		}
+		_, _ = harness.db.Exec(context.Background(), `DROP EVENT TRIGGER IF EXISTS asset_catalog_test_pause_down`)
+		_, _ = harness.db.Exec(context.Background(), `DROP FUNCTION IF EXISTS asset_catalog_test_hooks.pause_down_after_lock()`)
+		_, _ = harness.db.Exec(context.Background(), `DROP SCHEMA IF EXISTS asset_catalog_test_hooks`)
+	})
+	downSQL := readMigration(t, "000015_assets_catalog.down.sql")
+	go func() {
+		_, downErr := harness.migration.Exec(
+			context.Background(),
+			downSQL,
+		)
+		downResult <- downErr
+	}()
+
+	var migrationPID int32
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		err = harness.db.QueryRow(context.Background(), `
+			SELECT activity.pid
+			FROM pg_catalog.pg_stat_activity AS activity
+			JOIN pg_catalog.pg_locks AS waiting ON waiting.pid=activity.pid
+			WHERE activity.datname=pg_catalog.current_database()
+			  AND activity.usename='aiops_migrator'
+			  AND waiting.locktype='advisory'
+			  AND NOT waiting.granted
+			ORDER BY activity.query_start DESC
+			LIMIT 1
+		`).Scan(&migrationPID)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("observe blocked down migration: %v", err)
+		}
+		select {
+		case downErr := <-downResult:
+			downPending = false
+			t.Fatalf("down migration completed before lock observation: %v", downErr)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatal("down migration did not reach the post-lock observation boundary")
+	}
+
+	var lockedRelations []string
+	if err := harness.db.QueryRow(context.Background(), `
+		SELECT COALESCE(pg_catalog.array_agg(relation.relname ORDER BY relation.relname), ARRAY[]::text[])
+		FROM pg_catalog.pg_locks AS held
+		JOIN pg_catalog.pg_class AS relation ON relation.oid=held.relation
+		JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+		WHERE held.pid=$1
+		  AND held.locktype='relation'
+		  AND held.mode='AccessExclusiveLock'
+		  AND held.granted
+		  AND namespace.nspname='public'
+	`, migrationPID).Scan(&lockedRelations); err != nil {
+		t.Fatalf("observe down relation locks: %v", err)
+	}
+	wantRelations := assetCatalogDownLockTableNames()
+	sort.Strings(wantRelations)
+	if strings.Join(lockedRelations, "\n") != strings.Join(wantRelations, "\n") {
+		t.Fatalf("down held relations=%v, want %v", lockedRelations, wantRelations)
+	}
+
+	lateTransaction, err := harness.db.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin transaction after down acquired locks: %v", err)
+	}
+	_, lateErr := lateTransaction.Exec(context.Background(), `
+		LOCK TABLE public.asset_sources IN ROW EXCLUSIVE MODE NOWAIT
+	`)
+	_ = lateTransaction.Rollback(context.Background())
+	var postgresError *pgconn.PgError
+	if !errors.As(lateErr, &postgresError) || postgresError.Code != "55P03" {
+		t.Fatalf("post-lock transaction error=%v, want SQLSTATE 55P03", lateErr)
+	}
+
+	var unlocked bool
+	if err := holder.QueryRow(context.Background(), `
+		SELECT pg_catalog.pg_advisory_unlock($1::bigint)
+	`, advisoryKey).Scan(&unlocked); err != nil || !unlocked {
+		t.Fatalf("release down observation advisory lock: unlocked=%v error=%v", unlocked, err)
+	}
+	advisoryHeld = false
+	select {
+	case downErr := <-downResult:
+		downPending = false
+		if downErr != nil {
+			t.Fatalf("complete observed down migration: %v", downErr)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("observed down migration did not complete after advisory release")
+	}
+
+	execAssetSQL(t, harness.db, `
+		DROP EVENT TRIGGER asset_catalog_test_pause_down;
+		DROP FUNCTION asset_catalog_test_hooks.pause_down_after_lock();
+		DROP SCHEMA asset_catalog_test_hooks;
+	`)
+	assertAssetCatalogOwnedTableCount(t, harness.db, 0)
+}
+
+func assertAssetCatalogOwnedTableCount(t *testing.T, database *pgxpool.Pool, expected int) {
+	t.Helper()
+	var tableCount int
+	if err := database.QueryRow(context.Background(), `
+		SELECT count(*)
+		FROM pg_catalog.pg_class AS relation
+		JOIN pg_catalog.pg_namespace AS namespace
+		  ON namespace.oid=relation.relnamespace
+		WHERE namespace.nspname='public'
+		  AND relation.relkind IN ('r','p')
+		  AND relation.relname=ANY($1)
+	`, assetCatalogTableNames()).Scan(&tableCount); err != nil {
+		t.Fatalf("count catalog tables: %v", err)
+	}
+	if tableCount != expected {
+		t.Fatalf("catalog table count=%d, want %d", tableCount, expected)
 	}
 }
 
@@ -573,6 +1407,8 @@ func TestAssetCatalogMigrationCoreInvariants(t *testing.T) {
 	fixture := seedGovernedManualCatalog(t, harness.db)
 	expectAssetSQLState(t, harness.db, "55000", `UPDATE asset_observations SET source_revision=source_revision+1 WHERE id=$1`, fixture.observationID)
 	expectAssetSQLState(t, harness.db, "55000", `DELETE FROM asset_type_details WHERE id=$1`, fixture.typeDetailID)
+	expectAssetSQLState(t, harness.db, "55000", `UPDATE asset_source_revision_authorities SET canonical_ordinal=canonical_ordinal WHERE source_id=$1`, fixture.sourceID)
+	expectAssetSQLState(t, harness.db, "55000", `UPDATE asset_source_revisions SET profile_code=profile_code WHERE id=$1`, fixture.revisionID)
 	expectAssetSQLState(t, harness.db, "23514", `UPDATE assets SET lifecycle='STALE',version=version+1 WHERE id=$1`, fixture.assetID)
 	execAssetSQL(t, harness.db, `UPDATE assets SET lifecycle='ACTIVE',version=version+1 WHERE id=$1`, fixture.assetID)
 	execAssetSQL(t, harness.db, `UPDATE assets SET lifecycle='RETIRED',version=version+1 WHERE id=$1`, fixture.assetID)
@@ -601,8 +1437,15 @@ func assetCatalogControlDatabaseNameSafe(name string) bool {
 }
 
 func assetCatalogTableNames() []string {
-	return []string{"asset_sources", "asset_source_revisions", "asset_source_runs", "asset_observations", "assets",
+	return []string{"asset_sources", "asset_source_revisions", "asset_source_revision_authorities", "asset_source_runs", "asset_observations", "assets",
 		"asset_type_details", "asset_conflicts", "asset_relationships", "service_asset_bindings"}
+}
+
+func assetCatalogDownLockTableNames() []string {
+	return append([]string{
+		"tenants", "workspaces", "environments", "integrations", "services", "service_bindings",
+		"audit_records", "outbox_events",
+	}, assetCatalogTableNames()...)
 }
 
 func assetCatalogFixtureSummary(fixture assetCatalogFixture) string {

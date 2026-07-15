@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -142,7 +143,7 @@ func TestAssetCatalogOwnedFunctionsUseCatalogFirstSearchPath(t *testing.T) {
 		SELECT count(*)::integer,
 			COALESCE(string_agg(p.oid::regprocedure::text, ',' ORDER BY p.oid::regprocedure::text)
 				FILTER (WHERE p.proconfig IS DISTINCT FROM
-					ARRAY['search_path=pg_catalog, public']::text[]), '')
+					ARRAY['search_path=pg_catalog, public, pg_temp']::text[]), '')
 		FROM pg_catalog.pg_proc AS p
 		JOIN pg_catalog.pg_namespace AS n ON n.oid=p.pronamespace
 		WHERE n.nspname='public' AND (
@@ -154,8 +155,8 @@ func TestAssetCatalogOwnedFunctionsUseCatalogFirstSearchPath(t *testing.T) {
 	`).Scan(&total, &unsafeFunctions); err != nil {
 		t.Fatalf("read 000015 function search paths: %v", err)
 	}
-	if total < 31 {
-		t.Fatalf("000015 owned function count=%d, want at least 31", total)
+	if total != 35 {
+		t.Fatalf("000015 owned function count=%d, want 35", total)
 	}
 	if unsafeFunctions != "" {
 		t.Fatalf("000015 functions without fixed catalog-first search_path: %s", unsafeFunctions)
@@ -1269,6 +1270,8 @@ const (
 	closureExternalValidationID = "8f000000-0000-4000-8000-000000000003"
 )
 
+const closureExternalProfileManifestV1 = `{"backpressure_base_seconds":1,"backpressure_max_seconds":60,"compatibility_class":"EXTERNAL_V1","credential_purpose":"DISCOVERY_READ","dlp_policy_code":"ASSET_SAFE_V1","environment_mapping_mode":"SINGLE_ENVIRONMENT","freshness_kind":"OBJECT_SEQUENCE","integration_mode":"REQUIRED","max_document_bytes":65536,"max_page_bytes":1048576,"max_page_items":100,"max_page_relations":100,"network_mode":"NONE","parser_code":"EXTERNAL_V1","profile_code":"EXTERNAL_V1","provider_kind":"EXTERNAL_V1","rate_limit_requests":100,"rate_limit_window_seconds":60,"relationship_types":["DEPENDS_ON"],"schedule_mode":"NONE","source_kind":"EXTERNAL_CMDB","sync_mode":"ON_DEMAND","trust_mode":"NONE","trusted_path_codes":["DISPLAY_NAME","EXTERNAL_ID","KIND"],"typed_extension_code":null,"version":"asset-source-profile-manifest.v1"}`
+
 func startClosureManualValidationRunInTx(
 	t *testing.T,
 	tx pgx.Tx,
@@ -1418,32 +1421,17 @@ func seedForgedLegacyManualFinalizingRun(
 func prepareQueuedClosureValidation(t *testing.T, database *pgxpool.Pool) assetCatalogFixture {
 	t.Helper()
 	fixture := seedDraftAssetCatalog(t, database)
-	fixture.sourceID = closureExternalSourceID
-	fixture.revisionID = closureExternalRevisionID
+	fixture = seedClosureExternalDraftDefinition(
+		t,
+		database,
+		fixture,
+		closureExternalSourceID,
+		closureExternalRevisionID,
+		"EXTERNAL_V1",
+		"queued validation source",
+		"queued-validation-source",
+	)
 	fixture.validationRunID = closureExternalValidationID
-	fixture.revisionDigest = strings.Repeat("4", 64)
-	execAssetSQL(t, database, `
-		INSERT INTO asset_sources (
-			id,tenant_id,workspace_id,source_kind,provider_kind,name,
-			create_idempotency_key,create_request_hash
-		) VALUES ($1,$2,$3,'EXTERNAL_CMDB','EXTERNAL_V1','queued validation source',
-			'queued-validation-source',repeat('1',64))
-	`, fixture.sourceID, fixture.tenantID, fixture.workspaceID)
-	execAssetSQL(t, database, `
-		INSERT INTO asset_source_revisions (
-			id,tenant_id,workspace_id,source_id,revision,
-			canonical_provider_schema,canonical_provider_schema_sha256,integration_id,sync_mode,
-			authority_scope_digest,source_definition_digest,canonical_revision_digest,
-			credential_reference_id,rate_limit_requests,rate_limit_window_seconds,
-			backpressure_base_seconds,backpressure_max_seconds,profile_code,
-			created_by,change_reason_code,expected_source_version
-		) SELECT $1,$2,$3,$4,1,convert_to('{"type":"object"}','UTF8'),
-			encode(sha256(convert_to('{"type":"object"}','UTF8')),'hex'),$5,'ON_DEMAND',
-			repeat('2',64),repeat('3',64),$6,'opaque-credential',100,60,1,60,
-			'EXTERNAL_V1','closure-test','INITIAL_CREATE',source.version
-		FROM asset_sources AS source WHERE source.id=$4
-	`, fixture.revisionID, fixture.tenantID, fixture.workspaceID, fixture.sourceID,
-		fixture.integrationID, fixture.revisionDigest)
 	execAssetSQL(t, database, `
 		INSERT INTO asset_source_runs (
 			id,tenant_id,workspace_id,source_id,source_revision,source_revision_digest,
@@ -1622,40 +1610,26 @@ func seedClosureExternalValidationOnFixture(
 	fixture assetCatalogFixture,
 ) assetCatalogFixture {
 	t.Helper()
-	fixture.sourceID = closureExternalSourceID
-	fixture.revisionID = closureExternalRevisionID
+	fixture = seedClosureExternalDraftDefinition(
+		t,
+		database,
+		fixture,
+		closureExternalSourceID,
+		closureExternalRevisionID,
+		"EXTERNAL_V1",
+		"closure external source",
+		"closure-external-source",
+	)
 	fixture.validationRunID = closureExternalValidationID
-	fixture.revisionDigest = strings.Repeat("4", 64)
-	execAssetSQL(t, database, `
-		INSERT INTO asset_sources (
-			id,tenant_id,workspace_id,source_kind,provider_kind,name,
-			create_idempotency_key,create_request_hash
-		) VALUES ($1,$2,$3,'EXTERNAL_CMDB','EXTERNAL_V1','closure external source',
-			'closure-external-source',repeat('1',64))
-	`, closureExternalSourceID, fixture.tenantID, fixture.workspaceID)
-	execAssetSQL(t, database, `
-		INSERT INTO asset_source_revisions (
-			id,tenant_id,workspace_id,source_id,revision,
-			canonical_provider_schema,canonical_provider_schema_sha256,integration_id,sync_mode,
-			authority_scope_digest,source_definition_digest,canonical_revision_digest,
-			credential_reference_id,rate_limit_requests,rate_limit_window_seconds,
-			backpressure_base_seconds,backpressure_max_seconds,profile_code,
-			created_by,change_reason_code,expected_source_version
-		) SELECT $1,$2,$3,$4,1,convert_to('{"type":"object"}','UTF8'),
-			encode(sha256(convert_to('{"type":"object"}','UTF8')),'hex'),$5,'ON_DEMAND',
-			repeat('2',64),repeat('3',64),repeat('4',64),'opaque-credential',100,60,1,60,
-			'EXTERNAL_V1','closure-test','INITIAL_CREATE',source.version
-		FROM asset_sources AS source WHERE source.id=$4
-	`, closureExternalRevisionID, fixture.tenantID, fixture.workspaceID,
-		closureExternalSourceID, fixture.integrationID)
 	execAssetSQL(t, database, `
 		INSERT INTO asset_source_runs (
 			id,tenant_id,workspace_id,source_id,source_revision,source_revision_digest,
 			run_kind,trigger_type,gate_revision,idempotency_key,request_hash,checkpoint_version
-		) SELECT $1,$2,$3,$4,1,repeat('4',64),'VALIDATION','HUMAN',gate_revision,
+		) SELECT $1,$2,$3,$4,1,$5,'VALIDATION','HUMAN',gate_revision,
 			'closure-external-validation',repeat('5',64),0
 		FROM asset_sources WHERE id=$4
-	`, closureExternalValidationID, fixture.tenantID, fixture.workspaceID, closureExternalSourceID)
+	`, closureExternalValidationID, fixture.tenantID, fixture.workspaceID, closureExternalSourceID,
+		fixture.revisionDigest)
 	execAssetSQL(t, database, `
 		UPDATE asset_source_revisions
 		SET state='VALIDATING',validation_run_id=$2,version=version+1 WHERE id=$1
@@ -1694,6 +1668,183 @@ func seedClosureExternalValidationOnFixture(
 			heartbeat_at=statement_timestamp(),version=version+1
 		WHERE id=$1
 	`, closureExternalValidationID)
+	return fixture
+}
+
+func seedClosureExternalDraftDefinition(
+	t *testing.T,
+	database *pgxpool.Pool,
+	fixture assetCatalogFixture,
+	sourceID string,
+	revisionID string,
+	providerKind string,
+	name string,
+	idempotencyKey string,
+) assetCatalogFixture {
+	t.Helper()
+	fixture.sourceID = sourceID
+	fixture.revisionID = revisionID
+	profile := []byte(strings.ReplaceAll(closureExternalProfileManifestV1, "EXTERNAL_V1", providerKind))
+	providerSchema := []byte(`{"type":"object"}`)
+	profileDigest := sha256.Sum256(profile)
+	providerSchemaDigest := sha256.Sum256(providerSchema)
+	authorityDigest := assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-authority-scope.v1"),
+		[]byte("1"),
+		[]byte(fixture.environmentID),
+	)
+	fixture.sourceDefinitionDigest = assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-definition.v2"),
+		[]byte("EXTERNAL_CMDB"),
+		[]byte(providerKind),
+		[]byte(providerKind),
+		profileDigest[:],
+		providerSchemaDigest[:],
+	)
+	fixture.revisionDigest = assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-revision-binding.v1"),
+		[]byte(fixture.tenantID),
+		[]byte(fixture.workspaceID),
+		[]byte(fixture.sourceID),
+		[]byte("1"),
+		assetCatalogCorrectiveDecodeDigest(t, fixture.sourceDefinitionDigest),
+		[]byte(fixture.integrationID),
+		[]byte("ON_DEMAND"),
+		[]byte("opaque-credential"),
+		nil,
+		nil,
+		assetCatalogCorrectiveDecodeDigest(t, authorityDigest),
+		[]byte("100"),
+		[]byte("60"),
+		[]byte("1"),
+		[]byte("60"),
+		[]byte(providerKind),
+		nil,
+		nil,
+		nil,
+	)
+
+	transaction, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatalf("begin external source definition closure: %v", err)
+	}
+	defer func() { _ = transaction.Rollback(context.Background()) }()
+	execAssetSQL(t, transaction, `
+		INSERT INTO asset_sources (
+			id,tenant_id,workspace_id,source_kind,provider_kind,name,
+			create_idempotency_key,create_request_hash
+		) VALUES ($1,$2,$3,'EXTERNAL_CMDB',$4,$5,$6,repeat('1',64))
+	`, sourceID, fixture.tenantID, fixture.workspaceID, providerKind, name, idempotencyKey)
+	execAssetSQL(t, transaction, `
+		INSERT INTO asset_source_revisions (
+			id,tenant_id,workspace_id,source_id,revision,
+			canonical_profile_manifest,profile_manifest_sha256,
+			canonical_provider_schema,canonical_provider_schema_sha256,integration_id,sync_mode,
+			authority_scope_digest,source_definition_digest,canonical_revision_digest,
+			credential_reference_id,rate_limit_requests,rate_limit_window_seconds,
+			backpressure_base_seconds,backpressure_max_seconds,profile_code,
+			created_by,change_reason_code,expected_source_version
+		) SELECT $1,$2,$3,$4,1,$5,$6,$7,$8,$9,'ON_DEMAND',
+			$10,$11,$12,'opaque-credential',100,60,1,60,
+			$13,'closure-test','INITIAL_CREATE',source.version
+		FROM asset_sources AS source WHERE source.id=$4
+	`, revisionID, fixture.tenantID, fixture.workspaceID,
+		sourceID, profile, hex.EncodeToString(profileDigest[:]),
+		providerSchema, hex.EncodeToString(providerSchemaDigest[:]), fixture.integrationID,
+		authorityDigest, fixture.sourceDefinitionDigest, fixture.revisionDigest, providerKind)
+	execAssetSQL(t, transaction, `
+		INSERT INTO asset_source_revision_authorities (
+			tenant_id,workspace_id,source_id,source_revision,environment_id,canonical_ordinal
+		) VALUES ($1,$2,$3,1,$4,1)
+	`, fixture.tenantID, fixture.workspaceID, fixture.sourceID, fixture.environmentID)
+	if err := transaction.Commit(context.Background()); err != nil {
+		t.Fatalf("commit external source definition closure: %v", err)
+	}
+	return fixture
+}
+
+func seedClosureExternalSuccessorDefinition(
+	t *testing.T,
+	database *pgxpool.Pool,
+	fixture assetCatalogFixture,
+	revisionID string,
+	revision int64,
+	providerKind string,
+	providerSchema []byte,
+	changeReason string,
+) assetCatalogFixture {
+	t.Helper()
+	fixture.revisionID = revisionID
+	profile := []byte(strings.ReplaceAll(closureExternalProfileManifestV1, "EXTERNAL_V1", providerKind))
+	profileDigest := sha256.Sum256(profile)
+	providerSchemaDigest := sha256.Sum256(providerSchema)
+	authorityDigest := assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-authority-scope.v1"),
+		[]byte("1"),
+		[]byte(fixture.environmentID),
+	)
+	fixture.sourceDefinitionDigest = assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-definition.v2"),
+		[]byte("EXTERNAL_CMDB"),
+		[]byte(providerKind),
+		[]byte(providerKind),
+		profileDigest[:],
+		providerSchemaDigest[:],
+	)
+	fixture.revisionDigest = assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-revision-binding.v1"),
+		[]byte(fixture.tenantID),
+		[]byte(fixture.workspaceID),
+		[]byte(fixture.sourceID),
+		[]byte(strconv.FormatInt(revision, 10)),
+		assetCatalogCorrectiveDecodeDigest(t, fixture.sourceDefinitionDigest),
+		[]byte(fixture.integrationID),
+		[]byte("ON_DEMAND"),
+		[]byte("opaque-credential"),
+		nil,
+		nil,
+		assetCatalogCorrectiveDecodeDigest(t, authorityDigest),
+		[]byte("100"),
+		[]byte("60"),
+		[]byte("1"),
+		[]byte("60"),
+		[]byte(providerKind),
+		nil,
+		nil,
+		nil,
+	)
+
+	transaction, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatalf("begin external successor definition closure: %v", err)
+	}
+	defer func() { _ = transaction.Rollback(context.Background()) }()
+	execAssetSQL(t, transaction, `
+		INSERT INTO asset_source_revisions (
+			id,tenant_id,workspace_id,source_id,revision,
+			canonical_profile_manifest,profile_manifest_sha256,
+			canonical_provider_schema,canonical_provider_schema_sha256,integration_id,sync_mode,
+			authority_scope_digest,source_definition_digest,canonical_revision_digest,
+			credential_reference_id,rate_limit_requests,rate_limit_window_seconds,
+			backpressure_base_seconds,backpressure_max_seconds,profile_code,
+			created_by,change_reason_code,expected_source_version
+		) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'ON_DEMAND',
+			$11,$12,$13,'opaque-credential',100,60,1,60,$14,
+			'closure-test',$15,source.version
+		FROM asset_sources AS source WHERE source.id=$4
+	`, revisionID, fixture.tenantID, fixture.workspaceID, fixture.sourceID, revision,
+		profile, hex.EncodeToString(profileDigest[:]), providerSchema,
+		hex.EncodeToString(providerSchemaDigest[:]), fixture.integrationID,
+		authorityDigest, fixture.sourceDefinitionDigest, fixture.revisionDigest,
+		providerKind, changeReason)
+	execAssetSQL(t, transaction, `
+		INSERT INTO asset_source_revision_authorities (
+			tenant_id,workspace_id,source_id,source_revision,environment_id,canonical_ordinal
+		) VALUES ($1,$2,$3,$4,$5,1)
+	`, fixture.tenantID, fixture.workspaceID, fixture.sourceID, revision, fixture.environmentID)
+	if err := transaction.Commit(context.Background()); err != nil {
+		t.Fatalf("commit external successor definition closure: %v", err)
+	}
 	return fixture
 }
 
@@ -1845,7 +1996,7 @@ func insertClosureExternalObservation(
 				provider_provenance_sha256,observation_chain_sha256,accepted_checkpoint_version,
 				run_fence_epoch,run_page_sequence,schema_version,normalized_document,document_sha256,
 				field_provenance,field_provenance_sha256
-			) SELECT $1,$2,$3,$5,$4,$6,'EXTERNAL_V1',$8,1,$9,repeat('3',64),observed_at,'OBJECT_SEQUENCE',1,
+			) SELECT $1,$2,$3,$5,$4,$6,'EXTERNAL_V1',$8,1,$9,$12,observed_at,'OBJECT_SEQUENCE',1,
 				repeat('1',64),repeat('2',64),repeat('3',64),repeat('4',64),$10,1,1,1,'asset.v1',document,
 				encode(sha256(document),'hex'),provenance,encode(sha256(provenance),'hex') FROM payload
 			RETURNING observed_at
@@ -1857,7 +2008,8 @@ func insertClosureExternalObservation(
 		) SELECT $11,$2,$3,$5,$4,'EXTERNAL_V1',$8,'LINUX_VM',$7,$1,$10,observed_at,1,
 			'create-'||$8,repeat('5',64) FROM inserted
 	`, observationID, fixture.tenantID, fixture.workspaceID, fixture.sourceID, fixture.environmentID,
-		fixture.runID, displayName, externalID, fixture.revisionDigest, chain, assetID)
+		fixture.runID, displayName, externalID, fixture.revisionDigest, chain, assetID,
+		fixture.sourceDefinitionDigest)
 }
 
 func seedClosureExternalProjectionEdges(
@@ -2229,24 +2381,17 @@ func publishClosureExternalSuccessor(
 	fixture assetCatalogFixture,
 ) {
 	t.Helper()
-	fixture.revisionID = "8f500000-0000-4000-8000-000000000002"
+	fixture = seedClosureExternalSuccessorDefinition(
+		t,
+		database,
+		fixture,
+		"8f500000-0000-4000-8000-000000000002",
+		2,
+		"EXTERNAL_V1",
+		[]byte(`{"type":"object","version":2}`),
+		"DEFINITION_CHANGE",
+	)
 	fixture.validationRunID = "8f500000-0000-4000-8000-000000000003"
-	fixture.revisionDigest = strings.Repeat("d", 64)
-	execAssetSQL(t, database, `
-		INSERT INTO asset_source_revisions (
-			id,tenant_id,workspace_id,source_id,revision,
-			canonical_provider_schema,canonical_provider_schema_sha256,integration_id,sync_mode,
-			authority_scope_digest,source_definition_digest,canonical_revision_digest,
-			credential_reference_id,rate_limit_requests,rate_limit_window_seconds,
-			backpressure_base_seconds,backpressure_max_seconds,profile_code,
-			created_by,change_reason_code,expected_source_version
-		) SELECT $1,$2,$3,$4,2,convert_to('{"type":"object","version":2}','UTF8'),
-			encode(sha256(convert_to('{"type":"object","version":2}','UTF8')),'hex'),$5,
-			'ON_DEMAND',repeat('a',64),repeat('b',64),$6,'opaque-credential',100,60,1,60,
-			'EXTERNAL_V1','closure-test','DEFINITION_CHANGE',source.version
-		FROM asset_sources AS source WHERE source.id=$4
-	`, fixture.revisionID, fixture.tenantID, fixture.workspaceID, fixture.sourceID,
-		fixture.integrationID, fixture.revisionDigest)
 	execAssetSQL(t, database, `
 		UPDATE asset_sources
 		SET gate_status='UNAVAILABLE',gate_reason_code='VALIDATION_REQUESTED',

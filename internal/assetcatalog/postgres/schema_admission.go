@@ -19,7 +19,7 @@ const AssetCatalogUnavailableCode = "asset_catalog_unavailable"
 
 // Reviewed from migrations 000001-000015 on PostgreSQL 18.4. The manifest
 // deliberately normalizes compatible PostgreSQL 18.x patch versions.
-const assetCatalogSchemaManifestSHA256 = "13a56c2c38a6ba7c3ad9b3d7d3330c489a6bf04a18564210cd5e46ccbd3833c5"
+const assetCatalogSchemaManifestSHA256 = "41457b4355d130b8112b676b6cb242ce068178f3f42902a04024efeb942e59a8"
 
 var ErrAssetCatalogUnavailable = errors.New(AssetCatalogUnavailableCode)
 
@@ -122,7 +122,9 @@ func (admission *SchemaAdmission) Check(ctx context.Context) error {
 	if !ok {
 		return ErrAssetCatalogUnavailable
 	}
-	transaction, err := admission.database.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	transaction, err := admission.database.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly,
+	})
 	if err != nil {
 		return ErrAssetCatalogUnavailable
 	}
@@ -139,6 +141,7 @@ func (admission *SchemaAdmission) Check(ctx context.Context) error {
 }
 
 const schemaAdmissionSetLocalSearchPathSQL = `SET LOCAL search_path = pg_catalog, pg_temp`
+const schemaAdmissionSetLocalQuoteIdentifiersSQL = `SET LOCAL quote_all_identifiers = off`
 
 func loadSchemaAdmissionManifest(
 	ctx context.Context,
@@ -149,6 +152,9 @@ func loadSchemaAdmissionManifest(
 	// unqualified operators and types while parsing the next statement, so an
 	// execution-time CTE inside that statement cannot protect object resolution.
 	if err := transaction.Exec(ctx, schemaAdmissionSetLocalSearchPathSQL); err != nil {
+		return nil, err
+	}
+	if err := transaction.Exec(ctx, schemaAdmissionSetLocalQuoteIdentifiersSQL); err != nil {
 		return nil, err
 	}
 	var manifest []byte
@@ -191,8 +197,32 @@ func decodeReviewedManifestSHA256(encoded string) ([sha256.Size]byte, bool) {
 }
 
 const schemaAdmissionSQL = `
-WITH trusted_namespace AS MATERIALIZED (
-	SELECT namespace.oid, namespace.nspname
+WITH role_names(label, name) AS (
+    VALUES
+        ('MIGRATOR'::text, 'aiops_migrator'::text),
+        ('SCHEMA_OWNER'::text, 'aiops_schema_owner'::text),
+        ('RUNTIME'::text, 'aiops_control_plane_runtime'::text),
+        ('WORKLOAD'::text, 'aiops_control_plane_workload'::text)
+),
+base_roles AS MATERIALIZED (
+    SELECT names.label, role.oid
+    FROM role_names AS names
+    JOIN pg_catalog.pg_roles AS role
+      ON role.rolname = names.name
+),
+current_database_object AS MATERIALIZED (
+    SELECT
+        database.datdba AS owner_oid,
+        COALESCE(database.datacl, pg_catalog.acldefault('d', database.datdba)) AS acl
+    FROM pg_catalog.pg_database AS database
+    WHERE database.datname = pg_catalog.current_database()
+),
+trusted_namespace AS MATERIALIZED (
+	SELECT
+        namespace.oid,
+        namespace.nspname,
+        namespace.nspowner AS owner_oid,
+        COALESCE(namespace.nspacl, pg_catalog.acldefault('n', namespace.nspowner)) AS acl
 	FROM pg_catalog.pg_namespace AS namespace
 	WHERE namespace.nspname = $1
 ),
@@ -218,6 +248,7 @@ owned_table_names(name) AS (
     VALUES
         ('asset_sources'),
         ('asset_source_revisions'),
+        ('asset_source_revision_authorities'),
         ('asset_source_runs'),
         ('asset_observations'),
         ('assets'),
@@ -230,6 +261,43 @@ surface_table_names(name) AS (
     VALUES
         ('audit_records'),
         ('outbox_events')
+),
+authorization_relation_names(name) AS (
+    VALUES
+        ('tenants'::text),
+        ('integrations'::text),
+        ('workspaces'::text),
+        ('environments'::text),
+        ('services'::text),
+        ('service_bindings'::text),
+        ('audit_records'::text),
+        ('outbox_events'::text),
+        ('asset_sources'::text),
+        ('asset_source_revisions'::text),
+        ('asset_source_revision_authorities'::text),
+        ('asset_source_runs'::text),
+        ('asset_observations'::text),
+        ('assets'::text),
+        ('asset_type_details'::text),
+        ('asset_conflicts'::text),
+        ('asset_relationships'::text),
+        ('service_asset_bindings'::text)
+),
+authorization_relations AS MATERIALIZED (
+    SELECT
+        relation.oid,
+        relation.relname,
+        relation.relowner AS owner_oid,
+        COALESCE(
+            relation.relacl,
+            pg_catalog.acldefault('r', relation.relowner)
+        ) AS acl
+    FROM pg_catalog.pg_class AS relation
+    JOIN trusted_namespace AS namespace
+      ON namespace.oid = relation.relnamespace
+    JOIN authorization_relation_names AS expected
+      ON expected.name = relation.relname
+    WHERE relation.relkind IN ('r', 'p')
 ),
 owned_relations AS (
     SELECT
@@ -460,6 +528,41 @@ trigger_candidates AS (
         WHERE tracked_relation.oid = trigger_record.tgrelid
     )
 ),
+trigger_function_dependencies AS MATERIALIZED (
+    SELECT
+        trigger_candidate.oid AS trigger_oid,
+        pg_catalog.count(dependency.objid)::bigint AS direct_function_dependency_count,
+        COALESCE(
+            pg_catalog.jsonb_agg(
+                pg_catalog.jsonb_build_array(
+                    dependency.objsubid,
+                    function_namespace.nspname,
+                    function_record.proname,
+                    pg_catalog.pg_get_function_identity_arguments(function_record.oid),
+                    dependency.refobjsubid,
+                    dependency.deptype::text
+                )
+                ORDER BY
+                    dependency.objsubid,
+                    function_namespace.nspname COLLATE "C",
+                    function_record.proname COLLATE "C",
+                    pg_catalog.pg_get_function_identity_arguments(function_record.oid) COLLATE "C",
+                    dependency.refobjsubid,
+                    dependency.deptype::text COLLATE "C"
+            ) FILTER (WHERE dependency.objid IS NOT NULL),
+            '[]'::pg_catalog.jsonb
+        ) AS direct_function_dependencies
+    FROM trigger_candidates AS trigger_candidate
+    LEFT JOIN pg_catalog.pg_depend AS dependency
+      ON dependency.classid = 'pg_catalog.pg_trigger'::pg_catalog.regclass
+     AND dependency.objid = trigger_candidate.oid
+     AND dependency.refclassid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+    LEFT JOIN pg_catalog.pg_proc AS function_record
+      ON function_record.oid = dependency.refobjid
+    LEFT JOIN pg_catalog.pg_namespace AS function_namespace
+      ON function_namespace.oid = function_record.pronamespace
+    GROUP BY trigger_candidate.oid
+),
 trigger_records AS (
     SELECT
         'trigger'::text AS record_kind,
@@ -498,6 +601,8 @@ trigger_records AS (
                 trigger_record.tgattr::text,
                 pg_catalog.encode(trigger_record.tgargs, 'hex'),
                 pg_catalog.pg_get_expr(trigger_record.tgqual, trigger_record.tgrelid, false),
+                trigger_dependency.direct_function_dependency_count,
+                trigger_dependency.direct_function_dependencies,
                 CASE
                     WHEN trigger_record.tgisinternal THEN NULL
                     ELSE pg_catalog.pg_get_triggerdef(trigger_record.oid, false)
@@ -515,6 +620,8 @@ trigger_records AS (
     FROM trigger_candidates AS trigger_candidate
     JOIN pg_catalog.pg_trigger AS trigger_record
       ON trigger_record.oid = trigger_candidate.oid
+    JOIN trigger_function_dependencies AS trigger_dependency
+      ON trigger_dependency.trigger_oid = trigger_record.oid
     JOIN pg_catalog.pg_class AS relation
       ON relation.oid = trigger_record.tgrelid
     JOIN pg_catalog.pg_namespace AS relation_namespace
@@ -530,6 +637,44 @@ trigger_records AS (
     LEFT JOIN pg_catalog.pg_namespace AS referenced_namespace
       ON referenced_namespace.oid = referenced_relation.relnamespace
 ),
+owned_function_names(name) AS (
+    VALUES
+        ('asset_catalog_text_valid'::text),
+        ('asset_catalog_code_valid'::text),
+        ('asset_catalog_sha256_valid'::text),
+        ('asset_catalog_provider_kind_valid'::text),
+        ('asset_catalog_idempotency_key_valid'::text),
+        ('asset_catalog_json_object_valid'::text),
+        ('asset_catalog_labels_valid'::text),
+        ('asset_catalog_checkpoint_envelope_valid'::text),
+        ('asset_catalog_field_provenance_valid'::text),
+        ('asset_catalog_framed_value_v1'::text),
+        ('asset_catalog_source_run_no_credential_digest'::text),
+        ('asset_catalog_source_run_delay_intent_digest'::text),
+        ('asset_catalog_source_run_failure_override_digest'::text),
+        ('asset_catalog_source_run_terminal_digest'::text),
+        ('asset_catalog_opaque_reference_valid'::text),
+        ('asset_catalog_future_source_gate_admitted'::text),
+        ('asset_catalog_source_revision_binding_digest'::text),
+        ('validate_asset_management_audit_insert'::text),
+        ('reject_asset_catalog_immutable'::text),
+        ('reject_asset_catalog_delete'::text),
+        ('reject_asset_catalog_truncate'::text),
+        ('enforce_assets_transition'::text),
+        ('enforce_asset_conflict_transition'::text),
+        ('enforce_asset_catalog_edge_mutation'::text),
+        ('enforce_asset_relationship_mutation'::text),
+        ('validate_asset_relationship_page_closure'::text),
+        ('enforce_asset_sources_mutation'::text),
+        ('validate_asset_source_deferred_state'::text),
+        ('enforce_asset_source_revision_transition'::text),
+        ('validate_asset_source_revision_deferred_state'::text),
+        ('enforce_asset_source_run_mutation'::text),
+        ('validate_asset_source_run_page_closure'::text),
+        ('validate_asset_source_run_terminal_closure'::text),
+        ('enforce_asset_observation_admission'::text),
+        ('validate_asset_observation_page_closure'::text)
+),
 owned_function_oids AS (
     SELECT DISTINCT trigger_record.function_oid AS oid
     FROM trigger_records AS trigger_record
@@ -540,6 +685,11 @@ owned_function_oids AS (
     JOIN trusted_namespace AS namespace
       ON namespace.oid = function_record.pronamespace
     WHERE pg_catalog.left(function_record.proname, 14) = 'asset_catalog_'
+       OR EXISTS (
+            SELECT 1
+            FROM owned_function_names AS expected
+            WHERE expected.name = function_record.proname
+       )
 ),
 function_records AS (
     SELECT
@@ -567,6 +717,11 @@ function_records AS (
             'UTF8'
         ) AS payload,
         function_record.oid AS object_oid,
+        function_record.proowner AS owner_oid,
+        COALESCE(
+            function_record.proacl,
+            pg_catalog.acldefault('f', function_record.proowner)
+        ) AS acl,
         function_namespace.nspname AS namespace_name,
         function_record.proname,
         pg_catalog.pg_get_function_identity_arguments(function_record.oid) AS identity_arguments
@@ -577,6 +732,144 @@ function_records AS (
       ON function_namespace.oid = function_record.pronamespace
     JOIN pg_catalog.pg_language AS language
       ON language.oid = function_record.prolang
+),
+authorization_objects AS MATERIALIZED (
+    SELECT
+        'database'::text AS object_kind,
+        'current'::text AS object_name,
+        database.owner_oid,
+        database.acl
+    FROM current_database_object AS database
+    UNION ALL
+    SELECT
+        'schema'::text,
+        namespace.nspname,
+        namespace.owner_oid,
+        namespace.acl
+    FROM trusted_namespace AS namespace
+    UNION ALL
+    SELECT
+        'relation'::text,
+        relation.relname,
+        relation.owner_oid,
+        relation.acl
+    FROM authorization_relations AS relation
+    UNION ALL
+    SELECT
+        'column'::text,
+        relation.relname || '.' || attribute.attname,
+        relation.owner_oid,
+        COALESCE(
+            attribute.attacl,
+            pg_catalog.acldefault('c', relation.owner_oid)
+        )
+    FROM authorization_relations AS relation
+    JOIN pg_catalog.pg_attribute AS attribute
+      ON attribute.attrelid = relation.oid
+     AND attribute.attnum > 0
+     AND NOT attribute.attisdropped
+    UNION ALL
+    SELECT
+        'function'::text,
+        function_record.namespace_name || '.' || function_record.proname || '(' ||
+            function_record.identity_arguments || ')',
+        function_record.owner_oid,
+        function_record.acl
+    FROM function_records AS function_record
+),
+authorization_owner_records AS (
+    SELECT
+        'authorization-owner'::text AS record_kind,
+        object_record.object_kind || pg_catalog.chr(31) ||
+            object_record.object_name AS sort_key,
+        pg_catalog.convert_to(
+            pg_catalog.jsonb_build_array(
+                'authorization-owner',
+                object_record.object_kind,
+                object_record.object_name,
+                COALESCE(
+                    (
+                        SELECT CASE
+                            WHEN role.label = 'SCHEMA_OWNER' THEN 'OWNER'
+                            ELSE role.label
+                        END
+                        FROM base_roles AS role
+                        WHERE role.oid = object_record.owner_oid
+                    ),
+                    'UNKNOWN:' || object_record.owner_oid::text
+                )
+            )::text,
+            'UTF8'
+        ) AS payload
+    FROM authorization_objects AS object_record
+    WHERE object_record.object_kind <> 'column'
+),
+authorization_acl_rows AS (
+    SELECT
+        object_record.object_kind,
+        object_record.object_name,
+        semantic.grantee,
+        semantic.grantor,
+        entry.privilege_type,
+        entry.is_grantable,
+        pg_catalog.count(*)::integer AS multiplicity
+    FROM authorization_objects AS object_record
+    CROSS JOIN LATERAL pg_catalog.aclexplode(object_record.acl) AS entry
+    CROSS JOIN LATERAL (
+        SELECT
+            CASE
+                WHEN entry.grantee = 0::oid THEN 'PUBLIC'
+                WHEN entry.grantee = object_record.owner_oid THEN 'OWNER'
+                ELSE COALESCE(
+                    (
+                        SELECT role.label
+                        FROM base_roles AS role
+                        WHERE role.oid = entry.grantee
+                    ),
+                    'UNKNOWN:' || entry.grantee::text
+                )
+            END AS grantee,
+            CASE
+                WHEN entry.grantor = object_record.owner_oid THEN 'OWNER'
+                ELSE COALESCE(
+                    (
+                        SELECT role.label
+                        FROM base_roles AS role
+                        WHERE role.oid = entry.grantor
+                    ),
+                    'UNKNOWN:' || entry.grantor::text
+                )
+            END AS grantor
+    ) AS semantic
+    GROUP BY
+        object_record.object_kind,
+        object_record.object_name,
+        semantic.grantee,
+        semantic.grantor,
+        entry.privilege_type,
+        entry.is_grantable
+),
+authorization_acl_records AS (
+    SELECT
+        'authorization-acl'::text AS record_kind,
+        acl.object_kind || pg_catalog.chr(31) || acl.object_name ||
+            pg_catalog.chr(31) || acl.grantee || pg_catalog.chr(31) ||
+            acl.grantor || pg_catalog.chr(31) || acl.privilege_type ||
+            pg_catalog.chr(31) || acl.is_grantable::text AS sort_key,
+        pg_catalog.convert_to(
+            pg_catalog.jsonb_build_array(
+                'authorization-acl',
+                acl.object_kind,
+                acl.object_name,
+                acl.grantee,
+                acl.grantor,
+                acl.privilege_type,
+                acl.is_grantable,
+                acl.multiplicity
+            )::text,
+            'UTF8'
+        ) AS payload
+    FROM authorization_acl_rows AS acl
 ),
 relation_comment_records AS (
     SELECT
@@ -712,6 +1005,10 @@ manifest_records AS (
     UNION ALL
     SELECT record_kind, sort_key, payload FROM function_records
     UNION ALL
+    SELECT record_kind, sort_key, payload FROM authorization_owner_records
+    UNION ALL
+    SELECT record_kind, sort_key, payload FROM authorization_acl_records
+    UNION ALL
     SELECT record_kind, sort_key, payload FROM relation_comment_records
     UNION ALL
     SELECT record_kind, sort_key, payload FROM index_comment_records
@@ -728,8 +1025,11 @@ manifest_body AS (
         COALESCE(
             pg_catalog.string_agg(
                 pg_catalog.int4send(pg_catalog.octet_length(payload)) || payload,
-                ''::bytea
-                ORDER BY record_kind, sort_key
+            ''::bytea
+                ORDER BY
+                    record_kind COLLATE "C",
+                    sort_key COLLATE "C",
+                    payload
             ),
             ''::bytea
         ) AS body

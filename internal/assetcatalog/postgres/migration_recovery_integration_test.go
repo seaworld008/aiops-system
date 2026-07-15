@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	assetpostgres "github.com/seaworld008/aiops-system/internal/assetcatalog/postgres"
+	storepostgres "github.com/seaworld008/aiops-system/internal/store/postgres"
 )
 
 type recoveredTableProof struct {
@@ -21,7 +22,7 @@ type recoveredTableProof struct {
 func TestAssetCatalogRecovery(t *testing.T) {
 	pair := prepareRecoveryPostgreSQLPair(t)
 	source := pair.sourcePool
-	(&assetCatalogHarness{db: source}).applyThroughAssetCatalog(t)
+	pair.sourceHarness.applyThroughAssetCatalog(t)
 	fixture := seedRepresentativeAssetCatalog(t, source)
 	seedRecoveryProjection(t, source, fixture)
 	authoritativeSeed := fixture
@@ -34,9 +35,11 @@ func TestAssetCatalogRecovery(t *testing.T) {
 	authoritativeSeed.relationshipID = "6d000000-0000-4000-8000-000000000201"
 	authoritativeSeed.bindingID = "6e000000-0000-4000-8000-000000000201"
 	authoritativeFixture := seedClosureAuthoritativeCompleteCatalogOnFixture(t, source, authoritativeSeed)
+	assertRecoveryAdmissions(t, pair.sourceHarness)
 	sourceProof := collectAssetCatalogProof(t, source)
 	verifyAssetCatalogClosure(t, source, fixture)
 	verifyAuthoritativeCompletePointer(t, source, authoritativeFixture)
+	assertRecoveryCatalogOwners(t, pair.sourceHarness.admin)
 
 	backup := logicalDumpDatabase(t, pair.source)
 	if len(backup) < 1024 || !strings.HasPrefix(string(backup[:5]), "PGDMP") {
@@ -44,8 +47,10 @@ func TestAssetCatalogRecovery(t *testing.T) {
 	}
 	backupSHA256 := sha256.Sum256(backup)
 	t.Logf("logical recovery archive SHA-256=%x", backupSHA256)
+	assertRecoveryPoolIdentity(t, pair.targetHarness.migration, "aiops_migrator", "aiops_migrator")
 	restoreLogicalDump(t, pair.target, backup)
 	target := pair.targetPool
+	assertRecoveryAdmissions(t, pair.targetHarness)
 	targetProof := collectAssetCatalogProof(t, target)
 	if len(sourceProof) != len(targetProof) {
 		t.Fatalf("restored proof table count=%d, want %d", len(targetProof), len(sourceProof))
@@ -58,16 +63,154 @@ func TestAssetCatalogRecovery(t *testing.T) {
 	}
 	verifyAssetCatalogClosure(t, target, fixture)
 	verifyAuthoritativeCompletePointer(t, target, authoritativeFixture)
+	verifyRecoveryAdmissionDriftMatrix(t, pair.targetHarness, pair.target, targetProof)
 	verifyRestoredMutationGuards(t, target, fixture)
-	if err := assetpostgres.NewSchemaAdmission(target, "public").Check(context.Background()); err != nil {
-		t.Fatalf("restored schema admission: %v", err)
-	}
 	execAssetSQL(t, target, `
 		ALTER TABLE asset_observations DROP CONSTRAINT asset_observations_run_revision_fk
 	`)
 	if err := assetpostgres.NewSchemaAdmission(target, "public").Check(context.Background()); !errors.Is(err, assetpostgres.ErrAssetCatalogUnavailable) {
 		t.Fatalf("schema admission after restored exact-FK removal error=%v, want %v",
 			err, assetpostgres.ErrAssetCatalogUnavailable)
+	}
+}
+
+func assertRecoveryAdmissions(t *testing.T, harness *assetCatalogHarness) {
+	t.Helper()
+	if err := assetpostgres.NewSchemaAdmission(harness.application, "public").Check(context.Background()); err != nil {
+		t.Fatalf("recovery schema admission: %v", err)
+	}
+	if err := storepostgres.NewDatabaseRoleAdmission(harness.application, "public").Check(context.Background()); err != nil {
+		t.Fatalf("recovery database-role admission: %v", err)
+	}
+}
+
+func verifyRecoveryAdmissionDriftMatrix(
+	t *testing.T,
+	harness *assetCatalogHarness,
+	container *recoveryPostgreSQLContainer,
+	baseline map[string]recoveredTableProof,
+) {
+	t.Helper()
+	database := pgx.Identifier{container.databaseName}.Sanitize()
+	bootstrapAdmin := pgx.Identifier{container.username}.Sanitize()
+	type admissionDrift struct {
+		name                  string
+		apply                 string
+		repair                string
+		schemaAdmissionReject bool
+	}
+	drifts := []admissionDrift{
+		{
+			name:   "role flag",
+			apply:  `ALTER ROLE aiops_control_plane_runtime LOGIN`,
+			repair: `ALTER ROLE aiops_control_plane_runtime NOLOGIN`,
+		},
+		{
+			name: "membership option",
+			apply: `GRANT aiops_control_plane_runtime TO aiops_control_plane_workload
+				WITH ADMIN FALSE, INHERIT TRUE, SET TRUE`,
+			repair: `GRANT aiops_control_plane_runtime TO aiops_control_plane_workload
+				WITH ADMIN FALSE, INHERIT TRUE, SET FALSE`,
+		},
+		{
+			name:                  "database owner",
+			apply:                 "ALTER DATABASE " + database + " OWNER TO " + bootstrapAdmin,
+			repair:                "ALTER DATABASE " + database + " OWNER TO aiops_schema_owner",
+			schemaAdmissionReject: true,
+		},
+		{
+			name:                  "database TEMP ACL",
+			apply:                 "GRANT TEMPORARY ON DATABASE " + database + " TO aiops_control_plane_workload",
+			repair:                "REVOKE TEMPORARY ON DATABASE " + database + " FROM aiops_control_plane_workload",
+			schemaAdmissionReject: true,
+		},
+		{
+			name:                  "schema owner",
+			apply:                 "ALTER SCHEMA public OWNER TO " + bootstrapAdmin,
+			repair:                `ALTER SCHEMA public OWNER TO aiops_schema_owner`,
+			schemaAdmissionReject: true,
+		},
+		{
+			name:                  "schema PUBLIC ACL",
+			apply:                 `GRANT USAGE ON SCHEMA public TO PUBLIC`,
+			repair:                `REVOKE USAGE ON SCHEMA public FROM PUBLIC`,
+			schemaAdmissionReject: true,
+		},
+		{
+			name:                  "relation owner",
+			apply:                 "ALTER TABLE public.assets OWNER TO " + bootstrapAdmin,
+			repair:                `ALTER TABLE public.assets OWNER TO aiops_schema_owner`,
+			schemaAdmissionReject: true,
+		},
+		{
+			name:                  "relation ACL",
+			apply:                 `GRANT DELETE ON TABLE public.assets TO aiops_control_plane_runtime`,
+			repair:                `REVOKE DELETE ON TABLE public.assets FROM aiops_control_plane_runtime`,
+			schemaAdmissionReject: true,
+		},
+		{
+			name:                  "function ACL",
+			apply:                 `GRANT EXECUTE ON FUNCTION public.asset_catalog_sha256_valid(text) TO PUBLIC`,
+			repair:                `REVOKE EXECUTE ON FUNCTION public.asset_catalog_sha256_valid(text) FROM PUBLIC`,
+			schemaAdmissionReject: true,
+		},
+	}
+
+	for _, drift := range drifts {
+		drift := drift
+		t.Run(drift.name, func(t *testing.T) {
+			mustExecuteRecoveryDrift(t, harness.admin, drift.apply)
+			repaired := false
+			t.Cleanup(func() {
+				if !repaired {
+					mustExecuteRecoveryDrift(t, harness.admin, drift.repair)
+				}
+			})
+
+			if err := storepostgres.NewDatabaseRoleAdmission(harness.application, "public").Check(context.Background()); !errors.Is(err, storepostgres.ErrDatabaseRoleUnavailable) {
+				t.Fatalf("database-role admission after %s drift error=%v, want %v",
+					drift.name, err, storepostgres.ErrDatabaseRoleUnavailable)
+			}
+			schemaErr := assetpostgres.NewSchemaAdmission(harness.application, "public").Check(context.Background())
+			if drift.schemaAdmissionReject {
+				if !errors.Is(schemaErr, assetpostgres.ErrAssetCatalogUnavailable) {
+					t.Fatalf("schema admission after %s drift error=%v, want %v",
+						drift.name, schemaErr, assetpostgres.ErrAssetCatalogUnavailable)
+				}
+			} else if schemaErr != nil {
+				t.Fatalf("schema admission changed for role-only %s drift: %v", drift.name, schemaErr)
+			}
+			assertRecoveryProofEqual(t, collectAssetCatalogProof(t, harness.application), baseline)
+
+			mustExecuteRecoveryDrift(t, harness.admin, drift.repair)
+			repaired = true
+			assertRecoveryAdmissions(t, harness)
+			assertRecoveryProofEqual(t, collectAssetCatalogProof(t, harness.application), baseline)
+		})
+	}
+}
+
+func mustExecuteRecoveryDrift(t *testing.T, admin *pgxpool.Pool, statement string) {
+	t.Helper()
+	if _, err := admin.Exec(context.Background(), statement); err != nil {
+		t.Fatalf("apply recovery admission drift fixture: %v", err)
+	}
+}
+
+func assertRecoveryProofEqual(
+	t *testing.T,
+	actual map[string]recoveredTableProof,
+	want map[string]recoveredTableProof,
+) {
+	t.Helper()
+	if len(actual) != len(want) {
+		t.Fatalf("recovery proof table count=%d, want %d", len(actual), len(want))
+	}
+	for table, wantTable := range want {
+		if actualTable, ok := actual[table]; !ok || actualTable != wantTable {
+			t.Fatalf("recovery proof for %s=%+v present=%v, want %+v",
+				table, actualTable, ok, wantTable)
+		}
 	}
 }
 
@@ -117,24 +260,31 @@ func verifyRestoredMutationGuards(t *testing.T, database *pgxpool.Pool, fixture 
 	expectAssetSQLState(t, database, "55000", `
 		UPDATE asset_type_details SET actor_id='tampered' WHERE id=$1
 	`, fixture.typeDetailID)
+	expectAssetSQLState(t, database, "55000", `
+		UPDATE asset_source_revision_authorities SET canonical_ordinal=canonical_ordinal+1
+		WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND source_revision=1
+	`, fixture.tenantID, fixture.workspaceID, fixture.sourceID)
 
 	rows := []struct {
-		table string
-		id    string
+		table     string
+		predicate string
+		arguments []any
 	}{
-		{"asset_sources", fixture.sourceID},
-		{"asset_source_revisions", fixture.revisionID},
-		{"asset_source_runs", fixture.runID},
-		{"asset_observations", fixture.observationID},
-		{"assets", fixture.assetID},
-		{"asset_type_details", fixture.typeDetailID},
-		{"asset_conflicts", fixture.conflictID},
-		{"asset_relationships", fixture.relationshipID},
-		{"service_asset_bindings", fixture.bindingID},
+		{"asset_sources", "id=$1", []any{fixture.sourceID}},
+		{"asset_source_revisions", "id=$1", []any{fixture.revisionID}},
+		{"asset_source_revision_authorities", "tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND source_revision=1",
+			[]any{fixture.tenantID, fixture.workspaceID, fixture.sourceID}},
+		{"asset_source_runs", "id=$1", []any{fixture.runID}},
+		{"asset_observations", "id=$1", []any{fixture.observationID}},
+		{"assets", "id=$1", []any{fixture.assetID}},
+		{"asset_type_details", "id=$1", []any{fixture.typeDetailID}},
+		{"asset_conflicts", "id=$1", []any{fixture.conflictID}},
+		{"asset_relationships", "id=$1", []any{fixture.relationshipID}},
+		{"service_asset_bindings", "id=$1", []any{fixture.bindingID}},
 	}
 	for _, row := range rows {
-		query := fmt.Sprintf("DELETE FROM %s WHERE id=$1", pgx.Identifier{row.table}.Sanitize())
-		expectAssetSQLState(t, database, "55000", query, row.id)
+		query := fmt.Sprintf("DELETE FROM %s WHERE %s", pgx.Identifier{row.table}.Sanitize(), row.predicate)
+		expectAssetSQLState(t, database, "55000", query, row.arguments...)
 	}
 
 	expectAssetSQLState(t, database, "P0001", `
@@ -184,14 +334,16 @@ func collectAssetCatalogProof(t *testing.T, database *pgxpool.Pool) map[string]r
 	t.Helper()
 	tables := []string{
 		"asset_sources", "asset_source_revisions", "asset_source_runs", "asset_observations",
-		"assets", "asset_type_details", "asset_conflicts", "asset_relationships", "service_asset_bindings",
+		"asset_source_revision_authorities", "assets", "asset_type_details", "asset_conflicts",
+		"asset_relationships", "service_asset_bindings",
 		"audit_records", "outbox_events",
 	}
 	proof := make(map[string]recoveredTableProof, len(tables))
 	for _, table := range tables {
 		query := fmt.Sprintf(`
 			SELECT count(*), encode(sha256(convert_to(COALESCE(
-				string_agg(to_jsonb(row_value)::text, E'\n' ORDER BY row_value.id), ''
+				string_agg(to_jsonb(row_value)::text, E'\n'
+					ORDER BY (to_jsonb(row_value)::text) COLLATE "C"), ''
 			), 'UTF8')), 'hex')
 			FROM %s AS row_value
 		`, pgx.Identifier{table}.Sanitize())
@@ -210,7 +362,7 @@ func collectAssetCatalogProof(t *testing.T, database *pgxpool.Pool) map[string]r
 func verifyAssetCatalogClosure(t *testing.T, database *pgxpool.Pool, fixture assetCatalogFixture) {
 	t.Helper()
 	verifyCatalogForeignKeyClosure(t, database)
-	verifyCatalogContentHashes(t, database)
+	verifyCatalogContentHashes(t, database, fixture)
 	verifyCatalogFactCoordinates(t, database, fixture)
 	verifyCatalogSourcePointers(t, database, fixture)
 	verifyCatalogGovernanceReceipts(t, database, fixture)
@@ -240,6 +392,12 @@ func verifyCatalogForeignKeyClosure(t *testing.T, database *pgxpool.Pool) {
 			 WHERE s.last_complete_snapshot_run_id IS NOT NULL AND r.id IS NULL) +
 			(SELECT count(*) FROM asset_source_revisions r LEFT JOIN asset_sources s
 			 ON s.tenant_id=r.tenant_id AND s.workspace_id=r.workspace_id AND s.id=r.source_id WHERE s.id IS NULL) +
+			(SELECT count(*) FROM asset_source_revision_authorities a LEFT JOIN asset_source_revisions r
+			 ON r.tenant_id=a.tenant_id AND r.workspace_id=a.workspace_id AND r.source_id=a.source_id
+			 AND r.revision=a.source_revision WHERE r.id IS NULL) +
+			(SELECT count(*) FROM asset_source_revision_authorities a LEFT JOIN environments e
+			 ON e.tenant_id=a.tenant_id AND e.workspace_id=a.workspace_id AND e.id=a.environment_id
+			 WHERE e.id IS NULL) +
 			(SELECT count(*) FROM asset_source_revisions r LEFT JOIN integrations i
 			 ON i.tenant_id=r.tenant_id AND i.workspace_id=r.workspace_id AND i.id=r.integration_id
 			 WHERE r.integration_id IS NOT NULL AND i.id IS NULL) +
@@ -356,13 +514,14 @@ func verifyCatalogForeignKeyClosure(t *testing.T, database *pgxpool.Pool) {
 		  AND relation.relname = ANY($1::text[])
 		  AND constraint_record.contype='f'
 	`, []string{
-		"asset_sources", "asset_source_revisions", "asset_source_runs", "asset_observations",
+		"asset_sources", "asset_source_revisions", "asset_source_revision_authorities",
+		"asset_source_runs", "asset_observations",
 		"assets", "asset_type_details", "asset_conflicts", "asset_relationships", "service_asset_bindings",
 	}).Scan(&foreignKeys, &invalidForeignKeys); err != nil {
 		t.Fatalf("verify restored foreign-key validation state: %v", err)
 	}
-	if foreignKeys != 33 || invalidForeignKeys != 0 {
-		t.Fatalf("asset catalog foreign keys=(total:%d unvalidated:%d), want (33,0)",
+	if foreignKeys != 35 || invalidForeignKeys != 0 {
+		t.Fatalf("asset catalog foreign keys=(total:%d unvalidated:%d), want (35,0)",
 			foreignKeys, invalidForeignKeys)
 	}
 }
@@ -390,12 +549,28 @@ func verifyRecoveryAuditOutboxLink(t *testing.T, database *pgxpool.Pool) {
 	}
 }
 
-func verifyCatalogContentHashes(t *testing.T, database *pgxpool.Pool) {
+func verifyCatalogContentHashes(
+	t *testing.T,
+	database *pgxpool.Pool,
+	fixture assetCatalogFixture,
+) {
 	t.Helper()
+	authorityDigest := assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-authority-scope.v1"),
+		[]byte("1"),
+		[]byte(fixture.environmentID),
+	)
 	var badHashes int64
 	if err := database.QueryRow(context.Background(), `
 		SELECT
-			(SELECT count(*) FROM asset_source_revisions WHERE encode(sha256(canonical_provider_schema),'hex')<>canonical_provider_schema_sha256) +
+			(SELECT count(*) FROM asset_source_revisions WHERE
+				encode(sha256(canonical_profile_manifest),'hex')<>profile_manifest_sha256 OR
+				encode(sha256(canonical_provider_schema),'hex')<>canonical_provider_schema_sha256 OR
+				asset_catalog_source_revision_binding_digest(asset_source_revisions)<>canonical_revision_digest) +
+			(SELECT CASE WHEN count(*)=1 AND bool_and(
+				authority_scope_digest=$2 AND source_definition_digest=$3 AND canonical_revision_digest=$4
+			) THEN 0 ELSE 1 END
+			 FROM asset_source_revisions WHERE source_id=$1) +
 			(SELECT count(*) FROM asset_observations WHERE encode(sha256(normalized_document),'hex')<>document_sha256
 			 OR encode(sha256(field_provenance),'hex')<>field_provenance_sha256) +
 			(SELECT count(*) FROM asset_type_details WHERE encode(sha256(details_document),'hex')<>details_sha256) +
@@ -408,7 +583,7 @@ func verifyCatalogContentHashes(t *testing.T, database *pgxpool.Pool) {
 				NOT asset_catalog_sha256_valid(relation_page_sha256) OR
 				NOT asset_catalog_sha256_valid(provider_version_sha256) OR
 				NOT asset_catalog_sha256_valid(relation_fact_sha256))
-	`).Scan(&badHashes); err != nil {
+	`, fixture.sourceID, authorityDigest, fixture.sourceDefinitionDigest, fixture.revisionDigest).Scan(&badHashes); err != nil {
 		t.Fatalf("verify asset catalog SHA-256 equality: %v", err)
 	}
 	if badHashes != 0 {

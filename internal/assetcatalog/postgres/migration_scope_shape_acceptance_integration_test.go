@@ -112,7 +112,7 @@ func TestAssetCatalogScopeShapeAcceptanceLifecycleIdentityAndStaticUniqueness(t 
 	harness := newAssetCatalogHarness(t)
 	harness.applyThroughAssetCatalog(t)
 	fixture := seedGovernedManualCatalog(t, harness.db)
-	seedScopeShapeSecondaryScope(t, harness.db)
+	seedScopeShapeSecondaryEnvironment(t, harness.db)
 
 	t.Run("legal lifecycle transition advances version exactly once", func(t *testing.T) {
 		var before, after int64
@@ -122,16 +122,25 @@ func TestAssetCatalogScopeShapeAcceptanceLifecycleIdentityAndStaticUniqueness(t 
 			t.Fatalf("read asset version before lifecycle transition: %v", err)
 		}
 		var lifecycle string
+		var serverTimestamp bool
 		if err := harness.db.QueryRow(context.Background(), `
-			UPDATE assets SET lifecycle='ACTIVE',version=version+1
-			WHERE id=$1 RETURNING lifecycle,version
-		`, fixture.assetID).Scan(&lifecycle, &after); err != nil {
+			UPDATE assets
+			SET lifecycle='ACTIVE',version=version+1,updated_at='2000-01-01T00:00:00Z'
+			WHERE id=$1
+			RETURNING lifecycle,version,updated_at=statement_timestamp()
+		`, fixture.assetID).Scan(&lifecycle, &after, &serverTimestamp); err != nil {
 			t.Fatalf("apply legal lifecycle transition: %v", err)
 		}
-		if lifecycle != "ACTIVE" || after != before+1 {
-			t.Fatalf("legal lifecycle result=%s/version %d, want ACTIVE/version %d",
-				lifecycle, after, before+1)
+		if lifecycle != "ACTIVE" || after != before+1 || !serverTimestamp {
+			t.Fatalf("legal lifecycle result=%s/version %d/server timestamp %t, want ACTIVE/version %d/server timestamp true",
+				lifecycle, after, serverTimestamp, before+1)
 		}
+	})
+
+	t.Run("asset update requires the next version", func(t *testing.T) {
+		expectRuntimeContractError(t, harness.db, "55000", "assets_version_guard", `
+			UPDATE assets SET display_name=display_name WHERE id=$1
+		`, fixture.assetID)
 	})
 
 	t.Run("existing environment cannot reparent asset identity", func(t *testing.T) {
@@ -198,7 +207,7 @@ func TestAssetCatalogScopeShapeAcceptanceRejectsObservationDrift(t *testing.T) {
 	harness.applyThroughAssetCatalog(t)
 	external := seedClosureAuthoritativeCompleteCatalog(t, harness.db)
 	seedScopeShapeSecondaryScope(t, harness.db)
-	seedScopeShapeExternalRevisionTwo(t, harness.db, external)
+	revisionTwo := seedScopeShapeExternalRevisionTwo(t, harness.db, external)
 	liveRun := startClosureExternalDiscoveryRun(t, harness.db, external)
 
 	t.Run("observation provider exists but belongs to another source", func(t *testing.T) {
@@ -214,8 +223,8 @@ func TestAssetCatalogScopeShapeAcceptanceRejectsObservationDrift(t *testing.T) {
 		candidate := newScopeShapeObservation(external, liveRun,
 			"91400000-0000-4000-8000-000000000002", "scope-revision-drift")
 		candidate.sourceRevision = scopeShapeExternalRevisionTwo
-		candidate.revisionDigest = scopeShapeRevisionDigest("c")
-		candidate.sourceDefinitionDigest = scopeShapeRevisionDigest("b")
+		candidate.revisionDigest = revisionTwo.revisionDigest
+		candidate.sourceDefinitionDigest = revisionTwo.sourceDefinitionDigest
 		candidate.provenanceRevision = scopeShapeExternalRevisionTwo
 		expectScopeShapeObservationError(t, harness.db, candidate, "23503",
 			"asset_observations_run_revision_fk")
@@ -371,6 +380,11 @@ func TestAssetCatalogScopeShapeAcceptanceRejectsStoredShapeViolations(t *testing
 	harness.applyThroughAssetCatalog(t)
 	primary := seedDraftAssetCatalog(t, harness.db)
 	seedScopeShapeSecondaryScope(t, harness.db)
+	secondaryProfile := []byte(strings.ReplaceAll(
+		closureExternalProfileManifestV1,
+		"EXTERNAL_V1",
+		"SECONDARY_V1",
+	))
 
 	for _, test := range []struct {
 		name     string
@@ -391,6 +405,7 @@ func TestAssetCatalogScopeShapeAcceptanceRejectsStoredShapeViolations(t *testing
 				"asset_source_revisions_schema_ck", `
 				INSERT INTO asset_source_revisions (
 					id,tenant_id,workspace_id,source_id,revision,
+					canonical_profile_manifest,profile_manifest_sha256,
 					canonical_provider_schema,canonical_provider_schema_sha256,
 					integration_id,sync_mode,authority_scope_digest,
 					source_definition_digest,canonical_revision_digest,
@@ -399,12 +414,13 @@ func TestAssetCatalogScopeShapeAcceptanceRejectsStoredShapeViolations(t *testing
 					backpressure_max_seconds,profile_code,created_by,
 					change_reason_code,expected_source_version
 				) SELECT '91500000-0000-4000-8000-000000000001',$1,$2,$3,2,$4,
-					encode(sha256($4),'hex'),$5,'ON_DEMAND',repeat('1',64),
+					encode(sha256($4),'hex'),$5,encode(sha256($5),'hex'),$6,
+					'ON_DEMAND',repeat('1',64),
 					repeat('2',64),repeat('3',64),'opaque-credential',100,60,1,60,
 					'SECONDARY_V1','scope-test','SHAPE_CHECK',source.version
 				FROM asset_sources AS source WHERE source.id=$3
 			`, scopeShapeSecondaryTenantID, scopeShapeSecondaryWorkspaceID,
-				scopeShapeSecondarySourceID, test.document,
+				scopeShapeSecondarySourceID, secondaryProfile, test.document,
 				scopeShapeSecondaryIntegrationID)
 		})
 	}
@@ -726,6 +742,22 @@ const scopeShapeRelationshipInsertSQL = `
 	)
 `
 
+func seedScopeShapeSecondaryEnvironment(t *testing.T, database *pgxpool.Pool) {
+	t.Helper()
+	execAssetSQL(t, database, `
+		INSERT INTO tenants (id,name) VALUES ($1,'scope-secondary-tenant')
+	`, scopeShapeSecondaryTenantID)
+	execAssetSQL(t, database, `
+		INSERT INTO workspaces (id,tenant_id,name)
+		VALUES ($1,$2,'scope-secondary-workspace')
+	`, scopeShapeSecondaryWorkspaceID, scopeShapeSecondaryTenantID)
+	execAssetSQL(t, database, `
+		INSERT INTO environments (id,tenant_id,workspace_id,name,kind)
+		VALUES ($1,$2,$3,'scope-secondary-production','PROD')
+	`, scopeShapeSecondaryEnvironmentID, scopeShapeSecondaryTenantID,
+		scopeShapeSecondaryWorkspaceID)
+}
+
 func seedScopeShapeSecondaryScope(t *testing.T, database *pgxpool.Pool) {
 	t.Helper()
 	execAssetSQL(t, database, `
@@ -762,78 +794,36 @@ func seedScopeShapeSecondaryScope(t *testing.T, database *pgxpool.Pool) {
 		)
 	`, scopeShapeSecondaryTenantID, scopeShapeSecondaryWorkspaceID,
 		scopeShapeSecondaryServiceID, scopeShapeSecondaryEnvironmentID)
-	execAssetSQL(t, database, `
-		INSERT INTO asset_sources (
-			id,tenant_id,workspace_id,source_kind,provider_kind,name,
-			create_idempotency_key,create_request_hash
-		) VALUES (
-			$1,$2,$3,'EXTERNAL_CMDB','SECONDARY_V1','scope secondary source',
-			'scope-secondary-source',repeat('5',64)
-		)
-	`, scopeShapeSecondarySourceID, scopeShapeSecondaryTenantID,
-		scopeShapeSecondaryWorkspaceID)
-	schema := []byte(`{"type":"object"}`)
-	execAssetSQL(t, database, `
-		INSERT INTO asset_source_revisions (
-			id,tenant_id,workspace_id,source_id,revision,
-			canonical_provider_schema,canonical_provider_schema_sha256,
-			integration_id,sync_mode,authority_scope_digest,source_definition_digest,
-			canonical_revision_digest,credential_reference_id,rate_limit_requests,
-			rate_limit_window_seconds,backpressure_base_seconds,
-			backpressure_max_seconds,profile_code,created_by,change_reason_code,
-			expected_source_version
-		) SELECT $1,$2,$3,$4,1,$5,encode(sha256($5),'hex'),$6,'ON_DEMAND',
-			repeat('6',64),repeat('7',64),repeat('8',64),'opaque-credential',
-			100,60,1,60,'SECONDARY_V1','scope-test','INITIAL_CREATE',source.version
-		FROM asset_sources AS source WHERE source.id=$4
-	`, scopeShapeSecondaryRevisionID, scopeShapeSecondaryTenantID,
-		scopeShapeSecondaryWorkspaceID, scopeShapeSecondarySourceID, schema,
-		scopeShapeSecondaryIntegrationID)
+	seedClosureExternalDraftDefinition(t, database, assetCatalogFixture{
+		tenantID:      scopeShapeSecondaryTenantID,
+		workspaceID:   scopeShapeSecondaryWorkspaceID,
+		environmentID: scopeShapeSecondaryEnvironmentID,
+		integrationID: scopeShapeSecondaryIntegrationID,
+	}, scopeShapeSecondarySourceID, scopeShapeSecondaryRevisionID, "SECONDARY_V1",
+		"scope secondary source", "scope-secondary-source")
 }
 
 func seedScopeShapeExternalRevisionTwo(
 	t *testing.T,
 	database *pgxpool.Pool,
 	fixture assetCatalogFixture,
-) {
+) assetCatalogFixture {
 	t.Helper()
-	schema := []byte(`{"type":"object","revision":2}`)
-	execAssetSQL(t, database, `
-		INSERT INTO asset_source_revisions (
-			id,tenant_id,workspace_id,source_id,revision,
-			canonical_provider_schema,canonical_provider_schema_sha256,
-			integration_id,sync_mode,authority_scope_digest,source_definition_digest,
-			canonical_revision_digest,credential_reference_id,rate_limit_requests,
-			rate_limit_window_seconds,backpressure_base_seconds,
-			backpressure_max_seconds,profile_code,created_by,change_reason_code,
-			expected_source_version
-		) SELECT $1,$2,$3,$4,$5,$6,encode(sha256($6),'hex'),$7,'ON_DEMAND',
-			repeat('a',64),repeat('b',64),repeat('c',64),'opaque-credential',
-			100,60,1,60,'EXTERNAL_V1','scope-test','REVISION_TWO',source.version
-		FROM asset_sources AS source WHERE source.id=$4
-	`, scopeShapeExternalRevisionTwoID, fixture.tenantID, fixture.workspaceID,
-		fixture.sourceID, scopeShapeExternalRevisionTwo, schema, fixture.integrationID)
+	return seedClosureExternalSuccessorDefinition(t, database, fixture,
+		scopeShapeExternalRevisionTwoID, scopeShapeExternalRevisionTwo, "EXTERNAL_V1",
+		[]byte(`{"revision":2,"type":"object"}`), "REVISION_TWO")
 }
 
 func seedScopeShapeSecondaryRevisionTwo(t *testing.T, database *pgxpool.Pool) {
 	t.Helper()
-	schema := []byte(`{"type":"object","revision":2}`)
-	execAssetSQL(t, database, `
-		INSERT INTO asset_source_revisions (
-			id,tenant_id,workspace_id,source_id,revision,
-			canonical_provider_schema,canonical_provider_schema_sha256,
-			integration_id,sync_mode,authority_scope_digest,source_definition_digest,
-			canonical_revision_digest,credential_reference_id,rate_limit_requests,
-			rate_limit_window_seconds,backpressure_base_seconds,
-			backpressure_max_seconds,profile_code,created_by,change_reason_code,
-			expected_source_version
-		) SELECT '91000000-0000-4000-8000-00000000000b',$1,$2,$3,2,$4,
-			encode(sha256($4),'hex'),$5,'ON_DEMAND',repeat('9',64),repeat('a',64),
-			repeat('b',64),'opaque-credential',100,60,1,60,'SECONDARY_V1',
-			'scope-test','REVISION_TWO',source.version
-		FROM asset_sources AS source WHERE source.id=$3
-	`, scopeShapeSecondaryTenantID, scopeShapeSecondaryWorkspaceID,
-		scopeShapeSecondarySourceID, schema, scopeShapeSecondaryIntegrationID)
+	seedClosureExternalSuccessorDefinition(t, database, assetCatalogFixture{
+		tenantID:      scopeShapeSecondaryTenantID,
+		workspaceID:   scopeShapeSecondaryWorkspaceID,
+		environmentID: scopeShapeSecondaryEnvironmentID,
+		integrationID: scopeShapeSecondaryIntegrationID,
+		sourceID:      scopeShapeSecondarySourceID,
+	}, "91000000-0000-4000-8000-00000000000b", 2, "SECONDARY_V1",
+		[]byte(`{"revision":2,"type":"object"}`), "REVISION_TWO")
 }
 
 func scopeShapeRevisionDigest(character string) string {

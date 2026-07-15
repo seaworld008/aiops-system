@@ -12,43 +12,26 @@ func TestAssetCatalogMigrationOwnsExactTablesAndGuardsData(t *testing.T) {
 	up := strings.ToLower(readMigration(t, "000015_assets_catalog.up.sql"))
 	down := strings.ToLower(readMigration(t, "000015_assets_catalog.down.sql"))
 	owned := []string{
-		"asset_sources",
-		"asset_source_revisions",
-		"asset_source_runs",
-		"asset_observations",
-		"assets",
-		"asset_type_details",
-		"asset_conflicts",
-		"asset_relationships",
-		"service_asset_bindings",
+		"public.asset_sources",
+		"public.asset_source_revisions",
+		"public.asset_source_revision_authorities",
+		"public.asset_source_runs",
+		"public.asset_observations",
+		"public.assets",
+		"public.asset_type_details",
+		"public.asset_conflicts",
+		"public.asset_relationships",
+		"public.service_asset_bindings",
 	}
-	for _, table := range owned {
-		if !strings.Contains(up, "create table "+table) {
-			t.Errorf("up does not create %s", table)
-		}
-		if !strings.Contains(down, "drop table "+table) {
-			t.Errorf("down does not drop %s", table)
-		}
-	}
-	for _, forbidden := range []string{
-		"connection_profiles",
-		"published_targets",
-		"asset_snapshots",
-		"investigation_grants",
-		"runner_realms",
-		"credential_references",
-	} {
-		if strings.Contains(up, "create table "+forbidden) {
-			t.Errorf("000015 illegally owns %s", forbidden)
-		}
-	}
+	assertExactSQLObjectSet(t, "000015 created table ownership", createdTableIdentities(up), owned)
+	assertExactSQLObjectSet(t, "000015 dropped table ownership", droppedTableIdentities(down), owned)
 	for _, required := range []string{
 		"unique (tenant_id, workspace_id, source_id, provider_kind, external_id)",
 		"unique (tenant_id, workspace_id, environment_id, id)",
-		"before update on asset_observations",
-		"before update on asset_type_details",
-		"before delete on asset_sources",
-		"before truncate on asset_sources",
+		"before update on public.asset_observations",
+		"before update on public.asset_type_details",
+		"before delete on public.asset_sources",
+		"before truncate on public.asset_sources",
 		"constraint assets_kind_check",
 		"retired asset is terminal",
 		"unsafe asset catalog rollback: catalog state remains",
@@ -131,7 +114,7 @@ func TestAssetCatalogMigrationPinsTrustedPublicSearchPathBeforeObjectResolution(
 		t.Run(name, func(t *testing.T) {
 			migration := strings.ToLower(readMigration(t, name))
 			searchPath := strings.Index(migration,
-				"set local search_path = public, pg_catalog, pg_temp;")
+				"set local search_path = pg_catalog, public, pg_temp;")
 			firstObjectResolution := strings.Index(migration, "lock table")
 			if searchPath < 0 || firstObjectResolution < 0 || searchPath > firstObjectResolution {
 				t.Fatal("migration must pin the trusted public search_path before resolving catalog objects")
@@ -151,9 +134,31 @@ func TestAssetCatalogMigrationUsesWrapSafeSameTransactionXIDComparison(t *testin
 		t.Fatal("same-transaction closure must not reinterpret wrapped 32-bit xmin as epoch-zero xid8")
 	}
 	const wrapSafeComparison = ".xmin = pg_catalog.pg_current_xact_id()::xid"
-	if count := strings.Count(up, wrapSafeComparison); count != 16 {
-		t.Fatalf("wrap-safe same-transaction comparisons = %d, want 16", count)
+	if count := strings.Count(up, wrapSafeComparison); count != 18 {
+		t.Fatalf("wrap-safe same-transaction comparisons = %d, want 18", count)
 	}
+}
+
+func TestAssetCatalogMigrationLocksEveryPrerequisiteBeforePreflight(t *testing.T) {
+	raw := readMigration(t, "000015_assets_catalog.up.sql")
+	locks := correctiveDownLockStatements(raw)
+	if got, want := len(locks), 1; got != want {
+		t.Fatalf("up prerequisite lock statements = %d, want %d", got, want)
+	}
+	wantLock := "lock table public.tenants, public.workspaces, public.environments, public.integrations, public.services, public.service_bindings, public.audit_records, public.outbox_events in access exclusive mode nowait;"
+	if locks[0] != wantLock {
+		t.Fatalf("up prerequisite lock = %q, want %q", locks[0], wantLock)
+	}
+
+	up := correctiveNormalizeSQL(raw)
+	correctiveAssertOrdered(t, "up bootstrap", up, []string{
+		"begin;",
+		"set local lock_timeout = '5s';",
+		"set local search_path = pg_catalog, public, pg_temp;",
+		"set local role aiops_schema_owner;",
+		wantLock,
+		"do $$ declare missing_role text;",
+	})
 }
 
 func readMigration(t *testing.T, name string) string {
