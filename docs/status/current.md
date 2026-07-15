@@ -1,8 +1,8 @@
 # 当前项目状态
 
-> 更新时间：2026-07-15
+> 更新时间：2026-07-16
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前集成基线：本文件所在的最新 `origin/main` 提交；最近完成 Batch：`M1A-asset-governance-repository`（PR #38）；当前并行 Batch：`M1B-asset-source-read-projection`（Pack 02 只读子切片）与 `M1C-discovery-data-plane-contract`（Pack 02/05 纯合同基础）
+> 当前集成基线：本文件所在的最新 `origin/main` 提交；最近完成 Batch：`M1B-asset-source-read-projection`（PR #41）与 `M1C-discovery-data-plane-contract`（PR #42）；当前 Batch：`M1D-checkpoint-codec-foundation`（Pack 09 Checkpoint Codec 基础）
 
 ## 当前结论
 
@@ -20,9 +20,11 @@ M0 同批完成 Task 2 的固定 Tenant 身份、Asset domain、validation/lifec
 
 M1A 已通过 PR #38 squash merge 到 `origin/main@f8aec40`：Pack 02 Task 3 的复合 Scope PostgreSQL Repository、MANUAL 原子治理写、receipt-first 幂等 replay、安全读模型以及 Observation/Type Detail/Audit/Outbox/Run 同事务闭包已成为关闭态代码。最终复核发现的一个 P1（冲突重放可借改写 SourceID 形成资格探针）已修复；修复后真实 PostgreSQL 18.4 受影响包、定向 race、G1/G2 重新全绿，同一 reviewer 最终 `APPROVE`。全仓 race、完整恢复、真实 Provider、HA、安全和浏览器/发布资格仍为 deferred G3/G4。
 
-Pack 02 Task 4 与 Pack 09 Task 27 的 checkpoint/事务所有权冲突仍约束写路径：旧 `Batch` 只有 cursor hash，却要求同事务持久化非 MANUAL checkpoint 密文/key ID/AAD，不能执行。进一步依赖审计确认，把 Task 4 与 Task 27 的 21+ 文件硬合成一个 Batch还会形成 `discoverysource` 合同、queue/fence/codec 与 PageCommitter 的循环依赖并违反快速计划的 L/XL 拆分门。当前并行执行互不重叠的 M1B Source 只读投影和 M1C 纯数据面合同；M1C 同时拥有 `assetdiscovery` 的 normalized fact 类型与引用它们的 `discoverysource` closed outcome，从根上解除 Task 13 反向依赖完整 Task 4 的循环。PageCommitter 写路径继续 `NOT_STARTED`，只有在 M1C 和 queue/checkpoint 基础分别合并后，才按精确 manifest 实施。最终 PageCommitter 仍是唯一 serializable page transaction owner；任何只凭 hash 推进 checkpoint、MANUAL-only 假绿、caller-owned page digest 或嵌套事务实现均被禁止。
+M1B 已通过 PR #41 squash merge 到 `origin/main@f9720ff`：现有 `assetcatalog.SourceReadRepository` 的 PostgreSQL 实现现在提供复合 Source Scope、完整 authority-set subset、restricted-empty、MANUAL 单 Environment usage、安全列投影、`source.id ASC` keyset/QueryDigest 和 exact current/published/last-success 指针。真实 PostgreSQL 18.4 受影响包、fresh G1/G2、代码地图和独立 P0/P1 复核均通过；Source mutation、Provider 和运行能力仍未开放。
 
-M1C 的 pre-RED 合同审计正确阻止了四处未定值/不可实现文字进入代码：opaque checkpoint 与 Pack 06 直接读取 raw cursor、五个 Provider 公共值缺少固定 ABI、Go 真 alias 无法与原 concrete type 区分、provenance ownership 重复为自由字符串；同批还纠正了 Provider proof 在 Broker cleanup 前声称 cleanup 成功的时序矛盾。当前合同修订固定 process-local typed callback access、raw material 全序列化/日志拒绝、安全 checkpoint equality/digest、closed Validation proof/error 语义和已合并 `assetcatalog.FieldOwnership` 复用；M1C 只能在该修订合并后从新 `origin/main` 恢复真实 RED。其余 PageCommitter/Queue/Worker/Provider 能力仍未开始。
+M1C 已通过 PR #42 squash merge 到 `origin/main@ceca330`：`assetdiscovery` normalized facts/relations/freshness/provenance 与 `discoverysource` typed Runtime/opaque Checkpoint/Validation/closed `Page|Delay` 合同已成为稳定关闭态 `Produces`。pre-RED 审计修复了四处未定 ABI；最终复核又发现并关闭 Provider proof 可冒领 Broker cleanup/Gate availability code namespace 的 P1，修复后真实负例、两个受影响包、定向 race、fresh G1/G2 和同一 reviewer 复核全部通过。
+
+Pack 02 Task 4 与 Pack 09 Task 27 的 checkpoint/事务所有权冲突仍约束写路径：旧 `Batch` 只有 cursor hash，却要求同事务持久化非 MANUAL checkpoint 密文/key ID/AAD，不能执行。M1B/M1C 已解除只读与 Provider 数据面合同依赖；当前 M1D 只实现 Checkpoint Codec，不预先发明尚无消费者的 Queue ABI。现有 `assetcatalog.LeaseFence` 已是 `internal/leasefence.Fence` 的密封别名，不重复修改。PageCommitter、Queue 公共 ABI/PostgreSQL lifecycle、cleanup 和 limiter 继续 `NOT_STARTED`；最终 PageCommitter 仍是唯一 serializable page transaction owner，任何只凭 hash 推进 checkpoint、MANUAL-only 假绿、caller-owned page digest 或嵌套事务实现均被禁止。
 
 ## 当前实施进度
 
@@ -87,7 +89,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
 | 现有调查/执行内核 | 基线存在 | 以现有测试、迁移和 V3 文档为准 |
-| 新资产目录与发现 | BUILT_CLOSED（M0/M1A）/ UNAVAILABLE | Task 1 数据库底座、Task 2 领域/接口/LeaseFence 及 Task 3 PostgreSQL Repository/MANUAL 治理闭包已合并；Source read、discovery page commit、Source mutation、API、前端与真实 Provider 门仍未完成 |
+| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C）/ UNAVAILABLE | 数据库底座、领域/接口/LeaseFence、治理 Repository/MANUAL、Source read 和 discovery data-plane 合同已合并；Queue/checkpoint、page commit、Source mutation、API、前端与真实 Provider 门仍未完成 |
 | Connection 修订/验证/发布 | NOT_STARTED | 等待 Phase 2 |
 | VictoriaMetrics/Logs/Traces 全家桶 | NOT_STARTED | 等待 Phase 3 |
 | 事件/定时主动只读调查 | NOT_STARTED | 等待 Phase 4 |
@@ -107,10 +109,10 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 
 ## 下一步
 
-当前从同一最新 `origin/main` 并行执行两个无文件交集的 Medium/Small Batch。`M1B-asset-source-read-projection` 只实现 M0 已冻结的 `assetcatalog.SourceReadRepository`，文件所有权精确为 `internal/assetcatalog/postgres/source_reads.go`、`source_reads_test.go`、`source_reads_integration_test.go`。它提供复合 Source Scope、完整 authority-set 授权、安全字段投影、稳定 keyset cursor 和 exact current/published/last-success 读取；不得修改领域接口、migration、Source mutation、normalized fact 合同、PageCommitter、queue/checkpoint、OpenAPI/Web 或 Provider 网络能力。
+当前从最新 `origin/main` 串行执行 C0 Batch `M1D-checkpoint-codec-foundation`，精确文件只有 `internal/discoverycheckpoint/codec.go`、`codec_test.go`。它消费 M1C `discoverysource.Checkpoint` 与已冻结的 Source/Revision 安全元数据，只产出 typed `CheckpointAAD`、AES-256-GCM `CheckpointCodec`、DB-only sealed envelope 与独立 HKDF/HMAC replay identity。
 
-`M1C-discovery-data-plane-contract` 只创建 `internal/assetdiscovery/contracts.go`、`contracts_test.go`、`internal/discoverysource/contracts.go`、`contracts_test.go`：前两文件拥有纯 normalized item/relation/freshness/provenance 类型，后两文件拥有 closed Provider `Page|Delay`、concrete checkpoint/request/limit 与 XOR 验证合同。它不创建 Reconciler、SQL、Queue、Worker、Credential/Runtime 实现或网络 Provider，也不修改 M1B 文件。M1B/M1C 只消费已合并接口，彼此不得读取未提交内部实现。
+M1D 不创建或修改 `internal/discoveryqueue`，也不实现 PostgreSQL、Claim/Reclaim、cleanup Broker、limiter、PageCommitter、Worker、Source mutation、Provider 网络或生产 key file loader；不修改 migration、OpenAPI、status、任务包或任何已合并合同。它必须保留九字段 AAD golden/tamper/key-rotation、checkpoint/profile/Scope/version 绑定、raw key/checkpoint 全序列化与日志拒绝、AEAD/replay 子密钥分离及 65,507-byte 边界的真实 C0 负例。通过受影响测试、定向 race、G1/G2 和一次最终 P0/P1 复核后才可合并。
 
-M1B 为 C1，Scope/authority/access/cursor/Secret 排除属于不可延后的 C0 行为；M1C 为 C0 公共合同，必须有 closed outcome/XOR、checkpoint 非序列化安全形状、unknown/oversize/credential-shaped fact 的定向行为测试。两批各自执行受影响测试、G1/G2 和一次最终 P0/P1 复核并独立 PR；任一先完成均可先合并，另一批合并前必须从新 `origin/main` 复验无漂移。两者合并后才进入 queue/fence/checkpoint 基础，之后才创建唯一 PageCommitter 写事务 Batch；完整 queue lifecycle/cleanup/backpressure 可在稳定接口后独立收口。所有这些关闭态代码合并最多记为 `BUILT_CLOSED`，运行能力继续 `UNAVAILABLE`。
+M1D 合并后先持久化唯一 PageCommitter mutation manifest，再执行 package-private PostgreSQL projection helper + `PageCommitter` 原子页提交；Queue 公共 ABI 与 PostgreSQL lifecycle/cleanup/limiter 在真实消费者稳定后一起定值并分片收口。所有这些关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`。
 
 任何阶段出现 Scope/身份/计划/Runtime/策略/Kill Switch/credential 漂移、依赖不可用、Secret 风险或结果不确定时，保持在最后已验收状态并停止升级，不得用人工口头确认替代持久证据。
