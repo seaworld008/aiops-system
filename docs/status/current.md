@@ -2,7 +2,7 @@
 
 > 更新时间：2026-07-15
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前事实基线：`origin/main@d933638`；最近完成 Batch：`M0-asset-domain-contract`（PR #34）；下一 Batch：`M1A-asset-repository-reconciliation`（待从最新 `origin/main` 启动）
+> 当前集成基线：`origin/main@017dd1d`；最近完成 Batch：`M0-asset-domain-contract`（PR #34）；当前 Batch：`M1A-asset-governance-repository`（Pack 02 Task 3）
 
 ## 当前结论
 
@@ -17,6 +17,8 @@
 Phase 1 Task 1 的 `000015_assets_catalog` PostgreSQL 安全底座及 `M0-asset-domain-contract` 已通过 PR #34 squash merge 到 `origin/main@d933638`。M0 定向关闭了环境映射 P0 parity：数据库、Go 与 CSV/API 契约现在只接受 `SINGLE_ENVIRONMENT / EXPLICIT_ITEM_ENVIRONMENT`，明确拒绝旧 `MULTI_ENVIRONMENT`；原 corrective 的角色、ACL、不可变闭包、恢复和 admission 证据继续有效。
 
 M0 同批完成 Task 2 的固定 Tenant 身份、Asset domain、validation/lifecycle、稳定 Repository 接口、MANUAL Profile/BindingDigest parity 和进程内 lease/fence 最小正确实现。过度测试约束已删除或改为真实行为契约；最终 reviewer 对 8 个已发现 P1 的修复全部判定 PASS，新增 P0/P1 为 0。受影响 Go/race、PostgreSQL enum up/down/up、Binding parity、schema/role admission、G1 与 G2 均通过；全仓 race、全部 Provider E2E、双实例恢复和重型里程碑门按计划记为 deferred G3/G4，不得解释为已通过。
+
+M1A 入口审计发现 Pack 02 Task 4 与 Pack 09 Task 27 的 checkpoint/事务所有权冲突：旧 Task 4 `Batch` 只有 cursor hash，却要求同事务持久化非 MANUAL checkpoint 密文/key ID/AAD；仅凭 hash 无法生成或验证这些事实。当前执行已拆分为不依赖该缺口的 Task 3，Task 4 保持 `NOT_STARTED`，并与 Task 27 合并为后继 `M1B-discovery-page-commit`。M1B 由 `PageCommitter` 唯一拥有 serializable transaction、checkpoint sealing/验证、projection、receipt 和 checkpoint CAS；任何只凭 hash 推进 checkpoint、MANUAL-only 假绿或嵌套事务实现都被禁止。
 
 ## 当前实施进度
 
@@ -101,8 +103,8 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 
 ## 下一步
 
-下一步从 `origin/main@d933638` 启动 `M1A-asset-repository-reconciliation`，聚合 Phase 1 Pack 02 的 Task 3–4：实现复合 Scope PostgreSQL Repository、原子治理写、append-only Observation/Type Detail、确定性 reconciliation、失联/恢复和只读 Source 投影。该 Batch 只消费 M0 已合并的稳定 `Produces`，不得提前进入 Source mutation、API/OpenAPI、Web 或 Provider 网络能力。
+当前从 `origin/main@017dd1d` 执行 `M1A-asset-governance-repository`，只完成 Phase 1 Pack 02 Task 3：实现复合 Scope PostgreSQL Repository、MANUAL 原子治理写、幂等 replay、Audit/Outbox 同事务闭包和安全读模型。该 Batch 只消费 M0 已合并的稳定 `Produces`，不得进入 Task 4 discovery、Source mutation、API/OpenAPI、Web 或 Provider 网络能力。
 
-M1A 合并门固定为真实关键行为、受影响包、并发敏感路径定向 race、受影响 PostgreSQL 事务/回滚、G1 与一次 G2；全仓 race、全量恢复、真实 Provider、HA、安全、完整浏览器和发布演练继续归入 G3/G4。合并状态最多记为 `BUILT_CLOSED`，运行能力继续 `UNAVAILABLE`。
+M1A 合并门固定为真实关键行为、受影响包、并发敏感路径定向 race、受影响 PostgreSQL 事务/回滚、G1 与一次 G2；Task 4/M1B 必须等唯一 PageCommitter 契约合并后再实现。全仓 race、全量恢复、真实 Provider、HA、安全、完整浏览器和发布演练继续归入 G3/G4。合并状态最多记为 `BUILT_CLOSED`，运行能力继续 `UNAVAILABLE`。
 
 任何阶段出现 Scope/身份/计划/Runtime/策略/Kill Switch/credential 漂移、依赖不可用、Secret 风险或结果不确定时，保持在最后已验收状态并停止升级，不得用人工口头确认替代持久证据。
