@@ -18,7 +18,7 @@
 10. [10-overview-control-room.md](./10-overview-control-room.md) — 闭合 `/overview` 安全聚合 API/UI，分维显示 Assets/Sources/Connections/Investigations/Actions/Releases，未实现项显式 `NOT_STARTED/UNAVAILABLE`。
 11. [11-e2e-docs.md](./11-e2e-docs.md) — 完成指标、真实 Keycloak/PostgreSQL/Playwright、视觉/axe/安全、CI、备份恢复、HA、持久文档和 Phase 1 签名验收。
 
-快速构建桥接任务包 [12-m1e0-relation-page-corrective.md](./12-m1e0-relation-page-corrective.md) 已由 PR #46 关闭 fixed canonical empty relation digest 与 `000015` trigger 的 C0 冲突；当前执行 [13-m1e-page-commit-transaction.md](./13-m1e-page-commit-transaction.md)，实现 Pack 02/09 共用的五文件 PageCommitter 原子 mutation。两者都不改变上述最终验收顺序，完成后仍保持运行能力关闭。
+快速构建桥接任务包 [12-m1e0-relation-page-corrective.md](./12-m1e0-relation-page-corrective.md) 已由 PR #46 关闭 fixed canonical empty relation digest 与 `000015` trigger 的 C0 冲突。M1E contract RED 又发现 M1C normalized fact ABI 的 DisplayName 上限和跨 Environment 关系策略引用与既有 Asset/SQL 契约不闭合；当前先执行原 M1C 四文件 [14-m1c1-normalized-fact-contract-corrective.md](./14-m1c1-normalized-fact-contract-corrective.md)，合并后再从 fresh 窗口恢复 [13-m1e-page-commit-transaction.md](./13-m1e-page-commit-transaction.md)。这些桥接包都不改变上述最终验收顺序，完成后仍保持运行能力关闭。
 
 存在前置依赖的代码只能消费已合并的稳定 `Produces` 接口。快速构建可按覆盖计划聚合 2–4 个相关旧 Task，并在接口冻结后并行 Provider/Web 轨道；任务包顺序继续约束 Phase 1 最终验收，不再强制每个 checkbox 独立 Red/Green/commit。C0 契约保留定向 RED，所有延后的真库、HA、恢复、安全、真实 Provider 与 E2E 证据必须在 G3/G4 补齐，补齐前能力保持 `UNAVAILABLE`。
 
