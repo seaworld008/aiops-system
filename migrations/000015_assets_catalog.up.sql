@@ -2754,7 +2754,7 @@ BEGIN
        profile_document->>'freshness_kind' NOT IN (
             'CATALOG_SEQUENCE', 'OBJECT_SEQUENCE', 'OBJECT_TIME_SEQUENCE', 'CHECKPOINT_SEQUENCE'
        ) OR
-       profile_document->>'environment_mapping_mode' NOT IN ('SINGLE_ENVIRONMENT', 'MULTI_ENVIRONMENT') OR
+       profile_document->>'environment_mapping_mode' NOT IN ('SINGLE_ENVIRONMENT', 'EXPLICIT_ITEM_ENVIRONMENT') OR
        profile_document->>'integration_mode' NOT IN ('NONE', 'REQUIRED') OR
        profile_document->>'trust_mode' NOT IN ('NONE', 'REQUIRED') OR
        profile_document->>'network_mode' NOT IN ('NONE', 'REQUIRED') OR

@@ -947,6 +947,37 @@ func assetCatalogCorrectiveDecodeDigest(t *testing.T, encoded string) []byte {
 	return decoded
 }
 
+func TestAssetCatalogMigrationEnvironmentMappingModeParity(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyUpThrough(t, "000014_read_evidence_clock_skew.up.sql")
+	admission := assetpostgres.NewSchemaAdmission(harness.application, "public")
+
+	harness.applyMigration(t, "000015_assets_catalog.up.sql")
+	if err := admission.Check(context.Background()); err != nil {
+		t.Fatalf("schema admission after first 000015 up: %v", err)
+	}
+	harness.applyMigration(t, "000015_assets_catalog.down.sql")
+	harness.applyMigration(t, "000015_assets_catalog.up.sql")
+	if err := admission.Check(context.Background()); err != nil {
+		t.Fatalf("schema admission after 000015 up/down/up: %v", err)
+	}
+
+	t.Run("explicit item accepts two authorities", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 2)
+		candidate.environmentMappingMode = "EXPLICIT_ITEM_ENVIRONMENT"
+		candidate.refreshProfileManifest()
+		requireCorrectiveMatrixCandidateCommit(t, harness.db, candidate)
+	})
+
+	t.Run("legacy multi fails closed", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 2)
+		candidate.environmentMappingMode = "MULTI_ENVIRONMENT"
+		candidate.refreshProfileManifest()
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
+			"23514", "asset_source_revisions_profile_manifest_guard")
+	})
+}
+
 func TestAssetCatalogMigrationCorrectivePersistentContractMatrix(t *testing.T) {
 	harness := newAssetCatalogHarness(t)
 	harness.applyThroughAssetCatalog(t)
@@ -972,7 +1003,7 @@ func TestAssetCatalogMigrationCorrectivePersistentContractMatrix(t *testing.T) {
 	t.Run("authority absent", func(t *testing.T) {
 		candidate := newCorrectiveMatrixCandidate(t, 1)
 		candidate.authorities = nil
-		candidate.environmentMappingMode = "MULTI_ENVIRONMENT"
+		candidate.environmentMappingMode = "EXPLICIT_ITEM_ENVIRONMENT"
 		candidate.refreshProfileManifest()
 		expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
 			"23514", "asset_source_revision_authorities_order_guard")
@@ -1005,7 +1036,7 @@ func TestAssetCatalogMigrationCorrectivePersistentContractMatrix(t *testing.T) {
 			environmentID: candidate.environmentIDs[0],
 			ordinal:       2,
 		})
-		candidate.environmentMappingMode = "MULTI_ENVIRONMENT"
+		candidate.environmentMappingMode = "EXPLICIT_ITEM_ENVIRONMENT"
 		candidate.refreshProfileManifest()
 		expectCorrectiveMatrixCandidateError(t, harness.db, candidate, "23505", authorityEnvironmentPK)
 	})
@@ -1043,7 +1074,7 @@ func TestAssetCatalogMigrationCorrectivePersistentContractMatrix(t *testing.T) {
 	t.Run("authority late append", func(t *testing.T) {
 		candidate := newCorrectiveMatrixCandidate(t, 2)
 		candidate.authorities = candidate.authorities[:1]
-		candidate.environmentMappingMode = "MULTI_ENVIRONMENT"
+		candidate.environmentMappingMode = "EXPLICIT_ITEM_ENVIRONMENT"
 		candidate.refreshProfileManifest()
 		requireCorrectiveMatrixCandidateCommit(t, harness.db, candidate)
 
@@ -1416,7 +1447,7 @@ func newCorrectiveMatrixCandidate(t *testing.T, environmentCount int) corrective
 	if environmentCount == 1 {
 		candidate.environmentMappingMode = "SINGLE_ENVIRONMENT"
 	} else {
-		candidate.environmentMappingMode = "MULTI_ENVIRONMENT"
+		candidate.environmentMappingMode = "EXPLICIT_ITEM_ENVIRONMENT"
 	}
 	candidate.refreshProfileManifest()
 	return candidate

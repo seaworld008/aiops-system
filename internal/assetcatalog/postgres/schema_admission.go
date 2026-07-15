@@ -19,7 +19,7 @@ const AssetCatalogUnavailableCode = "asset_catalog_unavailable"
 
 // Reviewed from migrations 000001-000015 on PostgreSQL 18.4. The manifest
 // deliberately normalizes compatible PostgreSQL 18.x patch versions.
-const assetCatalogSchemaManifestSHA256 = "41457b4355d130b8112b676b6cb242ce068178f3f42902a04024efeb942e59a8"
+const assetCatalogSchemaManifestSHA256 = "33b62ea73326337e9f4933fee34374b505fd5ccbb2f2869f756d3ec55e836a7a"
 
 var ErrAssetCatalogUnavailable = errors.New(AssetCatalogUnavailableCode)
 
