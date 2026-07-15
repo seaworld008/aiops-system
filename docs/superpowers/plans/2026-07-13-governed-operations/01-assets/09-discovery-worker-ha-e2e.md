@@ -15,7 +15,7 @@
 - 生产必须有独立 `cmd/discovery-worker`；不得把 Provider SDK、Credential Resolver 或目标网络客户端装入 Control Plane、通用 `cmd/worker` 或浏览器。
 - 持久 Job/Run 只含 Source/Revision/Gate/Checkpoint digest、Scope、Run ID、预算、fence epoch/owner/token hash；不含 endpoint、Secret、raw Token、PEM、cursor plaintext、Header/Body 或 Provider 错误。完整 sealed `LeaseFence` 只由 Claim 返回到当前 Worker 内存，绝不进入 Job/Task/Batch/audit/log payload。
 - Raw lease token 只存 Worker 内存，DB 仅存 SHA-256；每次 reclaim 必须 `fence_epoch+1` 且旧 fence 无法 heartbeat/reconcile/checkpoint/complete。
-- Checkpoint 使用 AES-256-GCM；唯一 AAD 构造器消费 Pack 01 typed `CheckpointAAD`，并用 `FramedTupleV1("asset-source-checkpoint.v1",Tenant,Workspace,Source,Provider,Source definition revision,canonical revision digest,source definition digest,checkpoint key ID,Checkpoint version)` 的精确九字段顺序。key 只通过 workload secret binding 读取。持久 AAD 不含 gate revision/fence epoch/token，因为 checkpoint 必须跨 reclaim 和后续 Run 恢复且 Claim 不得制造 checkpoint 版本变更；每次 Open、Provider call、Reconcile、checkpoint 提交和 Complete 仍分别要求 exact live owner/token/epoch。Codec 必须有 golden bytes/hash、九字段逐项篡改、NULL/empty 和 key-rotation 测试。
+- Checkpoint 使用 AES-256-GCM；唯一 AAD 构造器与 typed `CheckpointAAD` 由 `internal/discoverycheckpoint` 拥有，并用 `FramedTupleV1("asset-source-checkpoint.v1",Tenant,Workspace,Source,Provider,Source definition revision,canonical revision digest,source definition digest,checkpoint key ID,Checkpoint version)` 的精确九字段顺序。key 只通过 workload secret binding 读取。持久 AAD 不含 gate revision/fence epoch/token，因为 checkpoint 必须跨 reclaim 和后续 Run 恢复且 Claim 不得制造 checkpoint 版本变更；每次 Open、Provider call、Reconcile、checkpoint 提交和 Complete 仍分别要求 exact live owner/token/epoch。Codec 必须有 golden bytes/hash、九字段逐项篡改、NULL/empty 和 key-rotation 测试。
 - 数据库持久每 source/workspace/provider 并发、token bucket、`not_before`、queue depth 和 failure streak；进程内 semaphore 只是二次保护，不是授权事实。
 - Validation Run 可消费 `VALIDATING` revision；Discovery/Import/Ingestion Run 仅可消费 exact `PUBLISHED + ACTIVE + AVAILABLE`。任何漂移停止并关闭影响的 provider/source gate。
 - Validation Run 的 checkpoint 输入固定为空；它不得比较、解密或推进当前 published revision 的 Source checkpoint。Discovery/Import/Ingestion 才消费 exact current checkpoint；checkpoint-lineage-rollover 仅走 Pack 01 的受治理同一 Run 例外。
@@ -25,13 +25,75 @@
 
 ## Fast-build checkpoint/transaction ownership correction (2026-07-15)
 
-The previous proposal to combine all Pack 02 Task 4 and Task 27 files into one `M1B-discovery-page-commit` is superseded because it creates a 21+ file XL Batch and a dependency cycle through the not-yet-merged Task 13 `discoverysource` contract. The safe order is: M1B implements only Pack 02's independent Source-read projection while non-overlapping M1C merges both `assetdiscovery` pure normalized fact types and the closed `discoverysource` data-plane contract；a queue foundation Batch then merges sealed `LeaseFence` and `CheckpointCodec` contracts/implementation；then one exact mutation Batch owns both the package-private PostgreSQL projection helper and `PageCommitter`. Queue lifecycle/cleanup/limiter breadth closes in its own Batch after those interfaces are stable.
+The previous proposal to combine all Pack 02 Task 4 and Task 27 files into one `M1B-discovery-page-commit` is superseded because it creates a 21+ file XL Batch and a dependency cycle. M1B Source read and M1C `assetdiscovery`/`discoverysource` contracts are now merged. The safe remaining order is: M1D implements only the Checkpoint Codec；one later exact mutation Batch owns both the package-private PostgreSQL projection helper and `PageCommitter`；Queue ABI/PostgreSQL lifecycle、cleanup and limiter are frozen only with their first real consumer and then close in ownership-safe slices.
+
+M1D has exactly two files: `internal/discoverycheckpoint/codec.go` and `codec_test.go`. It does not create `internal/discoveryqueue` or consume `LeaseFence`；existing `assetcatalog.LeaseFence` remains the exact alias of sealed `internal/leasefence.Fence` and is consumed unchanged by the later PageCommitter/Queue batches. This avoids freezing speculative Queue commands before their PostgreSQL state machine and cleanup consumers exist.
+
+The complete M1D public ABI is fixed below；fields and method signatures may not be widened in implementation:
+
+~~~go
+var (
+	ErrInvalidInput           = errors.New("checkpoint codec input invalid")
+	ErrUnavailable            = errors.New("checkpoint codec unavailable")
+	ErrAuthentication         = errors.New("checkpoint authentication failed")
+	ErrSensitiveSerialization = errors.New("checkpoint codec sensitive value is not serializable")
+)
+
+const CheckpointEnvelopeVersion byte = 1
+
+type CheckpointAAD struct {
+	TenantID, WorkspaceID, SourceID, ProviderKind string
+	CheckpointRevision                            int64
+	CanonicalRevisionDigest, SourceDefinitionDigest string
+	CheckpointKeyID                               string
+	CheckpointVersion                             int64
+}
+
+type SealedCheckpoint struct {
+	Envelope          []byte
+	CheckpointKeyID   string
+	CheckpointSHA256  string
+	CheckpointVersion int64
+}
+
+func (value SealedCheckpoint) Clone() SealedCheckpoint
+
+type ReplayIdentity struct {
+	CheckpointKeyID string
+	DigestSHA256    string
+}
+
+type InMemoryKeyring struct { /* opaque, sensitive, process-local */ }
+
+func NewInMemoryKeyring(activeKeyID string, retained map[string][32]byte) (*InMemoryKeyring, error)
+func (keys *InMemoryKeyring) ActiveKeyID() (string, error)
+func (keys *InMemoryKeyring) Destroy()
+
+type CheckpointCodec struct { /* opaque, process-local */ }
+
+func NewCheckpointCodec(keys *InMemoryKeyring) (*CheckpointCodec, error)
+func (codec *CheckpointCodec) Seal(ctx context.Context, aad CheckpointAAD, checkpoint discoverysource.Checkpoint) (SealedCheckpoint, error)
+func (codec *CheckpointCodec) Open(ctx context.Context, aad CheckpointAAD, expectedProfile assetcatalog.ProfileCode, sealed SealedCheckpoint) (discoverysource.Checkpoint, error)
+func (codec *CheckpointCodec) ReplayIdentity(ctx context.Context, aad CheckpointAAD, checkpoint discoverysource.Checkpoint) (ReplayIdentity, error)
+~~~
+
+`CheckpointAAD` is process-local and is the only owner of its byte representation. Its exact encoding remains Pack 01 `FramedTupleV1("asset-source-checkpoint.v1",TenantID,WorkspaceID,SourceID,ProviderKind,CheckpointRevision,raw CanonicalRevisionDigest,raw SourceDefinitionDigest,CheckpointKeyID,CheckpointVersion)`；UUID、Provider/code、positive integers and lowercase SHA-256 shapes are validated before crypto, and named digests are decoded to 32 raw bytes. `CheckpointAAD`、`InMemoryKeyring` and `CheckpointCodec` reject JSON/text/binary marshal/unmarshal and redact `String/GoString/LogValue/Format`；no public method returns raw AAD or key bytes.
+
+`NewInMemoryKeyring` accepts only unique valid opaque key IDs and exact 32-byte AES-256 master keys, copies the retained set, requires the active ID to exist, and is the sole M1D test/bootstrap key source；production workload-secret loading remains outside M1D. `Destroy` zeroes all retained masters and makes every copy/Codec return `ErrUnavailable`. `ActiveKeyID` is safe metadata. The constructor input remains caller-owned and must be cleared by its caller after construction.
+
+`Seal` requires `aad.CheckpointKeyID == ActiveKeyID` and obtains the profile/raw bytes only through M1C's bounded Checkpoint access. To preserve the already-frozen `discoverysource.MaxCheckpointCanonicalBytes == 65_507` against the database envelope maximum 65,536, raw canonical checkpoint bytes are the AES-GCM plaintext with no prefix. The 32-byte AEAD key is HKDF-SHA256(master, empty salt, `FramedTupleV1("asset-source-checkpoint-aead-key.v1",profile_code)`), GCM additional data is the exact nine-field `CheckpointAAD` encoding, and the persisted envelope is exactly `0x01 || fresh non-zero 12-byte nonce || ciphertext || 16-byte tag`；therefore its length is exactly `29 + len(raw checkpoint)`. The derived key and temporary raw bytes are always cleared. `SealedCheckpoint` contains only the four columns PageCommitter may persist；its hash is lowercase SHA-256 of the entire envelope, and it never enters Queue/API/audit/log payload.
+
+`Open` requires the sealed key ID/version/hash to equal the exact AAD, selects that retained key, derives the AEAD key from `expectedProfile`, authenticates before returning any bytes, and rebuilds a new profile-bound opaque Checkpoint. Missing retained key、malformed envelope/hash、AAD/profile/version drift and GCM failure all return only `ErrAuthentication`, with zero plaintext and no wrapped detail. `ReplayIdentity` selects `aad.CheckpointKeyID`, derives a separate 32-byte HMAC key with HKDF-SHA256、empty salt and fixed info `asset-source-checkpoint-replay-key.v1`, and computes HMAC-SHA256 over the already-frozen `FramedTupleV1("asset-source-checkpoint-replay.v1",the same nine AAD fields,canonical checkpoint bytes)`；`SourceDefinitionDigest` already binds the exact Profile definition, so Replay does not append a second profile frame. It returns only safe key ID/digest and clears raw/subkey bytes. Master、AEAD and replay keys are never reused as one another.
+
+Only `SealedCheckpoint` may cross the SQL persistence boundary and only `ReplayIdentity` may become a receipt comparison input. `CheckpointAAD`、keyring、Codec、raw checkpoint/AAD/key/subkey bytes are process-local. Context cancellation returns `ctx.Err()` before emitting output；invalid Seal/constructor input returns `ErrInvalidInput`, a destroyed/misconfigured active key path returns `ErrUnavailable`, and all Open/retained-key authentication failures collapse to `ErrAuthentication`. Errors never include IDs、digests、profile、envelope or crypto details.
+
+The later Queue Batch must freeze its full method ABI together with the PostgreSQL state machine rather than in M1D. Persisted/serializable Queue commands and rows never contain a fence；the in-process `ClaimResult` is the sole Queue result allowed to carry the sealed `assetcatalog.LeaseFence`, and that result must itself reject serialization/logging. This distinction preserves Task 27's Claim handoff without creating a durable raw-token carrier.
 
 In the page mutation Batch, `PageCommitter` is the sole owner of the serializable page transaction. It consumes the concrete next `discoverysource.Checkpoint` from Worker memory, seals it outside SQL with exact `CheckpointAAD`, then begins one transaction that locks and revalidates Run/Source/revision/fence/checkpoint-before, calls the package-private PostgreSQL projection helper, derives the cursor-after hash from the sealed ciphertext, computes the page digest server-side, persists projection/ciphertext/key ID/hash/receipt/checkpoint CAS, revalidates the fence and commits once.
 
 The old Pack 02 sketch in which `Batch` supplies `CursorAfterHash/PageDigest` and `Repository.ReconcileBatch` commits independently remains superseded. The later mutation manifest must list the exact projection/PageCommitter files under one owner with no concurrent edits；it must not pull unrelated queue/cleanup/limiter files into that review unit. No raw checkpoint、fence、`pgx.Tx` or SQL handle crosses a public interface；projection cannot commit without checkpoint, checkpoint cannot commit without projection, and neither path may open a nested transaction.
 
-Because AES-GCM sealing is randomized, receipt replay cannot depend only on a newly sealed ciphertext hash. `ApplyPage` first looks up `(Scope,Run,page sequence)` and verifies normalized item/relation/final semantics plus `HMAC-SHA256(replay_mac_key, FramedTupleV1("asset-source-checkpoint-replay.v1", exact typed CheckpointAAD, canonical checkpoint bytes))` using the receipt's persisted opaque key ID. `replay_mac_key` is a distinct 32-byte subkey derived from that retained checkpoint master key by HKDF-SHA256 with empty salt and fixed info `asset-source-checkpoint-replay-key.v1`；the AEAD key is never reused directly for HMAC and the derived subkey is cleared after use. This keyed identity excludes ciphertext randomness without persisting a guessable plaintext cursor digest；a different next checkpoint is an idempotency mismatch, and a missing retained key fails closed. An exact receipt returns the persisted result/checkpoint hash before fence admission or sealing. A fresh page seals once and reuses that exact envelope across bounded serialization retries；after an ambiguous commit it performs receipt lookup before any reseal. The final committed page digest still binds the actual persisted ciphertext hash.
+Because AES-GCM sealing is randomized, receipt replay cannot depend only on a newly sealed ciphertext hash. `ApplyPage` first looks up `(Scope,Run,page sequence)` and verifies normalized item/relation/final semantics plus `HMAC-SHA256(replay_mac_key, FramedTupleV1("asset-source-checkpoint-replay.v1",the same nine typed CheckpointAAD fields,canonical checkpoint bytes))` using the receipt's persisted opaque key ID. `replay_mac_key` is a distinct 32-byte subkey derived from that retained checkpoint master key by HKDF-SHA256 with empty salt and fixed info `asset-source-checkpoint-replay-key.v1`；the AEAD key is never reused directly for HMAC and the derived subkey is cleared after use. This keyed identity excludes ciphertext randomness without persisting a guessable plaintext cursor digest；a different next checkpoint is an idempotency mismatch, and a missing retained key fails closed. An exact receipt returns the persisted result/checkpoint hash before fence admission or sealing. A fresh page seals once and reuses that exact envelope across bounded serialization retries；after an ambiguous commit it performs receipt lookup before any reseal. The final committed page digest still binds the actual persisted ciphertext hash.
 
 This ordering is normative: receipt lookup and semantic/checkpoint replay verification happen before any seal or reseal. Only a confirmed new page may call `Seal`, exactly once；the resulting envelope is reused through bounded serialization retries. An ambiguous commit always returns to receipt lookup before any possible reseal.
 
