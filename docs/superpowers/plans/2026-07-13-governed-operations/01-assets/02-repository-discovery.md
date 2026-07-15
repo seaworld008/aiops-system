@@ -28,6 +28,16 @@
 - 每个任务严格按 Red → Green → Refactor 执行；任务末尾只提交本任务列出的文件。
 - 本包完成后按 [README.md](./README.md) 顺序进入 `03-mapping-auth-api.md`。
 
+## Fast-build scheduling correction (2026-07-15)
+
+`M1A-asset-governance-repository` only owns Task 3. Task 4 remains `NOT_STARTED` and the old `Store.ReconcileBatch`/caller-supplied `CursorAfterHash`/caller-supplied `PageDigest` transaction sketch below is **not executable**: it lacks checkpoint ciphertext、opaque key ID and typed AAD while requiring those facts to commit atomically.
+
+Task 4 is reassigned to `M1B-discovery-page-commit` together with Pack 09 Task 27. In M1B, `PageCommitter` is the sole serializable transaction owner. The Worker keeps the concrete Provider checkpoint only in memory；`CheckpointCodec.Seal` produces ciphertext/key ID/hash with exact typed AAD outside SQL；the transaction then locks and revalidates Run/Source/revision/fence/checkpoint-before, invokes a package-private projection helper, persists projection、sealed checkpoint、server-computed page digest、safe receipt and checkpoint CAS, revalidates the fence, and commits once. `assetdiscovery.Batch` carries only safe Scope/Source/Run/page identity metadata、normalized facts and final flags；it cannot carry raw fence、checkpoint plaintext、caller-owned cursor-after hash or caller-owned page digest. No exported API exposes `pgx.Tx`, and no Repository transaction may nest inside `PageCommitter`.
+
+Response-loss replay is receipt-first by exact Scope/Run/page sequence plus a server-computed semantic page identity over normalized item/relation/final fields **and** the next checkpoint. The checkpoint component is `HMAC-SHA256(replay_mac_key, FramedTupleV1("asset-source-checkpoint-replay.v1", exact typed CheckpointAAD, canonical checkpoint bytes))` using the receipt's persisted opaque checkpoint key ID. `replay_mac_key` is a separate 32-byte subkey derived from that ID's checkpoint master key by HKDF-SHA256 with empty salt and fixed info `asset-source-checkpoint-replay-key.v1`；the AEAD master key is never used directly as an HMAC key, and the derived subkey is cleared after use. Only the keyed digest/key ID is stored in safe receipt details, never an unkeyed plaintext/cursor digest. It excludes randomized checkpoint nonce/ciphertext while still making a different `NextCheckpoint` an idempotency mismatch. An exact existing receipt resolves the retained key, derives the replay subkey, recomputes the HMAC and returns its persisted result/committed checkpoint hash before fence admission or sealing；missing key or changed semantic identity fails closed. A genuinely new page is sealed once and the same sealed envelope is reused across bounded SQL retries. After an ambiguous commit, retry must perform receipt lookup before any reseal. The committed page digest binds the actual ciphertext hash, but it is not the sole replay lookup key.
+
+Until the M1B file/interface manifest is merged, no Task 4 production file may be implemented and no MANUAL-only path may be used to claim discovery reconciliation complete. Task 3 is independent of this checkpoint path and may proceed under its original file boundary and G2 gate.
+
 ---
 
 
