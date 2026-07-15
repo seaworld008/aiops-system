@@ -1,6 +1,6 @@
 # M1E0 — Repeated Empty Relation Page Corrective
 
-> 状态：`READY_FOR_IMPLEMENTATION / RUNTIME_CLOSED`。这是 M1E PageCommitter 的 C0 schema 入口门，只修复已确认规范与 `000015` trigger closure 的一个精确冲突。
+> 状态：`BUILT_CLOSED / RUNTIME_CLOSED`。已由 PR #46 squash merge 到 `origin/main@4ddb644`；这是 M1E PageCommitter 的 C0 schema 入口门，只修复已确认规范与 `000015` trigger closure 的一个精确冲突。
 
 **Goal:** 允许同一 Run 连续提交两个 canonical empty relation pages，同时继续要求 relation sequence、checkpoint、fence、同事务 exact receipt 和 page closure 全部成立。
 
@@ -30,11 +30,11 @@ Pack 01/现有 Go golden 已固定 canonical empty relation-page SHA-256 为 `b8
 
 ## C0/G2 evidence
 
-- [ ] 先在 `migration_corrective_test.go` 写 source-shape RED，证明两处 equality rejection 仍存在。
-- [ ] 再在真实 PostgreSQL integration test 写行为 RED：同一 live fenced Run 连续提交两个 empty relation pages（第二个可为 final complete-snapshot empty closure），当前第二次 commit 必须被旧 trigger 拒绝。
-- [ ] 最小收窄两处 equality predicate，只为 exact canonical-empty golden 增加例外；不改 digest 算法、receipt、sequence 或其他 closure。
-- [ ] GREEN 证明连续空页提交、同 empty digest 不同 sequence/request ID；同时相同非空 digest、changed/missing receipt、NULL/invalid digest、sequence jump、stale fence、wrong checkpoint 与 non-serializable transaction继续拒绝并全回滚。
-- [ ] 在 PostgreSQL 18.4 corrected schema 上用生产 manifest query 复算 reviewed SHA-256，更新唯一常量，并证明旧摘要/任一函数体漂移仍被 SchemaAdmission 拒绝。
-- [ ] 运行受影响 PostgreSQL tests、schema/role admission、up/down/up、G1/G2、`git diff --check` 与一次独立 P0/P1 复核；提交边界恰好四文件。
+- [x] 先在 `migration_corrective_test.go` 写 source-shape RED，证明两处 equality rejection 仍存在。
+- [x] 再在真实 PostgreSQL integration test 写行为 RED：同一 live fenced Run 连续提交两个 empty relation pages（第二个可为 final complete-snapshot empty closure），当前第二次 commit 必须被旧 trigger 拒绝。
+- [x] 最小收窄两处 equality predicate，只为 exact canonical-empty golden 增加例外；不改 digest 算法、receipt、sequence 或其他 closure。
+- [x] GREEN 证明连续空页提交、同 empty digest 不同 sequence/request ID；同时相同非空 digest、changed/missing receipt、NULL/invalid digest、sequence jump、stale fence、wrong checkpoint 与 non-serializable transaction继续拒绝并全回滚。
+- [x] 在 PostgreSQL 18.4 corrected schema 上用生产 manifest query 复算 reviewed SHA-256，更新唯一常量，并证明旧摘要/任一函数体漂移仍被 SchemaAdmission 拒绝。
+- [x] 运行受影响 PostgreSQL tests、schema/role admission、up/down/up、G1/G2、`git diff --check` 与一次独立 P0/P1 复核；提交边界恰好四文件。
 
 完成并 squash merge 后验证远端 `main`，归档本任务，再从最新 `origin/main` 创建独立 M1E 实现窗口。M1E0 只关闭 schema 可实施性缺口，不开放任何 Source/Queue/Worker/Provider 能力。
