@@ -22,6 +22,7 @@ Write `None` only after checking each boundary.
 - [ ] `go test -race -shuffle=on -count=1 ./...`
 - [ ] `go vet ./...`
 - [ ] `go build ./cmd/control-plane ./cmd/worker ./cmd/read-runner ./cmd/write-runner ./cmd/executor`
+- [ ] `scripts/code-map.sh changes all` was reviewed and `scripts/code-map.sh verify` passed.
 - [ ] `git diff --check`
 - [ ] PostgreSQL migration/integration tests were run, or the reason they could not run is documented.
 

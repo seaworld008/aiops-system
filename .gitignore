@@ -28,3 +28,11 @@ web/dist/
 # Runtime data
 .data/
 tmp/
+
+# Derived Agent code map (rebuild with scripts/code-map.sh)
+.gitnexus/
+.gitnexus-operation.lock
+.gitnexus-refresh.lock/
+.gitnexus-refresh.lock.pending.*/
+.aiops-code-map-snapshot.*/
+.code-map-artifact/
