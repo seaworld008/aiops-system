@@ -1,6 +1,6 @@
 # M1E — Atomic Page Commit Transaction
 
-> 状态：`BLOCKED_ON_M1C1 / RUNTIME_CLOSED`。M1E0 已由 PR #46 合并；M1E 首轮 contract RED 暴露 M1C normalized fact ABI 与既有 Asset/SQL 契约不闭合，必须先完成并合并 [M1C1 corrective](./14-m1c1-normalized-fact-contract-corrective.md)。M1C1 合并后，本任务包恢复为 Pack 02 Task 4 与 Pack 09 Task 27 之间唯一的 PageCommitter mutation manifest，fresh 实现 worktree 必须从当时最新 `origin/main` 创建。快速构建顺序与验证时机仍由[快速开发与真实验收计划](../../2026-07-15-fast-development-validation-program.md)统一拥有。
+> 状态：`READY_FOR_IMPLEMENTATION / RUNTIME_CLOSED`。M1E0 已由 PR #46 合并，[M1C1 corrective](./14-m1c1-normalized-fact-contract-corrective.md) 已由 PR #49 合并；本任务包恢复为 Pack 02 Task 4 与 Pack 09 Task 27 之间唯一的 PageCommitter mutation manifest，fresh 实现 worktree 必须从 `origin/main@c427a6b` 或其后继最新提交创建。快速构建顺序与验证时机仍由[快速开发与真实验收计划](../../2026-07-15-fast-development-validation-program.md)统一拥有。
 
 **Goal:** 在不开放 Queue、Worker 或 Provider 的前提下，实现一个真实 PostgreSQL `SERIALIZABLE` transaction owner，把 normalized asset/relation projection 与 encrypted checkpoint、receipt、Run/Source CAS 原子提交。
 
