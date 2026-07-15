@@ -16,6 +16,172 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+func TestAssetCatalogFutureSourceHookPersistentContractMatrix(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	base := seedDraftAssetCatalog(t, harness.db)
+	defaultDefinitionDigest := futureHookDefinitionDigest(t, harness.migration)
+	t.Cleanup(func() {
+		futureHookReplace(t, harness.migration, futureHookModeDefaultFalse)
+		if restored := futureHookDefinitionDigest(t, harness.migration); restored != defaultDefinitionDigest {
+			t.Errorf("future Source hook definition digest after cleanup=%s, want default %s",
+				restored, defaultDefinitionDigest)
+		}
+	})
+
+	if !t.Run("default false rejects serializable initial closures without residue", func(t *testing.T) {
+		for _, definition := range futureHookNewDefinitionPair(t, harness.db, base, "default-false") {
+			expectClosureCommitError(t, harness.application, pgx.Serializable, "23514",
+				"asset_sources_future_phase_gate_guard", func(tx pgx.Tx) error {
+					return futureHookInsertInitial(tx, definition)
+				})
+			futureHookAssertNoResidue(t, harness.application, definition.fixture.sourceID)
+		}
+	}) {
+		t.FailNow()
+	}
+
+	if !t.Run("NULL hook rejects serializable initial closures without residue", func(t *testing.T) {
+		futureHookReplace(t, harness.migration, futureHookModeNull)
+		for _, definition := range futureHookNewDefinitionPair(t, harness.db, base, "null-initial") {
+			expectClosureCommitError(t, harness.application, pgx.Serializable, "23514",
+				"asset_sources_future_phase_gate_guard", func(tx pgx.Tx) error {
+					return futureHookInsertInitial(tx, definition)
+				})
+			futureHookAssertNoResidue(t, harness.application, definition.fixture.sourceID)
+		}
+	}) {
+		t.FailNow()
+	}
+
+	if !t.Run("initial-only successor admits exact version two DRAFT closure", func(t *testing.T) {
+		futureHookReplace(t, harness.migration, futureHookModeInitialOnly)
+		for _, definition := range futureHookNewDefinitionPair(t, harness.db, base, "initial-only") {
+			futureHookCreateInitial(t, harness.application, definition)
+			futureHookAssertInitial(t, harness.application, definition)
+		}
+	}) {
+		t.FailNow()
+	}
+
+	if !t.Run("read committed initial closure is rejected for both future kinds", func(t *testing.T) {
+		for _, definition := range futureHookNewDefinitionPair(t, harness.db, base, "read-committed") {
+			expectClosureCommitError(t, harness.application, pgx.ReadCommitted, "55000",
+				"asset_sources_initial_revision_closure_guard", func(tx pgx.Tx) error {
+					return futureHookInsertInitial(tx, definition)
+				})
+			futureHookAssertNoResidue(t, harness.application, definition.fixture.sourceID)
+		}
+	}) {
+		t.FailNow()
+	}
+
+	if !t.Run("same transaction creation and legal validation binding rolls back", func(t *testing.T) {
+		futureHookReplace(t, harness.migration, futureHookModeTrue)
+		for _, definition := range futureHookNewDefinitionPair(t, harness.db, base, "same-tx-live") {
+			expectClosureCommitError(t, harness.application, pgx.Serializable, "55000",
+				"asset_sources_initial_revision_closure_guard", func(tx pgx.Tx) error {
+					if err := futureHookInsertInitial(tx, definition); err != nil {
+						return err
+					}
+					return futureHookBindValidation(tx, definition)
+				})
+			futureHookAssertNoResidue(t, harness.application, definition.fixture.sourceID)
+		}
+		futureHookReplace(t, harness.migration, futureHookModeInitialOnly)
+	}) {
+		t.FailNow()
+	}
+
+	var liveTrue, liveFalse, liveNull []futureHookDefinition
+	var cleanupBomb, cleanupFalse, cleanupNull []futureHookDefinition
+	if !t.Run("prepare independent persisted initial closures for later transactions", func(t *testing.T) {
+		liveTrue = futureHookNewDefinitionPair(t, harness.db, base, "live-true")
+		liveFalse = futureHookNewDefinitionPair(t, harness.db, base, "live-false")
+		liveNull = futureHookNewDefinitionPair(t, harness.db, base, "live-null")
+		cleanupBomb = futureHookNewDefinitionPair(t, harness.db, base, "cleanup-bomb")
+		cleanupFalse = futureHookNewDefinitionPair(t, harness.db, base, "cleanup-false")
+		cleanupNull = futureHookNewDefinitionPair(t, harness.db, base, "cleanup-null")
+		for _, definitions := range [][]futureHookDefinition{
+			liveTrue, liveFalse, liveNull, cleanupBomb, cleanupFalse, cleanupNull,
+		} {
+			for _, definition := range definitions {
+				futureHookCreateInitial(t, harness.application, definition)
+				futureHookAssertInitial(t, harness.application, definition)
+			}
+		}
+	}) {
+		t.FailNow()
+	}
+
+	if !t.Run("new serializable transaction reaches VALIDATING only under true hook", func(t *testing.T) {
+		futureHookReplace(t, harness.migration, futureHookModeTrue)
+		for _, definition := range liveTrue {
+			futureHookStartValidation(t, harness.application, definition)
+			futureHookAssertValidating(t, harness.application, definition)
+		}
+		for _, definitions := range [][]futureHookDefinition{cleanupBomb, cleanupFalse, cleanupNull} {
+			for _, definition := range definitions {
+				futureHookStartValidation(t, harness.application, definition)
+				futureHookOpenAvailable(t, harness.application, definition)
+			}
+		}
+	}) {
+		t.FailNow()
+	}
+
+	if !t.Run("false hook rejects later VALIDATING and permits read committed fail-close", func(t *testing.T) {
+		futureHookReplace(t, harness.migration, futureHookModeDefaultFalse)
+		for _, definition := range liveFalse {
+			expectClosureCommitError(t, harness.application, pgx.Serializable, "23514",
+				"asset_sources_future_phase_gate_guard", func(tx pgx.Tx) error {
+					return futureHookBindValidation(tx, definition)
+				})
+			futureHookAssertInitial(t, harness.application, definition)
+		}
+		for _, definition := range cleanupFalse {
+			futureHookPauseAvailableReadCommitted(t, harness.application, definition)
+		}
+	}) {
+		t.FailNow()
+	}
+
+	if !t.Run("NULL hook rejects later VALIDATING and permits read committed fail-close", func(t *testing.T) {
+		futureHookReplace(t, harness.migration, futureHookModeNull)
+		for _, definition := range liveNull {
+			expectClosureCommitError(t, harness.application, pgx.Serializable, "23514",
+				"asset_sources_future_phase_gate_guard", func(tx pgx.Tx) error {
+					return futureHookBindValidation(tx, definition)
+				})
+			futureHookAssertInitial(t, harness.application, definition)
+		}
+		for _, definition := range cleanupNull {
+			futureHookPauseAvailableReadCommitted(t, harness.application, definition)
+		}
+	}) {
+		t.FailNow()
+	}
+
+	if !t.Run("bomb hook is not called by cleanup-uncertain suspension or read committed fail-close", func(t *testing.T) {
+		for _, definition := range cleanupBomb {
+			futureHookStartDiscoveryFailure(t, harness.application, definition)
+		}
+		futureHookReplace(t, harness.migration, futureHookModeBomb)
+		for _, definition := range cleanupBomb {
+			futureHookSuspendCleanupUncertain(t, harness.application, definition)
+			futureHookCloseSuspendedReadCommitted(t, harness.application, definition)
+		}
+	}) {
+		t.FailNow()
+	}
+
+	futureHookReplace(t, harness.migration, futureHookModeDefaultFalse)
+	if restored := futureHookDefinitionDigest(t, harness.migration); restored != defaultDefinitionDigest {
+		t.Fatalf("restored future Source hook definition digest=%s, want default %s",
+			restored, defaultDefinitionDigest)
+	}
+}
+
 func TestAssetCatalogValidationCleanupUncertainRequiresSourceSuspension(t *testing.T) {
 	harness := newAssetCatalogHarness(t)
 	harness.applyThroughAssetCatalog(t)
@@ -2338,12 +2504,20 @@ func finishClosureExternalValidation(
 	if !publicationClosed {
 		t.Fatal("external publication did not close the visible validation gate at its exact epoch")
 	}
-	execAssetSQL(t, database, `
+	available, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatalf("begin external validation AVAILABLE gate: %v", err)
+	}
+	defer func() { _ = available.Rollback(context.Background()) }()
+	execAssetSQL(t, available, `
 		UPDATE asset_sources
 		SET gate_status='AVAILABLE',gate_reason_code=NULL,gate_revision=gate_revision+1,
 			validated_run_id=$2,validation_digest=$3,validated_binding_digest=$4,
 			version=version+1 WHERE id=$1
 	`, fixture.sourceID, fixture.validationRunID, proof, fixture.revisionDigest)
+	if err := available.Commit(context.Background()); err != nil {
+		t.Fatalf("commit external validation AVAILABLE gate: %v", err)
+	}
 }
 
 func revokeClosureAttempt(
@@ -2671,4 +2845,916 @@ func assertClosurePostgresError(t *testing.T, err error, state string, constrain
 		t.Fatalf("SQL error=%s/%s (%v), want %s/%s", databaseError.Code,
 			databaseError.ConstraintName, err, state, constraint)
 	}
+}
+
+type futureHookMode string
+
+const (
+	futureHookModeDefaultFalse futureHookMode = "default-false"
+	futureHookModeNull         futureHookMode = "null"
+	futureHookModeInitialOnly  futureHookMode = "initial-only"
+	futureHookModeTrue         futureHookMode = "true"
+	futureHookModeBomb         futureHookMode = "bomb"
+)
+
+type futureHookSourceSpec struct {
+	sourceKind     string
+	providerKind   string
+	profileCode    string
+	typedExtension bool
+}
+
+type futureHookDefinition struct {
+	fixture                  assetCatalogFixture
+	sourceKind               string
+	providerKind             string
+	profileCode              string
+	canonicalProfile         []byte
+	profileDigest            string
+	canonicalProviderSchema  []byte
+	providerSchemaDigest     string
+	authorityDigest          string
+	typedExtensionCode       string
+	preparedExtensionDigest  string
+	createIdempotencyKey     string
+	validationIdempotencyKey string
+	discoveryIdempotencyKey  string
+	validationProof          string
+	failureIntentDigest      string
+	cleanupDigest            string
+}
+
+func futureHookNewDefinitionPair(
+	t *testing.T,
+	database *pgxpool.Pool,
+	base assetCatalogFixture,
+	label string,
+) []futureHookDefinition {
+	t.Helper()
+	specifications := []futureHookSourceSpec{
+		{
+			sourceKind: "KUBERNETES_OPERATOR", providerKind: "FUTURE_K8S_V1",
+			profileCode: "FUTURE_K8S_V1", typedExtension: true,
+		},
+		{
+			sourceKind: "AWX_INVENTORY", providerKind: "FUTURE_AWX_V1",
+			profileCode: "FUTURE_AWX_V1", typedExtension: false,
+		},
+	}
+	definitions := make([]futureHookDefinition, 0, len(specifications))
+	for _, specification := range specifications {
+		definitions = append(definitions,
+			futureHookNewDefinition(t, database, base, specification, label))
+	}
+	return definitions
+}
+
+func futureHookNewDefinition(
+	t *testing.T,
+	database *pgxpool.Pool,
+	base assetCatalogFixture,
+	specification futureHookSourceSpec,
+	label string,
+) futureHookDefinition {
+	t.Helper()
+	fixture := base
+	if err := database.QueryRow(context.Background(), `
+		SELECT gen_random_uuid()::text,gen_random_uuid()::text,
+			gen_random_uuid()::text,gen_random_uuid()::text
+	`).Scan(&fixture.sourceID, &fixture.revisionID, &fixture.validationRunID, &fixture.runID); err != nil {
+		t.Fatalf("allocate unique future Source fixture UUIDs: %v", err)
+	}
+	canonicalProfile := futureHookCanonicalProfile(specification)
+	canonicalProviderSchema := []byte(`{"additionalProperties":false,"type":"object"}`)
+	profileDigestBytes := sha256.Sum256(canonicalProfile)
+	providerSchemaDigestBytes := sha256.Sum256(canonicalProviderSchema)
+	authorityDigest := assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-authority-scope.v1"),
+		[]byte("1"),
+		[]byte(fixture.environmentID),
+	)
+	sourceDefinitionDigest := assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-definition.v2"),
+		[]byte(specification.sourceKind),
+		[]byte(specification.providerKind),
+		[]byte(specification.profileCode),
+		profileDigestBytes[:],
+		providerSchemaDigestBytes[:],
+	)
+	typedExtensionCode := ""
+	preparedExtensionDigest := ""
+	if specification.typedExtension {
+		typedExtensionCode = specification.profileCode
+		preparedExtensionDigest = assetCatalogCorrectiveFramedDigest(
+			[]byte("future-hook-prepared-extension.v1"), []byte(fixture.sourceID),
+		)
+	}
+	canonicalRevisionDigest := assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-revision-binding.v1"),
+		[]byte(fixture.tenantID),
+		[]byte(fixture.workspaceID),
+		[]byte(fixture.sourceID),
+		[]byte("1"),
+		assetCatalogCorrectiveDecodeDigest(t, sourceDefinitionDigest),
+		nil,
+		[]byte("ON_DEMAND"),
+		[]byte("future-hook-credential"),
+		nil,
+		nil,
+		assetCatalogCorrectiveDecodeDigest(t, authorityDigest),
+		[]byte("10"),
+		[]byte("60"),
+		[]byte("1"),
+		[]byte("60"),
+		[]byte(specification.profileCode),
+		nil,
+		futureHookOptionalBytes(typedExtensionCode),
+		futureHookOptionalDigest(t, preparedExtensionDigest),
+	)
+	fixture.sourceDefinitionDigest = sourceDefinitionDigest
+	fixture.revisionDigest = canonicalRevisionDigest
+	keySuffix := strings.ReplaceAll(fixture.sourceID, "-", "")[:12]
+	return futureHookDefinition{
+		fixture: fixture, sourceKind: specification.sourceKind,
+		providerKind: specification.providerKind, profileCode: specification.profileCode,
+		canonicalProfile:        canonicalProfile,
+		profileDigest:           hex.EncodeToString(profileDigestBytes[:]),
+		canonicalProviderSchema: canonicalProviderSchema,
+		providerSchemaDigest:    hex.EncodeToString(providerSchemaDigestBytes[:]),
+		authorityDigest:         authorityDigest, typedExtensionCode: typedExtensionCode,
+		preparedExtensionDigest:  preparedExtensionDigest,
+		createIdempotencyKey:     "future-hook-create-" + label + "-" + keySuffix,
+		validationIdempotencyKey: "future-hook-validate-" + label + "-" + keySuffix,
+		discoveryIdempotencyKey:  "future-hook-discover-" + label + "-" + keySuffix,
+		validationProof: assetCatalogCorrectiveFramedDigest(
+			[]byte("future-hook-validation-proof.v1"), []byte(fixture.sourceID),
+		),
+		failureIntentDigest: assetCatalogCorrectiveFramedDigest(
+			[]byte("future-hook-failure-intent.v1"), []byte(fixture.runID),
+		),
+		cleanupDigest: assetCatalogCorrectiveFramedDigest(
+			[]byte("future-hook-cleanup-proof.v1"), []byte(fixture.runID),
+		),
+	}
+}
+
+func futureHookCanonicalProfile(specification futureHookSourceSpec) []byte {
+	typedExtension := "null"
+	if specification.typedExtension {
+		typedExtension = `"` + specification.profileCode + `"`
+	}
+	return []byte(`{"backpressure_base_seconds":1,"backpressure_max_seconds":60,` +
+		`"compatibility_class":"` + specification.profileCode + `",` +
+		`"credential_purpose":"DISCOVERY_READ","dlp_policy_code":"ASSET_SAFE_V1",` +
+		`"environment_mapping_mode":"SINGLE_ENVIRONMENT","freshness_kind":"OBJECT_SEQUENCE",` +
+		`"integration_mode":"NONE","max_document_bytes":65536,"max_page_bytes":1048576,` +
+		`"max_page_items":100,"max_page_relations":0,"network_mode":"NONE",` +
+		`"parser_code":"` + specification.profileCode + `","profile_code":"` +
+		specification.profileCode + `","provider_kind":"` + specification.providerKind + `",` +
+		`"rate_limit_requests":10,"rate_limit_window_seconds":60,"relationship_types":[],` +
+		`"schedule_mode":"NONE","source_kind":"` + specification.sourceKind + `",` +
+		`"sync_mode":"ON_DEMAND","trust_mode":"NONE",` +
+		`"trusted_path_codes":["DISPLAY_NAME","EXTERNAL_ID"],` +
+		`"typed_extension_code":` + typedExtension + `,` +
+		`"version":"asset-source-profile-manifest.v1"}`)
+}
+
+func futureHookInsertInitial(tx pgx.Tx, definition futureHookDefinition) error {
+	if _, err := tx.Exec(context.Background(), `
+		INSERT INTO public.asset_sources (
+			id,tenant_id,workspace_id,source_kind,provider_kind,name,
+			create_idempotency_key,create_request_hash
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,repeat('a',64))
+	`, definition.fixture.sourceID, definition.fixture.tenantID, definition.fixture.workspaceID,
+		definition.sourceKind, definition.providerKind,
+		"future hook "+strings.ToLower(definition.providerKind),
+		definition.createIdempotencyKey); err != nil {
+		return err
+	}
+	var typedExtensionCode any
+	var preparedExtensionDigest any
+	if definition.typedExtensionCode != "" {
+		typedExtensionCode = definition.typedExtensionCode
+		preparedExtensionDigest = definition.preparedExtensionDigest
+	}
+	if _, err := tx.Exec(context.Background(), `
+		INSERT INTO public.asset_source_revisions (
+			id,tenant_id,workspace_id,source_id,revision,
+			canonical_profile_manifest,profile_manifest_sha256,
+			canonical_provider_schema,canonical_provider_schema_sha256,
+			sync_mode,authority_scope_digest,source_definition_digest,canonical_revision_digest,
+			credential_reference_id,trust_reference_id,network_policy_reference_id,
+			rate_limit_requests,rate_limit_window_seconds,backpressure_base_seconds,
+			backpressure_max_seconds,profile_code,schedule_expression,
+			typed_extension_code,prepared_extension_digest,
+			created_by,change_reason_code,expected_source_version
+		) VALUES ($1,$2,$3,$4,1,$5,$6,$7,$8,'ON_DEMAND',$9,$10,$11,
+			'future-hook-credential',NULL,NULL,10,60,1,60,$12,NULL,$13,$14,
+			'future-hook-test','INITIAL_CREATE',1)
+	`, definition.fixture.revisionID, definition.fixture.tenantID,
+		definition.fixture.workspaceID, definition.fixture.sourceID,
+		definition.canonicalProfile, definition.profileDigest,
+		definition.canonicalProviderSchema, definition.providerSchemaDigest,
+		definition.authorityDigest, definition.fixture.sourceDefinitionDigest,
+		definition.fixture.revisionDigest, definition.profileCode,
+		typedExtensionCode, preparedExtensionDigest); err != nil {
+		return err
+	}
+	_, err := tx.Exec(context.Background(), `
+		INSERT INTO public.asset_source_revision_authorities (
+			tenant_id,workspace_id,source_id,source_revision,environment_id,canonical_ordinal
+		) VALUES ($1,$2,$3,1,$4,1)
+	`, definition.fixture.tenantID, definition.fixture.workspaceID,
+		definition.fixture.sourceID, definition.fixture.environmentID)
+	return err
+}
+
+func futureHookBindValidation(tx pgx.Tx, definition futureHookDefinition) error {
+	if _, err := tx.Exec(context.Background(), `
+		INSERT INTO public.asset_source_runs (
+			id,tenant_id,workspace_id,source_id,source_revision,source_revision_digest,
+			run_kind,trigger_type,gate_revision,idempotency_key,request_hash,checkpoint_version
+		) SELECT $1,$2,$3,$4,1,$5,'VALIDATION','HUMAN',source.gate_revision,$6,
+			repeat('b',64),0
+		FROM public.asset_sources AS source WHERE source.id=$4
+	`, definition.fixture.validationRunID, definition.fixture.tenantID,
+		definition.fixture.workspaceID, definition.fixture.sourceID,
+		definition.fixture.revisionDigest, definition.validationIdempotencyKey); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(context.Background(), `
+		UPDATE public.asset_source_revisions
+		SET state='VALIDATING',validation_run_id=$2,version=version+1
+		WHERE id=$1
+	`, definition.fixture.revisionID, definition.fixture.validationRunID); err != nil {
+		return err
+	}
+	_, err := tx.Exec(context.Background(), `
+		UPDATE public.asset_sources
+		SET gate_status='VALIDATING',gate_revision=gate_revision+1,
+			validated_run_id=$2,validation_digest=NULL,validated_binding_digest=NULL,
+			version=version+1
+		WHERE id=$1
+	`, definition.fixture.sourceID, definition.fixture.validationRunID)
+	return err
+}
+
+func futureHookCreateInitial(
+	t *testing.T,
+	database *pgxpool.Pool,
+	definition futureHookDefinition,
+) {
+	t.Helper()
+	tx, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatalf("begin serializable future Source initial closure: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	futureHookAssertIsolation(t, tx, "serializable")
+	if err := futureHookInsertInitial(tx, definition); err != nil {
+		t.Fatalf("insert %s initial future Source closure: %v", definition.sourceKind, err)
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("commit %s initial future Source closure: %v", definition.sourceKind, err)
+	}
+}
+
+func futureHookStartValidation(
+	t *testing.T,
+	database *pgxpool.Pool,
+	definition futureHookDefinition,
+) {
+	t.Helper()
+	tx, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatalf("begin serializable future Source validation gate: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	futureHookAssertIsolation(t, tx, "serializable")
+	if err := futureHookBindValidation(tx, definition); err != nil {
+		t.Fatalf("bind %s future Source validation: %v", definition.sourceKind, err)
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("commit %s future Source VALIDATING gate: %v", definition.sourceKind, err)
+	}
+}
+
+func futureHookOpenAvailable(
+	t *testing.T,
+	database *pgxpool.Pool,
+	definition futureHookDefinition,
+) {
+	t.Helper()
+	execAssetSQL(t, database, `
+		UPDATE public.asset_source_runs
+		SET status='RUNNING',stage_code='VALIDATING',lease_owner='future-hook-worker',
+			lease_expires_at=statement_timestamp()+interval '10 minutes',fence_epoch=1,
+			fence_token_hash=repeat('c',64),heartbeat_sequence=1,
+			heartbeat_at=statement_timestamp(),version=version+1
+		WHERE id=$1
+	`, definition.fixture.validationRunID)
+	finishClosureExternalValidation(
+		t,
+		database,
+		definition.fixture,
+		1,
+		definition.validationProof,
+	)
+	futureHookAssertAvailable(t, database, definition)
+}
+
+func futureHookStartDiscoveryFailure(
+	t *testing.T,
+	database *pgxpool.Pool,
+	definition futureHookDefinition,
+) {
+	t.Helper()
+	futureHookAssertAvailable(t, database, definition)
+	execAssetSQL(t, database, `
+		INSERT INTO public.asset_source_runs (
+			id,tenant_id,workspace_id,source_id,source_revision,source_revision_digest,
+			run_kind,trigger_type,gate_revision,idempotency_key,request_hash,
+			cursor_before_sha256,checkpoint_version
+		) SELECT $1,$2,$3,$4,source.published_revision,source.published_revision_digest,
+			'DISCOVERY','HUMAN',source.gate_revision,$5,repeat('d',64),
+			source.checkpoint_sha256,source.checkpoint_version
+		FROM public.asset_sources AS source WHERE source.id=$4
+	`, definition.fixture.runID, definition.fixture.tenantID,
+		definition.fixture.workspaceID, definition.fixture.sourceID,
+		definition.discoveryIdempotencyKey)
+	execAssetSQL(t, database, `
+		UPDATE public.asset_source_runs
+		SET status='RUNNING',stage_code='READING',lease_owner='future-hook-worker',
+			lease_expires_at=statement_timestamp()+interval '10 minutes',fence_epoch=1,
+			fence_token_hash=repeat('e',64),heartbeat_sequence=1,
+			heartbeat_at=statement_timestamp(),version=version+1
+		WHERE id=$1
+	`, definition.fixture.runID)
+	execAssetSQL(t, database, `
+		UPDATE public.asset_source_runs
+		SET stage_code='CLEANING_UP',cleanup_status='PENDING',
+			cleanup_attempt_id=gen_random_uuid(),cleanup_attempt_epoch=fence_epoch,
+			version=version+1
+		WHERE id=$1
+	`, definition.fixture.runID)
+	execAssetSQL(t, database, `
+		UPDATE public.asset_source_runs
+		SET status='FINALIZING',work_result_kind='FAILURE_INTENT',
+			work_result_status='FAILED',work_result_digest=$2,
+			work_result_recorded_at=statement_timestamp(),version=version+1
+		WHERE id=$1
+	`, definition.fixture.runID, definition.failureIntentDigest)
+
+	var exact bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT run.status='FINALIZING' AND run.stage_code='CLEANING_UP' AND
+			run.work_result_kind='FAILURE_INTENT' AND run.work_result_status='FAILED' AND
+			run.work_result_digest=$2 AND run.cleanup_status='PENDING' AND
+			run.cleanup_attempt_id IS NOT NULL AND run.cleanup_attempt_epoch=1 AND
+			run.gate_revision=source.gate_revision AND source.gate_status='AVAILABLE' AND
+			source.validated_run_id IS NOT NULL AND source.validation_digest IS NOT NULL AND
+			source.validated_binding_digest IS NOT NULL
+		FROM public.asset_source_runs AS run
+		JOIN public.asset_sources AS source ON source.id=run.source_id
+		WHERE run.id=$1
+	`, definition.fixture.runID, definition.failureIntentDigest).Scan(&exact); err != nil {
+		t.Fatalf("read future Source cleanup-uncertain preparation: %v", err)
+	}
+	if !exact {
+		t.Fatalf("%s future Source did not reach exact cleanup-only failure intent",
+			definition.sourceKind)
+	}
+}
+
+func futureHookSuspendCleanupUncertain(
+	t *testing.T,
+	database *pgxpool.Pool,
+	definition futureHookDefinition,
+) {
+	t.Helper()
+	gateRevision, sourceVersion := futureHookAssertAvailable(t, database, definition)
+	tx, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatalf("begin future Source cleanup-uncertain terminal closure: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	futureHookAssertIsolation(t, tx, "serializable")
+	var cleanupEpoch int64
+	if err := tx.QueryRow(context.Background(), `
+		SELECT cleanup_attempt_epoch FROM public.asset_source_runs WHERE id=$1
+	`, definition.fixture.runID).Scan(&cleanupEpoch); err != nil {
+		t.Fatalf("read future Source cleanup attempt epoch: %v", err)
+	}
+	insertCleanupAudit(t, tx, definition.fixture,
+		definition.fixture.runID, cleanupEpoch, definition.cleanupDigest)
+	execAssetSQL(t, tx, `
+		UPDATE public.asset_source_runs
+		SET cleanup_status='UNCERTAIN',cleanup_digest=$2,version=version+1
+		WHERE id=$1
+	`, definition.fixture.runID, definition.cleanupDigest)
+	var overrideDigest string
+	if err := tx.QueryRow(context.Background(), `
+		SELECT public.asset_catalog_source_run_failure_override_digest(
+			run,'CLEANUP_UNCERTAIN'
+		) FROM public.asset_source_runs AS run WHERE run.id=$1
+	`, definition.fixture.runID).Scan(&overrideDigest); err != nil {
+		t.Fatalf("derive future Source cleanup-uncertain override: %v", err)
+	}
+	execAssetSQL(t, tx, `
+		UPDATE public.asset_source_runs
+		SET failure_code='CLEANUP_UNCERTAIN',terminal_failure_override='CLEANUP_UNCERTAIN',
+			terminal_failure_override_digest=$2,version=version+1
+		WHERE id=$1
+	`, definition.fixture.runID, overrideDigest)
+	terminalDigest := sourceRunTerminalDigest(
+		t, tx, definition.fixture.runID, "FAILED", "CLEANUP_UNCERTAIN",
+	)
+	insertTerminalAudit(t, tx, definition.fixture, definition.fixture.runID, terminalDigest)
+	execAssetSQL(t, tx, `
+		UPDATE public.asset_source_runs
+		SET status='FAILED',stage_code='COMPLETED',terminal_command_sha256=$2,
+			version=version+1
+		WHERE id=$1
+	`, definition.fixture.runID, terminalDigest)
+	execAssetSQL(t, tx, `
+		UPDATE public.asset_sources
+		SET gate_status='SUSPENDED',gate_reason_code='CLEANUP_UNCERTAIN',
+			gate_revision=gate_revision+1,version=version+1
+		WHERE id=$1
+	`, definition.fixture.sourceID)
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("commit %s future Source cleanup-uncertain suspension: %v",
+			definition.sourceKind, err)
+	}
+
+	var exact bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT source.status='ACTIVE' AND source.gate_status='SUSPENDED' AND
+			source.gate_reason_code='CLEANUP_UNCERTAIN' AND
+			source.gate_revision=$3 AND source.version=$4 AND
+			source.validated_run_id IS NULL AND source.validation_digest IS NULL AND
+			source.validated_binding_digest IS NULL AND run.status='FAILED' AND
+			run.stage_code='COMPLETED' AND run.cleanup_status='UNCERTAIN' AND
+			run.cleanup_digest=$5 AND run.terminal_failure_override='CLEANUP_UNCERTAIN'
+		FROM public.asset_sources AS source
+		JOIN public.asset_source_runs AS run ON run.source_id=source.id
+		WHERE source.id=$1 AND run.id=$2
+	`, definition.fixture.sourceID, definition.fixture.runID,
+		gateRevision+1, sourceVersion+1, definition.cleanupDigest).Scan(&exact); err != nil {
+		t.Fatalf("read future Source cleanup-uncertain suspension: %v", err)
+	}
+	if !exact {
+		t.Fatalf("%s future Source cleanup-uncertain suspension lost exact gate closure",
+			definition.sourceKind)
+	}
+}
+
+func futureHookPauseAvailableReadCommitted(
+	t *testing.T,
+	database *pgxpool.Pool,
+	definition futureHookDefinition,
+) {
+	t.Helper()
+	gateRevision, sourceVersion := futureHookAssertAvailable(t, database, definition)
+	tx, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatalf("begin read-committed future Source fail-close: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	futureHookAssertIsolation(t, tx, "read committed")
+	if _, err := tx.Exec(context.Background(), `
+		UPDATE public.asset_sources SET status='PAUSED',version=version+1 WHERE id=$1
+	`, definition.fixture.sourceID); err != nil {
+		t.Fatalf("read-committed %s future Source fail-close: %v", definition.sourceKind, err)
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("commit read-committed %s future Source fail-close: %v",
+			definition.sourceKind, err)
+	}
+	futureHookAssertPausedUnavailable(
+		t, database, definition, gateRevision+1, sourceVersion+1,
+	)
+}
+
+func futureHookCloseSuspendedReadCommitted(
+	t *testing.T,
+	database *pgxpool.Pool,
+	definition futureHookDefinition,
+) {
+	t.Helper()
+	var gateRevision, sourceVersion int64
+	var exact bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT gate_revision,version,
+			status='ACTIVE' AND gate_status='SUSPENDED' AND
+			gate_reason_code='CLEANUP_UNCERTAIN' AND validated_run_id IS NULL AND
+			validation_digest IS NULL AND validated_binding_digest IS NULL
+		FROM public.asset_sources WHERE id=$1
+	`, definition.fixture.sourceID).Scan(&gateRevision, &sourceVersion, &exact); err != nil {
+		t.Fatalf("read suspended future Source before fail-close: %v", err)
+	}
+	if !exact {
+		t.Fatalf("%s future Source is not exactly SUSPENDED before fail-close",
+			definition.sourceKind)
+	}
+	tx, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatalf("begin suspended future Source read-committed fail-close: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	futureHookAssertIsolation(t, tx, "read committed")
+	if _, err := tx.Exec(context.Background(), `
+		UPDATE public.asset_sources
+		SET status='PAUSED',gate_status='UNAVAILABLE',gate_reason_code='SOURCE_NOT_ACTIVE',
+			gate_revision=gate_revision+1,version=version+1
+		WHERE id=$1
+	`, definition.fixture.sourceID); err != nil {
+		t.Fatalf("read-committed suspended %s future Source fail-close: %v",
+			definition.sourceKind, err)
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("commit suspended %s future Source fail-close: %v",
+			definition.sourceKind, err)
+	}
+	futureHookAssertPausedUnavailable(
+		t, database, definition, gateRevision+1, sourceVersion+1,
+	)
+}
+
+func futureHookAssertNoResidue(t *testing.T, database *pgxpool.Pool, sourceID string) {
+	t.Helper()
+	var sources, revisions, authorities, runs int
+	if err := database.QueryRow(context.Background(), `
+		SELECT
+			(SELECT count(*)::integer FROM public.asset_sources WHERE id=$1),
+			(SELECT count(*)::integer FROM public.asset_source_revisions WHERE source_id=$1),
+			(SELECT count(*)::integer FROM public.asset_source_revision_authorities WHERE source_id=$1),
+			(SELECT count(*)::integer FROM public.asset_source_runs WHERE source_id=$1)
+	`, sourceID).Scan(&sources, &revisions, &authorities, &runs); err != nil {
+		t.Fatalf("read rejected future Source transaction residue: %v", err)
+	}
+	if sources != 0 || revisions != 0 || authorities != 0 || runs != 0 {
+		t.Fatalf("rejected future Source residue source=%d revision=%d authority=%d run=%d",
+			sources, revisions, authorities, runs)
+	}
+}
+
+func futureHookAssertInitial(
+	t *testing.T,
+	database *pgxpool.Pool,
+	definition futureHookDefinition,
+) {
+	t.Helper()
+	var typedExtensionCode any
+	var preparedExtensionDigest any
+	if definition.typedExtensionCode != "" {
+		typedExtensionCode = definition.typedExtensionCode
+		preparedExtensionDigest = definition.preparedExtensionDigest
+	}
+	var exact bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT source.status='ACTIVE' AND source.version=2 AND
+			source.gate_status='UNAVAILABLE' AND source.gate_reason_code IS NULL AND
+			source.gate_revision=0 AND source.published_revision IS NULL AND
+			source.published_revision_digest IS NULL AND source.validated_run_id IS NULL AND
+			source.validation_digest IS NULL AND source.validated_binding_digest IS NULL AND
+			source.checkpoint_ciphertext IS NULL AND source.checkpoint_key_id IS NULL AND
+			source.checkpoint_sha256 IS NULL AND source.checkpoint_revision=0 AND
+			source.checkpoint_version=0 AND revision.state='DRAFT' AND revision.version=1 AND
+			revision.validation_run_id IS NULL AND revision.validation_digest IS NULL AND
+			revision.expected_source_version=1 AND
+			revision.canonical_revision_digest=$3 AND
+			revision.typed_extension_code IS NOT DISTINCT FROM $4::text AND
+			revision.prepared_extension_digest IS NOT DISTINCT FROM $5::text AND
+			(SELECT count(*)=1 FROM public.asset_source_revision_authorities AS authority
+			 WHERE authority.source_id=source.id AND authority.source_revision=1 AND
+			       authority.environment_id=$6 AND authority.canonical_ordinal=1) AND
+			(SELECT count(*)=0 FROM public.asset_source_runs AS run WHERE run.source_id=source.id)
+		FROM public.asset_sources AS source
+		JOIN public.asset_source_revisions AS revision ON revision.source_id=source.id
+		WHERE source.id=$1 AND revision.id=$2
+	`, definition.fixture.sourceID, definition.fixture.revisionID,
+		definition.fixture.revisionDigest, typedExtensionCode, preparedExtensionDigest,
+		definition.fixture.environmentID).Scan(&exact); err != nil {
+		t.Fatalf("read %s initial future Source closure: %v", definition.sourceKind, err)
+	}
+	if !exact {
+		t.Fatalf("%s future Source did not persist exact version-2 UNAVAILABLE plus DRAFT closure",
+			definition.sourceKind)
+	}
+}
+
+func futureHookAssertValidating(
+	t *testing.T,
+	database *pgxpool.Pool,
+	definition futureHookDefinition,
+) {
+	t.Helper()
+	var exact bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT source.status='ACTIVE' AND source.version=3 AND
+			source.gate_status='VALIDATING' AND
+			source.gate_reason_code='VALIDATION_IN_PROGRESS' AND
+			source.gate_revision=1 AND source.validated_run_id=run.id AND
+			source.validation_digest IS NULL AND source.validated_binding_digest IS NULL AND
+			revision.state='VALIDATING' AND revision.version=2 AND
+			revision.validation_run_id=run.id AND revision.validation_digest IS NULL AND
+			run.run_kind='VALIDATION' AND run.status='QUEUED' AND run.stage_code='WAITING' AND
+			run.gate_revision=0 AND run.checkpoint_version=0
+		FROM public.asset_sources AS source
+		JOIN public.asset_source_revisions AS revision ON revision.source_id=source.id
+		JOIN public.asset_source_runs AS run ON run.id=revision.validation_run_id
+		WHERE source.id=$1 AND revision.id=$2 AND run.id=$3
+	`, definition.fixture.sourceID, definition.fixture.revisionID,
+		definition.fixture.validationRunID).Scan(&exact); err != nil {
+		t.Fatalf("read %s future Source VALIDATING closure: %v", definition.sourceKind, err)
+	}
+	if !exact {
+		t.Fatalf("%s future Source did not reach exact later-transaction VALIDATING closure",
+			definition.sourceKind)
+	}
+}
+
+func futureHookAssertAvailable(
+	t *testing.T,
+	database *pgxpool.Pool,
+	definition futureHookDefinition,
+) (int64, int64) {
+	t.Helper()
+	var gateRevision, sourceVersion int64
+	var exact bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT source.gate_revision,source.version,
+			source.status='ACTIVE' AND source.gate_status='AVAILABLE' AND
+			source.gate_reason_code IS NULL AND source.gate_revision=3 AND
+			source.published_revision=1 AND
+			source.published_revision_digest=revision.canonical_revision_digest AND
+			source.checkpoint_revision=1 AND source.checkpoint_version=0 AND
+			source.validated_run_id=run.id AND source.validation_digest=$4 AND
+			source.validated_binding_digest=revision.canonical_revision_digest AND
+			revision.state='PUBLISHED' AND revision.validation_digest=$4 AND
+			run.status='SUCCEEDED' AND run.stage_code='COMPLETED' AND
+			run.work_result_kind='VALIDATION_PROOF' AND
+			run.work_result_status='SUCCEEDED' AND run.validation_outcome='SUCCEEDED'
+		FROM public.asset_sources AS source
+		JOIN public.asset_source_revisions AS revision ON revision.source_id=source.id
+		JOIN public.asset_source_runs AS run ON run.id=revision.validation_run_id
+		WHERE source.id=$1 AND revision.id=$2 AND run.id=$3
+	`, definition.fixture.sourceID, definition.fixture.revisionID,
+		definition.fixture.validationRunID, definition.validationProof).Scan(
+		&gateRevision,
+		&sourceVersion,
+		&exact,
+	); err != nil {
+		t.Fatalf("read %s future Source AVAILABLE closure: %v", definition.sourceKind, err)
+	}
+	if !exact {
+		t.Fatalf("%s future Source did not reach exact published AVAILABLE closure",
+			definition.sourceKind)
+	}
+	return gateRevision, sourceVersion
+}
+
+func futureHookAssertPausedUnavailable(
+	t *testing.T,
+	database *pgxpool.Pool,
+	definition futureHookDefinition,
+	wantGateRevision int64,
+	wantSourceVersion int64,
+) {
+	t.Helper()
+	var exact bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT status='PAUSED' AND gate_status='UNAVAILABLE' AND
+			gate_reason_code='SOURCE_NOT_ACTIVE' AND gate_revision=$2 AND version=$3 AND
+			validated_run_id IS NULL AND validation_digest IS NULL AND
+			validated_binding_digest IS NULL
+		FROM public.asset_sources WHERE id=$1
+	`, definition.fixture.sourceID, wantGateRevision, wantSourceVersion).Scan(&exact); err != nil {
+		t.Fatalf("read %s future Source PAUSED/UNAVAILABLE fail-close: %v",
+			definition.sourceKind, err)
+	}
+	if !exact {
+		t.Fatalf("%s future Source fail-close did not clear all validation fields at gate +1",
+			definition.sourceKind)
+	}
+}
+
+func futureHookAssertIsolation(t *testing.T, tx pgx.Tx, want string) {
+	t.Helper()
+	var got string
+	if err := tx.QueryRow(context.Background(), `
+		SELECT current_setting('transaction_isolation')
+	`).Scan(&got); err != nil {
+		t.Fatalf("read future Source transaction isolation: %v", err)
+	}
+	if got != want {
+		t.Fatalf("future Source transaction isolation=%q, want %q", got, want)
+	}
+}
+
+func futureHookReplace(t *testing.T, migration *pgxpool.Pool, mode futureHookMode) {
+	t.Helper()
+	definition := futureHookReplacementSQL(t, mode)
+	tx, err := migration.BeginTx(context.Background(), pgx.TxOptions{})
+	if err != nil {
+		t.Fatalf("begin future Source hook owner replacement: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	var sessionUser, currentUser string
+	if err := tx.QueryRow(context.Background(), `SELECT session_user,current_user`).Scan(
+		&sessionUser, &currentUser,
+	); err != nil {
+		t.Fatalf("read future Source hook replacement identity: %v", err)
+	}
+	if sessionUser != "aiops_migrator" || currentUser != "aiops_migrator" {
+		t.Fatalf("future Source hook replacement identity=%s/%s, want migrator/migrator",
+			sessionUser, currentUser)
+	}
+	if _, err := tx.Exec(context.Background(), `SET LOCAL ROLE aiops_schema_owner`); err != nil {
+		t.Fatalf("set future Source hook schema-owner role: %v", err)
+	}
+	if err := tx.QueryRow(context.Background(), `SELECT session_user,current_user`).Scan(
+		&sessionUser, &currentUser,
+	); err != nil {
+		t.Fatalf("read future Source hook owner identity: %v", err)
+	}
+	if sessionUser != "aiops_migrator" || currentUser != "aiops_schema_owner" {
+		t.Fatalf("future Source hook owner identity=%s/%s, want migrator/schema-owner",
+			sessionUser, currentUser)
+	}
+	if _, err := tx.Exec(context.Background(), definition); err != nil {
+		t.Fatalf("replace future Source hook in mode %s: %v", mode, err)
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("commit future Source hook mode %s: %v", mode, err)
+	}
+	futureHookAssertReplacementContract(t, migration)
+}
+
+func futureHookReplacementSQL(t *testing.T, mode futureHookMode) string {
+	t.Helper()
+	body := ""
+	switch mode {
+	case futureHookModeDefaultFalse:
+		body = `
+BEGIN
+    RETURN false;
+END;
+`
+	case futureHookModeNull:
+		body = `
+BEGIN
+    RETURN NULL;
+END;
+`
+	case futureHookModeTrue:
+		body = `
+BEGIN
+    RETURN true;
+END;
+`
+	case futureHookModeBomb:
+		body = `
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = 'P0001', MESSAGE = 'future Source hook bomb was invoked',
+        CONSTRAINT = 'future_hook_bomb_guard';
+END;
+`
+	case futureHookModeInitialOnly:
+		body = `
+BEGIN
+    RETURN candidate.source_kind IN ('KUBERNETES_OPERATOR', 'AWX_INVENTORY') AND
+        candidate.status = 'ACTIVE' AND candidate.version = 2 AND
+        candidate.gate_status = 'UNAVAILABLE' AND candidate.gate_reason_code IS NULL AND
+        candidate.gate_revision = 0 AND candidate.published_revision IS NULL AND
+        candidate.published_revision_digest IS NULL AND candidate.validated_run_id IS NULL AND
+        candidate.validation_digest IS NULL AND candidate.validated_binding_digest IS NULL AND
+        candidate.checkpoint_ciphertext IS NULL AND candidate.checkpoint_key_id IS NULL AND
+        candidate.checkpoint_sha256 IS NULL AND candidate.checkpoint_revision = 0 AND
+        candidate.checkpoint_version = 0 AND candidate.next_allowed_at IS NULL AND
+        candidate.consecutive_failures = 0 AND candidate.last_success_run_id IS NULL AND
+        candidate.last_success_at IS NULL AND candidate.last_complete_snapshot_run_id IS NULL AND
+        candidate.last_complete_snapshot_at IS NULL AND
+        (SELECT pg_catalog.count(*) = 1
+         FROM public.asset_source_revisions AS revision
+         WHERE revision.tenant_id = candidate.tenant_id
+           AND revision.workspace_id = candidate.workspace_id
+           AND revision.source_id = candidate.id AND revision.revision = 1
+           AND revision.state = 'DRAFT' AND revision.version = 1
+           AND revision.expected_source_version = 1
+           AND ((candidate.source_kind = 'KUBERNETES_OPERATOR' AND
+                 revision.typed_extension_code = revision.profile_code AND
+                 revision.prepared_extension_digest IS NOT NULL) OR
+                (candidate.source_kind = 'AWX_INVENTORY' AND
+                 revision.typed_extension_code IS NULL AND
+                 revision.prepared_extension_digest IS NULL))) AND
+        (SELECT pg_catalog.count(*) = 1
+         FROM public.asset_source_revision_authorities AS authority
+         WHERE authority.tenant_id = candidate.tenant_id
+           AND authority.workspace_id = candidate.workspace_id
+           AND authority.source_id = candidate.id AND authority.source_revision = 1
+           AND authority.canonical_ordinal = 1);
+END;
+`
+	default:
+		t.Fatalf("unknown future Source hook mode %q", mode)
+	}
+	return `CREATE OR REPLACE FUNCTION public.asset_catalog_future_source_gate_admitted(
+    candidate public.asset_sources
+) RETURNS boolean AS $$` + body + `$$ LANGUAGE plpgsql STABLE SECURITY INVOKER
+SET search_path = pg_catalog, public, pg_temp;`
+}
+
+func futureHookAssertReplacementContract(t *testing.T, migration *pgxpool.Pool) {
+	t.Helper()
+	var count int
+	var exact bool
+	if err := migration.QueryRow(context.Background(), `
+		SELECT count(*)::integer,COALESCE(bool_and(
+			p.prokind='f' AND NOT p.proretset AND p.pronargs=1 AND
+			argument_type.typname='asset_sources' AND
+			argument_namespace.nspname='public' AND
+			p.prorettype='pg_catalog.bool'::regtype::oid AND language.lanname='plpgsql' AND
+			p.provolatile='s' AND NOT p.prosecdef AND
+			p.proconfig IS NOT DISTINCT FROM
+				ARRAY['search_path=pg_catalog, public, pg_temp']::text[] AND
+			pg_catalog.pg_get_userbyid(p.proowner)='aiops_schema_owner' AND
+			pg_catalog.has_function_privilege(
+				'aiops_control_plane_runtime',p.oid,'EXECUTE'
+			) AND NOT EXISTS (
+				SELECT 1
+				FROM pg_catalog.aclexplode(COALESCE(
+					p.proacl,pg_catalog.acldefault('f',p.proowner)
+				)) AS acl
+				WHERE acl.grantee=0 AND acl.privilege_type='EXECUTE'
+			)
+		),false)
+		FROM pg_catalog.pg_proc AS p
+		JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=p.pronamespace
+		JOIN pg_catalog.pg_language AS language ON language.oid=p.prolang
+		LEFT JOIN pg_catalog.pg_type AS argument_type ON argument_type.oid=p.proargtypes[0]
+		LEFT JOIN pg_catalog.pg_namespace AS argument_namespace
+			ON argument_namespace.oid=argument_type.typnamespace
+		WHERE namespace.nspname='public' AND
+			p.proname='asset_catalog_future_source_gate_admitted'
+	`).Scan(&count, &exact); err != nil {
+		t.Fatalf("inspect future Source hook replacement contract: %v", err)
+	}
+	if count != 1 || !exact {
+		t.Fatalf("future Source hook replacement count=%d exact=%v, want one exact owner/signature/ACL contract",
+			count, exact)
+	}
+}
+
+func futureHookDefinitionDigest(t *testing.T, migration *pgxpool.Pool) string {
+	t.Helper()
+	tx, err := migration.BeginTx(context.Background(), pgx.TxOptions{})
+	if err != nil {
+		t.Fatalf("begin future Source hook definition fingerprint: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(context.Background(), `
+		SET LOCAL quote_all_identifiers=off;
+		SET LOCAL search_path=pg_catalog,pg_temp
+	`); err != nil {
+		t.Fatalf("pin future Source hook definition fingerprint GUCs: %v", err)
+	}
+	var digest string
+	if err := tx.QueryRow(context.Background(), `
+		SELECT pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+			pg_catalog.pg_get_functiondef(p.oid),'UTF8'
+		)),'hex')
+		FROM pg_catalog.pg_proc AS p
+		JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=p.pronamespace
+		JOIN pg_catalog.pg_type AS argument_type ON argument_type.oid=p.proargtypes[0]
+		JOIN pg_catalog.pg_namespace AS argument_namespace
+			ON argument_namespace.oid=argument_type.typnamespace
+		WHERE namespace.nspname='public' AND
+			p.proname='asset_catalog_future_source_gate_admitted' AND
+			p.pronargs=1 AND argument_type.typname='asset_sources' AND
+			argument_namespace.nspname='public'
+	`).Scan(&digest); err != nil {
+		t.Fatalf("fingerprint future Source hook definition: %v", err)
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("commit future Source hook definition fingerprint: %v", err)
+	}
+	return digest
+}
+
+func futureHookOptionalBytes(value string) []byte {
+	if value == "" {
+		return nil
+	}
+	return []byte(value)
+}
+
+func futureHookOptionalDigest(t *testing.T, value string) []byte {
+	t.Helper()
+	if value == "" {
+		return nil
+	}
+	return assetCatalogCorrectiveDecodeDigest(t, value)
 }

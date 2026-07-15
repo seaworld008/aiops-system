@@ -947,6 +947,1002 @@ func assetCatalogCorrectiveDecodeDigest(t *testing.T, encoded string) []byte {
 	return decoded
 }
 
+func TestAssetCatalogMigrationCorrectivePersistentContractMatrix(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+
+	authorityEnvironmentFK := requireCorrectiveMatrixConstraintName(
+		t, harness.db, "asset_source_revision_authorities", "f",
+		[]string{"tenant_id", "workspace_id", "environment_id"},
+	)
+	authorityEnvironmentPK := requireCorrectiveMatrixConstraintName(
+		t, harness.db, "asset_source_revision_authorities", "p",
+		[]string{"tenant_id", "workspace_id", "source_id", "source_revision", "environment_id"},
+	)
+	authorityOrdinalUK := requireCorrectiveMatrixConstraintName(
+		t, harness.db, "asset_source_revision_authorities", "u",
+		[]string{"tenant_id", "workspace_id", "source_id", "source_revision", "canonical_ordinal"},
+	)
+
+	t.Run("authority canonical success", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 3)
+		requireCorrectiveMatrixCandidateCommit(t, harness.db, candidate)
+	})
+
+	t.Run("authority absent", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 1)
+		candidate.authorities = nil
+		candidate.environmentMappingMode = "MULTI_ENVIRONMENT"
+		candidate.refreshProfileManifest()
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
+			"23514", "asset_source_revision_authorities_order_guard")
+	})
+
+	t.Run("authority cross scope", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 1)
+		candidate.foreignEnvironment = &correctiveMatrixForeignEnvironment{
+			workspaceID:   correctiveMatrixUUID(t),
+			environmentID: correctiveMatrixUUID(t),
+		}
+		candidate.authorities = []correctiveMatrixAuthority{{
+			environmentID: candidate.foreignEnvironment.environmentID,
+			ordinal:       1,
+		}}
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate, "23503", authorityEnvironmentFK)
+	})
+
+	t.Run("authority unsorted", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 2)
+		candidate.authorities[0].ordinal = 2
+		candidate.authorities[1].ordinal = 1
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
+			"23514", "asset_source_revision_authorities_order_guard")
+	})
+
+	t.Run("authority duplicate environment", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 1)
+		candidate.authorities = append(candidate.authorities, correctiveMatrixAuthority{
+			environmentID: candidate.environmentIDs[0],
+			ordinal:       2,
+		})
+		candidate.environmentMappingMode = "MULTI_ENVIRONMENT"
+		candidate.refreshProfileManifest()
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate, "23505", authorityEnvironmentPK)
+	})
+
+	t.Run("authority duplicate ordinal", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 2)
+		candidate.authorities[1].ordinal = candidate.authorities[0].ordinal
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate, "23505", authorityOrdinalUK)
+	})
+
+	t.Run("authority digest mismatch", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 2)
+		mismatchedDigest := strings.Repeat("f", 64)
+		candidate.authorityDigestOverride = &mismatchedDigest
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
+			"23514", "asset_source_revisions_digest_closure_guard")
+	})
+
+	t.Run("source definition digest mismatch", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 1)
+		mismatchedDigest := strings.Repeat("e", 64)
+		candidate.sourceDefinitionDigestOverride = &mismatchedDigest
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
+			"23514", "asset_source_revisions_digest_closure_guard")
+	})
+
+	t.Run("canonical binding digest mismatch", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 1)
+		mismatchedDigest := strings.Repeat("d", 64)
+		candidate.bindingDigestOverride = &mismatchedDigest
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
+			"23514", "asset_source_revisions_digest_closure_guard")
+	})
+
+	t.Run("authority late append", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 2)
+		candidate.authorities = candidate.authorities[:1]
+		candidate.environmentMappingMode = "MULTI_ENVIRONMENT"
+		candidate.refreshProfileManifest()
+		requireCorrectiveMatrixCandidateCommit(t, harness.db, candidate)
+
+		transaction, err := harness.db.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+		if err != nil {
+			t.Fatalf("begin corrective matrix late-authority transaction: %v", err)
+		}
+		_, mutationErr := transaction.Exec(context.Background(), `
+			INSERT INTO asset_source_revision_authorities (
+				tenant_id,workspace_id,source_id,source_revision,environment_id,canonical_ordinal
+			) VALUES ($1,$2,$3,1,$4,2)
+		`, candidate.tenantID, candidate.workspaceID, candidate.sourceID, candidate.environmentIDs[1])
+		if mutationErr == nil {
+			mutationErr = transaction.Commit(context.Background())
+		} else {
+			_ = transaction.Rollback(context.Background())
+		}
+		assertCorrectiveMatrixPostgresError(t, mutationErr,
+			"55000", "asset_source_revision_authorities_parent_guard")
+
+		var authorityCount int64
+		if err := harness.db.QueryRow(context.Background(), `
+			SELECT count(*) FROM asset_source_revision_authorities WHERE source_id=$1
+		`, candidate.sourceID).Scan(&authorityCount); err != nil {
+			t.Fatalf("count authority rows after rejected late append: %v", err)
+		}
+		if authorityCount != 1 {
+			t.Fatalf("late authority rejection left %d rows, want original one", authorityCount)
+		}
+	})
+
+	t.Run("Profile canonical success", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 1)
+		requireCorrectiveMatrixCandidateCommit(t, harness.db, candidate)
+	})
+
+	t.Run("Profile whitespace", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 1)
+		candidate.profileManifest = append([]byte("\n"), candidate.profileManifest...)
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
+			"23514", "asset_source_revisions_canonical_content_guard")
+	})
+
+	t.Run("Profile key order", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 1)
+		const canonicalPrefix = `{"backpressure_base_seconds":1,"backpressure_max_seconds":60,`
+		const reorderedPrefix = `{"backpressure_max_seconds":60,"backpressure_base_seconds":1,`
+		if !strings.HasPrefix(string(candidate.profileManifest), canonicalPrefix) {
+			t.Fatal("corrective matrix canonical Profile prefix drifted")
+		}
+		candidate.profileManifest = []byte(reorderedPrefix + strings.TrimPrefix(
+			string(candidate.profileManifest), canonicalPrefix,
+		))
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
+			"23514", "asset_source_revisions_canonical_content_guard")
+	})
+
+	t.Run("Profile duplicate key", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 1)
+		const canonicalPrefix = `{"backpressure_base_seconds":1,`
+		if !strings.HasPrefix(string(candidate.profileManifest), canonicalPrefix) {
+			t.Fatal("corrective matrix canonical Profile prefix drifted")
+		}
+		candidate.profileManifest = []byte(canonicalPrefix +
+			`"backpressure_base_seconds":1,` + strings.TrimPrefix(
+			string(candidate.profileManifest), canonicalPrefix,
+		))
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
+			"23514", "asset_source_revisions_schema_ck")
+	})
+
+	t.Run("Profile unknown key", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 1)
+		manifest := string(candidate.profileManifest)
+		if !strings.HasSuffix(manifest, "}") {
+			t.Fatal("corrective matrix canonical Profile suffix drifted")
+		}
+		candidate.profileManifest = []byte(strings.TrimSuffix(manifest, "}") +
+			`,"unknown_key":"UNKNOWN"}`)
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
+			"23514", "asset_source_revisions_profile_manifest_guard")
+	})
+
+	t.Run("Profile exact 16385 byte oversize", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 1)
+		const prefix = `{"padding":"`
+		const suffix = `"}`
+		candidate.profileManifest = []byte(prefix + strings.Repeat("x", 16385-len(prefix)-len(suffix)) + suffix)
+		if len(candidate.profileManifest) != 16385 {
+			t.Fatalf("oversize Profile length=%d, want exactly 16385", len(candidate.profileManifest))
+		}
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
+			"23514", "asset_source_revisions_schema_ck")
+	})
+
+	futureHookRestored := false
+	t.Cleanup(func() {
+		if !futureHookRestored {
+			setCorrectiveMatrixInitialFutureHook(t, harness, false)
+		}
+	})
+	setCorrectiveMatrixInitialFutureHook(t, harness, true)
+
+	t.Run("typed K8S matching pair success", func(t *testing.T) {
+		candidate := newCorrectiveMatrixFutureCandidate(t, "KUBERNETES_OPERATOR")
+		typedCode := candidate.profileCode
+		preparedDigest := strings.Repeat("1", 64)
+		candidate.manifestTypedExtension = &typedCode
+		candidate.typedExtensionCode = &typedCode
+		candidate.preparedExtensionDigest = &preparedDigest
+		candidate.refreshProfileManifest()
+		requireCorrectiveMatrixCandidateCommit(t, harness.db, candidate)
+	})
+
+	t.Run("typed K8S null pair", func(t *testing.T) {
+		candidate := newCorrectiveMatrixFutureCandidate(t, "KUBERNETES_OPERATOR")
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
+			"23514", "asset_source_revisions_typed_extension_guard")
+	})
+
+	t.Run("typed K8S code only", func(t *testing.T) {
+		candidate := newCorrectiveMatrixFutureCandidate(t, "KUBERNETES_OPERATOR")
+		typedCode := candidate.profileCode
+		candidate.manifestTypedExtension = &typedCode
+		candidate.typedExtensionCode = &typedCode
+		candidate.refreshProfileManifest()
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
+			"23514", "asset_source_revisions_typed_extension_ck")
+	})
+
+	t.Run("typed K8S digest only", func(t *testing.T) {
+		candidate := newCorrectiveMatrixFutureCandidate(t, "KUBERNETES_OPERATOR")
+		preparedDigest := strings.Repeat("2", 64)
+		candidate.preparedExtensionDigest = &preparedDigest
+		candidate.refreshProfileManifest()
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
+			"23514", "asset_source_revisions_typed_extension_ck")
+	})
+
+	t.Run("typed K8S code mismatch", func(t *testing.T) {
+		candidate := newCorrectiveMatrixFutureCandidate(t, "KUBERNETES_OPERATOR")
+		typedCode := "MATRIX_K8S_OTHER_V1"
+		preparedDigest := strings.Repeat("3", 64)
+		candidate.manifestTypedExtension = &typedCode
+		candidate.typedExtensionCode = &typedCode
+		candidate.preparedExtensionDigest = &preparedDigest
+		candidate.refreshProfileManifest()
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
+			"23514", "asset_source_revisions_typed_extension_guard")
+	})
+
+	t.Run("typed AWX null pair success", func(t *testing.T) {
+		candidate := newCorrectiveMatrixFutureCandidate(t, "AWX_INVENTORY")
+		requireCorrectiveMatrixCandidateCommit(t, harness.db, candidate)
+	})
+
+	t.Run("typed AWX present pair", func(t *testing.T) {
+		candidate := newCorrectiveMatrixFutureCandidate(t, "AWX_INVENTORY")
+		typedCode := candidate.profileCode
+		preparedDigest := strings.Repeat("4", 64)
+		candidate.manifestTypedExtension = &typedCode
+		candidate.typedExtensionCode = &typedCode
+		candidate.preparedExtensionDigest = &preparedDigest
+		candidate.refreshProfileManifest()
+		expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
+			"23514", "asset_source_revisions_typed_extension_guard")
+	})
+
+	setCorrectiveMatrixInitialFutureHook(t, harness, false)
+	futureHookRestored = true
+
+	t.Run("future hook exact default restored", func(t *testing.T) {
+		var admitted bool
+		if err := harness.application.QueryRow(context.Background(), `
+			SELECT public.asset_catalog_future_source_gate_admitted(NULL::public.asset_sources)
+		`).Scan(&admitted); err != nil {
+			t.Fatalf("call restored corrective matrix future hook: %v", err)
+		}
+		if admitted {
+			t.Fatal("restored corrective matrix future hook admitted a source, want exact fail-closed default")
+		}
+		if err := assetpostgres.NewSchemaAdmission(harness.application, "public").Check(context.Background()); err != nil {
+			t.Fatalf("schema admission after restoring corrective matrix future hook: %v", err)
+		}
+	})
+
+	t.Run("opaque reference truth table", func(t *testing.T) {
+		transaction, err := harness.application.BeginTx(context.Background(), pgx.TxOptions{
+			IsoLevel: pgx.Serializable, AccessMode: pgx.ReadOnly,
+		})
+		if err != nil {
+			t.Fatalf("begin corrective matrix opaque truth-table transaction: %v", err)
+		}
+		defer func() { _ = transaction.Rollback(context.Background()) }()
+		cases := []struct {
+			name      string
+			candidate string
+			want      bool
+		}{
+			{name: "safe opaque id", candidate: "credential-ref_01.v1", want: true},
+			{name: "URL", candidate: "https://example.invalid/token", want: false},
+			{name: "DSN", candidate: "postgres://user:pass@db/prod", want: false},
+			{name: "Vault path", candidate: "kv/data/team/credential", want: false},
+			{name: "PEM", candidate: "-----BEGIN PRIVATE KEY-----", want: false},
+			{name: "Header", candidate: "Authorization: Bearer token", want: false},
+		}
+		for _, testCase := range cases {
+			var valid bool
+			if err := transaction.QueryRow(context.Background(), `
+				SELECT public.asset_catalog_opaque_reference_valid($1)
+			`, testCase.candidate).Scan(&valid); err != nil {
+				t.Fatalf("evaluate corrective matrix opaque %s: %v", testCase.name, err)
+			}
+			if valid != testCase.want {
+				t.Fatalf("opaque %s validity=%t, want %t", testCase.name, valid, testCase.want)
+			}
+		}
+		if err := transaction.Commit(context.Background()); err != nil {
+			t.Fatalf("commit corrective matrix opaque truth-table transaction: %v", err)
+		}
+	})
+
+	t.Run("opaque safe references persist", func(t *testing.T) {
+		candidate := newCorrectiveMatrixCandidate(t, 1)
+		credentialReference := "credential-ref_01.v1"
+		trustReference := "trust-anchor_02.v1"
+		networkReference := "network-policy_03.v1"
+		candidate.credentialReference = &credentialReference
+		candidate.trustReference = &trustReference
+		candidate.networkReference = &networkReference
+		candidate.refreshProfileManifest()
+		requireCorrectiveMatrixCandidateCommit(t, harness.db, candidate)
+	})
+
+	invalidOpaqueReferences := []struct {
+		name      string
+		candidate string
+		apply     func(*correctiveMatrixCandidate, *string)
+	}{
+		{
+			name:      "opaque credential URL rejected",
+			candidate: "https://example.invalid/token",
+			apply: func(candidate *correctiveMatrixCandidate, value *string) {
+				candidate.credentialReference = value
+			},
+		},
+		{
+			name:      "opaque credential DSN rejected",
+			candidate: "postgres://user:pass@db/prod",
+			apply: func(candidate *correctiveMatrixCandidate, value *string) {
+				candidate.credentialReference = value
+			},
+		},
+		{
+			name:      "opaque trust Vault path rejected",
+			candidate: "kv/data/team/credential",
+			apply: func(candidate *correctiveMatrixCandidate, value *string) {
+				candidate.trustReference = value
+			},
+		},
+		{
+			name:      "opaque trust PEM rejected",
+			candidate: "-----BEGIN PRIVATE KEY-----",
+			apply: func(candidate *correctiveMatrixCandidate, value *string) {
+				candidate.trustReference = value
+			},
+		},
+		{
+			name:      "opaque network Header rejected",
+			candidate: "Authorization: Bearer token",
+			apply: func(candidate *correctiveMatrixCandidate, value *string) {
+				candidate.networkReference = value
+			},
+		},
+	}
+	for _, testCase := range invalidOpaqueReferences {
+		t.Run(testCase.name, func(t *testing.T) {
+			candidate := newCorrectiveMatrixCandidate(t, 1)
+			value := testCase.candidate
+			testCase.apply(&candidate, &value)
+			candidate.refreshProfileManifest()
+			expectCorrectiveMatrixCandidateError(t, harness.db, candidate,
+				"23514", "asset_source_revisions_reference_ck")
+		})
+	}
+}
+
+type correctiveMatrixAuthority struct {
+	environmentID string
+	ordinal       int32
+}
+
+type correctiveMatrixForeignEnvironment struct {
+	workspaceID   string
+	environmentID string
+}
+
+type correctiveMatrixCandidate struct {
+	label                          string
+	tenantID                       string
+	workspaceID                    string
+	sourceID                       string
+	revisionID                     string
+	environmentIDs                 []string
+	foreignEnvironment             *correctiveMatrixForeignEnvironment
+	authorities                    []correctiveMatrixAuthority
+	sourceKind                     string
+	providerKind                   string
+	profileCode                    string
+	syncMode                       string
+	environmentMappingMode         string
+	integrationID                  *string
+	credentialReference            *string
+	trustReference                 *string
+	networkReference               *string
+	scheduleExpression             *string
+	manifestTypedExtension         *string
+	typedExtensionCode             *string
+	preparedExtensionDigest        *string
+	rateLimitRequests              int32
+	rateLimitWindowSeconds         int32
+	backpressureBaseSeconds        int32
+	backpressureMaxSeconds         int32
+	profileManifest                []byte
+	providerSchema                 []byte
+	authorityDigestOverride        *string
+	sourceDefinitionDigestOverride *string
+	bindingDigestOverride          *string
+}
+
+type correctiveMatrixDigests struct {
+	profileManifest string
+	providerSchema  string
+	authority       string
+	definition      string
+	binding         string
+}
+
+func newCorrectiveMatrixCandidate(t *testing.T, environmentCount int) correctiveMatrixCandidate {
+	t.Helper()
+	if environmentCount < 1 {
+		t.Fatalf("corrective matrix environment count=%d, want at least one persisted Environment", environmentCount)
+	}
+	candidate := correctiveMatrixCandidate{
+		label:                   randomAssetHex(t, 8),
+		tenantID:                correctiveMatrixUUID(t),
+		workspaceID:             correctiveMatrixUUID(t),
+		sourceID:                correctiveMatrixUUID(t),
+		revisionID:              correctiveMatrixUUID(t),
+		sourceKind:              "EXTERNAL_CMDB",
+		providerKind:            "MATRIX_EXTERNAL_V1",
+		profileCode:             "MATRIX_EXTERNAL_V1",
+		syncMode:                "ON_DEMAND",
+		rateLimitRequests:       100,
+		rateLimitWindowSeconds:  60,
+		backpressureBaseSeconds: 1,
+		backpressureMaxSeconds:  60,
+		providerSchema:          []byte(`{"additionalProperties":false,"properties":{},"type":"object"}`),
+	}
+	for range environmentCount {
+		candidate.environmentIDs = append(candidate.environmentIDs, correctiveMatrixUUID(t))
+	}
+	sort.Strings(candidate.environmentIDs)
+	for index, environmentID := range candidate.environmentIDs {
+		candidate.authorities = append(candidate.authorities, correctiveMatrixAuthority{
+			environmentID: environmentID,
+			ordinal:       int32(index + 1),
+		})
+	}
+	if environmentCount == 1 {
+		candidate.environmentMappingMode = "SINGLE_ENVIRONMENT"
+	} else {
+		candidate.environmentMappingMode = "MULTI_ENVIRONMENT"
+	}
+	candidate.refreshProfileManifest()
+	return candidate
+}
+
+func newCorrectiveMatrixFutureCandidate(t *testing.T, sourceKind string) correctiveMatrixCandidate {
+	t.Helper()
+	candidate := newCorrectiveMatrixCandidate(t, 1)
+	candidate.sourceKind = sourceKind
+	switch sourceKind {
+	case "KUBERNETES_OPERATOR":
+		candidate.providerKind = "MATRIX_K8S_V1"
+		candidate.profileCode = "MATRIX_K8S_V1"
+	case "AWX_INVENTORY":
+		candidate.providerKind = "MATRIX_AWX_V1"
+		candidate.profileCode = "MATRIX_AWX_V1"
+	default:
+		t.Fatalf("unsupported corrective matrix future Source kind %q", sourceKind)
+	}
+	candidate.refreshProfileManifest()
+	return candidate
+}
+
+func (candidate *correctiveMatrixCandidate) refreshProfileManifest() {
+	integrationMode := "NONE"
+	if candidate.integrationID != nil {
+		integrationMode = "REQUIRED"
+	}
+	credentialPurpose := "NONE"
+	if candidate.credentialReference != nil {
+		credentialPurpose = "DISCOVERY_READ"
+	}
+	trustMode := "NONE"
+	if candidate.trustReference != nil {
+		trustMode = "REQUIRED"
+	}
+	networkMode := "NONE"
+	if candidate.networkReference != nil {
+		networkMode = "REQUIRED"
+	}
+	scheduleMode := "NONE"
+	if candidate.scheduleExpression != nil {
+		scheduleMode = "REQUIRED"
+	}
+	typedExtension := "null"
+	if candidate.manifestTypedExtension != nil {
+		typedExtension = fmt.Sprintf("%q", *candidate.manifestTypedExtension)
+	}
+	candidate.profileManifest = []byte(fmt.Sprintf(
+		`{"backpressure_base_seconds":%d,"backpressure_max_seconds":%d,"compatibility_class":%q,"credential_purpose":%q,"dlp_policy_code":"ASSET_SAFE_V1","environment_mapping_mode":%q,"freshness_kind":"OBJECT_SEQUENCE","integration_mode":%q,"max_document_bytes":65536,"max_page_bytes":1048576,"max_page_items":100,"max_page_relations":100,"network_mode":%q,"parser_code":%q,"profile_code":%q,"provider_kind":%q,"rate_limit_requests":%d,"rate_limit_window_seconds":%d,"relationship_types":[],"schedule_mode":%q,"source_kind":%q,"sync_mode":%q,"trust_mode":%q,"trusted_path_codes":["MATRIX_DISPLAY_NAME"],"typed_extension_code":%s,"version":"asset-source-profile-manifest.v1"}`,
+		candidate.backpressureBaseSeconds,
+		candidate.backpressureMaxSeconds,
+		candidate.profileCode,
+		credentialPurpose,
+		candidate.environmentMappingMode,
+		integrationMode,
+		networkMode,
+		candidate.profileCode,
+		candidate.profileCode,
+		candidate.providerKind,
+		candidate.rateLimitRequests,
+		candidate.rateLimitWindowSeconds,
+		scheduleMode,
+		candidate.sourceKind,
+		candidate.syncMode,
+		trustMode,
+		typedExtension,
+	))
+}
+
+func (candidate correctiveMatrixCandidate) digests(t *testing.T) correctiveMatrixDigests {
+	t.Helper()
+	profileHash := sha256.Sum256(candidate.profileManifest)
+	providerHash := sha256.Sum256(candidate.providerSchema)
+	authorityIDs := make([]string, 0, len(candidate.authorities))
+	for _, authority := range candidate.authorities {
+		authorityIDs = append(authorityIDs, authority.environmentID)
+	}
+	sort.Strings(authorityIDs)
+	authorityFrames := [][]byte{
+		[]byte("asset-source-authority-scope.v1"),
+		[]byte(fmt.Sprintf("%d", len(authorityIDs))),
+	}
+	for _, environmentID := range authorityIDs {
+		authorityFrames = append(authorityFrames, []byte(environmentID))
+	}
+	authorityDigest := assetCatalogCorrectiveFramedDigest(authorityFrames...)
+	if candidate.authorityDigestOverride != nil {
+		authorityDigest = *candidate.authorityDigestOverride
+	}
+	definitionDigest := assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-definition.v2"),
+		[]byte(candidate.sourceKind),
+		[]byte(candidate.providerKind),
+		[]byte(candidate.profileCode),
+		profileHash[:],
+		providerHash[:],
+	)
+	if candidate.sourceDefinitionDigestOverride != nil {
+		definitionDigest = *candidate.sourceDefinitionDigestOverride
+	}
+	var preparedDigest []byte
+	if candidate.preparedExtensionDigest != nil {
+		preparedDigest = assetCatalogCorrectiveDecodeDigest(t, *candidate.preparedExtensionDigest)
+	}
+	bindingDigest := assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-revision-binding.v1"),
+		[]byte(candidate.tenantID),
+		[]byte(candidate.workspaceID),
+		[]byte(candidate.sourceID),
+		[]byte("1"),
+		assetCatalogCorrectiveDecodeDigest(t, definitionDigest),
+		correctiveMatrixOptionalBytes(candidate.integrationID),
+		[]byte(candidate.syncMode),
+		correctiveMatrixOptionalBytes(candidate.credentialReference),
+		correctiveMatrixOptionalBytes(candidate.trustReference),
+		correctiveMatrixOptionalBytes(candidate.networkReference),
+		assetCatalogCorrectiveDecodeDigest(t, authorityDigest),
+		[]byte(fmt.Sprintf("%d", candidate.rateLimitRequests)),
+		[]byte(fmt.Sprintf("%d", candidate.rateLimitWindowSeconds)),
+		[]byte(fmt.Sprintf("%d", candidate.backpressureBaseSeconds)),
+		[]byte(fmt.Sprintf("%d", candidate.backpressureMaxSeconds)),
+		[]byte(candidate.profileCode),
+		correctiveMatrixOptionalBytes(candidate.scheduleExpression),
+		correctiveMatrixOptionalBytes(candidate.typedExtensionCode),
+		preparedDigest,
+	)
+	if candidate.bindingDigestOverride != nil {
+		bindingDigest = *candidate.bindingDigestOverride
+	}
+	return correctiveMatrixDigests{
+		profileManifest: hex.EncodeToString(profileHash[:]),
+		providerSchema:  hex.EncodeToString(providerHash[:]),
+		authority:       authorityDigest,
+		definition:      definitionDigest,
+		binding:         bindingDigest,
+	}
+}
+
+func correctiveMatrixUUID(t *testing.T) string {
+	t.Helper()
+	value := make([]byte, 16)
+	if _, err := rand.Read(value); err != nil {
+		t.Fatalf("read corrective matrix UUID randomness: %v", err)
+	}
+	value[6] = (value[6] & 0x0f) | 0x40
+	value[8] = (value[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", value[:4], value[4:6], value[6:8], value[8:10], value[10:])
+}
+
+func correctiveMatrixOptionalBytes(value *string) []byte {
+	if value == nil {
+		return nil
+	}
+	return []byte(*value)
+}
+
+func correctiveMatrixOptionalValue(value *string) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func commitCorrectiveMatrixCandidate(
+	t *testing.T,
+	database *pgxpool.Pool,
+	candidate correctiveMatrixCandidate,
+) (correctiveMatrixDigests, error) {
+	t.Helper()
+	digests := candidate.digests(t)
+	transaction, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatalf("begin corrective matrix transaction: %v", err)
+	}
+	if err := insertCorrectiveMatrixCandidate(transaction, candidate, digests); err != nil {
+		if rollbackErr := transaction.Rollback(context.Background()); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			t.Fatalf("rollback rejected corrective matrix transaction: %v", rollbackErr)
+		}
+		return digests, err
+	}
+	if err := transaction.Commit(context.Background()); err != nil {
+		_ = transaction.Rollback(context.Background())
+		return digests, err
+	}
+	return digests, nil
+}
+
+func insertCorrectiveMatrixCandidate(
+	transaction pgx.Tx,
+	candidate correctiveMatrixCandidate,
+	digests correctiveMatrixDigests,
+) error {
+	ctx := context.Background()
+	if _, err := transaction.Exec(ctx, `INSERT INTO tenants (id,name) VALUES ($1,$2)`,
+		candidate.tenantID, "matrix-tenant-"+candidate.label); err != nil {
+		return fmt.Errorf("insert corrective matrix tenant: %w", err)
+	}
+	if _, err := transaction.Exec(ctx, `INSERT INTO workspaces (id,tenant_id,name) VALUES ($1,$2,$3)`,
+		candidate.workspaceID, candidate.tenantID, "matrix-workspace-"+candidate.label); err != nil {
+		return fmt.Errorf("insert corrective matrix workspace: %w", err)
+	}
+	for index, environmentID := range candidate.environmentIDs {
+		if _, err := transaction.Exec(ctx, `
+			INSERT INTO environments (id,tenant_id,workspace_id,name,kind)
+			VALUES ($1,$2,$3,$4,'PROD')
+		`, environmentID, candidate.tenantID, candidate.workspaceID,
+			fmt.Sprintf("matrix-environment-%s-%d", candidate.label, index+1)); err != nil {
+			return fmt.Errorf("insert corrective matrix Environment: %w", err)
+		}
+	}
+	if candidate.foreignEnvironment != nil {
+		if _, err := transaction.Exec(ctx, `INSERT INTO workspaces (id,tenant_id,name) VALUES ($1,$2,$3)`,
+			candidate.foreignEnvironment.workspaceID, candidate.tenantID,
+			"matrix-foreign-workspace-"+candidate.label); err != nil {
+			return fmt.Errorf("insert corrective matrix foreign Workspace: %w", err)
+		}
+		if _, err := transaction.Exec(ctx, `
+			INSERT INTO environments (id,tenant_id,workspace_id,name,kind)
+			VALUES ($1,$2,$3,$4,'PROD')
+		`, candidate.foreignEnvironment.environmentID, candidate.tenantID,
+			candidate.foreignEnvironment.workspaceID, "matrix-foreign-environment-"+candidate.label); err != nil {
+			return fmt.Errorf("insert corrective matrix foreign Environment: %w", err)
+		}
+	}
+	if _, err := transaction.Exec(ctx, `
+		INSERT INTO asset_sources (
+			id,tenant_id,workspace_id,source_kind,provider_kind,name,
+			create_idempotency_key,create_request_hash
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,repeat('a',64))
+	`, candidate.sourceID, candidate.tenantID, candidate.workspaceID,
+		candidate.sourceKind, candidate.providerKind, "matrix-source-"+candidate.label,
+		"matrix-source-"+candidate.label); err != nil {
+		return fmt.Errorf("insert corrective matrix Source: %w", err)
+	}
+	if _, err := transaction.Exec(ctx, `
+		INSERT INTO asset_source_revisions (
+			id,tenant_id,workspace_id,source_id,revision,
+			canonical_profile_manifest,profile_manifest_sha256,
+			canonical_provider_schema,canonical_provider_schema_sha256,
+			integration_id,sync_mode,authority_scope_digest,source_definition_digest,
+			canonical_revision_digest,credential_reference_id,trust_reference_id,
+			network_policy_reference_id,rate_limit_requests,rate_limit_window_seconds,
+			backpressure_base_seconds,backpressure_max_seconds,profile_code,
+			schedule_expression,typed_extension_code,prepared_extension_digest,
+			created_by,change_reason_code,expected_source_version
+		) VALUES (
+			$1,$2,$3,$4,1,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+			$17,$18,$19,$20,$21,$22,$23,$24,'matrix-reviewer','INITIAL_CREATE',1
+		)
+	`, candidate.revisionID, candidate.tenantID, candidate.workspaceID, candidate.sourceID,
+		candidate.profileManifest, digests.profileManifest, candidate.providerSchema, digests.providerSchema,
+		correctiveMatrixOptionalValue(candidate.integrationID), candidate.syncMode, digests.authority,
+		digests.definition, digests.binding, correctiveMatrixOptionalValue(candidate.credentialReference),
+		correctiveMatrixOptionalValue(candidate.trustReference), correctiveMatrixOptionalValue(candidate.networkReference),
+		candidate.rateLimitRequests, candidate.rateLimitWindowSeconds, candidate.backpressureBaseSeconds,
+		candidate.backpressureMaxSeconds, candidate.profileCode, correctiveMatrixOptionalValue(candidate.scheduleExpression),
+		correctiveMatrixOptionalValue(candidate.typedExtensionCode),
+		correctiveMatrixOptionalValue(candidate.preparedExtensionDigest)); err != nil {
+		return fmt.Errorf("insert corrective matrix Source Revision: %w", err)
+	}
+	for _, authority := range candidate.authorities {
+		if _, err := transaction.Exec(ctx, `
+			INSERT INTO asset_source_revision_authorities (
+				tenant_id,workspace_id,source_id,source_revision,environment_id,canonical_ordinal
+			) VALUES ($1,$2,$3,1,$4,$5)
+		`, candidate.tenantID, candidate.workspaceID, candidate.sourceID,
+			authority.environmentID, authority.ordinal); err != nil {
+			return fmt.Errorf("insert corrective matrix authority: %w", err)
+		}
+	}
+	return nil
+}
+
+func expectCorrectiveMatrixCandidateError(
+	t *testing.T,
+	database *pgxpool.Pool,
+	candidate correctiveMatrixCandidate,
+	state string,
+	constraint string,
+) {
+	t.Helper()
+	_, err := commitCorrectiveMatrixCandidate(t, database, candidate)
+	assertCorrectiveMatrixPostgresError(t, err, state, constraint)
+	assertCorrectiveMatrixCandidateRolledBack(t, database, candidate)
+}
+
+func assertCorrectiveMatrixPostgresError(t *testing.T, err error, state, constraint string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("corrective matrix SQL unexpectedly succeeded; want %s/%s", state, constraint)
+	}
+	var databaseError *pgconn.PgError
+	if !errors.As(err, &databaseError) {
+		t.Fatalf("corrective matrix error=%v, want PostgreSQL %s/%s", err, state, constraint)
+	}
+	if databaseError.Code != state || databaseError.ConstraintName != constraint {
+		t.Fatalf("corrective matrix error=%s/%s (%v), want %s/%s",
+			databaseError.Code, databaseError.ConstraintName, err, state, constraint)
+	}
+}
+
+func assertCorrectiveMatrixCandidateRolledBack(
+	t *testing.T,
+	database *pgxpool.Pool,
+	candidate correctiveMatrixCandidate,
+) {
+	t.Helper()
+	var tenantCount, workspaceCount, environmentCount, sourceCount, revisionCount, authorityCount int64
+	if err := database.QueryRow(context.Background(), `
+		SELECT
+			(SELECT count(*) FROM tenants WHERE id=$1),
+			(SELECT count(*) FROM workspaces WHERE tenant_id=$1),
+			(SELECT count(*) FROM environments WHERE tenant_id=$1),
+			(SELECT count(*) FROM asset_sources WHERE id=$2),
+			(SELECT count(*) FROM asset_source_revisions WHERE id=$3),
+			(SELECT count(*) FROM asset_source_revision_authorities WHERE source_id=$2)
+	`, candidate.tenantID, candidate.sourceID, candidate.revisionID).Scan(
+		&tenantCount, &workspaceCount, &environmentCount, &sourceCount, &revisionCount, &authorityCount,
+	); err != nil {
+		t.Fatalf("inspect corrective matrix rollback: %v", err)
+	}
+	if tenantCount != 0 || workspaceCount != 0 || environmentCount != 0 ||
+		sourceCount != 0 || revisionCount != 0 || authorityCount != 0 {
+		t.Fatalf("rejected corrective matrix transaction persisted rows tenant=%d workspace=%d environment=%d source=%d revision=%d authority=%d",
+			tenantCount, workspaceCount, environmentCount, sourceCount, revisionCount, authorityCount)
+	}
+}
+
+func requireCorrectiveMatrixCandidateCommit(
+	t *testing.T,
+	database *pgxpool.Pool,
+	candidate correctiveMatrixCandidate,
+) correctiveMatrixDigests {
+	t.Helper()
+	digests, err := commitCorrectiveMatrixCandidate(t, database, candidate)
+	if err != nil {
+		var databaseError *pgconn.PgError
+		if errors.As(err, &databaseError) {
+			t.Fatalf("commit corrective matrix candidate: SQLSTATE %s constraint %s: %s",
+				databaseError.Code, databaseError.ConstraintName, databaseError.Message)
+		}
+		t.Fatalf("commit corrective matrix candidate: %v", err)
+	}
+	assertCorrectiveMatrixPersistedClosure(t, database, candidate, digests)
+	return digests
+}
+
+func assertCorrectiveMatrixPersistedClosure(
+	t *testing.T,
+	database *pgxpool.Pool,
+	candidate correctiveMatrixCandidate,
+	digests correctiveMatrixDigests,
+) {
+	t.Helper()
+	var profile []byte
+	var profileDigest, providerDigest, authorityDigest, definitionDigest, bindingDigest, recomputedBinding string
+	var credentialReference, trustReference, networkReference, typedCode, preparedDigest *string
+	if err := database.QueryRow(context.Background(), `
+		SELECT canonical_profile_manifest,profile_manifest_sha256,canonical_provider_schema_sha256,
+			authority_scope_digest,source_definition_digest,canonical_revision_digest,
+			public.asset_catalog_source_revision_binding_digest(candidate_revision),
+			credential_reference_id,trust_reference_id,network_policy_reference_id,
+			typed_extension_code,prepared_extension_digest
+		FROM public.asset_source_revisions AS candidate_revision
+		WHERE candidate_revision.id=$1
+	`, candidate.revisionID).Scan(
+		&profile, &profileDigest, &providerDigest, &authorityDigest, &definitionDigest,
+		&bindingDigest, &recomputedBinding, &credentialReference, &trustReference,
+		&networkReference, &typedCode, &preparedDigest,
+	); err != nil {
+		t.Fatalf("read persisted corrective matrix closure: %v", err)
+	}
+	if string(profile) != string(candidate.profileManifest) || profileDigest != digests.profileManifest ||
+		providerDigest != digests.providerSchema || authorityDigest != digests.authority ||
+		definitionDigest != digests.definition || bindingDigest != digests.binding ||
+		recomputedBinding != digests.binding ||
+		!correctiveMatrixOptionalStringEqual(credentialReference, candidate.credentialReference) ||
+		!correctiveMatrixOptionalStringEqual(trustReference, candidate.trustReference) ||
+		!correctiveMatrixOptionalStringEqual(networkReference, candidate.networkReference) ||
+		!correctiveMatrixOptionalStringEqual(typedCode, candidate.typedExtensionCode) ||
+		!correctiveMatrixOptionalStringEqual(preparedDigest, candidate.preparedExtensionDigest) {
+		t.Fatalf("persisted corrective matrix closure drifted for source %s", candidate.sourceID)
+	}
+	var environmentIDs []string
+	var ordinals []int32
+	if err := database.QueryRow(context.Background(), `
+		SELECT pg_catalog.array_agg(environment_id::text ORDER BY canonical_ordinal),
+			pg_catalog.array_agg(canonical_ordinal ORDER BY canonical_ordinal)
+		FROM public.asset_source_revision_authorities
+		WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND source_revision=1
+	`, candidate.tenantID, candidate.workspaceID, candidate.sourceID).Scan(&environmentIDs, &ordinals); err != nil {
+		t.Fatalf("read persisted corrective matrix authorities: %v", err)
+	}
+	expectedAuthorities := append([]correctiveMatrixAuthority(nil), candidate.authorities...)
+	sort.Slice(expectedAuthorities, func(left, right int) bool {
+		return expectedAuthorities[left].ordinal < expectedAuthorities[right].ordinal
+	})
+	var expectedEnvironmentIDs []string
+	var expectedOrdinals []int32
+	for _, authority := range expectedAuthorities {
+		expectedEnvironmentIDs = append(expectedEnvironmentIDs, authority.environmentID)
+		expectedOrdinals = append(expectedOrdinals, authority.ordinal)
+	}
+	if strings.Join(environmentIDs, "\n") != strings.Join(expectedEnvironmentIDs, "\n") ||
+		fmt.Sprint(ordinals) != fmt.Sprint(expectedOrdinals) {
+		t.Fatalf("persisted corrective matrix authorities ids=%v ordinals=%v, want ids=%v ordinals=%v",
+			environmentIDs, ordinals, expectedEnvironmentIDs, expectedOrdinals)
+	}
+}
+
+func correctiveMatrixOptionalStringEqual(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func requireCorrectiveMatrixConstraintName(
+	t *testing.T,
+	database *pgxpool.Pool,
+	tableName string,
+	constraintType string,
+	columns []string,
+) string {
+	t.Helper()
+	rows, err := database.Query(context.Background(), `
+		SELECT constraint_record.conname
+		FROM pg_catalog.pg_constraint AS constraint_record
+		JOIN pg_catalog.pg_class AS relation ON relation.oid=constraint_record.conrelid
+		JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+		WHERE namespace.nspname='public'
+		  AND relation.relname=$1
+		  AND constraint_record.contype::text=$2
+		  AND ARRAY(
+			SELECT attribute.attname
+			FROM pg_catalog.unnest(constraint_record.conkey) WITH ORDINALITY AS key_column(attnum,ordinality)
+			JOIN pg_catalog.pg_attribute AS attribute
+			  ON attribute.attrelid=constraint_record.conrelid
+			 AND attribute.attnum=key_column.attnum
+			ORDER BY key_column.ordinality
+		  )::text[]=$3::text[]
+		ORDER BY constraint_record.conname COLLATE "C"
+	`, tableName, constraintType, columns)
+	if err != nil {
+		t.Fatalf("resolve corrective matrix constraint on %s%v: %v", tableName, columns, err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan corrective matrix constraint on %s%v: %v", tableName, columns, err)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate corrective matrix constraint on %s%v: %v", tableName, columns, err)
+	}
+	if len(names) != 1 {
+		t.Fatalf("constraint resolution on %s type=%s columns=%v returned %v, want exactly one",
+			tableName, constraintType, columns, names)
+	}
+	return names[0]
+}
+
+func setCorrectiveMatrixInitialFutureHook(t *testing.T, harness *assetCatalogHarness, admit bool) {
+	t.Helper()
+	body := `BEGIN
+    RETURN false;
+END;`
+	if admit {
+		body = `BEGIN
+    RETURN candidate.source_kind IN ('KUBERNETES_OPERATOR', 'AWX_INVENTORY')
+       AND candidate.gate_status = 'UNAVAILABLE'
+       AND candidate.gate_revision = 0
+       AND candidate.version = 2
+       AND candidate.published_revision IS NULL
+       AND candidate.validated_run_id IS NULL
+       AND candidate.checkpoint_revision = 0
+       AND candidate.checkpoint_version = 0;
+END;`
+	}
+	ddl := `CREATE OR REPLACE FUNCTION public.asset_catalog_future_source_gate_admitted(candidate public.asset_sources)
+RETURNS boolean AS $function$
+` + body + `
+$function$ LANGUAGE plpgsql STABLE SECURITY INVOKER
+SET search_path = pg_catalog, public, pg_temp`
+	connection, err := harness.migration.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire corrective matrix migration connection: %v", err)
+	}
+	defer connection.Release()
+	assertAssetCatalogConnectionIdentity(t, connection, "aiops_migrator")
+	transaction, err := connection.BeginTx(context.Background(), pgx.TxOptions{})
+	if err != nil {
+		t.Fatalf("begin corrective matrix hook transaction: %v", err)
+	}
+	defer func() { _ = transaction.Rollback(context.Background()) }()
+	if _, err := transaction.Exec(context.Background(), `SET LOCAL ROLE aiops_schema_owner`); err != nil {
+		t.Fatalf("set corrective matrix hook owner role: %v", err)
+	}
+	var sessionUser, currentUser string
+	if err := transaction.QueryRow(context.Background(), `SELECT session_user,current_user`).Scan(&sessionUser, &currentUser); err != nil {
+		t.Fatalf("read corrective matrix hook migration identity: %v", err)
+	}
+	if sessionUser != "aiops_migrator" || currentUser != "aiops_schema_owner" {
+		t.Fatalf("corrective matrix hook identity=session:%q current:%q, want migrator/schema owner", sessionUser, currentUser)
+	}
+	if _, err := transaction.Exec(context.Background(), ddl); err != nil {
+		t.Fatalf("replace corrective matrix future hook: %v", err)
+	}
+	if _, err := transaction.Exec(context.Background(), `RESET ROLE`); err != nil {
+		t.Fatalf("reset corrective matrix hook owner role: %v", err)
+	}
+	if err := transaction.QueryRow(context.Background(), `SELECT session_user,current_user`).Scan(&sessionUser, &currentUser); err != nil {
+		t.Fatalf("read reset corrective matrix hook migration identity: %v", err)
+	}
+	if sessionUser != "aiops_migrator" || currentUser != "aiops_migrator" {
+		t.Fatalf("reset corrective matrix hook identity=session:%q current:%q, want migrator", sessionUser, currentUser)
+	}
+	if err := transaction.Commit(context.Background()); err != nil {
+		t.Fatalf("commit corrective matrix future hook: %v", err)
+	}
+}
+
 func TestAssetCatalogMigrationCompatibility(t *testing.T) {
 	harness := newAssetCatalogHarness(t)
 	harness.applyUpThrough(t, "000014_read_evidence_clock_skew.up.sql")
