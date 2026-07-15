@@ -2,7 +2,7 @@
 
 > 更新时间：2026-07-15
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前集成基线：`origin/main@017dd1d`；最近完成 Batch：`M0-asset-domain-contract`（PR #34）；当前 Batch：`M1A-asset-governance-repository`（Pack 02 Task 3）
+> 当前集成基线：本文件所在的最新 `origin/main` 提交；最近完成 Batch：`M0-asset-domain-contract`（PR #34）；当前 Batch：`M1A-asset-governance-repository`（Pack 02 Task 3）
 
 ## 当前结论
 
@@ -103,7 +103,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 
 ## 下一步
 
-当前从 `origin/main@017dd1d` 执行 `M1A-asset-governance-repository`，只完成 Phase 1 Pack 02 Task 3：实现复合 Scope PostgreSQL Repository、MANUAL 原子治理写、幂等 replay、Audit/Outbox 同事务闭包和安全读模型。该 Batch 只消费 M0 已合并的稳定 `Produces`，不得进入 Task 4 discovery、Source mutation、API/OpenAPI、Web 或 Provider 网络能力。
+当前从最新 `origin/main` 执行 `M1A-asset-governance-repository`，只完成 Phase 1 Pack 02 Task 3：实现复合 Scope PostgreSQL Repository、MANUAL 原子治理写、幂等 replay、Audit/Outbox 同事务闭包和安全读模型。该 Batch 只消费 M0 已合并的稳定 `Produces`，不得进入 Task 4 discovery、Source mutation、API/OpenAPI、Web 或 Provider 网络能力。
 
 M1A 合并门固定为真实关键行为、受影响包、并发敏感路径定向 race、受影响 PostgreSQL 事务/回滚、G1 与一次 G2；Task 4/M1B 必须等唯一 PageCommitter 契约合并后再实现。全仓 race、全量恢复、真实 Provider、HA、安全、完整浏览器和发布演练继续归入 G3/G4。合并状态最多记为 `BUILT_CLOSED`，运行能力继续 `UNAVAILABLE`。
 
