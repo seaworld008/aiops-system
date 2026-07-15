@@ -29,7 +29,7 @@ The previous proposal to combine all Pack 02 Task 4 and Task 27 files into one `
 
 M1D has exactly two files: `internal/discoverycheckpoint/codec.go` and `codec_test.go`. It does not create `internal/discoveryqueue` or consume `LeaseFence`；existing `assetcatalog.LeaseFence` remains the exact alias of sealed `internal/leasefence.Fence` and is consumed unchanged by the later PageCommitter/Queue batches. This avoids freezing speculative Queue commands before their PostgreSQL state machine and cleanup consumers exist.
 
-The complete M1D public ABI is fixed below；fields and method signatures may not be widened in implementation:
+The complete M1D public ABI is fixed below and was merged by PR #44；fields and method signatures may not be widened in later implementation:
 
 ~~~go
 var (
@@ -89,7 +89,7 @@ Only `SealedCheckpoint` may cross the SQL persistence boundary and only `ReplayI
 
 The later Queue Batch must freeze its full method ABI together with the PostgreSQL state machine rather than in M1D. Persisted/serializable Queue commands and rows never contain a fence；the in-process `ClaimResult` is the sole Queue result allowed to carry the sealed `assetcatalog.LeaseFence`, and that result must itself reject serialization/logging. This distinction preserves Task 27's Claim handoff without creating a durable raw-token carrier.
 
-In the page mutation Batch, `PageCommitter` is the sole owner of the serializable page transaction. It consumes the concrete next `discoverysource.Checkpoint` from Worker memory, seals it outside SQL with exact `CheckpointAAD`, then begins one transaction that locks and revalidates Run/Source/revision/fence/checkpoint-before, calls the package-private PostgreSQL projection helper, derives the cursor-after hash from the sealed ciphertext, computes the page digest server-side, persists projection/ciphertext/key ID/hash/receipt/checkpoint CAS, revalidates the fence and commits once.
+The page mutation Batch first consumes [M1E0 corrective](./12-m1e0-relation-page-corrective.md)，then fast plan §12 指向的 [M1E 原子页提交任务包](./13-m1e-page-commit-transaction.md) with exactly five new files and one owner. `PageCommitter` is the sole owner of the serializable page transaction. It consumes the concrete next `discoverysource.Checkpoint` only through the existing process-local `discoverysource.Page`, seals it outside SQL with exact `CheckpointAAD`, then begins one transaction that locks and revalidates Run/Source/revision/fence/checkpoint-before, calls the package-private PostgreSQL projection helper, derives cursor-after from the sealed ciphertext, computes page/relation digests from server-owned facts, persists projection/ciphertext/key ID/hash/receipts/checkpoint CAS, revalidates the fence and commits once. Its public ABI、canonical semantic identity、empty relation page rule、error vocabulary、exact files and G2 evidence are defined only in that task pack and are not duplicated here.
 
 The old Pack 02 sketch in which `Batch` supplies `CursorAfterHash/PageDigest` and `Repository.ReconcileBatch` commits independently remains superseded. The later mutation manifest must list the exact projection/PageCommitter files under one owner with no concurrent edits；it must not pull unrelated queue/cleanup/limiter files into that review unit. No raw checkpoint、fence、`pgx.Tx` or SQL handle crosses a public interface；projection cannot commit without checkpoint, checkpoint cannot commit without projection, and neither path may open a nested transaction.
 
