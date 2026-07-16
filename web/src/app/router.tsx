@@ -6,12 +6,23 @@ import {
 } from "@tanstack/react-router";
 
 import type { components } from "@/shared/api/schema";
+import { AssetCatalogPage } from "@/features/assets/AssetCatalogPage";
+import { AssetDetailPage } from "@/features/assets/AssetDetailPage";
+import {
+  assetListHref,
+  parseAssetSearch,
+  type AssetSearch,
+} from "@/features/assets/assetSearch";
 
 import { AppShell } from "./AppShell";
 
 type Session = components["schemas"]["Session"];
 
 export function createAppRouter(session: Session) {
+  const fallback = {
+    workspace: session.workspace_ids[0] ?? "",
+    environment: session.environment_ids[0] ?? "",
+  };
   const rootRoute = createRootRoute({
     component: () => (
       <AppShell session={session}>
@@ -35,9 +46,88 @@ export function createAppRouter(session: Session) {
       </section>
     ),
   });
-  const routeTree = rootRoute.addChildren([indexRoute]);
+  const assetsRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/assets",
+    validateSearch: (search) => parseAssetSearch(search, fallback),
+    component: AssetsRoute,
+  });
+  const assetDetailRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/assets/$assetId",
+    validateSearch: (search) => parseAssetSearch(search, fallback),
+    component: AssetDetailRoute,
+  });
+
+  function AssetsRoute() {
+    const search = parseAssetSearch(
+      assetsRoute.useSearch() as unknown,
+      fallback,
+    );
+    const navigate = assetsRoute.useNavigate();
+    return (
+      <AssetCatalogPage
+        search={search}
+        onSearchChange={(next, options) => {
+          void navigate({
+            search: next,
+            replace: options?.replace ?? false,
+          });
+        }}
+        onOpenAsset={(assetId) => {
+          const next: AssetSearch = { ...search };
+          delete next.assetId;
+          void navigate({
+            to: "/assets/$assetId",
+            params: { assetId },
+            search: next,
+          });
+        }}
+      />
+    );
+  }
+
+  function AssetDetailRoute() {
+    const search = parseAssetSearch(
+      assetDetailRoute.useSearch() as unknown,
+      fallback,
+    );
+    const params = assetDetailRoute.useParams() as unknown as {
+      assetId: string;
+    };
+    const assetId = params.assetId;
+    const navigate = assetDetailRoute.useNavigate();
+    const listSearch: AssetSearch = { ...search };
+    delete listSearch.assetId;
+    return (
+      <AssetDetailPage
+        assetId={assetId}
+        search={search}
+        backHref={assetListHref(listSearch)}
+        onBack={() => {
+          void navigate({
+            to: "/assets",
+            search: listSearch,
+          });
+        }}
+        onSearchChange={(next, options) => {
+          void navigate({
+            search: next,
+            replace: options?.replace ?? false,
+          });
+        }}
+      />
+    );
+  }
+
+  const routeTree = rootRoute.addChildren([
+    indexRoute,
+    assetsRoute,
+    assetDetailRoute,
+  ]);
   return createRouter({
     routeTree,
     defaultPreload: "intent",
+    search: { strict: true },
   });
 }
