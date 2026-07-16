@@ -2,7 +2,7 @@
 
 > 更新时间：2026-07-16
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前集成基线：本文件所在的最新 `origin/main`；最近完成 Batch：`M1I-session-openapi-corrective-v2`（PR #68，代码提交 `c6ed29f`）；当前并行工作：`M1I-web-foundation-assets` Task 9 与 `M1K-credential-problem-trace-corrective`
+> 当前集成基线：本文件所在的最新 `origin/main`；最近完成 Batch：`M1K-credential-problem-trace-corrective`（PR #70，代码提交 `113af87`）；当前工作：`M1I-web-foundation-assets` Task 9
 
 ## 当前结论
 
@@ -48,6 +48,8 @@ M1J Asset Catalog Unavailable C0 已通过 PR #66 squash merge 到 `origin/main@
 
 M1I Session OpenAPI C0 已通过 PR #68 squash merge 到 `origin/main@c6ed29f`：四个精确文件为现有 authenticated `GET /api/v1/session` 发布唯一 `getSession` operation、全局 OIDC、`200/401/503` responses 与八字段 closed `Session` schema，并同步 exact path-count 和 hard-coded contract digest。可信 RED 证明缺 path、path count `13→14` 和旧 digest 漂移；受影响 OpenAPI/HTTP、fresh G1、Secret/四文件边界、commit-bound 代码地图及 GitHub 快速 `go` 1 分钟均通过，独立复核 P0/P1 为 0。该契约解除 Web Task 9 的 generated Session/Scope 入口阻塞，不表示浏览器能力已经实现或可用。
 
+M1K Credential Problem Trace C0 已通过 PR #70 squash merge 到 `origin/main@113af87`：两个精确文件把 Credential Revocation handler 的全部 4xx/5xx Problem 响应迁移到已有 request-aware trace 投影，使响应体 `trace_id` 与 `X-Trace-ID` 一致，同时保持原有 status/code/detail、`WWW-Authenticate`、`no-store` 与 `nosniff` 语义。可信 RED 覆盖 manager 缺失、认证失败、路径/媒体类型/请求体错误、全部 manager error mapping 与未知 500；受影响 unit/race、fresh G1、Secret/两文件边界、commit-bound 代码地图及 GitHub 快速 `go` 1 分钟均通过，独立复核 P0/P1 为 0。该 corrective 只关闭既有 HTTP Problem 可追踪性债务，不开放 credential、资产或执行能力。
+
 ## 当前实施进度
 
 Phase 1 Task 1 首轮 Red → Green → 独立安全复核结果仍是有效证据，范围严格限于生产资产目录的数据库基础：
@@ -77,7 +79,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 - 小文档入口：[Governed Operations Production Program](../superpowers/plans/2026-07-13-governed-operations/README.md)
 - 覆盖追踪：[规范到实施计划覆盖矩阵](../superpowers/plans/2026-07-13-governed-operations/coverage-matrix.md)
 - 版本基线：[生产规划版本基线](../superpowers/plans/2026-07-13-governed-operations/version-baseline.md)
-- 前端应用平台架构已纳入确认规划：唯一 `web/` 采用 React 19 + TypeScript 7 + Vite 8 + TanStack，固定 `app → features → shared`、OpenAPI 唯一 DTO、服务端 `effective_actions`、Go 同源 SPA/API 与单 Control Plane 镜像 `/opt/aiops/web`；智能体验只通过 Evidence/Proposal/ActionPlan/Operation/Audit 受治理链呈现。该项仍是规划事实，`web/` 与新 React 业务实现继续为 `NOT_STARTED`。
+- 前端应用平台架构已纳入确认规划：唯一 `web/` 采用 React 19 + TypeScript 7 + Vite 8 + TanStack，固定 `app → features → shared`、OpenAPI 唯一 DTO、服务端 `effective_actions`、Go 同源 SPA/API 与单 Control Plane 镜像 `/opt/aiops/web`；智能体验只通过 Evidence/Proposal/ActionPlan/Operation/Audit 受治理链呈现。`M1I-web-foundation-assets` Task 9 已从包含 Session C0 的最新主线启动，当前仅为 `BUILDING_CLOSED`。
 - Phase 5 已确认但尚未实施的安全契约：[AWX Host Identity Enrollment](../contracts/awx-host-identity-enrollment-v1.md)、[AWX Governed Launch Admission](../contracts/awx-governed-launch-admission-v1.md)、[Host Identity Attestor](../contracts/host-identity-attestor-v1.md)。它们只修正后继阶段接口，Host/AWX/PostgreSQL 实现仍为 `NOT_STARTED`。
 
 实施阶段固定为：
@@ -111,7 +113,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
 | 现有调查/执行内核 | 基线存在 | 以现有测试、迁移和 V3 文档为准 |
-| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J/Session C0）/ M1I、M1K BUILDING_CLOSED / UNAVAILABLE | Session OpenAPI 已合并，Web Task 9 从最新 main 恢复；Credential Problem trace C0 并行关闭；Source mutation、Worker、前端与真实 Provider 门仍未完成 |
+| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J/Session C0/Credential Trace C0）/ M1I BUILDING_CLOSED / UNAVAILABLE | Session OpenAPI 与 Credential Problem trace corrective 已合并；Web Task 9 从最新 main 开发中；Source mutation、Worker、前端与真实 Provider 门仍未完成 |
 | Connection 修订/验证/发布 | NOT_STARTED | 等待 Phase 2 |
 | VictoriaMetrics/Logs/Traces 全家桶 | NOT_STARTED | 等待 Phase 3 |
 | 事件/定时主动只读调查 | NOT_STARTED | 等待 Phase 4 |
@@ -119,7 +121,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | HA 生产只读路径 | NOT_STARTED | 等待 Phase 6 |
 | 四类初始受治理生产 Action | CLOSED | 等待 Phase 7 逐类型演练与 Canary |
 | 生产发布与持续运维 | NOT_STARTED | 等待 Phase 8 |
-| 新 React 前端 | NOT_STARTED | 前端应用平台架构已纳入确认规划；`web/` 与业务实现尚未开始，Phase 1 建骨架，此后随各阶段纵向交付 |
+| 新 React 前端 | BUILDING_CLOSED | Web Task 9 正在建立 `web/` 基础、OIDC/Scope application shell、共享 API/UI 与 Go same-origin SPA service；未验收前仍不可用 |
 
 ## 已知基线注意事项
 
@@ -131,8 +133,8 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 
 ## 下一步
 
-从包含 PR #68 的最新 `origin/main` 新窗口恢复 `M1I-web-foundation-assets` Task 9：消费唯一 OpenAPI 的 `getBrowserConfig/getSession` 与现有 authenticated handler，建立 `web/` 工具链、生成类型、OIDC/Scope application shell、共享 API/UI 和 Go same-origin SPA service。它不得重新修改 OpenAPI 或 Session handler。
+继续在从 `origin/main@eda6e20` 创建的独立窗口执行 `M1I-web-foundation-assets` Task 9：消费唯一 OpenAPI 的 `getBrowserConfig/getSession` 与现有 authenticated handler，建立 `web/` 工具链、生成类型、OIDC/Scope application shell、共享 API/UI 和 Go same-origin SPA service。它不得重新修改 OpenAPI、Session handler、migration 或 status；完成 G2 后再提交 PR，并在合并后从最新主线轮换新窗口。
 
-`M1K-credential-problem-trace-corrective` 只拥有 `internal/httpapi/credential_revocations.go` 与对应测试，把所有 Credential Revocation 4xx/5xx Problem 迁移到已有 request-aware trace 投影；不得修改共享 Problem、OpenAPI、Router、Web 或 status。所有关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
+`M1K-credential-problem-trace-corrective` 已合并，不再是活动轨道。后续并发只在稳定 `Consumes/Produces` 已合并且 Batch 文件所有权不重叠时启动；所有关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
 
 任何阶段出现 Scope/身份/计划/Runtime/策略/Kill Switch/credential 漂移、依赖不可用、Secret 风险或结果不确定时，保持在最后已验收状态并停止升级，不得用人工口头确认替代持久证据。
