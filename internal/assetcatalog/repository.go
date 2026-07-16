@@ -17,6 +17,7 @@ var (
 	ErrVersionConflict = errors.New("version conflict")
 	ErrStateConflict   = errors.New("state conflict")
 	ErrIdempotency     = errors.New("idempotency conflict")
+	ErrUnavailable     = errors.New("asset catalog unavailable")
 )
 
 type MutationMetadata struct {

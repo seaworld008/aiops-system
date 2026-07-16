@@ -3,6 +3,8 @@ package httpapi_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -117,6 +119,67 @@ func TestAssetCrossScopeUnknownAndNoStoreProjection(t *testing.T) {
 			t.Errorf("%s response enumerates route scope: %s", name, response.Body.String())
 		}
 		assertControlPlaneResponseHeaders(t, response)
+	}
+}
+
+func TestAssetCatalogErrorsSeparateUnavailableStateAndUnknown(t *testing.T) {
+	t.Parallel()
+
+	const traceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	tests := map[string]struct {
+		err    error
+		status int
+		code   string
+	}{
+		"unavailable": {
+			err: fmt.Errorf(
+				"SQLSTATE 08006 sensitive database detail dsn=postgres://secret endpoint=https://internal.example: %w",
+				assetcatalog.ErrUnavailable,
+			),
+			status: http.StatusServiceUnavailable,
+			code:   "asset_catalog_unavailable",
+		},
+		"state conflict": {
+			err:    assetcatalog.ErrStateConflict,
+			status: http.StatusConflict,
+			code:   "invalid_asset_state",
+		},
+		"unknown": {
+			err:    errors.New("internal program failure"),
+			status: http.StatusInternalServerError,
+			code:   "asset_catalog_failed",
+		},
+	}
+	for name, test := range tests {
+		test := test
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			manager := &recordingAssetManager{err: test.err}
+			request := httptest.NewRequest(http.MethodGet, assetTestBasePath+"/"+assetTestAssetID, nil)
+			request.Header.Set("traceparent", "00-"+traceID+"-00f067aa0ba902b7-01")
+			response := httptest.NewRecorder()
+			httpapi.NewRouter(httpapi.Dependencies{
+				Authenticator:      fakeAuthenticator{principal: assetHTTPPrincipal()},
+				Assets:             manager,
+				ControlPlaneCursor: mustControlPlaneCursorCodec(t),
+			}).ServeHTTP(response, request)
+
+			body := response.Body.String()
+			if response.Code != test.status ||
+				!strings.Contains(body, `"code":"`+test.code+`"`) ||
+				!strings.Contains(body, `"trace_id":"`+traceID+`"`) {
+				t.Fatalf("response = %d %s, want %d %s with trace", response.Code, body, test.status, test.code)
+			}
+			for _, forbidden := range []string{
+				"sqlstate", "sensitive database detail", "postgres://", "internal.example",
+				"internal program failure", assetTestAssetID, assetTestWorkspaceID, assetTestEnvironmentID,
+			} {
+				if strings.Contains(strings.ToLower(body), strings.ToLower(forbidden)) {
+					t.Errorf("response leaked %q: %s", forbidden, body)
+				}
+			}
+			assertControlPlaneResponseHeaders(t, response)
+		})
 	}
 }
 
