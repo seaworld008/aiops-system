@@ -10,6 +10,7 @@ LOCK TABLE public.tenants, public.workspaces, public.environments, public.integr
     public.services, public.service_bindings, public.audit_records, public.outbox_events,
     public.asset_sources, public.asset_source_revisions,
     public.asset_source_revision_authorities, public.asset_source_runs,
+    public.asset_source_limit_buckets, public.asset_source_limit_permits,
     public.asset_observations, public.assets, public.asset_type_details,
     public.asset_conflicts, public.asset_relationships, public.service_asset_bindings
     IN ACCESS EXCLUSIVE MODE NOWAIT;
@@ -22,6 +23,8 @@ BEGIN
        OR EXISTS (SELECT 1 FROM public.asset_type_details)
        OR EXISTS (SELECT 1 FROM public.assets)
        OR EXISTS (SELECT 1 FROM public.asset_observations)
+       OR EXISTS (SELECT 1 FROM public.asset_source_limit_permits)
+       OR EXISTS (SELECT 1 FROM public.asset_source_limit_buckets)
        OR EXISTS (SELECT 1 FROM public.asset_source_runs)
        OR EXISTS (SELECT 1 FROM public.asset_source_revision_authorities)
        OR EXISTS (SELECT 1 FROM public.asset_source_revisions)
@@ -52,11 +55,14 @@ DROP TRIGGER asset_management_audit_insert_guard ON public.audit_records;
 DROP TRIGGER asset_observations_immutable ON public.asset_observations;
 DROP TRIGGER asset_type_details_immutable ON public.asset_type_details;
 DROP TRIGGER asset_source_revision_authorities_immutable ON public.asset_source_revision_authorities;
+DROP TRIGGER asset_source_limit_permits_immutable ON public.asset_source_limit_permits;
 
 DROP TRIGGER asset_sources_delete_guard ON public.asset_sources;
 DROP TRIGGER asset_source_revisions_delete_guard ON public.asset_source_revisions;
 DROP TRIGGER asset_source_revision_authorities_delete_guard ON public.asset_source_revision_authorities;
 DROP TRIGGER asset_source_runs_delete_guard ON public.asset_source_runs;
+DROP TRIGGER asset_source_limit_buckets_delete_guard ON public.asset_source_limit_buckets;
+DROP TRIGGER asset_source_limit_permits_delete_guard ON public.asset_source_limit_permits;
 DROP TRIGGER asset_observations_delete_guard ON public.asset_observations;
 DROP TRIGGER assets_delete_guard ON public.assets;
 DROP TRIGGER asset_type_details_delete_guard ON public.asset_type_details;
@@ -68,6 +74,8 @@ DROP TRIGGER asset_sources_truncate_guard ON public.asset_sources;
 DROP TRIGGER asset_source_revisions_truncate_guard ON public.asset_source_revisions;
 DROP TRIGGER asset_source_revision_authorities_truncate_guard ON public.asset_source_revision_authorities;
 DROP TRIGGER asset_source_runs_truncate_guard ON public.asset_source_runs;
+DROP TRIGGER asset_source_limit_buckets_truncate_guard ON public.asset_source_limit_buckets;
+DROP TRIGGER asset_source_limit_permits_truncate_guard ON public.asset_source_limit_permits;
 DROP TRIGGER asset_observations_truncate_guard ON public.asset_observations;
 DROP TRIGGER assets_truncate_guard ON public.assets;
 DROP TRIGGER asset_type_details_truncate_guard ON public.asset_type_details;
@@ -80,6 +88,7 @@ DROP TRIGGER asset_conflicts_transition_guard ON public.asset_conflicts;
 DROP TRIGGER asset_relationships_mutation_guard ON public.asset_relationships;
 DROP TRIGGER asset_relationships_page_closure_guard ON public.asset_relationships;
 DROP TRIGGER service_asset_bindings_mutation_guard ON public.service_asset_bindings;
+DROP TRIGGER asset_source_limit_buckets_mutation_guard ON public.asset_source_limit_buckets;
 DROP TRIGGER asset_sources_mutation_guard ON public.asset_sources;
 DROP TRIGGER asset_sources_deferred_state_guard ON public.asset_sources;
 DROP TRIGGER asset_source_revisions_transition_guard ON public.asset_source_revisions;
@@ -111,7 +120,10 @@ DROP FUNCTION public.validate_asset_source_run_page_closure();
 DROP FUNCTION public.validate_asset_source_run_terminal_closure();
 DROP FUNCTION public.enforce_asset_observation_admission();
 DROP FUNCTION public.validate_asset_observation_page_closure();
+DROP FUNCTION public.asset_catalog_lock_exact_service_binding(uuid, uuid, uuid, uuid);
 
+ALTER TABLE public.asset_source_limit_buckets
+    DROP CONSTRAINT asset_source_limit_buckets_last_receipt_fk;
 ALTER TABLE public.asset_sources
     DROP CONSTRAINT asset_sources_published_revision_fk;
 ALTER TABLE public.asset_sources
@@ -136,6 +148,8 @@ DROP TABLE public.asset_conflicts;
 DROP TABLE public.asset_type_details;
 DROP TABLE public.assets;
 DROP TABLE public.asset_observations;
+DROP TABLE public.asset_source_limit_permits;
+DROP TABLE public.asset_source_limit_buckets;
 DROP TABLE public.asset_source_runs;
 DROP TABLE public.asset_source_revision_authorities;
 DROP TABLE public.asset_source_revisions;

@@ -16,6 +16,8 @@ func TestAssetCatalogMigrationOwnsExactTablesAndGuardsData(t *testing.T) {
 		"public.asset_source_revisions",
 		"public.asset_source_revision_authorities",
 		"public.asset_source_runs",
+		"public.asset_source_limit_buckets",
+		"public.asset_source_limit_permits",
 		"public.asset_observations",
 		"public.assets",
 		"public.asset_type_details",
@@ -30,8 +32,13 @@ func TestAssetCatalogMigrationOwnsExactTablesAndGuardsData(t *testing.T) {
 		"unique (tenant_id, workspace_id, environment_id, id)",
 		"before update on public.asset_observations",
 		"before update on public.asset_type_details",
+		"before update on public.asset_source_limit_permits",
 		"before delete on public.asset_sources",
+		"before delete on public.asset_source_limit_buckets",
 		"before truncate on public.asset_sources",
+		"before truncate on public.asset_source_limit_permits",
+		"asset_source_limit_permits_one_terminal_uk",
+		"asset_catalog_lock_exact_service_binding",
 		"constraint assets_kind_check",
 		"retired asset is terminal",
 		"unsafe asset catalog rollback: catalog state remains",
@@ -134,8 +141,8 @@ func TestAssetCatalogMigrationUsesWrapSafeSameTransactionXIDComparison(t *testin
 		t.Fatal("same-transaction closure must not reinterpret wrapped 32-bit xmin as epoch-zero xid8")
 	}
 	const wrapSafeComparison = ".xmin = pg_catalog.pg_current_xact_id()::xid"
-	if count := strings.Count(up, wrapSafeComparison); count != 18 {
-		t.Fatalf("wrap-safe same-transaction comparisons = %d, want 18", count)
+	if count := strings.Count(up, wrapSafeComparison); count != 19 {
+		t.Fatalf("wrap-safe same-transaction comparisons = %d, want 19", count)
 	}
 }
 

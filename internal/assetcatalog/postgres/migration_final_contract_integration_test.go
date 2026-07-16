@@ -87,6 +87,43 @@ func TestAssetCatalogMigrationFinalOperationalContract(t *testing.T) {
 		})
 	})
 
+	t.Run("normalized Limiter bucket and permit receipt truth", func(t *testing.T) {
+		finalRequireColumns(t, harness.db, "asset_source_limit_buckets", []string{
+			"tenant_id", "workspace_id", "bucket_kind", "bucket_key", "source_id",
+			"provider_kind", "next_token_at", "last_receipt_id", "version",
+		})
+		finalRequireExactVocabulary(t, harness.db, "asset_source_limit_buckets", "bucket_kind",
+			[]string{"SOURCE", "WORKSPACE", "PROVIDER"})
+		finalRequireConstraintTokens(t, harness.db, "asset_source_limit_buckets_scope_key_ck", []string{
+			"SOURCE", "WORKSPACE", "PROVIDER", "bucket_key", "source_id", "provider_kind",
+		})
+		finalRequireForeignKey(t, harness.db, "asset_source_limit_buckets_last_receipt_fk",
+			"asset_source_limit_permits", []string{"tenant_id", "workspace_id", "id"})
+		finalRequireConstraintTokens(t, harness.db, "asset_source_limit_buckets_last_receipt_fk",
+			[]string{"FOREIGN KEY", "tenant_id", "workspace_id", "last_receipt_id",
+				"ON DELETE RESTRICT", "DEFERRABLE"})
+		finalRequireColumns(t, harness.db, "asset_source_limit_permits", []string{
+			"permit_id", "record_kind", "source_id", "run_id", "provider_kind",
+			"source_bucket_id", "workspace_bucket_id", "provider_bucket_id",
+			"request_id", "command_sha256", "receipt_sha256", "acquired_at",
+			"expires_at", "not_before", "terminal_reason_code",
+		})
+		finalRequireExactVocabulary(t, harness.db, "asset_source_limit_permits", "record_kind",
+			[]string{"ACQUIRE", "RELEASE", "DELAY", "EXPIRE"})
+		finalRequireConstraintTokens(t, harness.db, "asset_source_limit_permits_record_shape_ck", []string{
+			"ACQUIRE", "RELEASE", "DELAY", "EXPIRE", "permit_id", "not_before",
+			"terminal_reason_code",
+		})
+		finalRequireForeignKey(t, harness.db, "asset_source_limit_permits_acquire_exact_fk",
+			"asset_source_limit_permits", []string{
+				"tenant_id", "workspace_id", "id", "source_id", "run_id", "provider_kind",
+				"source_bucket_id", "source_bucket_kind", "source_bucket_key",
+				"workspace_bucket_id", "workspace_bucket_kind", "workspace_bucket_key",
+				"provider_bucket_id", "provider_bucket_kind", "provider_bucket_key",
+				"acquired_at", "expires_at",
+			})
+	})
+
 	t.Run("observation freshness tombstone and previous chain", func(t *testing.T) {
 		finalRequireColumns(t, harness.db, "asset_observations", []string{
 			"environment_id", "source_id", "run_id", "provider_kind", "external_id",

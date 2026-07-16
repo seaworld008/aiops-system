@@ -301,7 +301,7 @@ Cache only Go modules/build and pnpm store keyed by lockfile; never cache browse
 
 - [ ] **Step 3: Exercise rolling and failure behavior**
 
-`verify-asset-ha.sh` starts two Control Plane replicas against PostgreSQL, sends concurrent idempotent create/update/sync/decision requests through a round-robin proxy, kills one replica mid-request, and asserts exactly one domain mutation/audit/outbox result. It then interrupts a Source Run, verifies durable Queue lease/fence、single-nonterminal constraint and transaction row-lock recovery, and confirms no process-local/advisory discovery ownership state is required. Transaction advisory locking remains only inside the Idempotency-Key ledger.
+`verify-asset-ha.sh` starts two Control Plane replicas against PostgreSQL, sends concurrent idempotent create/update/sync/decision requests through a round-robin proxy, kills one replica mid-request, and asserts exactly one domain mutation/audit/outbox result. It then interrupts a Source Run, verifies durable Queue lease/fence、single-nonterminal constraint and transaction row-lock recovery, and confirms no process-local/advisory discovery ownership state is required. Limiter G2 additionally drives two database sessions through the same Source/Workspace/Provider buckets, loses an Acquire/terminal response, and proves exact receipt replay、one active slot/one terminal receipt and no Source-row/Queue/advisory substitute。M1F drives concurrent legacy binding downgrade against `asset_catalog_lock_exact_service_binding` and proves the runtime function blocks the mutation while direct runtime/workload parent row locks remain `42501`。Transaction advisory locking remains only inside the Idempotency-Key ledger.
 
 Both replicas serve their own immutable hashed assets and identical Browser Config/API contracts through the same proxy Origin. The rollout test keeps N and N-1 assets available for the drain window, exercises both browser/API pairings, and forbids removal of an old asset or API shape until N-1 clients are outside the supported window.
 
@@ -320,7 +320,7 @@ missing hashed chunk: persistent safe-reload prompt; high-risk Mutation disabled
 
 - [ ] **Step 4: Automate backup and restore verification**
 
-Create sanitized fixture rows in all ten tables, audits and outbox; take `pg_dump --format=custom` plus WAL/checkpoint metadata; restore into clean PostgreSQL 18; run migrations/checks; compare counts, scoped FK closure, immutable Source Revision plus ordered authority membership/digest, typed-extension nullable pair, published pointer/checkpoint/fence state, content hashes, versions, conflict/binding state, append-only triggers and pending outbox. The script prints only aggregate counts/checksums and exits nonzero on drift.
+Create sanitized fixture rows in all twelve tables, audits and outbox; take `pg_dump --format=custom` plus WAL/checkpoint metadata; restore into clean PostgreSQL 18; run migrations/checks; compare counts, scoped FK closure, immutable Source Revision plus ordered authority membership/digest, typed-extension nullable pair, published pointer/checkpoint/fence state, independent Limiter bucket CAS and append-only permit/terminal receipts, content hashes, versions, conflict/binding state, runtime-only M1F lock definition/ACL, append-only triggers and pending outbox. The script prints only aggregate counts/checksums and exits nonzero on drift.
 
 Run:
 
@@ -383,7 +383,7 @@ Expected: FAIL because at least one persistent fact file is missing.
 
 `current.md`: date/commit/environment; completed vs planned; migrations 000001–000022 ownership; current known `.worktrees` test caveat; active risks; next executable package.
 
-`implementation-blueprint-v4.md`: four planes; source/governance field ownership; ten-table Asset/Source Revision/authority membership/Run/Observation/conflict/relation/binding model; CSV/API/CMDB/vSphere/Proxmox/OpenStack/AWS/Azure/GCP provider registry; discovery-worker lease/fence/checkpoint/backpressure; lifecycle and per-provider gates; source reconciliation sequence; API/auth/ETag/idempotency; Overview truthful readiness; Connection→Runtime→Snapshot→Grant downstream; HA/backup/metrics; explicit eventual governed production-write chain.
+`implementation-blueprint-v4.md`: four planes; source/governance field ownership; twelve-table Asset/Source Revision/authority membership/Run/Limiter bucket+permit receipt/Observation/conflict/relation/binding model; CSV/API/CMDB/vSphere/Proxmox/OpenStack/AWS/Azure/GCP provider registry; discovery-worker lease/fence/checkpoint/backpressure; runtime-only exact Service/legacy-binding lock；lifecycle and per-provider gates; source reconciliation sequence; API/auth/ETag/idempotency; Overview truthful readiness; Connection→Runtime→Snapshot→Grant downstream; HA/backup/metrics; explicit eventual governed production-write chain.
 
 `ADR 0001`: context; decision for hybrid catalog/overlay; append-only observations; explicit cross-source merge; composite scope; alternatives rejected (replace CMDB, opaque JSON runtime, name merge, browser target access); consequences; migration/rollback.
 

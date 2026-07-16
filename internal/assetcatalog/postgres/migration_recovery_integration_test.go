@@ -249,7 +249,71 @@ func verifyAuthoritativeCompletePointer(
 func seedRecoveryProjection(t *testing.T, database *pgxpool.Pool, fixture assetCatalogFixture) {
 	t.Helper()
 	execAssetSQL(t, database, `UPDATE assets SET lifecycle='ACTIVE',version=version+1 WHERE id=$1`, fixture.assetID)
+	seedRecoveryLimiterTruth(t, database, fixture)
 	seedRecoveryAuditOutbox(t, database, fixture)
+}
+
+func seedRecoveryLimiterTruth(t *testing.T, database *pgxpool.Pool, fixture assetCatalogFixture) {
+	t.Helper()
+	transaction, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatalf("begin recovery Limiter truth fixture: %v", err)
+	}
+	defer func() { _ = transaction.Rollback(context.Background()) }()
+	const (
+		sourceBucketID    = "6f000000-0000-4000-8000-000000000201"
+		workspaceBucketID = "6f000000-0000-4000-8000-000000000202"
+		providerBucketID  = "6f000000-0000-4000-8000-000000000203"
+		acquireReceiptID  = "6f100000-0000-4000-8000-000000000201"
+		releaseReceiptID  = "6f100000-0000-4000-8000-000000000202"
+		acquiredAt        = "2026-07-16T00:00:00Z"
+		expiresAt         = "2026-07-16T00:05:00Z"
+	)
+	execAssetSQL(t, transaction, `
+		INSERT INTO asset_source_limit_buckets (
+			id,tenant_id,workspace_id,bucket_kind,bucket_key,source_id,provider_kind,next_token_at
+		) VALUES
+			($1,$4,$5,'SOURCE',$6,$6,NULL,$7),
+			($2,$4,$5,'WORKSPACE',$5,NULL,NULL,$7),
+			($3,$4,$5,'PROVIDER','MANUAL_V1',NULL,'MANUAL_V1',$7)
+	`, sourceBucketID, workspaceBucketID, providerBucketID,
+		fixture.tenantID, fixture.workspaceID, fixture.sourceID, acquiredAt)
+	execAssetSQL(t, transaction, `
+		INSERT INTO asset_source_limit_permits (
+			id,tenant_id,workspace_id,permit_id,record_kind,source_id,run_id,provider_kind,
+			source_bucket_id,source_bucket_kind,source_bucket_key,
+			workspace_bucket_id,workspace_bucket_kind,workspace_bucket_key,
+			provider_bucket_id,provider_bucket_kind,provider_bucket_key,
+			request_id,command_sha256,receipt_sha256,acquired_at,expires_at,created_at
+		) VALUES (
+			$1,$2,$3,$1,'ACQUIRE',$4,$5,'MANUAL_V1',
+			$6,'SOURCE',$4,$7,'WORKSPACE',$3,$8,'PROVIDER','MANUAL_V1',
+			'recovery-limiter-acquire',repeat('1',64),repeat('2',64),$9,$10,$9
+		)
+	`, acquireReceiptID, fixture.tenantID, fixture.workspaceID, fixture.sourceID, fixture.runID,
+		sourceBucketID, workspaceBucketID, providerBucketID, acquiredAt, expiresAt)
+	updateLimiterBuckets(t, transaction, acquireReceiptID, true,
+		sourceBucketID, workspaceBucketID, providerBucketID)
+	execAssetSQL(t, transaction, `
+		INSERT INTO asset_source_limit_permits (
+			id,tenant_id,workspace_id,permit_id,record_kind,source_id,run_id,provider_kind,
+			source_bucket_id,source_bucket_kind,source_bucket_key,
+			workspace_bucket_id,workspace_bucket_kind,workspace_bucket_key,
+			provider_bucket_id,provider_bucket_kind,provider_bucket_key,
+			request_id,command_sha256,receipt_sha256,acquired_at,expires_at,terminal_reason_code
+		) VALUES (
+			$1,$2,$3,$4,'RELEASE',$5,$6,'MANUAL_V1',
+			$7,'SOURCE',$5,$8,'WORKSPACE',$3,$9,'PROVIDER','MANUAL_V1',
+			'recovery-limiter-release',repeat('3',64),repeat('4',64),$10,$11,'RECOVERY_FIXTURE'
+		)
+	`, releaseReceiptID, fixture.tenantID, fixture.workspaceID, acquireReceiptID,
+		fixture.sourceID, fixture.runID, sourceBucketID, workspaceBucketID, providerBucketID,
+		acquiredAt, expiresAt)
+	updateLimiterBuckets(t, transaction, releaseReceiptID, false,
+		sourceBucketID, workspaceBucketID, providerBucketID)
+	if err := transaction.Commit(context.Background()); err != nil {
+		t.Fatalf("commit recovery Limiter truth fixture: %v", err)
+	}
 }
 
 func verifyRestoredMutationGuards(t *testing.T, database *pgxpool.Pool, fixture assetCatalogFixture) {
@@ -264,6 +328,10 @@ func verifyRestoredMutationGuards(t *testing.T, database *pgxpool.Pool, fixture 
 		UPDATE asset_source_revision_authorities SET canonical_ordinal=canonical_ordinal+1
 		WHERE tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND source_revision=1
 	`, fixture.tenantID, fixture.workspaceID, fixture.sourceID)
+	expectAssetSQLState(t, database, "55000", `
+		UPDATE asset_source_limit_permits SET receipt_sha256=receipt_sha256
+		WHERE id='6f100000-0000-4000-8000-000000000201'
+	`)
 
 	rows := []struct {
 		table     string
@@ -275,6 +343,8 @@ func verifyRestoredMutationGuards(t *testing.T, database *pgxpool.Pool, fixture 
 		{"asset_source_revision_authorities", "tenant_id=$1 AND workspace_id=$2 AND source_id=$3 AND source_revision=1",
 			[]any{fixture.tenantID, fixture.workspaceID, fixture.sourceID}},
 		{"asset_source_runs", "id=$1", []any{fixture.runID}},
+		{"asset_source_limit_buckets", "id='6f000000-0000-4000-8000-000000000201'", nil},
+		{"asset_source_limit_permits", "id='6f100000-0000-4000-8000-000000000201'", nil},
 		{"asset_observations", "id=$1", []any{fixture.observationID}},
 		{"assets", "id=$1", []any{fixture.assetID}},
 		{"asset_type_details", "id=$1", []any{fixture.typeDetailID}},
@@ -333,7 +403,8 @@ func seedRecoveryAuditOutbox(t *testing.T, database *pgxpool.Pool, fixture asset
 func collectAssetCatalogProof(t *testing.T, database *pgxpool.Pool) map[string]recoveredTableProof {
 	t.Helper()
 	tables := []string{
-		"asset_sources", "asset_source_revisions", "asset_source_runs", "asset_observations",
+		"asset_sources", "asset_source_revisions", "asset_source_runs",
+		"asset_source_limit_buckets", "asset_source_limit_permits", "asset_observations",
 		"asset_source_revision_authorities", "assets", "asset_type_details", "asset_conflicts",
 		"asset_relationships", "service_asset_bindings",
 		"audit_records", "outbox_events",
@@ -407,6 +478,41 @@ func verifyCatalogForeignKeyClosure(t *testing.T, database *pgxpool.Pool) {
 			(SELECT count(*) FROM asset_source_runs r LEFT JOIN asset_source_revisions v
 			 ON v.tenant_id=r.tenant_id AND v.workspace_id=r.workspace_id AND v.source_id=r.source_id
 			 AND v.revision=r.source_revision AND v.canonical_revision_digest=r.source_revision_digest WHERE v.id IS NULL) +
+			(SELECT count(*) FROM asset_source_limit_buckets b LEFT JOIN workspaces w
+			 ON w.tenant_id=b.tenant_id AND w.id=b.workspace_id WHERE w.id IS NULL) +
+			(SELECT count(*) FROM asset_source_limit_buckets b LEFT JOIN asset_sources s
+			 ON s.tenant_id=b.tenant_id AND s.workspace_id=b.workspace_id AND s.id=b.source_id
+			 WHERE b.source_id IS NOT NULL AND s.id IS NULL) +
+			(SELECT count(*) FROM asset_source_limit_buckets b LEFT JOIN asset_source_limit_permits p
+			 ON p.tenant_id=b.tenant_id AND p.workspace_id=b.workspace_id AND p.id=b.last_receipt_id
+			 WHERE b.last_receipt_id IS NOT NULL AND p.id IS NULL) +
+			(SELECT count(*) FROM asset_source_limit_permits p LEFT JOIN asset_sources s
+			 ON s.tenant_id=p.tenant_id AND s.workspace_id=p.workspace_id AND s.id=p.source_id
+			 AND s.provider_kind=p.provider_kind WHERE s.id IS NULL) +
+			(SELECT count(*) FROM asset_source_limit_permits p LEFT JOIN asset_source_runs r
+			 ON r.tenant_id=p.tenant_id AND r.workspace_id=p.workspace_id AND r.source_id=p.source_id
+			 AND r.id=p.run_id WHERE r.id IS NULL) +
+			(SELECT count(*) FROM asset_source_limit_permits p LEFT JOIN asset_source_limit_buckets b
+			 ON b.tenant_id=p.tenant_id AND b.workspace_id=p.workspace_id AND b.id=p.source_bucket_id
+			 AND b.bucket_kind=p.source_bucket_kind AND b.bucket_key=p.source_bucket_key WHERE b.id IS NULL) +
+			(SELECT count(*) FROM asset_source_limit_permits p LEFT JOIN asset_source_limit_buckets b
+			 ON b.tenant_id=p.tenant_id AND b.workspace_id=p.workspace_id AND b.id=p.workspace_bucket_id
+			 AND b.bucket_kind=p.workspace_bucket_kind AND b.bucket_key=p.workspace_bucket_key WHERE b.id IS NULL) +
+			(SELECT count(*) FROM asset_source_limit_permits p LEFT JOIN asset_source_limit_buckets b
+			 ON b.tenant_id=p.tenant_id AND b.workspace_id=p.workspace_id AND b.id=p.provider_bucket_id
+			 AND b.bucket_kind=p.provider_bucket_kind AND b.bucket_key=p.provider_bucket_key WHERE b.id IS NULL) +
+			(SELECT count(*) FROM asset_source_limit_permits p LEFT JOIN asset_source_limit_permits a
+			 ON a.tenant_id=p.tenant_id AND a.workspace_id=p.workspace_id AND a.id=p.permit_id
+			 AND a.source_id=p.source_id AND a.run_id=p.run_id AND a.provider_kind=p.provider_kind
+			 AND a.source_bucket_id=p.source_bucket_id AND a.source_bucket_kind=p.source_bucket_kind
+			 AND a.source_bucket_key=p.source_bucket_key
+			 AND a.workspace_bucket_id=p.workspace_bucket_id
+			 AND a.workspace_bucket_kind=p.workspace_bucket_kind
+			 AND a.workspace_bucket_key=p.workspace_bucket_key
+			 AND a.provider_bucket_id=p.provider_bucket_id
+			 AND a.provider_bucket_kind=p.provider_bucket_kind
+			 AND a.provider_bucket_key=p.provider_bucket_key
+			 AND a.acquired_at=p.acquired_at AND a.expires_at=p.expires_at WHERE a.id IS NULL) +
 			(SELECT count(*) FROM asset_observations o LEFT JOIN environments e
 			 ON e.tenant_id=o.tenant_id AND e.workspace_id=o.workspace_id AND e.id=o.environment_id
 			 WHERE e.id IS NULL) +
@@ -515,13 +621,14 @@ func verifyCatalogForeignKeyClosure(t *testing.T, database *pgxpool.Pool) {
 		  AND constraint_record.contype='f'
 	`, []string{
 		"asset_sources", "asset_source_revisions", "asset_source_revision_authorities",
-		"asset_source_runs", "asset_observations",
+		"asset_source_runs", "asset_source_limit_buckets", "asset_source_limit_permits",
+		"asset_observations",
 		"assets", "asset_type_details", "asset_conflicts", "asset_relationships", "service_asset_bindings",
 	}).Scan(&foreignKeys, &invalidForeignKeys); err != nil {
 		t.Fatalf("verify restored foreign-key validation state: %v", err)
 	}
-	if foreignKeys != 35 || invalidForeignKeys != 0 {
-		t.Fatalf("asset catalog foreign keys=(total:%d unvalidated:%d), want (35,0)",
+	if foreignKeys != 44 || invalidForeignKeys != 0 {
+		t.Fatalf("asset catalog foreign keys=(total:%d unvalidated:%d), want (44,0)",
 			foreignKeys, invalidForeignKeys)
 	}
 }

@@ -16,7 +16,7 @@
 - 持久 Job/Run 只含 Source/Revision/Gate/Checkpoint digest、Scope、Run ID、预算、fence epoch/owner/token hash；不含 endpoint、Secret、raw Token、PEM、cursor plaintext、Header/Body 或 Provider 错误。完整 sealed `LeaseFence` 只由 Claim 返回到当前 Worker 内存，绝不进入 Job/Task/Batch/audit/log payload。
 - Raw lease token 只存 Worker 内存，DB 仅存 SHA-256；每次 reclaim 必须 `fence_epoch+1` 且旧 fence 无法 heartbeat/reconcile/checkpoint/complete。
 - Checkpoint 使用 AES-256-GCM；唯一 AAD 构造器与 typed `CheckpointAAD` 由 `internal/discoverycheckpoint` 拥有，并用 `FramedTupleV1("asset-source-checkpoint.v1",Tenant,Workspace,Source,Provider,Source definition revision,canonical revision digest,source definition digest,checkpoint key ID,Checkpoint version)` 的精确九字段顺序。key 只通过 workload secret binding 读取。持久 AAD 不含 gate revision/fence epoch/token，因为 checkpoint 必须跨 reclaim 和后续 Run 恢复且 Claim 不得制造 checkpoint 版本变更；每次 Open、Provider call、Reconcile、checkpoint 提交和 Complete 仍分别要求 exact live owner/token/epoch。Codec 必须有 golden bytes/hash、九字段逐项篡改、NULL/empty 和 key-rotation 测试。
-- 数据库持久每 source/workspace/provider 并发、token bucket、`not_before`、queue depth 和 failure streak；进程内 semaphore 只是二次保护，不是授权事实。
+- 数据库通过 `asset_source_limit_buckets` 与 append-only `asset_source_limit_permits` 分别持久每 Source/Workspace/Provider 的 token bucket 和 active permit/terminal receipt；`not_before`、queue depth 与 failure streak 仍属于 Queue/Source backpressure。进程内 semaphore 只是二次保护，不是授权事实。
 - Validation Run 可消费 `VALIDATING` revision；Discovery/Import/Ingestion Run 仅可消费 exact `PUBLISHED + ACTIVE + AVAILABLE`。任何漂移停止并关闭影响的 provider/source gate。
 - Validation Run 的 checkpoint 输入固定为空；它不得比较、解密或推进当前 published revision 的 Source checkpoint。Discovery/Import/Ingestion 才消费 exact current checkpoint；checkpoint-lineage-rollover 仅走 Pack 01 的受治理同一 Run 例外。
 - Credential open/session cleanup 是 terminal 成功的必要证据。每个 attempt 先持久化 Broker-owned opaque UUID，再允许 open；Broker 持有真实 revoke/session handle，Run/API/日志永不携带。cleanup 未知不能把 run 写为成功并必须暂停 Source gate。
@@ -118,7 +118,7 @@ This ordering is normative: receipt lookup and semantic/checkpoint replay verifi
 - Produces `Queue.Claim/Reclaim/ReclaimFinalizing/ReapDrifted/CancelIneligible/Heartbeat/AdvanceStage/ReserveCleanupAttempt/RecordCleanup/Delay/ProposeValidationResult/PrepareFailureIntent/BeginCheckpointLineageRollover/Complete/Fail` and `PageCommitter.ApplyPage(ctx, LeaseFence, Batch)` with exact sealed `LeaseFence`; raw token is never a Batch field.
 - Produces `CleanupBroker.OpenAttempt/RevokeAttempt`；only the Broker owns the revocation/session handle，while Queue stores a random opaque attempt UUID/epoch and verifies signed cleanup proof.
 - Produces `CheckpointCodec.Seal/Open` and `Limiter.Acquire/Release/Delay` bound to Source/Workspace/Provider.
-- Consumes ten-table `000015` schema, including immutable `asset_source_revision_authorities`; creates no new migration.
+- Consumes twelve-table `000015` schema, including immutable `asset_source_revision_authorities`、`asset_source_limit_buckets` and `asset_source_limit_permits`; the later Limiter Go implementation creates no migration.
 
 - [ ] **Step 1: Write failing reclaim, stale-fence, checkpoint-tamper, and global-limit tests**
 
@@ -240,7 +240,11 @@ Pack 05 `Checkpoint`/`BoundRuntime` raw access remains process-local and call-si
 
 `BeginCheckpointLineageRollover` is available only to Profiles with a closed expiry reason and a verified Adapter evidence digest. It binds that proof to the exact current fence/Run/revision/checkpoint, degrades the gate and leaves the old checkpoint untouched；the same Run must then emit an authoritative full-snapshot `Page` whose first commit CASes from the old hash into a new lineage. No API/Worker can clear、rewind or create a side Run. Recoverable Provider/transport failure cleans and delays this same Run. Only terminal `SUCCEEDED + effective complete snapshot` seals rollover and restores the gate；any terminal failure or cleanup/checkpoint uncertainty suspends it and requires a newly validated/published revision.
 
-Limiter defaults come from immutable Source Profile and are clamped by server maxima. Persist active slots and next token time using source row/CAS so two replicas cannot exceed source/Workspace/provider limits. Queue depth beyond 10,000 runs/Workspace rejects new sync with `SOURCE_BACKPRESSURE`; no run is silently dropped. Provider `Retry-After` max 60s and exponential transport backoff max 15m are persisted.
+Limiter defaults come from the exact immutable Source Profile and are clamped by fixed server maxima. `Acquire/Release/Delay` runs in one `SERIALIZABLE READ WRITE` transaction, locks the three exact bucket rows in fixed `SOURCE→WORKSPACE→PROVIDER` order, counts only unexpired ACQUIRE rows without a terminal receipt, and advances each bucket by CAS over `next_token_at/last_receipt_id/version`. The bucket table contains no Queue lease/fence、Source backpressure or aggregate active counter；active slots are the normalized permit ledger itself.
+
+`asset_source_limit_permits` is append-only. ACQUIRE is the permit identity and binds exact Scope、Source/Run/Provider、the three canonical bucket identities、request ID、command SHA、receipt SHA、acquired time and a positive database-bounded TTL；RELEASE/DELAY/EXPIRE repeats that immutable tuple and appends the sole terminal receipt for the permit. Exact request+command replay after response loss returns the stored receipt without another token/slot；changed command digest, second terminal receipt, cross-bucket/source/run/provider drift or stale acquire fails closed. Crash recovery appends EXPIRE rather than deleting or rewriting the acquire. No advisory lock、process memory、`asset_sources.next_allowed_at/consecutive_failures` or Queue row may substitute for either Limiter table.
+
+Queue depth beyond 10,000 runs/Workspace rejects new sync with `SOURCE_BACKPRESSURE`; no run is silently dropped. Provider `Retry-After` max 60s and exponential transport backoff max 15m are persisted by Queue/Source backpressure and are not Limiter bucket truth.
 
 - [ ] **Step 4: Verify PostgreSQL failover behavior and commit**
 
@@ -253,7 +257,7 @@ TEST_DATABASE_URL="$TEST_DATABASE_URL" \
   go test -race ./internal/discoveryqueue/postgres ./internal/discoverylimit/postgres -run Integration -count=1
 ~~~
 
-Expected: PASS for concurrent claims, lease expiry/reclaim, stale fence at every boundary, crash-before/after-page commit, crash after `RecordCleanup` but before `Delay|Complete|Fail`, exact attempt/terminal receipt recovery, checkpoint tamper/rotation, global limit across replicas, Provider/transport delay, queue overflow and PostgreSQL reconnect.
+Expected: PASS for concurrent claims, lease expiry/reclaim, stale fence at every boundary, crash-before/after-page commit, crash after `RecordCleanup` but before `Delay|Complete|Fail`, exact attempt/terminal receipt recovery, checkpoint tamper/rotation, Source/Workspace/Provider bucket concurrency and response-loss replay across replicas, Provider/transport delay, queue overflow and PostgreSQL reconnect.
 
 ~~~bash
 git add internal/discoveryqueue internal/discoverycheckpoint internal/discoverylimit internal/discoverycleanup

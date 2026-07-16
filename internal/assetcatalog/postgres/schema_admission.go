@@ -19,7 +19,7 @@ const AssetCatalogUnavailableCode = "asset_catalog_unavailable"
 
 // Reviewed from migrations 000001-000015 on PostgreSQL 18.4. The manifest
 // deliberately normalizes compatible PostgreSQL 18.x patch versions.
-const assetCatalogSchemaManifestSHA256 = "1f5ed31f7f16bcbfa5baeafeb52aaeaf6859fde0643f9cde6f6a7cdbc44c676c"
+const assetCatalogSchemaManifestSHA256 = "1d1bf972e6314e1ddd4c0b4d6a44b010667701417386948c486b2551bd8b63a5"
 
 var ErrAssetCatalogUnavailable = errors.New(AssetCatalogUnavailableCode)
 
@@ -250,6 +250,8 @@ owned_table_names(name) AS (
         ('asset_source_revisions'),
         ('asset_source_revision_authorities'),
         ('asset_source_runs'),
+        ('asset_source_limit_buckets'),
+        ('asset_source_limit_permits'),
         ('asset_observations'),
         ('assets'),
         ('asset_type_details'),
@@ -276,6 +278,8 @@ authorization_relation_names(name) AS (
         ('asset_source_revisions'::text),
         ('asset_source_revision_authorities'::text),
         ('asset_source_runs'::text),
+        ('asset_source_limit_buckets'::text),
+        ('asset_source_limit_permits'::text),
         ('asset_observations'::text),
         ('assets'::text),
         ('asset_type_details'::text),
@@ -656,6 +660,7 @@ owned_function_names(name) AS (
         ('asset_catalog_opaque_reference_valid'::text),
         ('asset_catalog_future_source_gate_admitted'::text),
         ('asset_catalog_source_revision_binding_digest'::text),
+        ('asset_catalog_lock_exact_service_binding'::text),
         ('validate_asset_management_audit_insert'::text),
         ('reject_asset_catalog_immutable'::text),
         ('reject_asset_catalog_delete'::text),

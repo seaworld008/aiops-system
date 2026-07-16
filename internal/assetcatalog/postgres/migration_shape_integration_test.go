@@ -28,6 +28,18 @@ func TestAssetCatalogMigrationFinalColumnShape(t *testing.T) {
 			"cleanup_status", "cleanup_digest", "terminal_failure_override",
 			"terminal_failure_override_digest", "terminal_command_sha256",
 		},
+		"asset_source_limit_buckets": {
+			"bucket_kind", "bucket_key", "source_id", "provider_kind", "next_token_at",
+			"last_receipt_id", "version", "created_at", "updated_at",
+		},
+		"asset_source_limit_permits": {
+			"permit_id", "record_kind", "source_id", "run_id", "provider_kind",
+			"source_bucket_id", "source_bucket_kind", "source_bucket_key",
+			"workspace_bucket_id", "workspace_bucket_kind", "workspace_bucket_key",
+			"provider_bucket_id", "provider_bucket_kind", "provider_bucket_key",
+			"request_id", "command_sha256", "receipt_sha256", "acquired_at", "expires_at",
+			"not_before", "terminal_reason_code", "created_at",
+		},
 		"asset_observations": {
 			"canonical_revision_digest", "source_definition_digest", "freshness_kind",
 			"freshness_order_time", "freshness_order_sequence", "provider_version_sha256",
@@ -116,6 +128,11 @@ func TestAssetCatalogMigrationFinalNamedConstraintsAndIndexes(t *testing.T) {
 		"asset_sources_last_complete_snapshot_run_fk",
 		"asset_source_runs_nonterminal_uk",
 		"asset_source_runs_cleanup_reclaim_idx",
+		"asset_source_limit_buckets_scope_key_uk",
+		"asset_source_limit_buckets_last_receipt_fk",
+		"asset_source_limit_permits_workspace_request_uk",
+		"asset_source_limit_permits_one_terminal_uk",
+		"asset_source_limit_permits_active_lookup_idx",
 	} {
 		var present bool
 		if err := harness.db.QueryRow(context.Background(), `

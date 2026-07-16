@@ -104,9 +104,11 @@ It validates the four roles, two memberships, database/schema ACL, exact relatio
 
 ## Object ACL after `000015`
 
-All ten Asset Catalog relations and all ordinary functions are owned by `aiops_schema_owner`. Runtime receives only the reviewed relation/column privileges and the exact 17 pure function signatures. PUBLIC function `EXECUTE` is revoked on all 35 functions. Trigger/transition routines remain owner-only. Workload has no direct object ACL and consumes only inherited runtime rights.
+All twelve Asset Catalog relations and all ordinary functions are owned by `aiops_schema_owner`. Runtime receives only the reviewed relation/column privileges, the exact 17 pure function signatures, and the one fixed `public.asset_catalog_lock_exact_service_binding(uuid,uuid,uuid,uuid)` entry point. PUBLIC function `EXECUTE` is revoked on all 36 functions. Trigger/transition routines remain owner-only. Workload has no direct object ACL and consumes only inherited runtime rights.
 
-The four predecessor read surfaces are exactly `workspaces`, `environments`, `services`, and `service_bindings`; runtime gets `SELECT` there and no direct ACL on `tenants` or `integrations`. Audit/Outbox use the reviewed column-level INSERT/UPDATE surfaces. Asset/Audit/Outbox `DELETE` and `TRUNCATE`, unlisted columns, database/schema `CREATE`, and TEMP remain absent.
+The four predecessor read surfaces are exactly `workspaces`, `environments`, `services`, and `service_bindings`; runtime gets `SELECT` there and no direct ACL on `tenants` or `integrations`. It receives no `UPDATE`, grant option, or direct row-lock capability on `services`/`service_bindings`：direct `FOR KEY SHARE|FOR SHARE|FOR UPDATE` must return `42501`。The sole parent-lock path is the strict、non-overloaded、`VOLATILE PARALLEL UNSAFE SECURITY DEFINER` function above, owned by `aiops_schema_owner` with `search_path=pg_catalog, public, pg_temp`; it requires a `SERIALIZABLE READ WRITE` transaction and locks exact Service `FOR KEY SHARE` before exact legacy binding `FOR SHARE`, requiring `mapping_status='EXACT'`.
+
+Runtime gets `SELECT,INSERT` on `asset_source_limit_buckets` plus column-only `UPDATE(next_token_at,last_receipt_id,version,updated_at)` and `SELECT,INSERT` on append-only `asset_source_limit_permits`; it gets no table-wide bucket UPDATE and no permit UPDATE. Audit/Outbox use the reviewed column-level INSERT/UPDATE surfaces. Asset/Audit/Outbox/Limiter `DELETE` and `TRUNCATE`, unlisted columns, database/schema `CREATE`, and TEMP remain absent.
 
 ## Extension-owner ABI
 

@@ -68,12 +68,30 @@ func TestAssetCatalogSchemaAdmissionRejectsCatalogDrift(t *testing.T) {
 			mutation: `GRANT DELETE ON TABLE assets TO aiops_control_plane_runtime`,
 		},
 		{
+			name:     "broad Limiter bucket update",
+			mutation: `GRANT UPDATE ON TABLE asset_source_limit_buckets TO aiops_control_plane_runtime`,
+		},
+		{
+			name:     "parent relation update",
+			mutation: `GRANT UPDATE ON TABLE service_bindings TO aiops_control_plane_runtime`,
+		},
+		{
 			name:     "column acl",
 			mutation: `GRANT UPDATE (details) ON TABLE audit_records TO aiops_control_plane_runtime`,
 		},
 		{
 			name:     "function acl",
 			mutation: `GRANT EXECUTE ON FUNCTION reject_asset_catalog_immutable() TO PUBLIC`,
+		},
+		{
+			name: "runtime parent lock ACL",
+			mutation: `GRANT EXECUTE ON FUNCTION
+				asset_catalog_lock_exact_service_binding(uuid,uuid,uuid,uuid) TO PUBLIC`,
+		},
+		{
+			name: "runtime parent lock security",
+			mutation: `ALTER FUNCTION
+				asset_catalog_lock_exact_service_binding(uuid,uuid,uuid,uuid) SECURITY INVOKER`,
 		},
 		{
 			name:     "schema acl",
