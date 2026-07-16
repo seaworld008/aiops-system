@@ -6,7 +6,7 @@
 
 **Architecture:** `web/` 是唯一前端，遵循 `app → features → shared` 单向依赖；Go Control Plane 同源提供 `/api/*` 与 `web/dist`，生产不运行 Node。入口先读取匿名 `/api/v1/browser-config`，再注入 `keycloak-js` 内存 Token Provider；OpenAPI 生成唯一 API 类型，页面只消费安全 DTO 与 `effective_actions`。
 
-**Tech Stack:** Node.js 24、pnpm 10.34.0、React 19.2.7、Vite 8.1.4、TypeScript 7.0.2、TanStack Router/Query/Table、React Hook Form、Zod、Radix、lucide-react 1.24.0、keycloak-js 26.2.4、CSS Modules、Vitest、MSW。
+**Tech Stack:** Node.js 24、pnpm 10.34.0、React 19.2.7、Vite 8.1.4、TypeScript 5.9.3、TanStack Router/Query/Table、React Hook Form、Zod、Radix、lucide-react 1.24.0、keycloak-js 26.2.4、CSS Modules、Vitest、MSW。
 
 ## Global Constraints
 
@@ -158,7 +158,7 @@ Create `web/package.json`:
     "jsdom": "29.1.1",
     "msw": "2.15.0",
     "openapi-typescript": "7.13.0",
-    "typescript": "7.0.2",
+    "typescript": "5.9.3",
     "typescript-eslint": "8.63.0",
     "vite": "8.1.4",
     "vitest": "4.1.10"

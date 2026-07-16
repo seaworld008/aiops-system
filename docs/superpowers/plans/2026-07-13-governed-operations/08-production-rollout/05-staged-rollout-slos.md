@@ -6,7 +6,7 @@
 
 **Architecture:** A durable rollout controller consumes release-transition outbox events, computes immutable wave membership, evaluates server-owned SLO/gate windows and proposes transitions. It may automatically hold a wave and activate the applicable Kill Switch, but promotion and production rollback remain explicit independently approved decisions. A dense operations page renders the same server projection without deriving roles, gates or health in the browser.
 
-**Tech Stack:** Go 1.26.5, PostgreSQL 18.4+, Temporal, existing outbox and Kill Switch services, Prometheus-compatible metrics/alert rules, VictoriaMetrics/VictoriaLogs/VictoriaTraces dashboards, OpenAPI-generated React 19.2.7/TanStack clients, TypeScript 7.0.2, Vitest/MSW, Playwright and axe.
+**Tech Stack:** Go 1.26.5, PostgreSQL 18.4+, Temporal, existing outbox and Kill Switch services, Prometheus-compatible metrics/alert rules, VictoriaMetrics/VictoriaLogs/VictoriaTraces dashboards, OpenAPI-generated React 19.2.7/TanStack clients, TypeScript 5.9.3, Vitest/MSW, Playwright and axe.
 
 ## Global Constraints
 

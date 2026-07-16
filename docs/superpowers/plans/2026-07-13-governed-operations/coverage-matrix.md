@@ -107,7 +107,7 @@ Database / Domain
 
 前端共同基线：
 
-- 唯一工程 `web/`；Node 24、pnpm 10、React 19.2.7、TypeScript 7.0.2、Vite 8.1.4、TanStack Router/Query/Table；Vite 只用于构建和本地开发。
+- 唯一工程 `web/`；Node 24、pnpm 10、React 19.2.7、TypeScript 5.9.3、Vite 8.1.4、TanStack Router/Query/Table；Vite 只用于构建和本地开发。
 - 唯一公共契约 `api/openapi/control-plane-v1.yaml`，唯一生成文件 `web/src/shared/api/schema.d.ts`。
 - Keycloak Authorization Code + PKCE、`login-required`、Token 仅内存，请求前刷新；启动前读取 `/api/v1/browser-config`，缺失、畸形或含非公开字段即 fail closed。
 - `app → features → shared` 单向依赖；仅 `shared/api` 发网络请求并使用 OpenAPI 生成的 operation/path 类型。

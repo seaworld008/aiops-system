@@ -6,7 +6,7 @@
 
 **Architecture:** OpenAPI 3.1 是浏览器唯一契约；HTTP 只调用前四包的应用服务并返回 `effective_actions`。ActionPlan 创建端点接受最小 `SealIntent` 和独立 Idempotency-Key header；Service 在一个 serializable PostgreSQL transaction 内通过 Phase 4 `HandoffLoader` 重载 Proposal/Catalog/Evidence/Snapshot、解析其余可信事实并 `CreateInTx` 封存。React 使用 TanStack Router URL 状态、Query server state、generated types 和 Operation polling；复杂安全状态以结构化面板/时间线呈现，不使用聊天、终端或任意 JSON 编辑器。
 
-**Tech Stack:** Go 1.26.5、chi v5、OIDC、OpenAPI 3.1、React 19.2.7、TypeScript 7.0.2、Vite 8.1.4、TanStack Router/Query/Table、React Hook Form、Zod、Radix UI、Lucide、CSS Variables/Modules、MSW 2.15.0、Vitest 4.1.10。
+**Tech Stack:** Go 1.26.5、chi v5、OIDC、OpenAPI 3.1、React 19.2.7、TypeScript 5.9.3、Vite 8.1.4、TanStack Router/Query/Table、React Hook Form、Zod、Radix UI、Lucide、CSS Variables/Modules、MSW 2.15.0、Vitest 4.1.10。
 
 ## Global Constraints
 

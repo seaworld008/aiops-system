@@ -6,7 +6,7 @@
 
 **Architecture:** PostgreSQL 是授权、rollout、gate evidence 与 decision 的事实源；Temporal 只负责编排 ID/摘要；Keycloak 负责人的 OIDC 身份；Vault/PKI 通过 Kubernetes workload identity 提供短期服务证书与 READ 凭据；独立 Control Plane、Control Worker、Outbox、Scheduler、Discovery Worker、Gateway、Validation Runner、READ Runner 多副本运行。AWX capability 另消费 Phase 5 已交付的 governed AWX image、HA EnrollmentCleanupBroker/L7 gateway 和 host-local attestor，并以同一 platform revision 锁定其内容摘要。所有组件以内容寻址 platform revision 和 Helm/image lock 部署，Gateway 在四边界继续复验 Grant/Runtime/Realm/Kill Switch；生产写链在代码、配置、chart、网络、身份、凭据和 API 六层关闭。
 
-**Tech Stack:** Go 1.26.5、PostgreSQL 18.4+、Temporal Go SDK 1.46.0、Temporal Service、Keycloak Server 26.6.3/keycloak-js 26.2.4、HashiCorp Vault Kubernetes Auth/PKI/Transit、Kubernetes 1.36.2、Helm 3、OpenAPI 3.1、OpenTelemetry/Prometheus/Alertmanager/Grafana、S3-compatible immutable evidence/backup store、Node.js 24、pnpm 10.34.0、React 19.2.7、TypeScript 7.0.2、Vite 8.1.4、Playwright 1.61.1、axe-core 4.12.1、k6、RFC 8785 JCS/SHA-256。
+**Tech Stack:** Go 1.26.5、PostgreSQL 18.4+、Temporal Go SDK 1.46.0、Temporal Service、Keycloak Server 26.6.3/keycloak-js 26.2.4、HashiCorp Vault Kubernetes Auth/PKI/Transit、Kubernetes 1.36.2、Helm 3、OpenAPI 3.1、OpenTelemetry/Prometheus/Alertmanager/Grafana、S3-compatible immutable evidence/backup store、Node.js 24、pnpm 10.34.0、React 19.2.7、TypeScript 5.9.3、Vite 8.1.4、Playwright 1.61.1、axe-core 4.12.1、k6、RFC 8785 JCS/SHA-256。
 
 ## Global Constraints
 

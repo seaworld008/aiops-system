@@ -6,7 +6,7 @@
 
 **Architecture:** Control Plane 用一个只读 aggregation service 查询当前 Tenant/Workspace/Environment 的安全计数、门禁、证据时间和功能就绪度；每个维度独立返回 `NOT_STARTED|UNAVAILABLE|PARTIAL|AVAILABLE|DEGRADED|SUSPENDED`，不把下游表不存在当作零错误或成功。React 页使用高密度状态带、工作队列和新鲜度表，只消费 API `effective_actions`。
 
-**Tech Stack:** Go 1.26.5、PostgreSQL 18.4、OpenAPI 3.1、React 19.2.7、TypeScript 7.0.2、TanStack Query/Router、CSS Modules、Keycloak Server 26.6.3、keycloak-js 26.2.4、Playwright 1.61.1、axe 4.12.1。
+**Tech Stack:** Go 1.26.5、PostgreSQL 18.4、OpenAPI 3.1、React 19.2.7、TypeScript 5.9.3、TanStack Query/Router、CSS Modules、Keycloak Server 26.6.3、keycloak-js 26.2.4、Playwright 1.61.1、axe 4.12.1。
 
 ## Global Constraints
 
