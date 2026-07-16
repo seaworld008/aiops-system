@@ -11,10 +11,18 @@ import (
 )
 
 const (
-	contractTestAssetID = "11111111-1111-4111-8111-111111111111"
-	contractTestDigest  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	contractTestTraceID = "0123456789abcdef0123456789abcdef"
+	contractTestAssetID            = "11111111-1111-4111-8111-111111111111"
+	contractTestDigest             = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	contractTestTraceID            = "0123456789abcdef0123456789abcdef"
+	contractTestControlPlaneDigest = "sha256:f90439561a1b0fb266dd8f2a8f08f15d97421851ae2857e461981c2d6cadfab3"
 )
+
+func TestControlPlaneContractDigestPinsSessionContractRevision(t *testing.T) {
+	t.Parallel()
+	if got := ControlPlaneContractDigest(); got != contractTestControlPlaneDigest {
+		t.Fatalf("ControlPlaneContractDigest() = %q, want %q", got, contractTestControlPlaneDigest)
+	}
+}
 
 func TestDecodeStrictJSONRejectsDuplicateUnknownTrailingAndNonObjectValues(t *testing.T) {
 	t.Parallel()
