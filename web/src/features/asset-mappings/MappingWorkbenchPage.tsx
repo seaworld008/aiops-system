@@ -230,7 +230,14 @@ export function MappingWorkbenchPage({
     decision: ConflictDecision,
     conflicts: readonly AssetConflict[],
   ) => {
-    if (!desktopGovernance || scopeResolutionClosed) {
+    if (
+      !desktopGovernance ||
+      scopeResolutionClosed ||
+      (decision === "CONFIRM_EXACT" &&
+        conflicts.some(
+          (conflict) => conflict.candidate_service === null,
+        ))
+    ) {
       return;
     }
     setResults([]);
@@ -369,17 +376,23 @@ export function MappingWorkbenchPage({
                       className={styles.decisionActions}
                       aria-label="显式映射决定"
                     >
-                      <button
-                        type="button"
-                        onClick={() => {
-                          openDialog(
-                            "CONFIRM_EXACT",
-                            [selectedConflict],
-                          );
-                        }}
-                      >
-                        确认精确映射
-                      </button>
+                      {selectedConflict.candidate_service === null ? (
+                        <p role="status" className={styles.readOnly}>
+                          服务端未提供候选 Service；确认精确映射保持关闭，不会猜测目标。
+                        </p>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            openDialog(
+                              "CONFIRM_EXACT",
+                              [selectedConflict],
+                            );
+                          }}
+                        >
+                          确认精确映射
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => {

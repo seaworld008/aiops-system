@@ -407,6 +407,33 @@ describe("MappingWorkbenchPage", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("无候选 Service 时关闭确认精确映射并保留其他显式决定", async () => {
+    renderWorkbench({
+      ...conflictPage,
+      items: [{ ...baseConflict, candidate_service: null }],
+    });
+
+    expect(
+      await screen.findByText(
+        "服务端未提供候选 Service；确认精确映射保持关闭，不会猜测目标。",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", {
+        name: "确认精确映射",
+      }),
+    ).not.toBeInTheDocument();
+    for (const label of [
+      "拒绝候选",
+      "保持未解析",
+      "隔离资产",
+    ]) {
+      expect(
+        screen.getByRole("button", { name: label }),
+      ).toBeEnabled();
+    }
+  });
+
   it("窄屏只提供安全比较且不暴露单项或 batch mutation", async () => {
     vi.stubGlobal(
       "matchMedia",
