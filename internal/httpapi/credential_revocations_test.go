@@ -3,6 +3,7 @@ package httpapi_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,6 +22,7 @@ const (
 	httpEnvironmentID = "22222222-2222-4222-8222-222222222222"
 	httpRevocationID  = "33333333-3333-4333-8333-333333333333"
 	httpManagementURL = "/api/v1/workspaces/" + httpWorkspaceID + "/environments/" + httpEnvironmentID + "/credential-revocations"
+	httpTraceparent   = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
 )
 
 func TestCredentialRevocationListUsesSafeNoStoreProjection(t *testing.T) {
@@ -203,6 +205,138 @@ func TestCredentialRevocationConfirmationUsesStrictBoundedJSON(t *testing.T) {
 	})
 }
 
+func TestCredentialRevocationProblemsCarryRequestTraceAcrossHandlerFailures(t *testing.T) {
+	t.Parallel()
+
+	confirmationPath := httpManagementURL + "/" + httpRevocationID + "/external-confirmations"
+	tests := []struct {
+		name         string
+		deps         httpapi.Dependencies
+		method       string
+		path         string
+		body         string
+		contentTypes []string
+		wantStatus   int
+		wantCode     string
+		wantDetail   string
+	}{
+		{
+			name: "manager nil",
+			deps: httpapi.Dependencies{
+				Authenticator: fakeAuthenticator{principal: validHTTPPrincipal(authn.RoleAdmin)},
+			},
+			method: http.MethodGet, path: httpManagementURL,
+			wantStatus: http.StatusServiceUnavailable, wantCode: "credential_revocation_management_unavailable",
+			wantDetail: "Credential revocation management is unavailable",
+		},
+		{
+			name:   "authentication unavailable",
+			deps:   httpapi.Dependencies{},
+			method: http.MethodGet, path: httpManagementURL,
+			wantStatus: http.StatusServiceUnavailable, wantCode: "authentication_unavailable",
+			wantDetail: "OIDC authentication is unavailable",
+		},
+		{
+			name: "authentication required",
+			deps: httpapi.Dependencies{
+				Authenticator:         fakeAuthenticator{err: authn.ErrUnauthenticated},
+				CredentialRevocations: &credentialManagerStub{},
+			},
+			method: http.MethodGet, path: httpManagementURL,
+			wantStatus: http.StatusUnauthorized, wantCode: "authentication_required",
+			wantDetail: "A valid OIDC bearer token is required",
+		},
+		{
+			name: "list query parse",
+			deps: httpapi.Dependencies{
+				Authenticator:         fakeAuthenticator{principal: validHTTPPrincipal(authn.RoleSRE)},
+				CredentialRevocations: &credentialManagerStub{},
+			},
+			method: http.MethodGet, path: httpManagementURL + "?limit=0",
+			wantStatus: http.StatusBadRequest, wantCode: "invalid_credential_revocation_request",
+			wantDetail: "Credential revocation management request is invalid",
+		},
+		{
+			name: "item path parse",
+			deps: httpapi.Dependencies{
+				Authenticator:         fakeAuthenticator{principal: validHTTPPrincipal(authn.RoleSRE)},
+				CredentialRevocations: &credentialManagerStub{},
+			},
+			method: http.MethodGet, path: httpManagementURL + "/NOT-A-UUID",
+			wantStatus: http.StatusBadRequest, wantCode: "invalid_credential_revocation_request",
+			wantDetail: "Credential revocation management request is invalid",
+		},
+		{
+			name: "requeue body",
+			deps: httpapi.Dependencies{
+				Authenticator:         fakeAuthenticator{principal: validHTTPPrincipal(authn.RoleAdmin)},
+				CredentialRevocations: &credentialManagerStub{},
+			},
+			method: http.MethodPost, path: httpManagementURL + "/" + httpRevocationID + "/requeues", body: "{}",
+			wantStatus: http.StatusBadRequest, wantCode: "invalid_credential_revocation_request",
+			wantDetail: "Credential revocation management request is invalid",
+		},
+		{
+			name: "confirmation media",
+			deps: httpapi.Dependencies{
+				Authenticator:         fakeAuthenticator{principal: validHTTPPrincipal(authn.RoleSRE)},
+				CredentialRevocations: &credentialManagerStub{},
+			},
+			method: http.MethodPost, path: confirmationPath, body: "{}",
+			wantStatus: http.StatusUnsupportedMediaType, wantCode: "unsupported_media_type",
+			wantDetail: "Content-Type must be application/json",
+		},
+		{
+			name: "confirmation duplicate media",
+			deps: httpapi.Dependencies{
+				Authenticator:         fakeAuthenticator{principal: validHTTPPrincipal(authn.RoleSRE)},
+				CredentialRevocations: &credentialManagerStub{},
+			},
+			method: http.MethodPost, path: confirmationPath, body: "{}",
+			contentTypes: []string{"application/json", "application/json"},
+			wantStatus:   http.StatusUnsupportedMediaType, wantCode: "unsupported_media_type",
+			wantDetail: "Content-Type must be application/json",
+		},
+		{
+			name: "confirmation body",
+			deps: httpapi.Dependencies{
+				Authenticator:         fakeAuthenticator{principal: validHTTPPrincipal(authn.RoleSRE)},
+				CredentialRevocations: &credentialManagerStub{},
+			},
+			method: http.MethodPost, path: confirmationPath, body: "{}",
+			contentTypes: []string{"application/json"},
+			wantStatus:   http.StatusBadRequest, wantCode: "invalid_credential_revocation_request",
+			wantDetail: "Credential revocation management request is invalid",
+		},
+		{
+			name: "confirmation too large",
+			deps: httpapi.Dependencies{
+				Authenticator:         fakeAuthenticator{principal: validHTTPPrincipal(authn.RoleSRE)},
+				CredentialRevocations: &credentialManagerStub{},
+			},
+			method: http.MethodPost, path: confirmationPath,
+			body:         `{"evidence_hash":"` + strings.Repeat("a", 4097) + `"}`,
+			contentTypes: []string{"application/json"},
+			wantStatus:   http.StatusRequestEntityTooLarge, wantCode: "payload_too_large",
+			wantDetail: "Credential revocation confirmation exceeds 4 KiB",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, test.path, strings.NewReader(test.body))
+			for _, contentType := range test.contentTypes {
+				request.Header.Add("Content-Type", contentType)
+			}
+			response := httptest.NewRecorder()
+			httpapi.NewRouter(test.deps).ServeHTTP(response, request)
+			assertCredentialManagementProblem(
+				t, response, test.wantStatus, test.wantCode, test.wantDetail,
+			)
+		})
+	}
+}
+
 func TestCredentialRevocationListParsesStrictKeysetCursorAndFilters(t *testing.T) {
 	t.Parallel()
 
@@ -280,36 +414,115 @@ func TestCredentialRevocationPathsRequireCanonicalUUIDs(t *testing.T) {
 func TestCredentialRevocationErrorsUseUniformProblemMapping(t *testing.T) {
 	t.Parallel()
 
-	tests := map[string]struct {
+	tests := []struct {
+		name       string
 		err        error
 		wantStatus int
 		wantCode   string
+		wantDetail string
+		wantWWW    string
 	}{
-		"not found":                 {credential.ErrRevocationNotFound, http.StatusNotFound, "credential_revocation_not_found"},
-		"forbidden role":            {authz.ErrForbidden, http.StatusForbidden, "credential_revocation_forbidden"},
-		"reauthentication required": {authz.ErrReauthenticationRequired, http.StatusUnauthorized, "credential_revocation_reauthentication_required"},
-		"invalid transition":        {credential.ErrInvalidTransition, http.StatusConflict, "credential_revocation_conflict"},
-		"evidence conflict":         {credential.ErrEvidenceConflict, http.StatusConflict, "credential_revocation_conflict"},
-		"admin required":            {credential.ErrPlatformAdminRequired, http.StatusConflict, "credential_revocation_conflict"},
-		"persistence unavailable":   {credential.ErrRevocationPersistence, http.StatusServiceUnavailable, "credential_revocation_management_unavailable"},
-		"unsafe store result":       {credentialadmin.ErrUnsafeStoreResult, http.StatusInternalServerError, "credential_revocation_management_failed"},
+		{
+			name:       "management invalid request",
+			err:        fmt.Errorf("underlying-sensitive-marker: %w", credentialadmin.ErrInvalidRequest),
+			wantStatus: http.StatusBadRequest, wantCode: "invalid_credential_revocation_request",
+			wantDetail: "Credential revocation management request is invalid",
+		},
+		{
+			name:       "credential invalid request",
+			err:        fmt.Errorf("underlying-sensitive-marker: %w", credential.ErrInvalidRevocationRequest),
+			wantStatus: http.StatusBadRequest, wantCode: "invalid_credential_revocation_request",
+			wantDetail: "Credential revocation management request is invalid",
+		},
+		{
+			name:       "not found",
+			err:        fmt.Errorf("underlying-sensitive-marker: %w", credential.ErrRevocationNotFound),
+			wantStatus: http.StatusNotFound, wantCode: "credential_revocation_not_found",
+			wantDetail: "Credential revocation was not found",
+		},
+		{
+			name:       "forbidden role",
+			err:        fmt.Errorf("underlying-sensitive-marker: %w", authz.ErrForbidden),
+			wantStatus: http.StatusForbidden, wantCode: "credential_revocation_forbidden",
+			wantDetail: "Credential revocation operation is forbidden",
+		},
+		{
+			name:       "reauthentication required",
+			err:        fmt.Errorf("underlying-sensitive-marker: %w", authz.ErrReauthenticationRequired),
+			wantStatus: http.StatusUnauthorized, wantCode: "credential_revocation_reauthentication_required",
+			wantDetail: "Recent OIDC authentication is required",
+			wantWWW:    `Bearer error="insufficient_user_authentication"`,
+		},
+		{
+			name:       "invalid transition",
+			err:        fmt.Errorf("underlying-sensitive-marker: %w", credential.ErrInvalidTransition),
+			wantStatus: http.StatusConflict, wantCode: "credential_revocation_conflict",
+			wantDetail: "Credential revocation state conflicts with this operation",
+		},
+		{
+			name:       "evidence conflict",
+			err:        fmt.Errorf("underlying-sensitive-marker: %w", credential.ErrEvidenceConflict),
+			wantStatus: http.StatusConflict, wantCode: "credential_revocation_conflict",
+			wantDetail: "Credential revocation state conflicts with this operation",
+		},
+		{
+			name:       "admin required",
+			err:        fmt.Errorf("underlying-sensitive-marker: %w", credential.ErrPlatformAdminRequired),
+			wantStatus: http.StatusConflict, wantCode: "credential_revocation_conflict",
+			wantDetail: "Credential revocation state conflicts with this operation",
+		},
+		{
+			name:       "idempotency conflict",
+			err:        fmt.Errorf("underlying-sensitive-marker: %w", credential.ErrIdempotencyConflict),
+			wantStatus: http.StatusConflict, wantCode: "credential_revocation_conflict",
+			wantDetail: "Credential revocation state conflicts with this operation",
+		},
+		{
+			name:       "completion conflict",
+			err:        fmt.Errorf("underlying-sensitive-marker: %w", credential.ErrCompletionConflict),
+			wantStatus: http.StatusConflict, wantCode: "credential_revocation_conflict",
+			wantDetail: "Credential revocation state conflicts with this operation",
+		},
+		{
+			name:       "persistence unavailable",
+			err:        fmt.Errorf("underlying-sensitive-marker: %w", credential.ErrRevocationPersistence),
+			wantStatus: http.StatusServiceUnavailable, wantCode: "credential_revocation_management_unavailable",
+			wantDetail: "Credential revocation management is unavailable",
+		},
+		{
+			name:       "deadline unavailable",
+			err:        fmt.Errorf("underlying-sensitive-marker: %w", context.DeadlineExceeded),
+			wantStatus: http.StatusServiceUnavailable, wantCode: "credential_revocation_management_unavailable",
+			wantDetail: "Credential revocation management is unavailable",
+		},
+		{
+			name:       "unsafe store result",
+			err:        fmt.Errorf("underlying-sensitive-marker: %w", credentialadmin.ErrUnsafeStoreResult),
+			wantStatus: http.StatusInternalServerError, wantCode: "credential_revocation_management_failed",
+			wantDetail: "Credential revocation management failed",
+		},
+		{
+			name:       "unknown failure",
+			err:        fmt.Errorf("underlying-sensitive-marker: postgres://operator:secret@private-endpoint"),
+			wantStatus: http.StatusInternalServerError, wantCode: "credential_revocation_management_failed",
+			wantDetail: "Credential revocation management failed",
+		},
 	}
-	for name, test := range tests {
-		name, test := name, test
-		t.Run(name, func(t *testing.T) {
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
 			manager := &credentialManagerStub{err: test.err}
 			router := httpapi.NewRouter(httpapi.Dependencies{
 				Authenticator: fakeAuthenticator{principal: validHTTPPrincipal(authn.RoleAdmin)}, CredentialRevocations: manager,
 			})
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, httpManagementURL+"/"+httpRevocationID, nil))
-			if response.Code != test.wantStatus || !strings.Contains(response.Body.String(), `"code":"`+test.wantCode+`"`) {
-				t.Fatalf("response = %d %s", response.Code, response.Body.String())
+			assertCredentialManagementProblem(
+				t, response, test.wantStatus, test.wantCode, test.wantDetail,
+			)
+			if got := response.Header().Get("WWW-Authenticate"); got != test.wantWWW {
+				t.Fatalf("WWW-Authenticate = %q, want %q", got, test.wantWWW)
 			}
-			if got := response.Header().Get("Content-Type"); got != "application/problem+json" {
-				t.Fatalf("Content-Type = %q", got)
-			}
-			assertCredentialManagementSecurityHeaders(t, response)
 		})
 	}
 }
@@ -329,10 +542,16 @@ func TestCredentialRevocationCrossScopeAndUnknownAreIndistinguishable(t *testing
 	var firstBody string
 	for _, path := range paths {
 		response := httptest.NewRecorder()
-		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.Header.Set("traceparent", httpTraceparent)
+		router.ServeHTTP(response, request)
 		if response.Code != http.StatusNotFound {
 			t.Fatalf("GET %s response = %d %s", path, response.Code, response.Body.String())
 		}
+		assertCredentialManagementProblem(
+			t, response, http.StatusNotFound,
+			"credential_revocation_not_found", "Credential revocation was not found",
+		)
 		if firstBody == "" {
 			firstBody = response.Body.String()
 		} else if response.Body.String() != firstBody {
@@ -349,18 +568,31 @@ func TestCredentialManagementHeadersCoverAuthenticationNotFoundAndMethodNotAllow
 		path   string
 		deps   httpapi.Dependencies
 		status int
+		code   string
+		detail string
 	}{
-		{http.MethodGet, httpManagementURL, httpapi.Dependencies{Authenticator: fakeAuthenticator{err: authn.ErrUnauthenticated}}, http.StatusUnauthorized},
-		{http.MethodGet, httpManagementURL + "/" + httpRevocationID + "/unknown", httpapi.Dependencies{}, http.StatusNotFound},
-		{http.MethodPut, httpManagementURL, httpapi.Dependencies{}, http.StatusMethodNotAllowed},
+		{
+			http.MethodGet, httpManagementURL, httpapi.Dependencies{},
+			http.StatusServiceUnavailable, "authentication_unavailable", "OIDC authentication is unavailable",
+		},
+		{
+			http.MethodGet, httpManagementURL,
+			httpapi.Dependencies{Authenticator: fakeAuthenticator{err: authn.ErrUnauthenticated}},
+			http.StatusUnauthorized, "authentication_required", "A valid OIDC bearer token is required",
+		},
+		{
+			http.MethodGet, httpManagementURL + "/" + httpRevocationID + "/unknown", httpapi.Dependencies{},
+			http.StatusNotFound, "route_not_found", "The requested route does not exist",
+		},
+		{
+			http.MethodPut, httpManagementURL, httpapi.Dependencies{},
+			http.StatusMethodNotAllowed, "method_not_allowed", "The HTTP method is not allowed for this route",
+		},
 	}
 	for _, test := range tests {
 		response := httptest.NewRecorder()
 		httpapi.NewRouter(test.deps).ServeHTTP(response, httptest.NewRequest(test.method, test.path, nil))
-		if response.Code != test.status {
-			t.Fatalf("%s %s response = %d %s", test.method, test.path, response.Code, response.Body.String())
-		}
-		assertCredentialManagementSecurityHeaders(t, response)
+		assertCredentialManagementProblem(t, response, test.status, test.code, test.detail)
 	}
 }
 
@@ -376,7 +608,10 @@ func TestCredentialRevocationManagementIsUnavailableWithoutDurableManager(t *tes
 		!strings.Contains(response.Body.String(), `"code":"credential_revocation_management_unavailable"`) {
 		t.Fatalf("response = %d %s", response.Code, response.Body.String())
 	}
-	assertCredentialManagementSecurityHeaders(t, response)
+	assertCredentialManagementProblem(
+		t, response, http.StatusServiceUnavailable,
+		"credential_revocation_management_unavailable", "Credential revocation management is unavailable",
+	)
 
 	var typedNil *credentialManagerStub
 	router = httpapi.NewRouter(httpapi.Dependencies{
@@ -384,9 +619,10 @@ func TestCredentialRevocationManagementIsUnavailableWithoutDurableManager(t *tes
 	})
 	response = httptest.NewRecorder()
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, httpManagementURL, nil))
-	if response.Code != http.StatusServiceUnavailable {
-		t.Fatalf("typed-nil manager response = %d %s", response.Code, response.Body.String())
-	}
+	assertCredentialManagementProblem(
+		t, response, http.StatusServiceUnavailable,
+		"credential_revocation_management_unavailable", "Credential revocation management is unavailable",
+	)
 }
 
 type credentialManagerStub struct {
@@ -447,5 +683,48 @@ func assertCredentialManagementSecurityHeaders(t *testing.T, response *httptest.
 	}
 	if got := response.Header().Get("X-Content-Type-Options"); got != "nosniff" {
 		t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+}
+
+func assertCredentialManagementProblem(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	wantStatus int,
+	wantCode string,
+	wantDetail string,
+) {
+	t.Helper()
+	if response.Code != wantStatus {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, wantStatus, response.Body.String())
+	}
+	if got := response.Header().Get("Content-Type"); got != "application/problem+json" {
+		t.Fatalf("Content-Type = %q, want application/problem+json", got)
+	}
+	assertCredentialManagementSecurityHeaders(t, response)
+	responseTraceID := response.Header().Get("X-Trace-ID")
+	if len(responseTraceID) != 32 || responseTraceID != strings.ToLower(responseTraceID) ||
+		strings.Trim(responseTraceID, "0123456789abcdef") != "" || strings.Trim(responseTraceID, "0") == "" {
+		t.Fatalf("X-Trace-ID = %q, want a non-zero lowercase 32-character hex trace ID", responseTraceID)
+	}
+	var problem struct {
+		Type    string `json:"type"`
+		Title   string `json:"title"`
+		Status  int    `json:"status"`
+		Code    string `json:"code"`
+		Detail  string `json:"detail"`
+		TraceID string `json:"trace_id"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("decode Problem: %v; body=%s", err, response.Body.String())
+	}
+	if problem.Type != "about:blank" || problem.Title != http.StatusText(wantStatus) ||
+		problem.Status != wantStatus || problem.Code != wantCode || problem.Detail != wantDetail {
+		t.Fatalf("Problem = %#v", problem)
+	}
+	if problem.TraceID == "" || problem.TraceID != responseTraceID {
+		t.Fatalf("Problem trace_id = %q, X-Trace-ID = %q", problem.TraceID, responseTraceID)
+	}
+	if strings.Contains(strings.ToLower(response.Body.String()), "underlying-sensitive-marker") {
+		t.Fatalf("Problem leaked the underlying error: %s", response.Body.String())
 	}
 }

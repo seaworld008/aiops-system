@@ -77,22 +77,22 @@ func isCredentialManagementPath(path string) bool {
 func credentialRevocationListHandler(manager CredentialRevocationManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, request *http.Request) {
 		if credentialManagerUnavailable(manager) {
-			writeProblem(w, http.StatusServiceUnavailable, "credential_revocation_management_unavailable", "Credential revocation management is unavailable")
+			writeRequestProblem(w, request, http.StatusServiceUnavailable, "credential_revocation_management_unavailable", "Credential revocation management is unavailable")
 			return
 		}
 		principal, ok := authn.PrincipalFromContext(request.Context())
 		if !ok {
-			writeProblem(w, http.StatusUnauthorized, "authentication_required", "A valid OIDC bearer token is required")
+			writeRequestProblem(w, request, http.StatusUnauthorized, "authentication_required", "A valid OIDC bearer token is required")
 			return
 		}
 		managementRequest, err := parseCredentialRevocationListRequest(request)
 		if err != nil {
-			writeCredentialManagementError(w, err)
+			writeCredentialManagementError(w, request, err)
 			return
 		}
 		page, err := manager.List(request.Context(), principal, managementRequest)
 		if err != nil {
-			writeCredentialManagementError(w, err)
+			writeCredentialManagementError(w, request, err)
 			return
 		}
 		response := credentialRevocationPageResponse{
@@ -111,22 +111,22 @@ func credentialRevocationListHandler(manager CredentialRevocationManager) http.H
 func credentialRevocationGetHandler(manager CredentialRevocationManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, request *http.Request) {
 		if credentialManagerUnavailable(manager) {
-			writeProblem(w, http.StatusServiceUnavailable, "credential_revocation_management_unavailable", "Credential revocation management is unavailable")
+			writeRequestProblem(w, request, http.StatusServiceUnavailable, "credential_revocation_management_unavailable", "Credential revocation management is unavailable")
 			return
 		}
 		principal, ok := authn.PrincipalFromContext(request.Context())
 		if !ok {
-			writeProblem(w, http.StatusUnauthorized, "authentication_required", "A valid OIDC bearer token is required")
+			writeRequestProblem(w, request, http.StatusUnauthorized, "authentication_required", "A valid OIDC bearer token is required")
 			return
 		}
 		managementRequest, err := parseCredentialRevocationItemRequest(request)
 		if err != nil {
-			writeCredentialManagementError(w, err)
+			writeCredentialManagementError(w, request, err)
 			return
 		}
 		record, err := manager.Get(request.Context(), principal, managementRequest)
 		if err != nil {
-			writeCredentialManagementError(w, err)
+			writeCredentialManagementError(w, request, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, credentialRevocationDTO(record))
@@ -136,27 +136,27 @@ func credentialRevocationGetHandler(manager CredentialRevocationManager) http.Ha
 func credentialRevocationRequeueHandler(manager CredentialRevocationManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, request *http.Request) {
 		if credentialManagerUnavailable(manager) {
-			writeProblem(w, http.StatusServiceUnavailable, "credential_revocation_management_unavailable", "Credential revocation management is unavailable")
+			writeRequestProblem(w, request, http.StatusServiceUnavailable, "credential_revocation_management_unavailable", "Credential revocation management is unavailable")
 			return
 		}
 		principal, ok := authn.PrincipalFromContext(request.Context())
 		if !ok {
-			writeProblem(w, http.StatusUnauthorized, "authentication_required", "A valid OIDC bearer token is required")
+			writeRequestProblem(w, request, http.StatusUnauthorized, "authentication_required", "A valid OIDC bearer token is required")
 			return
 		}
 		managementRequest, err := parseCredentialRevocationItemRequest(request)
 		if err != nil {
-			writeCredentialManagementError(w, err)
+			writeCredentialManagementError(w, request, err)
 			return
 		}
 		body, err := io.ReadAll(http.MaxBytesReader(w, request.Body, 1))
 		if err != nil || len(body) != 0 {
-			writeCredentialManagementError(w, credentialadmin.ErrInvalidRequest)
+			writeCredentialManagementError(w, request, credentialadmin.ErrInvalidRequest)
 			return
 		}
 		record, err := manager.Requeue(request.Context(), principal, managementRequest)
 		if err != nil {
-			writeCredentialManagementError(w, err)
+			writeCredentialManagementError(w, request, err)
 			return
 		}
 		writeJSON(w, http.StatusAccepted, credentialRevocationDTO(record))
@@ -166,37 +166,37 @@ func credentialRevocationRequeueHandler(manager CredentialRevocationManager) htt
 func credentialRevocationConfirmationHandler(manager CredentialRevocationManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, request *http.Request) {
 		if credentialManagerUnavailable(manager) {
-			writeProblem(w, http.StatusServiceUnavailable, "credential_revocation_management_unavailable", "Credential revocation management is unavailable")
+			writeRequestProblem(w, request, http.StatusServiceUnavailable, "credential_revocation_management_unavailable", "Credential revocation management is unavailable")
 			return
 		}
 		principal, ok := authn.PrincipalFromContext(request.Context())
 		if !ok {
-			writeProblem(w, http.StatusUnauthorized, "authentication_required", "A valid OIDC bearer token is required")
+			writeRequestProblem(w, request, http.StatusUnauthorized, "authentication_required", "A valid OIDC bearer token is required")
 			return
 		}
 		item, err := parseCredentialRevocationItemRequest(request)
 		if err != nil {
-			writeCredentialManagementError(w, err)
+			writeCredentialManagementError(w, request, err)
 			return
 		}
 		contentTypes := request.Header.Values("Content-Type")
 		if len(contentTypes) != 1 || contentTypes[0] != "application/json" {
-			writeProblem(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
+			writeRequestProblem(w, request, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
 			return
 		}
 		body, err := io.ReadAll(http.MaxBytesReader(w, request.Body, 4<<10))
 		if err != nil {
 			var maximum *http.MaxBytesError
 			if errors.As(err, &maximum) {
-				writeProblem(w, http.StatusRequestEntityTooLarge, "payload_too_large", "Credential revocation confirmation exceeds 4 KiB")
+				writeRequestProblem(w, request, http.StatusRequestEntityTooLarge, "payload_too_large", "Credential revocation confirmation exceeds 4 KiB")
 				return
 			}
-			writeCredentialManagementError(w, credentialadmin.ErrInvalidRequest)
+			writeCredentialManagementError(w, request, credentialadmin.ErrInvalidRequest)
 			return
 		}
 		evidenceHash, err := decodeEvidenceHash(body)
 		if err != nil || !credential.ValidSHA256(evidenceHash) {
-			writeCredentialManagementError(w, credentialadmin.ErrInvalidRequest)
+			writeCredentialManagementError(w, request, credentialadmin.ErrInvalidRequest)
 			return
 		}
 		record, err := manager.Confirm(request.Context(), principal, credentialadmin.ConfirmationRequest{
@@ -204,7 +204,7 @@ func credentialRevocationConfirmationHandler(manager CredentialRevocationManager
 			RevocationID: item.RevocationID, EvidenceHash: evidenceHash,
 		})
 		if err != nil {
-			writeCredentialManagementError(w, err)
+			writeCredentialManagementError(w, request, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, credentialRevocationDTO(record))
@@ -347,24 +347,24 @@ func optionalTime(value time.Time) *time.Time {
 	return &value
 }
 
-func writeCredentialManagementError(w http.ResponseWriter, err error) {
+func writeCredentialManagementError(w http.ResponseWriter, request *http.Request, err error) {
 	switch {
 	case errors.Is(err, credentialadmin.ErrInvalidRequest), errors.Is(err, credential.ErrInvalidRevocationRequest):
-		writeProblem(w, http.StatusBadRequest, "invalid_credential_revocation_request", "Credential revocation management request is invalid")
+		writeRequestProblem(w, request, http.StatusBadRequest, "invalid_credential_revocation_request", "Credential revocation management request is invalid")
 	case errors.Is(err, credential.ErrRevocationNotFound):
-		writeProblem(w, http.StatusNotFound, "credential_revocation_not_found", "Credential revocation was not found")
+		writeRequestProblem(w, request, http.StatusNotFound, "credential_revocation_not_found", "Credential revocation was not found")
 	case errors.Is(err, authz.ErrForbidden):
-		writeProblem(w, http.StatusForbidden, "credential_revocation_forbidden", "Credential revocation operation is forbidden")
+		writeRequestProblem(w, request, http.StatusForbidden, "credential_revocation_forbidden", "Credential revocation operation is forbidden")
 	case errors.Is(err, authz.ErrReauthenticationRequired):
 		w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_user_authentication"`)
-		writeProblem(w, http.StatusUnauthorized, "credential_revocation_reauthentication_required", "Recent OIDC authentication is required")
+		writeRequestProblem(w, request, http.StatusUnauthorized, "credential_revocation_reauthentication_required", "Recent OIDC authentication is required")
 	case errors.Is(err, credential.ErrInvalidTransition), errors.Is(err, credential.ErrEvidenceConflict),
 		errors.Is(err, credential.ErrPlatformAdminRequired), errors.Is(err, credential.ErrIdempotencyConflict),
 		errors.Is(err, credential.ErrCompletionConflict):
-		writeProblem(w, http.StatusConflict, "credential_revocation_conflict", "Credential revocation state conflicts with this operation")
+		writeRequestProblem(w, request, http.StatusConflict, "credential_revocation_conflict", "Credential revocation state conflicts with this operation")
 	case errors.Is(err, credential.ErrRevocationPersistence), errors.Is(err, context.DeadlineExceeded):
-		writeProblem(w, http.StatusServiceUnavailable, "credential_revocation_management_unavailable", "Credential revocation management is unavailable")
+		writeRequestProblem(w, request, http.StatusServiceUnavailable, "credential_revocation_management_unavailable", "Credential revocation management is unavailable")
 	default:
-		writeProblem(w, http.StatusInternalServerError, "credential_revocation_management_failed", "Credential revocation management failed")
+		writeRequestProblem(w, request, http.StatusInternalServerError, "credential_revocation_management_failed", "Credential revocation management failed")
 	}
 }
