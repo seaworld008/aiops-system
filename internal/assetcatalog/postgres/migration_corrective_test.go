@@ -22,7 +22,7 @@ const correctiveManualProviderSchemaV1 = `{"additionalProperties":false,"propert
 
 const correctiveCanonicalEmptyRelationPageSHA256 = "b89ad607e709ef2ea85f7fc6eb0f80e32ae3ecf234220907a0fe718825f7c151"
 
-func TestAssetCatalogCorrectiveOwnsExact35RoutineSignaturesAndFutureHook(t *testing.T) {
+func TestAssetCatalogCorrectiveOwnsExact36RoutineSignaturesAndRuntimeLock(t *testing.T) {
 	up := readMigration(t, "000015_assets_catalog.up.sql")
 	correctiveAssertTopLevelParserSemantics(t)
 
@@ -36,6 +36,105 @@ func TestAssetCatalogCorrectiveOwnsExact35RoutineSignaturesAndFutureHook(t *test
 	if body != "begin return false; end;" {
 		t.Errorf("default future Source hook body = %q, want exact fail-closed RETURN false body", body)
 	}
+
+	lock := correctiveRequireFunction(t, up, "public.asset_catalog_lock_exact_service_binding")
+	lockAttributes := correctiveNormalizeSQL(lock.attributes)
+	correctiveRequireTokens(t, "runtime exact Service Binding lock attributes", lockAttributes,
+		"language plpgsql",
+		"volatile",
+		"strict",
+		"parallel unsafe",
+		"security definer",
+		"set search_path = pg_catalog, public, pg_temp",
+	)
+	correctiveRequireTokens(t, "runtime exact Service Binding lock result",
+		correctiveNormalizeSQL(lock.full), ") returns boolean as")
+	lockBody := correctiveNormalizeSQL(lock.body)
+	correctiveRequireTokens(t, "runtime exact Service Binding lock body", lockBody,
+		"current_setting('transaction_isolation')",
+		"'serializable'",
+		"current_setting('transaction_read_only')",
+		"'off'",
+		"from public.services",
+		"for key share",
+		"from public.service_bindings",
+		"for share",
+		"mapping_status <> 'exact'",
+		"asset_catalog_exact_service_binding_isolation_guard",
+		"asset_catalog_exact_service_binding_service_scope_guard",
+		"asset_catalog_exact_service_binding_environment_guard",
+		"asset_catalog_exact_service_binding_mapping_guard",
+	)
+	correctiveAssertOrdered(t, "runtime exact Service Binding lock order", lockBody, []string{
+		"from public.services",
+		"for key share",
+		"from public.service_bindings",
+		"for share",
+	})
+}
+
+func TestAssetCatalogCorrectiveOwnsNormalizedLimiterBucketAndPermitTruth(t *testing.T) {
+	up := readMigration(t, "000015_assets_catalog.up.sql")
+	buckets := correctiveNormalizeSQL(correctiveRequireTable(t, up, "public.asset_source_limit_buckets"))
+	permits := correctiveNormalizeSQL(correctiveRequireTable(t, up, "public.asset_source_limit_permits"))
+
+	correctiveRequireTokens(t, "Limiter bucket truth", buckets,
+		"bucket_kind text not null",
+		"bucket_key text not null",
+		"source_id uuid",
+		"provider_kind text",
+		"next_token_at timestamptz not null",
+		"last_receipt_id uuid",
+		"version bigint not null default 1",
+		"unique (tenant_id, workspace_id, bucket_kind, bucket_key)",
+		"asset_source_limit_buckets_scope_key_ck",
+		"asset_source_limit_buckets_time_ck",
+	)
+	correctiveRequireTokens(t, "Limiter permit/receipt truth", permits,
+		"permit_id uuid not null",
+		"record_kind text not null",
+		"'acquire'",
+		"'release'",
+		"'delay'",
+		"'expire'",
+		"source_bucket_id uuid not null",
+		"workspace_bucket_id uuid not null",
+		"provider_bucket_id uuid not null",
+		"request_id text not null",
+		"command_sha256 text not null",
+		"receipt_sha256 text not null",
+		"acquired_at timestamptz not null",
+		"expires_at timestamptz not null",
+		"not_before timestamptz",
+		"terminal_reason_code text",
+		"asset_source_limit_permits_acquire_exact_fk",
+		"asset_source_limit_permits_record_shape_ck",
+		"asset_source_limit_permits_time_ck",
+	)
+	correctiveRequireTokens(t, "Limiter terminal uniqueness", correctiveNormalizeSQL(up),
+		"create unique index asset_source_limit_permits_one_terminal_uk",
+		"where record_kind in ('release', 'delay', 'expire')",
+		"add constraint asset_source_limit_buckets_last_receipt_fk",
+		"foreign key (tenant_id, workspace_id, last_receipt_id)",
+		"references public.asset_source_limit_permits (tenant_id, workspace_id, id)",
+		"on delete restrict",
+		"deferrable initially immediate",
+	)
+
+	edge := correctiveNormalizeSQL(
+		correctiveRequireFunction(t, up, "public.enforce_asset_catalog_edge_mutation").body,
+	)
+	correctiveRequireTokens(t, "Limiter bucket CAS guard", edge,
+		"tg_table_name = 'asset_source_limit_buckets'",
+		"new.last_receipt_id",
+		"public.asset_source_limit_permits",
+		"new.next_token_at < old.next_token_at",
+		"new.version <> old.version + 1",
+		"asset_source_limit_buckets_identity_guard",
+		"asset_source_limit_buckets_receipt_guard",
+		"asset_source_limit_buckets_version_guard",
+		"asset_source_limit_buckets_token_monotonic_guard",
+	)
 }
 
 func TestAssetCatalogCorrectiveAllowsOnlyCanonicalEmptyRepeatedRelationPageDigest(t *testing.T) {
@@ -313,9 +412,9 @@ func TestAssetCatalogCorrectiveDownUsesOneShotNowaitAndDropsEveryDependency(t *t
 	if len(locks) != 1 {
 		t.Errorf("down LOCK TABLE statement count = %d, want exactly one", len(locks))
 	} else {
-		want := "lock table public.tenants, public.workspaces, public.environments, public.integrations, public.services, public.service_bindings, public.audit_records, public.outbox_events, public.asset_sources, public.asset_source_revisions, public.asset_source_revision_authorities, public.asset_source_runs, public.asset_observations, public.assets, public.asset_type_details, public.asset_conflicts, public.asset_relationships, public.service_asset_bindings in access exclusive mode nowait;"
+		want := "lock table public.tenants, public.workspaces, public.environments, public.integrations, public.services, public.service_bindings, public.audit_records, public.outbox_events, public.asset_sources, public.asset_source_revisions, public.asset_source_revision_authorities, public.asset_source_runs, public.asset_source_limit_buckets, public.asset_source_limit_permits, public.asset_observations, public.assets, public.asset_type_details, public.asset_conflicts, public.asset_relationships, public.service_asset_bindings in access exclusive mode nowait;"
 		if locks[0] != want {
-			t.Errorf("down one-shot lock = %q, want exact 18-relation NOWAIT lock", locks[0])
+			t.Errorf("down one-shot lock = %q, want exact 20-relation NOWAIT lock", locks[0])
 		}
 	}
 	if strings.Contains(down, " cascade") {
@@ -325,12 +424,18 @@ func TestAssetCatalogCorrectiveDownUsesOneShotNowaitAndDropsEveryDependency(t *t
 	assertExactSQLObjectSet(t, "down dropped trigger manifest", correctiveDroppedTriggerIdentities(downRaw), correctiveExpectedDroppedTriggerIdentities())
 	assertExactSQLObjectSet(t, "down dropped routine manifest", correctiveDroppedRoutineIdentities(downRaw), correctiveExpectedRoutineIdentities())
 	correctiveAssertOrdered(t, "cycle-breaking foreign keys", down, []string{
+		"drop constraint asset_source_limit_buckets_last_receipt_fk",
 		"drop constraint asset_sources_published_revision_fk",
 		"drop constraint asset_sources_validated_run_fk",
 		"drop constraint asset_sources_last_success_run_fk",
 		"drop constraint asset_sources_last_complete_snapshot_run_fk",
 		"drop constraint asset_source_revisions_validation_run_fk",
 	})
+	correctiveAssertBefore(t,
+		"drop constraint asset_source_limit_buckets_last_receipt_fk",
+		"drop table public.asset_source_limit_permits",
+		down,
+	)
 	correctiveAssertBefore(t,
 		"drop constraint asset_source_revisions_validation_run_fk",
 		"drop function public.asset_catalog_source_run_terminal_digest(public.asset_source_runs, text, text)",
@@ -349,13 +454,15 @@ func TestAssetCatalogCorrectiveDownUsesOneShotNowaitAndDropsEveryDependency(t *t
 	} {
 		correctiveAssertBefore(t, dependency.function, dependency.table, down)
 	}
-	correctiveAssertOrdered(t, "child-first ten-table drop order", down, []string{
+	correctiveAssertOrdered(t, "child-first twelve-table drop order", down, []string{
 		"drop table public.service_asset_bindings",
 		"drop table public.asset_relationships",
 		"drop table public.asset_conflicts",
 		"drop table public.asset_type_details",
 		"drop table public.assets",
 		"drop table public.asset_observations",
+		"drop table public.asset_source_limit_permits",
+		"drop table public.asset_source_limit_buckets",
 		"drop table public.asset_source_runs",
 		"drop table public.asset_source_revision_authorities",
 		"drop table public.asset_source_revisions",
@@ -455,7 +562,15 @@ func TestAssetCatalogCorrectiveEnforcesDatabaseRoleSeparation(t *testing.T) {
 		"set local role aiops_schema_owner",
 		"reset role",
 		"to aiops_control_plane_runtime",
+		"grant update (next_token_at, last_receipt_id, version, updated_at) on public.asset_source_limit_buckets to aiops_control_plane_runtime",
+		"public.asset_catalog_lock_exact_service_binding(uuid, uuid, uuid, uuid)",
 	)
+	if strings.Contains(up, "grant update on table public.asset_source_limit_buckets") ||
+		strings.Contains(up, "grant update on table public.asset_source_limit_permits") ||
+		strings.Contains(up, "grant update on table public.services") ||
+		strings.Contains(up, "grant update on table public.service_bindings") {
+		t.Error("runtime ACL grants an unreviewed broad UPDATE surface")
+	}
 	if !regexp.MustCompile(`(?is)revoke\s+(?:all|execute)\s+on\s+function\b.+?\s+from\s+public`).MatchString(up) {
 		t.Error("migration does not revoke PUBLIC function execution with one reviewed REVOKE form")
 	}
@@ -956,7 +1071,7 @@ func correctiveDroppedRoutineIdentities(sql string) []string {
 }
 
 func correctiveRoutineIdentitiesFromStatements(sql string, pattern *regexp.Regexp) []string {
-	identities := make([]string, 0, 35)
+	identities := make([]string, 0, 36)
 	for _, statement := range correctiveTopLevelSQLStatements(sql) {
 		match := pattern.FindStringSubmatchIndex(statement)
 		if match == nil {
@@ -1000,6 +1115,7 @@ func correctiveExpectedRoutineIdentities() []string {
 		"public.asset_catalog_opaque_reference_valid(text)",
 		"public.asset_catalog_future_source_gate_admitted(public.asset_sources)",
 		"public.asset_catalog_source_revision_binding_digest(public.asset_source_revisions)",
+		"public.asset_catalog_lock_exact_service_binding(uuid,uuid,uuid,uuid)",
 		"public.validate_asset_management_audit_insert()",
 		"public.reject_asset_catalog_immutable()",
 		"public.reject_asset_catalog_delete()",
@@ -1626,7 +1742,7 @@ func correctiveTriggerIdentities(t *testing.T, sql string) []string {
 	pattern := regexp.MustCompile(`(?is)^\s*create\s+(?:or\s+replace\s+)?(constraint\s+)?trigger\s+(` + correctiveSQLIdentifierPattern +
 		`)\s+(before|after|instead\s+of)\s+(.+?)\s+on\s+(` + correctiveQualifiedSQLIdentifierPattern() +
 		`)\s+(.+?)\bexecute\s+(function|procedure)\s+(` + correctiveQualifiedSQLIdentifierPattern() + `)\s*\(\s*\)\s*;\s*$`)
-	identities := make([]string, 0, 39)
+	identities := make([]string, 0, 45)
 	for _, statement := range correctiveTopLevelSQLStatements(sql) {
 		match := pattern.FindStringSubmatch(statement)
 		if match == nil {
@@ -1687,10 +1803,13 @@ func correctiveExpectedTriggerIdentities() []string {
 		row("asset_observations", "asset_observations_immutable", "before", []string{"update"}, "reject_asset_catalog_immutable"),
 		row("asset_type_details", "asset_type_details_immutable", "before", []string{"update"}, "reject_asset_catalog_immutable"),
 		row("asset_source_revision_authorities", "asset_source_revision_authorities_immutable", "before", []string{"update"}, "reject_asset_catalog_immutable"),
+		row("asset_source_limit_permits", "asset_source_limit_permits_immutable", "before", []string{"update"}, "reject_asset_catalog_immutable"),
 		row("asset_sources", "asset_sources_delete_guard", "before", []string{"delete"}, "reject_asset_catalog_delete"),
 		row("asset_source_revisions", "asset_source_revisions_delete_guard", "before", []string{"delete"}, "reject_asset_catalog_delete"),
 		row("asset_source_revision_authorities", "asset_source_revision_authorities_delete_guard", "before", []string{"delete"}, "reject_asset_catalog_delete"),
 		row("asset_source_runs", "asset_source_runs_delete_guard", "before", []string{"delete"}, "reject_asset_catalog_delete"),
+		row("asset_source_limit_buckets", "asset_source_limit_buckets_delete_guard", "before", []string{"delete"}, "reject_asset_catalog_delete"),
+		row("asset_source_limit_permits", "asset_source_limit_permits_delete_guard", "before", []string{"delete"}, "reject_asset_catalog_delete"),
 		row("asset_observations", "asset_observations_delete_guard", "before", []string{"delete"}, "reject_asset_catalog_delete"),
 		row("assets", "assets_delete_guard", "before", []string{"delete"}, "reject_asset_catalog_delete"),
 		row("asset_type_details", "asset_type_details_delete_guard", "before", []string{"delete"}, "reject_asset_catalog_delete"),
@@ -1701,6 +1820,8 @@ func correctiveExpectedTriggerIdentities() []string {
 		statement("asset_source_revisions", "asset_source_revisions_truncate_guard", "reject_asset_catalog_truncate"),
 		statement("asset_source_revision_authorities", "asset_source_revision_authorities_truncate_guard", "reject_asset_catalog_truncate"),
 		statement("asset_source_runs", "asset_source_runs_truncate_guard", "reject_asset_catalog_truncate"),
+		statement("asset_source_limit_buckets", "asset_source_limit_buckets_truncate_guard", "reject_asset_catalog_truncate"),
+		statement("asset_source_limit_permits", "asset_source_limit_permits_truncate_guard", "reject_asset_catalog_truncate"),
 		statement("asset_observations", "asset_observations_truncate_guard", "reject_asset_catalog_truncate"),
 		statement("assets", "assets_truncate_guard", "reject_asset_catalog_truncate"),
 		statement("asset_type_details", "asset_type_details_truncate_guard", "reject_asset_catalog_truncate"),
@@ -1712,6 +1833,7 @@ func correctiveExpectedTriggerIdentities() []string {
 		row("asset_relationships", "asset_relationships_mutation_guard", "before", []string{"insert", "update"}, "enforce_asset_relationship_mutation"),
 		deferred("asset_relationships", "asset_relationships_page_closure_guard", []string{"insert", "update"}, "validate_asset_relationship_page_closure"),
 		row("service_asset_bindings", "service_asset_bindings_mutation_guard", "before", []string{"insert", "update"}, "enforce_asset_catalog_edge_mutation"),
+		row("asset_source_limit_buckets", "asset_source_limit_buckets_mutation_guard", "before", []string{"insert", "update"}, "enforce_asset_catalog_edge_mutation"),
 		row("asset_sources", "asset_sources_mutation_guard", "before", []string{"insert", "update"}, "enforce_asset_sources_mutation"),
 		deferred("asset_sources", "asset_sources_deferred_state_guard", []string{"insert", "update"}, "validate_asset_source_deferred_state"),
 		row("asset_source_revisions", "asset_source_revisions_transition_guard", "before", []string{"insert", "update"}, "enforce_asset_source_revision_transition"),
@@ -1728,7 +1850,7 @@ func correctiveExpectedTriggerIdentities() []string {
 func correctiveDroppedTriggerIdentities(sql string) []string {
 	pattern := regexp.MustCompile(`(?is)^\s*drop\s+trigger\s+(` + correctiveSQLIdentifierPattern + `)\s+on\s+(` +
 		correctiveQualifiedSQLIdentifierPattern() + `)\s*;\s*$`)
-	identities := make([]string, 0, 39)
+	identities := make([]string, 0, 45)
 	for _, statement := range correctiveTopLevelSQLStatements(sql) {
 		match := pattern.FindStringSubmatch(statement)
 		if match == nil {
@@ -1758,7 +1880,7 @@ func droppedTableIdentities(sql string) []string {
 
 func correctiveSQLObjectIdentities(sql, expression string) []string {
 	pattern := regexp.MustCompile(expression)
-	identities := make([]string, 0, 10)
+	identities := make([]string, 0, 12)
 	for _, statement := range correctiveTopLevelSQLStatements(sql) {
 		match := pattern.FindStringSubmatch(statement)
 		if match != nil {

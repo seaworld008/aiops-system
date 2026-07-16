@@ -2,11 +2,11 @@
 
 本目录把 Phase 1 拆成 11 个生产任务包。它是[受治理运维能力总计划](../../2026-07-13-governed-operations-program.md)的第一阶段，产品、安全和前端语义以[已确认设计规范](../../../specs/2026-07-13-operational-assets-controlled-access-design.md)为准；快速构建的 Batch、并发和验证时机由[快速开发与真实验收计划](../../2026-07-15-fast-development-validation-program.md)统一覆盖。
 
-本阶段的终点不是枚举、假 Provider、静态页面或 Demo：它建立十表 PostgreSQL 事实（含不可变 Source Revision 权限 Environment 子表）、不可变 Source Revision、真实 CSV/API/CMDB/vSphere/Proxmox/OpenStack/AWS/Azure/GCP 协议适配、独立 Discovery Worker、HA lease/fence、加密 checkpoint、持久背压、逐 Provider gate，以及真实 OIDC/OpenAPI、Go 同源 SPA、类型化应用平台和 Overview。它仍不开放目标系统写操作；项目最终通过 Phase 7/8 的不可变 ActionPlan、策略、重新认证、人工审批、短凭据、类型化执行、独立验证、对账/回滚/升级与审计形成生产闭环。
+本阶段的终点不是枚举、假 Provider、静态页面或 Demo：它建立十二表 PostgreSQL 事实（含不可变 Source Revision 权限 Environment 子表，以及独立 Limiter bucket 与 permit/receipt truth）、不可变 Source Revision、真实 CSV/API/CMDB/vSphere/Proxmox/OpenStack/AWS/Azure/GCP 协议适配、独立 Discovery Worker、HA lease/fence、加密 checkpoint、持久背压、逐 Provider gate，以及真实 OIDC/OpenAPI、Go 同源 SPA、类型化应用平台和 Overview。它仍不开放目标系统写操作；项目最终通过 Phase 7/8 的不可变 ActionPlan、策略、重新认证、人工审批、短凭据、类型化执行、独立验证、对账/回滚/升级与审计形成生产闭环。
 
 ## 产品依赖与最终验收顺序
 
-1. [01-schema-domain.md](./01-schema-domain.md) — 创建 `000015_assets_catalog` 十张表、Source Revision 权限 Environment/Run/Fence/Checkpoint 约束与稳定领域接口。
+1. [01-schema-domain.md](./01-schema-domain.md) — 创建 `000015_assets_catalog` 十二张表、Source Revision 权限 Environment/Run/Fence/Checkpoint、Limiter bucket/permit receipt 约束与稳定领域接口。
 2. [02-repository-discovery.md](./02-repository-discovery.md) — 实现 Scope Repository、append-only Observation、provenance、tombstone/恢复和原子 checkpoint 投影。
 3. [03-mapping-auth-api.md](./03-mapping-auth-api.md) — 实现关系/冲突/Service Binding、Browser/API OIDC 边界、runtime Browser Config、OpenAPI/HTTP 基线和真实 Control Plane 装配。
 4. [04-web-foundation-assets.md](./04-web-foundation-assets.md) — 建立唯一 `web/`、`app → features → shared`、真实浏览器 OIDC、typed API/shared Operation/治理 UI、Go SPA、资产/映射/来源基线和持久前端 Foundation 规范。
@@ -32,7 +32,7 @@
 ## Produces
 
 - `assetcatalog.Scope`、`AssetLocator`、`Reader.Get(context.Context, AssetLocator) (Asset,error)` 和 `assets UNIQUE (tenant_id,workspace_id,environment_id,id)`。
-- 稳定 `asset_sources` + append-only/content-addressed `asset_source_revisions`，以及 fenced Run、encrypted checkpoint、Observation/provenance、Asset/Conflict/Relationship/Binding 事实。
+- 稳定 `asset_sources` + append-only/content-addressed `asset_source_revisions`，以及 fenced Run、encrypted checkpoint、独立 `asset_source_limit_buckets`/append-only `asset_source_limit_permits`、Observation/provenance、Asset/Conflict/Relationship/Binding 事实。
 - `source_revision` 唯一表示 Source definition revision；Provider 事实新鲜度用 profile-locked `FreshnessCandidate` 与 append-only Observation chain 持久，不同 Run 可追加同一未变事实，同 Run 漂移重放、时间/序列回退或碰撞整页关闭。
 - `SourceRevisionRepository`、`discoverysource.Provider`、`discoveryqueue.Queue`、`discoveryworker.Worker` 和真实 `cmd/discovery-worker`。
 - 严格 Control Plane OpenAPI、no-store closed-schema `GET /api/v1/browser-config`、`ASSET_*`/`ASSET_SOURCE_*` 权限、`effective_actions`、签名 Cursor、ETag/Idempotency/RFC 9457 和唯一生成 TypeScript 契约。
@@ -47,7 +47,7 @@
 | Go | `go 1.26` / `toolchain go1.26.5` |
 | PostgreSQL | 18.4 或更新 18.x |
 | 迁移 | `000015_assets_catalog` |
-| 表归属 | `asset_sources`、`asset_source_revisions`、`asset_source_revision_authorities`、`asset_source_runs`、`asset_observations`、`assets`、`asset_type_details`、`asset_conflicts`、`asset_relationships`、`service_asset_bindings` |
+| 表归属 | `asset_sources`、`asset_source_revisions`、`asset_source_revision_authorities`、`asset_source_runs`、`asset_source_limit_buckets`、`asset_source_limit_permits`、`asset_observations`、`assets`、`asset_type_details`、`asset_conflicts`、`asset_relationships`、`service_asset_bindings` |
 | 去重键 | `(tenant_id,workspace_id,source_id,provider_kind,external_id)` |
 | 前端 | `web/`；Node 24、pnpm 10.34.0、React 19.2.7、TypeScript 7.0.2、Vite 8.1.4、TanStack Router/Query/Table、RHF/Zod、Radix、lucide-react、CSS Modules |
 | OIDC | Keycloak Server 26.6.3；`keycloak-js` 26.2.4；Browser client `control-plane-web`、API audience `aiops-control-plane`；Authorization Code + PKCE、`login-required`、Token 仅内存 |
@@ -71,6 +71,8 @@
 - Relationship 显式保存 source/target Environment 与 Asset、Provenance、可空 provenance source/cross-environment policy、状态、版本和时间；不得虚构 Schema 中不存在的 confidence/last-observed 字段。
 - Binding 状态只有 `ACTIVE/INACTIVE`。`CreateBinding`、`DeleteBinding` 与 Conflict decision 都返回持久 `MutationReceipt`；HTTP 204 仍从 receipt 生成 Audit/Replay headers。
 - `service_asset_bindings` 同时由数据库 FK 与 Repository 验证 legacy `service_bindings(service_id,environment_id)` 资格；只验证同 Workspace 不足以创建 Binding。
+- M1F 在同一 `SERIALIZABLE READ WRITE` transaction 内先完成 Conflict/Asset 固定锁序，再调用 runtime-only `public.asset_catalog_lock_exact_service_binding(uuid,uuid,uuid,uuid)`；函数以 `SECURITY DEFINER` 依次锁 exact Service `FOR KEY SHARE` 和 exact legacy binding `FOR SHARE` 并要求 `EXACT`。Workload/runtime 对 `services`/`service_bindings` 无 UPDATE/grant option，直接 row lock 必须 `42501`。
+- Limiter 按 `SOURCE→WORKSPACE→PROVIDER` 锁定三张 `asset_source_limit_buckets` row，通过 `next_token_at+version+last_receipt_id` CAS 提交；active permit 与 Release/Delay/Expiry 的唯一事实是 `asset_source_limit_permits` 的 ACQUIRE/terminal append-only ledger。相同 request/command digest 的响应丢失只回放原 receipt，changed digest、第二 terminal receipt、跨 Run/Provider/bucket 或过期状态均 fail closed；Source backpressure、Queue fence 与 advisory/process memory 都不是 Limiter truth。
 - Task 2 唯一拥有 SourceScope、安全 SourceRun、Relationship/Conflict 与资产/映射基础契约；Pack 02/03 直接消费，不复制 DTO。Source mutation、Profile Registry 与 sealed typed-extension session 仅由 Pack 05 Task 13 拥有，且永不暴露 SQL/pgx/raw transaction。
 - `IsLifecycleEdge` 只表达无 self-edge 的结构图，不代表授权；幂等 replay 先读 receipt，公开 transition 仍由管理层按当前可信事实收窄。任何写命令中的 Tenant/route Scope、actor/auth time、Trace、Idempotency-Key、request hash 与 CAS 都由 verified Principal、完整 path/header 和服务端 canonicalization 注入，不能来自 JSON DTO。
 
@@ -98,7 +100,7 @@
 Phase 1 只有在以下全部成立时才可记录 `ASSET_CONTROL_PLANE_ACCEPTED`：
 
 - 11 个任务包的 checkbox 和 commit 边界全部完成；不得先标记状态再补 Provider。
-- PostgreSQL 18.4 的十表迁移、跨 Scope FK、Source Revision/authority membership 不可变与唯一发布、checkpoint/fence、并发/幂等、Outbox/Audit、备份恢复和应用回滚通过。
+- PostgreSQL 18.4 的十二表迁移、跨 Scope FK、Source Revision/authority membership 不可变与唯一发布、Limiter 三 bucket/permit receipt、runtime-only M1F parent lock、checkpoint/fence、并发/幂等、Outbox/Audit、备份恢复和应用回滚通过。
 - Source 六步向导、`ASSET_SOURCE_*` 权限、OpenAPI 严格 Schema、ETag/Idempotency/reauth、`effective_actions` 与唯一生成类型通过。
 - Browser Config 无 Secret/私有 Endpoint 且 malformed fail closed；浏览器/API OIDC `iss/aud/azp/auth_time` 分别验证，生产不依赖 `VITE_OIDC_*` 注入身份配置。
 - CSV/API/CMDB/vSphere/Proxmox/OpenStack/AWS/Azure/GCP 均有真实 protocol serialization、negative/DLP/provenance、incremental checkpoint、soft delete/recovery、rate/backpressure、credential cleanup、两副本 HA/fence 与非生产 canary 签名证据。

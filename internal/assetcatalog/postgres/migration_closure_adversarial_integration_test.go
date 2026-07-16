@@ -321,8 +321,8 @@ func TestAssetCatalogOwnedFunctionsUseCatalogFirstSearchPath(t *testing.T) {
 	`).Scan(&total, &unsafeFunctions); err != nil {
 		t.Fatalf("read 000015 function search paths: %v", err)
 	}
-	if total != 35 {
-		t.Fatalf("000015 owned function count=%d, want 35", total)
+	if total != 36 {
+		t.Fatalf("000015 owned function count=%d, want 36", total)
 	}
 	if unsafeFunctions != "" {
 		t.Fatalf("000015 functions without fixed catalog-first search_path: %s", unsafeFunctions)

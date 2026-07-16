@@ -437,6 +437,27 @@ func TestDatabaseRoleAdmissionRejectsReviewedRelationAndColumnACLDrift(t *testin
 			},
 		},
 		{
+			name: "broad limiter bucket update",
+			mutate: func(snapshot *databaseRoleAdmissionSnapshot) {
+				relation := relationByName(t, snapshot, "asset_source_limit_buckets")
+				relation.ACL = append(relation.ACL, testACL("RUNTIME", "UPDATE"))
+			},
+		},
+		{
+			name: "limiter permit update",
+			mutate: func(snapshot *databaseRoleAdmissionSnapshot) {
+				relation := relationByName(t, snapshot, "asset_source_limit_permits")
+				relation.ACL = append(relation.ACL, testACL("RUNTIME", "UPDATE"))
+			},
+		},
+		{
+			name: "service parent update",
+			mutate: func(snapshot *databaseRoleAdmissionSnapshot) {
+				relation := relationByName(t, snapshot, "services")
+				relation.ACL = append(relation.ACL, testACL("RUNTIME", "UPDATE"))
+			},
+		},
+		{
 			name: "runtime delete",
 			mutate: func(snapshot *databaseRoleAdmissionSnapshot) {
 				relation := relationByName(t, snapshot, "asset_sources")
@@ -494,6 +515,20 @@ func TestDatabaseRoleAdmissionRejectsReviewedRelationAndColumnACLDrift(t *testin
 			},
 		},
 		{
+			name: "missing limiter bucket cas column",
+			mutate: func(snapshot *databaseRoleAdmissionSnapshot) {
+				snapshot.Columns = removeColumnACL(snapshot.Columns,
+					"asset_source_limit_buckets", "last_receipt_id", "UPDATE")
+			},
+		},
+		{
+			name: "unexpected limiter bucket identity update",
+			mutate: func(snapshot *databaseRoleAdmissionSnapshot) {
+				snapshot.Columns = append(snapshot.Columns,
+					testColumnACL("asset_source_limit_buckets", "bucket_key", "RUNTIME", "UPDATE"))
+			},
+		},
+		{
 			name: "workload direct column acl",
 			mutate: func(snapshot *databaseRoleAdmissionSnapshot) {
 				snapshot.Columns[0].ACL.Grantee = "WORKLOAD"
@@ -543,6 +578,14 @@ func TestDatabaseRoleAdmissionRejectsReviewedFunctionACLDrift(t *testing.T) {
 			name: "missing runtime execute",
 			mutate: func(snapshot *databaseRoleAdmissionSnapshot) {
 				function := functionByIdentity(t, snapshot, "public.asset_catalog_text_valid(pg_catalog.text,pg_catalog.int4)")
+				function.ACL = removeACL(function.ACL, "RUNTIME", "EXECUTE")
+			},
+		},
+		{
+			name: "missing runtime parent lock execute",
+			mutate: func(snapshot *databaseRoleAdmissionSnapshot) {
+				function := functionByIdentity(t, snapshot,
+					"public.asset_catalog_lock_exact_service_binding(pg_catalog.uuid,pg_catalog.uuid,pg_catalog.uuid,pg_catalog.uuid)")
 				function.ACL = removeACL(function.ACL, "RUNTIME", "EXECUTE")
 			},
 		},
@@ -821,6 +864,8 @@ func validDatabaseRoleAdmissionSnapshot(trustedSchema string) databaseRoleAdmiss
 		"asset_source_revisions":            {"SELECT", "INSERT", "UPDATE"},
 		"asset_source_revision_authorities": {"SELECT", "INSERT"},
 		"asset_source_runs":                 {"SELECT", "INSERT", "UPDATE"},
+		"asset_source_limit_buckets":        {"SELECT", "INSERT"},
+		"asset_source_limit_permits":        {"SELECT", "INSERT"},
 		"asset_observations":                {"SELECT", "INSERT"},
 		"assets":                            {"SELECT", "INSERT", "UPDATE"},
 		"asset_type_details":                {"SELECT", "INSERT"},
@@ -841,6 +886,8 @@ func validDatabaseRoleAdmissionSnapshot(trustedSchema string) databaseRoleAdmiss
 		"asset_source_revisions",
 		"asset_source_revision_authorities",
 		"asset_source_runs",
+		"asset_source_limit_buckets",
+		"asset_source_limit_permits",
 		"asset_observations",
 		"assets",
 		"asset_type_details",
@@ -878,6 +925,10 @@ func validDatabaseRoleAdmissionSnapshot(trustedSchema string) databaseRoleAdmiss
 	} {
 		snapshot.Columns = append(snapshot.Columns, testColumnACL("outbox_events", column, "RUNTIME", "UPDATE"))
 	}
+	for _, column := range []string{"next_token_at", "last_receipt_id", "version", "updated_at"} {
+		snapshot.Columns = append(snapshot.Columns,
+			testColumnACL("asset_source_limit_buckets", column, "RUNTIME", "UPDATE"))
+	}
 
 	sourceRunsType := trustedSchema + ".asset_source_runs"
 	sourceType := trustedSchema + ".asset_sources"
@@ -900,6 +951,7 @@ func validDatabaseRoleAdmissionSnapshot(trustedSchema string) databaseRoleAdmiss
 		"asset_catalog_opaque_reference_valid(pg_catalog.text)":                                                       true,
 		"asset_catalog_future_source_gate_admitted(" + sourceType + ")":                                               true,
 		"asset_catalog_source_revision_binding_digest(" + sourceRevisionType + ")":                                    true,
+		"asset_catalog_lock_exact_service_binding(pg_catalog.uuid,pg_catalog.uuid,pg_catalog.uuid,pg_catalog.uuid)":   true,
 	}
 	for _, functionName := range []string{
 		"asset_catalog_text_valid(pg_catalog.text,pg_catalog.int4)",
@@ -919,6 +971,7 @@ func validDatabaseRoleAdmissionSnapshot(trustedSchema string) databaseRoleAdmiss
 		"asset_catalog_opaque_reference_valid(pg_catalog.text)",
 		"asset_catalog_future_source_gate_admitted(" + sourceType + ")",
 		"asset_catalog_source_revision_binding_digest(" + sourceRevisionType + ")",
+		"asset_catalog_lock_exact_service_binding(pg_catalog.uuid,pg_catalog.uuid,pg_catalog.uuid,pg_catalog.uuid)",
 		"validate_asset_management_audit_insert()",
 		"reject_asset_catalog_immutable()",
 		"reject_asset_catalog_delete()",

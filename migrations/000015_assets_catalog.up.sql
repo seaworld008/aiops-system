@@ -96,6 +96,63 @@ END;
 $$ LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE SECURITY INVOKER
 SET search_path = pg_catalog, public, pg_temp;
 
+CREATE OR REPLACE FUNCTION public.asset_catalog_lock_exact_service_binding(
+    desired_tenant_id uuid,
+    desired_workspace_id uuid,
+    desired_environment_id uuid,
+    desired_service_id uuid
+) RETURNS boolean AS $$
+DECLARE
+    locked_service_id uuid;
+    locked_mapping_status text;
+BEGIN
+    IF pg_catalog.current_setting('transaction_isolation') <> 'serializable' OR
+       pg_catalog.current_setting('transaction_read_only') <> 'off' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = 'exact Service Binding lock requires a serializable read-write transaction',
+            CONSTRAINT = 'asset_catalog_exact_service_binding_isolation_guard';
+    END IF;
+
+    SELECT service.id
+    INTO locked_service_id
+    FROM public.services AS service
+    WHERE service.tenant_id = desired_tenant_id
+      AND service.workspace_id = desired_workspace_id
+      AND service.id = desired_service_id
+    FOR KEY SHARE OF service;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23503',
+            MESSAGE = 'exact Service Binding lock requires its scoped Service',
+            CONSTRAINT = 'asset_catalog_exact_service_binding_service_scope_guard';
+    END IF;
+
+    SELECT binding.mapping_status
+    INTO locked_mapping_status
+    FROM public.service_bindings AS binding
+    WHERE binding.tenant_id = desired_tenant_id
+      AND binding.workspace_id = desired_workspace_id
+      AND binding.environment_id = desired_environment_id
+      AND binding.service_id = locked_service_id
+    FOR SHARE OF binding;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23503',
+            MESSAGE = 'exact Service Binding lock requires its scoped Environment binding',
+            CONSTRAINT = 'asset_catalog_exact_service_binding_environment_guard';
+    END IF;
+    IF locked_mapping_status <> 'EXACT' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            MESSAGE = 'exact Service Binding lock requires mapping_status EXACT',
+            CONSTRAINT = 'asset_catalog_exact_service_binding_mapping_guard';
+    END IF;
+    RETURN true;
+END;
+$$ LANGUAGE plpgsql VOLATILE STRICT PARALLEL UNSAFE SECURITY DEFINER
+SET search_path = pg_catalog, public, pg_temp;
+
 CREATE OR REPLACE FUNCTION public.asset_catalog_json_object_valid(
     document bytea,
     minimum_bytes integer,
@@ -875,6 +932,163 @@ ALTER TABLE public.asset_sources
         FOREIGN KEY (tenant_id, workspace_id, id, last_complete_snapshot_run_id)
         REFERENCES public.asset_source_runs (tenant_id, workspace_id, source_id, id) ON DELETE RESTRICT;
 
+CREATE TABLE public.asset_source_limit_buckets (
+    id uuid PRIMARY KEY,
+    tenant_id uuid NOT NULL,
+    workspace_id uuid NOT NULL,
+    bucket_kind text NOT NULL CHECK (bucket_kind IN ('SOURCE', 'WORKSPACE', 'PROVIDER')),
+    bucket_key text NOT NULL CHECK (asset_catalog_text_valid(bucket_key, 128)),
+    source_id uuid,
+    provider_kind text CHECK (
+        provider_kind IS NULL OR asset_catalog_provider_kind_valid(provider_kind)
+    ),
+    next_token_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+    last_receipt_id uuid,
+    version bigint NOT NULL DEFAULT 1 CHECK (version > 0),
+    created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+    UNIQUE (tenant_id, workspace_id, id),
+    CONSTRAINT asset_source_limit_buckets_scope_key_uk
+        UNIQUE (tenant_id, workspace_id, bucket_kind, bucket_key),
+    CONSTRAINT asset_source_limit_buckets_exact_identity_uk
+        UNIQUE (tenant_id, workspace_id, id, bucket_kind, bucket_key),
+    CONSTRAINT asset_source_limit_buckets_workspace_fk
+        FOREIGN KEY (tenant_id, workspace_id)
+        REFERENCES public.workspaces (tenant_id, id) ON DELETE RESTRICT,
+    CONSTRAINT asset_source_limit_buckets_source_fk
+        FOREIGN KEY (tenant_id, workspace_id, source_id)
+        REFERENCES public.asset_sources (tenant_id, workspace_id, id) ON DELETE RESTRICT,
+    CONSTRAINT asset_source_limit_buckets_scope_key_ck CHECK ((
+        (bucket_kind = 'SOURCE' AND source_id IS NOT NULL AND provider_kind IS NULL AND
+            bucket_key = source_id::text) OR
+        (bucket_kind = 'WORKSPACE' AND source_id IS NULL AND provider_kind IS NULL AND
+            bucket_key = workspace_id::text) OR
+        (bucket_kind = 'PROVIDER' AND source_id IS NULL AND provider_kind IS NOT NULL AND
+            bucket_key = provider_kind)
+    ) IS TRUE),
+    CONSTRAINT asset_source_limit_buckets_time_ck CHECK (
+        isfinite(next_token_at) AND isfinite(created_at) AND isfinite(updated_at)
+    )
+);
+
+CREATE TABLE public.asset_source_limit_permits (
+    id uuid PRIMARY KEY,
+    tenant_id uuid NOT NULL,
+    workspace_id uuid NOT NULL,
+    permit_id uuid NOT NULL,
+    record_kind text NOT NULL CHECK (record_kind IN ('ACQUIRE', 'RELEASE', 'DELAY', 'EXPIRE')),
+    source_id uuid NOT NULL,
+    run_id uuid NOT NULL,
+    provider_kind text NOT NULL CHECK (asset_catalog_provider_kind_valid(provider_kind)),
+    source_bucket_id uuid NOT NULL,
+    source_bucket_kind text NOT NULL DEFAULT 'SOURCE' CHECK (source_bucket_kind = 'SOURCE'),
+    source_bucket_key text NOT NULL CHECK (asset_catalog_text_valid(source_bucket_key, 128)),
+    workspace_bucket_id uuid NOT NULL,
+    workspace_bucket_kind text NOT NULL DEFAULT 'WORKSPACE' CHECK (workspace_bucket_kind = 'WORKSPACE'),
+    workspace_bucket_key text NOT NULL CHECK (asset_catalog_text_valid(workspace_bucket_key, 128)),
+    provider_bucket_id uuid NOT NULL,
+    provider_bucket_kind text NOT NULL DEFAULT 'PROVIDER' CHECK (provider_bucket_kind = 'PROVIDER'),
+    provider_bucket_key text NOT NULL CHECK (asset_catalog_text_valid(provider_bucket_key, 128)),
+    request_id text NOT NULL CHECK (asset_catalog_idempotency_key_valid(request_id)),
+    command_sha256 text NOT NULL CHECK (asset_catalog_sha256_valid(command_sha256)),
+    receipt_sha256 text NOT NULL CHECK (asset_catalog_sha256_valid(receipt_sha256)),
+    acquired_at timestamptz NOT NULL,
+    expires_at timestamptz NOT NULL,
+    not_before timestamptz,
+    terminal_reason_code text CHECK (
+        terminal_reason_code IS NULL OR asset_catalog_code_valid(terminal_reason_code, 128)
+    ),
+    created_at timestamptz NOT NULL DEFAULT statement_timestamp(),
+    UNIQUE (tenant_id, workspace_id, id),
+    CONSTRAINT asset_source_limit_permits_workspace_request_uk
+        UNIQUE (workspace_id, request_id),
+    CONSTRAINT asset_source_limit_permits_exact_identity_uk UNIQUE (
+        tenant_id, workspace_id, id, source_id, run_id, provider_kind,
+        source_bucket_id, source_bucket_kind, source_bucket_key,
+        workspace_bucket_id, workspace_bucket_kind, workspace_bucket_key,
+        provider_bucket_id, provider_bucket_kind, provider_bucket_key,
+        acquired_at, expires_at
+    ),
+    CONSTRAINT asset_source_limit_permits_source_provider_fk
+        FOREIGN KEY (tenant_id, workspace_id, source_id, provider_kind)
+        REFERENCES public.asset_sources (
+            tenant_id, workspace_id, id, provider_kind
+        ) ON DELETE RESTRICT,
+    CONSTRAINT asset_source_limit_permits_run_fk
+        FOREIGN KEY (tenant_id, workspace_id, source_id, run_id)
+        REFERENCES public.asset_source_runs (
+            tenant_id, workspace_id, source_id, id
+        ) ON DELETE RESTRICT,
+    CONSTRAINT asset_source_limit_permits_source_bucket_fk
+        FOREIGN KEY (
+            tenant_id, workspace_id, source_bucket_id, source_bucket_kind, source_bucket_key
+        ) REFERENCES public.asset_source_limit_buckets (
+            tenant_id, workspace_id, id, bucket_kind, bucket_key
+        ) ON DELETE RESTRICT,
+    CONSTRAINT asset_source_limit_permits_workspace_bucket_fk
+        FOREIGN KEY (
+            tenant_id, workspace_id, workspace_bucket_id, workspace_bucket_kind,
+            workspace_bucket_key
+        ) REFERENCES public.asset_source_limit_buckets (
+            tenant_id, workspace_id, id, bucket_kind, bucket_key
+        ) ON DELETE RESTRICT,
+    CONSTRAINT asset_source_limit_permits_provider_bucket_fk
+        FOREIGN KEY (
+            tenant_id, workspace_id, provider_bucket_id, provider_bucket_kind,
+            provider_bucket_key
+        ) REFERENCES public.asset_source_limit_buckets (
+            tenant_id, workspace_id, id, bucket_kind, bucket_key
+        ) ON DELETE RESTRICT,
+    CONSTRAINT asset_source_limit_permits_acquire_exact_fk FOREIGN KEY (
+        tenant_id, workspace_id, permit_id, source_id, run_id, provider_kind,
+        source_bucket_id, source_bucket_kind, source_bucket_key,
+        workspace_bucket_id, workspace_bucket_kind, workspace_bucket_key,
+        provider_bucket_id, provider_bucket_kind, provider_bucket_key,
+        acquired_at, expires_at
+    ) REFERENCES public.asset_source_limit_permits (
+        tenant_id, workspace_id, id, source_id, run_id, provider_kind,
+        source_bucket_id, source_bucket_kind, source_bucket_key,
+        workspace_bucket_id, workspace_bucket_kind, workspace_bucket_key,
+        provider_bucket_id, provider_bucket_kind, provider_bucket_key,
+        acquired_at, expires_at
+    ) ON DELETE RESTRICT,
+    CONSTRAINT asset_source_limit_permits_bucket_shape_ck CHECK (
+        source_bucket_key = source_id::text AND
+        workspace_bucket_key = workspace_id::text AND
+        provider_bucket_key = provider_kind
+    ),
+    CONSTRAINT asset_source_limit_permits_record_shape_ck CHECK ((
+        (record_kind = 'ACQUIRE' AND id = permit_id AND not_before IS NULL AND
+            terminal_reason_code IS NULL AND created_at = acquired_at) OR
+        (record_kind = 'RELEASE' AND id <> permit_id AND not_before IS NULL AND
+            asset_catalog_code_valid(terminal_reason_code, 128)) OR
+        (record_kind = 'DELAY' AND id <> permit_id AND not_before > created_at AND
+            asset_catalog_code_valid(terminal_reason_code, 128)) OR
+        (record_kind = 'EXPIRE' AND id <> permit_id AND not_before IS NULL AND
+            created_at >= expires_at AND asset_catalog_code_valid(terminal_reason_code, 128))
+    ) IS TRUE),
+    CONSTRAINT asset_source_limit_permits_time_ck CHECK (
+        isfinite(acquired_at) AND isfinite(expires_at) AND isfinite(created_at) AND
+        expires_at > acquired_at AND expires_at <= acquired_at + interval '1 hour' AND
+        created_at >= acquired_at AND (not_before IS NULL OR isfinite(not_before))
+    )
+);
+
+CREATE UNIQUE INDEX asset_source_limit_permits_one_terminal_uk
+    ON public.asset_source_limit_permits (tenant_id, workspace_id, permit_id)
+    WHERE record_kind IN ('RELEASE', 'DELAY', 'EXPIRE');
+CREATE INDEX asset_source_limit_permits_active_lookup_idx
+    ON public.asset_source_limit_permits (
+        tenant_id, workspace_id, source_id, provider_kind, expires_at, id
+    ) WHERE record_kind = 'ACQUIRE';
+
+ALTER TABLE public.asset_source_limit_buckets
+    ADD CONSTRAINT asset_source_limit_buckets_last_receipt_fk
+        FOREIGN KEY (tenant_id, workspace_id, last_receipt_id)
+        REFERENCES public.asset_source_limit_permits (tenant_id, workspace_id, id)
+        ON DELETE RESTRICT
+        DEFERRABLE INITIALLY IMMEDIATE;
+
 CREATE TABLE public.asset_observations (
     id uuid PRIMARY KEY,
     tenant_id uuid NOT NULL,
@@ -1328,6 +1542,10 @@ CREATE TRIGGER asset_source_revision_authorities_immutable
     BEFORE UPDATE ON public.asset_source_revision_authorities
     FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_immutable();
 
+CREATE TRIGGER asset_source_limit_permits_immutable
+    BEFORE UPDATE ON public.asset_source_limit_permits
+    FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_immutable();
+
 CREATE OR REPLACE FUNCTION public.reject_asset_catalog_delete() RETURNS trigger AS $$
 BEGIN
     RAISE EXCEPTION USING
@@ -1360,6 +1578,12 @@ CREATE TRIGGER asset_source_revision_authorities_delete_guard
 CREATE TRIGGER asset_source_runs_delete_guard
     BEFORE DELETE ON public.asset_source_runs
     FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_delete();
+CREATE TRIGGER asset_source_limit_buckets_delete_guard
+    BEFORE DELETE ON public.asset_source_limit_buckets
+    FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_delete();
+CREATE TRIGGER asset_source_limit_permits_delete_guard
+    BEFORE DELETE ON public.asset_source_limit_permits
+    FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_delete();
 CREATE TRIGGER asset_observations_delete_guard
     BEFORE DELETE ON public.asset_observations
     FOR EACH ROW EXECUTE FUNCTION public.reject_asset_catalog_delete();
@@ -1390,6 +1614,12 @@ CREATE TRIGGER asset_source_revision_authorities_truncate_guard
     FOR EACH STATEMENT EXECUTE FUNCTION public.reject_asset_catalog_truncate();
 CREATE TRIGGER asset_source_runs_truncate_guard
     BEFORE TRUNCATE ON public.asset_source_runs
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_asset_catalog_truncate();
+CREATE TRIGGER asset_source_limit_buckets_truncate_guard
+    BEFORE TRUNCATE ON public.asset_source_limit_buckets
+    FOR EACH STATEMENT EXECUTE FUNCTION public.reject_asset_catalog_truncate();
+CREATE TRIGGER asset_source_limit_permits_truncate_guard
+    BEFORE TRUNCATE ON public.asset_source_limit_permits
     FOR EACH STATEMENT EXECUTE FUNCTION public.reject_asset_catalog_truncate();
 CREATE TRIGGER asset_observations_truncate_guard
     BEFORE TRUNCATE ON public.asset_observations
@@ -1544,6 +1774,66 @@ CREATE TRIGGER asset_conflicts_transition_guard
 
 CREATE OR REPLACE FUNCTION public.enforce_asset_catalog_edge_mutation() RETURNS trigger AS $$
 BEGIN
+    IF TG_TABLE_NAME = 'asset_source_limit_buckets' THEN
+        IF TG_OP = 'INSERT' THEN
+            IF NEW.version <> 1 OR NEW.last_receipt_id IS NOT NULL THEN
+                RAISE EXCEPTION USING
+                    ERRCODE = '23514',
+                    MESSAGE = 'asset_source_limit_buckets must start at version one without a receipt',
+                    CONSTRAINT = 'asset_source_limit_buckets_initial_version_guard';
+            END IF;
+            NEW.created_at := statement_timestamp();
+            NEW.updated_at := NEW.created_at;
+            RETURN NEW;
+        END IF;
+        IF (to_jsonb(OLD) - ARRAY[
+                'next_token_at', 'last_receipt_id', 'version', 'updated_at'
+            ]) IS DISTINCT FROM
+           (to_jsonb(NEW) - ARRAY[
+                'next_token_at', 'last_receipt_id', 'version', 'updated_at'
+            ]) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'asset_source_limit_buckets identity and scope are immutable',
+                CONSTRAINT = 'asset_source_limit_buckets_identity_guard';
+        END IF;
+        IF NEW.version <> OLD.version + 1 THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'asset_source_limit_buckets version must advance exactly once',
+                CONSTRAINT = 'asset_source_limit_buckets_version_guard';
+        END IF;
+        IF NEW.next_token_at < OLD.next_token_at THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'asset_source_limit_buckets token time cannot move backward',
+                CONSTRAINT = 'asset_source_limit_buckets_token_monotonic_guard';
+        END IF;
+        IF NEW.last_receipt_id IS NULL OR
+           NEW.last_receipt_id IS NOT DISTINCT FROM OLD.last_receipt_id OR
+           NOT EXISTS (
+                SELECT 1
+                FROM public.asset_source_limit_permits AS receipt
+                WHERE receipt.tenant_id = NEW.tenant_id
+                  AND receipt.workspace_id = NEW.workspace_id
+                  AND receipt.id = NEW.last_receipt_id
+                  AND NEW.id IN (
+                        receipt.source_bucket_id,
+                        receipt.workspace_bucket_id,
+                        receipt.provider_bucket_id
+                  )
+                  AND receipt.xmin = pg_catalog.pg_current_xact_id()::xid
+           ) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '23503',
+                MESSAGE = 'asset_source_limit_buckets requires a new same-transaction exact receipt',
+                CONSTRAINT = 'asset_source_limit_buckets_receipt_guard';
+        END IF;
+        NEW.created_at := OLD.created_at;
+        NEW.updated_at := statement_timestamp();
+        RETURN NEW;
+    END IF;
+
     IF TG_OP = 'INSERT' THEN
         IF NEW.version <> 1 THEN
             RAISE EXCEPTION USING
@@ -1775,6 +2065,10 @@ CREATE CONSTRAINT TRIGGER asset_relationships_page_closure_guard
 
 CREATE TRIGGER service_asset_bindings_mutation_guard
     BEFORE INSERT OR UPDATE ON public.service_asset_bindings
+    FOR EACH ROW EXECUTE FUNCTION public.enforce_asset_catalog_edge_mutation();
+
+CREATE TRIGGER asset_source_limit_buckets_mutation_guard
+    BEFORE INSERT OR UPDATE ON public.asset_source_limit_buckets
     FOR EACH ROW EXECUTE FUNCTION public.enforce_asset_catalog_edge_mutation();
 
 CREATE OR REPLACE FUNCTION public.enforce_asset_sources_mutation() RETURNS trigger AS $$
@@ -4541,6 +4835,7 @@ REVOKE EXECUTE ON FUNCTION
     public.asset_catalog_opaque_reference_valid(text),
     public.asset_catalog_future_source_gate_admitted(public.asset_sources),
     public.asset_catalog_source_revision_binding_digest(public.asset_source_revisions),
+    public.asset_catalog_lock_exact_service_binding(uuid, uuid, uuid, uuid),
     public.validate_asset_management_audit_insert(),
     public.reject_asset_catalog_immutable(),
     public.reject_asset_catalog_delete(),
@@ -4569,6 +4864,8 @@ GRANT SELECT, INSERT ON TABLE
     public.asset_source_revisions,
     public.asset_source_revision_authorities,
     public.asset_source_runs,
+    public.asset_source_limit_buckets,
+    public.asset_source_limit_permits,
     public.asset_observations,
     public.assets,
     public.asset_type_details,
@@ -4576,6 +4873,8 @@ GRANT SELECT, INSERT ON TABLE
     public.asset_relationships,
     public.service_asset_bindings
     TO aiops_control_plane_runtime;
+GRANT UPDATE (next_token_at, last_receipt_id, version, updated_at)
+    ON public.asset_source_limit_buckets TO aiops_control_plane_runtime;
 GRANT UPDATE ON TABLE
     public.asset_sources,
     public.asset_source_revisions,
@@ -4614,7 +4913,8 @@ GRANT EXECUTE ON FUNCTION
     public.asset_catalog_source_run_terminal_digest(public.asset_source_runs, text, text),
     public.asset_catalog_opaque_reference_valid(text),
     public.asset_catalog_future_source_gate_admitted(public.asset_sources),
-    public.asset_catalog_source_revision_binding_digest(public.asset_source_revisions)
+    public.asset_catalog_source_revision_binding_digest(public.asset_source_revisions),
+    public.asset_catalog_lock_exact_service_binding(uuid, uuid, uuid, uuid)
     TO aiops_control_plane_runtime;
 
 RESET ROLE;

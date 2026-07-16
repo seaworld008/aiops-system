@@ -783,12 +783,28 @@ func TestAssetCatalogMigration(t *testing.T) {
 	if err := harness.db.QueryRow(context.Background(), `
 		SELECT count(*) FROM information_schema.tables
 		WHERE table_schema='public' AND table_name = ANY($1)
-	`, []string{"asset_sources", "asset_source_revisions", "asset_source_revision_authorities", "asset_source_runs", "asset_observations", "assets",
+	`, []string{"asset_sources", "asset_source_revisions", "asset_source_revision_authorities", "asset_source_runs",
+		"asset_source_limit_buckets", "asset_source_limit_permits", "asset_observations", "assets",
 		"asset_type_details", "asset_conflicts", "asset_relationships", "service_asset_bindings"}).Scan(&tableCount); err != nil {
 		t.Fatal(err)
 	}
-	if tableCount != 10 {
-		t.Fatalf("asset catalog table count=%d, want 10", tableCount)
+	if tableCount != 12 {
+		t.Fatalf("asset catalog table count=%d, want 12", tableCount)
+	}
+	var foreignKeyCount int
+	if err := harness.db.QueryRow(context.Background(), `
+		SELECT count(*)
+		FROM pg_catalog.pg_constraint AS constraint_record
+		JOIN pg_catalog.pg_class AS relation ON relation.oid=constraint_record.conrelid
+		JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+		WHERE namespace.nspname='public'
+		  AND relation.relname=ANY($1)
+		  AND constraint_record.contype='f'
+	`, assetCatalogTableNames()).Scan(&foreignKeyCount); err != nil {
+		t.Fatal(err)
+	}
+	if foreignKeyCount != 44 {
+		t.Fatalf("asset catalog foreign key count=%d, want 44", foreignKeyCount)
 	}
 	roleAdmission := storepostgres.NewDatabaseRoleAdmission(harness.application, "public")
 	if err := roleAdmission.Check(context.Background()); err != nil {
@@ -2243,7 +2259,7 @@ func TestAssetCatalogMigrationDownNowaitConflictRollsBack(t *testing.T) {
 			if !errors.As(downErr, &postgresError) || postgresError.Code != "55P03" {
 				t.Fatalf("conflicting one-shot down error=%v, want SQLSTATE 55P03", downErr)
 			}
-			assertAssetCatalogOwnedTableCount(t, harness.db, 10)
+			assertAssetCatalogOwnedTableCount(t, harness.db, 12)
 			if err := assetpostgres.NewSchemaAdmission(harness.application, "public").Check(context.Background()); err != nil {
 				t.Fatalf("schema admission after conflicting down rollback: %v", err)
 			}
@@ -2464,7 +2480,8 @@ func assetCatalogControlDatabaseNameSafe(name string) bool {
 }
 
 func assetCatalogTableNames() []string {
-	return []string{"asset_sources", "asset_source_revisions", "asset_source_revision_authorities", "asset_source_runs", "asset_observations", "assets",
+	return []string{"asset_sources", "asset_source_revisions", "asset_source_revision_authorities", "asset_source_runs",
+		"asset_source_limit_buckets", "asset_source_limit_permits", "asset_observations", "assets",
 		"asset_type_details", "asset_conflicts", "asset_relationships", "service_asset_bindings"}
 }
 
