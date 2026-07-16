@@ -41,6 +41,32 @@ func TestAuthenticatorBuildsPrincipalOnlyFromVerifiedBearerClaims(t *testing.T) 
 	}
 }
 
+func TestAuthenticatorAcceptsViewerAsAClosedAssetReadRole(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 16, 9, 0, 0, 0, time.UTC)
+	claims := validClaims(now)
+	claims.Roles = []string{"VIEWER", "UNKNOWN", "VIEWER"}
+	authenticator, err := NewAuthenticator(
+		&fakeVerifier{claims: claims},
+		Options{MaxSessionAge: 12 * time.Hour},
+		func() time.Time { return now },
+	)
+	if err != nil {
+		t.Fatalf("NewAuthenticator() error = %v", err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/assets", nil)
+	request.Header.Set("Authorization", "Bearer signed-token")
+
+	principal, err := authenticator.Authenticate(request)
+	if err != nil {
+		t.Fatalf("Authenticate() error = %v", err)
+	}
+	if !reflect.DeepEqual(principal.Roles, []Role{RoleViewer}) {
+		t.Fatalf("principal roles = %#v, want VIEWER only", principal.Roles)
+	}
+}
+
 func TestAuthenticatedPrincipalRequiresCanonicalTenantID(t *testing.T) {
 	t.Parallel()
 

@@ -93,6 +93,84 @@ func TestAuthorizerUsesDenyByDefaultRolePermissionMatrix(t *testing.T) {
 	}
 }
 
+func TestAssetPermissionMatrix(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 16, 9, 0, 0, 0, time.UTC)
+	authorizer, err := NewAuthorizer(5*time.Minute, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewAuthorizer() error = %v", err)
+	}
+	tests := []struct {
+		name       string
+		role       authn.Role
+		permission Permission
+		serviceID  string
+		allowed    bool
+	}{
+		{name: "viewer reads", role: authn.RoleViewer, permission: PermissionAssetRead, allowed: true},
+		{name: "viewer cannot manage", role: authn.RoleViewer, permission: PermissionAssetManage},
+		{name: "sre reads", role: authn.RoleSRE, permission: PermissionAssetRead, allowed: true},
+		{name: "sre cannot bind", role: authn.RoleSRE, permission: PermissionAssetBind, serviceID: "service-payments"},
+		{name: "owner reads", role: authn.RoleServiceOwner, permission: PermissionAssetRead, allowed: true},
+		{name: "owner binds owned service", role: authn.RoleServiceOwner, permission: PermissionAssetBind, serviceID: "service-payments", allowed: true},
+		{name: "owner cannot bind without service", role: authn.RoleServiceOwner, permission: PermissionAssetBind},
+		{name: "owner cannot bind other service", role: authn.RoleServiceOwner, permission: PermissionAssetBind, serviceID: "service-orders"},
+		{name: "approver reads", role: authn.RoleApprover, permission: PermissionAssetRead, allowed: true},
+		{name: "auditor reads", role: authn.RoleAuditor, permission: PermissionAssetRead, allowed: true},
+		{name: "admin manages", role: authn.RoleAdmin, permission: PermissionAssetManage, allowed: true},
+		{name: "admin binds with explicit service", role: authn.RoleAdmin, permission: PermissionAssetBind, serviceID: "service-payments", allowed: true},
+		{name: "admin resolves", role: authn.RoleAdmin, permission: PermissionAssetConflictResolve, allowed: true},
+		{name: "asset permissions never imply investigation", role: authn.RoleViewer, permission: PermissionInvestigationRun, serviceID: "service-payments"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := principal(now, test.role)
+			candidate.ServiceIDs = []string{"service-payments"}
+			err := authorizer.Authorize(candidate, Request{
+				Permission:    test.permission,
+				WorkspaceID:   "workspace-1",
+				EnvironmentID: "PROD",
+				ServiceID:     test.serviceID,
+			})
+			if test.allowed && err != nil {
+				t.Fatalf("Authorize() error = %v", err)
+			}
+			if !test.allowed && !errors.Is(err, ErrForbidden) {
+				t.Fatalf("Authorize() error = %v, want forbidden", err)
+			}
+		})
+	}
+}
+
+func TestAssetPermissionsDoNotRequireRecentAuthentication(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 16, 9, 0, 0, 0, time.UTC)
+	authorizer, err := NewAuthorizer(5*time.Minute, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewAuthorizer() error = %v", err)
+	}
+	admin := principal(now, authn.RoleAdmin)
+	admin.AuthenticatedAt = now.Add(-time.Hour)
+	for _, permission := range []Permission{
+		PermissionAssetRead,
+		PermissionAssetManage,
+		PermissionAssetBind,
+		PermissionAssetConflictResolve,
+	} {
+		request := Request{
+			Permission: permission, WorkspaceID: "workspace-1", EnvironmentID: "PROD",
+		}
+		if permission == PermissionAssetBind {
+			request.ServiceID = "service-payments"
+		}
+		if err := authorizer.Authorize(admin, request); err != nil {
+			t.Fatalf("Authorize(%s) error = %v", permission, err)
+		}
+	}
+}
+
 func TestAuthorizerCredentialRevocationRoleMatrixDoesNotRequireServiceScope(t *testing.T) {
 	t.Parallel()
 
