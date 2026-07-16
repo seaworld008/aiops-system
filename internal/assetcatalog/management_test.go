@@ -1,0 +1,804 @@
+package assetcatalog
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/seaworld008/aiops-system/internal/authn"
+	"github.com/seaworld008/aiops-system/internal/authz"
+	"github.com/seaworld008/aiops-system/internal/domain"
+)
+
+const (
+	managementTenantID      = "11111111-1111-4111-8111-111111111111"
+	managementOtherTenantID = "11111111-1111-4111-8111-111111111112"
+	managementWorkspaceID   = "22222222-2222-4222-8222-222222222222"
+	managementEnvironmentID = "33333333-3333-4333-8333-333333333333"
+	managementAssetID       = "44444444-4444-4444-8444-444444444444"
+	managementSourceID      = "55555555-5555-4555-8555-555555555555"
+	managementServiceID     = "66666666-6666-4666-8666-666666666666"
+	managementBindingID     = "77777777-7777-4777-8777-777777777777"
+	managementConflictID    = "88888888-8888-4888-8888-888888888888"
+)
+
+func TestManagementInterfacesHaveExactNarrowShape(t *testing.T) {
+	t.Parallel()
+
+	assertExactInterface(t, reflect.TypeOf((*AssetManager)(nil)).Elem(), reflect.TypeOf((*interface {
+		ListAssets(context.Context, authn.Principal, AssetCollectionRequest, AssetListInput) (AssetViewPage, error)
+		GetAsset(context.Context, authn.Principal, AssetPathRequest) (AssetView, error)
+		CreateAsset(context.Context, authn.Principal, AssetCollectionRequest, CreateAssetInput, ServerRequestMetadata) (AssetMutationView, error)
+		UpdateAsset(context.Context, authn.Principal, AssetPathRequest, UpdateGovernanceInput, ServerRequestMetadata) (AssetMutationView, error)
+		QuarantineAsset(context.Context, authn.Principal, AssetPathRequest, TransitionInput, ServerRequestMetadata) (AssetMutationView, error)
+		RetireAsset(context.Context, authn.Principal, AssetPathRequest, TransitionInput, ServerRequestMetadata) (AssetMutationView, error)
+	})(nil)).Elem())
+	assertExactInterface(t, reflect.TypeOf((*RelationshipManager)(nil)).Elem(), reflect.TypeOf((*interface {
+		ListRelationships(context.Context, authn.Principal, AssetCollectionRequest, RelationshipListInput) (RelationshipViewPage, error)
+	})(nil)).Elem())
+	assertExactInterface(t, reflect.TypeOf((*SourceManager)(nil)).Elem(), reflect.TypeOf((*interface {
+		ListSources(context.Context, authn.Principal, SourceCollectionRequest, SourceListInput) (SourceViewPage, error)
+		GetSource(context.Context, authn.Principal, SourcePathRequest) (SourceView, error)
+		GetSourceRun(context.Context, authn.Principal, SourceRunPathRequest) (SourceRunView, error)
+	})(nil)).Elem())
+	assertExactInterface(t, reflect.TypeOf((*ConflictManager)(nil)).Elem(), reflect.TypeOf((*interface {
+		ListConflicts(context.Context, authn.Principal, ConflictCollectionRequest, ConflictListInput) (ConflictViewPage, error)
+		ResolveConflict(context.Context, authn.Principal, ConflictPathRequest, ResolveConflictInput, ServerRequestMetadata) (ConflictMutationView, error)
+	})(nil)).Elem())
+	assertExactInterface(t, reflect.TypeOf((*BindingManager)(nil)).Elem(), reflect.TypeOf((*interface {
+		ListBindings(context.Context, authn.Principal, AssetCollectionRequest, BindingListInput) (BindingViewPage, error)
+		CreateBinding(context.Context, authn.Principal, AssetCollectionRequest, CreateBindingInput, ServerRequestMetadata) (BindingMutationView, error)
+		DeleteBinding(context.Context, authn.Principal, BindingPathRequest, DeleteBindingInput, ServerRequestMetadata) (MutationReceipt, error)
+	})(nil)).Elem())
+}
+
+func TestManagementFailsClosedWhenAnyDependencyIsMissing(t *testing.T) {
+	t.Parallel()
+
+	repository := &recordingManagementRepository{scope: managementScope()}
+	authorizer := managementAuthorizer(t)
+	tests := []struct {
+		name       string
+		assets     Repository
+		mappings   MappingRepository
+		sources    SourceReadRepository
+		authorizer *authz.Authorizer
+	}{
+		{name: "assets", mappings: repository, sources: repository, authorizer: authorizer},
+		{name: "mappings", assets: repository, sources: repository, authorizer: authorizer},
+		{name: "sources", assets: repository, mappings: repository, authorizer: authorizer},
+		{name: "authorizer", assets: repository, mappings: repository, sources: repository},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if manager, err := NewManagement(test.assets, test.mappings, test.sources, test.authorizer); err == nil || manager != nil {
+				t.Fatalf("NewManagement() = (%#v, %v), want closed error", manager, err)
+			}
+		})
+	}
+}
+
+func TestManagementDoesNotCallMutationRepositoryWhenUnauthorized(t *testing.T) {
+	t.Parallel()
+
+	repository := &recordingManagementRepository{scope: managementScope()}
+	manager := mustManagement(t, repository)
+	_, err := manager.CreateAsset(
+		context.Background(),
+		managementPrincipal(authn.RoleViewer),
+		AssetCollectionRequest{WorkspaceID: managementWorkspaceID, EnvironmentID: managementEnvironmentID},
+		validManagementCreateAssetInput(),
+		validManagementCreateMetadata(),
+	)
+	if !errors.Is(err, authz.ErrForbidden) {
+		t.Fatalf("CreateAsset() error = %v, want ErrForbidden", err)
+	}
+	if repository.resolveScopeCalls != 1 || repository.createAssetCalls != 0 {
+		t.Fatalf("calls ResolveScope/Create = %d/%d, want 1/0", repository.resolveScopeCalls, repository.createAssetCalls)
+	}
+}
+
+func TestManagementRejectsResolvedScopeFromAnotherTenant(t *testing.T) {
+	t.Parallel()
+
+	repository := &recordingManagementRepository{
+		scope: Scope{
+			TenantID: managementOtherTenantID, WorkspaceID: managementWorkspaceID,
+			EnvironmentID: managementEnvironmentID,
+		},
+	}
+	manager := mustManagement(t, repository)
+	_, err := manager.CreateAsset(
+		context.Background(),
+		managementPrincipal(authn.RoleAdmin),
+		AssetCollectionRequest{WorkspaceID: managementWorkspaceID, EnvironmentID: managementEnvironmentID},
+		validManagementCreateAssetInput(),
+		validManagementCreateMetadata(),
+	)
+	if !errors.Is(err, authz.ErrForbidden) {
+		t.Fatalf("CreateAsset(cross-tenant scope) error = %v, want ErrForbidden", err)
+	}
+	if repository.createAssetCalls != 0 {
+		t.Fatalf("Create() calls = %d, want 0", repository.createAssetCalls)
+	}
+}
+
+func TestEffectiveActionsComeFromAuthorizationAndObjectState(t *testing.T) {
+	t.Parallel()
+
+	repository := &recordingManagementRepository{
+		scope: managementScope(),
+		assetDetail: AssetDetailReadModel{AssetReadModel: AssetReadModel{Asset: Asset{
+			ID: managementAssetID, Scope: managementScope(), Lifecycle: LifecycleActive,
+			MappingStatus: domain.MappingExact,
+		}}},
+	}
+	manager := mustManagement(t, repository)
+	admin := managementPrincipal(authn.RoleAdmin)
+	request := AssetPathRequest{
+		WorkspaceID: managementWorkspaceID, EnvironmentID: managementEnvironmentID, AssetID: managementAssetID,
+	}
+
+	view, err := manager.GetAsset(context.Background(), admin, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []EffectiveAction{ActionEditGovernance, ActionQuarantine, ActionRetire}
+	if !slices.Equal(view.EffectiveActions, want) {
+		t.Fatalf("active effective actions = %v, want %v", view.EffectiveActions, want)
+	}
+
+	repository.assetDetail.Asset.Lifecycle = LifecycleRetired
+	view, err = manager.GetAsset(context.Background(), admin, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.EffectiveActions) != 0 {
+		t.Fatalf("retired effective actions = %v, want empty", view.EffectiveActions)
+	}
+}
+
+func TestManagementPushesServiceOwnerAccessIntoRepositoryQuery(t *testing.T) {
+	t.Parallel()
+
+	repository := &recordingManagementRepository{scope: managementScope()}
+	manager := mustManagement(t, repository)
+	owner := managementPrincipal(authn.RoleServiceOwner)
+	owner.ServiceIDs = []string{
+		"66666666-6666-4666-8666-666666666667",
+		managementServiceID,
+	}
+	_, err := manager.ListAssets(
+		context.Background(),
+		owner,
+		AssetCollectionRequest{WorkspaceID: managementWorkspaceID, EnvironmentID: managementEnvironmentID},
+		AssetListInput{Sort: AssetSortDisplayNameAsc, Limit: 50},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repository.listAssetCalls != 1 || repository.lastAssetList.Access.Unrestricted() {
+		t.Fatalf("List()/access = %d/%#v, want one restricted query", repository.listAssetCalls, repository.lastAssetList.Access)
+	}
+	want := []string{managementServiceID, "66666666-6666-4666-8666-666666666667"}
+	if got := repository.lastAssetList.Access.ServiceIDs(); !slices.Equal(got, want) {
+		t.Fatalf("service constraint = %v, want %v", got, want)
+	}
+}
+
+func TestManagementAuthorizesBindingAgainstRequestedOwnedService(t *testing.T) {
+	t.Parallel()
+
+	repository := &recordingManagementRepository{
+		scope: managementScope(),
+		bindingResult: BindingMutationResult{Binding: ServiceAssetBinding{
+			ID: managementBindingID, Scope: managementScope(), ServiceID: managementServiceID,
+			AssetID: managementAssetID, Role: BindingRoleDependency, Status: BindingStatusActive, Version: 1,
+		}},
+	}
+	manager := mustManagement(t, repository)
+	owner := managementPrincipal(authn.RoleServiceOwner)
+
+	_, err := manager.CreateBinding(
+		context.Background(),
+		owner,
+		AssetCollectionRequest{WorkspaceID: managementWorkspaceID, EnvironmentID: managementEnvironmentID},
+		CreateBindingInput{
+			ServiceID: managementServiceID, AssetID: managementAssetID,
+			Role: BindingRoleDependency, ReasonCode: "owner_binding",
+		},
+		validManagementCreateMetadata(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repository.createBindingCalls != 1 {
+		t.Fatalf("CreateBinding() calls = %d, want 1", repository.createBindingCalls)
+	}
+
+	other := CreateBindingInput{
+		ServiceID: "66666666-6666-4666-8666-666666666667", AssetID: managementAssetID,
+		Role: BindingRoleDependency, ReasonCode: "other_binding",
+	}
+	if _, err := manager.CreateBinding(
+		context.Background(), owner,
+		AssetCollectionRequest{WorkspaceID: managementWorkspaceID, EnvironmentID: managementEnvironmentID},
+		other, validManagementCreateMetadata(),
+	); !errors.Is(err, authz.ErrForbidden) {
+		t.Fatalf("CreateBinding(other service) error = %v, want ErrForbidden", err)
+	}
+	if repository.createBindingCalls != 1 {
+		t.Fatalf("CreateBinding() calls after denial = %d, want 1", repository.createBindingCalls)
+	}
+}
+
+func TestManagementResolveConflictUsesNarrowScopeLookupBeforeAuthorizedMutation(t *testing.T) {
+	t.Parallel()
+
+	repository := &recordingManagementRepository{
+		scope: managementScope(),
+		conflictResult: MappingDecisionResult{Conflict: ConflictReadModel{Conflict: Conflict{
+			ID: managementConflictID, Scope: managementScope(), Status: ConflictStatusResolved,
+			Resolution: ConflictResolutionConfirmExact, Version: 2,
+		}}},
+	}
+	manager := mustManagement(t, repository)
+	view, err := manager.ResolveConflict(
+		context.Background(),
+		managementPrincipal(authn.RoleAdmin),
+		ConflictPathRequest{WorkspaceID: managementWorkspaceID, ConflictID: managementConflictID},
+		ResolveConflictInput{
+			ServiceID: managementServiceID, Resolution: ConflictResolutionConfirmExact,
+			BindingRole: BindingRoleDependency, ReasonCode: "confirm_exact",
+		},
+		ServerRequestMetadata{
+			TraceID: "trace-conflict", IdempotencyKey: "conflict-resolution", ExpectedVersion: 1,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.View.ReadModel.ID != managementConflictID ||
+		repository.resolveConflictScopeCalls != 1 || repository.resolveConflictCalls != 1 {
+		t.Fatalf("result/calls = %#v/%d/%d", view, repository.resolveConflictScopeCalls, repository.resolveConflictCalls)
+	}
+	scope, ok := repository.lastDecision.Context.EnvironmentScope()
+	if !ok || scope != managementScope() || repository.lastDecision.Context.SubjectID() != "principal-subject" ||
+		repository.lastDecision.Context.RequestHash() == "" {
+		t.Fatalf("trusted decision context = %#v, scope=%#v/%t", repository.lastDecision.Context, scope, ok)
+	}
+}
+
+func TestManagementResolveConflictStopsAfterScopeLookupWhenTenantOrAuthorizationFails(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		scope     Scope
+		principal authn.Principal
+	}{
+		{
+			name: "cross tenant",
+			scope: Scope{
+				TenantID: managementOtherTenantID, WorkspaceID: managementWorkspaceID,
+				EnvironmentID: managementEnvironmentID,
+			},
+			principal: managementPrincipal(authn.RoleAdmin),
+		},
+		{
+			name:      "unauthorized role",
+			scope:     managementScope(),
+			principal: managementPrincipal(authn.RoleViewer),
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			repository := &recordingManagementRepository{scope: test.scope}
+			manager := mustManagement(t, repository)
+			_, err := manager.ResolveConflict(
+				context.Background(),
+				test.principal,
+				ConflictPathRequest{WorkspaceID: managementWorkspaceID, ConflictID: managementConflictID},
+				ResolveConflictInput{
+					ServiceID: managementServiceID, Resolution: ConflictResolutionConfirmExact,
+					BindingRole: BindingRoleDependency, ReasonCode: "confirm_exact",
+				},
+				ServerRequestMetadata{
+					TraceID: "trace-conflict-denied", IdempotencyKey: "conflict-resolution-denied",
+					ExpectedVersion: 1,
+				},
+			)
+			if !errors.Is(err, authz.ErrForbidden) {
+				t.Fatalf("ResolveConflict() error = %v, want ErrForbidden", err)
+			}
+			if repository.resolveConflictScopeCalls != 1 || repository.resolveConflictCalls != 0 {
+				t.Fatalf("scope/mutation calls = %d/%d, want 1/0",
+					repository.resolveConflictScopeCalls, repository.resolveConflictCalls)
+			}
+		})
+	}
+}
+
+func TestManagementDeleteBindingRemainsAdminOnlyWithoutPreauthorizationServiceProof(t *testing.T) {
+	t.Parallel()
+
+	repository := &recordingManagementRepository{scope: managementScope()}
+	manager := mustManagement(t, repository)
+	_, err := manager.DeleteBinding(
+		context.Background(),
+		managementPrincipal(authn.RoleServiceOwner),
+		BindingPathRequest{
+			WorkspaceID: managementWorkspaceID, EnvironmentID: managementEnvironmentID, BindingID: managementBindingID,
+		},
+		DeleteBindingInput{ReasonCode: "remove_binding"},
+		ServerRequestMetadata{
+			TraceID: "trace-delete", IdempotencyKey: "delete-binding", ExpectedVersion: 1,
+		},
+	)
+	if !errors.Is(err, authz.ErrForbidden) {
+		t.Fatalf("DeleteBinding(service owner) error = %v, want ErrForbidden", err)
+	}
+	if repository.deleteBindingCalls != 0 {
+		t.Fatalf("DeleteBinding() calls = %d, want 0", repository.deleteBindingCalls)
+	}
+}
+
+func TestManagementRejectsMalformedListInputsBeforeScopeResolution(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		call func(*Management, *recordingManagementRepository) error
+	}{
+		{
+			name: "assets",
+			call: func(manager *Management, repository *recordingManagementRepository) error {
+				_, err := manager.ListAssets(
+					context.Background(), managementPrincipal(authn.RoleAdmin),
+					AssetCollectionRequest{
+						WorkspaceID: managementWorkspaceID, EnvironmentID: managementEnvironmentID,
+					},
+					AssetListInput{Sort: AssetSortDisplayNameAsc, Limit: 0},
+				)
+				return err
+			},
+		},
+		{
+			name: "relationships",
+			call: func(manager *Management, repository *recordingManagementRepository) error {
+				_, err := manager.ListRelationships(
+					context.Background(), managementPrincipal(authn.RoleAdmin),
+					AssetCollectionRequest{
+						WorkspaceID: managementWorkspaceID, EnvironmentID: managementEnvironmentID,
+					},
+					RelationshipListInput{Limit: 0},
+				)
+				return err
+			},
+		},
+		{
+			name: "sources",
+			call: func(manager *Management, repository *recordingManagementRepository) error {
+				_, err := manager.ListSources(
+					context.Background(), managementPrincipal(authn.RoleAdmin),
+					SourceCollectionRequest{WorkspaceID: managementWorkspaceID},
+					SourceListInput{Limit: 0},
+				)
+				return err
+			},
+		},
+		{
+			name: "conflicts",
+			call: func(manager *Management, repository *recordingManagementRepository) error {
+				_, err := manager.ListConflicts(
+					context.Background(), managementPrincipal(authn.RoleAdmin),
+					ConflictCollectionRequest{
+						WorkspaceID: managementWorkspaceID, EnvironmentID: managementEnvironmentID,
+					},
+					ConflictListInput{Limit: 0},
+				)
+				return err
+			},
+		},
+		{
+			name: "bindings",
+			call: func(manager *Management, repository *recordingManagementRepository) error {
+				_, err := manager.ListBindings(
+					context.Background(), managementPrincipal(authn.RoleAdmin),
+					AssetCollectionRequest{
+						WorkspaceID: managementWorkspaceID, EnvironmentID: managementEnvironmentID,
+					},
+					BindingListInput{Limit: 0},
+				)
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			repository := &recordingManagementRepository{scope: managementScope()}
+			manager := mustManagement(t, repository)
+			if err := test.call(manager, repository); !errors.Is(err, ErrInvalidRequest) {
+				t.Fatalf("list error = %v, want ErrInvalidRequest", err)
+			}
+			if repository.resolveScopeCalls != 0 || repository.resolveSourceScopeCalls != 0 {
+				t.Fatalf("scope calls = environment:%d source:%d, want 0/0",
+					repository.resolveScopeCalls, repository.resolveSourceScopeCalls)
+			}
+		})
+	}
+}
+
+func TestManagementProjectsMappingAndSourceActionsFromAuthorizationAndState(t *testing.T) {
+	t.Parallel()
+
+	repository := &recordingManagementRepository{
+		scope: managementScope(),
+		bindingPage: BindingPage{Items: []ServiceAssetBinding{
+			{ID: managementBindingID, Scope: managementScope(), Status: BindingStatusActive},
+			{ID: "77777777-7777-4777-8777-777777777778", Scope: managementScope(), Status: BindingStatusInactive},
+		}},
+		conflictPage: ConflictPage{Items: []ConflictReadModel{
+			{Conflict: Conflict{ID: managementConflictID, Scope: managementScope(), Status: ConflictStatusOpen}},
+			{Conflict: Conflict{
+				ID: "88888888-8888-4888-8888-888888888889", Scope: managementScope(),
+				Status: ConflictStatusResolved, Resolution: ConflictResolutionKeepUnresolved,
+			}},
+		}},
+		sourcePage: SourcePage{Items: []SourceReadModel{{
+			Source: Source{ID: managementSourceID, TenantID: managementTenantID, WorkspaceID: managementWorkspaceID},
+		}}},
+		relationPage: RelationshipPage{Items: []Relationship{{
+			ID: "99999999-9999-4999-8999-999999999999",
+		}}},
+	}
+	manager := mustManagement(t, repository)
+	admin := managementPrincipal(authn.RoleAdmin)
+	collection := AssetCollectionRequest{
+		WorkspaceID: managementWorkspaceID, EnvironmentID: managementEnvironmentID,
+	}
+
+	bindings, err := manager.ListBindings(
+		context.Background(), admin, collection, BindingListInput{Limit: 10},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(bindings.Items[0].EffectiveActions, []EffectiveAction{ActionDeleteBinding}) ||
+		len(bindings.Items[1].EffectiveActions) != 0 {
+		t.Fatalf("binding effective actions = %#v", bindings.Items)
+	}
+
+	conflicts, err := manager.ListConflicts(
+		context.Background(), admin,
+		ConflictCollectionRequest{
+			WorkspaceID: managementWorkspaceID, EnvironmentID: managementEnvironmentID,
+		},
+		ConflictListInput{Limit: 10},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(conflicts.Items[0].EffectiveActions, []EffectiveAction{ActionResolveConflict}) ||
+		len(conflicts.Items[1].EffectiveActions) != 0 {
+		t.Fatalf("conflict effective actions = %#v", conflicts.Items)
+	}
+
+	sources, err := manager.ListSources(
+		context.Background(), admin,
+		SourceCollectionRequest{WorkspaceID: managementWorkspaceID},
+		SourceListInput{
+			Usage: SourceUsageManualAssetCreate, EnvironmentID: managementEnvironmentID, Limit: 10,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources.Items) != 1 ||
+		!slices.Equal(sources.Items[0].EffectiveActions, []EffectiveAction{ActionCreateAsset}) {
+		t.Fatalf("source effective actions = %#v", sources.Items)
+	}
+
+	relationships, err := manager.ListRelationships(
+		context.Background(), admin, collection, RelationshipListInput{Limit: 10},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(relationships.Items) != 1 || repository.listRelationshipCalls != 1 ||
+		repository.listBindingCalls != 1 || repository.listConflictCalls != 1 ||
+		repository.listSourceCalls != 1 {
+		t.Fatalf("mapping/source projections or calls drifted: %#v, calls=%d/%d/%d/%d",
+			relationships, repository.listRelationshipCalls, repository.listBindingCalls,
+			repository.listConflictCalls, repository.listSourceCalls)
+	}
+}
+
+func TestManagementAssetMutationsConstructOpaqueTrustedCommands(t *testing.T) {
+	t.Parallel()
+
+	repository := &recordingManagementRepository{
+		scope: managementScope(),
+		assetResult: AssetMutationResult{Asset: AssetDetailReadModel{
+			AssetReadModel: AssetReadModel{Asset: Asset{
+				ID: managementAssetID, Scope: managementScope(), Lifecycle: LifecycleActive,
+			}},
+		}},
+	}
+	manager := mustManagement(t, repository)
+	admin := managementPrincipal(authn.RoleAdmin)
+	collection := AssetCollectionRequest{
+		WorkspaceID: managementWorkspaceID, EnvironmentID: managementEnvironmentID,
+	}
+	path := AssetPathRequest{
+		WorkspaceID: managementWorkspaceID, EnvironmentID: managementEnvironmentID,
+		AssetID: managementAssetID,
+	}
+
+	if _, err := manager.CreateAsset(
+		context.Background(), admin, collection,
+		validManagementCreateAssetInput(), validManagementCreateMetadata(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.UpdateAsset(
+		context.Background(), admin, path,
+		UpdateGovernanceInput{
+			DisplayName: "Updated host", Criticality: CriticalityHigh,
+			DataClassification: DataClassificationConfidential, Labels: map[string]string{"team": "sre"},
+		},
+		ServerRequestMetadata{
+			TraceID: "trace-update", IdempotencyKey: "update-asset", ExpectedVersion: 1,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.QuarantineAsset(
+		context.Background(), admin, path, TransitionInput{ReasonCode: "SECURITY_REVIEW"},
+		ServerRequestMetadata{
+			TraceID: "trace-quarantine", IdempotencyKey: "quarantine-asset", ExpectedVersion: 2,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.RetireAsset(
+		context.Background(), admin, path, TransitionInput{ReasonCode: "DECOMMISSIONED"},
+		ServerRequestMetadata{
+			TraceID: "trace-retire", IdempotencyKey: "retire-asset", ExpectedVersion: 3,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	contexts := []MutationContext{
+		repository.lastCreateAsset.Context,
+		repository.lastUpdateAsset.Context,
+		repository.lastTransitions[0].Context,
+		repository.lastTransitions[1].Context,
+	}
+	hashes := make([]string, len(contexts))
+	for index, mutationContext := range contexts {
+		scope, ok := mutationContext.EnvironmentScope()
+		if !ok || scope != managementScope() ||
+			mutationContext.SubjectID() != "principal-subject" ||
+			mutationContext.ActorID() != "oidc:principal-subject" {
+			t.Fatalf("mutation context %d = %#v, scope=%#v/%t", index, mutationContext, scope, ok)
+		}
+		hashes[index] = mutationContext.RequestHash()
+	}
+	sortedHashes := slices.Clone(hashes)
+	slices.Sort(sortedHashes)
+	if len(slices.Compact(sortedHashes)) != len(hashes) ||
+		repository.lastUpdateAsset.ExpectedVersion != 1 ||
+		repository.lastTransitions[0].To != LifecycleQuarantined ||
+		repository.lastTransitions[1].To != LifecycleRetired {
+		t.Fatalf("trusted mutation commands drifted: hashes=%v update=%#v transitions=%#v",
+			hashes, repository.lastUpdateAsset, repository.lastTransitions)
+	}
+}
+
+func mustManagement(t *testing.T, repository *recordingManagementRepository) *Management {
+	t.Helper()
+	manager, err := NewManagement(repository, repository, repository, managementAuthorizer(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manager
+}
+
+func managementAuthorizer(t *testing.T) *authz.Authorizer {
+	t.Helper()
+	value, err := authz.NewAuthorizer(5*time.Minute, func() time.Time {
+		return time.Date(2026, 7, 16, 10, 0, 0, 0, time.UTC)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func managementPrincipal(role authn.Role) authn.Principal {
+	return authn.Principal{
+		Subject: "principal-subject", TenantID: managementTenantID,
+		AuthenticatedAt: time.Date(2026, 7, 16, 9, 59, 0, 0, time.UTC),
+		ExpiresAt:       time.Date(2026, 7, 16, 11, 0, 0, 0, time.UTC),
+		Roles:           []authn.Role{role},
+		WorkspaceIDs:    []string{managementWorkspaceID},
+		EnvironmentIDs:  []string{managementEnvironmentID},
+		ServiceIDs:      []string{managementServiceID},
+	}
+}
+
+func managementScope() Scope {
+	return Scope{
+		TenantID: managementTenantID, WorkspaceID: managementWorkspaceID,
+		EnvironmentID: managementEnvironmentID,
+	}
+}
+
+func validManagementCreateAssetInput() CreateAssetInput {
+	return CreateAssetInput{
+		SourceID: managementSourceID, Kind: KindLinuxVM,
+		ExternalID: "host-1", DisplayName: "Host 1", Criticality: CriticalityMedium,
+		DataClassification: DataClassificationInternal, Labels: map[string]string{"team": "platform"},
+	}
+}
+
+func validManagementCreateMetadata() ServerRequestMetadata {
+	return ServerRequestMetadata{TraceID: "trace-create", IdempotencyKey: "create-asset"}
+}
+
+type recordingManagementRepository struct {
+	scope       Scope
+	sourceScope SourceScope
+
+	assetDetail    AssetDetailReadModel
+	assetPage      AssetPage
+	bindingPage    BindingPage
+	conflictPage   ConflictPage
+	relationPage   RelationshipPage
+	sourcePage     SourcePage
+	sourceModel    SourceReadModel
+	sourceRun      SourceRun
+	assetResult    AssetMutationResult
+	bindingResult  BindingMutationResult
+	conflictResult MappingDecisionResult
+	receipt        MutationReceipt
+
+	resolveScopeCalls         int
+	resolveSourceScopeCalls   int
+	resolveConflictScopeCalls int
+	listAssetCalls            int
+	getAssetCalls             int
+	createAssetCalls          int
+	updateAssetCalls          int
+	transitionAssetCalls      int
+	listRelationshipCalls     int
+	listBindingCalls          int
+	createBindingCalls        int
+	deleteBindingCalls        int
+	listConflictCalls         int
+	resolveConflictCalls      int
+	listSourceCalls           int
+	getSourceCalls            int
+	getSourceRunCalls         int
+
+	lastAssetList   ListAssetsRequest
+	lastDecision    MappingDecision
+	lastCreateAsset CreateAssetCommand
+	lastUpdateAsset UpdateGovernanceCommand
+	lastTransitions []TransitionCommand
+}
+
+func (repository *recordingManagementRepository) ResolveScope(_ context.Context, workspaceID, environmentID string) (Scope, error) {
+	repository.resolveScopeCalls++
+	if repository.scope == (Scope{}) {
+		repository.scope = managementScope()
+	}
+	return repository.scope, nil
+}
+
+func (repository *recordingManagementRepository) ResolveSourceScope(_ context.Context, workspaceID string) (SourceScope, error) {
+	repository.resolveSourceScopeCalls++
+	if repository.sourceScope == (SourceScope{}) {
+		repository.sourceScope = SourceScope{TenantID: managementTenantID, WorkspaceID: managementWorkspaceID}
+	}
+	return repository.sourceScope, nil
+}
+
+func (repository *recordingManagementRepository) ResolveConflictScope(_ context.Context, workspaceID, conflictID string) (Scope, error) {
+	repository.resolveConflictScopeCalls++
+	if repository.scope == (Scope{}) {
+		repository.scope = managementScope()
+	}
+	return repository.scope, nil
+}
+
+func (repository *recordingManagementRepository) Get(_ context.Context, locator AssetLocator) (Asset, error) {
+	return repository.assetDetail.Asset.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) GetReadModel(_ context.Context, locator AssetLocator, access AssetReadConstraint) (AssetDetailReadModel, error) {
+	repository.getAssetCalls++
+	return repository.assetDetail.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) List(_ context.Context, request ListAssetsRequest) (AssetPage, error) {
+	repository.listAssetCalls++
+	repository.lastAssetList = request.Clone()
+	return repository.assetPage.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) Create(_ context.Context, command CreateAssetCommand) (AssetMutationResult, error) {
+	repository.createAssetCalls++
+	repository.lastCreateAsset = command.Clone()
+	return repository.assetResult.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) UpdateGovernance(_ context.Context, command UpdateGovernanceCommand) (AssetMutationResult, error) {
+	repository.updateAssetCalls++
+	repository.lastUpdateAsset = command.Clone()
+	return repository.assetResult.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) Transition(_ context.Context, command TransitionCommand) (AssetMutationResult, error) {
+	repository.transitionAssetCalls++
+	repository.lastTransitions = append(repository.lastTransitions, command)
+	return repository.assetResult.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) ListRelationships(_ context.Context, request ListRelationshipsRequest) (RelationshipPage, error) {
+	repository.listRelationshipCalls++
+	return repository.relationPage.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) ListBindings(_ context.Context, request ListBindingsRequest) (BindingPage, error) {
+	repository.listBindingCalls++
+	return repository.bindingPage.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) CreateBinding(_ context.Context, command CreateBindingCommand) (BindingMutationResult, error) {
+	repository.createBindingCalls++
+	return repository.bindingResult.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) DeleteBinding(_ context.Context, command DeleteBindingCommand) (MutationReceipt, error) {
+	repository.deleteBindingCalls++
+	return repository.receipt, nil
+}
+
+func (repository *recordingManagementRepository) ListConflicts(_ context.Context, request ListConflictsRequest) (ConflictPage, error) {
+	repository.listConflictCalls++
+	return repository.conflictPage.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) ResolveConflict(_ context.Context, decision MappingDecision) (MappingDecisionResult, error) {
+	repository.resolveConflictCalls++
+	repository.lastDecision = decision
+	return repository.conflictResult.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) GetSource(_ context.Context, locator SourceLocator, access SourceReadConstraint) (SourceReadModel, error) {
+	repository.getSourceCalls++
+	return repository.sourceModel.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) ListSources(_ context.Context, request ListSourcesRequest) (SourcePage, error) {
+	repository.listSourceCalls++
+	return repository.sourcePage.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) GetSourceRun(_ context.Context, locator SourceRunLocator, access SourceReadConstraint) (SourceRun, error) {
+	repository.getSourceRunCalls++
+	return repository.sourceRun.Clone(), nil
+}

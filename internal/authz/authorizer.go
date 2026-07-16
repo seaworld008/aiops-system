@@ -16,6 +16,10 @@ var (
 type Permission string
 
 const (
+	PermissionAssetRead                   Permission = "ASSET_READ"
+	PermissionAssetManage                 Permission = "ASSET_MANAGE"
+	PermissionAssetBind                   Permission = "ASSET_BIND"
+	PermissionAssetConflictResolve        Permission = "ASSET_CONFLICT_RESOLVE"
 	PermissionIncidentRead                Permission = "INCIDENT_READ"
 	PermissionInvestigationRun            Permission = "INVESTIGATION_RUN"
 	PermissionFeedbackWrite               Permission = "FEEDBACK_WRITE"
@@ -100,7 +104,8 @@ func requiresRecentAuthentication(permission Permission) bool {
 
 func requiresService(permission Permission) bool {
 	switch permission {
-	case PermissionInvestigationRun, PermissionFeedbackWrite, PermissionActionPropose, PermissionActionApprove, PermissionExecutionRequest:
+	case PermissionAssetBind, PermissionInvestigationRun, PermissionFeedbackWrite,
+		PermissionActionPropose, PermissionActionApprove, PermissionExecutionRequest:
 		return true
 	default:
 		return false
@@ -109,23 +114,29 @@ func requiresService(permission Permission) bool {
 
 func roleAllows(role authn.Role, permission Permission) bool {
 	switch role {
+	case authn.RoleViewer:
+		return permission == PermissionAssetRead
 	case authn.RoleSRE:
 		return slices.Contains([]Permission{
+			PermissionAssetRead,
 			PermissionIncidentRead, PermissionInvestigationRun, PermissionFeedbackWrite,
 			PermissionActionPropose, PermissionActionApprove, PermissionExecutionRequest, PermissionAuditRead,
 			PermissionCredentialRevocationRead, PermissionCredentialRevocationConfirm,
 		}, permission)
 	case authn.RoleServiceOwner:
 		return slices.Contains([]Permission{
+			PermissionAssetRead, PermissionAssetBind,
 			PermissionIncidentRead, PermissionInvestigationRun, PermissionFeedbackWrite, PermissionActionPropose, PermissionActionApprove,
 		}, permission)
 	case authn.RoleApprover:
-		return permission == PermissionIncidentRead || permission == PermissionActionApprove
+		return permission == PermissionAssetRead || permission == PermissionIncidentRead || permission == PermissionActionApprove
 	case authn.RoleAuditor:
-		return permission == PermissionIncidentRead || permission == PermissionAuditRead || permission == PermissionAuditExport ||
+		return permission == PermissionAssetRead || permission == PermissionIncidentRead ||
+			permission == PermissionAuditRead || permission == PermissionAuditExport ||
 			permission == PermissionCredentialRevocationRead
 	case authn.RoleAdmin:
 		return slices.Contains([]Permission{
+			PermissionAssetRead, PermissionAssetManage, PermissionAssetBind, PermissionAssetConflictResolve,
 			PermissionIncidentRead, PermissionAuditRead, PermissionAuditExport, PermissionCatalogManage,
 			PermissionCredentialRevocationRead, PermissionCredentialRevocationRequeue, PermissionCredentialRevocationConfirm,
 		}, permission)

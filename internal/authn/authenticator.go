@@ -15,6 +15,7 @@ var ErrUnauthenticated = errors.New("unauthenticated")
 type Role string
 
 const (
+	RoleViewer       Role = "VIEWER"
 	RoleSRE          Role = "SRE"
 	RoleServiceOwner Role = "SERVICE_OWNER"
 	RoleApprover     Role = "APPROVER"
@@ -130,7 +131,7 @@ func normalizeRoles(values []string) []Role {
 	for _, value := range values {
 		role := Role(value)
 		switch role {
-		case RoleSRE, RoleServiceOwner, RoleApprover, RoleAuditor, RoleAdmin:
+		case RoleViewer, RoleSRE, RoleServiceOwner, RoleApprover, RoleAuditor, RoleAdmin:
 			seen[role] = struct{}{}
 		}
 	}
