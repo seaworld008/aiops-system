@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -52,6 +53,42 @@ func (contractProvider) Discover(context.Context, BoundRuntime, DiscoverRequest)
 }
 
 var _ Provider = contractProvider{}
+
+func TestTask13ConsumesExactM1CRequestAndBindingABI(t *testing.T) {
+	assertExactFields := func(value any, expected map[string]reflect.Type) {
+		t.Helper()
+		typ := reflect.TypeOf(value)
+		if typ.NumField() != len(expected) {
+			t.Fatalf("%s field count = %d, want %d", typ.Name(), typ.NumField(), len(expected))
+		}
+		for index := 0; index < typ.NumField(); index++ {
+			field := typ.Field(index)
+			want, ok := expected[field.Name]
+			if !ok || field.Type != want {
+				t.Errorf("%s.%s = %s, expected exact field/type = %v", typ.Name(), field.Name, field.Type, want)
+			}
+		}
+	}
+
+	locatorType := reflect.TypeOf(assetcatalog.SourceLocator{})
+	limitsType := reflect.TypeOf(Limits{})
+	checkpointType := reflect.TypeOf(Checkpoint{})
+	assertExactFields(ValidationRequest{}, map[string]reflect.Type{
+		"Locator": locatorType, "SourceRevision": reflect.TypeOf(int64(0)),
+		"SourceRevisionDigest": reflect.TypeOf(""), "Limits": limitsType,
+	})
+	assertExactFields(DiscoverRequest{}, map[string]reflect.Type{
+		"Locator": locatorType, "SourceRevision": reflect.TypeOf(int64(0)),
+		"SourceRevisionDigest": reflect.TypeOf(""), "Checkpoint": checkpointType, "Limits": limitsType,
+	})
+	assertExactFields(RuntimeBinding{}, map[string]reflect.Type{
+		"Locator": locatorType, "SourceRevision": reflect.TypeOf(int64(0)),
+		"SourceRevisionDigest": reflect.TypeOf(""),
+		"RevisionStatus":       reflect.TypeOf(assetcatalog.SourceRevisionStatus("")),
+		"ProviderKind":         reflect.TypeOf(""),
+		"ProfileCode":          reflect.TypeOf(assetcatalog.ProfileCode("")),
+	})
+}
 
 func TestLimitsValidateRejectsEveryInvalidDimension(t *testing.T) {
 	tests := []struct {
