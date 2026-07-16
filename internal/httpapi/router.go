@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/seaworld008/aiops-system/internal/assetcatalog"
 	"github.com/seaworld008/aiops-system/internal/authn"
 	"github.com/seaworld008/aiops-system/internal/ids"
 	"github.com/seaworld008/aiops-system/internal/requestmeta"
@@ -40,6 +41,13 @@ type Dependencies struct {
 	WebhookVerifier       WebhookVerifier
 	Authenticator         Authenticator
 	CredentialRevocations CredentialRevocationManager
+	BrowserConfig         *BrowserConfig
+	ControlPlaneCursor    *ControlPlaneCursorCodec
+	Assets                assetcatalog.AssetManager
+	AssetRelations        assetcatalog.RelationshipManager
+	AssetSources          assetcatalog.SourceManager
+	AssetConflicts        assetcatalog.ConflictManager
+	ServiceAssetBindings  assetcatalog.BindingManager
 }
 
 func NewRouter(deps Dependencies) http.Handler {
@@ -49,12 +57,12 @@ func NewRouter(deps Dependencies) http.Handler {
 
 	router := chi.NewRouter()
 	router.Use(requestIDMiddleware)
-	router.Use(credentialManagementResponseHeaders)
-	router.NotFound(func(w http.ResponseWriter, _ *http.Request) {
-		writeProblem(w, http.StatusNotFound, "route_not_found", "The requested route does not exist")
+	router.Use(controlPlaneResponseHeaders)
+	router.NotFound(func(w http.ResponseWriter, request *http.Request) {
+		writeRequestProblem(w, request, http.StatusNotFound, "route_not_found", "The requested route does not exist")
 	})
-	router.MethodNotAllowed(func(w http.ResponseWriter, _ *http.Request) {
-		writeProblem(w, http.StatusMethodNotAllowed, "method_not_allowed", "The HTTP method is not allowed for this route")
+	router.MethodNotAllowed(func(w http.ResponseWriter, request *http.Request) {
+		writeRequestProblem(w, request, http.StatusMethodNotAllowed, "method_not_allowed", "The HTTP method is not allowed for this route")
 	})
 	router.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
@@ -70,7 +78,73 @@ func NewRouter(deps Dependencies) http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	router.Post("/api/v1/integrations/{integrationID}/webhooks/{provider}", webhookHandler(deps.SignalIngestor, deps.WebhookVerifier))
+	router.Get("/api/v1/browser-config", browserConfigHandler(deps.BrowserConfig))
 	router.With(authenticationMiddleware(deps.Authenticator)).Get("/api/v1/session", sessionHandler)
+	router.Route("/api/v1", func(api chi.Router) {
+		api.Group(func(governed chi.Router) {
+			governed.Use(authenticationMiddleware(deps.Authenticator))
+			governed.Get(
+				"/workspaces/{workspaceID}/environments/{environmentID}/assets",
+				listAssetsHandler(deps.Assets, deps.ControlPlaneCursor),
+			)
+			governed.Post(
+				"/workspaces/{workspaceID}/environments/{environmentID}/assets",
+				createAssetHandler(deps.Assets),
+			)
+			governed.Get(
+				"/workspaces/{workspaceID}/environments/{environmentID}/assets/{assetID}",
+				getAssetHandler(deps.Assets),
+			)
+			governed.Patch(
+				"/workspaces/{workspaceID}/environments/{environmentID}/assets/{assetID}",
+				patchAssetHandler(deps.Assets),
+			)
+			governed.Post(
+				"/workspaces/{workspaceID}/environments/{environmentID}/assets/{assetID}:quarantine",
+				quarantineAssetHandler(deps.Assets),
+			)
+			governed.Post(
+				"/workspaces/{workspaceID}/environments/{environmentID}/assets/{assetID}:retire",
+				retireAssetHandler(deps.Assets),
+			)
+			governed.Get(
+				"/workspaces/{workspaceID}/environments/{environmentID}/asset-relations",
+				listAssetRelationsHandler(deps.AssetRelations, deps.ControlPlaneCursor),
+			)
+			governed.Get(
+				"/workspaces/{workspaceID}/environments/{environmentID}/service-asset-bindings",
+				listServiceAssetBindingsHandler(deps.ServiceAssetBindings, deps.ControlPlaneCursor),
+			)
+			governed.Post(
+				"/workspaces/{workspaceID}/environments/{environmentID}/service-asset-bindings",
+				createServiceAssetBindingHandler(deps.ServiceAssetBindings),
+			)
+			governed.Delete(
+				"/workspaces/{workspaceID}/environments/{environmentID}/service-asset-bindings/{bindingID}",
+				deleteServiceAssetBindingHandler(deps.ServiceAssetBindings),
+			)
+			governed.Get(
+				"/workspaces/{workspaceID}/asset-sources",
+				listAssetSourcesHandler(deps.AssetSources, deps.ControlPlaneCursor),
+			)
+			governed.Get(
+				"/workspaces/{workspaceID}/asset-sources/{sourceID}",
+				getAssetSourceHandler(deps.AssetSources),
+			)
+			governed.Get(
+				"/workspaces/{workspaceID}/asset-source-runs/{runID}",
+				getAssetSourceRunHandler(deps.AssetSources),
+			)
+			governed.Get(
+				"/workspaces/{workspaceID}/asset-conflicts",
+				listAssetConflictsHandler(deps.AssetConflicts, deps.ControlPlaneCursor),
+			)
+			governed.Post(
+				"/workspaces/{workspaceID}/asset-conflicts/{conflictID}:resolve",
+				resolveAssetConflictHandler(deps.AssetConflicts),
+			)
+		})
+	})
 	router.With(authenticationMiddleware(deps.Authenticator)).Get(
 		"/api/v1/workspaces/{workspaceID}/environments/{environmentID}/credential-revocations",
 		credentialRevocationListHandler(deps.CredentialRevocations),
@@ -95,12 +169,12 @@ func authenticationMiddleware(authenticator Authenticator) func(http.Handler) ht
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 			if nilHTTPDependency(authenticator) {
-				writeProblem(w, http.StatusServiceUnavailable, "authentication_unavailable", "OIDC authentication is unavailable")
+				writeRequestProblem(w, request, http.StatusServiceUnavailable, "authentication_unavailable", "OIDC authentication is unavailable")
 				return
 			}
 			principal, err := authenticator.Authenticate(request)
 			if err != nil {
-				writeProblem(w, http.StatusUnauthorized, "authentication_required", "A valid OIDC bearer token is required")
+				writeRequestProblem(w, request, http.StatusUnauthorized, "authentication_required", "A valid OIDC bearer token is required")
 				return
 			}
 			next.ServeHTTP(w, request.WithContext(authn.WithPrincipal(request.Context(), principal)))
@@ -120,7 +194,7 @@ func nilHTTPDependency(value any) bool {
 func sessionHandler(w http.ResponseWriter, request *http.Request) {
 	principal, ok := authn.PrincipalFromContext(request.Context())
 	if !ok {
-		writeProblem(w, http.StatusUnauthorized, "authentication_required", "A valid OIDC bearer token is required")
+		writeRequestProblem(w, request, http.StatusUnauthorized, "authentication_required", "A valid OIDC bearer token is required")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -161,34 +235,34 @@ func validHex(value string, length int) bool {
 func webhookHandler(ingestor SignalIngestor, verifier WebhookVerifier) http.HandlerFunc {
 	return func(w http.ResponseWriter, request *http.Request) {
 		if ingestor == nil {
-			writeProblem(w, http.StatusServiceUnavailable, "signal_ingestor_unavailable", "Signal ingestion is unavailable")
+			writeRequestProblem(w, request, http.StatusServiceUnavailable, "signal_ingestor_unavailable", "Signal ingestion is unavailable")
 			return
 		}
 		if contentType := request.Header.Get("Content-Type"); !strings.HasPrefix(contentType, "application/json") {
-			writeProblem(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
+			writeRequestProblem(w, request, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
 			return
 		}
 		workspaceID := request.Header.Get("X-Workspace-ID")
 		if workspaceID == "" {
-			writeProblem(w, http.StatusBadRequest, "workspace_required", "X-Workspace-ID is required")
+			writeRequestProblem(w, request, http.StatusBadRequest, "workspace_required", "X-Workspace-ID is required")
 			return
 		}
 		body, err := io.ReadAll(http.MaxBytesReader(w, request.Body, 1<<20))
 		if err != nil {
-			writeProblem(w, http.StatusRequestEntityTooLarge, "payload_too_large", "Webhook payload exceeds 1 MiB")
+			writeRequestProblem(w, request, http.StatusRequestEntityTooLarge, "payload_too_large", "Webhook payload exceeds 1 MiB")
 			return
 		}
 		if verifier == nil {
-			writeProblem(w, http.StatusServiceUnavailable, "webhook_verifier_unavailable", "Webhook verification is unavailable")
+			writeRequestProblem(w, request, http.StatusServiceUnavailable, "webhook_verifier_unavailable", "Webhook verification is unavailable")
 			return
 		}
 		integrationID := chi.URLParam(request, "integrationID")
 		provider := chi.URLParam(request, "provider")
 		if err := verifier.Verify(integrationID, provider, request.Header, body); err != nil {
 			if errors.Is(err, webhook.ErrInvalidSignature) {
-				writeProblem(w, http.StatusUnauthorized, "invalid_webhook_signature", "Webhook signature is invalid")
+				writeRequestProblem(w, request, http.StatusUnauthorized, "invalid_webhook_signature", "Webhook signature is invalid")
 			} else {
-				writeProblem(w, http.StatusServiceUnavailable, "webhook_verification_failed", "Webhook verification could not be completed")
+				writeRequestProblem(w, request, http.StatusServiceUnavailable, "webhook_verification_failed", "Webhook verification could not be completed")
 			}
 			return
 		}
@@ -202,17 +276,17 @@ func webhookHandler(ingestor SignalIngestor, verifier WebhookVerifier) http.Hand
 		if err != nil {
 			switch {
 			case errors.Is(err, signal.ErrInvalidPayload):
-				writeProblem(w, http.StatusBadRequest, "invalid_signal_payload", "Signal payload is invalid")
+				writeRequestProblem(w, request, http.StatusBadRequest, "invalid_signal_payload", "Signal payload is invalid")
 			case errors.Is(err, signal.ErrUnsupportedProvider):
-				writeProblem(w, http.StatusNotFound, "unsupported_signal_provider", "Signal provider is not supported")
+				writeRequestProblem(w, request, http.StatusNotFound, "unsupported_signal_provider", "Signal provider is not supported")
 			case errors.Is(err, store.ErrIdempotencyConflict):
-				writeProblem(w, http.StatusConflict, "provider_event_conflict", "Provider event ID was reused with a different payload")
+				writeRequestProblem(w, request, http.StatusConflict, "provider_event_conflict", "Provider event ID was reused with a different payload")
 			case errors.Is(err, store.ErrScopeViolation):
-				writeProblem(w, http.StatusForbidden, "integration_scope_violation", "Integration is not authorized for this workspace or provider")
+				writeRequestProblem(w, request, http.StatusForbidden, "integration_scope_violation", "Integration is not authorized for this workspace or provider")
 			case errors.Is(err, store.ErrNotFound):
-				writeProblem(w, http.StatusNotFound, "integration_not_found", "Integration was not found")
+				writeRequestProblem(w, request, http.StatusNotFound, "integration_not_found", "Integration was not found")
 			default:
-				writeProblem(w, http.StatusInternalServerError, "signal_ingestion_failed", "Signal ingestion failed")
+				writeRequestProblem(w, request, http.StatusInternalServerError, "signal_ingestion_failed", "Signal ingestion failed")
 			}
 			return
 		}
@@ -224,16 +298,4 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
-}
-
-func writeProblem(w http.ResponseWriter, status int, code, detail string) {
-	w.Header().Set("Content-Type", "application/problem+json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"type":   "about:blank",
-		"title":  http.StatusText(status),
-		"status": status,
-		"code":   code,
-		"detail": detail,
-	})
 }

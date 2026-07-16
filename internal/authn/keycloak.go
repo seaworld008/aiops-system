@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -17,17 +18,25 @@ import (
 )
 
 type KeycloakVerifier struct {
-	clientID string
-	verifier *oidc.IDTokenVerifier
+	audience        string
+	authorizedParty string
+	verifier        *oidc.IDTokenVerifier
 }
 
-func NewKeycloakVerifier(ctx context.Context, issuer, clientID string) (*KeycloakVerifier, error) {
+func NewKeycloakVerifier(
+	ctx context.Context,
+	issuer string,
+	audience string,
+	authorizedParty string,
+) (*KeycloakVerifier, error) {
 	parsed, err := url.Parse(issuer)
-	if err != nil || issuer != strings.TrimSpace(issuer) || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+	if err != nil || issuer != strings.TrimSpace(issuer) || parsed.Scheme != "https" || parsed.Host == "" ||
+		parsed.User != nil || parsed.Opaque != "" || parsed.RawQuery != "" || parsed.ForceQuery ||
+		parsed.Fragment != "" || parsed.RawPath != "" || path.Clean(parsed.Path) != parsed.Path {
 		return nil, fmt.Errorf("Keycloak issuer must be a clean HTTPS URL")
 	}
-	if !scopePattern.MatchString(clientID) {
-		return nil, fmt.Errorf("valid Keycloak client id is required")
+	if !scopePattern.MatchString(audience) || !scopePattern.MatchString(authorizedParty) {
+		return nil, fmt.Errorf("valid Keycloak audience and authorized party are required")
 	}
 	strictClient := &http.Client{
 		Timeout: 10 * time.Second,
@@ -40,17 +49,19 @@ func NewKeycloakVerifier(ctx context.Context, issuer, clientID string) (*Keycloa
 		return nil, fmt.Errorf("discover Keycloak issuer: %w", err)
 	}
 	verifier := provider.Verifier(&oidc.Config{
-		ClientID: clientID,
+		ClientID: audience,
 		SupportedSigningAlgs: []string{
 			oidc.RS256, oidc.PS256, oidc.ES256, oidc.ES384, oidc.ES512,
 		},
 	})
-	return &KeycloakVerifier{clientID: clientID, verifier: verifier}, nil
+	return &KeycloakVerifier{
+		audience: audience, authorizedParty: authorizedParty, verifier: verifier,
+	}, nil
 }
 
 func (verifier *KeycloakVerifier) Verify(ctx context.Context, rawToken string) (VerifiedClaims, error) {
 	token, err := verifier.verifier.Verify(ctx, rawToken)
-	if err != nil {
+	if err != nil || len(token.Audience) != 1 || token.Audience[0] != verifier.audience {
 		return VerifiedClaims{}, ErrUnauthenticated
 	}
 	tenantID, err := decodeFixedTenantClaim(rawToken)
@@ -60,6 +71,7 @@ func (verifier *KeycloakVerifier) Verify(ctx context.Context, rawToken string) (
 	var claims struct {
 		PreferredUsername string   `json:"preferred_username"`
 		AuthTime          int64    `json:"auth_time"`
+		AuthorizedParty   string   `json:"azp"`
 		WorkspaceIDs      []string `json:"aiops_workspaces"`
 		EnvironmentIDs    []string `json:"aiops_environments"`
 		ServiceIDs        []string `json:"aiops_services"`
@@ -70,11 +82,12 @@ func (verifier *KeycloakVerifier) Verify(ctx context.Context, rawToken string) (
 			Roles []string `json:"roles"`
 		} `json:"resource_access"`
 	}
-	if err := token.Claims(&claims); err != nil || claims.AuthTime <= 0 {
+	if err := token.Claims(&claims); err != nil || claims.AuthTime <= 0 ||
+		claims.AuthorizedParty != verifier.authorizedParty {
 		return VerifiedClaims{}, ErrUnauthenticated
 	}
 	roles := append([]string(nil), claims.RealmAccess.Roles...)
-	roles = append(roles, claims.ResourceAccess[verifier.clientID].Roles...)
+	roles = append(roles, claims.ResourceAccess[verifier.audience].Roles...)
 	return VerifiedClaims{
 		Subject: token.Subject, Username: claims.PreferredUsername, TenantID: tenantID,
 		AuthenticatedAt: unixTime(claims.AuthTime), ExpiresAt: token.Expiry,

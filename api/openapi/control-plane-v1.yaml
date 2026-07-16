@@ -1,0 +1,2510 @@
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+info:
+  title: AIOps Control Plane API
+  version: 1.0.0
+  description: Governed operational asset management API. Runtime capabilities remain closed until their independent gates pass.
+servers:
+  - url: /
+security:
+  - oidc: []
+tags:
+  - name: Browser
+  - name: Assets
+  - name: AssetRelations
+  - name: AssetSources
+  - name: AssetConflicts
+  - name: ServiceAssetBindings
+paths:
+  /api/v1/browser-config:
+    get:
+      tags: [Browser]
+      operationId: getBrowserConfig
+      security: []
+      responses:
+        "200":
+          $ref: "#/components/responses/BrowserConfigOK"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/EnvironmentID"
+    get:
+      tags: [Assets]
+      operationId: listAssets
+      parameters:
+        - name: search
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+        - name: service_id
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/UUID"
+        - name: kinds
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            maxItems: 17
+            uniqueItems: true
+            items:
+              $ref: "#/components/schemas/AssetKind"
+        - name: source_ids
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            maxItems: 100
+            uniqueItems: true
+            items:
+              $ref: "#/components/schemas/UUID"
+        - name: lifecycles
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            maxItems: 5
+            uniqueItems: true
+            items:
+              $ref: "#/components/schemas/AssetLifecycle"
+        - name: mapping_statuses
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            maxItems: 3
+            uniqueItems: true
+            items:
+              $ref: "#/components/schemas/MappingStatus"
+        - name: criticalities
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            maxItems: 4
+            uniqueItems: true
+            items:
+              $ref: "#/components/schemas/Criticality"
+        - name: data_classifications
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            maxItems: 4
+            uniqueItems: true
+            items:
+              $ref: "#/components/schemas/DataClassification"
+        - name: sort
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/AssetSort"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          $ref: "#/components/responses/AssetPageOK"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+    post:
+      tags: [Assets]
+      operationId: createAsset
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAssetRequest"
+      responses:
+        "201":
+          $ref: "#/components/responses/AssetCreated"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "404":
+          $ref: "#/components/responses/Problem404"
+        "409":
+          $ref: "#/components/responses/Problem409"
+        "413":
+          $ref: "#/components/responses/Problem413"
+        "415":
+          $ref: "#/components/responses/Problem415"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets/{asset_id}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/EnvironmentID"
+      - $ref: "#/components/parameters/AssetID"
+    get:
+      tags: [Assets]
+      operationId: getAsset
+      responses:
+        "200":
+          $ref: "#/components/responses/AssetDetailOK"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "404":
+          $ref: "#/components/responses/Problem404"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+    patch:
+      tags: [Assets]
+      operationId: patchAsset
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PatchAssetRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AssetMutationOK"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "404":
+          $ref: "#/components/responses/Problem404"
+        "409":
+          $ref: "#/components/responses/Problem409"
+        "413":
+          $ref: "#/components/responses/Problem413"
+        "415":
+          $ref: "#/components/responses/Problem415"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets/{asset_id}:quarantine:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/EnvironmentID"
+      - $ref: "#/components/parameters/AssetID"
+      - $ref: "#/components/parameters/IdempotencyKey"
+      - $ref: "#/components/parameters/IfMatch"
+    post:
+      tags: [Assets]
+      operationId: quarantineAsset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransitionAssetRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AssetMutationOK"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "404":
+          $ref: "#/components/responses/Problem404"
+        "409":
+          $ref: "#/components/responses/Problem409"
+        "413":
+          $ref: "#/components/responses/Problem413"
+        "415":
+          $ref: "#/components/responses/Problem415"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets/{asset_id}:retire:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/EnvironmentID"
+      - $ref: "#/components/parameters/AssetID"
+      - $ref: "#/components/parameters/IdempotencyKey"
+      - $ref: "#/components/parameters/IfMatch"
+    post:
+      tags: [Assets]
+      operationId: retireAsset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransitionAssetRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AssetMutationOK"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "404":
+          $ref: "#/components/responses/Problem404"
+        "409":
+          $ref: "#/components/responses/Problem409"
+        "413":
+          $ref: "#/components/responses/Problem413"
+        "415":
+          $ref: "#/components/responses/Problem415"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/asset-relations:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/EnvironmentID"
+    get:
+      tags: [AssetRelations]
+      operationId: listAssetRelations
+      parameters:
+        - name: asset_id
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/UUID"
+        - name: source_id
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/UUID"
+        - name: types
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            maxItems: 9
+            uniqueItems: true
+            items:
+              $ref: "#/components/schemas/RelationshipType"
+        - name: statuses
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            maxItems: 2
+            uniqueItems: true
+            items:
+              $ref: "#/components/schemas/RelationshipStatus"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          $ref: "#/components/responses/AssetRelationPageOK"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/service-asset-bindings:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/EnvironmentID"
+    get:
+      tags: [ServiceAssetBindings]
+      operationId: listServiceAssetBindings
+      parameters:
+        - name: service_id
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/UUID"
+        - name: asset_id
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/UUID"
+        - name: roles
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            maxItems: 5
+            uniqueItems: true
+            items:
+              $ref: "#/components/schemas/BindingRole"
+        - name: statuses
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            maxItems: 2
+            uniqueItems: true
+            items:
+              $ref: "#/components/schemas/BindingStatus"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          $ref: "#/components/responses/ServiceAssetBindingPageOK"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+    post:
+      tags: [ServiceAssetBindings]
+      operationId: createServiceAssetBinding
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateServiceAssetBindingRequest"
+      responses:
+        "201":
+          $ref: "#/components/responses/ServiceAssetBindingCreated"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "404":
+          $ref: "#/components/responses/Problem404"
+        "409":
+          $ref: "#/components/responses/Problem409"
+        "413":
+          $ref: "#/components/responses/Problem413"
+        "415":
+          $ref: "#/components/responses/Problem415"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/service-asset-bindings/{binding_id}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/EnvironmentID"
+      - $ref: "#/components/parameters/BindingID"
+    delete:
+      tags: [ServiceAssetBindings]
+      operationId: deleteServiceAssetBinding
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeleteServiceAssetBindingRequest"
+      responses:
+        "204":
+          $ref: "#/components/responses/ServiceAssetBindingDeleted"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "404":
+          $ref: "#/components/responses/Problem404"
+        "409":
+          $ref: "#/components/responses/Problem409"
+        "413":
+          $ref: "#/components/responses/Problem413"
+        "415":
+          $ref: "#/components/responses/Problem415"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/asset-sources:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+    get:
+      tags: [AssetSources]
+      operationId: listAssetSources
+      parameters:
+        - name: kinds
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            maxItems: 10
+            uniqueItems: true
+            items:
+              $ref: "#/components/schemas/SourceKind"
+        - name: statuses
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            maxItems: 4
+            uniqueItems: true
+            items:
+              $ref: "#/components/schemas/SourceStatus"
+        - name: gate_statuses
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            maxItems: 5
+            uniqueItems: true
+            items:
+              $ref: "#/components/schemas/SourceGateStatus"
+        - name: usage
+          in: query
+          required: false
+          description: Must be supplied together with environment_id.
+          schema:
+            type: string
+            enum: [manual_asset_create]
+        - name: environment_id
+          in: query
+          required: false
+          description: Must be supplied together with usage=manual_asset_create.
+          schema:
+            $ref: "#/components/schemas/UUID"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          $ref: "#/components/responses/AssetSourcePageOK"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/SourceID"
+    get:
+      tags: [AssetSources]
+      operationId: getAssetSource
+      responses:
+        "200":
+          $ref: "#/components/responses/AssetSourceDetailOK"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "404":
+          $ref: "#/components/responses/Problem404"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/asset-source-runs/{run_id}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/RunID"
+    get:
+      tags: [AssetSources]
+      operationId: getAssetSourceRun
+      responses:
+        "200":
+          $ref: "#/components/responses/AssetSourceRunOK"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "404":
+          $ref: "#/components/responses/Problem404"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/asset-conflicts:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+    get:
+      tags: [AssetConflicts]
+      operationId: listAssetConflicts
+      parameters:
+        - name: environment_id
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/UUID"
+        - name: asset_id
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/UUID"
+        - name: source_id
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/UUID"
+        - name: statuses
+          in: query
+          required: false
+          style: form
+          explode: false
+          schema:
+            type: array
+            maxItems: 3
+            uniqueItems: true
+            items:
+              $ref: "#/components/schemas/ConflictStatus"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          $ref: "#/components/responses/AssetConflictPageOK"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/asset-conflicts/{conflict_id}:resolve:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/ConflictID"
+      - $ref: "#/components/parameters/IdempotencyKey"
+      - $ref: "#/components/parameters/IfMatch"
+    post:
+      tags: [AssetConflicts]
+      operationId: resolveAssetConflict
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResolveAssetConflictRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AssetConflictMutationOK"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "404":
+          $ref: "#/components/responses/Problem404"
+        "409":
+          $ref: "#/components/responses/Problem409"
+        "413":
+          $ref: "#/components/responses/Problem413"
+        "415":
+          $ref: "#/components/responses/Problem415"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+components:
+  securitySchemes:
+    oidc:
+      type: openIdConnect
+      openIdConnectUrl: https://identity.example.com/realms/aiops/.well-known/openid-configuration
+  parameters:
+    WorkspaceID:
+      name: workspace_id
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/UUID"
+    EnvironmentID:
+      name: environment_id
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/UUID"
+    AssetID:
+      name: asset_id
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/UUID"
+    SourceID:
+      name: source_id
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/UUID"
+    RunID:
+      name: run_id
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/UUID"
+    ConflictID:
+      name: conflict_id
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/UUID"
+    BindingID:
+      name: binding_id
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/UUID"
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+        maximum: 100
+        default: 50
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 2048
+        pattern: "^[A-Za-z0-9_-]+$"
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: "^[a-z0-9][a-z0-9._:/-]{0,127}$"
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 400
+  headers:
+    CacheControl:
+      required: true
+      schema:
+        type: string
+        const: no-store
+    ContentTypeOptions:
+      required: true
+      schema:
+        type: string
+        const: nosniff
+    ReferrerPolicy:
+      required: true
+      schema:
+        type: string
+        const: no-referrer
+    TraceID:
+      required: true
+      schema:
+        $ref: "#/components/schemas/TraceID"
+    ETag:
+      required: true
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 400
+    Location:
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 1024
+    AuditID:
+      required: true
+      schema:
+        $ref: "#/components/schemas/UUID"
+    IdempotentReplay:
+      required: true
+      schema:
+        type: string
+        enum: ["true", "false"]
+  responses:
+    BrowserConfigOK:
+      description: Public browser bootstrap metadata.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/BrowserConfig"
+    AssetPageOK:
+      description: Scoped asset page.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AssetPage"
+    AssetDetailOK:
+      description: Safe asset detail.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+        ETag:
+          $ref: "#/components/headers/ETag"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AssetDetail"
+    AssetCreated:
+      description: Asset created through the governed MANUAL path.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+        ETag:
+          $ref: "#/components/headers/ETag"
+        Location:
+          $ref: "#/components/headers/Location"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AssetMutationResult"
+    AssetMutationOK:
+      description: Governed asset mutation result.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+        ETag:
+          $ref: "#/components/headers/ETag"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AssetMutationResult"
+    AssetRelationPageOK:
+      description: Scoped relationship page.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AssetRelationPage"
+    ServiceAssetBindingPageOK:
+      description: Scoped Service binding page.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ServiceAssetBindingPage"
+    ServiceAssetBindingCreated:
+      description: Service binding created.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+        ETag:
+          $ref: "#/components/headers/ETag"
+        Location:
+          $ref: "#/components/headers/Location"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ServiceAssetBindingMutationResult"
+    ServiceAssetBindingDeleted:
+      description: Service binding is inactive; an identical replay returns the same receipt headers.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+        X-Audit-ID:
+          $ref: "#/components/headers/AuditID"
+        X-Idempotent-Replay:
+          $ref: "#/components/headers/IdempotentReplay"
+    AssetSourcePageOK:
+      description: Scoped safe Source page.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AssetSourcePage"
+    AssetSourceDetailOK:
+      description: Safe Source detail.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+        ETag:
+          $ref: "#/components/headers/ETag"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AssetSourceDetail"
+    AssetSourceRunOK:
+      description: Safe Source Run detail.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+        ETag:
+          $ref: "#/components/headers/ETag"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AssetSourceRun"
+    AssetConflictPageOK:
+      description: Scoped conflict page.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AssetConflictPage"
+    AssetConflictMutationOK:
+      description: Governed conflict decision.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+        ETag:
+          $ref: "#/components/headers/ETag"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AssetConflictMutationResult"
+    Problem400:
+      description: Malformed request.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Problem401:
+      description: Authentication is missing, invalid, or insufficiently recent.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Problem403:
+      description: Scope or authorization is forbidden.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Problem404:
+      description: Resource was not found in the authorized scope.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Problem409:
+      description: Version, idempotency, or state conflict.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Problem413:
+      description: Request body exceeds the operation bound.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Problem415:
+      description: Content type is unsupported.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Problem500:
+      description: Request failed without exposing internal detail.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Problem503:
+      description: Required durable or identity dependency is unavailable.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+  schemas:
+    UUID:
+      type: string
+      format: uuid
+      pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    TraceID:
+      type: string
+      pattern: "^[a-f0-9]{32}$"
+    Digest:
+      type: string
+      pattern: "^[a-f0-9]{64}$"
+    NullableUUID:
+      type: [string, "null"]
+      format: uuid
+      pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    NullableDigest:
+      type: [string, "null"]
+      pattern: "^[a-f0-9]{64}$"
+    NullableDateTime:
+      type: [string, "null"]
+      format: date-time
+    NullableSafeText:
+      type: [string, "null"]
+      minLength: 1
+      maxLength: 256
+    EffectiveAction:
+      type: string
+      enum:
+        - CREATE_ASSET
+        - EDIT_GOVERNANCE
+        - QUARANTINE
+        - RETIRE
+        - CREATE_BINDING
+        - DELETE_BINDING
+        - RESOLVE_CONFLICT
+    AssetKind:
+      type: string
+      enum:
+        - SERVICE
+        - LINUX_VM
+        - WINDOWS_VM
+        - BARE_METAL_HOST
+        - KUBERNETES_CLUSTER
+        - KUBERNETES_NAMESPACE
+        - KUBERNETES_WORKLOAD
+        - DATABASE_INSTANCE
+        - DATABASE
+        - METRICS_SOURCE
+        - LOG_SOURCE
+        - TRACE_SOURCE
+        - AWX_INVENTORY
+        - ARGO_APPLICATION
+        - CI_PIPELINE
+        - GIT_REPOSITORY
+        - CLOUD_RESOURCE
+    AssetLifecycle:
+      type: string
+      enum: [DISCOVERED, ACTIVE, STALE, QUARANTINED, RETIRED]
+    MappingStatus:
+      type: string
+      enum: [EXACT, AMBIGUOUS, UNRESOLVED]
+    Criticality:
+      type: string
+      enum: [LOW, MEDIUM, HIGH, CRITICAL]
+    DataClassification:
+      type: string
+      enum: [PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED]
+    AssetSort:
+      type: string
+      enum: [display_name_asc, last_observed_at_desc]
+      default: display_name_asc
+    RelationshipType:
+      type: string
+      enum:
+        - RUNS_ON
+        - CONTAINS
+        - DEPENDS_ON
+        - MONITORED_BY
+        - LOGS_TO
+        - TRACES_TO
+        - DELIVERED_BY
+        - MANAGED_BY
+        - PRIMARY_RUNTIME_FOR
+    RelationshipStatus:
+      type: string
+      enum: [ACTIVE, INACTIVE]
+    BindingRole:
+      type: string
+      enum: [PRIMARY_RUNTIME, DEPENDENCY, OBSERVABILITY_SOURCE, DELIVERY_TARGET, MANAGED_TARGET]
+    BindingStatus:
+      type: string
+      enum: [ACTIVE, INACTIVE]
+    Provenance:
+      type: string
+      enum: [MANUAL, DISCOVERED, MERGE_DECISION]
+    SourceKind:
+      type: string
+      enum:
+        - MANUAL
+        - CSV_IMPORT
+        - CONTROL_PLANE_API
+        - EXTERNAL_CMDB
+        - VSPHERE
+        - PROXMOX
+        - OPENSTACK
+        - CLOUD_PROVIDER
+        - KUBERNETES_OPERATOR
+        - AWX_INVENTORY
+    SourceStatus:
+      type: string
+      enum: [ACTIVE, PAUSED, DEGRADED, DISABLED]
+    SourceGateStatus:
+      type: string
+      enum: [UNAVAILABLE, VALIDATING, AVAILABLE, DEGRADED, SUSPENDED]
+    SourceRevisionStatus:
+      type: string
+      enum: [DRAFT, VALIDATING, VALIDATED, REJECTED, PUBLISHED, SUPERSEDED]
+    RunKind:
+      type: string
+      enum: [VALIDATION, DISCOVERY, CSV_IMPORT, API_INGESTION, MANUAL_MUTATION]
+    RunStatus:
+      type: string
+      enum: [QUEUED, DELAYED, RUNNING, FINALIZING, SUCCEEDED, PARTIAL, FAILED, CANCELLED]
+    RunStage:
+      type: string
+      enum: [WAITING, DELAYED, VALIDATING, READING, NORMALIZING, APPLYING, CLEANING_UP, COMPLETED]
+    TriggerType:
+      type: string
+      enum: [HUMAN, API, SCHEDULED]
+    CredentialCleanupStatus:
+      type: string
+      enum: [NOT_OPENED, PENDING, REVOKED, NO_CREDENTIAL, UNCERTAIN]
+    ConflictStatus:
+      type: string
+      enum: [OPEN, RESOLVED, REJECTED]
+    ConflictResolution:
+      type: string
+      enum: [CONFIRM_EXACT, REJECT_CANDIDATE, KEEP_UNRESOLVED, QUARANTINE_ASSET]
+    FieldOwnership:
+      type: string
+      enum: [SOURCE, GOVERNANCE, MERGE_DECISION]
+    BrowserConfig:
+      type: object
+      additionalProperties: false
+      required: [oidc, api_base_path, build]
+      properties:
+        oidc:
+          $ref: "#/components/schemas/BrowserOIDCConfig"
+        api_base_path:
+          type: string
+          const: /api/v1
+        build:
+          $ref: "#/components/schemas/BrowserBuildInfo"
+    BrowserOIDCConfig:
+      type: object
+      additionalProperties: false
+      required: [url, realm, client_id]
+      properties:
+        url:
+          type: string
+          format: uri
+          pattern: "^https://"
+          maxLength: 2048
+        realm:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+        client_id:
+          type: string
+          const: control-plane-web
+    BrowserBuildInfo:
+      type: object
+      additionalProperties: false
+      required: [version, commit, contract_digest]
+      properties:
+        version:
+          type: string
+          minLength: 1
+          maxLength: 128
+        commit:
+          type: string
+          minLength: 1
+          maxLength: 128
+        contract_digest:
+          type: string
+          pattern: "^sha256:[a-f0-9]{64}$"
+    PageMeta:
+      type: object
+      additionalProperties: false
+      required: [next_cursor]
+      properties:
+        next_cursor:
+          type: [string, "null"]
+          maxLength: 2048
+          pattern: "^[A-Za-z0-9_-]+$"
+    Label:
+      type: object
+      additionalProperties: false
+      required: [key, value]
+      properties:
+        key:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"
+        value:
+          type: string
+          maxLength: 1024
+    SourceReference:
+      type: object
+      additionalProperties: false
+      required: [id, name, kind]
+      properties:
+        id:
+          $ref: "#/components/schemas/UUID"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        kind:
+          $ref: "#/components/schemas/SourceKind"
+    ServiceReference:
+      type: object
+      additionalProperties: false
+      required: [id, name, role]
+      properties:
+        id:
+          $ref: "#/components/schemas/UUID"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        role:
+          $ref: "#/components/schemas/BindingRole"
+    ConnectionSummary:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: NOT_CONFIGURED
+    CapabilitySummary:
+      type: object
+      additionalProperties: false
+      required: [status, count]
+      properties:
+        status:
+          type: string
+          const: NOT_CONFIGURED
+        count:
+          type: integer
+          format: int64
+          minimum: 0
+    AssetSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - environment_id
+        - display_name
+        - external_id
+        - kind
+        - provider_kind
+        - source
+        - service_summaries
+        - mapping_status
+        - lifecycle
+        - owner_group
+        - criticality
+        - data_classification
+        - labels
+        - connection_summary
+        - capability_summary
+        - last_observed_at
+        - version
+        - effective_actions
+      properties:
+        id:
+          $ref: "#/components/schemas/UUID"
+        environment_id:
+          $ref: "#/components/schemas/UUID"
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        external_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+        kind:
+          $ref: "#/components/schemas/AssetKind"
+        provider_kind:
+          type: string
+          pattern: "^[A-Z][A-Z0-9_]{0,63}$"
+        source:
+          $ref: "#/components/schemas/SourceReference"
+        service_summaries:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/ServiceReference"
+        mapping_status:
+          $ref: "#/components/schemas/MappingStatus"
+        lifecycle:
+          $ref: "#/components/schemas/AssetLifecycle"
+        owner_group:
+          $ref: "#/components/schemas/NullableSafeText"
+        criticality:
+          $ref: "#/components/schemas/Criticality"
+        data_classification:
+          $ref: "#/components/schemas/DataClassification"
+        labels:
+          type: array
+          maxItems: 64
+          items:
+            $ref: "#/components/schemas/Label"
+        connection_summary:
+          $ref: "#/components/schemas/ConnectionSummary"
+        capability_summary:
+          $ref: "#/components/schemas/CapabilitySummary"
+        last_observed_at:
+          type: string
+          format: date-time
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+        effective_actions:
+          type: array
+          maxItems: 7
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/EffectiveAction"
+    FieldProvenance:
+      type: object
+      additionalProperties: false
+      required: [field_code, source_id, provider_kind, source_revision, observed_at, provider_path_code, confidence, ownership]
+      properties:
+        field_code:
+          type: string
+          minLength: 1
+          maxLength: 128
+        source_id:
+          $ref: "#/components/schemas/UUID"
+        provider_kind:
+          type: string
+          pattern: "^[A-Z][A-Z0-9_]{0,63}$"
+        source_revision:
+          type: integer
+          format: int64
+          minimum: 1
+        observed_at:
+          type: string
+          format: date-time
+        provider_path_code:
+          type: string
+          minLength: 1
+          maxLength: 128
+        confidence:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 100
+        ownership:
+          $ref: "#/components/schemas/FieldOwnership"
+    RelationCounts:
+      type: object
+      additionalProperties: false
+      required: [incoming, outgoing]
+      properties:
+        incoming:
+          type: integer
+          format: int64
+          minimum: 0
+        outgoing:
+          type: integer
+          format: int64
+          minimum: 0
+    AssetDetail:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - environment_id
+        - display_name
+        - external_id
+        - kind
+        - provider_kind
+        - source
+        - service_summaries
+        - mapping_status
+        - lifecycle
+        - owner_group
+        - criticality
+        - data_classification
+        - labels
+        - connection_summary
+        - capability_summary
+        - last_observed_at
+        - version
+        - effective_actions
+        - field_provenance
+        - relation_counts
+      properties:
+        id:
+          $ref: "#/components/schemas/UUID"
+        environment_id:
+          $ref: "#/components/schemas/UUID"
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        external_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+        kind:
+          $ref: "#/components/schemas/AssetKind"
+        provider_kind:
+          type: string
+          pattern: "^[A-Z][A-Z0-9_]{0,63}$"
+        source:
+          $ref: "#/components/schemas/SourceReference"
+        service_summaries:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/ServiceReference"
+        mapping_status:
+          $ref: "#/components/schemas/MappingStatus"
+        lifecycle:
+          $ref: "#/components/schemas/AssetLifecycle"
+        owner_group:
+          $ref: "#/components/schemas/NullableSafeText"
+        criticality:
+          $ref: "#/components/schemas/Criticality"
+        data_classification:
+          $ref: "#/components/schemas/DataClassification"
+        labels:
+          type: array
+          maxItems: 64
+          items:
+            $ref: "#/components/schemas/Label"
+        connection_summary:
+          $ref: "#/components/schemas/ConnectionSummary"
+        capability_summary:
+          $ref: "#/components/schemas/CapabilitySummary"
+        last_observed_at:
+          type: string
+          format: date-time
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+        effective_actions:
+          type: array
+          maxItems: 7
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/EffectiveAction"
+        field_provenance:
+          type: array
+          maxItems: 256
+          items:
+            $ref: "#/components/schemas/FieldProvenance"
+        relation_counts:
+          $ref: "#/components/schemas/RelationCounts"
+    AssetPage:
+      type: object
+      additionalProperties: false
+      required: [items, page, effective_actions]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/AssetSummary"
+        page:
+          $ref: "#/components/schemas/PageMeta"
+        effective_actions:
+          type: array
+          maxItems: 7
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/EffectiveAction"
+    CreateAssetRequest:
+      type: object
+      additionalProperties: false
+      required: [source_id, kind, external_id, display_name, owner_group, criticality, data_classification, labels]
+      properties:
+        source_id:
+          $ref: "#/components/schemas/UUID"
+        kind:
+          $ref: "#/components/schemas/AssetKind"
+        external_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        owner_group:
+          $ref: "#/components/schemas/NullableSafeText"
+        criticality:
+          $ref: "#/components/schemas/Criticality"
+        data_classification:
+          $ref: "#/components/schemas/DataClassification"
+        labels:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/Label"
+    PatchAssetRequest:
+      type: object
+      additionalProperties: false
+      required: [display_name, owner_group, criticality, data_classification, labels]
+      properties:
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        owner_group:
+          $ref: "#/components/schemas/NullableSafeText"
+        criticality:
+          $ref: "#/components/schemas/Criticality"
+        data_classification:
+          $ref: "#/components/schemas/DataClassification"
+        labels:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/Label"
+    TransitionAssetRequest:
+      type: object
+      additionalProperties: false
+      required: [reason_code]
+      properties:
+        reason_code:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Z][A-Z0-9_]{0,127}$"
+    MutationReceipt:
+      type: object
+      additionalProperties: false
+      required: [audit_id, trace_id, idempotent_replay]
+      properties:
+        audit_id:
+          $ref: "#/components/schemas/UUID"
+        trace_id:
+          $ref: "#/components/schemas/TraceID"
+        idempotent_replay:
+          type: boolean
+    AssetMutationResult:
+      type: object
+      additionalProperties: false
+      required: [asset, mutation_receipt]
+      properties:
+        asset:
+          $ref: "#/components/schemas/AssetDetail"
+        mutation_receipt:
+          $ref: "#/components/schemas/MutationReceipt"
+    AssetRelationSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - source_environment_id
+        - target_environment_id
+        - source_asset_id
+        - target_asset_id
+        - type
+        - status
+        - provenance
+        - source_id
+        - source_revision
+        - last_run_id
+        - last_page_sequence
+        - accepted_checkpoint_version
+        - run_fence_epoch
+        - provider_version_sha256
+        - relation_fact_sha256
+        - version
+        - updated_at
+      properties:
+        id:
+          $ref: "#/components/schemas/UUID"
+        source_environment_id:
+          $ref: "#/components/schemas/UUID"
+        target_environment_id:
+          $ref: "#/components/schemas/UUID"
+        source_asset_id:
+          $ref: "#/components/schemas/UUID"
+        target_asset_id:
+          $ref: "#/components/schemas/UUID"
+        type:
+          $ref: "#/components/schemas/RelationshipType"
+        status:
+          $ref: "#/components/schemas/RelationshipStatus"
+        provenance:
+          $ref: "#/components/schemas/Provenance"
+        source_id:
+          $ref: "#/components/schemas/UUID"
+        source_revision:
+          type: integer
+          format: int64
+          minimum: 1
+        last_run_id:
+          $ref: "#/components/schemas/UUID"
+        last_page_sequence:
+          type: integer
+          format: int64
+          minimum: 0
+        accepted_checkpoint_version:
+          type: integer
+          format: int64
+          minimum: 0
+        run_fence_epoch:
+          type: integer
+          format: int64
+          minimum: 0
+        provider_version_sha256:
+          $ref: "#/components/schemas/Digest"
+        relation_fact_sha256:
+          $ref: "#/components/schemas/Digest"
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+        updated_at:
+          type: string
+          format: date-time
+    AssetRelationPage:
+      type: object
+      additionalProperties: false
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/AssetRelationSummary"
+        page:
+          $ref: "#/components/schemas/PageMeta"
+    ServiceAssetBindingSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - environment_id
+        - service_id
+        - asset_id
+        - role
+        - mapping_status
+        - provenance
+        - status
+        - version
+        - etag
+        - created_at
+        - updated_at
+        - effective_actions
+      properties:
+        id:
+          $ref: "#/components/schemas/UUID"
+        environment_id:
+          $ref: "#/components/schemas/UUID"
+        service_id:
+          $ref: "#/components/schemas/UUID"
+        asset_id:
+          $ref: "#/components/schemas/UUID"
+        role:
+          $ref: "#/components/schemas/BindingRole"
+        mapping_status:
+          type: string
+          const: EXACT
+        provenance:
+          $ref: "#/components/schemas/Provenance"
+        status:
+          $ref: "#/components/schemas/BindingStatus"
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+        etag:
+          type: string
+          minLength: 8
+          maxLength: 400
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        effective_actions:
+          type: array
+          maxItems: 7
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/EffectiveAction"
+    ServiceAssetBindingPage:
+      type: object
+      additionalProperties: false
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/ServiceAssetBindingSummary"
+        page:
+          $ref: "#/components/schemas/PageMeta"
+    CreateServiceAssetBindingRequest:
+      type: object
+      additionalProperties: false
+      required: [service_id, asset_id, role, reason_code]
+      properties:
+        service_id:
+          $ref: "#/components/schemas/UUID"
+        asset_id:
+          $ref: "#/components/schemas/UUID"
+        role:
+          $ref: "#/components/schemas/BindingRole"
+        reason_code:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Z][A-Z0-9_]{0,127}$"
+    DeleteServiceAssetBindingRequest:
+      type: object
+      additionalProperties: false
+      required: [reason_code]
+      properties:
+        reason_code:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Z][A-Z0-9_]{0,127}$"
+    ServiceAssetBindingMutationResult:
+      type: object
+      additionalProperties: false
+      required: [binding, mutation_receipt]
+      properties:
+        binding:
+          $ref: "#/components/schemas/ServiceAssetBindingSummary"
+        mutation_receipt:
+          $ref: "#/components/schemas/MutationReceipt"
+    SourceRunCounts:
+      type: object
+      additionalProperties: false
+      required: [observed, created, changed, unchanged, conflicts, missing, stale, restored, tombstoned, rejected]
+      properties:
+        observed:
+          type: integer
+          format: int64
+          minimum: 0
+        created:
+          type: integer
+          format: int64
+          minimum: 0
+        changed:
+          type: integer
+          format: int64
+          minimum: 0
+        unchanged:
+          type: integer
+          format: int64
+          minimum: 0
+        conflicts:
+          type: integer
+          format: int64
+          minimum: 0
+        missing:
+          type: integer
+          format: int64
+          minimum: 0
+        stale:
+          type: integer
+          format: int64
+          minimum: 0
+        restored:
+          type: integer
+          format: int64
+          minimum: 0
+        tombstoned:
+          type: integer
+          format: int64
+          minimum: 0
+        rejected:
+          type: integer
+          format: int64
+          minimum: 0
+    AssetSourceSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - kind
+        - provider_kind
+        - status
+        - gate_status
+        - gate_reason_code
+        - gate_revision
+        - published_revision
+        - published_revision_digest
+        - checkpoint_sha256
+        - checkpoint_version
+        - last_success_run_id
+        - last_success_at
+        - last_complete_snapshot_run_id
+        - last_complete_snapshot_at
+        - current_run_counts
+        - last_run_counts
+        - version
+        - created_at
+        - updated_at
+        - effective_actions
+      properties:
+        id:
+          $ref: "#/components/schemas/UUID"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        kind:
+          $ref: "#/components/schemas/SourceKind"
+        provider_kind:
+          type: string
+          pattern: "^[A-Z][A-Z0-9_]{0,63}$"
+        status:
+          $ref: "#/components/schemas/SourceStatus"
+        gate_status:
+          $ref: "#/components/schemas/SourceGateStatus"
+        gate_reason_code:
+          type: [string, "null"]
+          maxLength: 128
+        gate_revision:
+          type: integer
+          format: int64
+          minimum: 0
+        published_revision:
+          type: [integer, "null"]
+          format: int64
+          minimum: 1
+        published_revision_digest:
+          $ref: "#/components/schemas/NullableDigest"
+        checkpoint_sha256:
+          $ref: "#/components/schemas/NullableDigest"
+        checkpoint_version:
+          type: integer
+          format: int64
+          minimum: 0
+        last_success_run_id:
+          $ref: "#/components/schemas/NullableUUID"
+        last_success_at:
+          $ref: "#/components/schemas/NullableDateTime"
+        last_complete_snapshot_run_id:
+          $ref: "#/components/schemas/NullableUUID"
+        last_complete_snapshot_at:
+          $ref: "#/components/schemas/NullableDateTime"
+        current_run_counts:
+          oneOf:
+            - $ref: "#/components/schemas/SourceRunCounts"
+            - type: "null"
+        last_run_counts:
+          oneOf:
+            - $ref: "#/components/schemas/SourceRunCounts"
+            - type: "null"
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        effective_actions:
+          type: array
+          maxItems: 7
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/EffectiveAction"
+    SourceRevisionSummary:
+      type: object
+      additionalProperties: false
+      required: [revision, status, binding_digest, source_definition_digest, created_at, updated_at]
+      properties:
+        revision:
+          type: integer
+          format: int64
+          minimum: 1
+        status:
+          $ref: "#/components/schemas/SourceRevisionStatus"
+        binding_digest:
+          $ref: "#/components/schemas/Digest"
+        source_definition_digest:
+          $ref: "#/components/schemas/Digest"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    AssetSourceDetail:
+      type: object
+      additionalProperties: false
+      required: [summary, latest_revision, published_revision]
+      properties:
+        summary:
+          $ref: "#/components/schemas/AssetSourceSummary"
+        latest_revision:
+          $ref: "#/components/schemas/SourceRevisionSummary"
+        published_revision:
+          oneOf:
+            - $ref: "#/components/schemas/SourceRevisionSummary"
+            - type: "null"
+    AssetSourcePage:
+      type: object
+      additionalProperties: false
+      required: [items, page, effective_actions]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/AssetSourceSummary"
+        page:
+          $ref: "#/components/schemas/PageMeta"
+        effective_actions:
+          type: array
+          maxItems: 0
+          items:
+            $ref: "#/components/schemas/EffectiveAction"
+    AssetSourceRun:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - source_id
+        - source_revision
+        - source_revision_digest
+        - kind
+        - status
+        - stage
+        - stage_changed_at
+        - trigger_type
+        - gate_revision
+        - page_sequence
+        - relation_page_sequence
+        - cursor_before_sha256
+        - cursor_after_sha256
+        - checkpoint_version
+        - not_before
+        - final_page
+        - complete_snapshot
+        - effective_complete_snapshot
+        - work_result_kind
+        - work_result_status
+        - work_result_digest
+        - work_result_recorded_at
+        - validation_outcome
+        - validation_proof_digest
+        - credential_cleanup_status
+        - counts
+        - failure_code
+        - trace_id
+        - version
+        - created_at
+        - started_at
+        - heartbeat_at
+        - completed_at
+        - effective_actions
+      properties:
+        id:
+          $ref: "#/components/schemas/UUID"
+        source_id:
+          $ref: "#/components/schemas/UUID"
+        source_revision:
+          type: integer
+          format: int64
+          minimum: 1
+        source_revision_digest:
+          $ref: "#/components/schemas/Digest"
+        kind:
+          $ref: "#/components/schemas/RunKind"
+        status:
+          $ref: "#/components/schemas/RunStatus"
+        stage:
+          $ref: "#/components/schemas/RunStage"
+        stage_changed_at:
+          type: string
+          format: date-time
+        trigger_type:
+          $ref: "#/components/schemas/TriggerType"
+        gate_revision:
+          type: integer
+          format: int64
+          minimum: 0
+        page_sequence:
+          type: integer
+          format: int64
+          minimum: 0
+        relation_page_sequence:
+          type: integer
+          format: int64
+          minimum: 0
+        cursor_before_sha256:
+          $ref: "#/components/schemas/NullableDigest"
+        cursor_after_sha256:
+          $ref: "#/components/schemas/NullableDigest"
+        checkpoint_version:
+          type: integer
+          format: int64
+          minimum: 0
+        not_before:
+          type: string
+          format: date-time
+        final_page:
+          type: boolean
+        complete_snapshot:
+          type: boolean
+        effective_complete_snapshot:
+          type: boolean
+        work_result_kind:
+          type: [string, "null"]
+          enum: [DATA_PROJECTION, VALIDATION_PROOF, FAILURE_INTENT, null]
+        work_result_status:
+          type: [string, "null"]
+          enum: [SUCCEEDED, PARTIAL, FAILED, null]
+        work_result_digest:
+          $ref: "#/components/schemas/NullableDigest"
+        work_result_recorded_at:
+          $ref: "#/components/schemas/NullableDateTime"
+        validation_outcome:
+          type: [string, "null"]
+          enum: [SUCCEEDED, FAILED, null]
+        validation_proof_digest:
+          $ref: "#/components/schemas/NullableDigest"
+        credential_cleanup_status:
+          $ref: "#/components/schemas/CredentialCleanupStatus"
+        counts:
+          $ref: "#/components/schemas/SourceRunCounts"
+        failure_code:
+          type: [string, "null"]
+          maxLength: 128
+        trace_id:
+          type: [string, "null"]
+          pattern: "^[a-f0-9]{32}$"
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          $ref: "#/components/schemas/NullableDateTime"
+        heartbeat_at:
+          $ref: "#/components/schemas/NullableDateTime"
+        completed_at:
+          $ref: "#/components/schemas/NullableDateTime"
+        effective_actions:
+          type: array
+          maxItems: 0
+          items:
+            $ref: "#/components/schemas/EffectiveAction"
+    ConflictAssetReference:
+      type: object
+      additionalProperties: false
+      required: [id, display_name, kind, lifecycle]
+      properties:
+        id:
+          $ref: "#/components/schemas/UUID"
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        kind:
+          $ref: "#/components/schemas/AssetKind"
+        lifecycle:
+          $ref: "#/components/schemas/AssetLifecycle"
+    ConflictServiceReference:
+      type: object
+      additionalProperties: false
+      required: [id, name]
+      properties:
+        id:
+          $ref: "#/components/schemas/UUID"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+    ConflictObservationReference:
+      type: object
+      additionalProperties: false
+      required: [id, source_id, source_revision, observed_at]
+      properties:
+        id:
+          $ref: "#/components/schemas/UUID"
+        source_id:
+          $ref: "#/components/schemas/UUID"
+        source_revision:
+          type: integer
+          format: int64
+          minimum: 1
+        observed_at:
+          type: string
+          format: date-time
+    ConflictImpactCounts:
+      type: object
+      additionalProperties: false
+      required:
+        - asset_active_bindings
+        - asset_active_relationships
+        - candidate_asset_active_bindings
+        - candidate_asset_active_relationships
+        - candidate_service_active_bindings
+      properties:
+        asset_active_bindings:
+          type: integer
+          format: int64
+          minimum: 0
+        asset_active_relationships:
+          type: integer
+          format: int64
+          minimum: 0
+        candidate_asset_active_bindings:
+          type: integer
+          format: int64
+          minimum: 0
+        candidate_asset_active_relationships:
+          type: integer
+          format: int64
+          minimum: 0
+        candidate_service_active_bindings:
+          type: integer
+          format: int64
+          minimum: 0
+    AssetConflictDetail:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - environment_id
+        - asset
+        - candidate_asset
+        - candidate_service
+        - source_id
+        - observation
+        - type
+        - field_name
+        - existing_value_sha256
+        - candidate_value_sha256
+        - status
+        - resolution
+        - resolution_reason_code
+        - resolved_at
+        - impact_counts
+        - version
+        - etag
+        - created_at
+        - updated_at
+        - effective_actions
+      properties:
+        id:
+          $ref: "#/components/schemas/UUID"
+        environment_id:
+          $ref: "#/components/schemas/UUID"
+        asset:
+          $ref: "#/components/schemas/ConflictAssetReference"
+        candidate_asset:
+          oneOf:
+            - $ref: "#/components/schemas/ConflictAssetReference"
+            - type: "null"
+        candidate_service:
+          oneOf:
+            - $ref: "#/components/schemas/ConflictServiceReference"
+            - type: "null"
+        source_id:
+          $ref: "#/components/schemas/UUID"
+        observation:
+          $ref: "#/components/schemas/ConflictObservationReference"
+        type:
+          type: string
+          minLength: 1
+          maxLength: 128
+        field_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        existing_value_sha256:
+          $ref: "#/components/schemas/Digest"
+        candidate_value_sha256:
+          $ref: "#/components/schemas/Digest"
+        status:
+          $ref: "#/components/schemas/ConflictStatus"
+        resolution:
+          type: [string, "null"]
+          enum: [CONFIRM_EXACT, REJECT_CANDIDATE, KEEP_UNRESOLVED, QUARANTINE_ASSET, null]
+        resolution_reason_code:
+          type: [string, "null"]
+          maxLength: 128
+        resolved_at:
+          $ref: "#/components/schemas/NullableDateTime"
+        impact_counts:
+          $ref: "#/components/schemas/ConflictImpactCounts"
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+        etag:
+          type: string
+          minLength: 8
+          maxLength: 400
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        effective_actions:
+          type: array
+          maxItems: 7
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/EffectiveAction"
+    AssetConflictSummary:
+      $ref: "#/components/schemas/AssetConflictDetail"
+    AssetConflictPage:
+      type: object
+      additionalProperties: false
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/AssetConflictSummary"
+        page:
+          $ref: "#/components/schemas/PageMeta"
+    ResolveAssetConflictRequest:
+      oneOf:
+        - $ref: "#/components/schemas/ConfirmExactConflictRequest"
+        - $ref: "#/components/schemas/RejectCandidateConflictRequest"
+        - $ref: "#/components/schemas/KeepUnresolvedConflictRequest"
+        - $ref: "#/components/schemas/QuarantineConflictAssetRequest"
+    ConfirmExactConflictRequest:
+      type: object
+      additionalProperties: false
+      required: [resolution, service_id, binding_role, reason_code]
+      properties:
+        resolution:
+          type: string
+          const: CONFIRM_EXACT
+        service_id:
+          $ref: "#/components/schemas/UUID"
+        binding_role:
+          $ref: "#/components/schemas/BindingRole"
+        reason_code:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Z][A-Z0-9_]{0,127}$"
+    RejectCandidateConflictRequest:
+      type: object
+      additionalProperties: false
+      required: [resolution, reason_code]
+      properties:
+        resolution:
+          type: string
+          const: REJECT_CANDIDATE
+        reason_code:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Z][A-Z0-9_]{0,127}$"
+    KeepUnresolvedConflictRequest:
+      type: object
+      additionalProperties: false
+      required: [resolution, reason_code]
+      properties:
+        resolution:
+          type: string
+          const: KEEP_UNRESOLVED
+        reason_code:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Z][A-Z0-9_]{0,127}$"
+    QuarantineConflictAssetRequest:
+      type: object
+      additionalProperties: false
+      required: [resolution, reason_code]
+      properties:
+        resolution:
+          type: string
+          const: QUARANTINE_ASSET
+        reason_code:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Z][A-Z0-9_]{0,127}$"
+    AssetConflictMutationResult:
+      type: object
+      additionalProperties: false
+      required: [conflict, binding, mutation_receipt]
+      properties:
+        conflict:
+          $ref: "#/components/schemas/AssetConflictDetail"
+        binding:
+          oneOf:
+            - $ref: "#/components/schemas/ServiceAssetBindingSummary"
+            - type: "null"
+        mutation_receipt:
+          $ref: "#/components/schemas/MutationReceipt"
+    Problem:
+      type: object
+      additionalProperties: false
+      required: [type, title, status, code, detail, trace_id]
+      properties:
+        type:
+          type: string
+          const: about:blank
+        title:
+          type: string
+          minLength: 1
+          maxLength: 128
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        code:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[a-z][a-z0-9_]{0,127}$"
+        detail:
+          type: string
+          minLength: 1
+          maxLength: 512
+        trace_id:
+          $ref: "#/components/schemas/TraceID"

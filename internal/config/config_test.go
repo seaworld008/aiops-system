@@ -10,12 +10,14 @@ import (
 
 func TestLoadUsesSafeDefaults(t *testing.T) {
 	clearRunnerGatewayEnvironment(t)
+	clearControlPlaneOIDCEnvironment(t)
 	t.Setenv("AIOPS_HTTP_ADDR", "")
 	t.Setenv("AIOPS_SHUTDOWN_TIMEOUT", "")
 	t.Setenv("AIOPS_ENVIRONMENT", "")
 	t.Setenv("AIOPS_WEBHOOK_HMAC_SECRETS_JSON", "")
 	t.Setenv("AIOPS_WRITE_EXECUTION_MODE", "")
 	t.Setenv("AIOPS_OIDC_RECENT_AUTH_WINDOW", "")
+	t.Setenv("AIOPS_CONTROL_PLANE_CURSOR_HMAC_SECRET", "")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -36,6 +38,13 @@ func TestLoadUsesSafeDefaults(t *testing.T) {
 	}
 	if cfg.OIDCRecentAuthWindow != 5*time.Minute {
 		t.Fatalf("OIDCRecentAuthWindow = %s, want 5m", cfg.OIDCRecentAuthWindow)
+	}
+	if cfg.OIDCIssuer != "" || cfg.OIDCAPIAudience != "" || cfg.OIDCAuthorizedParty != "" ||
+		cfg.WebOIDCURL != "" || cfg.WebOIDCRealm != "" || cfg.WebOIDCClientID != "" {
+		t.Fatalf("OIDC/browser configuration = %#v, want disabled", cfg)
+	}
+	if len(cfg.ControlPlaneCursorHMACSecret) != 0 {
+		t.Fatalf("ControlPlaneCursorHMACSecret length = %d, want 0", len(cfg.ControlPlaneCursorHMACSecret))
 	}
 	if cfg.RunnerGateway != nil {
 		t.Fatalf("RunnerGateway = %#v, want disabled", cfg.RunnerGateway)
@@ -305,10 +314,117 @@ func TestLoadRejectsProductionWithoutOIDCConfiguration(t *testing.T) {
 	t.Setenv("AIOPS_ENVIRONMENT", "production")
 	t.Setenv("AIOPS_DATABASE_URL", "postgres://configured")
 	t.Setenv("AIOPS_WEBHOOK_HMAC_SECRETS_JSON", `{"33333333-3333-4333-8333-333333333333/alertmanager":"secret"}`)
-	t.Setenv("AIOPS_OIDC_ISSUER", "")
-	t.Setenv("AIOPS_OIDC_CLIENT_ID", "")
+	clearControlPlaneOIDCEnvironment(t)
 	if _, err := config.Load(); err == nil {
 		t.Fatal("Load() error = nil, want OIDC fail-closed production configuration")
+	}
+}
+
+func TestLoadRequiresAllSixControlPlaneOIDCValuesTogether(t *testing.T) {
+	keys := []string{
+		"AIOPS_OIDC_ISSUER",
+		"AIOPS_OIDC_API_AUDIENCE",
+		"AIOPS_OIDC_AUTHORIZED_PARTY",
+		"AIOPS_WEB_OIDC_URL",
+		"AIOPS_WEB_OIDC_REALM",
+		"AIOPS_WEB_OIDC_CLIENT_ID",
+	}
+	values := []string{
+		"https://identity.example.com/realms/aiops",
+		"aiops-control-plane",
+		"control-plane-web",
+		"https://identity.example.com",
+		"aiops",
+		"control-plane-web",
+	}
+	for index, key := range keys {
+		index, key := index, key
+		t.Run(key, func(t *testing.T) {
+			clearControlPlaneOIDCEnvironment(t)
+			t.Setenv(key, values[index])
+			if _, err := config.Load(); err == nil {
+				t.Fatalf("Load() error = nil with only %s", key)
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsSeparatedBrowserAndAPIOIDCConfiguration(t *testing.T) {
+	setOIDCEnvironment(t)
+	t.Setenv("AIOPS_CONTROL_PLANE_CURSOR_HMAC_SECRET", "0123456789abcdef0123456789abcdef")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.OIDCIssuer != "https://identity.example.com/realms/aiops" ||
+		cfg.OIDCAPIAudience != "aiops-control-plane" ||
+		cfg.OIDCAuthorizedParty != "control-plane-web" ||
+		cfg.WebOIDCURL != "https://identity.example.com" ||
+		cfg.WebOIDCRealm != "aiops" ||
+		cfg.WebOIDCClientID != "control-plane-web" {
+		t.Fatalf("OIDC/browser configuration = %#v", cfg)
+	}
+	if string(cfg.ControlPlaneCursorHMACSecret) != "0123456789abcdef0123456789abcdef" {
+		t.Fatalf("cursor secret was not copied exactly")
+	}
+}
+
+func TestLoadRejectsLegacyOrDriftedControlPlaneOIDCConfiguration(t *testing.T) {
+	tests := map[string]func(*testing.T){
+		"legacy client id": func(t *testing.T) {
+			setOIDCEnvironment(t)
+			t.Setenv("AIOPS_OIDC_CLIENT_ID", "aiops-control-plane")
+		},
+		"wrong API audience": func(t *testing.T) {
+			setOIDCEnvironment(t)
+			t.Setenv("AIOPS_OIDC_API_AUDIENCE", "control-plane-web")
+		},
+		"wrong authorized party": func(t *testing.T) {
+			setOIDCEnvironment(t)
+			t.Setenv("AIOPS_OIDC_AUTHORIZED_PARTY", "another-client")
+		},
+		"browser client drift": func(t *testing.T) {
+			setOIDCEnvironment(t)
+			t.Setenv("AIOPS_WEB_OIDC_CLIENT_ID", "another-client")
+		},
+		"issuer realm drift": func(t *testing.T) {
+			setOIDCEnvironment(t)
+			t.Setenv("AIOPS_OIDC_ISSUER", "https://identity.example.com/realms/other")
+		},
+		"unsafe browser url": func(t *testing.T) {
+			setOIDCEnvironment(t)
+			t.Setenv("AIOPS_WEB_OIDC_URL", "http://identity.example.com")
+		},
+		"unclean issuer path": func(t *testing.T) {
+			setOIDCEnvironment(t)
+			t.Setenv("AIOPS_OIDC_ISSUER", "https://identity.example.com/a/../realms/aiops")
+		},
+		"unclean browser url path": func(t *testing.T) {
+			setOIDCEnvironment(t)
+			t.Setenv("AIOPS_WEB_OIDC_URL", "https://identity.example.com/a/..")
+		},
+		"private browser url": func(t *testing.T) {
+			setOIDCEnvironment(t)
+			t.Setenv("AIOPS_WEB_OIDC_URL", "https://10.0.0.1")
+			t.Setenv("AIOPS_OIDC_ISSUER", "https://10.0.0.1/realms/aiops")
+		},
+		"internal browser host": func(t *testing.T) {
+			setOIDCEnvironment(t)
+			t.Setenv("AIOPS_WEB_OIDC_URL", "https://identity.internal")
+			t.Setenv("AIOPS_OIDC_ISSUER", "https://identity.internal/realms/aiops")
+		},
+	}
+	for name, arrange := range tests {
+		name, arrange := name, arrange
+		t.Run(name, func(t *testing.T) {
+			clearControlPlaneOIDCEnvironment(t)
+			t.Setenv("AIOPS_OIDC_CLIENT_ID", "")
+			arrange(t)
+			if _, err := config.Load(); err == nil {
+				t.Fatal("Load() error = nil, want fail-closed rejection")
+			}
+		})
 	}
 }
 
@@ -334,8 +450,28 @@ func TestLoadNormalizesProductionAliasesBeforeFailClosedChecks(t *testing.T) {
 
 func setOIDCEnvironment(t *testing.T) {
 	t.Helper()
-	t.Setenv("AIOPS_OIDC_ISSUER", "https://keycloak.example.com/realms/aiops")
-	t.Setenv("AIOPS_OIDC_CLIENT_ID", "aiops-control-plane")
+	t.Setenv("AIOPS_OIDC_ISSUER", "https://identity.example.com/realms/aiops")
+	t.Setenv("AIOPS_OIDC_API_AUDIENCE", "aiops-control-plane")
+	t.Setenv("AIOPS_OIDC_AUTHORIZED_PARTY", "control-plane-web")
+	t.Setenv("AIOPS_WEB_OIDC_URL", "https://identity.example.com")
+	t.Setenv("AIOPS_WEB_OIDC_REALM", "aiops")
+	t.Setenv("AIOPS_WEB_OIDC_CLIENT_ID", "control-plane-web")
+	t.Setenv("AIOPS_OIDC_CLIENT_ID", "")
+}
+
+func clearControlPlaneOIDCEnvironment(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"AIOPS_OIDC_ISSUER",
+		"AIOPS_OIDC_API_AUDIENCE",
+		"AIOPS_OIDC_AUTHORIZED_PARTY",
+		"AIOPS_WEB_OIDC_URL",
+		"AIOPS_WEB_OIDC_REALM",
+		"AIOPS_WEB_OIDC_CLIENT_ID",
+		"AIOPS_OIDC_CLIENT_ID",
+	} {
+		t.Setenv(key, "")
+	}
 }
 
 func clearRunnerGatewayEnvironment(t *testing.T) {

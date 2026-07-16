@@ -107,6 +107,52 @@ func TestSessionEndpointRequiresVerifiedOIDCPrincipal(t *testing.T) {
 	}
 }
 
+func TestControlPlaneOpenAPIOperationsAreRegisteredWithExactMethods(t *testing.T) {
+	t.Parallel()
+	const (
+		workspaceID   = "11111111-1111-4111-8111-111111111111"
+		environmentID = "22222222-2222-4222-8222-222222222222"
+		resourceID    = "33333333-3333-4333-8333-333333333333"
+	)
+	base := "/api/v1/workspaces/" + workspaceID
+	environmentBase := base + "/environments/" + environmentID
+	operations := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/api/v1/browser-config"},
+		{http.MethodGet, environmentBase + "/assets"},
+		{http.MethodPost, environmentBase + "/assets"},
+		{http.MethodGet, environmentBase + "/assets/" + resourceID},
+		{http.MethodPatch, environmentBase + "/assets/" + resourceID},
+		{http.MethodPost, environmentBase + "/assets/" + resourceID + ":quarantine"},
+		{http.MethodPost, environmentBase + "/assets/" + resourceID + ":retire"},
+		{http.MethodGet, environmentBase + "/asset-relations"},
+		{http.MethodGet, environmentBase + "/service-asset-bindings"},
+		{http.MethodPost, environmentBase + "/service-asset-bindings"},
+		{http.MethodDelete, environmentBase + "/service-asset-bindings/" + resourceID},
+		{http.MethodGet, base + "/asset-sources"},
+		{http.MethodGet, base + "/asset-sources/" + resourceID},
+		{http.MethodGet, base + "/asset-source-runs/" + resourceID},
+		{http.MethodGet, base + "/asset-conflicts?environment_id=" + environmentID},
+		{http.MethodPost, base + "/asset-conflicts/" + resourceID + ":resolve"},
+	}
+	router := httpapi.NewRouter(httpapi.Dependencies{
+		Authenticator: fakeAuthenticator{principal: authn.Principal{
+			Subject: "test", TenantID: workspaceID, Roles: []authn.Role{authn.RoleAdmin},
+			WorkspaceIDs: []string{workspaceID}, EnvironmentIDs: []string{environmentID},
+			AuthenticatedAt: time.Now().Add(-time.Minute), ExpiresAt: time.Now().Add(time.Hour),
+		}},
+	})
+	for _, operation := range operations {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(operation.method, operation.path, nil))
+		if response.Code == http.StatusNotFound || response.Code == http.StatusMethodNotAllowed {
+			t.Errorf("%s %s was not registered exactly: %d %s", operation.method, operation.path, response.Code, response.Body.String())
+		}
+	}
+}
+
 type fakeAuthenticator struct {
 	principal authn.Principal
 	err       error
