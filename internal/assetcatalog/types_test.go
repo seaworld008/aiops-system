@@ -156,11 +156,15 @@ func TestRepositoryInterfacesAreReadSafeAndDoNotPreemptSourceLifecycle(t *testin
 		"version conflict": ErrVersionConflict,
 		"state conflict":   ErrStateConflict,
 		"idempotency":      ErrIdempotency,
+		"unavailable":      ErrUnavailable,
 	} {
 		if err == nil || strings.TrimSpace(err.Error()) == "" {
 			t.Errorf("stable error %s is empty", name)
 		}
-		for _, unsafe := range []string{"postgres", "sqlstate", "provider", "endpoint", "password", "dsn"} {
+		for _, unsafe := range []string{
+			"postgres", "sqlstate", "database", "connection", "network",
+			"provider", "endpoint", "password", "dsn",
+		} {
 			if strings.Contains(strings.ToLower(err.Error()), unsafe) {
 				t.Errorf("stable error %s leaks implementation token %q", name, unsafe)
 			}

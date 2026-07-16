@@ -731,7 +731,9 @@ func writeAssetCatalogError(
 		writeRequestProblem(writer, request, http.StatusConflict, "idempotency_conflict", "Idempotency-Key was reused with a different request")
 	case errors.Is(err, assetcatalog.ErrStateConflict):
 		writeRequestProblem(writer, request, http.StatusConflict, "invalid_asset_state", "The asset catalog state conflicts with this operation")
-	case errors.Is(err, errAssetCatalogUnavailable), errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(err, errAssetCatalogUnavailable),
+		errors.Is(err, assetcatalog.ErrUnavailable),
+		errors.Is(err, context.DeadlineExceeded):
 		writeRequestProblem(writer, request, http.StatusServiceUnavailable, "asset_catalog_unavailable", "Asset catalog is unavailable")
 	default:
 		metadata := requestmeta.From(request.Context())
