@@ -232,6 +232,21 @@ The return pair is also exact XOR：`err != nil` requires `outcome == nil`，and
 
 `BoundRuntime` is created only inside `cmd/discovery-worker` from the exact `VALIDATING` or `PUBLISHED` revision/profile and workload secret binding；it follows the fixed process-local typed-access ABI above and implements idempotent `Close/Clear`. `DiscoverRequest` intentionally contains no `LeaseFence`；the Worker revalidates its fence around the call and only `PageCommitter/Reconciler` consumes the sealed fence. `DiscoverRequest`, queue payload, Temporal history, audit and logs contain no endpoint, credential, CA, header or Provider request body. Every installed Profile fixes one `FreshnessKind` plus `EnvironmentMappingMode`：`EXPLICIT_ITEM_ENVIRONMENT` only for CSV/API inputs that carry a validated Environment ID, or `SINGLE_ENVIRONMENT` for fixed infrastructure adapters. The latter requires exactly one same-Workspace `AuthorityEnvironmentID`；the former validates every item/relation endpoint against the immutable sorted allow-list. Only the sorted Environment allow-list is membership input to `authority_scope_digest`；freshness kind and mapping mode are immutable semantics of the versioned Profile canonical bytes. `BindingDigest` binds that Profile through `source_definition_digest/profile_code` and independently binds `authority_scope_digest`，so changing either semantic requires a new versioned Profile/revision and complete digest closure；Provider wire data can never choose another kind or invent/remap a Catalog Environment.
 
+#### M1L Source create / Profile Registry corrective contract（2026-07-17）
+
+Task 13 的 `Produces` 同时包含 `SourceRevisionRepository.CreateSource` 与 `SourceProfileRegistry`；稳定 Source 不能由 Task 14、HTTP 或其他 Repository 先行插入后再补 revision。`SourceProfileID` 是公共请求使用的 opaque selector，不是持久事实：固定 grammar 为 `^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$` 且 UTF-8 byte length 为 1–64；它不写入 Source、Revision、authority、Audit 或 Outbox，也不进入 `authority_scope_digest`、`source_definition_digest` 或 `canonical_revision_digest`。完整写请求的幂等 request/command hash 仍覆盖 selector，不能把 changed selector 当作同一 replay。
+
+内建 Registry 只安装 selector `manual-v1`，并把它解析为现有不可变 `ManualProfileV1()`：`ProfileCode=MANUAL_V1`、`SourceKind=MANUAL`、`ProviderKind=MANUAL_V1`。Registry 每次返回 caller-owned clone；同一个 selector 或 `ProfileCode` 不得出现第二份语义，任何 Profile semantic 变化都必须同时使用新的 `SourceProfileID` 和新的 versioned `ProfileCode`，禁止 alias、原地替换或同 ID 语义漂移。调用者只能提交 selector 和允许的安全选择，不能提交 `SourceKind`、`ProviderKind`、`ProfileCode`、canonical manifest/schema、Integration、rate/backpressure、freshness、mapping 或 extension resolved facts；`CreateSourceRevisionCommand` 也使用 selector，Repository 在 mutation 前解析完整 Profile。
+
+`CreateSource` 固定在一个 `SERIALIZABLE READ WRITE` transaction 内完成：
+
+1. 校验受信 `MutationContext`、完整 request/hash、selector、名称和 authority，解析 immutable Registry Profile，并锁 exact Workspace/idempotency facts；
+2. 插入 version 1 的 stable Source；同事务插入 `revision=1 / DRAFT / expected_source_version=1` 的 immutable revision 和按 Environment UUID canonical text 排序、ordinal 连续的 authority children；现有 migration trigger 将 Source version 精确推进到 2；
+3. 同事务写一个 `asset.source.revision.created.v1` receipt/Audit/Outbox closure，提交前由 `000015` deferred guards 重载并复算 authority、definition 与 20-frame BindingDigest；
+4. 返回 stable Source、revision 1 和 receipt；matching replay 只返回原 Source/receipt，changed hash、并发漂移、跨 Scope 或任一 base/revision/authority/Audit/Outbox 失败均整笔回滚。
+
+当前唯一可解析的 `manual-v1` 必须是 exact `SINGLE_ENVIRONMENT`，且 Credential/Trust/Network/Integration/schedule/typed-extension 全部 absent；Source 初始为 migration 强制的 `ACTIVE + UNAVAILABLE` closed gate、无 published/validation/checkpoint/success facts，revision 1 为 `DRAFT`。本 corrective 不创建 Task 14 的权限、Management、HTTP、router、OpenAPI 或 generated Web surface；Task 14 继续等待该稳定 `Produces` 合并。
+
 - [ ] **Step 1: Write failing revision immutability and publication-gate tests**
 
 ~~~go
@@ -283,7 +298,7 @@ func TestCreateSourceRollsBackStableIdentityWhenRevisionBindingIsInvalid(t *test
 	command := validCreateSourceCommand()
 	command.SourceProfileID = "incompatible-profile"
 
-	if _, err := repository.CreateSource(context.Background(), command); !errors.Is(err, assetcatalog.ErrInvalidRequest) {
+	if _, err := repository.CreateSource(context.Background(), command); !errors.Is(err, assetcatalog.ErrNotFound) {
 		t.Fatalf("CreateSource error = %v", err)
 	}
 	assertSourceRevisionCreateSideEffectsByKey(t, db, command.Context.IdempotencyKey(), 0, 0, 0, 0)
@@ -328,26 +343,19 @@ type SourceRevisionRepository interface {
 }
 
 type CreateSourceCommand struct {
-	Context                        MutationContext
-	Name                           string
-	SourceProfileID                string
-	CredentialReferenceID          string
-	TrustReferenceID               string
-	NetworkPolicyReferenceID       string
-	AuthorityEnvironmentIDs        []string
-	SyncMode, ScheduleExpression   string
+	Context                 MutationContext
+	Name                    string
+	SourceProfileID         SourceProfileID
+	AuthorityEnvironmentIDs []string
 }
 
 type CreateSourceRevisionCommand struct {
-	Context                         MutationContext
-	SourceID                        string
-	SourceProfileID                 string
-	CredentialReferenceID          string
-	TrustReferenceID               string
-	NetworkPolicyReferenceID       string
-	AuthorityEnvironmentIDs        []string
-	SyncMode, ScheduleExpression   string
-	ExpectedSourceVersion          int64
+	Context                 MutationContext
+	SourceID                string
+	SourceProfileID         SourceProfileID
+	AuthorityEnvironmentIDs []string
+	ChangeReasonCode        string
+	ExpectedSourceVersion   int64
 }
 
 type SourceRevisionMutation struct {

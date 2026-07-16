@@ -9,6 +9,7 @@ import (
 var ErrSourceRevisionNotValidated = errors.New("source revision not validated")
 
 type SourceRevisionRepository interface {
+	CreateSource(context.Context, CreateSourceCommand) (SourceRevisionMutation, error)
 	CreateRevision(context.Context, CreateSourceRevisionCommand) (SourceRevisionMutation, error)
 	RequestValidation(context.Context, ValidateSourceRevisionCommand) (SourceRunMutation, error)
 	Publish(context.Context, PublishSourceRevisionCommand) (SourceRevisionMutation, error)
@@ -16,10 +17,22 @@ type SourceRevisionRepository interface {
 	RequestSync(context.Context, RequestSyncCommand) (SourceRunMutation, error)
 }
 
+type CreateSourceCommand struct {
+	Context                 MutationContext
+	Name                    string
+	SourceProfileID         SourceProfileID
+	AuthorityEnvironmentIDs []string
+}
+
+func (command CreateSourceCommand) Clone() CreateSourceCommand {
+	command.AuthorityEnvironmentIDs = slices.Clone(command.AuthorityEnvironmentIDs)
+	return command
+}
+
 type CreateSourceRevisionCommand struct {
 	Context                 MutationContext
 	SourceID                string
-	ProfileCode             ProfileCode
+	SourceProfileID         SourceProfileID
 	AuthorityEnvironmentIDs []string
 	ChangeReasonCode        string
 	ExpectedSourceVersion   int64

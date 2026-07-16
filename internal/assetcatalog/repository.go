@@ -241,6 +241,26 @@ type SourceProfileAdmissionResolver interface {
 	ResolveProfileAdmission(context.Context, ProfileCode) (BuiltinSourceProfile, error)
 }
 
+type SourceProfileRegistry interface {
+	Resolve(SourceProfileID) (BuiltinSourceProfile, error)
+}
+
+type builtinSourceProfileRegistry struct{}
+
+func NewBuiltinSourceProfileRegistry() SourceProfileRegistry {
+	return builtinSourceProfileRegistry{}
+}
+
+func (builtinSourceProfileRegistry) Resolve(id SourceProfileID) (BuiltinSourceProfile, error) {
+	if !id.Valid() {
+		return BuiltinSourceProfile{}, ErrInvalidRequest
+	}
+	if id != SourceProfileIDManualV1 {
+		return BuiltinSourceProfile{}, ErrNotFound
+	}
+	return ManualProfileV1().Clone(), nil
+}
+
 type builtinSourceProfileAdmissionResolver struct{}
 
 func NewBuiltinSourceProfileAdmissionResolver() SourceProfileAdmissionResolver {
@@ -251,7 +271,7 @@ func (builtinSourceProfileAdmissionResolver) ResolveProfileAdmission(_ context.C
 	if code != ProfileCode("MANUAL_V1") {
 		return BuiltinSourceProfile{}, ErrNotFound
 	}
-	return ManualProfileV1(), nil
+	return ManualProfileV1().Clone(), nil
 }
 
 func validUniqueUUIDs(values []string, allowEmpty bool) bool {

@@ -80,7 +80,7 @@ func TestMapSourceRevisionErrorClassifiesOnlyNonterminalRunUniqueConflict(t *tes
 func TestSourceRevisionCommandHashBindsCASAndSafeSemanticFields(t *testing.T) {
 	command := assetcatalog.CreateSourceRevisionCommand{
 		SourceID:                "60000000-0000-4000-8000-000000000001",
-		ProfileCode:             "MANUAL_V1",
+		SourceProfileID:         assetcatalog.SourceProfileIDManualV1,
 		AuthorityEnvironmentIDs: []string{"30000000-0000-4000-8000-000000000001"},
 		ChangeReasonCode:        "SOURCE_CONFIGURATION_CHANGED",
 		ExpectedSourceVersion:   7,
@@ -124,8 +124,8 @@ func TestSourceRevisionCommandHashNormalizesAuthorityOrder(t *testing.T) {
 		WorkspaceID: "20000000-0000-4000-8000-000000000001",
 	}
 	command := assetcatalog.CreateSourceRevisionCommand{
-		SourceID:    "60000000-0000-4000-8000-000000000001",
-		ProfileCode: "MANUAL_V1",
+		SourceID:        "60000000-0000-4000-8000-000000000001",
+		SourceProfileID: assetcatalog.SourceProfileIDManualV1,
 		AuthorityEnvironmentIDs: []string{
 			"30000000-0000-4000-8000-000000000002",
 			"30000000-0000-4000-8000-000000000001",
@@ -142,6 +142,42 @@ func TestSourceRevisionCommandHashNormalizesAuthorityOrder(t *testing.T) {
 	second, err := createSourceRevisionCommandHash(scope, command)
 	if err != nil || second != first {
 		t.Fatalf("authority-order hashes = %q / %q, error = %v", first, second, err)
+	}
+}
+
+func TestCreateSourceCommandHashBindsSelectorNameScopeAndCanonicalAuthorities(t *testing.T) {
+	scope := assetcatalog.SourceScope{
+		TenantID:    "10000000-0000-4000-8000-000000000001",
+		WorkspaceID: "20000000-0000-4000-8000-000000000001",
+	}
+	command := assetcatalog.CreateSourceCommand{
+		Name:            "manual source",
+		SourceProfileID: assetcatalog.SourceProfileIDManualV1,
+		AuthorityEnvironmentIDs: []string{
+			"30000000-0000-4000-8000-000000000002",
+			"30000000-0000-4000-8000-000000000001",
+		},
+	}
+	first, err := createSourceCommandHash(scope, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.AuthorityEnvironmentIDs[0], command.AuthorityEnvironmentIDs[1] =
+		command.AuthorityEnvironmentIDs[1], command.AuthorityEnvironmentIDs[0]
+	reordered, err := createSourceCommandHash(scope, command)
+	if err != nil || reordered != first {
+		t.Fatalf("authority-order hashes = %q / %q, error = %v", first, reordered, err)
+	}
+	command.Name = "changed source"
+	changed, err := createSourceCommandHash(scope, command)
+	if err != nil || changed == first {
+		t.Fatalf("name mutation hash = %q, %v; want different from %q", changed, err, first)
+	}
+	command.Name = "manual source"
+	command.SourceProfileID = "future-v1"
+	changed, err = createSourceCommandHash(scope, command)
+	if err != nil || changed == first {
+		t.Fatalf("selector mutation hash = %q, %v; want different from %q", changed, err, first)
 	}
 }
 

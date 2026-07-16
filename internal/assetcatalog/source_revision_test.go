@@ -10,6 +10,10 @@ import (
 
 type sourceRevisionRepositoryABI struct{}
 
+func (sourceRevisionRepositoryABI) CreateSource(context.Context, CreateSourceCommand) (SourceRevisionMutation, error) {
+	return SourceRevisionMutation{}, nil
+}
+
 func (sourceRevisionRepositoryABI) CreateRevision(context.Context, CreateSourceRevisionCommand) (SourceRevisionMutation, error) {
 	return SourceRevisionMutation{}, nil
 }
@@ -33,19 +37,30 @@ func (sourceRevisionRepositoryABI) RequestSync(context.Context, RequestSyncComma
 var _ SourceRevisionRepository = sourceRevisionRepositoryABI{}
 
 func TestSourceRevisionCommandsCloneOwnedAuthorityState(t *testing.T) {
-	command := CreateSourceRevisionCommand{
+	createSource := CreateSourceCommand{
+		Name:                    "manual source",
+		SourceProfileID:         SourceProfileIDManualV1,
+		AuthorityEnvironmentIDs: []string{"30000000-0000-4000-8000-000000000002", "30000000-0000-4000-8000-000000000001"},
+	}
+	clonedSource := createSource.Clone()
+	createSource.AuthorityEnvironmentIDs[0] = "30000000-0000-4000-8000-000000000099"
+	if clonedSource.AuthorityEnvironmentIDs[0] == createSource.AuthorityEnvironmentIDs[0] {
+		t.Fatalf("CreateSourceCommand.Clone() aliased caller-owned state: %#v", clonedSource)
+	}
+
+	createRevision := CreateSourceRevisionCommand{
 		SourceID:                "60000000-0000-4000-8000-000000000001",
-		ProfileCode:             "MANUAL_V1",
+		SourceProfileID:         SourceProfileIDManualV1,
 		AuthorityEnvironmentIDs: []string{"30000000-0000-4000-8000-000000000002", "30000000-0000-4000-8000-000000000001"},
 		ChangeReasonCode:        "SOURCE_CONFIGURATION_CHANGED",
 		ExpectedSourceVersion:   7,
 	}
 
-	cloned := command.Clone()
-	command.AuthorityEnvironmentIDs[0] = "30000000-0000-4000-8000-000000000099"
+	clonedRevision := createRevision.Clone()
+	createRevision.AuthorityEnvironmentIDs[0] = "30000000-0000-4000-8000-000000000099"
 
-	if cloned.AuthorityEnvironmentIDs[0] == command.AuthorityEnvironmentIDs[0] {
-		t.Fatalf("CreateSourceRevisionCommand.Clone() aliased caller-owned state: %#v", cloned)
+	if clonedRevision.AuthorityEnvironmentIDs[0] == createRevision.AuthorityEnvironmentIDs[0] {
+		t.Fatalf("CreateSourceRevisionCommand.Clone() aliased caller-owned state: %#v", clonedRevision)
 	}
 }
 
@@ -77,7 +92,8 @@ func TestSourceRevisionCommandsExposeExactCASCoordinates(t *testing.T) {
 		}
 	}
 
-	assertFields(CreateSourceRevisionCommand{}, "Context", "SourceID", "ProfileCode", "ExpectedSourceVersion")
+	assertFields(CreateSourceCommand{}, "Context", "Name", "SourceProfileID", "AuthorityEnvironmentIDs")
+	assertFields(CreateSourceRevisionCommand{}, "Context", "SourceID", "SourceProfileID", "ExpectedSourceVersion")
 	assertFields(ValidateSourceRevisionCommand{},
 		"Context", "SourceID", "Revision", "ExpectedSourceVersion", "ExpectedRevisionVersion", "ExpectedRevisionDigest")
 	assertFields(PublishSourceRevisionCommand{},
@@ -91,6 +107,7 @@ func TestSourceRevisionCommandsExposeExactCASCoordinates(t *testing.T) {
 
 func TestSourceRevisionCommandsHaveNoArbitraryOrSecretBearingSurface(t *testing.T) {
 	for _, value := range []any{
+		CreateSourceCommand{},
 		CreateSourceRevisionCommand{},
 		ValidateSourceRevisionCommand{},
 		PublishSourceRevisionCommand{},
@@ -113,15 +130,28 @@ func TestSourceRevisionCommandsHaveNoArbitraryOrSecretBearingSurface(t *testing.
 	}
 }
 
-func TestCreateSourceRevisionCommandCannotCarryResolvedProfileFacts(t *testing.T) {
-	typ := reflect.TypeOf(CreateSourceRevisionCommand{})
-	for _, forbidden := range []string{
-		"Profile", "BuiltinSourceProfile", "CanonicalProfileManifest", "CanonicalProviderSchema",
-		"ProviderKind", "IntegrationID", "CredentialReferenceID", "TrustReferenceID",
-		"NetworkPolicyReferenceID", "TypedExtensionCode", "PreparedExtensionDigest",
-	} {
-		if field, ok := typ.FieldByName(forbidden); ok {
-			t.Errorf("%s exposes caller-constructible resolved profile field %s (%s)", typ.Name(), field.Name, field.Type)
+func TestSourceCreateCommandsCannotCarryResolvedProfileFacts(t *testing.T) {
+	for _, command := range []any{CreateSourceCommand{}, CreateSourceRevisionCommand{}} {
+		typ := reflect.TypeOf(command)
+		for _, forbidden := range []string{
+			"ProfileCode", "Profile", "BuiltinSourceProfile", "CanonicalProfileManifest",
+			"CanonicalProviderSchema", "SourceKind", "ProviderKind", "IntegrationID",
+			"CredentialReferenceID", "TrustReferenceID", "NetworkPolicyReferenceID",
+			"SyncMode", "ScheduleExpression", "RateLimitRequests", "FreshnessKind",
+			"EnvironmentMapping", "TypedExtensionCode", "PreparedExtensionDigest",
+		} {
+			if field, ok := typ.FieldByName(forbidden); ok {
+				t.Errorf("%s exposes caller-constructible resolved profile field %s (%s)", typ.Name(), field.Name, field.Type)
+			}
+		}
+	}
+}
+
+func TestSourceProfileIDIsNotAPersistedSourceOrRevisionFact(t *testing.T) {
+	for _, value := range []any{Source{}, SourceRevision{}, SourceRevisionMutation{}} {
+		typ := reflect.TypeOf(value)
+		if _, found := typ.FieldByName("SourceProfileID"); found {
+			t.Errorf("%s persists public SourceProfileID selector", typ.Name())
 		}
 	}
 }
