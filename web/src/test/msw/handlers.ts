@@ -1,6 +1,8 @@
 import { http, HttpResponse } from "msw";
 
 import {
+  assetConflictMutationResultFixture,
+  assetConflictPageFixture,
   assetDetailFixture,
   assetMutationResultFixture,
   assetPageFixture,
@@ -57,6 +59,26 @@ export const handlers = [
     HttpResponse.json(assetSourcePageFixture, {
       headers: noStoreHeaders,
     }),
+  ),
+  http.get(
+    "/api/v1/workspaces/:workspaceId/asset-conflicts",
+    () =>
+      HttpResponse.json(assetConflictPageFixture, {
+        headers: noStoreHeaders,
+      }),
+  ),
+  http.post(
+    "/api/v1/workspaces/:workspaceId/asset-conflicts/:conflictId\\:resolve",
+    () =>
+      HttpResponse.json(assetConflictMutationResultFixture, {
+        headers: {
+          ...noStoreHeaders,
+          ETag:
+            assetConflictMutationResultFixture.conflict.etag,
+          "X-Audit-ID":
+            assetConflictMutationResultFixture.mutation_receipt.audit_id,
+        },
+      }),
   ),
   http.post(
     "/api/v1/workspaces/:workspaceId/environments/:environmentId/assets",

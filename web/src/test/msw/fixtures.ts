@@ -6,6 +6,7 @@ export const primaryAssetID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 export const secondaryAssetID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 export const manualSourceID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 export const serviceID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+export const assetConflictID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 
 export const browserConfigFixture: components["schemas"]["BrowserConfig"] = {
   oidc: {
@@ -196,6 +197,78 @@ export const assetMutationResultFixture: components["schemas"]["AssetMutationRes
   mutation_receipt: {
     audit_id: "12121212-1212-4121-8121-121212121212",
     trace_id: "4".repeat(32),
+    idempotent_replay: false,
+  },
+};
+
+export const assetConflictFixture: components["schemas"]["AssetConflictDetail"] = {
+  id: assetConflictID,
+  environment_id: environmentID,
+  asset: {
+    id: primaryAssetID,
+    display_name: assetSummaryFixture.display_name,
+    kind: assetSummaryFixture.kind,
+    lifecycle: "DISCOVERED",
+  },
+  candidate_asset: {
+    id: secondaryAssetID,
+    display_name: secondaryAssetSummaryFixture.display_name,
+    kind: secondaryAssetSummaryFixture.kind,
+    lifecycle: "DISCOVERED",
+  },
+  candidate_service: {
+    id: serviceID,
+    name: "payments",
+  },
+  source_id: manualSourceID,
+  observation: {
+    id: "14141414-1414-4141-8141-141414141414",
+    source_id: manualSourceID,
+    source_revision: 1,
+    observed_at: "2026-07-17T00:20:00Z",
+  },
+  type: "FIELD_CONFLICT",
+  field_name: "display_name",
+  existing_value_sha256: "5".repeat(64),
+  candidate_value_sha256: "6".repeat(64),
+  status: "OPEN",
+  resolution: null,
+  resolution_reason_code: null,
+  resolved_at: null,
+  impact_counts: {
+    asset_active_bindings: 1,
+    asset_active_relationships: 1,
+    candidate_asset_active_bindings: 1,
+    candidate_asset_active_relationships: 0,
+    candidate_service_active_bindings: 1,
+  },
+  version: 5,
+  etag: `"asset-conflict:${assetConflictID}:v5"`,
+  created_at: "2026-07-16T00:00:00Z",
+  updated_at: "2026-07-17T00:20:00Z",
+  effective_actions: ["RESOLVE_CONFLICT"],
+};
+
+export const assetConflictPageFixture: components["schemas"]["AssetConflictPage"] = {
+  items: [assetConflictFixture],
+  page: { next_cursor: null },
+};
+
+export const assetConflictMutationResultFixture: components["schemas"]["AssetConflictMutationResult"] = {
+  conflict: {
+    ...assetConflictFixture,
+    status: "RESOLVED",
+    resolution: "CONFIRM_EXACT",
+    resolution_reason_code: "SERVICE_OWNER_VERIFIED",
+    resolved_at: "2026-07-17T00:30:00Z",
+    version: 6,
+    etag: `"asset-conflict:${assetConflictID}:v6"`,
+    effective_actions: [],
+  },
+  binding: null,
+  mutation_receipt: {
+    audit_id: "15151515-1515-4151-8151-151515151515",
+    trace_id: "7".repeat(32),
     idempotent_replay: false,
   },
 };
