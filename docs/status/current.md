@@ -1,8 +1,8 @@
 # 当前项目状态
 
-> 更新时间：2026-07-16
+> 更新时间：2026-07-17
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前集成基线：本文件所在的最新 `origin/main`；最近完成 Batch：`M1I-typescript-toolchain-contract-corrective`（PR #73，代码提交 `690f84a`）；当前并行工作：`M1I-web-foundation-assets` Task 9 与 `M1L-source-revision-contract` Task 13
+> 当前集成基线：本文件所在的最新 `origin/main`；最近完成 Batch：`M1L-source-revision-contract` Task 13（PR #77，代码提交 `2a66e8a`）与 `M1I-web-foundation-assets` Task 9（PR #76，代码提交 `8202a58`）；当前正在从该基线轮换 `M1I-asset-catalog-ui` Task 10 与 `M1L-source-authorization-http` Task 14
 
 ## 当前结论
 
@@ -52,6 +52,10 @@ M1K Credential Problem Trace C0 已通过 PR #70 squash merge 到 `origin/main@1
 
 M1I TypeScript 工具链契约 corrective 已通过 PR #73 squash merge 到 `origin/main@690f84a`：24 个精确规划文件中的 25 处 TypeScript `7.0.2` 已统一为正式 peer intersection 的最高稳定版本 `5.9.3`；固定 `typescript-eslint@8.63.0`、`openapi-typescript@7.13.0`、Node 24 和 pnpm 10.34.0 的仓库外严格 peer graph 安装通过。版本基线同时记录 TypeScript 7 的正式升级入口，并禁止 `packageExtensions`、忽略 peer dependency、第二套 TypeScript 或手写 DTO 绕过。独立规格与 P0/P1 复核均通过，GitHub 快速 `go` 通过；该 corrective 只解除 Web Task 9 的工具链入口阻塞，不表示前端已经实现或可用。
 
+M1L Source Revision Contract 已通过 PR #77 squash merge 到 `origin/main@2a66e8a`：六个精确文件实现 `CreateRevision/RequestValidation/Publish/Disable/RequestSync` 的 immutable Repository、复合 Scope、SERIALIZABLE、ETag/CAS、receipt-first replay、Audit/Outbox 与安全错误投影。MANUAL 使用 exact installed Profile 完成同步 Validation/Publication 闭包；非 MANUAL 在稳定引用解析器和后继 Adapter 尚未交付时保持 fail closed。PostgreSQL 18.4 Task 13 integration、领域/M1C/PostgreSQL 定向 race、fresh G1、DLP/Secret/边界与代码地图均通过；两轮独立复核最终 P0/P1 为 0。Task 14–16、真实 Provider、HA、恢复及 G3/G4 仍未完成，Source 能力继续 `UNAVAILABLE/CLOSED`。
+
+M1I Web Foundation 已通过 PR #76 squash merge 到 `origin/main@8202a58`：五十九个精确文件建立唯一 `web/`、冻结 React/TypeScript/Vite 工具链、唯一生成类型、Browser Config→Keycloak PKCE→Session bootstrap、Scope/history、typed API、共享 Operation/UI，以及 Go 同源 SPA、CSP、路径隔离和 readiness fail-closed。独立复核发现的 TOCTOU、生产 API/Auth 注入、深链/dirty guard、终态 Operation、响应式、AbortSignal、网络旁路与 history Scope 漂移均以可信 RED→GREEN 关闭；最终 `pnpm check`、50/50 Vitest、受影响 Go race、fresh G1、bundle/Secret/边界与代码地图通过，P0/P1 为 0。真实 Keycloak/浏览器、Playwright/axe、HA、恢复及 G3/G4 仍 deferred，前端继续 `UNAVAILABLE/CLOSED`。
+
 ## 当前实施进度
 
 Phase 1 Task 1 首轮 Red → Green → 独立安全复核结果仍是有效证据，范围严格限于生产资产目录的数据库基础：
@@ -81,7 +85,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 - 小文档入口：[Governed Operations Production Program](../superpowers/plans/2026-07-13-governed-operations/README.md)
 - 覆盖追踪：[规范到实施计划覆盖矩阵](../superpowers/plans/2026-07-13-governed-operations/coverage-matrix.md)
 - 版本基线：[生产规划版本基线](../superpowers/plans/2026-07-13-governed-operations/version-baseline.md)
-- 前端应用平台架构已纳入确认规划：唯一 `web/` 采用 React 19.2.7 + TypeScript 5.9.3 + Vite 8.1.4 + TanStack，固定 `app → features → shared`、OpenAPI 唯一 DTO、服务端 `effective_actions`、Go 同源 SPA/API 与单 Control Plane 镜像 `/opt/aiops/web`；智能体验只通过 Evidence/Proposal/ActionPlan/Operation/Audit 受治理链呈现。工具链 corrective 合并后，`M1I-web-foundation-assets` Task 9 已从最新主线的新窗口恢复，当前仍为 `BUILDING_CLOSED` 且不可用。
+- 前端应用平台架构已纳入确认规划并由 `M1I-web-foundation-assets` Task 9 落地为关闭态 Foundation：唯一 `web/` 采用 React 19.2.7 + TypeScript 5.9.3 + Vite 8.1.4 + TanStack，固定 `app → features → shared`、OpenAPI 唯一 DTO、服务端 `effective_actions`、Go 同源 SPA/API 与单 Control Plane 镜像 `/opt/aiops/web`；智能体验只通过 Evidence/Proposal/ActionPlan/Operation/Audit 受治理链呈现。Task 10 起只扩展纵向页面，不得重建认证、transport、Scope、状态仓库或第二套前端事实源。
 - Phase 5 已确认但尚未实施的安全契约：[AWX Host Identity Enrollment](../contracts/awx-host-identity-enrollment-v1.md)、[AWX Governed Launch Admission](../contracts/awx-governed-launch-admission-v1.md)、[Host Identity Attestor](../contracts/host-identity-attestor-v1.md)。它们只修正后继阶段接口，Host/AWX/PostgreSQL 实现仍为 `NOT_STARTED`。
 
 实施阶段固定为：
@@ -115,7 +119,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
 | 现有调查/执行内核 | 基线存在 | 以现有测试、迁移和 V3 文档为准 |
-| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J/Session C0/Credential Trace C0/TypeScript C0）/ M1I、M1L BUILDING_CLOSED / UNAVAILABLE | Web Task 9 与 Source Revision Task 13 在文件所有权不重叠的独立窗口并行；Worker、前端、Source HTTP/ingestion 与真实 Provider 门仍未完成 |
+| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J/Session C0/Credential Trace C0/TypeScript C0/M1I Web Foundation/M1L Source Revision）/ Task 10、Task 14 BUILDING_CLOSED / UNAVAILABLE | Web Foundation 与 immutable Source Revision 已合并；正在轮换 Asset Catalog UI 与 Source authorization/OpenAPI/HTTP，Worker、ingestion 与真实 Provider 门仍未完成 |
 | Connection 修订/验证/发布 | NOT_STARTED | 等待 Phase 2 |
 | VictoriaMetrics/Logs/Traces 全家桶 | NOT_STARTED | 等待 Phase 3 |
 | 事件/定时主动只读调查 | NOT_STARTED | 等待 Phase 4 |
@@ -123,7 +127,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | HA 生产只读路径 | NOT_STARTED | 等待 Phase 6 |
 | 四类初始受治理生产 Action | CLOSED | 等待 Phase 7 逐类型演练与 Canary |
 | 生产发布与持续运维 | NOT_STARTED | 等待 Phase 8 |
-| 新 React 前端 | BUILDING_CLOSED | Web Task 9 已从 `origin/main@690f84a` 的 fresh 窗口恢复，正在建立前端基础、OIDC/Scope shell、共享 API/UI 与 Go same-origin SPA service；未验收前仍不可用 |
+| 新 React 前端 | BUILT_CLOSED Foundation / BUILDING_CLOSED Asset UI / UNAVAILABLE | Task 9 Foundation 已合并；Task 10 只消费既有 generated Asset DTO 与共享 shell，建立 `/assets` 关闭态纵向页面，真实浏览器资格未通过前仍不可用 |
 
 ## 已知基线注意事项
 
@@ -135,10 +139,10 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 
 ## 下一步
 
-继续在从 `origin/main@690f84a` 创建的 fresh 窗口执行 `M1I-web-foundation-assets` Task 9：消费唯一 OpenAPI 的 `getBrowserConfig/getSession` 与现有 authenticated handler，使用严格 peer-compatible TypeScript `5.9.3` 工具链建立 `web/`、生成类型、OIDC/Scope application shell、共享 API/UI 和 Go same-origin SPA service。它不得重新修改 OpenAPI、Session handler、migration 或 status，也不得通过 peer 绕过、双 TypeScript 或手写 DTO 偏离已合并契约；完成 G2 后再提交 PR，并在合并后轮换后续窗口。
+从最新 `origin/main@8202a58` 创建 fresh 可见窗口执行 `M1I-asset-catalog-ui` Task 10：只拥有 `web/src/features/assets/`、`web/src/app/router.tsx` 和两个既有 MSW fixture/handler 文件；消费已合并 generated Asset DTO、typed client、Scope/history、shared UI 与 `effective_actions`，实现 `/assets` 和 `/assets/$assetId` 的关闭态纵向切片。不得修改 OpenAPI、生成类型、后端、Foundation、status 或 Tasks 11–12；执行受影响 Web G2、fresh G1 和独立 P0/P1 复核后再提交 PR。
 
-并行执行从 `origin/main@7713e2c` 创建的 `M1L-source-revision-contract` Task 13：只拥有 Source Revision domain/repository、现有 `discoverysource` 稳定 ABI 的最小扩展和 PostgreSQL Repository 文件，不修改 migration、OpenAPI、Web、HTTP、status 或 Worker。入口若发现 `000015` 与已合并 ABI 无法支持 exact contract，必须在 clean/明确脏区边界停止并先修正权威契约；否则完成定向 C0 RED、受影响 G2 和独立 P0/P1 复核后提交 PR。
+并行从最新 `origin/main@8202a58` 创建 fresh 可见窗口执行 `M1L-source-authorization-http` Task 14：只拥有 Source 权限/Management、唯一 OpenAPI、Source HTTP/router 与生成 `schema.d.ts`；消费已合并 SourceRevisionRepository，发布严格 Source/Revision/Run DTO、human/workload 身份隔离和服务端 `effective_actions`。不得修改 migration、Task 10 feature 文件、status、CSV/API ingestion 或 Worker；完成 C0 RED、Go/OpenAPI/generated parity、受影响 G2、fresh G1 和独立 P0/P1 复核后提交 PR。
 
-`M1K-credential-problem-trace-corrective` 已合并，不再是活动轨道。后续并发只在稳定 `Consumes/Produces` 已合并且 Batch 文件所有权不重叠时启动；所有关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
+Task 10 与 Task 14 文件所有权无重叠：前者只消费当前生成契约，后者是唯一 OpenAPI/generated owner；后继不得读取对方未提交内部实现。后续并发只在稳定 `Consumes/Produces` 已合并且 Batch 文件所有权不重叠时启动；所有关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
 
 任何阶段出现 Scope/身份/计划/Runtime/策略/Kill Switch/credential 漂移、依赖不可用、Secret 风险或结果不确定时，保持在最后已验收状态并停止升级，不得用人工口头确认替代持久证据。
