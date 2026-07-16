@@ -2,7 +2,7 @@
 
 > 更新时间：2026-07-16
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前集成基线：本文件所在的最新 `origin/main`；最近完成 Batch：`M1I-typescript-toolchain-contract-corrective`（PR #73，代码提交 `690f84a`）；当前工作：`M1I-web-foundation-assets` Task 9
+> 当前集成基线：本文件所在的最新 `origin/main`；最近完成 Batch：`M1I-typescript-toolchain-contract-corrective`（PR #73，代码提交 `690f84a`）；当前并行工作：`M1I-web-foundation-assets` Task 9 与 `M1L-source-revision-contract` Task 13
 
 ## 当前结论
 
@@ -115,7 +115,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
 | 现有调查/执行内核 | 基线存在 | 以现有测试、迁移和 V3 文档为准 |
-| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J/Session C0/Credential Trace C0/TypeScript C0）/ M1I BUILDING_CLOSED / UNAVAILABLE | Session OpenAPI、Credential Problem trace 与 TypeScript 工具链 corrective 已合并；Web Task 9 从最新 main 开发中；Source mutation、Worker、前端与真实 Provider 门仍未完成 |
+| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J/Session C0/Credential Trace C0/TypeScript C0）/ M1I、M1L BUILDING_CLOSED / UNAVAILABLE | Web Task 9 与 Source Revision Task 13 在文件所有权不重叠的独立窗口并行；Worker、前端、Source HTTP/ingestion 与真实 Provider 门仍未完成 |
 | Connection 修订/验证/发布 | NOT_STARTED | 等待 Phase 2 |
 | VictoriaMetrics/Logs/Traces 全家桶 | NOT_STARTED | 等待 Phase 3 |
 | 事件/定时主动只读调查 | NOT_STARTED | 等待 Phase 4 |
@@ -136,6 +136,8 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 ## 下一步
 
 继续在从 `origin/main@690f84a` 创建的 fresh 窗口执行 `M1I-web-foundation-assets` Task 9：消费唯一 OpenAPI 的 `getBrowserConfig/getSession` 与现有 authenticated handler，使用严格 peer-compatible TypeScript `5.9.3` 工具链建立 `web/`、生成类型、OIDC/Scope application shell、共享 API/UI 和 Go same-origin SPA service。它不得重新修改 OpenAPI、Session handler、migration 或 status，也不得通过 peer 绕过、双 TypeScript 或手写 DTO 偏离已合并契约；完成 G2 后再提交 PR，并在合并后轮换后续窗口。
+
+并行执行从 `origin/main@7713e2c` 创建的 `M1L-source-revision-contract` Task 13：只拥有 Source Revision domain/repository、现有 `discoverysource` 稳定 ABI 的最小扩展和 PostgreSQL Repository 文件，不修改 migration、OpenAPI、Web、HTTP、status 或 Worker。入口若发现 `000015` 与已合并 ABI 无法支持 exact contract，必须在 clean/明确脏区边界停止并先修正权威契约；否则完成定向 C0 RED、受影响 G2 和独立 P0/P1 复核后提交 PR。
 
 `M1K-credential-problem-trace-corrective` 已合并，不再是活动轨道。后续并发只在稳定 `Consumes/Produces` 已合并且 Batch 文件所有权不重叠时启动；所有关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
 
