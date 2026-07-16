@@ -21,23 +21,26 @@ import (
 
 func TestNewKeycloakVerifierRejectsUnsafeDiscoveryConfiguration(t *testing.T) {
 	t.Parallel()
-	var exactConstructor func(context.Context, string, string) (*KeycloakVerifier, error) = NewKeycloakVerifier
+	var exactConstructor func(context.Context, string, string, string) (*KeycloakVerifier, error) = NewKeycloakVerifier
 	if exactConstructor == nil {
 		t.Fatal("NewKeycloakVerifier constructor is nil")
 	}
 
 	for _, test := range []struct {
-		issuer   string
-		clientID string
+		issuer, audience, authorizedParty string
 	}{
-		{"", "aiops-control-plane"},
-		{"http://keycloak.example.com/realms/aiops", "aiops-control-plane"},
-		{"https://user@keycloak.example.com/realms/aiops", "aiops-control-plane"},
-		{"https://keycloak.example.com/realms/aiops?secret=x", "aiops-control-plane"},
-		{"https://keycloak.example.com/realms/aiops", ""},
+		{"", "aiops-control-plane", "control-plane-web"},
+		{"http://keycloak.example.com/realms/aiops", "aiops-control-plane", "control-plane-web"},
+		{"https://user@keycloak.example.com/realms/aiops", "aiops-control-plane", "control-plane-web"},
+		{"https://keycloak.example.com/realms/aiops?unsafe=x", "aiops-control-plane", "control-plane-web"},
+		{"https://keycloak.example.com/a/../realms/aiops", "aiops-control-plane", "control-plane-web"},
+		{"https://keycloak.example.com/realms/aiops", "", "control-plane-web"},
+		{"https://keycloak.example.com/realms/aiops", "aiops-control-plane", ""},
 	} {
-		if _, err := NewKeycloakVerifier(context.Background(), test.issuer, test.clientID); err == nil {
-			t.Fatalf("NewKeycloakVerifier(%q, %q) error = nil", test.issuer, test.clientID)
+		if _, err := NewKeycloakVerifier(
+			context.Background(), test.issuer, test.audience, test.authorizedParty,
+		); err == nil {
+			t.Fatalf("NewKeycloakVerifier(%q, %q, %q) error = nil", test.issuer, test.audience, test.authorizedParty)
 		}
 	}
 }
@@ -67,14 +70,14 @@ func TestKeycloakVerifierUsesOnlyFixedTenantClaim(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	const clientID = "aiops-control-plane"
+	const clientID = testKeycloakAudience
 	oidcContext := oidc.ClientContext(context.Background(), server.Client())
 	provider, err := oidc.NewProvider(oidcContext, server.URL)
 	if err != nil {
 		t.Fatalf("discover test OIDC provider: %v", err)
 	}
 	verifier := &KeycloakVerifier{
-		clientID: clientID,
+		audience: clientID, authorizedParty: testKeycloakAuthorizedParty,
 		verifier: provider.Verifier(&oidc.Config{
 			ClientID:             clientID,
 			SupportedSigningAlgs: []string{oidc.RS256},
@@ -88,6 +91,11 @@ func TestKeycloakVerifierUsesOnlyFixedTenantClaim(t *testing.T) {
 		"tenant_id": "22222222-2222-4222-8222-222222222222", "tenant": "33333333-3333-4333-8333-333333333333",
 		"aiops_workspaces": []string{"workspace-1"}, "aiops_environments": []string{"PROD"}, "aiops_services": []string{"service-1"},
 		"realm_access": map[string]any{"roles": []string{"SRE"}},
+		"resource_access": map[string]any{
+			clientID:                         map[string]any{"roles": []string{"VIEWER"}},
+			testKeycloakAuthorizedParty:      map[string]any{"roles": []string{"ADMIN"}},
+			"unrelated-control-plane-client": map[string]any{"roles": []string{"AUDITOR"}},
+		},
 	})
 	claims, err := verifier.Verify(context.Background(), rawToken)
 	if err != nil {
@@ -95,6 +103,30 @@ func TestKeycloakVerifierUsesOnlyFixedTenantClaim(t *testing.T) {
 	}
 	if claims.TenantID != "11111111-1111-4111-8111-111111111111" {
 		t.Fatalf("Verify().TenantID = %q, want only aiops_tenant_id", claims.TenantID)
+	}
+	if !reflect.DeepEqual(claims.Roles, []string{"SRE", "VIEWER"}) {
+		t.Fatalf("Verify().Roles = %#v, want realm plus API-audience roles only", claims.Roles)
+	}
+	for name, mutate := range map[string]func(map[string]any){
+		"missing azp": func(claims map[string]any) { delete(claims, "azp") },
+		"wrong azp":   func(claims map[string]any) { claims["azp"] = "other-client" },
+		"extra aud": func(claims map[string]any) {
+			claims["aud"] = []string{clientID, "other-api"}
+		},
+		"wrong aud": func(claims map[string]any) { claims["aud"] = []string{"other-api"} },
+	} {
+		tokenClaims := map[string]any{
+			"iss": server.URL, "sub": "subject-1", "aud": []string{clientID},
+			"azp": testKeycloakAuthorizedParty,
+			"iat": now.Unix(), "exp": now.Add(time.Hour).Unix(), "auth_time": now.Add(-time.Minute).Unix(),
+			"aiops_tenant_id": "11111111-1111-4111-8111-111111111111",
+		}
+		mutate(tokenClaims)
+		candidate := signKeycloakTestTokenExact(t, privateKey, keyID, tokenClaims)
+		if verified, verifyErr := verifier.Verify(context.Background(), candidate); !errors.Is(verifyErr, ErrUnauthenticated) ||
+			!reflect.DeepEqual(verified, VerifiedClaims{}) {
+			t.Errorf("Verify(%s) = (%#v, %v), want fail closed", name, verified, verifyErr)
+		}
 	}
 	authenticator, err := NewAuthenticator(verifier, Options{MaxSessionAge: 12 * time.Hour}, func() time.Time { return now })
 	if err != nil {
@@ -176,7 +208,7 @@ func TestKeycloakVerifierUsesOnlyFixedTenantClaim(t *testing.T) {
 		"same duplicate":        `"aiops_tenant_id":"11111111-1111-4111-8111-111111111111"`,
 		"conflicting duplicate": `"aiops_tenant_id":"22222222-2222-4222-8222-222222222222"`,
 	} {
-		payload := []byte(fmt.Sprintf(`{"iss":%q,"sub":"subject-1","aud":[%q],"iat":%d,"exp":%d,"auth_time":%d,"aiops_tenant_id":"11111111-1111-4111-8111-111111111111",%s,"aiops_workspaces":[%q],"aiops_environments":["PROD"],"realm_access":{"roles":["SRE"]}}`, server.URL, clientID, now.Unix(), now.Add(time.Hour).Unix(), now.Add(-time.Minute).Unix(), duplicateTail, testKeycloakWorkspaceID))
+		payload := []byte(fmt.Sprintf(`{"iss":%q,"sub":"subject-1","aud":[%q],"azp":%q,"iat":%d,"exp":%d,"auth_time":%d,"aiops_tenant_id":"11111111-1111-4111-8111-111111111111",%s,"aiops_workspaces":[%q],"aiops_environments":["PROD"],"realm_access":{"roles":["SRE"]}}`, server.URL, clientID, testKeycloakAuthorizedParty, now.Unix(), now.Add(time.Hour).Unix(), now.Add(-time.Minute).Unix(), duplicateTail, testKeycloakWorkspaceID))
 		duplicateToken := signKeycloakTestPayload(t, privateKey, keyID, payload)
 		if claims, err := verifier.Verify(context.Background(), duplicateToken); err == nil || claims.TenantID != "" {
 			t.Errorf("Verify(%s tenant claim) = (%#v, %v), want duplicate rejection", name, claims, err)
@@ -184,9 +216,25 @@ func TestKeycloakVerifierUsesOnlyFixedTenantClaim(t *testing.T) {
 	}
 }
 
-const testKeycloakWorkspaceID = "workspace-1"
+const (
+	testKeycloakWorkspaceID     = "workspace-1"
+	testKeycloakAudience        = "aiops-control-plane"
+	testKeycloakAuthorizedParty = "control-plane-web"
+)
 
 func signKeycloakTestToken(t *testing.T, privateKey *rsa.PrivateKey, keyID string, claims map[string]any) string {
+	t.Helper()
+	cloned := make(map[string]any, len(claims)+1)
+	for key, value := range claims {
+		cloned[key] = value
+	}
+	if _, present := cloned["azp"]; !present {
+		cloned["azp"] = testKeycloakAuthorizedParty
+	}
+	return signKeycloakTestTokenExact(t, privateKey, keyID, cloned)
+}
+
+func signKeycloakTestTokenExact(t *testing.T, privateKey *rsa.PrivateKey, keyID string, claims map[string]any) string {
 	t.Helper()
 	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: jose.JSONWebKey{Key: privateKey, KeyID: keyID, Algorithm: string(jose.RS256), Use: "sig"}}, nil)
 	if err != nil {

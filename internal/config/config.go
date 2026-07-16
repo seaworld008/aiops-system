@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -36,18 +38,23 @@ type RunnerGatewayConfig struct {
 }
 
 type Config struct {
-	HTTPAddr             string
-	Environment          string
-	ShutdownTimeout      time.Duration
-	WebhookHMACSecret    string
-	WebhookHMACSecrets   map[string]string
-	DatabaseURL          string
-	OIDCIssuer           string
-	OIDCClientID         string
-	OIDCMaxSessionAge    time.Duration
-	OIDCRecentAuthWindow time.Duration
-	WriteExecutionMode   WriteExecutionMode
-	RunnerGateway        *RunnerGatewayConfig
+	HTTPAddr                     string
+	Environment                  string
+	ShutdownTimeout              time.Duration
+	WebhookHMACSecret            string
+	WebhookHMACSecrets           map[string]string
+	DatabaseURL                  string
+	OIDCIssuer                   string
+	OIDCAPIAudience              string
+	OIDCAuthorizedParty          string
+	WebOIDCURL                   string
+	WebOIDCRealm                 string
+	WebOIDCClientID              string
+	ControlPlaneCursorHMACSecret []byte
+	OIDCMaxSessionAge            time.Duration
+	OIDCRecentAuthWindow         time.Duration
+	WriteExecutionMode           WriteExecutionMode
+	RunnerGateway                *RunnerGatewayConfig
 }
 
 func Load() (Config, error) {
@@ -71,17 +78,22 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("AIOPS_ENVIRONMENT must be development, test, staging, or production")
 	}
 	cfg := Config{
-		HTTPAddr:             valueOrDefault("AIOPS_HTTP_ADDR", defaultHTTPAddr),
-		Environment:          environment,
-		ShutdownTimeout:      defaultShutdownTimeout,
-		WebhookHMACSecret:    os.Getenv("AIOPS_WEBHOOK_HMAC_SECRET"),
-		WebhookHMACSecrets:   make(map[string]string),
-		DatabaseURL:          os.Getenv("AIOPS_DATABASE_URL"),
-		OIDCIssuer:           strings.TrimSpace(os.Getenv("AIOPS_OIDC_ISSUER")),
-		OIDCClientID:         strings.TrimSpace(os.Getenv("AIOPS_OIDC_CLIENT_ID")),
-		OIDCMaxSessionAge:    12 * time.Hour,
-		OIDCRecentAuthWindow: 5 * time.Minute,
-		WriteExecutionMode:   writeExecutionMode,
+		HTTPAddr:                     valueOrDefault("AIOPS_HTTP_ADDR", defaultHTTPAddr),
+		Environment:                  environment,
+		ShutdownTimeout:              defaultShutdownTimeout,
+		WebhookHMACSecret:            os.Getenv("AIOPS_WEBHOOK_HMAC_SECRET"),
+		WebhookHMACSecrets:           make(map[string]string),
+		DatabaseURL:                  os.Getenv("AIOPS_DATABASE_URL"),
+		OIDCIssuer:                   strings.TrimSpace(os.Getenv("AIOPS_OIDC_ISSUER")),
+		OIDCAPIAudience:              strings.TrimSpace(os.Getenv("AIOPS_OIDC_API_AUDIENCE")),
+		OIDCAuthorizedParty:          strings.TrimSpace(os.Getenv("AIOPS_OIDC_AUTHORIZED_PARTY")),
+		WebOIDCURL:                   strings.TrimSpace(os.Getenv("AIOPS_WEB_OIDC_URL")),
+		WebOIDCRealm:                 strings.TrimSpace(os.Getenv("AIOPS_WEB_OIDC_REALM")),
+		WebOIDCClientID:              strings.TrimSpace(os.Getenv("AIOPS_WEB_OIDC_CLIENT_ID")),
+		ControlPlaneCursorHMACSecret: []byte(os.Getenv("AIOPS_CONTROL_PLANE_CURSOR_HMAC_SECRET")),
+		OIDCMaxSessionAge:            12 * time.Hour,
+		OIDCRecentAuthWindow:         5 * time.Minute,
+		WriteExecutionMode:           writeExecutionMode,
 	}
 	if raw := os.Getenv("AIOPS_WEBHOOK_HMAC_SECRETS_JSON"); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.WebhookHMACSecrets); err != nil {
@@ -122,8 +134,11 @@ func Load() (Config, error) {
 		}
 		cfg.OIDCRecentAuthWindow = duration
 	}
-	if (cfg.OIDCIssuer == "") != (cfg.OIDCClientID == "") {
-		return Config{}, fmt.Errorf("AIOPS_OIDC_ISSUER and AIOPS_OIDC_CLIENT_ID must be configured together")
+	if os.Getenv("AIOPS_OIDC_CLIENT_ID") != "" {
+		return Config{}, fmt.Errorf("AIOPS_OIDC_CLIENT_ID is obsolete; configure separate API audience and authorized party")
+	}
+	if err := validateControlPlaneOIDCConfig(cfg); err != nil {
+		return Config{}, err
 	}
 	runnerGateway, err := loadRunnerGatewayConfig(cfg.HTTPAddr, cfg.DatabaseURL)
 	if err != nil {
@@ -136,11 +151,112 @@ func Load() (Config, error) {
 	if cfg.Environment == "production" && cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("AIOPS_DATABASE_URL is required in production")
 	}
-	if cfg.Environment == "production" && (cfg.OIDCIssuer == "" || cfg.OIDCClientID == "") {
-		return Config{}, fmt.Errorf("AIOPS_OIDC_ISSUER and AIOPS_OIDC_CLIENT_ID are required in production")
+	if cfg.Environment == "production" && cfg.OIDCIssuer == "" {
+		return Config{}, fmt.Errorf("all six Control Plane OIDC and browser OIDC values are required in production")
 	}
 
 	return cfg, nil
+}
+
+func validateControlPlaneOIDCConfig(cfg Config) error {
+	values := []string{
+		cfg.OIDCIssuer, cfg.OIDCAPIAudience, cfg.OIDCAuthorizedParty,
+		cfg.WebOIDCURL, cfg.WebOIDCRealm, cfg.WebOIDCClientID,
+	}
+	configured := 0
+	for _, value := range values {
+		if value != "" {
+			configured++
+		}
+	}
+	if configured == 0 {
+		return nil
+	}
+	if configured != len(values) {
+		return fmt.Errorf("all six Control Plane OIDC and browser OIDC values must be configured together")
+	}
+	if !validCleanHTTPSURL(cfg.OIDCIssuer) || !validCleanHTTPSURL(cfg.WebOIDCURL) ||
+		!validOIDCIdentifier(cfg.OIDCAPIAudience) ||
+		!validOIDCIdentifier(cfg.OIDCAuthorizedParty) ||
+		!validOIDCIdentifier(cfg.WebOIDCRealm) ||
+		!validOIDCIdentifier(cfg.WebOIDCClientID) {
+		return fmt.Errorf("Control Plane OIDC and browser OIDC values are invalid")
+	}
+	if cfg.OIDCAPIAudience != "aiops-control-plane" ||
+		cfg.OIDCAuthorizedParty != "control-plane-web" ||
+		cfg.WebOIDCClientID != "control-plane-web" {
+		return fmt.Errorf("Control Plane OIDC audience and public client are fixed")
+	}
+	expectedIssuer := strings.TrimSuffix(cfg.WebOIDCURL, "/") + "/realms/" + cfg.WebOIDCRealm
+	if cfg.OIDCIssuer != expectedIssuer {
+		return fmt.Errorf("Control Plane OIDC issuer does not match browser URL and realm")
+	}
+	return nil
+}
+
+func validCleanHTTPSURL(value string) bool {
+	parsed, err := url.Parse(value)
+	return err == nil && value == strings.TrimSpace(value) && len(value) <= 2048 &&
+		parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil &&
+		parsed.Opaque == "" && parsed.RawQuery == "" && !parsed.ForceQuery &&
+		parsed.Fragment == "" && parsed.RawPath == "" && cleanURLPath(parsed.Path) &&
+		validPublicOIDCHost(parsed.Hostname()) &&
+		!containsControl(value)
+}
+
+func validPublicOIDCHost(value string) bool {
+	if value == "" || len(value) > 253 || value != strings.ToLower(value) ||
+		strings.HasSuffix(value, ".") {
+		return false
+	}
+	if address := net.ParseIP(value); address != nil {
+		return address.IsGlobalUnicast() && !address.IsPrivate() && !address.IsLoopback() &&
+			!address.IsLinkLocalUnicast() && !address.IsLinkLocalMulticast()
+	}
+	for _, suffix := range []string{
+		"localhost", ".localhost", ".local", ".internal", ".invalid", ".test", ".home.arpa",
+	} {
+		if value == strings.TrimPrefix(suffix, ".") || strings.HasSuffix(value, suffix) {
+			return false
+		}
+	}
+	labels := strings.Split(value, ".")
+	if len(labels) < 2 {
+		return false
+	}
+	for _, label := range labels {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, character := range label {
+			if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' ||
+				character == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
+}
+
+func cleanURLPath(value string) bool {
+	return value == "" || path.Clean(value) == value
+}
+
+func validOIDCIdentifier(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for index, character := range value {
+		if (character >= 'A' && character <= 'Z') ||
+			(character >= 'a' && character <= 'z') ||
+			(character >= '0' && character <= '9') ||
+			(index > 0 && (character == '.' || character == '_' || character == '-')) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func loadRunnerGatewayConfig(publicAddr, databaseURL string) (*RunnerGatewayConfig, error) {
