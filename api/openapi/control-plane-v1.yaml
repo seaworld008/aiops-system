@@ -26,6 +26,17 @@ paths:
           $ref: "#/components/responses/BrowserConfigOK"
         "503":
           $ref: "#/components/responses/Problem503"
+  /api/v1/session:
+    get:
+      tags: [Browser]
+      operationId: getSession
+      responses:
+        "200":
+          $ref: "#/components/responses/SessionOK"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "503":
+          $ref: "#/components/responses/Problem503"
   /api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets:
     parameters:
       - $ref: "#/components/parameters/WorkspaceID"
@@ -811,6 +822,21 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/BrowserConfig"
+    SessionOK:
+      description: Current authenticated browser session.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Session"
     AssetPageOK:
       description: Scoped asset page.
       headers:
@@ -1346,6 +1372,70 @@ components:
         contract_digest:
           type: string
           pattern: "^sha256:[a-f0-9]{64}$"
+    Session:
+      type: object
+      additionalProperties: false
+      required:
+        - subject
+        - username
+        - roles
+        - workspace_ids
+        - environment_ids
+        - service_ids
+        - authenticated_at
+        - expires_at
+      properties:
+        subject:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$"
+        username:
+          type: string
+          maxLength: 256
+        roles:
+          type: array
+          minItems: 1
+          maxItems: 6
+          uniqueItems: true
+          items:
+            type: string
+            enum: [VIEWER, SRE, SERVICE_OWNER, APPROVER, AUDITOR, ADMIN]
+        workspace_ids:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 256
+            pattern: "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$"
+        environment_ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 256
+            pattern: "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$"
+        service_ids:
+          type: array
+          maxItems: 5000
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 256
+            pattern: "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$"
+        authenticated_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
     PageMeta:
       type: object
       additionalProperties: false

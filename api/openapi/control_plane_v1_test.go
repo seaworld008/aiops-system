@@ -11,7 +11,7 @@ import (
 	"go.yaml.in/yaml/v3"
 )
 
-func TestControlPlaneContractHasExactAssetRoutes(t *testing.T) {
+func TestControlPlaneContractHasExactRoutes(t *testing.T) {
 	raw, document := readControlPlaneContract(t)
 	if document["openapi"] != "3.1.0" {
 		t.Fatalf("openapi = %#v, want 3.1.0", document["openapi"])
@@ -22,6 +22,7 @@ func TestControlPlaneContractHasExactAssetRoutes(t *testing.T) {
 
 	required := map[string][]string{
 		"/api/v1/browser-config": {"get"},
+		"/api/v1/session":        {"get"},
 		"/api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets": {
 			"get", "post",
 		},
@@ -91,6 +92,109 @@ func TestControlPlaneContractHasExactAssetRoutes(t *testing.T) {
 	}
 }
 
+func TestControlPlaneSessionContractMatchesAuthenticatedPrincipal(t *testing.T) {
+	_, document := readControlPlaneContract(t)
+	paths := mustMap(t, document["paths"], "#/paths")
+	sessionPath := mustMap(t, paths["/api/v1/session"], "#/paths/~1api~1v1~1session")
+	session := mustMap(t, sessionPath["get"], "#/paths/~1api~1v1~1session/get")
+
+	if got := session["operationId"]; got != "getSession" {
+		t.Fatalf("session operationId = %#v, want getSession", got)
+	}
+	assertExactStrings(t, session["tags"], []string{"Browser"}, "session tags")
+	if security, overridden := session["security"]; overridden {
+		t.Fatalf("session security override = %#v, want inherited global OIDC security", security)
+	}
+
+	responses := mustMap(t, session["responses"], "session responses")
+	wantResponses := map[string]string{
+		"200": "#/components/responses/SessionOK",
+		"401": "#/components/responses/Problem401",
+		"503": "#/components/responses/Problem503",
+	}
+	if len(responses) != len(wantResponses) {
+		t.Fatalf("session response count = %d, want %d", len(responses), len(wantResponses))
+	}
+	for status, wantReference := range wantResponses {
+		response := mustMap(t, responses[status], "session response "+status)
+		if got := response["$ref"]; got != wantReference {
+			t.Fatalf("session response %s ref = %#v, want %q", status, got, wantReference)
+		}
+	}
+
+	sessionOK := resolveControlPlaneResponse(
+		t,
+		document,
+		mustMap(t, responses["200"], "session response 200"),
+	)
+	content := mustMap(t, sessionOK["content"], "SessionOK content")
+	mediaType := mustMap(t, content["application/json"], "SessionOK application/json")
+	responseSchema := mustMap(t, mediaType["schema"], "SessionOK schema")
+	if got := responseSchema["$ref"]; got != "#/components/schemas/Session" {
+		t.Fatalf("SessionOK schema ref = %#v, want Session", got)
+	}
+
+	components := mustMap(t, document["components"], "#/components")
+	schemas := mustMap(t, components["schemas"], "#/components/schemas")
+	schema := mustMap(t, schemas["Session"], "#/components/schemas/Session")
+	if schema["type"] != "object" || schema["additionalProperties"] != false {
+		t.Fatalf("Session schema is not a closed object: %#v", schema)
+	}
+	fields := []string{
+		"subject",
+		"username",
+		"roles",
+		"workspace_ids",
+		"environment_ids",
+		"service_ids",
+		"authenticated_at",
+		"expires_at",
+	}
+	assertExactStrings(t, schema["required"], fields, "Session required")
+	properties := mustMap(t, schema["properties"], "Session properties")
+	assertExactMapKeys(t, properties, fields, "Session properties")
+
+	subject := mustMap(t, properties["subject"], "Session subject")
+	if subject["type"] != "string" || subject["minLength"] != 1 || subject["maxLength"] != 256 ||
+		subject["pattern"] != "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$" {
+		t.Fatalf("Session subject schema = %#v", subject)
+	}
+	username := mustMap(t, properties["username"], "Session username")
+	if username["type"] != "string" || username["maxLength"] != 256 {
+		t.Fatalf("Session username schema = %#v", username)
+	}
+	if minimum, present := username["minLength"]; present {
+		t.Fatalf("Session username minLength = %#v, want absent because username may be empty", minimum)
+	}
+
+	roles := mustMap(t, properties["roles"], "Session roles")
+	if roles["type"] != "array" || roles["minItems"] != 1 || roles["maxItems"] != 6 ||
+		roles["uniqueItems"] != true {
+		t.Fatalf("Session roles schema = %#v", roles)
+	}
+	roleItems := mustMap(t, roles["items"], "Session role items")
+	if roleItems["type"] != "string" {
+		t.Fatalf("Session role item type = %#v, want string", roleItems["type"])
+	}
+	assertExactStrings(
+		t,
+		roleItems["enum"],
+		[]string{"VIEWER", "SRE", "SERVICE_OWNER", "APPROVER", "AUDITOR", "ADMIN"},
+		"Session role enum",
+	)
+
+	assertSessionScopeArray(t, properties, "workspace_ids", 1, 1000)
+	assertSessionScopeArray(t, properties, "environment_ids", 1, 100)
+	assertSessionScopeArray(t, properties, "service_ids", 0, 5000)
+
+	for _, field := range []string{"authenticated_at", "expires_at"} {
+		timestamp := mustMap(t, properties[field], "Session "+field)
+		if timestamp["type"] != "string" || timestamp["format"] != "date-time" {
+			t.Fatalf("Session %s schema = %#v", field, timestamp)
+		}
+	}
+}
+
 func TestControlPlaneContractClosesObjectsAndUsesProblemResponses(t *testing.T) {
 	_, document := readControlPlaneContract(t)
 	assertControlPlaneClosedObjects(t, "#", document)
@@ -148,6 +252,14 @@ func TestControlPlaneBrowserConfigIsAnonymousAndAllOtherOperationsAreSecured(t *
 	globalSecurity, ok := document["security"].([]any)
 	if !ok || len(globalSecurity) != 1 {
 		t.Fatalf("global security = %#v", document["security"])
+	}
+	oidcSecurity := mustMap(t, globalSecurity[0], "global security requirement")
+	if len(oidcSecurity) != 1 {
+		t.Fatalf("global security requirement = %#v, want only oidc", oidcSecurity)
+	}
+	oidcScopes, ok := oidcSecurity["oidc"].([]any)
+	if !ok || len(oidcScopes) != 0 {
+		t.Fatalf("global oidc scopes = %#v, want []", oidcSecurity["oidc"])
 	}
 	paths := mustMap(t, document["paths"], "#/paths")
 	browser := mustMap(t, mustMap(t, paths["/api/v1/browser-config"], "browser path")["get"], "browser get")
@@ -271,4 +383,70 @@ func mustMap(t *testing.T, value any, path string) map[string]any {
 		t.Fatalf("%s = %#v, want object", path, value)
 	}
 	return result
+}
+
+func assertExactStrings(t *testing.T, value any, want []string, path string) {
+	t.Helper()
+	values, ok := value.([]any)
+	if !ok {
+		t.Fatalf("%s = %#v, want string array", path, value)
+	}
+	if len(values) != len(want) {
+		t.Fatalf("%s length = %d, want %d", path, len(values), len(want))
+	}
+	wantSet := make(map[string]struct{}, len(want))
+	for _, item := range want {
+		wantSet[item] = struct{}{}
+	}
+	for _, raw := range values {
+		item, ok := raw.(string)
+		if !ok {
+			t.Fatalf("%s entry = %#v, want string", path, raw)
+		}
+		if _, exists := wantSet[item]; !exists {
+			t.Fatalf("%s contains unexpected value %q", path, item)
+		}
+		delete(wantSet, item)
+	}
+	if len(wantSet) != 0 {
+		t.Fatalf("%s is missing values %#v", path, wantSet)
+	}
+}
+
+func assertExactMapKeys(t *testing.T, values map[string]any, want []string, path string) {
+	t.Helper()
+	if len(values) != len(want) {
+		t.Fatalf("%s count = %d, want %d", path, len(values), len(want))
+	}
+	for _, key := range want {
+		if _, ok := values[key]; !ok {
+			t.Fatalf("%s lacks %q", path, key)
+		}
+	}
+}
+
+func assertSessionScopeArray(
+	t *testing.T,
+	properties map[string]any,
+	field string,
+	minimum int,
+	maximum int,
+) {
+	t.Helper()
+	schema := mustMap(t, properties[field], "Session "+field)
+	if schema["type"] != "array" || schema["maxItems"] != maximum || schema["uniqueItems"] != true {
+		t.Fatalf("Session %s schema = %#v", field, schema)
+	}
+	if minimum == 0 {
+		if value, present := schema["minItems"]; present {
+			t.Fatalf("Session %s minItems = %#v, want absent", field, value)
+		}
+	} else if schema["minItems"] != minimum {
+		t.Fatalf("Session %s minItems = %#v, want %d", field, schema["minItems"], minimum)
+	}
+	items := mustMap(t, schema["items"], "Session "+field+" items")
+	if items["type"] != "string" || items["minLength"] != 1 || items["maxLength"] != 256 ||
+		items["pattern"] != "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$" {
+		t.Fatalf("Session %s item schema = %#v", field, items)
+	}
 }
