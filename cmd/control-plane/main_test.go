@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +15,58 @@ import (
 	"github.com/seaworld008/aiops-system/internal/authz"
 	"github.com/seaworld008/aiops-system/internal/httpapi"
 )
+
+func TestCombineReadinessFailsClosedAndRequiresEveryCheck(t *testing.T) {
+	t.Parallel()
+
+	expected := errors.New("web assets unavailable")
+	calls := make([]string, 0, 3)
+	ready := combineReadiness(
+		func() error {
+			calls = append(calls, "database")
+			return nil
+		},
+		func() error {
+			calls = append(calls, "web")
+			return expected
+		},
+		func() error {
+			calls = append(calls, "late")
+			return nil
+		},
+	)
+	if err := ready(); !errors.Is(err, expected) {
+		t.Fatalf("ready() error = %v, want %v", err, expected)
+	}
+	if strings.Join(calls, ",") != "database,web" {
+		t.Fatalf("readiness calls = %v", calls)
+	}
+
+	if err := combineReadiness(nil)(); err == nil {
+		t.Fatal("nil readiness check did not fail closed")
+	}
+}
+
+func TestNewOptionalWebUIKeepsDevelopmentDisabledAndConfiguredRootsFailClosed(t *testing.T) {
+	t.Parallel()
+
+	webUI, err := newOptionalWebUI("", "")
+	if err != nil || webUI != nil {
+		t.Fatalf("newOptionalWebUI(disabled) = (%#v, %v), want (nil, nil)", webUI, err)
+	}
+
+	webUI, err = newOptionalWebUI(
+		t.TempDir(),
+		"https://identity.example.com",
+	)
+	if err == nil || webUI != nil {
+		t.Fatalf(
+			"newOptionalWebUI(missing artifacts) = (%#v, %v), want closed error",
+			webUI,
+			err,
+		)
+	}
+}
 
 func TestNewAssetCatalogAssemblyFailsClosedWhenAnyDependencyIsMissing(t *testing.T) {
 	t.Parallel()

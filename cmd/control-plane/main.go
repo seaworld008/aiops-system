@@ -115,6 +115,14 @@ func run() error {
 		dependencyFailure = errors.Join(dependencyFailure, errors.New("browser configuration is unavailable"))
 	}
 
+	webUI, err := newOptionalWebUI(cfg.WebRoot, cfg.WebOIDCURL)
+	if err != nil {
+		return fmt.Errorf("initialize Web UI: %w", err)
+	}
+	if webUI != nil {
+		defer webUI.Close()
+	}
+
 	var cursorCodec *httpapi.ControlPlaneCursorCodec
 	cursorCodec, err = httpapi.NewControlPlaneCursorCodec(cfg.ControlPlaneCursorHMACSecret)
 	if err != nil {
@@ -155,7 +163,7 @@ func run() error {
 		dependencyFailure = errors.Join(dependencyFailure, errors.New("asset catalog is unavailable"))
 	}
 
-	ready := func() error {
+	dependencyReady := func() error {
 		if dependencyFailure != nil || databasePool == nil || assetAssembly.Admission == nil {
 			return errors.New("control plane dependencies are unavailable")
 		}
@@ -169,6 +177,11 @@ func run() error {
 		}
 		return nil
 	}
+	readinessChecks := []func() error{dependencyReady}
+	if webUI != nil {
+		readinessChecks = append(readinessChecks, webUI.Ready)
+	}
+	ready := combineReadiness(readinessChecks...)
 
 	publicServer := &http.Server{
 		Addr: cfg.HTTPAddr,
@@ -186,6 +199,7 @@ func run() error {
 			AssetSources:          assetAssembly.AssetSources,
 			AssetConflicts:        assetAssembly.AssetConflicts,
 			ServiceAssetBindings:  assetAssembly.ServiceAssetBindings,
+			WebUI:                 webUI,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
@@ -257,6 +271,27 @@ func run() error {
 		shutdownFailure = errors.Join(shutdownFailure, <-shutdownErrors)
 	}
 	return errors.Join(serveFailure, shutdownFailure)
+}
+
+func combineReadiness(checks ...func() error) func() error {
+	return func() error {
+		for _, check := range checks {
+			if check == nil {
+				return errors.New("readiness dependency is unavailable")
+			}
+			if err := check(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+func newOptionalWebUI(root, oidcURL string) (*httpapi.WebUI, error) {
+	if root == "" {
+		return nil, nil
+	}
+	return httpapi.NewWebUI(root, oidcURL)
 }
 
 type assetCatalogAssembly struct {

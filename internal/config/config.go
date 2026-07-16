@@ -50,6 +50,7 @@ type Config struct {
 	WebOIDCURL                   string
 	WebOIDCRealm                 string
 	WebOIDCClientID              string
+	WebRoot                      string
 	ControlPlaneCursorHMACSecret []byte
 	OIDCMaxSessionAge            time.Duration
 	OIDCRecentAuthWindow         time.Duration
@@ -90,6 +91,7 @@ func Load() (Config, error) {
 		WebOIDCURL:                   strings.TrimSpace(os.Getenv("AIOPS_WEB_OIDC_URL")),
 		WebOIDCRealm:                 strings.TrimSpace(os.Getenv("AIOPS_WEB_OIDC_REALM")),
 		WebOIDCClientID:              strings.TrimSpace(os.Getenv("AIOPS_WEB_OIDC_CLIENT_ID")),
+		WebRoot:                      os.Getenv("AIOPS_WEB_ROOT"),
 		ControlPlaneCursorHMACSecret: []byte(os.Getenv("AIOPS_CONTROL_PLANE_CURSOR_HMAC_SECRET")),
 		OIDCMaxSessionAge:            12 * time.Hour,
 		OIDCRecentAuthWindow:         5 * time.Minute,
@@ -140,6 +142,9 @@ func Load() (Config, error) {
 	if err := validateControlPlaneOIDCConfig(cfg); err != nil {
 		return Config{}, err
 	}
+	if cfg.WebRoot != "" && !validWebRoot(cfg.WebRoot) {
+		return Config{}, fmt.Errorf("AIOPS_WEB_ROOT must be a clean absolute non-root path")
+	}
 	runnerGateway, err := loadRunnerGatewayConfig(cfg.HTTPAddr, cfg.DatabaseURL)
 	if err != nil {
 		return Config{}, err
@@ -154,8 +159,18 @@ func Load() (Config, error) {
 	if cfg.Environment == "production" && cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("all six Control Plane OIDC and browser OIDC values are required in production")
 	}
+	if cfg.Environment == "production" && cfg.WebRoot != "/opt/aiops/web" {
+		return Config{}, fmt.Errorf("AIOPS_WEB_ROOT must be /opt/aiops/web in production")
+	}
 
 	return cfg, nil
+}
+
+func validWebRoot(value string) bool {
+	return value != "" && value == strings.TrimSpace(value) && len(value) <= 4096 && filepath.IsAbs(value) &&
+		filepath.Clean(value) == value &&
+		value != filepath.VolumeName(value)+string(filepath.Separator) &&
+		!containsControl(value)
 }
 
 func validateControlPlaneOIDCConfig(cfg Config) error {
