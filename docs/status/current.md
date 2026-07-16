@@ -2,7 +2,7 @@
 
 > 更新时间：2026-07-16
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前集成基线：本文件所在的最新 `origin/main`；最近完成 Batch：`Queue-PostgreSQL-lifecycle`（PR #55，代码提交 `7180993`）；当前并行 Batch：`CleanupBroker-boundary`、`Persisted-Limiter`
+> 当前集成基线：本文件所在的最新 `origin/main`；最近完成 Batch：`CleanupBroker-boundary`（PR #57，代码提交 `3a3520c`）；当前并行 Batch：`M1F-mapping-management-boundary`、`Limiter-persistence-contract-corrective`
 
 ## 当前结论
 
@@ -33,6 +33,10 @@ M1C1 已通过 PR #49 squash merge 到 `origin/main@c427a6b`：`NormalizedItem.D
 M1E 已通过 PR #53 squash merge 到 `origin/main@3f75809`：五个新文件实现 `PageCommitter`、package-private PostgreSQL projection helper 及 receipt-first 原子页提交，固定 wrong-profile-before-Seal、single-Seal、bounded serializable retry、canonical page/relation identity、locked Revision Fact/relationship-policy resolver、one-transaction closure 与安全错误 vocabulary。PR #52 先关闭 Observation ACL 契约冲突；同一独立 reviewer 发现并关闭 fingerprint collision 未 CAS `AMBIGUOUS`、bulk tombstone/restore 缺失逐资源 Audit/Outbox 两个 P1，最终无未关闭 P0/P1。真实 PostgreSQL 18.4 TLS、42501 权限矩阵、定向 race、受影响包 G2、fresh G1、边界/DLP/secret 检查均通过。Queue/Worker/Provider/生产装配继续 `NOT_STARTED/UNAVAILABLE/CLOSED`，全仓 race、真实 Provider、HA、恢复、完整安全、浏览器和发布资格仍为 deferred G3/G4。
 
 Queue PostgreSQL lifecycle 已通过 PR #55 squash merge 到 `origin/main@7180993`：四个新文件冻结完整 Queue ABI、process-local sealed `ClaimResult` 与 bounded `CleanupProof` verifier boundary，并实现 claim/reclaim、strict heartbeat、cleanup intent/delay、validation/failure finalization、checkpoint lineage rollover 和 receipt-first terminal replay。真实 PostgreSQL 18.4 TLS application 身份随机顺序状态机、定向 race、受影响回归与 fresh G1/G2 均通过；独立 reviewer 首轮发现的 rollover 跨 fresh fence exact replay P1 已用真实 RED→GREEN 关闭，最终无剩余 P0/P1。Limiter、CleanupBroker transport、Worker、Provider 和生产装配仍为 `NOT_STARTED/UNAVAILABLE/CLOSED`，双实例 HA/恢复、PostgreSQL 重启、真实 Provider、完整安全/浏览器/发布资格继续 deferred G3/G4。
+
+CleanupBroker boundary 已通过 PR #57 squash merge 到 `origin/main@3a3520c`：两个新文件提供 exact attempt 并发/响应丢失单 session、opaque attempt revoke、稳定 signed proof replay、`REVOKED|UNCERTAIN` fail-closed 语义、pointer/value serialization/logging 关闭边界，以及与 in-flight Open/Revoke/Verify 闭合的 Destroy 生命周期。规格、代码质量与独立 P0/P1 复核最终均 `APPROVE`；fresh G1、Queue/Broker G2、定向 race、Secret/import/两文件边界均通过。真实 Credential/Vault/Provider transport、Worker、生产装配、HA/恢复和 G3/G4 仍未完成，运行能力继续 `UNAVAILABLE/CLOSED`。
+
+Persisted-Limiter 前置可表达性检查已按硬门停止且没有产生代码：现有 `000015` 只有 source 级 `next_allowed_at/consecutive_failures`，缺少 Source/Workspace/Provider 三组独立 bucket 时钟、active permit/slot identity 与 response-loss-safe Release receipt；Queue lease/fence 又由 Queue 状态机独占，不能充当 Limiter 持久事实。原“不创建 migration、直接实现三个 Limiter 文件”的任务边界因此为 `BLOCKED`。受影响轨道必须先完成权威契约与 `000015` corrective 并独立复核，不得使用 advisory lock、进程内状态、Queue 字段复用或宽松降级制造绿灯。
 
 ## 当前实施进度
 
@@ -97,7 +101,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
 | 现有调查/执行内核 | 基线存在 | 以现有测试、迁移和 V3 文档为准 |
-| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue）/ CleanupBroker + Limiter BUILDING_CLOSED / UNAVAILABLE | Queue ABI/PostgreSQL lifecycle 已合并；CleanupBroker boundary 与 persisted Limiter 以不重叠文件并行实施，Source mutation、Worker、API、前端与真实 Provider 门仍未完成 |
+| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker）/ M1F + Limiter corrective BUILDING_CLOSED / UNAVAILABLE | CleanupBroker 已合并；Limiter 因 `000015` 持久事实不足先修契约，Mapping/Management 走独立文件轨道；Source mutation、Worker、API、前端与真实 Provider 门仍未完成 |
 | Connection 修订/验证/发布 | NOT_STARTED | 等待 Phase 2 |
 | VictoriaMetrics/Logs/Traces 全家桶 | NOT_STARTED | 等待 Phase 3 |
 | 事件/定时主动只读调查 | NOT_STARTED | 等待 Phase 4 |
@@ -117,11 +121,11 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 
 ## 下一步
 
-当前从 Queue 合并后的最新 `origin/main` 并行执行两个 ownership-safe Batch：
+从 CleanupBroker 合并后的最新 `origin/main` 并行执行两个 ownership-safe Batch：
 
-- `CleanupBroker-boundary` 精确拥有 `internal/discoverycleanup/broker.go` 与 `broker_test.go`，消费已合并的 opaque attempt/cleanup proof 合同，只实现 session/revocation handle 的进程内安全边界与幂等 signed proof；不接触 Queue SQL、credential resolver、Worker 或生产装配。
-- `Persisted-Limiter` 精确拥有 `internal/discoverylimit/limiter.go`、`internal/discoverylimit/postgres/limiter.go` 与 `limiter_integration_test.go`，消费 `000015` 与已合并 Queue eligibility，不创建 migration，实现 Source/Workspace/Provider 持久 slot/token/backpressure。
+- `M1F-mapping-management-boundary` 聚合 Pack 03 Tasks 5–6，精确拥有 Mapping PostgreSQL Repository、Task 2 domain/repository 的必要增量、`authn/authz` 资产权限和五个窄 Management 接口；不修改 migration、OpenAPI、Web、Limiter、Queue、CleanupBroker 或 status。
+- `Limiter-persistence-contract-corrective` 是 C0 修正轨道。它先冻结 Source/Workspace/Provider 三组独立 bucket、permit/acquire/release 幂等与崩溃恢复事实，修正已确认规范、Pack 09 Task 27 与 `000015` 权威 schema/admission；契约独立复核通过前不得创建 Limiter 生产实现。`docs/status/current.md` 仍只由主管理/集成批次更新。
 
-两个 Batch 不修改同一文件、migration、OpenAPI、生成类型、Web、status 或未合并内部实现；各自通过真实 RED/GREEN、受影响测试、G1/G2 与独立复核后分别 squash merge。Worker、Provider 和生产装配必须等其稳定 `Produces` 合并后再启动。所有关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
+两个 Batch 不修改同一文件、OpenAPI、生成类型、Web、status 或未合并内部实现。M1F 通过受影响行为测试、G1/G2 与两阶段复核后交付；Limiter corrective 按 C0 先契约后 PostgreSQL RED/GREEN，并只运行受影响 migration/admission G2。Task 28 Worker、Provider 和生产装配必须等 Limiter stable `Produces` 合并且各自前置满足后再启动。所有关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
 
 任何阶段出现 Scope/身份/计划/Runtime/策略/Kill Switch/credential 漂移、依赖不可用、Secret 风险或结果不确定时，保持在最后已验收状态并停止升级，不得用人工口头确认替代持久证据。
