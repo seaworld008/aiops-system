@@ -20,6 +20,25 @@
 
 本包最多产生 `BUILT_CLOSED`。Queue lifecycle、cleanup、limiter、Worker、Provider、生产装配、HA/恢复和运行能力均不在本包，继续 `NOT_STARTED/UNAVAILABLE/CLOSED`。
 
+## C0 prerequisite — Observation immutable-prior ACL corrective
+
+M1E 实现前必须先合并本节独立 C0 corrective。`000015` 的 `SECURITY INVOKER enforce_asset_observation_admission()` 继续先对 current Asset 执行 `FOR UPDATE`，由该行锁序列化同一资产的 Observation 投影；随后对 append-only prior Observation 的 exact identity/chain/freshness 复验必须是同一 `SERIALIZABLE` snapshot 内的普通 immutable read，不得获取物理 row lock。Application runtime 对 `asset_observations` 仍只有 `SELECT, INSERT`，不得扩 `UPDATE` ACL、改为 `SECURITY DEFINER`、关闭 immutable guard 或放宽任一 transaction closure。
+
+该 corrective 恰好拥有以下四个文件，与下节 M1E 五文件实现边界分离：
+
+1. `migrations/000015_assets_catalog.up.sql`
+2. `internal/assetcatalog/postgres/migration_observation_acl_corrective_integration_test.go`
+3. `internal/assetcatalog/postgres/schema_admission.go`，仅更新从 PostgreSQL 18.4 真实 manifest 复核所得 SHA-256
+4. 本任务包
+
+C0 corrective evidence：
+
+- [x] RED：真实 PostgreSQL 18.4 application runtime 普通读取 prior Observation 成功、无 `UPDATE` 权限、显式 `SELECT ... FOR SHARE` 稳定返回 `42501`，合法 later Observation 经触发器同样因内部 row lock 返回 `42501`。
+- [x] GREEN：仅移除 prior Observation 查询的物理 row lock；合法 later Observation、tombstone 与 restore 成功，previous-chain/freshness regression、伪 prior、并发 current Asset lock 与 fence drift 继续 fail closed。
+- [x] ACL/immutable closure：普通 `SELECT` 仍成功；显式 `FOR SHARE`、`UPDATE`、`DELETE`、`TRUNCATE` 均以 runtime 身份返回 `42501`，失败前后 Observation count 与 Asset projection 不变。
+- [x] SchemaAdmission：以生产等价只读 `REPEATABLE READ` transaction、固定 `search_path` 和 `quote_all_identifiers` 从真实 catalog manifest 双次重算唯一 SHA-256；旧摘要先关闭 admission，新摘要再通过。
+- [x] 已完成 000015 up/down/up、受影响 PostgreSQL tests、G1/G2 与独立 P0/P1 reviewer；以精确四文件 clean commit 交接，G3/G4 仍 deferred，系统保持 `RUNTIME_CLOSED/UNAVAILABLE`。
+
 ## Exact file ownership
 
 M1E 恰好新增以下五个文件，不得修改 migration、既有 Repository、M1C/M1D 文件、Queue、cleanup、limiter、Worker、Provider、OpenAPI、Web 或 status：
