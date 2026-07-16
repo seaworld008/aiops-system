@@ -2,7 +2,7 @@
 
 > 更新时间：2026-07-16
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前集成基线：本文件所在的最新 `origin/main`；最近完成 Batch：`CleanupBroker-boundary`（PR #57，代码提交 `3a3520c`）；当前并行 Batch：`M1F-mapping-management-boundary`、`Limiter-persistence-contract-corrective`
+> 当前集成基线：本文件所在的最新 `origin/main`；最近完成 Batch：`M1F-mapping-management-boundary`（PR #60，代码提交 `1a8e777`）；当前 Batch：`M1G-control-plane-api-boundary`
 
 ## 当前结论
 
@@ -36,14 +36,16 @@ Queue PostgreSQL lifecycle 已通过 PR #55 squash merge 到 `origin/main@718099
 
 CleanupBroker boundary 已通过 PR #57 squash merge 到 `origin/main@3a3520c`：两个新文件提供 exact attempt 并发/响应丢失单 session、opaque attempt revoke、稳定 signed proof replay、`REVOKED|UNCERTAIN` fail-closed 语义、pointer/value serialization/logging 关闭边界，以及与 in-flight Open/Revoke/Verify 闭合的 Destroy 生命周期。规格、代码质量与独立 P0/P1 复核最终均 `APPROVE`；fresh G1、Queue/Broker G2、定向 race、Secret/import/两文件边界均通过。真实 Credential/Vault/Provider transport、Worker、生产装配、HA/恢复和 G3/G4 仍未完成，运行能力继续 `UNAVAILABLE/CLOSED`。
 
-Persisted-Limiter 前置可表达性检查已按硬门停止且没有产生代码：现有 `000015` 只有 source 级 `next_allowed_at/consecutive_failures`，缺少 Source/Workspace/Provider 三组独立 bucket 时钟、active permit/slot identity 与 response-loss-safe Release receipt；Queue lease/fence 又由 Queue 状态机独占，不能充当 Limiter 持久事实。原“不创建 migration、直接实现三个 Limiter 文件”的任务边界因此为 `BLOCKED`。受影响轨道必须先完成权威契约与 `000015` corrective 并独立复核，不得使用 advisory lock、进程内状态、Queue 字段复用或宽松降级制造绿灯。
+Limiter persistence C0 corrective 已通过 PR #59 squash merge 到 `origin/main@034d4e3`：`000015` 现在拥有 `asset_source_limit_buckets` 与 append-only `asset_source_limit_permits`，精确表达 Source/Workspace/Provider 三组 bucket、ACQUIRE/RELEASE/DELAY/EXPIRE receipt、响应丢失 replay、CAS、down 拆环和恢复语义；同批加入 runtime-only `SECURITY DEFINER asset_catalog_lock_exact_service_binding(...)` 及精确 ACL/admission。真实 PostgreSQL 18.4 TLS、定向 race、双实例恢复、两路独立复核、fresh G1/G2 均通过。该 corrective 只解除后继 Limiter/M1F 的持久契约阻塞，没有实现 Limiter Go runtime，运行能力继续 `UNAVAILABLE/CLOSED`。
+
+M1F Mapping/Management 已通过 PR #60 squash merge 到 `origin/main@1a8e777`：九个精确文件实现 Task 5–6 的 `MappingRepository`、复合 `ResolveConflictScope`、关系/冲突/Binding 安全查询、serializable CAS/固定锁序/持久 receipt/Audit/Outbox 原子闭包、VIEWER 与 `ASSET_*` 权限，以及五个窄 Management 接口。C0 RED 覆盖跨 Tenant、缺 exact Environment binding、复合 Scope 重载、非 EXACT 和错误 If-Match；真实 PostgreSQL Mapping integration/race、受影响 unit/race、fresh G1/G2、代码地图和独立复核均通过，最终 P0/P1 为 0。OpenAPI、HTTP、Web、Source mutation、Worker、Provider 和生产装配仍未完成。
 
 ## 当前实施进度
 
 Phase 1 Task 1 首轮 Red → Green → 独立安全复核结果仍是有效证据，范围严格限于生产资产目录的数据库基础：
 
-- `000015` corrective 契约固定只拥有十张 Asset Catalog 表；新增的 `asset_source_revision_authorities` 是 Source Revision 的不可变权限 Environment 成员事实，其余九张保持首轮所有权。十表共同包含完整 Scope FK、不可变历史、Source Revision/Run/lease/fence/checkpoint、Observation/Relationship freshness domain、receipt/terminal closure、受保护 down 和生产 schema admission manifest。
-- 首轮 schema admission 固定受审 PostgreSQL 18.4 catalog 摘要；corrective Up 已实现精确 35 个函数与 39 个触发器。逐签名 owner/ACL、deparse GUC、definition digest、直接 `pg_depend`、跨 locale C 排序、恢复后指纹与双实例恢复已通过 Steps 4–5 真库/race/独立复核。
+- `000015` corrective 契约固定拥有十二张 Asset Catalog 表；除 Source/Revision/authority/Run/Observation/Asset/Type Detail/Conflict/Relationship/Binding 外，新增独立 Limiter bucket 与 permit/receipt truth。十二表共同包含完整 Scope FK、不可变历史、Source Revision/Run/lease/fence/checkpoint、Limiter CAS/replay、Observation/Relationship freshness domain、receipt/terminal closure、受保护 down 和生产 schema admission manifest。
+- schema admission 固定受审 PostgreSQL 18.4 catalog 摘要；corrective Up 已实现精确 36 个函数与 45 个触发器。逐签名 owner/ACL、deparse GUC、definition digest、直接 `pg_depend`、跨 locale C 排序、恢复后指纹与双实例恢复已通过真库/race/独立复核。
 - 真实 PostgreSQL 18.4 TLS 普通、race、在线兼容、双实例 dump/restore、恢复后 admission 与零 Skip 门均通过；full migration runner 和 Asset harness 只接受项目专用 `aiops_test` 控制库命名族，在其中创建 128 位随机物理数据库，并只清理已确认创建的数据库，不破坏共享 `public`。
 - 首轮 `make test-integration` 六个 PostgreSQL 包和 `go test ./... -count=1` 全绿；当时的独立安全与 Task 1 验收审计均无未关闭 P1/P2/P3。
 
@@ -101,7 +103,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
 | 现有调查/执行内核 | 基线存在 | 以现有测试、迁移和 V3 文档为准 |
-| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker）/ M1F + Limiter corrective BUILDING_CLOSED / UNAVAILABLE | CleanupBroker 已合并；Limiter 因 `000015` 持久事实不足先修契约，Mapping/Management 走独立文件轨道；Source mutation、Worker、API、前端与真实 Provider 门仍未完成 |
+| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F）/ M1G BUILDING_CLOSED / UNAVAILABLE | Limiter 持久契约与 Mapping/Management 已合并；Limiter Go runtime、OpenAPI/HTTP、Source mutation、Worker、前端与真实 Provider 门仍未完成 |
 | Connection 修订/验证/发布 | NOT_STARTED | 等待 Phase 2 |
 | VictoriaMetrics/Logs/Traces 全家桶 | NOT_STARTED | 等待 Phase 3 |
 | 事件/定时主动只读调查 | NOT_STARTED | 等待 Phase 4 |
@@ -121,11 +123,8 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 
 ## 下一步
 
-从 CleanupBroker 合并后的最新 `origin/main` 并行执行两个 ownership-safe Batch：
+从 M1F 合并后的最新 `origin/main` 执行 `M1G-control-plane-api-boundary`，聚合 Pack 03 Tasks 7–8：由同一 Contract owner 精确维护唯一 OpenAPI、Browser Config/OIDC 安全原语、资产/来源/关系/冲突/Binding HTTP handlers、RFC 9457、ETag/Idempotency 与 Control Plane 装配；只消费已合并的五个 Management `Produces`，不得重新定义 DTO 或读取其他任务未提交实现。
 
-- `M1F-mapping-management-boundary` 聚合 Pack 03 Tasks 5–6，精确拥有 Mapping PostgreSQL Repository、Task 2 domain/repository 的必要增量、`authn/authz` 资产权限和五个窄 Management 接口；不修改 migration、OpenAPI、Web、Limiter、Queue、CleanupBroker 或 status。
-- `Limiter-persistence-contract-corrective` 是 C0 修正轨道。它先冻结 Source/Workspace/Provider 三组独立 bucket、permit/acquire/release 幂等与崩溃恢复事实，修正已确认规范、Pack 09 Task 27 与 `000015` 权威 schema/admission；契约独立复核通过前不得创建 Limiter 生产实现。`docs/status/current.md` 仍只由主管理/集成批次更新。
-
-两个 Batch 不修改同一文件、OpenAPI、生成类型、Web、status 或未合并内部实现。M1F 通过受影响行为测试、G1/G2 与两阶段复核后交付；Limiter corrective 按 C0 先契约后 PostgreSQL RED/GREEN，并只运行受影响 migration/admission G2。Task 28 Worker、Provider 和生产装配必须等 Limiter stable `Produces` 合并且各自前置满足后再启动。所有关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
+M1G 的 OpenAPI 与生成类型所有权保持单一，Web 轨道必须等待该公共契约合并后再开始。Limiter Go runtime/Task 28 Worker 可在独立文件所有权明确且只消费 PR #59 stable persistence contract 时另行排期，但不得与 M1G 修改同一 migration、OpenAPI、生成类型、status 或 Control Plane 装配文件。所有关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
 
 任何阶段出现 Scope/身份/计划/Runtime/策略/Kill Switch/credential 漂移、依赖不可用、Secret 风险或结果不确定时，保持在最后已验收状态并停止升级，不得用人工口头确认替代持久证据。
