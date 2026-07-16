@@ -2,7 +2,7 @@
 
 > 更新时间：2026-07-16
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前集成基线：本文件所在的最新 `origin/main`；最近完成 Batch：`M1J-assetcatalog-unavailable-corrective`（PR #66，代码提交 `192ca04`）；当前工作：`M1I-session-openapi-corrective-v2`
+> 当前集成基线：本文件所在的最新 `origin/main`；最近完成 Batch：`M1I-session-openapi-corrective-v2`（PR #68，代码提交 `c6ed29f`）；当前并行工作：`M1I-web-foundation-assets` Task 9 与 `M1K-credential-problem-trace-corrective`
 
 ## 当前结论
 
@@ -45,6 +45,8 @@ M1G Control Plane API 已通过 PR #62 squash merge 到 `origin/main@39053fb`：
 M1H Discovery Limiter Runtime 已通过 PR #64 squash merge 到 `origin/main@2f05686`：三个新文件提供关闭态 `Limiter.Acquire/Release/Delay` ABI 与 PostgreSQL runtime，固定 exact Scope/Source/Run/Provider、`SOURCE→WORKSPACE→PROVIDER` 锁序、单个 `SERIALIZABLE READ WRITE` transaction、bucket CAS、append-only permit/terminal ledger、响应丢失 replay、过期 `EXPIRE` 恢复、Run lease/admission 重验和 exact installed Profile 验证。真实 PostgreSQL 18.4 TLS、定向 race、scoped G2、fresh G1、Secret/三文件边界和代码地图均通过；独立复核发现的 fresh Acquire admission 重验与 installed Profile parity 两项 P1 已关闭，最终无剩余 P0/P1。GitHub 快速 `go` 1 分钟通过。Worker、Provider、生产装配及 G3/G4 仍未完成，运行能力继续 `UNAVAILABLE/CLOSED`。
 
 M1J Asset Catalog Unavailable C0 已通过 PR #66 squash merge 到 `origin/main@192ca04`：六个精确文件新增脱敏 `assetcatalog.ErrUnavailable`，只把明确连接、pool 和 PostgreSQL 系统可用性故障映射为 `503 asset_catalog_unavailable`；既有语义冲突继续 `409`，未知 SQLSTATE 或程序错误继续脱敏 `500`，不泄漏 SQLSTATE、数据库文本、DSN 或 endpoint。独立复核发现普通 `BeginTx` 错误被过宽归类为 503 的一个 P1，已以第二轮 RED→GREEN 修复；受影响 unit/race、scoped G2、fresh G1、Secret/六文件边界、代码地图及 GitHub 快速 `go` 48 秒均通过，最终 P0/P1 为 0。
+
+M1I Session OpenAPI C0 已通过 PR #68 squash merge 到 `origin/main@c6ed29f`：四个精确文件为现有 authenticated `GET /api/v1/session` 发布唯一 `getSession` operation、全局 OIDC、`200/401/503` responses 与八字段 closed `Session` schema，并同步 exact path-count 和 hard-coded contract digest。可信 RED 证明缺 path、path count `13→14` 和旧 digest 漂移；受影响 OpenAPI/HTTP、fresh G1、Secret/四文件边界、commit-bound 代码地图及 GitHub 快速 `go` 1 分钟均通过，独立复核 P0/P1 为 0。该契约解除 Web Task 9 的 generated Session/Scope 入口阻塞，不表示浏览器能力已经实现或可用。
 
 ## 当前实施进度
 
@@ -109,7 +111,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
 | 现有调查/执行内核 | 基线存在 | 以现有测试、迁移和 V3 文档为准 |
-| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J）/ M1I BUILDING_CLOSED / UNAVAILABLE | Limiter runtime 与 Asset Catalog unavailable C0 已合并；Session OpenAPI C0 正在关闭，Web Task 9 等待唯一 Session 契约后恢复；Source mutation、Worker、前端与真实 Provider 门仍未完成 |
+| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J/Session C0）/ M1I、M1K BUILDING_CLOSED / UNAVAILABLE | Session OpenAPI 已合并，Web Task 9 从最新 main 恢复；Credential Problem trace C0 并行关闭；Source mutation、Worker、前端与真实 Provider 门仍未完成 |
 | Connection 修订/验证/发布 | NOT_STARTED | 等待 Phase 2 |
 | VictoriaMetrics/Logs/Traces 全家桶 | NOT_STARTED | 等待 Phase 3 |
 | 事件/定时主动只读调查 | NOT_STARTED | 等待 Phase 4 |
@@ -129,8 +131,8 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 
 ## 下一步
 
-从最新 `origin/main` 推进 `M1I-session-openapi-corrective-v2`：前序 clean 任务确认现有 authenticated `GET /api/v1/session` handler 与规范一致，但任何唯一 OpenAPI 内容变更都必须同步 exact path-count 测试和 hard-coded contract digest。v2 因此只拥有 `api/openapi/control-plane-v1.yaml`、`api/openapi/control_plane_v1_test.go`、`internal/httpapi/control_plane_contract.go`、`internal/httpapi/control_plane_contract_test.go` 四个文件，补齐 `getSession` operation、closed Session schema 与 digest，不修改 handler、Web、migration 或 status。
+从包含 PR #68 的最新 `origin/main` 新窗口恢复 `M1I-web-foundation-assets` Task 9：消费唯一 OpenAPI 的 `getBrowserConfig/getSession` 与现有 authenticated handler，建立 `web/` 工具链、生成类型、OIDC/Scope application shell、共享 API/UI 和 Go same-origin SPA service。它不得重新修改 OpenAPI 或 Session handler。
 
-`M1I-web-foundation-assets` 已在 pre-RED 发现 Task 9 要求 generated client 消费 `/api/v1/session`，但 PR #62 的唯一 OpenAPI 尚未登记该 path；因此 worktree 保持 clean 并暂停，不采用手写 Session DTO、字符串路径或绕过 Scope 校验。Session corrective 合并后，M1I 必须从最新 `origin/main` 新窗口恢复。旧 credential Problem `trace_id` 仍由后继独立 C0 关闭。所有关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
+`M1K-credential-problem-trace-corrective` 只拥有 `internal/httpapi/credential_revocations.go` 与对应测试，把所有 Credential Revocation 4xx/5xx Problem 迁移到已有 request-aware trace 投影；不得修改共享 Problem、OpenAPI、Router、Web 或 status。所有关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
 
 任何阶段出现 Scope/身份/计划/Runtime/策略/Kill Switch/credential 漂移、依赖不可用、Secret 风险或结果不确定时，保持在最后已验收状态并停止升级，不得用人工口头确认替代持久证据。
