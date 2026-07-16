@@ -49,7 +49,7 @@
 | 迁移 | `000015_assets_catalog` |
 | 表归属 | `asset_sources`、`asset_source_revisions`、`asset_source_revision_authorities`、`asset_source_runs`、`asset_source_limit_buckets`、`asset_source_limit_permits`、`asset_observations`、`assets`、`asset_type_details`、`asset_conflicts`、`asset_relationships`、`service_asset_bindings` |
 | 去重键 | `(tenant_id,workspace_id,source_id,provider_kind,external_id)` |
-| 前端 | `web/`；Node 24、pnpm 10.34.0、React 19.2.7、TypeScript 7.0.2、Vite 8.1.4、TanStack Router/Query/Table、RHF/Zod、Radix、lucide-react、CSS Modules |
+| 前端 | `web/`；Node 24、pnpm 10.34.0、React 19.2.7、TypeScript 5.9.3、Vite 8.1.4、TanStack Router/Query/Table、RHF/Zod、Radix、lucide-react、CSS Modules |
 | OIDC | Keycloak Server 26.6.3；`keycloak-js` 26.2.4；Browser client `control-plane-web`、API audience `aiops-control-plane`；Authorization Code + PKCE、`login-required`、Token 仅内存 |
 | Browser Config | 匿名 `GET /api/v1/browser-config`；closed schema + `no-store`；只含公开 OIDC、API base path 和 build metadata；缺失/畸形 fail closed |
 | 契约 | `api/openapi/control-plane-v1.yaml` → `web/src/shared/api/schema.d.ts`；仅 `shared/api` 发网络请求并使用 generated `paths/operations` |

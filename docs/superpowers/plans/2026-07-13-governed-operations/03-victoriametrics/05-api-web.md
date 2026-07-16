@@ -6,7 +6,7 @@
 
 **Architecture:** 后端从统一 Asset/Connection/Compatibility/Runtime 仓储组装一个显式 allowlist projection，OpenAPI 是浏览器唯一契约。前端复用 `/assets`、`/assets/$assetId`、`/connections`、`/connections/new`、`/capabilities`；`/connections/new` 只创建 server `DRAFT` 并 replace 到 canonical ID/revision route。generated TypeScript、TanStack Query 与 URL 状态构建生态保存视图；Topology、Compatibility、Capability Matrix 共享同一版本化 read model，不请求私有 Target artifact。
 
-**Tech Stack:** Go 1.26.5、OpenAPI 3.1、现有 `internal/httpapi`/authn/authz、Node >=24 <25、pnpm 10.34.0、React 19.2.7、Vite 8.1.4、TypeScript 7.0.2、TanStack Router 1.170.17、TanStack Query 5.101.2、TanStack Table 8.21.3、React Hook Form 7.81.0、Zod 4.4.3、Radix UI 1.6.2、lucide-react 1.24.0、Vitest 4.1.10、Testing Library 16.3.2、MSW 2.15.0、Playwright、axe-core。
+**Tech Stack:** Go 1.26.5、OpenAPI 3.1、现有 `internal/httpapi`/authn/authz、Node >=24 <25、pnpm 10.34.0、React 19.2.7、Vite 8.1.4、TypeScript 5.9.3、TanStack Router 1.170.17、TanStack Query 5.101.2、TanStack Table 8.21.3、React Hook Form 7.81.0、Zod 4.4.3、Radix UI 1.6.2、lucide-react 1.24.0、Vitest 4.1.10、Testing Library 16.3.2、MSW 2.15.0、Playwright、axe-core。
 
 ## Global Constraints
 

@@ -6,7 +6,7 @@
 
 **Architecture:** 应用服务从 Asset/Connection/Target/Capability/Runtime/Snapshot/Grant/Receipt 投影安全 DTO，并以服务端授权与对象状态计算 `effective_actions`。OpenAPI 是唯一契约，HTTP 严格解析并调用 Phase 4 TriggerStarter；React 只使用生成类型、URL 状态与 Query cache，固定表单由 discriminated schema 显式组件实现，不动态解释任意 JSON Schema。
 
-**Tech Stack:** Go 1.26.5、go-chi/v5、OIDC/Keycloak Server 26.6.3、浏览器 `keycloak-js` 26.2.4、现有 authn/authz、OpenAPI 3.1、RFC 9457；Node >=24 <25、pnpm 10.34.0、React 19.2.7、TypeScript 7.0.2、Vite 8.1.4、TanStack Router/Query/Table、React Hook Form、Zod、Radix UI、`lucide-react` 1.24.0、CSS Modules、Vitest、Testing Library、MSW。
+**Tech Stack:** Go 1.26.5、go-chi/v5、OIDC/Keycloak Server 26.6.3、浏览器 `keycloak-js` 26.2.4、现有 authn/authz、OpenAPI 3.1、RFC 9457；Node >=24 <25、pnpm 10.34.0、React 19.2.7、TypeScript 5.9.3、Vite 8.1.4、TanStack Router/Query/Table、React Hook Form、Zod、Radix UI、`lucide-react` 1.24.0、CSS Modules、Vitest、Testing Library、MSW。
 
 ## Global Constraints
 

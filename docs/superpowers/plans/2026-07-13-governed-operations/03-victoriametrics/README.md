@@ -6,7 +6,7 @@
 
 **Architecture:** Operator 发现层只产生安全投影并复用统一资产目录；连接契约在服务端固定租户路由、Target/Connector/Evidence/Executor 版本闭包；独立只读执行器只实现明确列出的查询端点，并在证据进入控制平面前执行 schema、预算与 DLP 校验。旧 runtime bundle N 与新 bundle N+1 同时可运行，兼容性不明确时关闭能力而不阻止资产可见。
 
-**Tech Stack:** Go 1.26.5、PostgreSQL 18.4+、Kubernetes client-go v0.36.2、VictoriaMetrics Operator v0.73.1、VictoriaMetrics v1.147.0、VictoriaLogs v1.51.0、VictoriaTraces v0.9.4、React 19.2.7、TypeScript 7.0.2、TanStack Query、Vitest、MSW、Playwright、axe-core、Prometheus/OpenTelemetry。
+**Tech Stack:** Go 1.26.5、PostgreSQL 18.4+、Kubernetes client-go v0.36.2、VictoriaMetrics Operator v0.73.1、VictoriaMetrics v1.147.0、VictoriaLogs v1.51.0、VictoriaTraces v0.9.4、React 19.2.7、TypeScript 5.9.3、TanStack Query、Vitest、MSW、Playwright、axe-core、Prometheus/OpenTelemetry。
 
 ## Global Constraints
 

@@ -6,7 +6,7 @@
 
 **Architecture:** 既有 package 05 OpenAPI/HTTP 路由与 package 06 generated client 是唯一契约，本包只加固并扩展它们，不创建平行 API、DTO 或身份源。PostgreSQL Reader 生成低敏安全投影；公共 HTTP 使用真实 OIDC/authz、scope/filter-bound HMAC cursor、ETag、Idempotency-Key 和 `effective_actions`；前端使用 TanStack Router URL state、TanStack Query server state、现有 AppShell/Token 与真实 Keycloak session。Realm capability binding 在本阶段只读，不能从浏览器创建、编辑、提升或绕过发布门。
 
-**Tech Stack:** Go 1.26.5、PostgreSQL 18.4+、OpenAPI 3.1、Node 24、pnpm 10.34.0、React 19.2.7、TypeScript 7.0.2、TanStack Router 1.170.17、TanStack Query 5.101.2、TanStack Table 8.21.3、Zod 4.4.3、radix-ui 1.6.2、lucide-react 1.24.0、CSS Variables/CSS Modules、Keycloak Server 26.6.3、keycloak-js 26.2.4、Playwright 1.61.1、@axe-core/playwright 4.12.1。
+**Tech Stack:** Go 1.26.5、PostgreSQL 18.4+、OpenAPI 3.1、Node 24、pnpm 10.34.0、React 19.2.7、TypeScript 5.9.3、TanStack Router 1.170.17、TanStack Query 5.101.2、TanStack Table 8.21.3、Zod 4.4.3、radix-ui 1.6.2、lucide-react 1.24.0、CSS Variables/CSS Modules、Keycloak Server 26.6.3、keycloak-js 26.2.4、Playwright 1.61.1、@axe-core/playwright 4.12.1。
 
 ## Global Constraints
 

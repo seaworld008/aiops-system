@@ -6,7 +6,7 @@
 
 **Architecture:** 公共 API 扩展 Phase 2 workspace 级 Connection 路由，所有请求显式绑定 required `environment_id`；创建草稿和 N+1 修订由服务器分配身份并返回 canonical `Location/ETag`。前端只消费生成类型和安全引用，第一次持久化后立即从临时 `/connections/new` 跳转 canonical Revision 路由。E2E 使用真实 Keycloak Server 26.6.3、PostgreSQL、mTLS Validation Gateway/Runner、Host Probe、AWX 和 PostgreSQL，公共浏览器链与 Runner 私有协议不混用。
 
-**Tech Stack:** OpenAPI 3.1、Go 1.26.5、chi v5、Keycloak Server 26.6.3、浏览器 `keycloak-js` 26.2.4/OIDC、PostgreSQL 18.4+、Node 24、pnpm 10.34.0、React 19.2.7、TypeScript 7.0.2、Vite 8.1.4、TanStack Router/Query、React Hook Form、Zod、`lucide-react` 1.24.0、CSS Modules、Vitest、MSW（测试）、Playwright 1.61.1、axe 4.12.1、Docker Compose。
+**Tech Stack:** OpenAPI 3.1、Go 1.26.5、chi v5、Keycloak Server 26.6.3、浏览器 `keycloak-js` 26.2.4/OIDC、PostgreSQL 18.4+、Node 24、pnpm 10.34.0、React 19.2.7、TypeScript 5.9.3、Vite 8.1.4、TanStack Router/Query、React Hook Form、Zod、`lucide-react` 1.24.0、CSS Modules、Vitest、MSW（测试）、Playwright 1.61.1、axe 4.12.1、Docker Compose。
 
 ## Global Constraints
 

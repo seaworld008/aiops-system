@@ -6,7 +6,7 @@
 
 **Architecture:** `asset_sources` 只保存稳定身份、已发布修订指针、checkpoint 和 gate；`asset_source_revisions` 保存 server-canonical、content-addressed、发布后不可变的安全配置。CSV 与 API 先通过来源专属 parser/schema、身份、签名、DLP 和限额，再产生相同的 fenced `assetdiscovery.Batch`；浏览器和调用方都不能提交 endpoint、Secret、任意 Header/Body 或原始 Provider 配置。
 
-**Tech Stack:** Go 1.26.5、PostgreSQL 18.4、pgx v5、OpenAPI 3.1、chi v5、mTLS/JWS SHA-256、RFC 4180 CSV、React 19.2.7、TypeScript 7.0.2、Playwright 1.61.1。
+**Tech Stack:** Go 1.26.5、PostgreSQL 18.4、pgx v5、OpenAPI 3.1、chi v5、mTLS/JWS SHA-256、RFC 4180 CSV、React 19.2.7、TypeScript 5.9.3、Playwright 1.61.1。
 
 ## Global Constraints
 

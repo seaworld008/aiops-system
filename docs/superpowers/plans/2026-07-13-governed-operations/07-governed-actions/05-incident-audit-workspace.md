@@ -6,7 +6,7 @@
 
 **Architecture:** PostgreSQL read model 是唯一事实源；OpenAPI 暴露低敏、Scope 强绑定的查询契约，浏览器只消费 generated types。Incident 页是后续 Governed Action 页的上游工作台；Audit 页独立展示 actor、decision、resource、digest 与链完整性，不提供原始凭据、Provider 响应或任意查询入口。
 
-**Tech Stack:** Go 1.26.5、chi v5、PostgreSQL 18.4、OpenAPI 3.1、React 19.2.7、TypeScript 7.0.2、Vite 8.1.4、TanStack Router/Query/Table、Radix UI、Lucide、CSS Modules、Vitest、MSW、Playwright、axe。
+**Tech Stack:** Go 1.26.5、chi v5、PostgreSQL 18.4、OpenAPI 3.1、React 19.2.7、TypeScript 5.9.3、Vite 8.1.4、TanStack Router/Query/Table、Radix UI、Lucide、CSS Modules、Vitest、MSW、Playwright、axe。
 
 ## Global Constraints
 

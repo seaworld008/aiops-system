@@ -6,7 +6,7 @@
 
 **Architecture:** PostgreSQL read model 在 Tenant/Workspace/Environment 复合 Scope 内聚合 Investigation、Incident、Grant、Evidence 与 ActionProposal 的安全投影，并把主动策略、Kill Switch、ActionProposal Catalog 与 READ Admission 映射为可扩展 Policy Hub 条目；公共 API 仅提供 Cursor 分页只读查询。React 通过 TanStack Router/Query/Table 把 Scope、筛选、排序、分页、选中对象和 Tab 写入 URL，真实 OIDC Authorization Code + PKCE 决定会话，按钮只消费响应中的 `effective_actions`。
 
-**Tech Stack:** Go 1.26.5、PostgreSQL 18.4+、pgx/v5、go-chi/v5、OpenAPI 3.1、RFC 9457；Node >=24 <25、pnpm 10.34.0、React 19.2.7、Vite 8.1.4、TypeScript 7.0.2、TanStack Router 1.170.17、Query 5.101.2、Table 8.21.3、Zod 4.4.3、Radix UI 1.6.2、lucide-react 1.24.0、CSS Modules、Keycloak Server 26.6.3、keycloak-js 26.2.4、Vitest 4.1.10、Testing Library 16.3.2、MSW 2.15.0、Playwright 1.61.1、@axe-core/playwright 4.12.1。
+**Tech Stack:** Go 1.26.5、PostgreSQL 18.4+、pgx/v5、go-chi/v5、OpenAPI 3.1、RFC 9457；Node >=24 <25、pnpm 10.34.0、React 19.2.7、Vite 8.1.4、TypeScript 5.9.3、TanStack Router 1.170.17、Query 5.101.2、Table 8.21.3、Zod 4.4.3、Radix UI 1.6.2、lucide-react 1.24.0、CSS Modules、Keycloak Server 26.6.3、keycloak-js 26.2.4、Vitest 4.1.10、Testing Library 16.3.2、MSW 2.15.0、Playwright 1.61.1、@axe-core/playwright 4.12.1。
 
 ## Global Constraints
 

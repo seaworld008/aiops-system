@@ -6,7 +6,7 @@
 
 **Architecture:** OpenAPI 生成类型是唯一前端契约；Connection adapter 只通过 Phase 1 `web/src/shared/api` 的 method/path/operation 类型化 transport 访问同源 API，并复用 `web/src/shared/operations` 的 Operation 投影与轮询 Hook。TanStack Router 保存 Scope/filter/selection/wizard/Operation URL 状态，TanStack Query 保存 server state；React Hook Form + Zod 驱动 Provider 判别表单；MSW 只服务测试和本地 UI 测试，不是生产 fallback。
 
-**Tech Stack:** Node 24、pnpm 10.34.0、React 19.2.7、Vite 8.1.4、TypeScript 7.0.2、TanStack Router 1.170.17、Query 5.101.2、Table 8.21.3、React Hook Form 7.81.0、Zod 4.4.3、radix-ui 1.6.2、lucide-react 1.24.0、CSS Variables/CSS Modules、openapi-typescript 7.13.0、Vitest 4.1.10、Testing Library React 16.3.2、MSW 2.15.0。
+**Tech Stack:** Node 24、pnpm 10.34.0、React 19.2.7、Vite 8.1.4、TypeScript 5.9.3、TanStack Router 1.170.17、Query 5.101.2、Table 8.21.3、React Hook Form 7.81.0、Zod 4.4.3、radix-ui 1.6.2、lucide-react 1.24.0、CSS Variables/CSS Modules、openapi-typescript 7.13.0、Vitest 4.1.10、Testing Library React 16.3.2、MSW 2.15.0。
 
 ## Global Constraints
 
