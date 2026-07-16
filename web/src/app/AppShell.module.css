@@ -1,0 +1,216 @@
+.shell {
+  display: grid;
+  grid-template:
+    "sidebar context" var(--context-height)
+    "sidebar main" minmax(0, 1fr)
+    / var(--nav-width) minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.skipLink {
+  position: fixed;
+  z-index: 100;
+  top: var(--space-2);
+  left: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  color: #ffffff;
+  background: var(--color-primary);
+  transform: translateY(-160%);
+  transition: transform 140ms ease;
+}
+
+.skipLink:focus {
+  transform: translateY(0);
+}
+
+.sidebar {
+  grid-area: sidebar;
+  overflow-y: auto;
+  color: #f4f7fa;
+  background: var(--color-nav);
+}
+
+.product {
+  display: flex;
+  min-height: var(--context-height);
+  padding: var(--space-2) var(--space-4);
+  border-bottom: 1px solid rgb(255 255 255 / 14%);
+  flex-direction: column;
+  justify-content: center;
+}
+
+.productName {
+  font-weight: 700;
+}
+
+.productState {
+  color: #b9c5d0;
+  font-size: 11px;
+}
+
+.navigation {
+  padding: var(--space-3) var(--space-2) var(--space-6);
+}
+
+.navigationGroup h2 {
+  margin: var(--space-4) var(--space-2) var(--space-1);
+  color: #aebbc7;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.navigationGroup ul {
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.disabledNavigationItem {
+  display: flex;
+  min-height: 38px;
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  color: #dbe3ea;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.disabledNavigationItem small {
+  color: #93a3b2;
+  font-size: 10px;
+}
+
+.contextBar {
+  display: flex;
+  grid-area: context;
+  min-width: 0;
+  min-height: var(--context-height);
+  padding: 0 var(--space-5);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-surface);
+  align-items: center;
+  justify-content: space-between;
+}
+
+.scopeControls {
+  display: flex;
+  min-width: 0;
+  gap: var(--space-3);
+}
+
+.scopeControls label {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.scopeControls label > span {
+  color: var(--color-muted);
+  font-size: 12px;
+}
+
+.scopeControls select {
+  max-width: 260px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+}
+
+.user {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.main {
+  grid-area: main;
+  min-width: 0;
+  padding: var(--space-6);
+}
+
+@media (width < 1024px) {
+  .shell {
+    grid-template:
+      "sidebar" auto
+      "context" var(--context-height)
+      "main" minmax(0, 1fr)
+      / minmax(0, 1fr);
+  }
+
+  .sidebar {
+    display: flex;
+    overflow-x: auto;
+    overflow-y: hidden;
+    align-items: stretch;
+  }
+
+  .product {
+    min-width: 190px;
+    border-right: 1px solid rgb(255 255 255 / 14%);
+    border-bottom: 0;
+  }
+
+  .navigation {
+    display: flex;
+    min-width: max-content;
+    padding: var(--space-1) var(--space-2);
+    gap: var(--space-2);
+  }
+
+  .navigationGroup {
+    display: flex;
+    align-items: center;
+  }
+
+  .navigationGroup h2 {
+    margin: 0 var(--space-2);
+  }
+
+  .navigationGroup ul {
+    display: flex;
+  }
+
+  .disabledNavigationItem {
+    min-width: 142px;
+  }
+
+  .contextBar {
+    padding-inline: var(--space-3);
+  }
+
+  .main {
+    padding: var(--space-4);
+  }
+}
+
+@media (width < 768px) {
+  .contextBar {
+    min-height: auto;
+    padding-block: var(--space-2);
+    align-items: flex-start;
+  }
+
+  .scopeControls {
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .scopeControls label > span {
+    width: 72px;
+  }
+
+  .scopeControls select {
+    max-width: min(64vw, 280px);
+  }
+
+  .main {
+    padding: var(--space-3);
+  }
+
+  .product {
+    min-width: 168px;
+  }
+}

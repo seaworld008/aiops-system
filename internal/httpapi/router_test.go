@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,37 @@ import (
 	"github.com/seaworld008/aiops-system/internal/authn"
 	"github.com/seaworld008/aiops-system/internal/httpapi"
 )
+
+func TestRouterKeepsUnknownAPIOutOfSPAFallbackAndIncludesWebReadiness(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeWebFixture(t, root)
+	webUI, err := httpapi.NewWebUI(root, "https://identity.example.com")
+	if err != nil {
+		t.Fatalf("NewWebUI() error = %v", err)
+	}
+	router := httpapi.NewRouter(httpapi.Dependencies{
+		Version: "test-version",
+		Ready:   webUI.Ready,
+		WebUI:   webUI,
+	})
+	api := httptest.NewRecorder()
+	router.ServeHTTP(api, httptest.NewRequest(http.MethodGet, "/api/unknown", nil))
+	if api.Code != http.StatusNotFound || strings.Contains(api.Body.String(), "shell") ||
+		!strings.Contains(api.Body.String(), "route_not_found") {
+		t.Fatalf("unknown API response = %d %q", api.Code, api.Body.String())
+	}
+
+	if err := os.Remove(filepath.Join(root, "index.html")); err != nil {
+		t.Fatalf("remove index: %v", err)
+	}
+	ready := httptest.NewRecorder()
+	router.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if ready.Code != http.StatusServiceUnavailable {
+		t.Fatalf("ready after Web asset loss = %d %q", ready.Code, ready.Body.String())
+	}
+}
 
 func TestHealthEndpoints(t *testing.T) {
 	router := httpapi.NewRouter(httpapi.Dependencies{

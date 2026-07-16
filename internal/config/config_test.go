@@ -18,6 +18,7 @@ func TestLoadUsesSafeDefaults(t *testing.T) {
 	t.Setenv("AIOPS_WRITE_EXECUTION_MODE", "")
 	t.Setenv("AIOPS_OIDC_RECENT_AUTH_WINDOW", "")
 	t.Setenv("AIOPS_CONTROL_PLANE_CURSOR_HMAC_SECRET", "")
+	t.Setenv("AIOPS_WEB_ROOT", "")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -48,6 +49,61 @@ func TestLoadUsesSafeDefaults(t *testing.T) {
 	}
 	if cfg.RunnerGateway != nil {
 		t.Fatalf("RunnerGateway = %#v, want disabled", cfg.RunnerGateway)
+	}
+	if cfg.WebRoot != "" {
+		t.Fatalf("WebRoot = %q, want disabled", cfg.WebRoot)
+	}
+}
+
+func TestLoadAcceptsOnlySafeAbsoluteWebRoots(t *testing.T) {
+	t.Setenv("AIOPS_WEB_ROOT", "/srv/aiops/control-plane-web")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.WebRoot != "/srv/aiops/control-plane-web" {
+		t.Fatalf("WebRoot = %q", cfg.WebRoot)
+	}
+}
+
+func TestLoadRejectsUnsafeWebRoots(t *testing.T) {
+	for _, value := range []string{
+		"web/dist",
+		"/",
+		"/opt/aiops/../private",
+		"/opt/aiops/web/",
+		" /opt/aiops/web",
+		"/opt/aiops/web ",
+		"/opt/aiops/web\nprivate",
+	} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("AIOPS_WEB_ROOT", value)
+			if _, err := config.Load(); err == nil {
+				t.Fatalf("Load() error = nil for AIOPS_WEB_ROOT=%q", value)
+			}
+		})
+	}
+}
+
+func TestLoadRequiresExactProductionWebRoot(t *testing.T) {
+	setProductionControlPlaneEnvironment(t)
+	t.Setenv("AIOPS_WEB_ROOT", "/opt/aiops/web")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.WebRoot != "/opt/aiops/web" {
+		t.Fatalf("WebRoot = %q", cfg.WebRoot)
+	}
+
+	for _, value := range []string{"", "/srv/aiops/web", "/opt/aiops/web-next"} {
+		t.Run(value, func(t *testing.T) {
+			setProductionControlPlaneEnvironment(t)
+			t.Setenv("AIOPS_WEB_ROOT", value)
+			if _, err := config.Load(); err == nil {
+				t.Fatalf("Load() error = nil for production AIOPS_WEB_ROOT=%q", value)
+			}
+		})
 	}
 }
 
@@ -299,6 +355,7 @@ func TestLoadParsesIntegrationScopedWebhookSecrets(t *testing.T) {
 	t.Setenv("AIOPS_DATABASE_URL", "postgres://configured")
 	t.Setenv("AIOPS_WEBHOOK_HMAC_SECRET", "")
 	t.Setenv("AIOPS_WEBHOOK_HMAC_SECRETS_JSON", `{"33333333-3333-4333-8333-333333333333/alertmanager":"secret"}`)
+	t.Setenv("AIOPS_WEB_ROOT", "/opt/aiops/web")
 	setOIDCEnvironment(t)
 
 	cfg, err := config.Load()
@@ -472,6 +529,15 @@ func clearControlPlaneOIDCEnvironment(t *testing.T) {
 	} {
 		t.Setenv(key, "")
 	}
+}
+
+func setProductionControlPlaneEnvironment(t *testing.T) {
+	t.Helper()
+	t.Setenv("AIOPS_ENVIRONMENT", "production")
+	t.Setenv("AIOPS_DATABASE_URL", "postgres://configured")
+	t.Setenv("AIOPS_WEBHOOK_HMAC_SECRET", "")
+	t.Setenv("AIOPS_WEBHOOK_HMAC_SECRETS_JSON", `{"33333333-3333-4333-8333-333333333333/alertmanager":"secret"}`)
+	setOIDCEnvironment(t)
 }
 
 func clearRunnerGatewayEnvironment(t *testing.T) {

@@ -48,6 +48,7 @@ type Dependencies struct {
 	AssetSources          assetcatalog.SourceManager
 	AssetConflicts        assetcatalog.ConflictManager
 	ServiceAssetBindings  assetcatalog.BindingManager
+	WebUI                 *WebUI
 }
 
 func NewRouter(deps Dependencies) http.Handler {
@@ -162,6 +163,9 @@ func NewRouter(deps Dependencies) http.Handler {
 		credentialRevocationConfirmationHandler(deps.CredentialRevocations),
 	)
 
+	if deps.WebUI != nil {
+		return deps.WebUI.Wrap(router)
+	}
 	return router
 }
 
