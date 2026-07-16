@@ -2,7 +2,7 @@
 
 > 更新时间：2026-07-16
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前集成基线：本文件所在的最新 `origin/main`；最近完成 Batch：`M1G-control-plane-api-boundary`（PR #62，代码提交 `39053fb`）；当前 Batch：`M1H-discovery-limiter-runtime`
+> 当前集成基线：本文件所在的最新 `origin/main`；最近完成 Batch：`M1H-discovery-limiter-runtime`（PR #64，代码提交 `2f05686`）；当前并行工作：`M1J-assetcatalog-unavailable-corrective` 与 `M1I-session-openapi-corrective`
 
 ## 当前结论
 
@@ -41,6 +41,8 @@ Limiter persistence C0 corrective 已通过 PR #59 squash merge 到 `origin/main
 M1F Mapping/Management 已通过 PR #60 squash merge 到 `origin/main@1a8e777`：九个精确文件实现 Task 5–6 的 `MappingRepository`、复合 `ResolveConflictScope`、关系/冲突/Binding 安全查询、serializable CAS/固定锁序/持久 receipt/Audit/Outbox 原子闭包、VIEWER 与 `ASSET_*` 权限，以及五个窄 Management 接口。C0 RED 覆盖跨 Tenant、缺 exact Environment binding、复合 Scope 重载、非 EXACT 和错误 If-Match；真实 PostgreSQL Mapping integration/race、受影响 unit/race、fresh G1/G2、代码地图和独立复核均通过，最终 P0/P1 为 0。OpenAPI、HTTP、Web、Source mutation、Worker、Provider 和生产装配仍未完成。
 
 M1G Control Plane API 已通过 PR #62 squash merge 到 `origin/main@39053fb`：二十四个精确文件实现唯一 OpenAPI 3.1、匿名 no-store Browser Config、浏览器/API 分离 OIDC 校验、严格 JSON、强 ETag、签名 Cursor、RFC 9457、安全 DTO、资产/来源/关系/冲突/Binding handlers，以及只装配真实 PostgreSQL Management 并在启动和 readiness 持续执行 SchemaAdmission 的关闭态 Control Plane。可信 RED 覆盖 OpenAPI/安全原语/认证/Scope/DTO/依赖缺失；独立复核发现的 Source 查询参数未成对约束和缺失 SchemaAdmission 两项 P1 已关闭。受影响 unit/race、OpenAPI 生成、约 25 万次 strict JSON fuzz、fresh G1/G2、代码地图、Secret/Provider 与二十四文件边界均通过；GitHub 快速 `go` 55 秒通过。旧 credential Problem 缺 `trace_id` 与 Asset Catalog stable error 集缺少数据库不可用 sentinel 作为上游 C0 债务保留，相关能力继续 `UNAVAILABLE/CLOSED`。
+
+M1H Discovery Limiter Runtime 已通过 PR #64 squash merge 到 `origin/main@2f05686`：三个新文件提供关闭态 `Limiter.Acquire/Release/Delay` ABI 与 PostgreSQL runtime，固定 exact Scope/Source/Run/Provider、`SOURCE→WORKSPACE→PROVIDER` 锁序、单个 `SERIALIZABLE READ WRITE` transaction、bucket CAS、append-only permit/terminal ledger、响应丢失 replay、过期 `EXPIRE` 恢复、Run lease/admission 重验和 exact installed Profile 验证。真实 PostgreSQL 18.4 TLS、定向 race、scoped G2、fresh G1、Secret/三文件边界和代码地图均通过；独立复核发现的 fresh Acquire admission 重验与 installed Profile parity 两项 P1 已关闭，最终无剩余 P0/P1。GitHub 快速 `go` 1 分钟通过。Worker、Provider、生产装配及 G3/G4 仍未完成，运行能力继续 `UNAVAILABLE/CLOSED`。
 
 ## 当前实施进度
 
@@ -105,7 +107,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
 | 现有调查/执行内核 | 基线存在 | 以现有测试、迁移和 V3 文档为准 |
-| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G）/ M1H BUILDING_CLOSED / UNAVAILABLE | OpenAPI/HTTP/关闭态 Control Plane 已合并；Limiter Go runtime 正在构建，Source mutation、Worker、前端与真实 Provider 门仍未完成 |
+| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H）/ M1I、M1J BUILDING_CLOSED / UNAVAILABLE | Limiter runtime 已合并；Asset Catalog unavailable C0 与 Session OpenAPI C0 正在关闭，Web Task 9 等待唯一 Session 契约后恢复；Source mutation、Worker、前端与真实 Provider 门仍未完成 |
 | Connection 修订/验证/发布 | NOT_STARTED | 等待 Phase 2 |
 | VictoriaMetrics/Logs/Traces 全家桶 | NOT_STARTED | 等待 Phase 3 |
 | 事件/定时主动只读调查 | NOT_STARTED | 等待 Phase 4 |
@@ -125,8 +127,8 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 
 ## 下一步
 
-从 `origin/main@39053fb` 并行推进两个文件所有权不重叠的关闭态 Batch：`M1H-discovery-limiter-runtime` 只消费 PR #59 的 stable persistence contract，在三个 `internal/discoverylimit` 文件内实现 PostgreSQL Limiter；`M1I-web-foundation-assets` 消费 PR #62 已合并的唯一 OpenAPI，建立唯一 `web/`、生成类型、浏览器 OIDC/Scope 壳层与资产只读纵向基线。两者不得修改同一 migration、OpenAPI、Control Plane 装配或 status。
+从 `origin/main@2f05686` 推进两个文件所有权不重叠的 C0 corrective：`M1J-assetcatalog-unavailable-corrective` 只在六个 Asset Catalog Repository/HTTP 文件内区分数据库不可用 `503`、语义冲突 `409` 与未知 `500`；`M1I-session-openapi-corrective` 只为现有 authenticated `GET /api/v1/session` 补齐唯一 OpenAPI operation/closed schema 与契约测试。两者不得修改 migration、Web、status 或彼此文件。
 
-Asset Catalog 数据库不可用 sentinel 与旧 credential Problem `trace_id` 由后继小型 C0 corrective 单独关闭，不得由 M1H/M1I 越界修改；在纠错合并前相关错误投影和能力继续关闭。所有关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
+`M1I-web-foundation-assets` 已在 pre-RED 发现 Task 9 要求 generated client 消费 `/api/v1/session`，但 PR #62 的唯一 OpenAPI 尚未登记该 path；因此 worktree 保持 clean 并暂停，不采用手写 Session DTO、字符串路径或绕过 Scope 校验。Session corrective 合并后，M1I 必须从最新 `origin/main` 新窗口恢复。旧 credential Problem `trace_id` 仍由后继独立 C0 关闭。所有关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
 
 任何阶段出现 Scope/身份/计划/Runtime/策略/Kill Switch/credential 漂移、依赖不可用、Secret 风险或结果不确定时，保持在最后已验收状态并停止升级，不得用人工口头确认替代持久证据。
