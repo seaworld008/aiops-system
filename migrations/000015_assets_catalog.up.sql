@@ -4392,8 +4392,7 @@ BEGIN
           AND observation.provider_kind = NEW.provider_kind
           AND observation.external_id = NEW.external_id
           AND observation.id = NEW.previous_observation_id
-          AND observation.observation_chain_sha256 = NEW.previous_chain_sha256
-        FOR SHARE OF observation;
+          AND observation.observation_chain_sha256 = NEW.previous_chain_sha256;
         IF NOT FOUND OR prior_observation.observed_at >= NEW.observed_at OR
            NEW.source_revision < prior_observation.source_revision OR
            (NEW.source_revision = prior_observation.source_revision AND (
