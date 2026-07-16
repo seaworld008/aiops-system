@@ -2,7 +2,7 @@
 
 > 更新时间：2026-07-16
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前集成基线：本文件所在的最新 `origin/main` 提交；最近完成 Batch：`M1C1-normalized-fact-contract-corrective`（PR #49）；当前 Batch：`M1E-atomic-page-commit-transaction`
+> 当前集成基线：`origin/main@3f75809`；最近完成 Batch：`M1E-atomic-page-commit-transaction`（PR #53）；当前 Batch：`Queue-PostgreSQL-lifecycle`
 
 ## 当前结论
 
@@ -28,7 +28,9 @@ M1D 已通过 PR #44 squash merge 到 `origin/main@661af40`：`internal/discover
 
 M1E0 已通过 PR #46 squash merge 到 `origin/main@4ddb644`：`000015` 的两个 relation digest equality rejection 现在只为 exact canonical-empty digest 提供例外，相同非空 digest、sequence、checkpoint、fence、exact receipt 与 deferred closure 继续 fail closed；corrected PostgreSQL 18.4 manifest SHA 已纳入 SchemaAdmission。真实连续空页、完整负向回滚矩阵、up/down/up、schema/role admission、fresh G1/G2 与独立 P0/P1 复核均通过。
 
-M1C1 已通过 PR #49 squash merge 到 `origin/main@c427a6b`：`NormalizedItem.DisplayName` 已与 Asset/SQL 收敛为 256-byte 上限；`ObservedRelation` 现在显式携带结构校验后的 `CrossEnvironmentPolicyReferenceID`，同 Environment 禁止该值，cross Environment 必须 non-empty/valid；六元 relation identity 保持不变，reference 作为 present framed field 计入 `MaxPageBytes`。三个真实 RED、完整 GREEN 矩阵、两包 unit/race、fresh G1/G2 与独立 P0/P1 复核均通过。Opaque reference 仍只是 lookup key，不等于策略许可；M1E 必须用 locked SourceRevision resolver 取得 expected reference并 exact 比较。旧 M1E 未提交内部实现不作为输入，当前从 fresh 窗口恢复 [M1E 原子页提交](../superpowers/plans/2026-07-13-governed-operations/01-assets/13-m1e-page-commit-transaction.md)。Queue/Worker/Provider/生产装配继续 `NOT_STARTED`。
+M1C1 已通过 PR #49 squash merge 到 `origin/main@c427a6b`：`NormalizedItem.DisplayName` 已与 Asset/SQL 收敛为 256-byte 上限；`ObservedRelation` 现在显式携带结构校验后的 `CrossEnvironmentPolicyReferenceID`，同 Environment 禁止该值，cross Environment 必须 non-empty/valid；六元 relation identity 保持不变，reference 作为 present framed field 计入 `MaxPageBytes`。三个真实 RED、完整 GREEN 矩阵、两包 unit/race、fresh G1/G2 与独立 P0/P1 复核均通过。Opaque reference 仍只是 lookup key，不等于策略许可；M1E 使用 locked SourceRevision resolver 取得 expected reference 并 exact 比较。
+
+M1E 已通过 PR #53 squash merge 到 `origin/main@3f75809`：五个新文件实现 `PageCommitter`、package-private PostgreSQL projection helper 及 receipt-first 原子页提交，固定 wrong-profile-before-Seal、single-Seal、bounded serializable retry、canonical page/relation identity、locked Revision Fact/relationship-policy resolver、one-transaction closure 与安全错误 vocabulary。PR #52 先关闭 Observation ACL 契约冲突；同一独立 reviewer 发现并关闭 fingerprint collision 未 CAS `AMBIGUOUS`、bulk tombstone/restore 缺失逐资源 Audit/Outbox 两个 P1，最终无未关闭 P0/P1。真实 PostgreSQL 18.4 TLS、42501 权限矩阵、定向 race、受影响包 G2、fresh G1、边界/DLP/secret 检查均通过。Queue/Worker/Provider/生产装配继续 `NOT_STARTED/UNAVAILABLE/CLOSED`，全仓 race、真实 Provider、HA、恢复、完整安全、浏览器和发布资格仍为 deferred G3/G4。
 
 ## 当前实施进度
 
@@ -93,7 +95,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
 | 现有调查/执行内核 | 基线存在 | 以现有测试、迁移和 V3 文档为准 |
-| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1）/ M1E BUILDING_CLOSED / UNAVAILABLE | 数据库底座、领域/接口/LeaseFence、治理 Repository/MANUAL、Source read、corrected discovery data-plane 合同、checkpoint Codec 与 repeated-empty relation-page corrective 已合并；M1E page commit 正在实现，Queue、Source mutation、API、前端与真实 Provider 门仍未完成 |
+| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E）/ Queue BUILDING_CLOSED / UNAVAILABLE | 数据库底座、领域/接口/LeaseFence、治理 Repository/MANUAL、Source read、corrected discovery data-plane 合同、checkpoint Codec、relation-page corrective 与 M1E 原子页提交已合并；Queue PostgreSQL lifecycle 正在实施，Source mutation、Worker、API、前端与真实 Provider 门仍未完成 |
 | Connection 修订/验证/发布 | NOT_STARTED | 等待 Phase 2 |
 | VictoriaMetrics/Logs/Traces 全家桶 | NOT_STARTED | 等待 Phase 3 |
 | 事件/定时主动只读调查 | NOT_STARTED | 等待 Phase 4 |
@@ -113,8 +115,8 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 
 ## 下一步
 
-当前从最新 `origin/main@c427a6b` 执行 `M1E-atomic-page-commit-transaction`，按五文件任务包实现 package-private PostgreSQL projection helper 与 `PageCommitter` 原子页提交。它只消费已经合并的 M1A/M1C/M1D/M1E0/M1C1 稳定 `Produces`，固定 receipt-first、wrong-profile-before-Seal、single-Seal、bounded serializable retry、canonical page/relation identity、locked Revision Fact/relationship-policy resolver、one-transaction closure 与安全错误 vocabulary。
+当前从最新 `origin/main@3f75809` 执行 `Queue-PostgreSQL-lifecycle` Batch。该 Batch 只消费已经合并的 M0/M1C/M1D/M1E 稳定 `Produces` 与 `000015` 十表 schema，不创建 migration，不修改 OpenAPI、生成类型或本状态文件；Queue 公共 ABI、process-local `ClaimResult` 与 sealed `LeaseFence` 在第一个真实 PostgreSQL consumer 中一起定值，覆盖 claim/reclaim、strict heartbeat、stage/failure/cleanup intent、delay、terminal receipt 与 stale-fence fail-closed。
 
-M1E G1/G2/独立复核通过并 squash merge 后，归档旧窗口并从最新 `origin/main` 创建 Queue PostgreSQL lifecycle Batch；Queue 公共 ABI、ClaimResult 与 sealed `LeaseFence` 只在真实消费点一起定值。所有这些关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
+Limiter、CleanupBroker transport、Worker、真实 Provider 和生产装配按稳定接口与文件所有权拆到后续 Batch；不得为并行读取 Queue 未合并内部实现。Queue 通过真实 RED/GREEN、受影响测试、G1/G2 与独立复核后再 squash merge 并轮换新窗口。所有关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
 
 任何阶段出现 Scope/身份/计划/Runtime/策略/Kill Switch/credential 漂移、依赖不可用、Secret 风险或结果不确定时，保持在最后已验收状态并停止升级，不得用人工口头确认替代持久证据。
