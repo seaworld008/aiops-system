@@ -6,6 +6,8 @@ import {
 } from "@tanstack/react-router";
 
 import type { components } from "@/shared/api/schema";
+import { MappingWorkbenchPage } from "@/features/asset-mappings/MappingWorkbenchPage";
+import { parseMappingSearch } from "@/features/asset-mappings/mappingSearch";
 import { AssetCatalogPage } from "@/features/assets/AssetCatalogPage";
 import { AssetDetailPage } from "@/features/assets/AssetDetailPage";
 import {
@@ -42,7 +44,7 @@ export function createAppRouter(session: Session) {
     component: () => (
       <section>
         <p>应用基础、身份和作用域已安全加载。</p>
-        <p>资产、映射与发现页面将在后续任务中接入。</p>
+        <p>资产与映射页面已接入；发现页面将在后续任务中接入。</p>
       </section>
     ),
   });
@@ -57,6 +59,12 @@ export function createAppRouter(session: Session) {
     path: "/assets/$assetId",
     validateSearch: (search) => parseAssetSearch(search, fallback),
     component: AssetDetailRoute,
+  });
+  const assetMappingsRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/asset-mappings",
+    validateSearch: (search) => parseMappingSearch(search, fallback),
+    component: AssetMappingsRoute,
   });
 
   function AssetsRoute() {
@@ -120,10 +128,30 @@ export function createAppRouter(session: Session) {
     );
   }
 
+  function AssetMappingsRoute() {
+    const search = parseMappingSearch(
+      assetMappingsRoute.useSearch() as unknown,
+      fallback,
+    );
+    const navigate = assetMappingsRoute.useNavigate();
+    return (
+      <MappingWorkbenchPage
+        search={search}
+        onSearchChange={(next, options) => {
+          void navigate({
+            search: next,
+            replace: options?.replace ?? false,
+          });
+        }}
+      />
+    );
+  }
+
   const routeTree = rootRoute.addChildren([
     indexRoute,
     assetsRoute,
     assetDetailRoute,
+    assetMappingsRoute,
   ]);
   return createRouter({
     routeTree,
