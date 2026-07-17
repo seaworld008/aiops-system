@@ -2,7 +2,7 @@
 
 > 更新时间：2026-07-17
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前集成基线：本文件所在的最新 `origin/main@3e69b5d`；最近完成 Batch：`M1L-source-create-registry-corrective`（PR #81）与 `M1I-mapping-workbench` Task 11（PR #82）；当前从该基线并行执行 Source Task 14 与 `M1I-navigation-corrective`
+> 当前集成基线：本分支基于最新 `origin/main@fbdcbea5cb508a007499f7d6c29d5daffc7b54e6`（PR #88）；PR #84–#88 已合并并保持 `BUILT_CLOSED`；当前仅有两个可见 Batch 为 `BUILDING_CLOSED`：Pack 06 Task 17 External CMDB fixed-protocol foundation 与 C0 CSV profile registry/admission corrective
 
 ## 当前结论
 
@@ -59,6 +59,16 @@ M1L Source Create/Profile Registry corrective 已通过 PR #81 squash merge 到 
 M1I Web Foundation 已通过 PR #76 squash merge 到 `origin/main@8202a58`：五十九个精确文件建立唯一 `web/`、冻结 React/TypeScript/Vite 工具链、唯一生成类型、Browser Config→Keycloak PKCE→Session bootstrap、Scope/history、typed API、共享 Operation/UI，以及 Go 同源 SPA、CSP、路径隔离和 readiness fail-closed。独立复核发现的 TOCTOU、生产 API/Auth 注入、深链/dirty guard、终态 Operation、响应式、AbortSignal、网络旁路与 history Scope 漂移均以可信 RED→GREEN 关闭；最终 `pnpm check`、50/50 Vitest、受影响 Go race、fresh G1、bundle/Secret/边界与代码地图通过，P0/P1 为 0。真实 Keycloak/浏览器、Playwright/axe、HA、恢复及 G3/G4 仍 deferred，前端继续 `UNAVAILABLE/CLOSED`。
 
 M1I Asset Catalog UI 已通过 PR #79 squash merge 到 `origin/main@9fea2dc`：十三个精确文件交付 `/assets` 与 `/assets/$assetId`、URL-owned 搜索/筛选/cursor/selection/tab、键盘表格、桌面 drawer/窄屏详情、MANUAL 登记和治理 mutation。权限只消费服务端 `effective_actions`；治理写使用 fresh Idempotency-Key 与当前 ETag/If-Match，409 安全重载且不 optimistic/自动重放，Scope/资产切换清理本地 mutation 结果，敏感 label key fail closed。可信 RED、68 个 Web tests、typecheck/lint/build、fresh G1、Secret/边界与 commit-bound code map 均通过，独立复核最终 P0/P1 为 0；真实 Keycloak/浏览器/Playwright/axe 和 G3/G4 仍 deferred，页面能力继续 `UNAVAILABLE/CLOSED`。
+
+M1I Navigation Scope corrective 已通过 PR #84 squash merge 到 `origin/main@04f0256`，状态为 `BUILT_CLOSED`：仅 `/assets` 与 `/asset-mappings` 成为真实导航，保留当前已授权 Workspace/Environment Scope，并让同 Scope 点击与 Back/Forward 共同经过既有 dirty-draft guard；未实现项继续 disabled。G1 的本地完整命令与 GitHub 快速 `go` 均通过；受影响 Web G2 的 `pnpm check`、94 个测试、五文件边界、Secret/production-bundle scan 与两次独立复核通过。真实浏览器/Keycloak、Playwright/axe、HA、恢复、安全和发布资格仍为 deferred G3/G4，导航存在不表示前端可用。
+
+Pack 05 Task 14 Source authorization/OpenAPI/HTTP/effective actions 已通过 PR #85 squash merge 到 `origin/main@88727e1`，状态为 `BUILT_CLOSED`：服务端权限、唯一 OpenAPI/生成类型、strict Source/revision HTTP 与 permission-and-state-aware `effective_actions` 已闭合；create 只调用 `Repository.CreateSource`，workload ingestion 与 CSV import runtime 继续 fail closed。G1 本地完整命令和 GitHub 快速 `go` 通过；受影响 G2 的 authz/assetcatalog/httpapi/OpenAPI unit+race、生成物漂移、100 个 Web 测试、typecheck/lint/build、14 文件边界、Secret scan、代码地图和独立复核通过。全仓 race、真实 Provider、HA/恢复、真实 Keycloak/浏览器、完整安全与发布资格仍为 deferred G3/G4，Source 运行能力继续 `UNAVAILABLE/CLOSED`。
+
+Pack 05 Task 15A bounded CSV parser/checkpoint intermediate 已通过 PR #86 squash merge 到 `origin/main@9ae5f2e`，状态为 `BUILT_CLOSED`：只交付固定 11 列 `CSV_RFC4180_V1` parser、32 MiB/100000 行/512-byte 字段/2000-row page 上限、同 Environment relation、provenance 与可恢复的安全 checkpoint intermediate。G1 的定向格式/校验、GitHub 快速 `go` 通过；受影响 G2 的 `csvimport` unit+race、五文件边界、Secret scan 和独立 P0/P1 复核通过。Task 15B 的 importer、detached signature、quarantine、sealed checkpoint、fenced Run/Reconciler、HTTP upload、backpressure 与 terminal cleanup 未因此实现；真实签名、PostgreSQL/Worker/HA、上传 E2E、安全和发布资格仍为 deferred G3/G4。
+
+Pack 05 Task 14/15/15A 契约纠偏已通过 PR #87 squash merge 到 `origin/main@27ba219`，状态为 `BUILT_CLOSED`：公共 create/revision 的 resolved facts 只归 server-installed `SourceProfileRegistry` 所有，CSV V1 relation 固定同 Environment，Task 15A 与 15B 的完成边界已明确。G1 的 GitHub 快速 `go` 通过；本次文档范围 G2 的定向 RED/GREEN 断言、UTF-8/末尾换行、Markdown fence、本地链接、不完整标记扫描、`git diff --check`、单文件边界和独立只读复核通过，按范围未运行 Go/Web/数据库测试。Task 15B 与 CSV Source 运行能力继续 `NOT_STARTED/UNAVAILABLE/CLOSED`，G3/G4 继续 deferred。
+
+Pack 04 Task 12 只读 Source inventory/detail 与 Run timeline 已通过 PR #88 squash merge 到 `origin/main@fbdcbea`，状态为 `BUILT_CLOSED`：`/asset-sources` 深链路由已存在，URL 持有安全 Scope/筛选/选择状态，Run 计数与轮询保持 bounded 且不渲染 raw cursor、credential、endpoint 或上游错误；顶级 navigation 仍 disabled。G1 的 GitHub 快速 `go` 与 `git diff --check` 通过；受影响 Web G2 的 106 个回归测试、目标 6 个测试、typecheck/lint/build、十文件边界、Secret/forbidden-field scan 和 P0/P1 复核通过。GitNexus commit-bound verify 因另一 worktree 的 registry alias 占用未记为 PASS，已记录十文件人工影响分析；真实浏览器/Keycloak、Playwright/axe、HA 和 G3/G4 仍 deferred。
 
 ## 当前实施进度
 
@@ -123,7 +133,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
 | 现有调查/执行内核 | 基线存在 | 以现有测试、迁移和 V3 文档为准 |
-| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J/Session C0/Credential Trace C0/TypeScript C0/M1I Web Foundation/Source Revision/Create/Profile Registry/M1I Asset Catalog UI/Mapping Workbench）/ Task 14 BUILDING_CLOSED / UNAVAILABLE | Source 原子 Create/Profile Registry 与 Mapping Workbench 已合并；Task 14 正在消费已合并接口实现授权、OpenAPI、strict HTTP 与 effective actions，Worker、ingestion 与真实 Provider 门仍未完成 |
+| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J/Session C0/Credential Trace C0/TypeScript C0/M1I Web Foundation/Source Revision/Create/Profile Registry/M1I Asset Catalog UI/Mapping Workbench/Navigation Scope corrective/Task 14 Source API/Task 15A CSV parser/Task 12 Source inventory）/ BUILDING_CLOSED（CSV Profile C0/External CMDB Task 17）/ UNAVAILABLE | Task 14、Task 15A 与只读 Source inventory 已合并；当前两个 Batch 仅构建 CSV profile registry/admission 与 External CMDB 固定协议基础。Task 15B、Discovery Worker、真实 Provider gate 与运行资格仍未完成 |
 | Connection 修订/验证/发布 | NOT_STARTED | 等待 Phase 2 |
 | VictoriaMetrics/Logs/Traces 全家桶 | NOT_STARTED | 等待 Phase 3 |
 | 事件/定时主动只读调查 | NOT_STARTED | 等待 Phase 4 |
@@ -131,7 +141,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | HA 生产只读路径 | NOT_STARTED | 等待 Phase 6 |
 | 四类初始受治理生产 Action | CLOSED | 等待 Phase 7 逐类型演练与 Canary |
 | 生产发布与持续运维 | NOT_STARTED | 等待 Phase 8 |
-| 新 React 前端 | BUILT_CLOSED Foundation + Asset UI + Mapping UI / BUILDING_CLOSED Navigation corrective / UNAVAILABLE | Task 9 Foundation、Task 10 Asset Catalog UI 与 Task 11 Mapping Workbench 已合并；Navigation corrective 只开放已实现路由并把同 Scope 导航纳入 dirty-draft guard，真实浏览器资格未通过前仍不可用 |
+| 新 React 前端 | BUILT_CLOSED Foundation + Asset UI + Mapping UI + Navigation Scope corrective + read-only Source inventory / UNAVAILABLE | `/assets` 与 `/asset-mappings` 已进入受控导航；`/asset-sources` 可直接深链但顶级 navigation 仍 disabled。真实 Keycloak/浏览器、Playwright/axe 与 G3/G4 未通过前仍不可用 |
 
 ## 已知基线注意事项
 
@@ -143,10 +153,13 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 
 ## 下一步
 
-从最新 `origin/main@3e69b5d` 的 fresh 可见窗口执行 Pack 05 Task 14：消费已合并的 `SourceRevisionRepository.CreateSource` 与 `SourceProfileRegistry`，由同一个 Contract owner 修改授权、Management、唯一 OpenAPI、strict HTTP、router、生成类型以及随 OpenAPI 原始 SHA 同步的既有 contract digest/pin 文件。不得修改 migration、Source repository/domain、其他 Web、status、Worker/Provider 或 Task 15–16；完成代表性 C0 RED、受影响 Go/OpenAPI/Web G2、fresh G1 和独立 P0/P1 复核后提交 PR。
+从最新 `origin/main@fbdcbea5cb508a007499f7d6c29d5daffc7b54e6` 仅并行执行以下两个可见 Batch；两者尚未合并，状态只记录为 `BUILDING_CLOSED`，不记录 commit、G1/G2 通过或完成事实：
 
-并行完成 `M1I-navigation-corrective`：只开放已合并的 `/assets` 与 `/asset-mappings`，保留当前 Workspace/Environment Scope，并将同 Scope 点击导航纳入现有 `useDraftGuard`/Radix 确认；其他未实现项继续 `aria-disabled`。该 corrective 不修改 OpenAPI、生成类型、feature、status 或运行能力。
+- Pack 06 Task 17 External CMDB fixed-protocol foundation：只建立 `EXTERNAL_CMDB/CMDB_CATALOG_V1` 的固定 Catalog v1 safe schema、TLS/identity/read-only capability probe、规范化边界与窄 `discoverysource.Provider`；wire operation 只允许 `GET /v1/capabilities`、`GET /v1/assets`、`GET /v1/relations`，不建立通用 HTTP/endpoint/header/body/query 能力。
+- C0 CSV profile registry/admission corrective：只把 exact server-owned `CSV_IMPORT/CSV_RFC4180_V1` profile 纳入唯一 registry，并闭合 Source create/revision/action admission 对已安装 profile 与 runtime-closed 状态的 parity；不实现或开放 CSV import 执行路径。
 
-两个 Batch 文件所有权无重叠，且只消费 `origin/main` 已合并接口。所有关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
+Task 15B importer、quarantine、detached signature、sealed checkpoint、fenced orchestration/Reconciler、HTTP upload、backpressure 与 cleanup 继续 `NOT_STARTED/UNAVAILABLE/CLOSED`。External CMDB server-installed registry/creation admission、Task 18 incremental checkpoint/provenance/delete/restore、Task 19 真实 staging canary 与 per-source availability gate 同样保持 `NOT_STARTED/UNAVAILABLE/CLOSED`。
+
+所有 Provider/Source、前端真实浏览器和生产资格继续 `UNAVAILABLE/CLOSED`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、Keycloak/浏览器、Playwright/axe 和发布资格均为 deferred，不得解释为 PASS。
 
 任何阶段出现 Scope/身份/计划/Runtime/策略/Kill Switch/credential 漂移、依赖不可用、Secret 风险或结果不确定时，保持在最后已验收状态并停止升级，不得用人工口头确认替代持久证据。
