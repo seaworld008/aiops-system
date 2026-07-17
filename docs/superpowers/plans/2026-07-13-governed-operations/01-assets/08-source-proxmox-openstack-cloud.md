@@ -196,7 +196,7 @@ func TestCloudProvidersRejectAuthorityMismatchIndependently(t *testing.T) {
 	}
 	for _, test := range tests {
 		proof, err := test.provider.Validate(context.Background(), test.runtime, validationRequest())
-		if err != nil || proof.Outcome != assetcatalog.ValidationOutcomeFailed || proof.Code != "AUTHORITY_MISMATCH" {
+		if err != nil || proof.Outcome != assetcatalog.ValidationOutcomeFailed || proof.Code != "AUTHORITY_REJECTED" {
 			t.Errorf("%s validation escaped authority: %#v", test.name, proof)
 		}
 	}
