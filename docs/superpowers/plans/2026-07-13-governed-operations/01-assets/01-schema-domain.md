@@ -178,13 +178,12 @@ sync_mode: MANUAL ON_DEMAND SCHEDULED
 source status: ACTIVE PAUSED DEGRADED DISABLED
 source gate: UNAVAILABLE VALIDATING AVAILABLE DEGRADED SUSPENDED
 source revision: DRAFT VALIDATING VALIDATED REJECTED PUBLISHED SUPERSEDED
-run kind: VALIDATION QUALIFICATION DISCOVERY CSV_IMPORT API_INGESTION MANUAL_MUTATION
+run kind: VALIDATION DISCOVERY CSV_IMPORT API_INGESTION MANUAL_MUTATION
 run status: QUEUED DELAYED RUNNING FINALIZING SUCCEEDED PARTIAL FAILED CANCELLED
 run stage: WAITING DELAYED VALIDATING READING NORMALIZING APPLYING CLEANING_UP COMPLETED
 trigger_type: HUMAN API SCHEDULED
 credential cleanup: NOT_OPENED PENDING REVOKED NO_CREDENTIAL UNCERTAIN
-work result: DATA_PROJECTION VALIDATION_PROOF QUALIFICATION_PROOF FAILURE_INTENT
-qualification evidence: TWO_WORKER_HA PROVIDER_CANARY
+work result: DATA_PROJECTION VALIDATION_PROOF FAILURE_INTENT
 terminal failure override: CLEANUP_UNCERTAIN
 delay reason: PROVIDER_RETRY_AFTER TRANSPORT_BACKOFF
 pending transition: DELAY
@@ -203,7 +202,7 @@ provenance: MANUAL DISCOVERED MERGE_DECISION
 freshness: CATALOG_SEQUENCE OBJECT_SEQUENCE OBJECT_TIME_SEQUENCE CHECKPOINT_SEQUENCE
 ~~~
 
-`QUALIFICATION`、`QUALIFICATION_PROOF`、safe evidence/HA digest columns 和 gate-evidence pointer 是后继 Pack 06 Task 19A2a 的 future schema/domain C0 extension；Task 19A2b 才实现 persistence/runtime rechecks，Task 19A2c 才装配唯一 lane/verifier registry/sink/signer。本次合同纠偏不把它们描述为当前已实现，也不重开或勾改上述 Task 1 checkbox，合并前数据库/运行能力继续关闭。
+> **Future-only boundary:** `QUALIFICATION`、`QUALIFICATION_PROOF`、qualification evidence `TWO_WORKER_HA|PROVIDER_CANARY`、safe evidence/HA digest columns 和 gate-evidence pointer 都不属于上述当前 `000015` exact vocabulary；它们是后继 Pack 06 Task 19A2a 的 future schema/domain C0 extension。本文件后续 Task 1/Task 2 中保留的任何 qualification Run/work-result、GateEvidence/HA 字段与 qualification/evidence-specific gate arithmetic 也都只是 Task 19A2a/19A2b/19A2c 的 future cross-reference，不是已勾选 Task 1、当前 `000015` 或当前 Go types 的实现要求；现有 validation 与 checkpoint-lineage-rollover gate arithmetic 继续属于当前 Task 1 合同。Task 19A2b 才实现 persistence/runtime rechecks，Task 19A2c 才装配唯一 lane/verifier registry/sink/signer。本次合同纠偏不把它们描述为当前已实现，也不重开或勾改上述 Task 1 checkbox，合并前数据库/运行能力继续关闭。
 
 The Phase 1 Relationship check constraint is named `asset_relationships_type_check` and contains exactly the nine values above. A later owned migration may expand it only together with the shared Go `RelationshipType` enum/tests and a down guard；Phase 1 adapters cannot submit future values early.
 

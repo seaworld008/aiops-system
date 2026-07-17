@@ -531,10 +531,14 @@ Any credential/trust/network/profile/revision/runtime-manifest/signing-key chang
 go test -race ./internal/sourceprofile ./internal/assetsource/externalcmdb \
   ./cmd/control-plane -run 'ExternalCMDBGate|Qualification|AdmitGate' -count=1
 go vet ./internal/sourceprofile ./internal/assetsource/externalcmdb ./cmd/control-plane
+bash -n scripts/verify-external-cmdb-source.sh
+corepack pnpm@10.34.0 --dir web typecheck
+corepack pnpm@10.34.0 --dir web lint
+corepack pnpm@10.34.0 --dir web build
 git diff --check
 ```
 
-G2 uses only deterministic safe receipt/evaluator fixtures and merged generic persistence/assembly interfaces。It must not require or probe a lab binding、mTLS endpoint、real CMDB、browser or Task 29A G3 artifact，and it must not invoke `scripts/verify-external-cmdb-source.sh` or Playwright。Missing evaluator registration、changed/expired receipt、unsafe field、persistence method、second gate owner or assembly drift must fail。A passing G2 permits only the closed code/evaluator PR to merge as `BUILT_CLOSED`。
+G2 uses only deterministic safe receipt/evaluator fixtures and merged generic persistence/assembly interfaces。`bash -n` 只静态解析 future verifier 而不执行它；三个 pnpm 命令只运行 `web/package.json` 已存在的 `typecheck`、`lint` 与 production `build` scripts。G2 must not require or probe a lab binding、mTLS endpoint、real CMDB、browser or Task 29A G3 artifact，and it must not execute `scripts/verify-external-cmdb-source.sh`、Playwright or `test:e2e`。Missing evaluator registration、changed/expired receipt、unsafe field、persistence method、second gate owner or assembly drift must fail。A passing G2 permits only the closed code/evaluator PR to merge as `BUILT_CLOSED`。
 
 - [ ] **Step 3: Commit the G2-verified closed code/evaluator batch**
 
