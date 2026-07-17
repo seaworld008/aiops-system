@@ -1,0 +1,13 @@
+{
+  "protocol_version": "cmdb-catalog/v1",
+  "authority_id": "cmdb-production-01",
+  "snapshot_epoch": "snapshot-2026-07-17-0001",
+  "max_page_size": 500,
+  "supports_delta": true,
+  "supports_tombstone": true,
+  "server_time": "2026-07-17T09:30:00Z",
+  "permissions": [
+    "assets.read",
+    "relations.read"
+  ]
+}

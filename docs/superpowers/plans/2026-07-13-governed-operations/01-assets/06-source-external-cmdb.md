@@ -108,6 +108,14 @@ git add api/openapi/external-cmdb-catalog-v1.yaml internal/assetsource/externalc
 git commit -m "feat(assetdiscovery): add fixed external cmdb provider"
 ~~~
 
+#### Task 18 快速构建拆分：18A Provider protocol foundation / 18B durable reconciliation
+
+快速构建将旧 Task 18 拆成两个独立关闭态 Batch；Task 18 只有在 18A 与 18B 的范围和最终证据全部完成后才可勾选完成。
+
+- **Task 18A（本 Batch，C2，1–2 日）**只拥有 Provider 侧固定 `CAPABILITIES → ASSETS → RELATIONS → COMPLETE` 分页、`CMDB_CATALOG_V1` 私有 canonical checkpoint、`(updated_at,external_id)` 非递减校验、authority/snapshot epoch 一致性、严格 Schema/DLP/预算、真实 TLS wire fixture，以及 closed `Page|Delay` 结果。它只消费已合并 Task 17 client/normalization 和 package-private typed `providerRetryAfter(error)`；client-level accessor 可解析 `0..60s`，但 Provider 只有严格 `(0,60s]` 可转为公共 `Delay{Reason: PROVIDER_RETRY_AFTER}`，合法 wire `0` 必须以 closed provider contract error 停止，不能伪造为 `1ns/1s`。checkpoint canonical bytes 只经 `discoverysource.WithCheckpointBytes` 读取并经 `discoverysource.NewCheckpoint` 返回，不公开 raw cursor、endpoint、credential 或 serialization surface。
+- **Task 18B（后继 Batch）**拥有 PostgreSQL `PageCommitter`/projection integration、Queue/Worker、lease/fence 与 stale-worker 并发、原子 checkpoint/page receipt、完整快照 missing detection、显式/隐式 deletion、soft-stale/restore、crash/reclaim、HA takeover 和恢复闭环。18B 才可修改 `internal/assetcatalog/postgres/discovery_integration_test.go` 或后继 Worker/Repository 文件，并承担对应真库与 G3 证据。
+- 18A 的 partial/transport/schema/snapshot/cursor failure 只返回关闭态错误或 bounded Delay，不把 partial run 解释为 missing/stale，不执行数据库写，也不声称 tombstone/恢复已进入 Catalog。Task 19 gate、真实 CMDB、HA、恢复、G3/G4 全部继续 deferred；`EXTERNAL_CMDB/CMDB_CATALOG_V1` 保持 `UNAVAILABLE/CLOSED`。
+
 ### Task 18: Incremental asset/relation checkpoint, provenance, deletion, and recovery
 
 **Files:**

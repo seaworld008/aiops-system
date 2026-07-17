@@ -342,14 +342,6 @@ func validationRequestMatchesBinding(
 		request.SourceRevisionDigest == binding.SourceRevisionDigest
 }
 
-func (*provider) Discover(
-	context.Context,
-	discoverysource.BoundRuntime,
-	discoverysource.DiscoverRequest,
-) (discoverysource.DiscoverOutcome, error) {
-	return nil, providerError("DISCOVERY_DEFERRED_CLOSED")
-}
-
 func newCatalogClient(config catalogClientConfig) (*catalogClient, error) {
 	baseURL, err := url.Parse(config.BaseURL)
 	if err != nil || baseURL.Scheme != "https" || baseURL.Host == "" || baseURL.User != nil ||
