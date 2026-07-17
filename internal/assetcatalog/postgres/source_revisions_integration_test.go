@@ -338,6 +338,214 @@ func TestSourceRevisionIntegrationConcurrentCreateSourceHasOneAtomicClosure(t *t
 	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 1, 1, 1, 1, 1)
 }
 
+func TestSourceRevisionIntegrationConcurrentCreateSourceRetriesStaleSerializableSnapshot(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	fixture := seedSourceCreationScope(t, harness.db)
+	repository, err := assetpostgres.New(
+		harness.application,
+		func() time.Time { return time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC) },
+		deterministicAssetIDGenerator(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const barrierKey int64 = 15000180081
+	execAssetSQL(t, harness.db, `
+CREATE SEQUENCE source_create_snapshot_attempts`)
+	execAssetSQL(t, harness.db, `
+GRANT USAGE,SELECT,UPDATE ON SEQUENCE source_create_snapshot_attempts
+TO aiops_control_plane_workload`)
+	execAssetSQL(t, harness.db, `
+CREATE FUNCTION source_create_snapshot_barrier() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER SET search_path=pg_catalog,public,pg_temp AS $$
+DECLARE
+	attempt bigint;
+BEGIN
+	attempt := pg_catalog.nextval('public.source_create_snapshot_attempts'::pg_catalog.regclass);
+	IF attempt=1 THEN
+		PERFORM pg_catalog.pg_advisory_xact_lock(15000180081::bigint);
+	ELSIF attempt=2 THEN
+		RAISE EXCEPTION 'controlled concurrent Source create unique race'
+			USING ERRCODE='23505',
+			      SCHEMA='public',
+			      TABLE='asset_sources',
+			      CONSTRAINT='asset_sources_workspace_id_create_idempotency_key_key';
+	END IF;
+	RETURN NEW;
+END
+$$`)
+	execAssetSQL(t, harness.db, `
+CREATE TRIGGER aaa_source_create_snapshot_barrier
+BEFORE INSERT ON asset_sources FOR EACH ROW
+EXECUTE FUNCTION source_create_snapshot_barrier()`)
+
+	holder, err := harness.db.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire Source create barrier holder: %v", err)
+	}
+	barrierHeld := true
+	t.Cleanup(func() {
+		if barrierHeld {
+			_, _ = holder.Exec(
+				context.Background(),
+				`SELECT pg_catalog.pg_advisory_unlock($1::bigint)`,
+				barrierKey,
+			)
+		}
+		holder.Release()
+	})
+	if _, err := holder.Exec(
+		context.Background(),
+		`SELECT pg_catalog.pg_advisory_lock($1::bigint)`,
+		barrierKey,
+	); err != nil {
+		t.Fatalf("hold Source create barrier: %v", err)
+	}
+
+	command := manualSourceCreateCommand(t, fixture, "controlled-concurrent-create", "8")
+	type callResult struct {
+		value assetcatalog.SourceRevisionMutation
+		err   error
+	}
+	callContext, cancelCalls := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelCalls()
+	firstResult := make(chan callResult, 1)
+	go func() {
+		value, callErr := repository.CreateSource(callContext, command)
+		firstResult <- callResult{value: value, err: callErr}
+	}()
+	firstPID := waitForSourceCreateAdvisoryWait(
+		t, harness.db, "INSERT INTO asset_sources", 0,
+	)
+
+	secondResult := make(chan callResult, 1)
+	go func() {
+		value, callErr := repository.CreateSource(callContext, command)
+		secondResult <- callResult{value: value, err: callErr}
+	}()
+	secondPID := waitForSourceCreateAdvisoryWait(
+		t, harness.db, "asset-management-idempotency.v1:", firstPID,
+	)
+	var exactWait bool
+	if err := harness.db.QueryRow(context.Background(), `
+SELECT EXISTS (
+	SELECT 1
+	FROM pg_catalog.pg_locks AS waiting
+	JOIN pg_catalog.pg_locks AS held
+	  ON held.locktype=waiting.locktype
+	 AND held.database IS NOT DISTINCT FROM waiting.database
+	 AND held.classid IS NOT DISTINCT FROM waiting.classid
+	 AND held.objid IS NOT DISTINCT FROM waiting.objid
+	 AND held.objsubid IS NOT DISTINCT FROM waiting.objsubid
+	WHERE waiting.pid=$1
+	  AND held.pid=$2
+	  AND waiting.locktype='advisory'
+	  AND NOT waiting.granted
+	  AND held.granted
+)
+`, secondPID, firstPID).Scan(&exactWait); err != nil {
+		t.Fatalf("read exact Source idempotency lock wait: %v", err)
+	}
+	if !exactWait {
+		t.Fatalf("second Source create pid %d did not wait on first pid %d exact advisory lock",
+			secondPID, firstPID)
+	}
+
+	var unlocked bool
+	if err := holder.QueryRow(
+		context.Background(),
+		`SELECT pg_catalog.pg_advisory_unlock($1::bigint)`,
+		barrierKey,
+	).Scan(&unlocked); err != nil || !unlocked {
+		t.Fatalf("release Source create barrier: unlocked=%t error=%v", unlocked, err)
+	}
+	barrierHeld = false
+
+	first := <-firstResult
+	if first.err != nil || first.value.Receipt.IdempotentReplay {
+		t.Fatalf("first controlled CreateSource() = (%#v, %v)", first.value, first.err)
+	}
+	second := <-secondResult
+	if second.err != nil ||
+		second.value.Source.ID != first.value.Source.ID ||
+		second.value.Revision.ID != first.value.Revision.ID ||
+		second.value.Receipt.AuditID != first.value.Receipt.AuditID ||
+		!second.value.Receipt.IdempotentReplay {
+		t.Fatalf("second controlled CreateSource() = (%#v, %v), want replay of %#v",
+			second.value, second.err, first.value)
+	}
+
+	changed := command
+	changed.Name = "changed controlled concurrent source"
+	if _, err := repository.CreateSource(context.Background(), changed); !errors.Is(
+		err, assetcatalog.ErrIdempotency,
+	) {
+		t.Fatalf("CreateSource(changed controlled replay) error = %v", err)
+	}
+	crossScope := command
+	crossScope.Context = sourceRevisionMutationContext(
+		t,
+		assetcatalog.SourceScope{
+			TenantID: fixture.tenantID, WorkspaceID: fixture.otherWorkspaceID,
+		},
+		command.Context.IdempotencyKey(),
+		"8",
+	)
+	if _, err := repository.CreateSource(context.Background(), crossScope); !errors.Is(
+		err, assetcatalog.ErrScopeViolation,
+	) {
+		t.Fatalf("CreateSource(cross-scope controlled replay) error = %v", err)
+	}
+	var insertAttempts int64
+	if err := harness.db.QueryRow(
+		context.Background(),
+		`SELECT last_value FROM source_create_snapshot_attempts`,
+	).Scan(&insertAttempts); err != nil || insertAttempts != 2 {
+		t.Fatalf("controlled Source insert attempts = %d, %v; want 2", insertAttempts, err)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 1, 1, 1, 1, 1)
+}
+
+func waitForSourceCreateAdvisoryWait(
+	t *testing.T,
+	database *pgxpool.Pool,
+	queryFragment string,
+	excludedPID int32,
+) int32 {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var pid int32
+	var snapshotEstablished bool
+	for time.Now().Before(deadline) {
+		err := database.QueryRow(context.Background(), `
+SELECT activity.pid,activity.backend_xmin IS NOT NULL
+FROM pg_catalog.pg_stat_activity AS activity
+JOIN pg_catalog.pg_locks AS waiting ON waiting.pid=activity.pid
+WHERE activity.datname=pg_catalog.current_database()
+  AND activity.usename='aiops_control_plane_workload'
+  AND activity.pid<>$1
+  AND waiting.locktype='advisory'
+  AND NOT waiting.granted
+  AND pg_catalog.strpos(activity.query,$2)>0
+ORDER BY activity.query_start
+LIMIT 1
+`, excludedPID, queryFragment).Scan(&pid, &snapshotEstablished)
+		if err == nil {
+			if !snapshotEstablished {
+				t.Fatalf("blocked Source create pid %d has no established serializable snapshot", pid)
+			}
+			return pid
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("observe blocked Source create: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("Source create did not reach advisory wait for query fragment %q", queryFragment)
+	return 0
+}
+
 func TestSourceRevisionIntegrationCreateSourceProfileSelectorErrorsHaveNoSideEffects(t *testing.T) {
 	harness := newAssetCatalogHarness(t)
 	harness.applyThroughAssetCatalog(t)

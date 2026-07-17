@@ -1,11 +1,13 @@
 package postgres
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/seaworld008/aiops-system/internal/assetcatalog"
 )
@@ -75,6 +77,252 @@ func TestMapSourceRevisionErrorClassifiesOnlyNonterminalRunUniqueConflict(t *tes
 	if got := mapSourceRevisionError(unrelated); errors.Is(got, assetcatalog.ErrStateConflict) {
 		t.Fatalf("unrelated unique constraint mapped to state conflict: %v", got)
 	}
+}
+
+func TestSourceCreationReplayRaceOnlyAcceptsExactUniqueConstraint(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "exact Source create idempotency race",
+			err: &pgconn.PgError{
+				Code:           "23505",
+				ConstraintName: sourceCreateIdempotencyConstraint,
+			},
+			want: true,
+		},
+		{
+			name: "wrapped exact Source create idempotency race",
+			err: errors.Join(errors.New("operation failed"), &pgconn.PgError{
+				Code:           "23505",
+				ConstraintName: sourceCreateIdempotencyConstraint,
+			}),
+			want: true,
+		},
+		{
+			name: "different unique constraint",
+			err: &pgconn.PgError{
+				Code:           "23505",
+				ConstraintName: "asset_management_idempotency_audit_uk",
+			},
+		},
+		{
+			name: "different SQLSTATE",
+			err: &pgconn.PgError{
+				Code:           "23503",
+				ConstraintName: sourceCreateIdempotencyConstraint,
+			},
+		},
+		{name: "unknown error", err: errors.New("unknown database error")},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := isSourceCreationReplayRace(testCase.err); got != testCase.want {
+				t.Fatalf("isSourceCreationReplayRace() = %t, want %t", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestSourceCreationSerializableReservesReceiptAttemptAfterRetryBudget(t *testing.T) {
+	operationErrors := []error{
+		&pgconn.PgError{Code: "40001"},
+		&pgconn.PgError{Code: "40P01"},
+		&pgconn.PgError{
+			Code:           "23505",
+			ConstraintName: sourceCreateIdempotencyConstraint,
+		},
+		nil,
+	}
+	var begins, commits, rollbacks int
+	var receiptRequirements []bool
+	repository := &Repository{pool: &assetCatalogPool{
+		beginTx: func(_ context.Context, options pgx.TxOptions) (pgx.Tx, error) {
+			begins++
+			if options.IsoLevel != pgx.Serializable || options.AccessMode != pgx.ReadWrite {
+				t.Fatalf("Source creation transaction options = %#v", options)
+			}
+			return &sourceCreationRetryTx{commits: &commits, rollbacks: &rollbacks}, nil
+		},
+	}}
+	result, err := withSourceCreationSerializable(
+		context.Background(),
+		repository,
+		func(_ pgx.Tx, receiptRequired bool) (string, error) {
+			receiptRequirements = append(receiptRequirements, receiptRequired)
+			attempt := len(receiptRequirements) - 1
+			if attempt >= len(operationErrors) {
+				t.Fatalf("unexpected Source creation attempt %d", attempt+1)
+			}
+			if operationErrors[attempt] != nil {
+				return "", operationErrors[attempt]
+			}
+			return "original receipt", nil
+		},
+	)
+	if err != nil || result != "original receipt" {
+		t.Fatalf("withSourceCreationSerializable() = (%q, %v)", result, err)
+	}
+	if begins != 4 || commits != 1 || rollbacks != 3 {
+		t.Fatalf("Source creation transaction counts = begin:%d commit:%d rollback:%d; want 4/1/3",
+			begins, commits, rollbacks)
+	}
+	wantRequirements := []bool{false, false, false, true}
+	if !reflect.DeepEqual(receiptRequirements, wantRequirements) {
+		t.Fatalf("receipt-required attempts = %v, want %v",
+			receiptRequirements, wantRequirements)
+	}
+}
+
+func TestSourceCreationSerializableDoesNotRetryUnrelatedErrors(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		err     error
+		wantErr error
+	}{
+		{
+			name: "different unique constraint",
+			err: &pgconn.PgError{
+				Code:           "23505",
+				ConstraintName: "asset_management_idempotency_audit_uk",
+			},
+			wantErr: assetcatalog.ErrIdempotency,
+		},
+		{
+			name: "different SQLSTATE",
+			err: &pgconn.PgError{
+				Code:           "23503",
+				ConstraintName: sourceCreateIdempotencyConstraint,
+			},
+			wantErr: assetcatalog.ErrScopeViolation,
+		},
+		{
+			name:    "unknown error",
+			err:     errors.New("unknown database error"),
+			wantErr: errAssetCatalogRepositoryFailure,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var begins, commits, rollbacks int
+			var receiptRequirements []bool
+			repository := sourceCreationRetryRepository(
+				t, &begins, &commits, &rollbacks,
+			)
+			_, err := withSourceCreationSerializable(
+				context.Background(),
+				repository,
+				func(_ pgx.Tx, receiptRequired bool) (string, error) {
+					receiptRequirements = append(receiptRequirements, receiptRequired)
+					return "", testCase.err
+				},
+			)
+			if !errors.Is(err, testCase.wantErr) {
+				t.Fatalf("withSourceCreationSerializable() error = %v, want %v",
+					err, testCase.wantErr)
+			}
+			if begins != 1 || commits != 0 || rollbacks != 1 {
+				t.Fatalf("Source creation transaction counts = begin:%d commit:%d rollback:%d; want 1/0/1",
+					begins, commits, rollbacks)
+			}
+			if !reflect.DeepEqual(receiptRequirements, []bool{false}) {
+				t.Fatalf("receipt-required attempts = %v, want [false]",
+					receiptRequirements)
+			}
+		})
+	}
+}
+
+func TestSourceCreationReceiptTransactionNeverRetries(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		err     error
+		wantErr error
+	}{
+		{
+			name:    "serialization failure",
+			err:     &pgconn.PgError{Code: "40001"},
+			wantErr: assetcatalog.ErrStateConflict,
+		},
+		{
+			name: "same exact unique race",
+			err: &pgconn.PgError{
+				Code:           "23505",
+				ConstraintName: sourceCreateIdempotencyConstraint,
+			},
+			wantErr: assetcatalog.ErrIdempotency,
+		},
+		{
+			name:    "unknown error",
+			err:     errors.New("unknown database error"),
+			wantErr: errAssetCatalogRepositoryFailure,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var begins, commits, rollbacks int
+			var receiptRequirements []bool
+			repository := sourceCreationRetryRepository(
+				t, &begins, &commits, &rollbacks,
+			)
+			_, err := withSourceCreationSerializable(
+				context.Background(),
+				repository,
+				func(_ pgx.Tx, receiptRequired bool) (string, error) {
+					receiptRequirements = append(receiptRequirements, receiptRequired)
+					if !receiptRequired {
+						return "", &pgconn.PgError{
+							Code:           "23505",
+							ConstraintName: sourceCreateIdempotencyConstraint,
+						}
+					}
+					return "", testCase.err
+				},
+			)
+			if !errors.Is(err, testCase.wantErr) {
+				t.Fatalf("withSourceCreationSerializable() error = %v, want %v",
+					err, testCase.wantErr)
+			}
+			if begins != 2 || commits != 0 || rollbacks != 2 {
+				t.Fatalf("Source creation transaction counts = begin:%d commit:%d rollback:%d; want 2/0/2",
+					begins, commits, rollbacks)
+			}
+			if !reflect.DeepEqual(receiptRequirements, []bool{false, true}) {
+				t.Fatalf("receipt-required attempts = %v, want [false true]",
+					receiptRequirements)
+			}
+		})
+	}
+}
+
+func sourceCreationRetryRepository(
+	t *testing.T,
+	begins, commits, rollbacks *int,
+) *Repository {
+	t.Helper()
+	return &Repository{pool: &assetCatalogPool{
+		beginTx: func(_ context.Context, options pgx.TxOptions) (pgx.Tx, error) {
+			*begins++
+			if options.IsoLevel != pgx.Serializable || options.AccessMode != pgx.ReadWrite {
+				t.Fatalf("Source creation transaction options = %#v", options)
+			}
+			return &sourceCreationRetryTx{commits: commits, rollbacks: rollbacks}, nil
+		},
+	}}
+}
+
+type sourceCreationRetryTx struct {
+	pgx.Tx
+	commits, rollbacks *int
+}
+
+func (tx *sourceCreationRetryTx) Commit(context.Context) error {
+	*tx.commits++
+	return nil
+}
+
+func (tx *sourceCreationRetryTx) Rollback(context.Context) error {
+	*tx.rollbacks++
+	return nil
 }
 
 func TestSourceRevisionCommandHashBindsCASAndSafeSemanticFields(t *testing.T) {

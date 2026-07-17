@@ -25,6 +25,8 @@ const (
 	sourceInitialCreateReason      = "INITIAL_CREATE"
 )
 
+const sourceCreateIdempotencyConstraint = "asset_sources_workspace_id_create_idempotency_key_key"
+
 var lockSourceMutationSQL = `
 SELECT ` + sourceProjectionSQL("source") + `
 FROM asset_sources AS source
@@ -171,8 +173,13 @@ func (repository *Repository) CreateSource(
 	if err != nil {
 		return assetcatalog.SourceRevisionMutation{}, err
 	}
-	return withSourceRevisionSerializable(ctx, repository, func(tx pgx.Tx) (assetcatalog.SourceRevisionMutation, error) {
-		return repository.createSourceInTx(ctx, tx, scope, command, commandHash, profile, ids)
+	return withSourceCreationSerializable(ctx, repository, func(
+		tx pgx.Tx,
+		receiptRequired bool,
+	) (assetcatalog.SourceRevisionMutation, error) {
+		return repository.createSourceInTx(
+			ctx, tx, scope, command, commandHash, profile, ids, receiptRequired,
+		)
 	})
 }
 
@@ -307,6 +314,86 @@ func withSourceRevisionSerializable[T any](
 		return result, nil
 	}
 	return zero, assetcatalog.ErrStateConflict
+}
+
+func withSourceCreationSerializable[T any](
+	ctx context.Context,
+	repository *Repository,
+	operation func(pgx.Tx, bool) (T, error),
+) (T, error) {
+	var zero T
+	for attempt := 0; attempt < serializableAttempts; attempt++ {
+		tx, err := repository.pool.BeginTx(ctx, pgx.TxOptions{
+			IsoLevel: pgx.Serializable, AccessMode: pgx.ReadWrite,
+		})
+		if err != nil {
+			return zero, mapSourceRevisionError(err)
+		}
+		result, operationErr := operation(tx, false)
+		if operationErr != nil {
+			_ = tx.Rollback(ctx)
+			if isSourceCreationReplayRace(operationErr) {
+				if err := waitForRetry(ctx, attempt); err != nil {
+					return zero, err
+				}
+				return withSourceCreationReceipt(ctx, repository, operation)
+			}
+			if isRetryablePGError(operationErr) && attempt+1 < serializableAttempts {
+				if err := waitForRetry(ctx, attempt); err != nil {
+					return zero, err
+				}
+				continue
+			}
+			return zero, mapSourceRevisionError(operationErr)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			if isSourceCreationReplayRace(err) {
+				if waitErr := waitForRetry(ctx, attempt); waitErr != nil {
+					return zero, waitErr
+				}
+				return withSourceCreationReceipt(ctx, repository, operation)
+			}
+			if isRetryablePGError(err) && attempt+1 < serializableAttempts {
+				if waitErr := waitForRetry(ctx, attempt); waitErr != nil {
+					return zero, waitErr
+				}
+				continue
+			}
+			return zero, mapSourceRevisionError(err)
+		}
+		return result, nil
+	}
+	return zero, assetcatalog.ErrStateConflict
+}
+
+func withSourceCreationReceipt[T any](
+	ctx context.Context,
+	repository *Repository,
+	operation func(pgx.Tx, bool) (T, error),
+) (T, error) {
+	var zero T
+	tx, err := repository.pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel: pgx.Serializable, AccessMode: pgx.ReadWrite,
+	})
+	if err != nil {
+		return zero, mapSourceRevisionError(err)
+	}
+	result, operationErr := operation(tx, true)
+	if operationErr != nil {
+		_ = tx.Rollback(ctx)
+		return zero, mapSourceRevisionError(operationErr)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return zero, mapSourceRevisionError(err)
+	}
+	return result, nil
+}
+
+func isSourceCreationReplayRace(err error) bool {
+	var postgresError *pgconn.PgError
+	return errors.As(err, &postgresError) &&
+		postgresError.Code == "23505" &&
+		postgresError.ConstraintName == sourceCreateIdempotencyConstraint
 }
 
 func prepareSourceMutation(
@@ -709,6 +796,7 @@ func (repository *Repository) createSourceInTx(
 	commandHash string,
 	profile assetcatalog.BuiltinSourceProfile,
 	ids []string,
+	receiptRequired bool,
 ) (assetcatalog.SourceRevisionMutation, error) {
 	if len(ids) != 4 {
 		return assetcatalog.SourceRevisionMutation{}, assetcatalog.ErrStateConflict
@@ -750,6 +838,9 @@ func (repository *Repository) createSourceInTx(
 		}
 		replay.Receipt = sourceCreationReplayReceipt(record)
 		return replay.Clone(), nil
+	}
+	if receiptRequired {
+		return assetcatalog.SourceRevisionMutation{}, assetcatalog.ErrStateConflict
 	}
 	if err := validateResolvedSourceAuthorities(ctx, tx, scope, profile, authorities); err != nil {
 		return assetcatalog.SourceRevisionMutation{}, err
