@@ -2,7 +2,7 @@
 
 > 更新时间：2026-07-17
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前集成基线：本文件所在的最新 `origin/main`；最近完成 Batch：`M1I-asset-catalog-ui` Task 10（PR #79，代码提交 `9fea2dc`）；当前从该基线并行执行 `M1I-mapping-workbench` Task 11 与 `M1L-source-create-registry-corrective`，Task 14 在 corrective 合并前保持暂停
+> 当前集成基线：本文件所在的最新 `origin/main@3e69b5d`；最近完成 Batch：`M1L-source-create-registry-corrective`（PR #81）与 `M1I-mapping-workbench` Task 11（PR #82）；当前从该基线并行执行 Source Task 14 与 `M1I-navigation-corrective`
 
 ## 当前结论
 
@@ -54,7 +54,7 @@ M1I TypeScript 工具链契约 corrective 已通过 PR #73 squash merge 到 `ori
 
 M1L Source Revision 的已实现子集已通过 PR #77 squash merge 到 `origin/main@2a66e8a`：六个精确文件实现 `CreateRevision/RequestValidation/Publish/Disable/RequestSync` 的 immutable Repository、复合 Scope、SERIALIZABLE、ETag/CAS、receipt-first replay、Audit/Outbox 与安全错误投影。MANUAL 使用 exact installed Profile 完成同步 Validation/Publication 闭包；非 MANUAL 在稳定引用解析器和后继 Adapter 尚未交付时保持 fail closed。PostgreSQL 18.4 定向 integration/race、fresh G1、DLP/Secret/边界与代码地图均通过，既有五方法子集的两轮独立复核最终 P0/P1 为 0。
 
-2026-07-17 的 Task 14 入口复核发现该合并子集遗漏了 Task 13 权威 `Produces` 中的 `SourceRevisionRepository.CreateSource` 与 `SourceProfileRegistry`：因此 stable Source + immutable revision 1 尚无同一 `SERIALIZABLE` transaction 的生产 owner，Task 14 不能用关闭态 POST、HTTP 层拼装或宽松 Profile 选择器代替。当前已从 `origin/main@9fea2dc` 启动 `M1L-source-create-registry-corrective`，只补齐 opaque `SourceProfileID`、已安装 Profile 解析和 Source/revision-1/authority/receipt/Audit/Outbox 原子闭包；corrective 合并前 Task 14 保持暂停，Source 能力继续 `UNAVAILABLE/CLOSED`。
+M1L Source Create/Profile Registry corrective 已通过 PR #81 squash merge 到 `origin/main@3e69b5d`：`SourceProfileRegistry` 只安装 opaque selector `manual-v1`，`CreateSource` 成为 stable Source + immutable revision 1 + authority + receipt/Audit/Outbox 的唯一 `SERIALIZABLE` 原子 owner。publication/后续 revision 后 replay、旧 snapshot 并发以及普通重试预算最后一次才命中精确 create-key `23505` 均已通过真实 PostgreSQL 18.4、定向 race、fresh G1 与独立 P0/P1 复核；Task 14 入口门已解除。真实 Adapter、Worker、Provider 与运行资格仍未完成，Source 能力继续 `UNAVAILABLE/CLOSED`。
 
 M1I Web Foundation 已通过 PR #76 squash merge 到 `origin/main@8202a58`：五十九个精确文件建立唯一 `web/`、冻结 React/TypeScript/Vite 工具链、唯一生成类型、Browser Config→Keycloak PKCE→Session bootstrap、Scope/history、typed API、共享 Operation/UI，以及 Go 同源 SPA、CSP、路径隔离和 readiness fail-closed。独立复核发现的 TOCTOU、生产 API/Auth 注入、深链/dirty guard、终态 Operation、响应式、AbortSignal、网络旁路与 history Scope 漂移均以可信 RED→GREEN 关闭；最终 `pnpm check`、50/50 Vitest、受影响 Go race、fresh G1、bundle/Secret/边界与代码地图通过，P0/P1 为 0。真实 Keycloak/浏览器、Playwright/axe、HA、恢复及 G3/G4 仍 deferred，前端继续 `UNAVAILABLE/CLOSED`。
 
@@ -123,7 +123,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
 | 现有调查/执行内核 | 基线存在 | 以现有测试、迁移和 V3 文档为准 |
-| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J/Session C0/Credential Trace C0/TypeScript C0/M1I Web Foundation/Source Revision 五方法子集/M1I Asset Catalog UI）/ Task 11、Source Create/Registry corrective BUILDING_CLOSED / Task 14 PAUSED_CLOSED / UNAVAILABLE | Asset Catalog UI 已合并；正在并行 Mapping Workbench 与 Task 13 corrective，corrective 合并前不得恢复 Source authorization/OpenAPI/HTTP，Worker、ingestion 与真实 Provider 门仍未完成 |
+| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J/Session C0/Credential Trace C0/TypeScript C0/M1I Web Foundation/Source Revision/Create/Profile Registry/M1I Asset Catalog UI/Mapping Workbench）/ Task 14 BUILDING_CLOSED / UNAVAILABLE | Source 原子 Create/Profile Registry 与 Mapping Workbench 已合并；Task 14 正在消费已合并接口实现授权、OpenAPI、strict HTTP 与 effective actions，Worker、ingestion 与真实 Provider 门仍未完成 |
 | Connection 修订/验证/发布 | NOT_STARTED | 等待 Phase 2 |
 | VictoriaMetrics/Logs/Traces 全家桶 | NOT_STARTED | 等待 Phase 3 |
 | 事件/定时主动只读调查 | NOT_STARTED | 等待 Phase 4 |
@@ -131,7 +131,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | HA 生产只读路径 | NOT_STARTED | 等待 Phase 6 |
 | 四类初始受治理生产 Action | CLOSED | 等待 Phase 7 逐类型演练与 Canary |
 | 生产发布与持续运维 | NOT_STARTED | 等待 Phase 8 |
-| 新 React 前端 | BUILT_CLOSED Foundation + Asset UI / BUILDING_CLOSED Mapping UI / UNAVAILABLE | Task 9 Foundation 与 Task 10 Asset Catalog UI 已合并；Task 11 正在消费既有 conflict DTO、typed client 与共享治理 UI，真实浏览器资格未通过前仍不可用 |
+| 新 React 前端 | BUILT_CLOSED Foundation + Asset UI + Mapping UI / BUILDING_CLOSED Navigation corrective / UNAVAILABLE | Task 9 Foundation、Task 10 Asset Catalog UI 与 Task 11 Mapping Workbench 已合并；Navigation corrective 只开放已实现路由并把同 Scope 导航纳入 dirty-draft guard，真实浏览器资格未通过前仍不可用 |
 
 ## 已知基线注意事项
 
@@ -143,10 +143,10 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 
 ## 下一步
 
-从最新 `origin/main@9fea2dc` 的 fresh 可见窗口执行 `M1I-mapping-workbench` Task 11：只拥有 `web/src/features/asset-mappings/`、`web/src/app/router.tsx` 和两个既有 MSW fixture/handler 文件；消费已合并 Conflict safe DTO、typed client、ETag 与 `effective_actions`，实现 `/asset-mappings` 的关闭态显式决定工作台。不得修改 OpenAPI、生成类型、Task 10 assets feature、Foundation、status、navigation 或 Task 12；执行受影响 Web G2、fresh G1 和独立 P0/P1 复核后再提交 PR。
+从最新 `origin/main@3e69b5d` 的 fresh 可见窗口执行 Pack 05 Task 14：消费已合并的 `SourceRevisionRepository.CreateSource` 与 `SourceProfileRegistry`，由同一个 Contract owner 修改授权、Management、唯一 OpenAPI、strict HTTP、router、生成类型以及随 OpenAPI 原始 SHA 同步的既有 contract digest/pin 文件。不得修改 migration、Source repository/domain、其他 Web、status、Worker/Provider 或 Task 15–16；完成代表性 C0 RED、受影响 Go/OpenAPI/Web G2、fresh G1 和独立 P0/P1 复核后提交 PR。
 
-并行从最新 `origin/main@9fea2dc` 执行 `M1L-source-create-registry-corrective`：先在 Pack 05 唯一任务包冻结 opaque `SourceProfileID`，再只在 Task 13 domain/repository/PostgreSQL owner 文件补齐 `SourceProfileRegistry` 与 `CreateSource` 的 stable Source + revision 1 原子闭包。不得修改 migration、Management/HTTP/OpenAPI/generated Web、status、Worker/Provider 或 Task 14；完成真实 C0 RED、PostgreSQL 18.4 G2、定向 race、fresh G1 和独立 P0/P1 复核后提交 PR。
+并行完成 `M1I-navigation-corrective`：只开放已合并的 `/assets` 与 `/asset-mappings`，保留当前 Workspace/Environment Scope，并将同 Scope 点击导航纳入现有 `useDraftGuard`/Radix 确认；其他未实现项继续 `aria-disabled`。该 corrective 不修改 OpenAPI、生成类型、feature、status 或运行能力。
 
-Task 11 与 corrective 文件所有权无重叠，且都只消费已合并的稳定接口；Task 14 不得读取 corrective 未提交内部实现，也不得恢复先前已中断的脏 worktree。corrective squash merge并验证远端 `main` 后，才从新基线创建 fresh Task 14 可见窗口。所有关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
+两个 Batch 文件所有权无重叠，且只消费 `origin/main` 已合并接口。所有关闭态 Batch 最多记为 `BUILT_CLOSED`，资产运行能力继续 `UNAVAILABLE`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、浏览器和发布资格仍为 deferred。
 
 任何阶段出现 Scope/身份/计划/Runtime/策略/Kill Switch/credential 漂移、依赖不可用、Secret 风险或结果不确定时，保持在最后已验收状态并停止升级，不得用人工口头确认替代持久证据。
