@@ -86,6 +86,13 @@ func TestValidateCapabilitiesRequiresPinnedAuthorityProtocolAndExactReadOnlyPerm
 			},
 			wantCode: "PERMISSION_SCOPE_MISMATCH",
 		},
+		{
+			name: "snapshot endpoint",
+			mutate: func(capabilities *catalogCapabilities) {
+				capabilities.SnapshotEpoch = "https://db.internal:5432/snapshot"
+			},
+			wantCode: "CAPABILITY_SCHEMA_MISMATCH",
+		},
 	}
 
 	for _, test := range tests {
@@ -100,6 +107,9 @@ func TestValidateCapabilitiesRequiresPinnedAuthorityProtocolAndExactReadOnlyPerm
 			got := validateCapabilities(capabilities, "cmdb-production-01", now)
 			if got.Passed != test.wantPassed || got.Code != test.wantCode {
 				t.Fatalf("validateCapabilities() = %#v, want passed=%t code=%q", got, test.wantPassed, test.wantCode)
+			}
+			if strings.Contains(got.Code, "db.internal") || strings.Contains(got.Code, "5432") {
+				t.Fatalf("capability rejection leaked endpoint: %#v", got)
 			}
 		})
 	}

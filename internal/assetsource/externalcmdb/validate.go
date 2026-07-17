@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"net"
 	"regexp"
 	"slices"
 	"strconv"
@@ -61,9 +62,9 @@ func validCapabilitySchema(capabilities catalogCapabilities, expectedAuthority s
 		capabilities.SupportsDelta &&
 		capabilities.SupportsTombstone &&
 		!capabilities.ServerTime.IsZero() &&
-		!containsSensitiveText(capabilities.ProtocolVersion) &&
-		!containsSensitiveText(capabilities.AuthorityID) &&
-		!containsSensitiveText(capabilities.SnapshotEpoch)
+		!unsafeCatalogText(capabilities.ProtocolVersion) &&
+		!unsafeCatalogText(capabilities.AuthorityID) &&
+		!unsafeCatalogText(capabilities.SnapshotEpoch)
 }
 
 func capabilityRejected(code string) capabilityValidation {
@@ -118,12 +119,8 @@ func validateCatalogAssetSchema(asset catalogAsset, maxDocumentBytes int64) stri
 		len(asset.Attributes) > 64 || maxDocumentBytes <= 0 {
 		return "SCHEMA_REJECTED"
 	}
-	if containsSensitiveText(asset.ExternalID) || containsSensitiveText(asset.DisplayName) ||
-		containsSensitiveText(asset.TypeCode) || containsSensitiveText(asset.TombstoneReason) {
-		return "DLP_REJECTED"
-	}
-	if unsafeExecutableText(asset.ExternalID) || unsafeExecutableText(asset.DisplayName) ||
-		unsafeExecutableText(asset.TypeCode) || unsafeExecutableText(asset.TombstoneReason) {
+	if unsafeCatalogText(asset.ExternalID) || unsafeCatalogText(asset.DisplayName) ||
+		unsafeCatalogText(asset.TypeCode) || unsafeCatalogText(asset.TombstoneReason) {
 		return "DLP_REJECTED"
 	}
 	if asset.Deleted {
@@ -146,10 +143,7 @@ func validateCatalogAssetSchema(asset catalogAsset, maxDocumentBytes int64) stri
 		if !safeText(key, 1, 64) || !safeText(value, 0, 1_024) || !allowedAttributeCode(key) {
 			return "SCHEMA_REJECTED"
 		}
-		if sensitiveNamePattern.MatchString(key) || containsSensitiveText(value) {
-			return "DLP_REJECTED"
-		}
-		if unsafeExecutableText(key) || unsafeExecutableText(value) {
+		if sensitiveNamePattern.MatchString(key) || unsafeCatalogText(key) || unsafeCatalogText(value) {
 			return "DLP_REJECTED"
 		}
 		documentBytes += int64(len(key) + len(value) + 6)
@@ -300,7 +294,7 @@ func digestFramedTuple(fields ...string) string {
 }
 
 func safeIdentifier(value string) bool {
-	return safeProtocolIdentifier.MatchString(value) && !containsSensitiveText(value)
+	return safeProtocolIdentifier.MatchString(value) && !unsafeCatalogText(value)
 }
 
 func safeText(value string, minimum int, maximum int) bool {
@@ -317,6 +311,139 @@ func safeText(value string, minimum int, maximum int) bool {
 
 func containsSensitiveText(value string) bool {
 	return sensitiveValuePattern.MatchString(value)
+}
+
+func unsafeCatalogText(value string) bool {
+	return containsSensitiveText(value) || unsafeExecutableText(value) || endpointShapedText(value)
+}
+
+func endpointShapedText(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	if containsEndpointScheme(lower) || containsDSNMarker(lower) {
+		return true
+	}
+	return containsHostPort(trimmed)
+}
+
+func containsEndpointScheme(value string) bool {
+	offset := 0
+	for offset < len(value) {
+		index := strings.Index(value[offset:], "://")
+		if index < 0 {
+			return false
+		}
+		colon := offset + index
+		start := colon
+		for start > 0 && endpointSchemeCharacter(value[start-1]) {
+			start--
+		}
+		scheme := value[start:colon]
+		if len(scheme) >= 1 && len(scheme) <= 32 && asciiLetter(scheme[0]) {
+			return true
+		}
+		offset = colon + 3
+	}
+	return false
+}
+
+func endpointSchemeCharacter(value byte) bool {
+	return asciiLetter(value) || value >= '0' && value <= '9' ||
+		value == '+' || value == '-' || value == '.'
+}
+
+func asciiLetter(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z'
+}
+
+func containsDSNMarker(value string) bool {
+	for _, marker := range []string{
+		"dsn=", "dsn:", "data source=", "data_source=", "datasource=",
+		"host=", "hostname=", "server=", "address=", "addr=", "port=",
+	} {
+		offset := 0
+		for offset < len(value) {
+			index := strings.Index(value[offset:], marker)
+			if index < 0 {
+				break
+			}
+			index += offset
+			if index == 0 || endpointBoundary(value[index-1]) {
+				return true
+			}
+			offset = index + 1
+		}
+	}
+	return false
+}
+
+func endpointBoundary(value byte) bool {
+	switch value {
+	case ' ', '\t', '\r', '\n', ';', ',', '&', '?', '(', ')', '{', '}', '[', ']', '"', '\'':
+		return true
+	default:
+		return false
+	}
+}
+
+func containsHostPort(value string) bool {
+	tokens := strings.FieldsFunc(value, func(character rune) bool {
+		return unicode.IsSpace(character) || strings.ContainsRune(",;\"'(){}<>", character)
+	})
+	for _, token := range tokens {
+		candidate := strings.Trim(token, ".,")
+		if index := strings.LastIndexByte(candidate, '='); index >= 0 {
+			candidate = candidate[index+1:]
+		}
+		if index := strings.IndexAny(candidate, "/?#"); index >= 0 {
+			candidate = candidate[:index]
+		}
+		host, port, err := net.SplitHostPort(candidate)
+		if err != nil || !endpointPort(port) || !endpointHost(host) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func endpointPort(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range []byte(value) {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	port, err := strconv.Atoi(value)
+	return err == nil && port >= 1 && port <= 65_535
+}
+
+func endpointHost(value string) bool {
+	if zone := strings.LastIndexByte(value, '%'); zone >= 0 {
+		value = value[:zone]
+	}
+	if value == "" {
+		return false
+	}
+	if net.ParseIP(value) != nil || strings.EqualFold(value, "localhost") {
+		return true
+	}
+	hasLetter := false
+	for _, character := range []byte(value) {
+		switch {
+		case asciiLetter(character):
+			hasLetter = true
+		case character >= '0' && character <= '9', character == '.', character == '-':
+		default:
+			return false
+		}
+	}
+	return hasLetter
 }
 
 func unsafeExecutableText(value string) bool {

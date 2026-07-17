@@ -102,12 +102,9 @@ func normalizeRelation(
 		relation.Deleted {
 		return assetdiscovery.ObservedRelation{}, normalizationError("RELATION_SCHEMA_REJECTED")
 	}
-	if containsSensitiveText(relation.ExternalID) ||
-		containsSensitiveText(relation.FromExternalID) ||
-		containsSensitiveText(relation.ToExternalID) ||
-		unsafeExecutableText(relation.ExternalID) ||
-		unsafeExecutableText(relation.FromExternalID) ||
-		unsafeExecutableText(relation.ToExternalID) {
+	if unsafeCatalogText(relation.ExternalID) ||
+		unsafeCatalogText(relation.FromExternalID) ||
+		unsafeCatalogText(relation.ToExternalID) {
 		return assetdiscovery.ObservedRelation{}, normalizationError("DLP_REJECTED")
 	}
 	relationType, ok := catalogRelationshipType(relation.TypeCode)
@@ -214,7 +211,7 @@ func normalizeAttributes(values map[string]string) (map[string]string, []string,
 		if !allowedAttributeCode(code) {
 			return nil, nil, normalizationError("ATTRIBUTE_CODE_REJECTED")
 		}
-		if unsafeExecutableText(value) || containsSensitiveText(value) {
+		if unsafeCatalogText(value) {
 			return nil, nil, normalizationError("DLP_REJECTED")
 		}
 		normalized[code] = value

@@ -70,8 +70,10 @@ func TestNormalizeAssetRejectsUnknownTypeAndDLP(t *testing.T) {
 
 	secretLike := "sk-" + strings.Repeat("a", 20)
 	tests := []struct {
-		name   string
-		mutate func(*catalogAsset)
+		name           string
+		mutate         func(*catalogAsset)
+		forbidden      string
+		wantSchemaCode string
 	}{
 		{
 			name: "unknown type",
@@ -90,6 +92,23 @@ func TestNormalizeAssetRejectsUnknownTypeAndDLP(t *testing.T) {
 			mutate: func(asset *catalogAsset) {
 				asset.Attributes = map[string]string{"hostname": secretLike}
 			},
+			forbidden: secretLike,
+		},
+		{
+			name: "URL attribute value",
+			mutate: func(asset *catalogAsset) {
+				asset.Attributes = map[string]string{"hostname": "https://db.internal:5432"}
+			},
+			forbidden:      "db.internal:5432",
+			wantSchemaCode: "DLP_REJECTED",
+		},
+		{
+			name: "DSN attribute value",
+			mutate: func(asset *catalogAsset) {
+				asset.Attributes = map[string]string{"hostname": "host=db.internal port=5432"}
+			},
+			forbidden:      "db.internal",
+			wantSchemaCode: "DLP_REJECTED",
 		},
 		{
 			name: "formula display name",
@@ -124,14 +143,36 @@ func TestNormalizeAssetRejectsUnknownTypeAndDLP(t *testing.T) {
 
 			asset := validCatalogAsset()
 			test.mutate(&asset)
+			if test.wantSchemaCode != "" {
+				if got := validateCatalogAssetSchema(asset, 64<<10); got != test.wantSchemaCode {
+					t.Fatalf("validateCatalogAssetSchema() = %q, want %q", got, test.wantSchemaCode)
+				}
+			}
 			got, err := normalizeAsset(normalizeTestEnvironmentID, asset)
 			if err == nil {
 				t.Fatalf("normalizeAsset() = %#v, want rejection", got)
 			}
-			if strings.Contains(err.Error(), secretLike) {
+			if test.forbidden != "" && strings.Contains(err.Error(), test.forbidden) {
 				t.Fatalf("error leaked rejected payload: %v", err)
 			}
 		})
+	}
+}
+
+func TestEndpointDLPAllowsOrdinarySafeText(t *testing.T) {
+	t.Parallel()
+
+	asset := validCatalogAsset()
+	asset.ExternalID = "opaque:id.with-dots-01"
+	asset.DisplayName = "payments-api.prod - maintenance 09:30"
+	asset.Attributes = map[string]string{
+		"hostname": "db.internal",
+		"version":  "2026.07-rc1",
+	}
+	if got, err := normalizeAsset(normalizeTestEnvironmentID, asset); err != nil {
+		t.Fatalf("ordinary safe text rejected: %v", err)
+	} else if got.ExternalID != asset.ExternalID || got.DisplayName != asset.DisplayName {
+		t.Fatalf("ordinary safe text drifted: %#v", got)
 	}
 }
 
@@ -224,6 +265,14 @@ func TestNormalizeRelationRejectsUnknownTypeAndUsesClosedPath(t *testing.T) {
 	relation.TypeCode = "CONNECTED_TO"
 	if got, err := normalizeRelation(normalizeTestEnvironmentID, relation); err == nil {
 		t.Fatalf("normalizeRelation() = %#v, want unknown-type rejection", got)
+	}
+
+	relation.TypeCode = "DEPENDS_ON"
+	relation.FromExternalID = "db.internal:5432"
+	if got, err := normalizeRelation(normalizeTestEnvironmentID, relation); err == nil {
+		t.Fatalf("endpoint-shaped relation = %#v, want rejection", got)
+	} else if strings.Contains(err.Error(), relation.FromExternalID) {
+		t.Fatalf("relation rejection leaked endpoint: %v", err)
 	}
 }
 
