@@ -8,6 +8,8 @@ import {
 import type { components } from "@/shared/api/schema";
 import { MappingWorkbenchPage } from "@/features/asset-mappings/MappingWorkbenchPage";
 import { parseMappingSearch } from "@/features/asset-mappings/mappingSearch";
+import { AssetSourcesPage } from "@/features/asset-sources/AssetSourcesPage";
+import { parseSourceSearch } from "@/features/asset-sources/sourceSearch";
 import { AssetCatalogPage } from "@/features/assets/AssetCatalogPage";
 import { AssetDetailPage } from "@/features/assets/AssetDetailPage";
 import {
@@ -65,6 +67,13 @@ export function createAppRouter(session: Session) {
     path: "/asset-mappings",
     validateSearch: (search) => parseMappingSearch(search, fallback),
     component: AssetMappingsRoute,
+  });
+  const assetSourcesRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/asset-sources",
+    validateSearch: (search) =>
+      parseSourceSearch(search, { workspace: fallback.workspace }),
+    component: AssetSourcesRoute,
   });
 
   function AssetsRoute() {
@@ -147,11 +156,31 @@ export function createAppRouter(session: Session) {
     );
   }
 
+  function AssetSourcesRoute() {
+    const search = parseSourceSearch(
+      assetSourcesRoute.useSearch() as unknown,
+      { workspace: fallback.workspace },
+    );
+    const navigate = assetSourcesRoute.useNavigate();
+    return (
+      <AssetSourcesPage
+        search={search}
+        onSearchChange={(next, options) => {
+          void navigate({
+            search: next,
+            replace: options?.replace ?? false,
+          });
+        }}
+      />
+    );
+  }
+
   const routeTree = rootRoute.addChildren([
     indexRoute,
     assetsRoute,
     assetDetailRoute,
     assetMappingsRoute,
+    assetSourcesRoute,
   ]);
   return createRouter({
     routeTree,

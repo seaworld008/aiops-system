@@ -7,11 +7,13 @@ import {
   assetMutationResultFixture,
   assetPageFixture,
   assetRelationPageFixture,
+  assetSourceDetailFixture,
   assetSourcePageFixture,
   browserConfigFixture,
   secondaryAssetDetailFixture,
   secondaryAssetID,
   sessionFixture,
+  sourceRunFixture,
 } from "./fixtures";
 
 const noStoreHeaders = {
@@ -59,6 +61,20 @@ export const handlers = [
     HttpResponse.json(assetSourcePageFixture, {
       headers: noStoreHeaders,
     }),
+  ),
+  http.get(
+    "/api/v1/workspaces/:workspaceId/asset-sources/:sourceId",
+    () =>
+      HttpResponse.json(assetSourceDetailFixture, {
+        headers: noStoreHeaders,
+      }),
+  ),
+  http.get(
+    "/api/v1/workspaces/:workspaceId/asset-source-runs/:runId",
+    () =>
+      HttpResponse.json(sourceRunFixture, {
+        headers: noStoreHeaders,
+      }),
   ),
   http.get(
     "/api/v1/workspaces/:workspaceId/asset-conflicts",

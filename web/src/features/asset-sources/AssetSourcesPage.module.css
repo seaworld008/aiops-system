@@ -1,0 +1,242 @@
+.page {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-3);
+}
+
+.breadcrumb {
+  color: var(--color-muted);
+  font-size: 12px;
+}
+
+.pageHeader,
+.sectionHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.pageHeader h1,
+.sectionHeader h2,
+.countSection h3,
+.failurePanel h3,
+.statePanel h2 {
+  margin: 0;
+}
+
+.pageHeader p,
+.sectionHeader p,
+.statePanel p {
+  margin: var(--space-1) 0 0;
+  color: var(--color-muted);
+}
+
+.inventory,
+.detailPanel,
+.runPanel,
+.statePanel,
+.failurePanel,
+.safeNote {
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+
+.sectionHeader,
+.statePanel,
+.failurePanel {
+  padding: var(--space-3);
+}
+
+.inventory .sectionHeader {
+  border-bottom: 1px solid var(--color-border);
+}
+
+.detailPanel,
+.runPanel {
+  display: grid;
+  padding: var(--space-4);
+  gap: var(--space-4);
+}
+
+.tableScroller {
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.tableScroller table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.tableScroller th,
+.tableScroller td {
+  min-width: 130px;
+  height: var(--table-row-height);
+  padding: var(--space-2);
+  border-bottom: 1px solid var(--color-border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.tableScroller th:first-child {
+  min-width: 220px;
+}
+
+.tableScroller tbody tr[aria-selected="true"] {
+  background: #eef4fb;
+}
+
+.tableScroller tbody th span,
+.tableScroller td span {
+  display: block;
+  margin-top: var(--space-1);
+  color: var(--color-muted);
+  font-size: 12px;
+}
+
+.tableScroller button {
+  padding: 0;
+  border: 0;
+  color: var(--color-primary);
+  font: inherit;
+  font-weight: 600;
+  background: transparent;
+}
+
+.definitionList,
+.countGrid {
+  display: grid;
+  min-width: 0;
+  margin: 0;
+  gap: 1px;
+  border: 1px solid var(--color-border);
+  background: var(--color-border);
+}
+
+.definitionList {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.definitionList div,
+.countGrid div {
+  display: grid;
+  min-width: 0;
+  padding: var(--space-2);
+  background: var(--color-surface);
+  gap: var(--space-1);
+}
+
+.definitionList dt,
+.countGrid dt {
+  color: var(--color-muted);
+  font-size: 12px;
+}
+
+.definitionList dd,
+.countGrid dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.authorityList {
+  display: grid;
+  padding: 0;
+  margin: 0;
+  gap: var(--space-1);
+  list-style: none;
+}
+
+.countSection {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.countSection h3 {
+  font-size: 14px;
+}
+
+.countGrid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.countGrid dd {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.safeNote,
+.failurePanel {
+  padding: var(--space-3);
+  margin: 0;
+  border-left-width: 4px;
+}
+
+.safeNote {
+  border-left-color: var(--color-primary);
+}
+
+.failurePanel {
+  border-left-color: var(--color-danger);
+  background: #fff3f2;
+}
+
+.failurePanel dl {
+  display: grid;
+  margin: var(--space-2) 0;
+  gap: var(--space-2);
+}
+
+.failurePanel dl div {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  gap: var(--space-2);
+}
+
+.failurePanel dt {
+  color: var(--color-muted);
+}
+
+.failurePanel dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.failurePanel p {
+  margin: 0;
+}
+
+.conflictLink {
+  margin: 0;
+}
+
+@media (width < 1024px) {
+  .definitionList {
+    grid-template-columns: 1fr;
+  }
+
+  .countGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (width < 768px) {
+  .pageHeader,
+  .sectionHeader {
+    flex-direction: column;
+  }
+
+  .detailPanel,
+  .runPanel {
+    padding: var(--space-3);
+  }
+
+  .countGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .tableScroller button {
+    min-height: 44px;
+  }
+}

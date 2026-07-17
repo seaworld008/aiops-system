@@ -323,7 +323,21 @@ form-action <OIDC-origin>
 
 不允许 inline script/style 例外、`unsafe-inline`、`unsafe-eval`、通配 connect、跨域表单目标或 permissive CORS。
 
-## 12. 测试与关闭态交付
+## 12. 发现来源库存与 Source Run 时间线
+
+`/asset-sources` 是可直接深链的只读关闭态页面；导航中的“发现与同步”继续保持 disabled，页面存在不表示 Source 创建、同步、Provider 或运行能力已经开放。URL 只保存非敏感的 `workspace`、`status`、`kind`、`cursor`、`sourceId` 与 `runId`，数组必须排序去重，非法枚举、过长 Cursor 和非法 UUID 在写回前移除。
+
+来源库存与详情只消费 `AssetSourcePage`、`AssetSourceDetail` 的服务端安全投影：
+
+- 展示来源名称、ID、类型、Provider、Source/Gate 状态、最近成功时间、checkpoint digest、修订状态、`sync_mode` 与 `authority_environment_ids`；
+- `last_run_counts` 只在存在 `last_success_run_id` 时标为“最近成功运行计数”，`current_run_counts` 只标为“当前非终态运行计数”，两者与所选 Run 自身计数分别呈现，禁止累计历史或相互覆盖；
+- `PARTIAL` 必须显式显示，不能改写最近成功结果；
+- 不显示 raw cursor、Provider payload、credential/integration reference、endpoint、上游错误正文、任意 Header/Body 或其他未声明字段；
+- Pack 04 不显示“创建来源”“立即同步”或任何 mutation 控件，且不根据角色名或枚举推断权限。
+
+`runId` 选择已存在的 `AssetSourceRun`，轮询复用 Foundation 唯一 `useOperation` 状态机：只对所选 `QUEUED / DELAYED / RUNNING / FINALIZING` Run 每两秒读取安全 GET 投影；hidden/offline 暂停，focus/online 恢复；`SUCCEEDED / PARTIAL / FAILED / CANCELLED` 终态停止，绝不发起或重放同步 mutation。时间线只接受服务端 closed stage：`WAITING`、`DELAYED`、`VALIDATING`、`READING`、`NORMALIZING`、`APPLYING`、`CLEANING_UP`、`COMPLETED`，不得按耗时或角色猜测阶段。失败只显示稳定 `failure_code` 与 Trace ID；存在冲突时链接到保留 Workspace/Environment/Source Scope 的映射工作台。
+
+## 13. 测试与关闭态交付
 
 Vitest/jsdom 使用测试专用 MSW；生产 `main.tsx` 和 production bundle 不得导入 MSW、fixture、loopback transport 或 fake identity。Playwright、真实 Keycloak 和真实浏览器资格属于后续 G3/G4，本 Task 只建立可测试接口并保持能力关闭。
 
