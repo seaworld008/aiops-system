@@ -634,8 +634,8 @@ func TestSourceEffectiveActionsArePermissionAndStateAware(t *testing.T) {
 		Source: source, LatestRevision: revision,
 	}
 	admin := managementPrincipal(authn.RoleAdmin)
-	publishable := func() SourceReadModel {
-		value := base.Clone()
+	publishableProfile := func(model SourceReadModel) SourceReadModel {
+		value := model.Clone()
 		value.LatestRevision.Status = SourceRevisionValidated
 		value.LatestRevision.ValidationRunID = "99999999-9999-4999-8999-999999999999"
 		value.LatestRevision.ValidationDigest = strings.Repeat("b", 64)
@@ -645,6 +645,9 @@ func TestSourceEffectiveActionsArePermissionAndStateAware(t *testing.T) {
 		value.Source.ValidationDigest = ""
 		value.Source.ValidatedBindingDigest = ""
 		return value
+	}
+	publishable := func() SourceReadModel {
+		return publishableProfile(base)
 	}
 	tests := []struct {
 		name      string
@@ -698,9 +701,19 @@ func TestSourceEffectiveActionsArePermissionAndStateAware(t *testing.T) {
 			want: []EffectiveAction{},
 		},
 		{
-			name: "repository publish preconditions expose publication", principal: admin,
+			name: "manual runtime and repository publish preconditions expose publication", principal: admin,
 			model: publishable(),
 			want:  []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource, ActionPublishSourceRevision},
+		},
+		{
+			name: "installed CSV publishable state keeps closed publication runtime hidden", principal: admin,
+			model: publishableProfile(SourceReadModel{Source: csvSource, LatestRevision: csvRevision}),
+			want:  []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "future installed profile defaults publication runtime closed", principal: admin,
+			model: publishableProfile(SourceReadModel{Source: futureSource, LatestRevision: futureRevision}),
+			want:  []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
 		},
 		{
 			name: "revision state drift closes publication", principal: admin,

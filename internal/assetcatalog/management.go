@@ -1422,7 +1422,7 @@ func (management *Management) sourceActionAdmission(
 			source.GateStatus != SourceGateDegraded &&
 			source.GateStatus != SourceGateSuspended &&
 			(revision.Status == SourceRevisionDraft || revision.Status == SourceRevisionRejected),
-		CanPublish: latestProfile.ProfileCode != "" &&
+		CanPublish: sourcePublicationRuntimeAvailable(latestProfile.ProfileCode) &&
 			source.Status == SourceStatusActive &&
 			source.GateStatus == SourceGateValidating &&
 			source.GateReasonCode == "VALIDATION_IN_PROGRESS" &&
@@ -1444,6 +1444,15 @@ func (management *Management) sourceActionAdmission(
 }
 
 func sourceValidationRuntimeAvailable(profileCode ProfileCode) bool {
+	switch profileCode {
+	case ProfileCode("MANUAL_V1"):
+		return true
+	default:
+		return false
+	}
+}
+
+func sourcePublicationRuntimeAvailable(profileCode ProfileCode) bool {
 	switch profileCode {
 	case ProfileCode("MANUAL_V1"):
 		return true
