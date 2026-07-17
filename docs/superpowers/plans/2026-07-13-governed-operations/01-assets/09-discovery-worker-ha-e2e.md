@@ -17,7 +17,7 @@
 - Raw lease token 只存 Worker 内存，DB 仅存 SHA-256；每次 reclaim 必须 `fence_epoch+1` 且旧 fence 无法 heartbeat/reconcile/checkpoint/complete。
 - Checkpoint 使用 AES-256-GCM；唯一 AAD 构造器与 typed `CheckpointAAD` 由 `internal/discoverycheckpoint` 拥有，并用 `FramedTupleV1("asset-source-checkpoint.v1",Tenant,Workspace,Source,Provider,Source definition revision,canonical revision digest,source definition digest,checkpoint key ID,Checkpoint version)` 的精确九字段顺序。key 只通过 workload secret binding 读取。持久 AAD 不含 gate revision/fence epoch/token，因为 checkpoint 必须跨 reclaim 和后续 Run 恢复且 Claim 不得制造 checkpoint 版本变更；每次 Open、Provider call、Reconcile、checkpoint 提交和 Complete 仍分别要求 exact live owner/token/epoch。Codec 必须有 golden bytes/hash、九字段逐项篡改、NULL/empty 和 key-rotation 测试。
 - 数据库通过 `asset_source_limit_buckets` 与 append-only `asset_source_limit_permits` 分别持久每 Source/Workspace/Provider 的 token bucket 和 active permit/terminal receipt；`not_before`、queue depth 与 failure streak 仍属于 Queue/Source backpressure。进程内 semaphore 只是二次保护，不是授权事实。
-- Validation Run 可消费 `VALIDATING` revision；Discovery/Import/Ingestion Run 仅可消费 exact `PUBLISHED + ACTIVE + AVAILABLE`。任何漂移停止并关闭影响的 provider/source gate。
+- Validation Run 可消费 `VALIDATING` revision；Discovery/Import/Ingestion Run 与普通 `RequestSync` 仅可消费 exact `PUBLISHED + ACTIVE + AVAILABLE`，需要真实资格的 Profile 还必须在每个普通 admission/data-write boundary 重载 current unexpired gate evidence。Task 19A2a/19A2b/19A2c 后继依次建立 schema/domain、persistence/rechecks 与唯一 production lane 的 `QUALIFICATION` Run 是唯一 `PUBLISHED + ACTIVE + UNAVAILABLE` 例外，只经 fixed mTLS workload qualification lane 和同一个 Task 28A Worker loop 执行零 Catalog projection 的 Provider read/protocol/DLP/cleanup/HA proof；它不能被普通 claim predicate、browser 或 sync API创建。任何漂移停止并关闭影响的 provider/source gate。
 - Validation Run 的 checkpoint 输入固定为空；它不得比较、解密或推进当前 published revision 的 Source checkpoint。Discovery/Import/Ingestion 才消费 exact current checkpoint；checkpoint-lineage-rollover 仅走 Pack 01 的受治理同一 Run 例外。
 - Credential open/session cleanup 是 terminal 成功的必要证据。每个 attempt 先持久化 Broker-owned opaque UUID，再允许 open；Broker 持有真实 revoke/session handle，Run/API/日志永不携带。cleanup 未知不能把 run 写为成功并必须暂停 Source gate。
 - `MANUAL` 不进 Worker；`KUBERNETES_OPERATOR` 由 Phase 3 注册；`AWX_INVENTORY` 由 Phase 5 固定 AWX 契约注册。未注册时都是 `UNAVAILABLE`，不得用通用 Provider 替代。
@@ -110,10 +110,15 @@ M1D Checkpoint Codec + M1E PageCommitter + Task 27 Queue/Cleanup/Limiter
   -> Task 28B recoverable cleanup-session transport/same-attempt authority
   -> Task 28C production constructor/registry/binary
   -> External CMDB Task 19A Control Plane profile/validation admission
-  -> Task 29 two-worker HA/provider qualification
+  -> External CMDB Task 19A2a gate-evidence schema/domain/admission
+  -> External CMDB Task 19A2b gate persistence/runtime rechecks
+  -> External CMDB Task 19A2c qualification lane/API/production assembly
+  -> Task 29A provider-neutral two-worker HA receipt/metrics
+  -> External CMDB Task 19B per-source canary/evaluator/atomic gate
+  -> Task 29B signed final provider matrix/E2E/CI
 ```
 
-后继 Batch 只能从最新 `origin/main` 读取已合并 `Produces`。Task 18B 不得读取 Task 28A 未提交文件；Task 28B 不得读取 Task 18B 未合并 descriptor；Task 28C 不得读取 Task 28B 或其他 Provider 未合并实现。源文件核验发现 process-local Broker 不能满足 replacement Worker cleanup 后，原来的“Task 28A core + Task 28B production”最小拆分增加一个独立 transport Batch，并把 production 顺延为 Task 28C；所有新 Batch exact files 互不重叠，且都以 1–2 日为上限。
+后继 Batch 只能从最新 `origin/main` 读取已合并 `Produces`。Task 18B 不得读取 Task 28A 未提交文件；Task 28B 不得读取 Task 18B 未合并 descriptor；Task 28C 不得读取 Task 28B 或其他 Provider 未合并实现。Source Gate 后半段严格为 `Task 28C → Task 19A → Task 19A2a → Task 19A2b → Task 19A2c → Task 29A → Task 19B → Task 29B`；每个 Batch 都由新窗口独立真实 G2/PR/merge，Task 29A 不消费 canary、不写 gate，Task 19B 不拥有 HA runner/metrics，Task 29B 不重建 gate/canary/HA。源文件核验发现 process-local Broker 不能满足 replacement Worker cleanup 后，原来的“Task 28A core + Task 28B production”最小拆分增加一个独立 transport Batch，并把 production 顺延为 Task 28C；后续因 canary↔AVAILABLE、Task 19B↔旧 Task 29 证据循环、46-file context risk 与 23-file persistence L Batch，最终拆成 12-file Task 19A2a、11-file Task 19A2b、19-file Task 19A2c、Task 29A 与 Task 29B，三段 Source Gate files 零重叠。
 
 ### Task 27: Merged durable queue, cleanup, checkpoint, and limiter primitives
 
@@ -176,7 +181,7 @@ go test -race ./internal/discoveryqueue/postgres \
   ./internal/discoverylimit/postgres -run Integration -count=1
 ~~~
 
-`AIOPS_TEST_POSTGRES_DSN` 缺失或任何 integration test Skip 都不能记为 PostgreSQL PASS。Expected: concurrent claims、lease expiry/reclaim、stale fence、exact attempt/terminal receipt recovery、checkpoint tamper/rotation、三 bucket concurrency 和 response-loss replay 继续通过。两 Worker、进程/数据库 restart、HA takeover 和完整 recovery 保留到 Task 29/G3；不得把单进程 G2 写成这些证据已完成。
+`AIOPS_TEST_POSTGRES_DSN` 缺失或任何 integration test Skip 都不能记为 PostgreSQL PASS。Expected: concurrent claims、lease expiry/reclaim、stale fence、exact attempt/terminal receipt recovery、checkpoint tamper/rotation、三 bucket concurrency 和 response-loss replay 继续通过。两 Worker、进程/数据库 restart、HA takeover 和完整 recovery 保留到 Task 29A/G3；不得把单进程 G2 写成这些证据已完成。
 
 ### Task 28A: Provider-neutral Worker core and claim-runtime seam
 
@@ -235,13 +240,13 @@ go vet ./internal/discoveryworker
 git diff --check
 ~~~
 
-G2 必须覆盖 dependency nil matrix、三 claim modes、exact ordered Reserve/Open/Resolve、same-opener/session/runtime-cell/handle/proof binding、Run/attempt/epoch/runtime-binding drift、validation/data split、Page/Delay XOR、fence drift、cleanup ordering、response-loss replay、panic/cancel 和 sensitive serialization。该 Batch 不声称真实 PostgreSQL/provider integration 或跨进程 attempt recovery；每个 Provider 在后继 integration Batch 以 `AIOPS_TEST_POSTGRES_DSN` 取得自己的真库 G2，跨进程 recovery 由 Task 28B/Task 29 证明。
+G2 必须覆盖 dependency nil matrix、三 claim modes、exact ordered Reserve/Open/Resolve、same-opener/session/runtime-cell/handle/proof binding、Run/attempt/epoch/runtime-binding drift、validation/data split、Page/Delay XOR、fence drift、cleanup ordering、response-loss replay、panic/cancel 和 sensitive serialization。该 Batch 不声称真实 PostgreSQL/provider integration 或跨进程 attempt recovery；每个 Provider 在后继 integration Batch 以 `AIOPS_TEST_POSTGRES_DSN` 取得自己的真库 G2，跨进程 recovery 由 Task 28B/Task 29A 证明。Task 19A2c 必须先核对并复用本 Task `worker.go/worker_test.go/claim_runtime.go/claim_runtime_test.go` seam；禁止创建 separate qualification runner。若 seam 不足，先停工并用只修改这四文件的 sequential C0 corrective 扩展同一 Worker mode/outcome sink，合并后再继续。
 
 **Deferred G3/G4:** 两 Worker、多进程 takeover、Worker/数据库 restart、HA/recovery、真实 Provider、production identity/config/binary 和 provider gate 全部 deferred。Task 28A 合并后只能记 `BUILT_CLOSED`，所有 Source/Worker 能力继续 `UNAVAILABLE/CLOSED`。
 
 ### Task 28B: Recoverable cleanup-session transport and attempt authority
 
-**Batch:** C0/C1，1–2 日；只能消费已合并 Task 28A 与至少一个已合并 Provider descriptor/integration，必须先于 production constructor 与 Task 29 合并。
+**Batch:** C0/C1，1–2 日；只能消费已合并 Task 28A 与至少一个已合并 Provider descriptor/integration，必须先于 production constructor 与 Task 29A 合并。
 
 **Exact files:**
 
@@ -250,7 +255,7 @@ G2 必须覆盖 dependency nil matrix、三 claim modes、exact ordered Reserve/
 - Create: `internal/discoveryworker/attempt_session.go`
 - Create: `internal/discoveryworker/attempt_session_test.go`
 
-不得修改 Task 27 `broker.go`/`broker_test.go`、Task 28A 四文件或任一 Provider 文件。该额外 Batch 是源文件核验发现 process-local `attempts` map 与新进程 `ErrAttemptNotFound` 后的最小必要拆分，不把跨进程 recovery 伪装成 Task 29 脚本行为。
+不得修改 Task 27 `broker.go`/`broker_test.go`、Task 28A 四文件或任一 Provider 文件。该额外 Batch 是源文件核验发现 process-local `attempts` map 与新进程 `ErrAttemptNotFound` 后的最小必要拆分，不把跨进程 recovery 伪装成 Task 29A 脚本行为。
 
 **Consumes（只读已合并）:**
 
@@ -288,7 +293,7 @@ git diff --check
 
 G2 必须用 test-only fixed-protocol authority fixture 证明两个独立 client/Broker 实例之间的 exact recovery-open/revoke、same-session runtime/handle/proof、changed tuple、mTLS negative、response-loss replay、zero secret payload 与 sensitive serialization；fixture 不进入 production graph，也不声称真实外部 authority 已验收。单进程 Broker test 不能代替该门。
 
-**Deferred G3/G4:** 两个真实 Worker binary、kill owner、通过 opaque lab binding 连接的已预置真实外部 shared authority及其 reconnect/recovery、Worker/数据库 restart、HA takeover、credential resolver/key rotation 与 Provider canary 留给 Task 29/G3/G4。Task 28B 最多为 `BUILT_CLOSED`，不使任一 Provider 可用。
+**Deferred G3/G4:** 两个真实 Worker binary、kill owner、通过 opaque lab binding 连接的已预置真实外部 shared authority及其 reconnect/recovery、Worker/数据库 restart、HA takeover 与 credential resolver/key rotation 留给 Task 29A；Provider canary 留给各 Provider gate（External CMDB 为 Task 19B），最终 matrix 留给 Task 29B。Task 28B 最多为 `BUILT_CLOSED`，不使任一 Provider 可用。
 
 ### Task 28C: Production constructor and Provider registry
 
@@ -317,6 +322,7 @@ G2 必须用 test-only fixed-protocol authority fixture 证明两个独立 clien
 - Immutable exact Provider registry；只注册具有已合并 adapter + neutral profile descriptor/fact-policy + durable-integration evidence 的 Phase 1 row。External CMDB registry 必须比较 Task 18B `internal/sourceprofile` canonical descriptor digest，不能重建 metadata；`KUBERNETES_OPERATOR`、`AWX_INVENTORY` 和任何缺依赖 Provider 保持未注册/`UNAVAILABLE`，不得使用 family/default HTTP adapter。
 - `internal/discoveryworker.NewProduction(...)`、`cmd/discovery-worker.newProduction(Config)` 和独立 binary startup/readiness/shutdown。
 - Production constructor uses PostgreSQL Queue/PageCommitter/Limiter、Task 28B single `AttemptSessionAuthority`、由它构造的 process-local Broker、checkpoint keyring、low-cardinality metrics boundary and mTLS workload identity；constructor 不接受彼此独立的 `SessionOpener` 与 runtime resolver 注入，credential/session transport 只能由该 authority open/recover path 调用。它还产生仅含 Provider/Profile/canonical descriptor/runtime-recovery capability digest 的 safe content-addressed runtime-admission manifest，供 Task 19A Control Plane admission 只读消费；manifest 不含 endpoint、credential、socket、key 或 runtime material。
+- A production-only `WorkerObserver`/dependency-decorator extension seam in `internal/discoveryworker/production.go` and `cmd/discovery-worker/production.go`。It decorates the exact Queue/PageCommitter/Limiter dependencies injected into Task 28A and exposes one closed later slot for the Task 19A2c qualification outcome dependency，never edits or copies the Task 28A loop，and emits only closed safe enums such as Provider/result/boundary。The constructor derives an opaque worker-identity digest from the authenticated mTLS workload identity and a fresh process-instance digest from its symlink-safe startup bootstrap；CLI/config/caller values cannot supply either digest。Task 28C wires an explicit closed observer so the binary remains `BUILT_CLOSED`; Task 29A is the sole sequential owner that replaces it with real low-cardinality metrics and，after Task 19A2c，registers the HA verifier。
 
 源文件核验显示现有 `internal/config.Config` 是 Control Plane-wide 配置，生产代码当前只由 `cmd/control-plane` 消费。把 discovery credential/keyring/socket 文件加入该共享类型会制造无关 owner 和敏感配置耦合，因此 Discovery Worker 配置只由 `cmd/discovery-worker/config.go` 拥有。Task 28C 不得修改 Task 28A/28B 文件，也不得把 Provider-specific profile/fact policy 重写进 registry。
 
@@ -338,6 +344,7 @@ func TestProductionConstructorFailsClosedForEveryMissingDependency(t *testing.T)
 		func(d *ProductionDependencies) { d.Checkpoints = nil },
 		func(d *ProductionDependencies) { d.Registry = nil },
 		func(d *ProductionDependencies) { d.WorkloadIdentity = nil },
+		func(d *ProductionDependencies) { d.Observer = nil },
 	} {
 		candidate := valid.Clone()
 		mutate(&candidate)
@@ -355,17 +362,19 @@ func TestProductionRegistryRejectsUnavailableOrDriftedProvider(t *testing.T) {
 }
 ~~~
 
+The same RED enumerates `Config`、supported flags and environment-variable bindings and rejects any worker/process identity field or alias。The same authenticated workload identity across a restart must derive the same opaque worker digest but a distinct fresh process-instance digest；a different authenticated workload identity must derive a different worker digest。Tests never accept a precomputed digest。
+
 Run: `go test ./internal/discoveryworker ./cmd/discovery-worker -count=1`
 
 Expected: FAIL because production constructor/registry/binary do not exist；Task 28A core itself is an already-merged `Consumes` and is not changed by this RED。
 
 - [ ] **Step 2: Compose the merged Worker core and exact Provider descriptors**
 
-Task 28C 不实现第二个 fenced run loop。它只把 Task 28A `New(Dependencies)` 与真实 PostgreSQL Queue/PageCommitter/Limiter、CheckpointCodec、Task 28B 唯一 `AttemptSessionAuthority` 和 immutable registry 组合；process-local Broker 与 resolver 必须由该同一 authority 构造，禁止分别注入、再次调用 credential resolver 或新建 session。每个 Provider descriptor 必须来自对应已合并 Provider Batch，并与 neutral metadata digest exact 相等。缺 descriptor、Task 28B transport、duplicate Provider/Profile、semantic drift、attempt binding 漂移或 unsupported kind 在创建 Worker 前 fail closed。Core 的 claim、Page/Delay、cleanup、terminal、panic 和 cancellation 行为继续由 Task 28A 四文件唯一拥有。
+Task 28C 不实现第二个 fenced run loop。它只把 Task 28A `New(Dependencies)` 与真实 PostgreSQL Queue/PageCommitter/Limiter、CheckpointCodec、Task 28B 唯一 `AttemptSessionAuthority`、immutable registry 和 mandatory production observer/decorators 组合；process-local Broker 与 resolver 必须由该同一 authority 构造，禁止分别注入、再次调用 credential resolver 或新建 session。Observer 只能包装已注入依赖并接收 server-derived safe enum，不得接收 Source/Run/external ID、endpoint、digest 或任意 labels。每个 Provider descriptor 必须来自对应已合并 Provider Batch，并与 neutral metadata digest exact 相等。缺 descriptor、Task 28B transport、observer、duplicate Provider/Profile、semantic drift、attempt binding 漂移或 unsupported kind 在创建 Worker 前 fail closed。Core 的 claim、Page/Delay、cleanup、terminal、panic 和 cancellation 行为继续由 Task 28A 四文件唯一拥有。
 
 - [ ] **Step 3: Assemble the real binary without production fake branches**
 
-`cmd/discovery-worker` requires PostgreSQL DSN file, workload identity certificate/key file, CA file, secure source-profile manifest file, Task 28B shared session-authority endpoint/socket, checkpoint keyring file, metrics private bind and worker ID. Files must be absolute, owner-only where secret-bearing, symlink-safe and loaded through existing secure bootstrap patterns. Startup verifies migrations through 000015, manifest digest/signature, registry completeness, mTLS identity, DB time and dependency health before readiness.
+`cmd/discovery-worker` requires PostgreSQL DSN file, workload identity certificate/key file, CA file, secure source-profile manifest file, Task 28B shared session-authority endpoint/socket, checkpoint keyring file and metrics private bind. Files must be absolute, owner-only where secret-bearing, symlink-safe and loaded through existing secure bootstrap patterns. The binary consumes the authenticated workload identity certificate/key only through the production mTLS bootstrap and server-derives its opaque worker-identity digest；it creates a fresh opaque process-instance digest during the same symlink-safe startup. Neither identity digest accepts a flag、environment variable、config value or caller input。Startup verifies migrations through 000015, manifest digest/signature, registry completeness, mTLS identity, DB time and dependency health before readiness.
 
 The binary does not import `internal/*/memory`, testdata, MSW, Control Plane handler or model/LLM packages. Add AST/import tests proving Provider SDK、Provider HTTP-client、credential/session transport packages are reachable only from `cmd/discovery-worker` production graph and never from `cmd/control-plane`；Control Plane 后续只能 import `internal/sourceprofile` neutral metadata/admission package，其既有 HTTP server graph 不受影响。
 
@@ -379,11 +388,11 @@ Run:
 gofmt -w $(rg --files internal/discoveryworker cmd/discovery-worker -g '*.go')
 go test -race ./internal/discoveryworker ./cmd/discovery-worker -count=1
 go build ./cmd/discovery-worker
-go test ./cmd/control-plane ./cmd/discovery-worker -run 'Production|Registry|Boundary|Secret' -count=1
+go test ./cmd/control-plane ./cmd/discovery-worker -run 'Production|Registry|Observer|Decorator|Boundary|Secret|Identity|Bootstrap' -count=1
 git diff --check
 ~~~
 
-Expected: PASS; missing/stale configuration fails before ready, shutdown cleans credentials/leases, Control Plane has no Provider network/secret dependency and no test fake is production-reachable.
+Expected: PASS; missing/stale configuration fails before ready，any worker/process identity flag、environment variable or config field is rejected，the two opaque digests are derived/generated only by production bootstrap，shutdown cleans credentials/leases, Control Plane has no Provider network/secret dependency and no test fake is production-reachable.
 
 ~~~bash
 git add internal/discoveryworker/registry.go internal/discoveryworker/registry_test.go \
@@ -392,49 +401,145 @@ git add internal/discoveryworker/registry.go internal/discoveryworker/registry_t
 git commit -m "feat(assetdiscovery): assemble production discovery worker"
 ~~~
 
-**Deferred G3/G4:** 两个真实 binary、PostgreSQL reconnect/restart、HA takeover、real workload identity/credential resolver/keyring rotation、全 Provider lab matrix 和发布资格由 Task 29/G3/G4 执行。Task 28C 最多为 `BUILT_CLOSED`；binary 存在不代表任一 Provider 或 Worker 可用。
+**Deferred G3/G4:** 两个真实 binary、PostgreSQL reconnect/restart、HA takeover、real workload identity/credential resolver/keyring rotation 由 Task 29A 执行；各 Provider canary/gate 由其独立任务执行，最终 lab matrix/发布资格由 Task 29B 聚合。Task 28C 最多为 `BUILT_CLOSED`；binary 存在不代表任一 Provider 或 Worker 可用。
 
-### Task 29: Multi-provider HA drills, final gate matrix, telemetry, and E2E evidence
+### Task 29A: Provider-neutral two-worker HA receipt and telemetry
 
-**Files:**
+**Batch:** C0/C1，1–2 日 implementation plus deferred G3 execution；只能消费已合并 Task 19A2a、Task 19A2b、Task 19A2c 与 Task 28C observer seam，独立真实 G2/PR/merge，必须先于 External CMDB Task 19B 和任何 final matrix。
+
+**Exact files:**
 - Create: `internal/discoveryworker/metrics.go`
 - Create: `internal/discoveryworker/metrics_test.go`
+- Create: `internal/discoveryqualification/ha.go`
+- Create: `internal/discoveryqualification/ha_test.go`
 - Create: `scripts/verify-discovery-worker-ha.sh`
-- Create: `scripts/verify-asset-source-provider-matrix.sh`
 - Create: `docs/operations/asset-sources/discovery-worker.md`
-- Create: `docs/operations/asset-sources/provider-gates.md`
-- Create: `web/e2e/source-provider-gates.spec.ts`
-- Modify: `Makefile`
-- Modify: `.github/workflows/ci.yml`
+- Modify: `internal/discoveryworker/production.go`
+- Modify: `internal/discoveryworker/production_test.go`
+- Modify: `cmd/discovery-worker/production.go`
+- Modify: `cmd/discovery-worker/production_test.go`
+- Modify: `cmd/discovery-worker/qualification.go`
+- Modify: `cmd/discovery-worker/qualification_test.go`
+
+上述 12 个 files 不与 Task 19B 或 Task 29B 重叠。前六个 files 唯一拥有 HA verifier/metrics/drill/runbook；后六个 files 是对已合并 Task 28C production observer seam 与 Task 19A2c qualification registration seam 的 sequential wiring owner。`internal/discoveryqualification/ha.go` 只实现 `EvidenceVerifier`：它只能接收 Task 19A2c outcome sink 从 Task 19A2b Repository 重载的 immutable `QualificationFactSnapshot`，验证 distinct worker/process、takeover/restart/recovery/cleanup/pre-terminal response-loss chain 后返回 verified digest；它不得接收 caller facts、claim Run、调用 Queue/Worker/Provider/CleanupBroker、持久 terminal、自签或实现任何 loop/runner。Task 29A 不修改 migration、Source gate repository/evaluator、Provider adapter/canary、OpenAPI/Web、Makefile 或 CI。
+
+**Mandatory production seam preflight — fail closed:**
+
+实现第一步必须只读核对已合并 `internal/discoveryworker/production.go`、`production_test.go`、`cmd/discovery-worker/production.go`、`production_test.go` 与 Task 19A2c `cmd/discovery-worker/qualification.go`、`qualification_test.go`。前四个必须已有不复制 Worker loop 的 observer/dependency-decorator seam，后两个必须已有 immutable verifier-registry registration + sole sink/signer seam。若任一不足，Task 29A 必须停止且不得编辑上述 12 文件；主管理先开仅修改这六个 exact files 的最小 sequential C0 seam corrective，独立新窗口、定向 RED/G2、单一 PR/merge，只补 closed extension/registration seam，不实现 metrics/HA verifier。该 corrective 合并后重新启动 Task 29A；禁止用 Task28A 修改、脚本日志、test fake 或第二 loop 代替 production seam。
 
 **Interfaces:**
-- Consumes Task 28C real binary/registry、Task 28B fixed mTLS recovery client/same-attempt composition、each Provider's merged G2 evidence，以及通过 opaque lab binding 预置的真实外部 shared session authority；Task 29 不拥有 authority server/binary，脚本不得启动或用 fake session map 代替它。
-- Produces low-cardinality metrics `asset_source_claims_total{provider,result}`, `asset_source_pages_total{provider,result}`, `asset_source_backpressure_total{provider,reason}`, `asset_source_fence_rejections_total{boundary}`, `asset_source_gate_status{provider,status}`, `asset_source_checkpoint_age_seconds{provider}`.
-- Produces signed provider acceptance matrix keyed by exact Provider profile/revision; missing providers remain explicitly `UNAVAILABLE`.
-- HA scripts consume only test/lab binding IDs（包括 `AIOPS_DISCOVERY_SESSION_AUTHORITY_LAB_BINDING`）from environment and never print their values；missing binding、mTLS identity failure 或 authority unavailable 必须 fail closed，不能 Skip。
+- Consumes Task 19A2a safe receipt/HA schema、Task 19A2b server-generated durable fact loader、Task 19A2c fixed `TWO_WORKER_HA` qualification lane/immutable verifier registry/sole sink+signer、Task 28C real binary/registry/observer decorators、Task 28B fixed mTLS recovery client/same-attempt composition，以及通过 opaque lab binding 预置的真实外部 shared session authority；不拥有 authority server/binary，脚本不得启动或用 fake/shared process map 代替它。
+- `cmd/discovery-worker/qualification.go` registers exactly the Task 29A HA verifier into the Task 19A2c immutable registry；the sole outcome sink reloads facts、invokes it and passes the verified digest to the sole signer。`ha.go` has no persistence or signing key and cannot make a receipt from script/caller input。
+- `internal/discoveryworker/production.go` wraps the real Queue/PageCommitter/Limiter/qualification sink through Task 28C decorators，and `cmd/discovery-worker/production.go` injects the real metrics observer into both Worker processes。No metrics value comes from logs、shell parsing、test fake or a parallel Worker callback。
+- Produces one current signed `TWO_WORKER_HA` receipt bound to exact Tenant/Workspace/Source、published revision/binding、Provider/Profile descriptor、Task 28C runtime manifest、opaque lab-binding digest、distinct owner/takeover worker and process identity digests、takeover/restart/session-recovery/cleanup/pre-terminal-response-loss receipt digests、fact-chain digest and expiry。它不消费 real Provider canary receipt，不写 `asset_sources.gate_status`，不产生 per-source Provider decision 或 final matrix。
+- Produces only low-cardinality metrics `asset_source_claims_total{provider,result}`, `asset_source_pages_total{provider,result}`, `asset_source_backpressure_total{provider,reason}`, `asset_source_fence_rejections_total{boundary}`, `asset_source_checkpoint_age_seconds{provider}` and `asset_source_qualification_runs_total{provider,evidence_kind,result}`。Labels 禁止 Tenant/Workspace/Source/Run/external ID、subject、endpoint 或 digest。
+- Script consumes only test/lab binding IDs including `AIOPS_DISCOVERY_SESSION_AUTHORITY_LAB_BINDING`，never prints values；missing binding、mTLS identity failure、authority unavailable 或 Skip 必须 fail closed。
 
-- [ ] **Step 1: Write failing provider-matrix and metric-cardinality tests**
+- [ ] **Step 1: Write failing HA receipt and metric-cardinality tests**
 
 ~~~go
-func TestProviderMatrixNeverTreatsFamilyAsSingleGate(t *testing.T) {
-	matrix := NewProviderMatrix()
-	matrix.Accept(validReceipt("AWS_EC2_V1"))
-	if matrix.Status("AWS_EC2_V1") != "AVAILABLE" || matrix.Status("AZURE_COMPUTE_V1") != "UNAVAILABLE" {
-		t.Fatalf("matrix = %#v", matrix)
+func TestHAVerifierCannotClaimCanaryGateOrSigning(t *testing.T) {
+	snapshot := loadRepositoryClosedHAFacts(t)
+	verified, err := NewHAVerifier().Verify(snapshot)
+	if err != nil || verified.EvidenceKind != qualification.EvidenceTwoWorkerHA {
+		t.Fatalf("verification = %#v, %v", verified, err)
 	}
-	for _, forbidden := range []string{"tenant_id", "workspace_id", "source_id", "external_id", "subject", "endpoint"} {
-		if strings.Contains(gatherMetrics(t), forbidden) {
-			t.Fatalf("metrics contain %s", forbidden)
+	snapshot.HATakeoverReceiptDigest = ""
+	if _, err := NewHAVerifier().Verify(snapshot); err == nil {
+		t.Fatal("verifier accepted incomplete durable facts")
+	}
+	verifierType := reflect.TypeOf(NewHAVerifier())
+	for _, forbidden := range []string{"Sign", "Persist", "AdmitGate", "RunCanary"} {
+		if _, exists := verifierType.MethodByName(forbidden); exists {
+			t.Fatalf("HA verifier exposes forbidden method %s", forbidden)
 		}
 	}
 }
 ~~~
 
-Run: `go test ./internal/discoveryworker -run 'ProviderMatrix|Metrics' -count=1`
+Run: `go test ./internal/discoveryworker ./internal/discoveryqualification ./cmd/discovery-worker -run 'HAReceipt|HAVerifier|Metrics|ProductionWiring' -count=1`
 
-Expected: FAIL because acceptance matrix/metrics are missing.
+Expected: FAIL because provider-neutral HA verifier、signed-receipt wiring and production metrics observer are missing.
 
-- [ ] **Step 2: Implement exact coverage and fail-closed matrix**
+- [ ] **Step 2: Execute two-worker cleanup/restart/response-loss qualification**
+
+`verify-discovery-worker-ha.sh` starts two real Task 28C Worker processes and PostgreSQL，then calls only Task 19A2c's mTLS qualification operation with `evidence_kind=TWO_WORKER_HA` against an already-published closed qualification Source. It does not call Provider canary、`AdmitGate` or ordinary `RequestSync`。It kills the lease owner during bounded Provider read/session use，requires a distinct replacement workload/process identity to take over at exact `fence_epoch+1`，proves a fresh process-local Broker direct revoke returns `ErrAttemptNotFound`，then recovery-opens the same external session through Task 28B。
+
+The drill restarts Worker and PostgreSQL，loses one pre-terminal recovery/cleanup command response，replays its exact persisted receipt before finalization and rejects a changed command。Task 19A2b derives every HA digest from Queue/run/Task28B receipts；the Task 19A2c sink reloads that snapshot，invokes Task 29A `ha.go` and alone signs/persists the terminal receipt。After sealing, terminal response-loss replay may be tested separately but cannot self-reference inside the signed fact chain。The drill also scrapes the private metrics endpoint from both real binaries and proves bounded labels；cleanup uncertainty produces only `FAILED + SUSPENDED` and no HA receipt。It never runs a real Provider canary or changes the gate.
+
+**G2 — required, no Skip:**
+
+~~~bash
+test -n "${AIOPS_TEST_POSTGRES_DSN:-}"
+go test -race ./internal/discoveryworker ./internal/discoveryqualification \
+  ./internal/discoveryqueue/... ./cmd/discovery-worker \
+  -run 'HAVerifier|HAReceipt|ProductionWiring|Metrics|Cardinality' -count=1
+go build ./cmd/discovery-worker
+git diff --check
+~~~
+
+G2 必须使用真实 Task 19A2b PostgreSQL fact loader、Task 19A2c registry/sink/signer 与 Task 28C production constructors；missing verifier/observer、caller facts、fake signer、unbounded label、second loop 或 Skip 均不得 PASS。该 Batch 代码合并后仍为 `BUILT_CLOSED`。
+
+**Deferred G3 — required before any HA receipt is accepted:**
+
+~~~bash
+test -n "${AIOPS_DISCOVERY_SESSION_AUTHORITY_LAB_BINDING:-}"
+scripts/verify-discovery-worker-ha.sh
+git diff --check
+~~~
+
+Expected: two-process takeover/restart/same-session cleanup/pre-terminal response-loss、real binary metrics and zero-projection signed receipt PASS；source remains `PUBLISHED + UNAVAILABLE` and no canary/matrix artifact is created。缺 external authority、mTLS、PostgreSQL restart、second Worker、signer、metrics scrape 或任何 Skip 均不得记录 G3 PASS。
+
+- [ ] **Step 3: Commit**
+
+~~~bash
+git add internal/discoveryworker/metrics.go internal/discoveryworker/metrics_test.go \
+  internal/discoveryqualification/ha.go internal/discoveryqualification/ha_test.go \
+  internal/discoveryworker/production.go internal/discoveryworker/production_test.go \
+  cmd/discovery-worker/production.go cmd/discovery-worker/production_test.go \
+  cmd/discovery-worker/qualification.go cmd/discovery-worker/qualification_test.go \
+  scripts/verify-discovery-worker-ha.sh docs/operations/asset-sources/discovery-worker.md
+git commit -m "test(assetdiscovery): prove provider-neutral worker ha"
+~~~
+
+**Deferred G3/G4 in this corrective:** 本 PR 不执行 Task 29A 或 G3；absence of its current signed receipt keeps every dependent Provider gate closed。
+
+### Task 29B: Signed provider matrix and final E2E CI
+
+**Batch:** C0/C1/Q，1–2 日 assembly plus deferred G4 execution；只能在每个 Phase 1 Provider 的 Task 29A HA receipt 与独立 per-source gate/canary 已合并并真实执行后开始。External CMDB 必须先完成 Task 19B。
+
+**Exact files:**
+- Create: `internal/discoveryqualification/provider_matrix.go`
+- Create: `internal/discoveryqualification/provider_matrix_test.go`
+- Create: `scripts/verify-asset-source-provider-matrix.sh`
+- Create: `docs/operations/asset-sources/provider-gates.md`
+- Create: `web/e2e/source-provider-gates.spec.ts`
+- Modify: `Makefile`
+- Modify: `.github/workflows/ci.yml`
+
+Task 29B 不修改 Task 29A metrics/HA/script/runbook、Task 19A2a schema/domain、Task 19A2b evidence/gate persistence、Task 19A2c API/Worker mode/assembly，或任一 Provider gate/evaluator/canary file。
+
+**Interfaces:**
+- Consumes only already-completed signed safe facts for each exact Provider row：current validation、protocol/negative/DLP/provenance/checkpoint/delete-recovery/rate/backpressure/cleanup、Task 29A `TWO_WORKER_HA` receipt、Provider-owned non-production canary receipt、current atomic gate-evidence pointer and status。It does not call Provider、queue qualification、kill Worker、re-run HA/canary or write a gate。
+- Produces a content-addressed signed final provider acceptance matrix keyed by exact Source/Profile/Revision/binding and receipt digests；missing、expired、drifted or unavailable rows remain explicitly `UNAVAILABLE` and cannot borrow family evidence。The matrix is a release/visibility aggregate, never an admission input.
+
+- [ ] **Step 1: Write failing fail-closed matrix tests**
+
+~~~go
+func TestProviderMatrixNeverTreatsFamilyAsSingleGate(t *testing.T) {
+	matrix := NewProviderMatrix()
+	matrix.Accept(completedReceiptSet("AWS_EC2_V1"))
+	if matrix.Status("AWS_EC2_V1") != "AVAILABLE" || matrix.Status("AZURE_COMPUTE_V1") != "UNAVAILABLE" {
+		t.Fatalf("matrix = %#v", matrix)
+	}
+}
+~~~
+
+Run: `go test ./internal/discoveryqualification -run ProviderMatrix -count=1`
+
+Expected: FAIL because final matrix aggregation does not exist.
+
+- [ ] **Step 2: Aggregate the exact closed row set without rebuilding evidence**
 
 Matrix rows are:
 
@@ -453,33 +558,30 @@ KUBERNETES_OPERATOR            -> Phase 3, UNAVAILABLE here
 AWX_INVENTORY                  -> Phase 5, UNAVAILABLE here
 ~~~
 
-Each Phase 1 row requires current validation, real protocol, negative, DLP, provenance, incremental checkpoint, delete/recovery, rate/backpressure, credential cleanup, two-replica HA/fence and real non-production canary receipts. Receipt expiry/drift changes only that row to unavailable/suspended. UI and API return the same orthogonal status/reason/evidence timestamps.
+Every Phase 1 row must reference the already-open exact per-source gate plus its distinct current HA/canary receipt digests；Task 29B verifies signatures/expiry/Scope/revision/binding equality and signs the aggregate. It cannot synthesize a receipt, call `AdmitGate`, infer a family status or turn a Provider on. UI and API show the same orthogonal status/reason/evidence timestamps.
 
-- [ ] **Step 3: Execute kill/failover/backpressure and full provider E2E**
+- [ ] **Step 3: Run final provider E2E/CI aggregation**
 
-`verify-discovery-worker-ha.sh` starts two real Worker processes and PostgreSQL，then uses only `AIOPS_DISCOVERY_SESSION_AUTHORITY_LAB_BINDING` to connect through Task 28B production client to an already-provisioned real external shared session authority；the script neither starts nor implements that authority and never accepts its endpoint/credential as a flag。It queues validation and discovery for every CI protocol provider，kills the lease owner during Provider read、after final page commit and after `RecordCleanup` but before each of `Delay|Complete|Fail`。Replacement Worker 必须取得一个 reclaim/epoch increment 和 exact cleanup-only `RunCoordinates + CleanupAttempt`，先证明其新 process-local Broker 直接 revoke 会 `ErrAttemptNotFound`，再经 production recovery-open 找回同一外部 session 的 revoke handle；它不得获得 `BoundRuntime`、checkpoint、endpoint 或 credential，随后只完成 revoke/proof/receipt 与 deterministic persisted next intent。The drill proves no duplicate same-Run Observation/relation、one append-only unchanged Observation in a later Run、no stale checkpoint commit、one terminal receipt and correct gate. It separately loses the first `Complete/Fail` response and proves exact receipt-first replay succeeds after `LeaseFence.Destroy` while a changed digest is rejected. It also drifts a Source under an expired lease and proves `ReapDrifted` closes the Run/slot without any Provider call；cleanup uncertainty deterministically yields `FAILED + SUSPENDED`. The owned matrix restarts PostgreSQL/Workers and verifies authority reconnect/recovery through the external lab binding，saturates source/workspace/provider limits and proves durable Provider Retry-After/transport backoff/queue rejection/recovery。Missing/unreachable authority、mTLS failure、Skip 或任何脚本内 shared map/fake proof 均不得算 G3 PASS。
-
-Run:
+`verify-asset-source-provider-matrix.sh` reads only safe receipt/query APIs and opaque lab binding IDs；it does not accept endpoint/credential flags or start any authority/Provider/Worker. It proves changed/expired receipt、family substitution、missing row、matrix signature replay and UI projection fail closed.
 
 ~~~bash
-go test -race ./internal/discoveryworker ./internal/discoveryqueue/... ./internal/assetsource/... -count=1
-test -n "${AIOPS_DISCOVERY_SESSION_AUTHORITY_LAB_BINDING:-}"
-scripts/verify-discovery-worker-ha.sh
+go test -race ./internal/discoveryqualification -run ProviderMatrix -count=1
 scripts/verify-asset-source-provider-matrix.sh
-corepack pnpm@10.34.0 --dir web test:e2e -- --grep "source provider gate|source failover"
-go build ./cmd/discovery-worker
+corepack pnpm@10.34.0 --dir web test:e2e -- --grep "source provider gate"
 git diff --check
 ~~~
 
-Expected: all CI protocol providers pass positive/negative/HA; lab-only canaries are verified by signed receipts; `KUBERNETES_OPERATOR` and `AWX_INVENTORY` remain visibly unavailable; no duplicate mutation, leaked secret or false-green family gate exists.
+Expected: only rows with independently completed gate/canary/HA evidence appear accepted；Kubernetes/AWX remain visibly unavailable here，and no duplicate qualification、gate mutation、leaked secret or false-green family gate exists.
 
 - [ ] **Step 4: Commit**
 
 ~~~bash
-git add internal/discoveryworker/metrics.go internal/discoveryworker/metrics_test.go \
-  scripts/verify-discovery-worker-ha.sh scripts/verify-asset-source-provider-matrix.sh \
-  docs/operations/asset-sources/discovery-worker.md \
+git add internal/discoveryqualification/provider_matrix.go \
+  internal/discoveryqualification/provider_matrix_test.go \
+  scripts/verify-asset-source-provider-matrix.sh \
   docs/operations/asset-sources/provider-gates.md web/e2e/source-provider-gates.spec.ts \
   Makefile .github/workflows/ci.yml
-git commit -m "test(assetdiscovery): prove provider ha and gates"
+git commit -m "test(assetdiscovery): sign final provider matrix"
 ~~~
+
+**Deferred G4 in this corrective:** 本 PR 只冻结无环合同；Task 29B、final E2E/CI 和 matrix signature 未执行，所有 Provider/Worker 继续 `NOT_STARTED/UNAVAILABLE/CLOSED`。
