@@ -2,11 +2,13 @@
 
 > 更新时间：2026-07-17
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前已合并实现基线：[PR #99](https://github.com/seaworld008/aiops-system/pull/99) squash merge `main@0c6b1c5b6e27fff6d3f6e877474531470f0f6cbd`；Pack 06 Task 18A External CMDB paging/checkpoint protocol foundation 及其 merge-late P1 corrective 均为 `BUILT_CLOSED`，Pack 07 Task 20 vSphere fixed client/validation foundation 为 `BUILT_CLOSED/BLOCKED_BY_UNRESOLVED_REVIEW_THREADS`，仍未合并且运行能力关闭。[PR #94](https://github.com/seaworld008/aiops-system/pull/94) 是 PR #92 实现基线 `main@eb3080231c2dc501884fd797f7f6f1bffacc1a23` 之后的独立状态同步文档 commit，已合并为 `main@b65420c4acc391c83c41356e3eab4dafad302ad2`；它不是当前实现基线，也不用于自指本次尚未产生的状态文档 commit
+> 当前已合并实现基线：[PR #101](https://github.com/seaworld008/aiops-system/pull/101) squash merge `origin/main@1bb383cee20df4db70ebb749c26698c4d3cdd3b6`；本次对账目标 PR 在 first-parent 上的顺序精确为 PR #100 → #103 → #102 → #104 → #105 → #96 → #101。Pack 07 Task 20 vSphere fixed client/validation foundation 与 Pack 09 Task 28A provider-neutral Worker core 均已进入主线并保持 `BUILT_CLOSED`；这不表示 Source、Provider、Discovery Worker、HA 或生产资格已经可用
 
 ## 当前结论
 
 可运维资产、受控连接、事件/定时只读调查、受治理生产动作和生产发布运维的设计规范已经确认；八阶段范围仍以完整生产闭环为终点。2026-07-15 起采用[快速开发与真实验收计划](../superpowers/plans/2026-07-15-fast-development-validation-program.md)：189 个旧 Task 不再逐个重复发布级验证，而是聚合为 1–2 日 Batch，按 PR/G1、Batch/G2、Milestone/G3、系统代码完成后真实资格/G4 分层执行。
+
+Codex Review 的到达时序、分级、merge-late 反馈和 corrective 关闭方式只遵循快速计划 [§9.1](../superpowers/plans/2026-07-15-fast-development-validation-program.md#91-codex-review-非阻塞闭环)；本状态页只记录当前 GitHub 事实与已合并纠偏证据，不复制第二套 Review 规则。
 
 开发完成度与运行能力已经分离。当前可以把关闭态代码推进为 `BUILDING_CLOSED`/`BUILT_CLOSED`，也可在稳定 `Produces` 接口合并后并行后继轨道；这不等于阶段验收、Provider 可用或生产上线。所有未通过真实资格门的 Source、Connection、Capability、READ/WRITE admission、Action 和 Release 继续保持 `NOT_STARTED/UNAVAILABLE/CLOSED`。
 
@@ -88,7 +90,19 @@ External CMDB Task 18A Provider protocol foundation 已通过 [PR #98](https://g
 
 PR #98 合并后于 2026-07-17T08:05:33Z 到达的有效 P1 [discussion_r3601450856](https://github.com/seaworld008/aiops-system/pull/98#discussion_r3601450856) 已由 [PR #99](https://github.com/seaworld008/aiops-system/pull/99) 于 2026-07-17T08:27:25Z 正常 squash merge 到 `main@0c6b1c5b6e27fff6d3f6e877474531470f0f6cbd` 修复；该 PR 的 base 为 `b1f608aeedc33e26117708b88c50c3cd9c8baf95`、head 为 `3cbcc346a8b4997a38923c1ec3d5871ebd21d30c`，精确两文件为 `internal/assetsource/externalcmdb/discover.go` 与 `internal/assetsource/externalcmdb/discover_test.go`。真实跨 Run RED 复现首轮持久化 `COMPLETE` checkpoint 后的后续 Run 返回 `DISCOVERY_ALREADY_COMPLETE`；GREEN 覆盖定向及完整 unit、package race、fresh G1、两文件/Secret 边界，最终独立 P0/P1=0。GitHub `go` 于 2026-07-17T08:24:35Z–08:25:24Z `SUCCESS`，合并时无 Review/reviewThreads；修复合并后已用 reply [discussion_r3601594643](https://github.com/seaworld008/aiops-system/pull/98#discussion_r3601594643) 记录证据并 resolve 原 P1。该 corrective 与 Task 18A 均为 `BUILT_CLOSED`；Task 18B/19、PostgreSQL/Worker/HA/恢复、真实 Provider 与 G3/G4 仍 deferred，External CMDB 继续 `UNAVAILABLE/CLOSED`。
 
-vSphere Task 20 fixed client/validation foundation 的 [PR #96](https://github.com/seaworld008/aiops-system/pull/96) 当前为 OPEN、ready，已无冲突 rebase 到 base/merge-base `0c6b1c5b6e27fff6d3f6e877474531470f0f6cbd`，新 head 为 `819babd3ba8f5b6a3c269905b167d8ad548972f2`；range-diff 的三个 commit 逐一等价，精确九文件边界仍为 `go.mod`、`go.sum` 与 `internal/assetsource/vsphere/` 下 `client.go`、`normalize.go`、`normalize_test.go`、`profile.go`、`security_test.go`、`validate.go`、`validate_test.go`。最初独立复核 P0=0/P1=3 的 govmomi 预装 `DialTLSContext`、IPv4 非重叠绕过、`CONTAINS` 父子矩阵/Folder 策略三项已在原九文件内修复并通过相应门；第一条有效 P2 [discussion_r3601367414](https://github.com/seaworld008/aiops-system/pull/96#discussion_r3601367414) 已由等价 corrective 修复并回复，第二条有效 P2 [discussion_r3601449135](https://github.com/seaworld008/aiops-system/pull/96#discussion_r3601449135) 也已在 `validate.go` 与既有 `validate_test.go` 完成 caller cancel/deadline RED→GREEN 并回复。两组 corrective 定向 unit/race、完整 vSphere unit/race、fresh G1、两文件/九文件/Secret/forbidden 边界全部通过，最终自审 P0=0/P1=0，worktree clean；新 GitHub `go` 于 2026-07-17T08:32:31Z–08:32:51Z `SUCCESS`。两条 thread 仍遵守“未合并不得 resolve”规则保持 unresolved，故 mergeState 为 `BLOCKED`；Task 20 已为 `BUILT_CLOSED/BLOCKED_BY_UNRESOLVED_REVIEW_THREADS`，但仍未合并且 vSphere 运行能力继续 `UNAVAILABLE/CLOSED`。
+Discovery Worker/External CMDB ownership contract 已通过 [PR #100](https://github.com/seaworld008/aiops-system/pull/100) 于 2026-07-17T09:37:32Z squash merge 到 `main@569b468c2edf139f36535d9d12c3fb400afe747a`。精确四文件合同冻结 M1E PageCommitter 与已合并 Task 27 Queue/process-local CleanupBroker/Limiter 的唯一 owner，把 Worker 后继拆为 Task 28A provider-neutral core、Task 28B recoverable fixed-mTLS session client/composition、Task 28C registry/production binary，并把 Task 18B 收窄为 External-CMDB-specific durable integration 加唯一 neutral `internal/sourceprofile` descriptor。文档门、四文件边界与 fresh G1 通过；2026-07-17T09:40:03Z 到达的 merge-late Codex P2 由后续 PR #102 持久纠偏。该合同本身不实现或开放 Worker/Provider。
+
+Cleanup open-failure terminalization corrective 已通过 [PR #103](https://github.com/seaworld008/aiops-system/pull/103) 于 2026-07-17T11:33:56Z squash merge 到 `main@f9be70aef395f98c8f2feeae98bf9b2e97c4db3a`，状态为 `BUILT_CLOSED`。精确两文件让 exact Broker attempt 在无 handle 或带 handle 的 open failure 上都封存 signed `UNCERTAIN` proof；带 handle 时只 revoke/destroy 一次，既有 Queue 可据此原子终结为 `FAILED + SUSPENDED`，而不新增 `NO_CREDENTIAL` 或改 Queue/数据库 ABI。CleanupBroker/Queue 定向 unit/race、fresh G1 与人工影响分析通过；真实 PostgreSQL、跨进程恢复、HA 与 G3/G4 未运行，PR 无 Codex Review 或 inline thread。
+
+Source Gate qualification DAG corrective 已通过 [PR #102](https://github.com/seaworld008/aiops-system/pull/102) 于 2026-07-17T12:59:05Z squash merge 到 `main@26d1517bc1a1ade4a2a8fbe9829a2e71bb48eecd`。精确八份规范/计划文件固定无环顺序 `Task 28C → Task 19A → Task 19A2a → Task 19A2b → Task 19A2c → Task 29A → Task 19B → Task 29B`，其中 19A2a/19A2b/19A2c 分别唯一拥有 schema/domain/admission、persistence/runtime rechecks、复用 Task 28A 唯一 loop 的 qualification API/production assembly；Task 29A、Task 19B、Task 29B 分别只拥有 HA receipt/metrics、CMDB canary/evaluator/AdmitGate、最终只读 matrix。文档合同门与 fresh G1 通过，G3/G4 全部 deferred；2026-07-17T12:48:20Z current-head Review 的两个 P2 后由 PR #105 持久关闭，不能把历史 Review 解释为当前实现已完成或 Provider 已可用。
+
+Broker-owned runtime binding corrective 已通过 [PR #104](https://github.com/seaworld008/aiops-system/pull/104) 于 2026-07-17T13:20:36Z squash merge 到 `main@a943cb263c760de056f7100660315eac83594b4c`，状态为 `BUILT_CLOSED`。精确两文件新增可选 `RuntimeSessionHandle` 与 `CleanupBroker.BindAttemptRuntime`：Provider runtime 只能来自 exact Broker-owned session；foreign/reconstructed acknowledgement、binding drift、cleanup-only/closed handle 均关闭，并发/response-loss replay 只 bind 一次，revoke/destroy 清理同一 runtime cell。Cleanup/Source/Queue 定向 race G2 与 fresh G1 通过；2026-07-17T13:16:01Z current-head Codex Review 无重大问题且 inline thread 为 0。Task 28B、真实 Provider、生产装配、HA/恢复与 G3/G4 仍 deferred。
+
+PR #102 post-merge P2 contract corrective 已通过 [PR #105](https://github.com/seaworld008/aiops-system/pull/105) 于 2026-07-17T13:41:52Z squash merge 到 `main@5175e64beb98d648b5a3b4ecc7b617a1f78ef4a2`。精确两份计划文件把 current `000015`/Go vocabulary 与 future Task 19A2a qualification/evidence 合同重新分界，并为 future Task 19B G2 增加 `bash -n`、Web typecheck/lint/production build，而不执行 deferred lab/G4。文档门、两文件边界与 fresh G1 通过；2026-07-17T13:38:32Z current-head Codex Review 无重大问题，PR #105 两条 inline thread 在合并证据回复后均 resolved。该 corrective 不改变任何实现 checkbox 或能力状态。
+
+vSphere Task 20 fixed client/validation foundation 已通过 [PR #96](https://github.com/seaworld008/aiops-system/pull/96) 于 2026-07-17T14:00:30Z squash merge 到 `main@01d6016bdb42ec58d4fc1040e5d99a1fb74192ad`，状态为 `BUILT_CLOSED`。精确九文件固定 `govmomi v0.55.1`、unregistered `VSPHERE_VCENTER_V1` constructor、TLS/vCenter identity-before-login、read privilege floor、bounded probes 与 allow-listed normalization。四个 Codex P2 的 Provider-version/order 分离、caller cancel/deadline、独立 SOAP 调用预算和 typed VM/Host connection-state closure 均已 RED→GREEN；完整 vSphere race G2、受影响合同与 fresh G1 通过，`govulncheck` 因本机未安装明确未记为 PASS。current-head `540424ac9199c87782ec16d14b10ddd8b6cef711` 的 Codex Review 于 2026-07-17T13:54:47Z 确认无重大问题，四条 inline thread 在合并证据回复后全部 resolved。Task 21/22、Provider registration、Worker、gate、HA/canary 与 G3/G4 均未完成，vSphere 继续 `UNAVAILABLE/CLOSED`。
+
+Task 28A provider-neutral Discovery Worker core 已通过 [PR #101](https://github.com/seaworld008/aiops-system/pull/101) 于 2026-07-17T14:47:05Z squash merge 到当前 `origin/main@1bb383cee20df4db70ebb749c26698c4d3cdd3b6`，状态为 `BUILT_CLOSED`。精确四文件稳定产出 `discoveryworker.New(Dependencies)`、`Worker.Run/Stop`、attempt-bound `ClaimRuntimeResolver` 与 opaque `ClaimRuntime`，并固定 `ReserveCleanupAttempt → OpenAttempt → BindAttemptRuntime → ResolveOpenedAttempt → Provider → runtime clear → same-attempt revoke/proof → RecordCleanup`；provider、cleanup-only、terminal、Validation/data、Page/Delay XOR、fence/runtime-cell drift、panic/cancel、response-loss 和敏感序列化边界由同一 loop 处理。六包普通/race G2、Cleanup/Queue corrective regressions、fresh G1、四文件/Secret 边界通过；current head `c766ca6100508143ca0f81c1ad91a4553771c30e` 的 Codex Review 于 2026-07-17T14:44:58Z 确认无重大问题，全部 6 条 inline thread 当前均 resolved，不把旧 head Review 误记为当前未修复。真实 PostgreSQL/Provider integration、Task 18B/28B/28C、`cmd/discovery-worker`、HA/restart/recovery 与 G3/G4 仍 deferred。
 
 ## 当前实施进度
 
@@ -106,6 +120,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 ## 已存在的代码事实
 
 - Go 模块、Control Plane、Worker、READ/WRITE Runner、Executor 及调查/执行基础包已经存在。
+- `origin/main` 已有 `internal/discoveryworker` provider-neutral core，但还没有 `cmd/discovery-worker`、Provider registry、production constructor、recoverable session transport 或任何已开门的 Source/Provider runtime。
 - 生产部署基线仍到 `000014_read_evidence_clock_skew`；仓库 `main` 已包含尚未生产部署的 `000015_assets_catalog`。先前 Step 8 的缺失矩阵已闭合并重新独立验收；当前只对环境映射枚举 parity 做定向修正。
 - 现有架构包含 OIDC、策略、Action/Execution、credential revocation、mTLS Runner Gateway、调查 Runtime/Target/Connector/Evidence 和 Temporal 编排基础。
 - `000008` 的生产 WRITE 关闭约束仍是安全基线；在 Phase 7 的逐 Action 门禁正式验收前不得移除。
@@ -153,7 +168,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
 | 现有调查/执行内核 | 基线存在 | 以现有测试、迁移和 V3 文档为准 |
-| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J/Session C0/Credential Trace C0/TypeScript C0/M1I Web Foundation/Source Revision/Create/Profile Registry/M1I Asset Catalog UI/Mapping Workbench/Navigation Scope corrective/Task 14 Source API/Task 15A CSV parser/CSV Profile Registry+runtime admission/Task 12 Source inventory/External CMDB Task 17/PR #95 Review corrective/External CMDB Task 18A/PR #99 corrective/vSphere Task 20）/ BLOCKED_BY_UNRESOLVED_REVIEW_THREADS / UNAVAILABLE | Task 18A 只完成 Provider protocol foundation，PR #99 已关闭 merge-late P1；Task 18B/19 与完整 CMDB PostgreSQL/Worker 闭环仍 deferred。PR #96 Task 20 已完成 final rebase 与 GitHub `go`，但仍未合并且两条 threads unresolved。CSV/CMDB/vSphere runtime、Task 15B、Discovery Worker、真实 Provider gate 与运行资格仍未完成 |
+| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J/Session C0/Credential Trace C0/TypeScript C0/M1I Web Foundation/Source Revision/Create/Profile Registry/M1I Asset Catalog UI/Mapping Workbench/Navigation Scope corrective/Task 14 Source API/Task 15A CSV parser/CSV Profile Registry+runtime admission/Task 12 Source inventory/External CMDB Task 17/PR #95 Review corrective/External CMDB Task 18A/PR #99 corrective/PR #100/#102/#105 ownership contracts/PR #103/#104 Broker correctives/vSphere Task 20/Task 28A Worker core）/ UNAVAILABLE | Task 18B 正在独立轨道推进但尚无合并事实；Task 28B 必须等待其 stable `Produces`。vSphere 只合并 Task 20，Task 21/22 尚无主线实现。Task 28A 只有 provider-neutral core，尚无 transport/registry/binary/Provider integration。CSV/CMDB/vSphere 实际运行、Task 15B、Discovery Worker 生产运行、真实 Provider gate、HA 与 G3/G4 资格仍为 `NOT_STARTED/UNAVAILABLE/CLOSED` |
 | Connection 修订/验证/发布 | NOT_STARTED | 等待 Phase 2 |
 | VictoriaMetrics/Logs/Traces 全家桶 | NOT_STARTED | 等待 Phase 3 |
 | 事件/定时主动只读调查 | NOT_STARTED | 等待 Phase 4 |
@@ -173,15 +188,16 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 
 ## 下一步
 
-基于当前已合并实现基线 `main@0c6b1c5b6e27fff6d3f6e877474531470f0f6cbd`，后续工作按以下关闭边界推进：
+基于当前已合并实现基线 `origin/main@1bb383cee20df4db70ebb749c26698c4d3cdd3b6`，后续工作按以下关闭边界推进：
 
-- Pack 06 Task 18A External CMDB paging/checkpoint protocol foundation 与 PR #99 corrective 均为 `BUILT_CLOSED`：只完成固定 `CAPABILITIES → ASSETS → RELATIONS → COMPLETE`、私有 canonical checkpoint、排序/authority/snapshot continuity、严格 `Page|Delay`、真实 TLS wire fixture，以及跨 Run `COMPLETE` checkpoint 重新开始同步的纠偏；原 P1 已回复并 resolved。Task 18B/19 及 PostgreSQL/Worker/HA/恢复/真实 gate 仍 deferred，不得把纠偏合并解释为 Source 可用。
-- Pack 07 Task 20 vSphere fixed client/validation foundation 的 PR #96 为 `BUILT_CLOSED/BLOCKED_BY_UNRESOLVED_REVIEW_THREADS`：final rebase、等价性核验、corrective 门与 GitHub `go` 均已通过，但两条已修复并回复的 threads 遵守规则仍 unresolved；本状态任务不替其 resolve 或 merge。该 Batch 仍只构建 exact `VSPHERE_VCENTER_V1` fixed client、vCenter identity/privilege validation 与安全 normalization foundation；不注册 Source Profile，不实现 Task 21 full/delta checkpoint、Task 22 canary/gate 或 Worker，合并前 vSphere 主线能力继续 `NOT_STARTED/UNAVAILABLE/CLOSED`。
+- Pack 06 Task 18B 从最新 main 在独立可见轨道推进，当前只可记为 active/in-progress，尚无合并或验收事实。它只能消费 Task 18A、M1E/Task 27 与已合并 Task 28A 的 stable `Produces`，拥有 External-CMDB-specific durable reconciliation/lifecycle integration 和唯一 neutral descriptor；不得重建 Queue、Worker、PageCommitter、Limiter、CleanupBroker 或 production binary。
+- Pack 09 Task 28B 必须等待 Task 18B stable `Produces` 合并后再开始；随后 Task 28C 才可消费已合并 28A/28B 与 Provider descriptor 组装 registry/production binary。Task 19A/19A2a/19A2b/19A2c、Task 29A、Task 19B、Task 29B 继续严格按已合并 DAG 门禁推进，不得并行读取未合并内部实现或提前生成 HA/canary/gate/matrix 证据。
+- Pack 07 当前主线只有 Task 20 foundation；Task 21 的 full/delta inventory/checkpoint 代码没有已合并实现，也未满足真实 session-continuity 入口。相关三文档 corrective 仍在独立未合并轨道，其尚未持久化设计不能写成已批准事实。Task 22 canary/gate 与 vSphere registry/Worker/HA 继续 `NOT_STARTED/UNAVAILABLE/CLOSED`。
 
 Task 15B importer/quarantine/detached signature/HTTP/Worker 尚未启动，并且 quarantine object metadata、签名 verifier 与可信存储真值仍需要单独 C0 边界；不得用内存对象、fake storage 或测试 verifier 冒充生产实现。sealed checkpoint、fenced orchestration/Reconciler、durable backpressure 与 cleanup 也继续 `NOT_STARTED/UNAVAILABLE/CLOSED`。
 
-External CMDB Task 18B 的 PostgreSQL PageCommitter/projection、Queue/Worker、lease/fence、missing detection、deletion/restore、crash/reclaim、HA/recovery，Task 19 的真实 staging canary/per-source availability gate，以及 server-installed registry/creation admission、vSphere Task 21/22、全部真实 Provider 与 PG/Worker 资格仍为 deferred，并保持 `NOT_STARTED/UNAVAILABLE/CLOSED`。
+本状态同步启动门于 2026-07-17 核验时，GitHub 唯一 open PR 是 Dependabot [#23](https://github.com/seaworld008/aiops-system/pull/23)；版本基线与依赖升级另有 owner，本状态轨道不处理它，也不把它计作当前实现 Batch。
 
-所有 Provider/Source、前端真实浏览器和生产资格继续 `UNAVAILABLE/CLOSED`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、Keycloak/浏览器、Playwright/axe 和发布资格均为 deferred，不得解释为 PASS。
+所有 Source/Provider/Discovery Worker 的实际运行、HA、前端真实浏览器和生产资格继续 `NOT_STARTED/UNAVAILABLE/CLOSED`；G3/G4 的全仓 race、真实 Provider、HA、恢复、安全、Keycloak/浏览器、Playwright/axe 和发布资格均为 deferred，不得解释为 PASS。
 
 任何阶段出现 Scope/身份/计划/Runtime/策略/Kill Switch/credential 漂移、依赖不可用、Secret 风险或结果不确定时，保持在最后已验收状态并停止升级，不得用人工口头确认替代持久证据。
