@@ -21,18 +21,27 @@ export type DraftGuardRegistration = {
 type ScopeRuntimeValue = {
   scope: Scope;
   requestScopeChange: (scope: Scope) => void;
+  requestNavigation: (targetURL: string) => void;
   registerDraftGuard: (registration: DraftGuardRegistration) => () => void;
 };
 
-type ScopeRuntimeProviderProps = PropsWithChildren<ScopeRuntimeValue>;
+type ScopeRuntimeProviderProps = PropsWithChildren<
+  Omit<ScopeRuntimeValue, "requestNavigation"> & {
+    requestNavigation?: ScopeRuntimeValue["requestNavigation"];
+  }
+>;
 
 const ScopeRuntimeContext = createContext<ScopeRuntimeValue | undefined>(
   undefined,
 );
 
+const failClosedNavigation: ScopeRuntimeValue["requestNavigation"] = () =>
+  undefined;
+
 export function ScopeRuntimeProvider({
   scope,
   requestScopeChange,
+  requestNavigation = failClosedNavigation,
   registerDraftGuard,
   children,
 }: ScopeRuntimeProviderProps) {
@@ -42,6 +51,7 @@ export function ScopeRuntimeProvider({
       value: {
         scope,
         requestScopeChange,
+        requestNavigation,
         registerDraftGuard,
       },
     },
@@ -51,10 +61,10 @@ export function ScopeRuntimeProvider({
 
 export function useScope(): Pick<
   ScopeRuntimeValue,
-  "scope" | "requestScopeChange"
+  "scope" | "requestScopeChange" | "requestNavigation"
 > {
-  const { scope, requestScopeChange } = useScopeRuntime();
-  return { scope, requestScopeChange };
+  const { scope, requestScopeChange, requestNavigation } = useScopeRuntime();
+  return { scope, requestScopeChange, requestNavigation };
 }
 
 export function useDraftGuard(

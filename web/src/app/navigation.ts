@@ -24,8 +24,13 @@ export const navigationGroups: readonly NavigationGroup[] = [
   {
     label: "资产与连接",
     items: [
-      { label: "资产目录", path: "/assets", phase: "后续阶段", enabled: false },
-      { label: "映射工作台", path: "/asset-mappings", phase: "后续阶段", enabled: false },
+      { label: "资产目录", path: "/assets", phase: "关闭态页面", enabled: true },
+      {
+        label: "映射工作台",
+        path: "/asset-mappings",
+        phase: "关闭态页面",
+        enabled: true,
+      },
       { label: "连接与数据源", path: "/connections", phase: "后续阶段", enabled: false },
       { label: "发现与同步", path: "/asset-sources", phase: "后续阶段", enabled: false },
       {

@@ -29,6 +29,17 @@ type ScopeTransition = {
   targetURL?: string;
 };
 
+type PendingTransition =
+  | {
+      kind: "scope";
+      transition: ScopeTransition;
+    }
+  | {
+      kind: "navigation";
+      targetURL: string;
+      preserveTargetSearch: boolean;
+    };
+
 const scopeSpecificSearchKeys = [
   "cursor",
   "trail",
@@ -50,9 +61,13 @@ export function ScopeProvider({
   const [scope, setScope] = useState<Scope | undefined>(() =>
     initialScope(session),
   );
-  const [pending, setPending] = useState<ScopeTransition | undefined>();
+  const [pending, setPending] = useState<PendingTransition | undefined>();
+  const [discardState, setDiscardState] = useState<
+    "confirm" | "verifying" | "blocked"
+  >("confirm");
   const draftGuards = useRef(new Set<DraftGuardRegistration>());
   const currentURL = useRef(window.location.href);
+  const providerDirty = useRef(isDirty);
   const registerDraftGuard = useCallback(
     (registration: DraftGuardRegistration) => {
       draftGuards.current.add(registration);
@@ -70,6 +85,80 @@ export function ScopeProvider({
       ),
     [isDirty],
   );
+  const discardDirtyDrafts = useCallback(async (): Promise<boolean> => {
+    const dirtyRegistrations: DraftGuardRegistration[] = [];
+    for (const registration of draftGuards.current) {
+      try {
+        if (registration.isDirty()) {
+          dirtyRegistrations.push(registration);
+        }
+      } catch {
+        return false;
+      }
+    }
+    try {
+      onDiscardDraft?.();
+      for (const registration of dirtyRegistrations) {
+        registration.discard();
+      }
+    } catch {
+      return false;
+    }
+    await new Promise<void>((resolve) => {
+      window.setTimeout(resolve, 0);
+    });
+    let allDraftsClean = !providerDirty.current;
+    for (const registration of draftGuards.current) {
+      try {
+        if (registration.isDirty()) {
+          allDraftsClean = false;
+        }
+      } catch {
+        allDraftsClean = false;
+      }
+    }
+    return allDraftsClean;
+  }, [onDiscardDraft]);
+  const confirmDraftDiscard = useCallback(async (): Promise<boolean> => {
+    setDiscardState("verifying");
+    if (await discardDirtyDrafts()) {
+      return true;
+    }
+    setDiscardState("blocked");
+    return false;
+  }, [discardDirtyDrafts]);
+
+  useEffect(() => {
+    providerDirty.current = isDirty;
+  }, [isDirty]);
+
+  useEffect(() => {
+    const history = window.history;
+    const originalPushState = history.pushState.bind(history);
+    const originalReplaceState = history.replaceState.bind(history);
+    const trackedPushState: History["pushState"] = (data, unused, url) => {
+      originalPushState(data, unused, url);
+      currentURL.current = window.location.href;
+    };
+    const trackedReplaceState: History["replaceState"] = (
+      data,
+      unused,
+      url,
+    ) => {
+      originalReplaceState(data, unused, url);
+      currentURL.current = window.location.href;
+    };
+    history.pushState = trackedPushState;
+    history.replaceState = trackedReplaceState;
+    return () => {
+      if (history.pushState === trackedPushState) {
+        history.pushState = originalPushState;
+      }
+      if (history.replaceState === trackedReplaceState) {
+        history.replaceState = originalReplaceState;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (scope !== undefined) {
@@ -83,7 +172,10 @@ export function ScopeProvider({
     }
   }, [scope]);
 
-  const applyScope = useCallback(async (transition: ScopeTransition) => {
+  const applyScope = useCallback(async (
+    transition: ScopeTransition,
+    discardDrafts: boolean,
+  ) => {
     const previous = scope;
     if (previous === undefined) {
       return;
@@ -98,6 +190,7 @@ export function ScopeProvider({
           );
     if (destination === undefined) {
       replaceHistoryURL(currentURL.current);
+      setDiscardState("confirm");
       setPending(undefined);
       return;
     }
@@ -106,7 +199,11 @@ export function ScopeProvider({
       new URL(window.location.href).href !== destination.href
     ) {
       replaceHistoryURL(currentURL.current);
+      setDiscardState("confirm");
       setPending(undefined);
+      return;
+    }
+    if (discardDrafts && !(await confirmDraftDiscard())) {
       return;
     }
     await queryClient.cancelQueries({
@@ -119,24 +216,68 @@ export function ScopeProvider({
         query.queryKey[1] === previous.workspaceId &&
         query.queryKey[2] === previous.environmentId,
     });
-    try {
-      onDiscardDraft?.();
-      for (const registration of draftGuards.current) {
-        if (draftIsDirty(registration)) {
-          registration.discard();
-        }
-      }
-    } catch {
-      setPending(undefined);
-      return;
-    }
     if (transition.history === "push") {
       window.history.pushState(window.history.state, "", destination.href);
     }
     currentURL.current = destination.href;
     setScope(transition.next);
+    setDiscardState("confirm");
     setPending(undefined);
-  }, [onDiscardDraft, queryClient, scope, session]);
+  }, [confirmDraftDiscard, queryClient, scope, session]);
+
+  const applyNavigation = useCallback(
+    async (
+      targetURL: string,
+      discardDrafts: boolean,
+      preserveTargetSearch: boolean,
+    ) => {
+      if (scope === undefined) {
+        return;
+      }
+      const destination = preserveTargetSearch
+        ? validatedTransitionURL(session, scope, targetURL)
+        : validatedNavigationURL(session, scope, targetURL);
+      if (destination === undefined) {
+        setDiscardState("confirm");
+        setPending(undefined);
+        return;
+      }
+      if (discardDrafts && !(await confirmDraftDiscard())) {
+        return;
+      }
+      currentURL.current = destination.href;
+      setDiscardState("confirm");
+      setPending(undefined);
+      window.history.pushState(window.history.state, "", destination.href);
+    },
+    [confirmDraftDiscard, scope, session],
+  );
+
+  const requestNavigation = useCallback(
+    (targetURL: string) => {
+      if (scope === undefined) {
+        return;
+      }
+      const destination = validatedNavigationURL(session, scope, targetURL);
+      if (
+        destination === undefined ||
+        destination.href === new URL(window.location.href).href
+      ) {
+        return;
+      }
+      if (hasDirtyDraft()) {
+        setDiscardState("confirm");
+        setPending({
+          kind: "navigation",
+          targetURL: destination.href,
+          preserveTargetSearch: false,
+        });
+        return;
+      }
+      void applyNavigation(destination.href, false, false);
+    },
+    [applyNavigation, hasDirtyDraft, scope, session],
+  );
 
   const requestScopeChange = (next: Scope) => {
     if (scope === undefined) {
@@ -159,10 +300,14 @@ export function ScopeProvider({
       history: "push",
     };
     if (hasDirtyDraft()) {
-      setPending(transition);
+      setDiscardState("confirm");
+      setPending({
+        kind: "scope",
+        transition,
+      });
       return;
     }
-    void applyScope(transition);
+    void applyScope(transition, false);
   };
 
   useEffect(() => {
@@ -177,23 +322,40 @@ export function ScopeProvider({
         return;
       }
       if (sameScope(scope, next)) {
+        if (hasDirtyDraft()) {
+          replaceHistoryURL(currentURL.current);
+          setDiscardState("confirm");
+          setPending({
+            kind: "navigation",
+            targetURL: targetURL.href,
+            preserveTargetSearch: true,
+          });
+          return;
+        }
         currentURL.current = targetURL.href;
         return;
       }
       if (hasDirtyDraft()) {
         replaceHistoryURL(currentURL.current);
+        setDiscardState("confirm");
         setPending({
-          next,
-          history: "push",
-          targetURL: targetURL.href,
+          kind: "scope",
+          transition: {
+            next,
+            history: "push",
+            targetURL: targetURL.href,
+          },
         });
         return;
       }
-      void applyScope({
-        next,
-        history: "preserve",
-        targetURL: targetURL.href,
-      });
+      void applyScope(
+        {
+          next,
+          history: "preserve",
+          targetURL: targetURL.href,
+        },
+        false,
+      );
     };
     window.addEventListener("popstate", handlePopState);
     return () => {
@@ -214,13 +376,15 @@ export function ScopeProvider({
     <ScopeRuntimeProvider
       scope={scope}
       requestScopeChange={requestScopeChange}
+      requestNavigation={requestNavigation}
       registerDraftGuard={registerDraftGuard}
     >
       {children}
       <AlertDialog.Root
         open={pending !== undefined}
         onOpenChange={(open) => {
-          if (!open) {
+          if (!open && discardState !== "verifying") {
+            setDiscardState("confirm");
             setPending(undefined);
           }
         }}
@@ -231,26 +395,54 @@ export function ScopeProvider({
             className="dialog-content"
             aria-describedby="scope-switch-description"
           >
-            <AlertDialog.Title>切换作用域</AlertDialog.Title>
+            <AlertDialog.Title>
+              {discardState === "blocked"
+                ? "无法安全离开当前页面"
+                : pending?.kind === "navigation"
+                  ? "离开当前页面"
+                  : "切换作用域"}
+            </AlertDialog.Title>
             <AlertDialog.Description id="scope-switch-description">
-              当前存在未保存草稿。切换会只放弃本地草稿，并清理旧作用域查询。
+              {discardState === "blocked"
+                ? "当前操作仍在提交或草稿无法安全丢弃。为避免中断治理操作，已阻止离开当前页面。"
+                : discardState === "verifying"
+                  ? "正在确认草稿已安全丢弃；完成前不会离开当前页面。"
+                  : pending?.kind === "navigation"
+                    ? "当前存在未保存草稿。前往其他页面会只放弃本地草稿。"
+                    : "当前存在未保存草稿。切换会只放弃本地草稿，并清理旧作用域查询。"}
             </AlertDialog.Description>
             <div className="dialog-actions">
-              <AlertDialog.Cancel asChild>
-                <button type="button">取消</button>
-              </AlertDialog.Cancel>
-              <AlertDialog.Action asChild>
+              {discardState !== "verifying" ? (
+                <AlertDialog.Cancel asChild>
+                  <button type="button">
+                    {discardState === "blocked" ? "留在当前页面" : "取消"}
+                  </button>
+                </AlertDialog.Cancel>
+              ) : (
+                <button type="button" disabled>
+                  正在确认草稿状态
+                </button>
+              )}
+              {discardState === "confirm" ? (
                 <button
                   type="button"
                   onClick={() => {
-                    if (pending !== undefined) {
-                      void applyScope(pending);
+                    if (pending?.kind === "navigation") {
+                      void applyNavigation(
+                        pending.targetURL,
+                        true,
+                        pending.preserveTargetSearch,
+                      );
+                    } else if (pending?.kind === "scope") {
+                      void applyScope(pending.transition, true);
                     }
                   }}
                 >
-                  放弃并切换
+                  {pending?.kind === "navigation"
+                    ? "放弃并前往"
+                    : "放弃并切换"}
                 </button>
-              </AlertDialog.Action>
+              ) : null}
             </div>
           </AlertDialog.Content>
         </AlertDialog.Portal>
@@ -319,6 +511,23 @@ function validatedTransitionURL(
   ) {
     return undefined;
   }
+  return url;
+}
+
+function validatedNavigationURL(
+  session: Session,
+  scope: Scope,
+  value: string,
+): URL | undefined {
+  const url = validatedTransitionURL(session, scope, value);
+  if (url === undefined) {
+    return undefined;
+  }
+  url.search = new URLSearchParams({
+    workspace: scope.workspaceId,
+    environment: scope.environmentId,
+  }).toString();
+  url.hash = "";
   return url;
 }
 

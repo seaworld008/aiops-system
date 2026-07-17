@@ -15,7 +15,7 @@ type AppShellProps = PropsWithChildren<{
 
 export function AppShell({ session, children }: AppShellProps) {
   const mainRef = useRef<HTMLElement>(null);
-  const { scope, requestScopeChange } = useScope();
+  const { scope, requestScopeChange, requestNavigation } = useScope();
   const username = session.username === "" ? session.subject : session.username;
 
   return (
@@ -42,13 +42,37 @@ export function AppShell({ session, children }: AppShellProps) {
               <ul>
                 {group.items.map((item) => (
                   <li key={item.path}>
-                    <span
-                      aria-disabled={!item.enabled}
-                      className={styles.disabledNavigationItem}
-                    >
-                      <span>{item.label}</span>
-                      <small>{item.phase}</small>
-                    </span>
+                    {item.enabled ? (
+                      <a
+                        className={styles.disabledNavigationItem}
+                        href={scopedNavigationHref(item.path, scope)}
+                        onClick={(event) => {
+                          if (
+                            event.defaultPrevented ||
+                            event.button !== 0 ||
+                            event.metaKey ||
+                            event.ctrlKey ||
+                            event.shiftKey ||
+                            event.altKey
+                          ) {
+                            return;
+                          }
+                          event.preventDefault();
+                          requestNavigation(event.currentTarget.href);
+                        }}
+                      >
+                        <span>{item.label}</span>
+                        <small>{item.phase}</small>
+                      </a>
+                    ) : (
+                      <span
+                        aria-disabled="true"
+                        className={styles.disabledNavigationItem}
+                      >
+                        <span>{item.label}</span>
+                        <small>{item.phase}</small>
+                      </span>
+                    )}
                   </li>
                 ))}
               </ul>
@@ -107,4 +131,18 @@ export function AppShell({ session, children }: AppShellProps) {
       </main>
     </div>
   );
+}
+
+function scopedNavigationHref(
+  path: string,
+  scope: {
+    workspaceId: string;
+    environmentId: string;
+  },
+): string {
+  const search = new URLSearchParams({
+    workspace: scope.workspaceId,
+    environment: scope.environmentId,
+  });
+  return `${path}?${search.toString()}`;
 }
