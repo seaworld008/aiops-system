@@ -50,7 +50,7 @@ func TestValidateRequiresPinnedAuthorityAndReadOnlyCapabilities(t *testing.T) {
 	})
 	provider := newProviderForServer(t, server, expectedAuthority("cmdb-production-01"))
 	proof, err := provider.Validate(context.Background(), server.Runtime(), validValidationRequest())
-	if err != nil || proof.Outcome != assetcatalog.ValidationOutcomeFailed || proof.Code != "AUTHORITY_MISMATCH" {
+	if err != nil || proof.Outcome != assetcatalog.ValidationOutcomeFailed || proof.Code != "AUTHORITY_REJECTED" {
 		t.Fatalf("Validate = (%#v, %v)", proof, err)
 	}
 }
@@ -74,7 +74,7 @@ Expected: FAIL because the CMDB provider and protocol contract do not exist.
 The protocol contract allows only stable fields:
 
 ~~~text
-Capability: protocol_version, authority_id, snapshot_epoch, max_page_size,
+Capability: protocol_version, authority_id, permissions, snapshot_epoch, max_page_size,
             supports_delta, supports_tombstone, server_time
 Asset: external_id, type_code, display_name, object_revision_positive_int64, updated_at,
        deleted, tombstone_reason, attributes{allow-listed code:string}
