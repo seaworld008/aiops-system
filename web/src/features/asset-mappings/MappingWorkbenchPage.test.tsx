@@ -201,13 +201,15 @@ function defaultSearch(
 function renderWorkbench(
   page: AssetConflictPage = conflictPage,
   search: MappingSearch = defaultSearch(),
+  onListRequest?: (url: URL) => void,
 ) {
   testServer.use(
-    http.get(conflictListPath, () =>
-      HttpResponse.json(page, {
+    http.get(conflictListPath, ({ request }) => {
+      onListRequest?.(new URL(request.url));
+      return HttpResponse.json(page, {
         headers: { "X-Trace-ID": traceID },
-      }),
-    ),
+      });
+    }),
   );
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -273,7 +275,10 @@ function renderWorkbench(
   };
 }
 
-async function completeConfirmExactForm(user: ReturnType<typeof userEvent.setup>) {
+async function completeConfirmExactForm(
+  user: ReturnType<typeof userEvent.setup>,
+  conflictCount = 1,
+) {
   await user.selectOptions(
     screen.getByLabelText("Binding Role"),
     "PRIMARY_RUNTIME",
@@ -284,7 +289,10 @@ async function completeConfirmExactForm(user: ReturnType<typeof userEvent.setup>
   );
   await user.click(
     screen.getByRole("checkbox", {
-      name: "我已审阅受影响的连接与策略",
+      name:
+        conflictCount > 1
+          ? `我已逐项审阅全部 ${conflictCount} 项冲突及其受影响的连接与策略`
+          : "我已审阅受影响的连接与策略",
     }),
   );
 }
@@ -367,6 +375,74 @@ describe("MappingWorkbenchPage", () => {
     expect(changed.status).toEqual(["REJECTED"]);
     expect(changed.cursor).toBeUndefined();
     expect(changed.conflictId).toBeUndefined();
+  });
+
+  it("把 risk、Service 和 age 限定为当前服务端页并安全提示后续 cursor", async () => {
+    let requestedURL: URL | undefined;
+    renderWorkbench(
+      {
+        items: [baseConflict],
+        page: { next_cursor: "cursor-with-later-matches" },
+      },
+      defaultSearch({
+        status: ["OPEN", "REJECTED"],
+        risk: ["CRITICAL"],
+        source: sourceID,
+        service: secondConflictID,
+        age: "OVER_30D",
+      }),
+      (url) => {
+        requestedURL = url;
+      },
+    );
+
+    expect(
+      await screen.findByText(
+        "风险、Service 和等待时长仅筛选当前服务端页；Source 和状态由服务端筛选。",
+      ),
+    ).toBeVisible();
+    expect(
+      await screen.findByText(
+        "当前服务端页没有匹配项；这不表示全部冲突均无匹配。后续 cursor 页可能仍有匹配，请继续下一页审阅。",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "下一页" }),
+    ).toBeEnabled();
+
+    await waitFor(() => {
+      expect(requestedURL).toBeDefined();
+    });
+    expect(requestedURL?.searchParams.get("source_id")).toBe(
+      sourceID,
+    );
+    expect(requestedURL?.searchParams.get("statuses")).toBe(
+      "OPEN,REJECTED",
+    );
+    expect(
+      Array.from(requestedURL?.searchParams.keys() ?? []).sort(),
+    ).toEqual([
+      "environment_id",
+      "limit",
+      "source_id",
+      "statuses",
+    ]);
+  });
+
+  it("服务端空页存在 next cursor 时仍提示继续审阅", async () => {
+    renderWorkbench({
+      items: [],
+      page: { next_cursor: "cursor-after-empty-page" },
+    });
+
+    expect(
+      await screen.findByText(
+        "当前服务端页没有冲突或未解析项；后续 cursor 页可能仍有匹配，请继续下一页审阅。",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "下一页" }),
+    ).toBeEnabled();
   });
 
   it("无服务端有效动作时只读比较且不暴露 fingerprint 或隐式决定", async () => {
@@ -649,6 +725,69 @@ describe("MappingWorkbenchPage", () => {
     });
   });
 
+  it("批量决定逐项展示全部冲突影响并要求复核全部项", async () => {
+    const user = userEvent.setup();
+    const second = conflict(secondConflictID, "payments-api-02", {
+      impact_counts: {
+        asset_active_bindings: 9,
+        asset_active_relationships: 8,
+        candidate_asset_active_bindings: 7,
+        candidate_asset_active_relationships: 6,
+        candidate_service_active_bindings: 5,
+      },
+    });
+    renderWorkbench({
+      items: [baseConflict, second],
+      page: { next_cursor: null },
+    });
+
+    for (const item of [baseConflict, second]) {
+      await user.click(
+        await screen.findByRole("checkbox", {
+          name: `选择冲突 ${item.asset.display_name}`,
+        }),
+      );
+    }
+    await user.click(
+      screen.getByRole("button", {
+        name: "批量拒绝候选",
+      }),
+    );
+
+    const dialog = screen.getByRole("alertdialog");
+    for (const item of [baseConflict, second]) {
+      expect(
+        within(dialog).getByText(item.asset.display_name),
+      ).toBeVisible();
+      expect(within(dialog).getByText(item.id)).toBeVisible();
+    }
+    expect(
+      within(dialog).getByText(
+        "现有 Binding 1；现有关系 2；候选 Binding 1；候选关系 1；Service Binding 2",
+      ),
+    ).toBeVisible();
+    expect(
+      within(dialog).getByText(
+        "现有 Binding 9；现有关系 8；候选 Binding 7；候选关系 6；Service Binding 5",
+      ),
+    ).toBeVisible();
+
+    await user.type(
+      within(dialog).getByLabelText("审计原因代码"),
+      "GOVERNANCE_REVIEWED",
+    );
+    const submit = within(dialog).getByRole("button", {
+      name: "确认并记录决定",
+    });
+    expect(submit).toBeDisabled();
+    await user.click(
+      within(dialog).getByRole("checkbox", {
+        name: "我已逐项审阅全部 2 项冲突及其受影响的连接与策略",
+      }),
+    );
+    expect(submit).toBeEnabled();
+  });
+
   it.each([409, 403] as const)(
     "batch 在首个 %s 失败时停止后项且不自动重放",
     async (failureStatus) => {
@@ -699,7 +838,7 @@ describe("MappingWorkbenchPage", () => {
           name: "批量确认精确映射",
         }),
       );
-      await completeConfirmExactForm(user);
+      await completeConfirmExactForm(user, conflicts.length);
       await user.click(
         screen.getByRole("button", {
           name: "确认并记录决定",
@@ -901,6 +1040,11 @@ describe("MappingWorkbenchPage", () => {
       "GOVERNANCE_REVIEWED",
     );
     await user.click(
+      screen.getByRole("checkbox", {
+        name: `我已逐项审阅全部 ${conflicts.length} 项冲突及其受影响的连接与策略`,
+      }),
+    );
+    await user.click(
       screen.getByRole("button", {
         name: "确认并记录决定",
       }),
@@ -1028,7 +1172,7 @@ describe("MappingWorkbenchPage", () => {
           name: "批量确认精确映射",
         }),
       );
-      await completeConfirmExactForm(user);
+      await completeConfirmExactForm(user, conflicts.length);
       await user.click(
         screen.getByRole("button", {
           name: "确认并记录决定",

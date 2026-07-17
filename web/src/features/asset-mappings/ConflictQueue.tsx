@@ -18,6 +18,8 @@ export type ConflictQueueProps = {
   batchSelectedIds: ReadonlySet<string>;
   navigationBlocked: boolean;
   resolveControlsAvailable: boolean;
+  currentPageFiltersActive: boolean;
+  hasNextPage: boolean;
   onSelect: (conflictId: string) => void;
   onBatchSelectionChange: (
     conflictId: string,
@@ -31,6 +33,8 @@ export function ConflictQueue({
   batchSelectedIds,
   navigationBlocked,
   resolveControlsAvailable,
+  currentPageFiltersActive,
+  hasNextPage,
   onSelect,
   onBatchSelectionChange,
 }: ConflictQueueProps) {
@@ -81,7 +85,13 @@ export function ConflictQueue({
       </header>
       {conflicts.length === 0 ? (
         <p role="status" className={styles.emptyState}>
-          当前筛选没有冲突或未解析项。
+          {hasNextPage
+            ? currentPageFiltersActive
+              ? "当前服务端页没有匹配项；这不表示全部冲突均无匹配。后续 cursor 页可能仍有匹配，请继续下一页审阅。"
+              : "当前服务端页没有冲突或未解析项；后续 cursor 页可能仍有匹配，请继续下一页审阅。"
+            : currentPageFiltersActive
+              ? "当前服务端页没有匹配项；风险、Service 和等待时长未执行跨页聚合。"
+              : "当前服务端页没有冲突或未解析项。"}
         </p>
       ) : (
         <ul className={styles.queueList}>

@@ -205,7 +205,13 @@ export function ResolveConflictDialog({
       name: "impact_acknowledged",
     }),
   };
-  const formReady = decisionReady(decision, values);
+  const impactAcknowledgementRequired =
+    decision === "CONFIRM_EXACT" || conflicts.length > 1;
+  const formReady = decisionReady(
+    decision,
+    values,
+    impactAcknowledgementRequired,
+  );
   const submit = async (rawValues: FormValues) => {
     setProblem(null);
     setConflictLock(null);
@@ -237,7 +243,11 @@ export function ResolveConflictDialog({
       });
       return;
     }
-    const request = decisionRequest(decision, parsed.data);
+    const request = decisionRequest(
+      decision,
+      parsed.data,
+      impactAcknowledgementRequired,
+    );
     if (request === undefined) {
       setProblem({
         type: "about:blank",
@@ -300,7 +310,7 @@ export function ResolveConflictDialog({
       <AlertDialog.Portal>
         <AlertDialog.Overlay className="dialog-overlay" />
         <AlertDialog.Content
-          className={`dialog-content ${
+          className={`dialog-content ${styles.mappingDecisionDialog} ${
             decision === "QUARANTINE_ASSET"
               ? styles.destructiveDialog
               : ""
@@ -320,7 +330,15 @@ export function ResolveConflictDialog({
                 {first.type} / {first.field_name}
               </p>
               <h3>受影响的连接与策略</h3>
-              <p>{impactText(first)}</p>
+              <ul className={styles.impactList}>
+                {conflicts.map((conflict) => (
+                  <li key={conflict.id}>
+                    <strong>{conflict.asset.display_name}</strong>
+                    <span data-monospace="true">{conflict.id}</span>
+                    <span>{impactText(conflict)}</span>
+                  </li>
+                ))}
+              </ul>
             </section>
           )}
           {decision === "KEEP_UNRESOLVED" ? (
@@ -401,13 +419,17 @@ export function ResolveConflictDialog({
                 placeholder="SERVICE_OWNER_VERIFIED"
               />
             </label>
-            {decision === "CONFIRM_EXACT" ? (
+            {impactAcknowledgementRequired ? (
               <label className={styles.impactAcknowledgement}>
                 <input
                   type="checkbox"
                   {...register("impact_acknowledged")}
                 />
-                <span>我已审阅受影响的连接与策略</span>
+                <span>
+                  {conflicts.length > 1
+                    ? `我已逐项审阅全部 ${conflicts.length} 项冲突及其受影响的连接与策略`
+                    : "我已审阅受影响的连接与策略"}
+                </span>
               </label>
             ) : null}
             <div className="dialog-actions">
@@ -452,15 +474,22 @@ function defaultValues(
 function decisionReady(
   decision: ConflictDecision,
   values: FormValues,
+  impactAcknowledgementRequired: boolean,
 ): boolean {
   const reasonReady = /^[A-Z][A-Z0-9_]{0,127}$/u.test(
     values.reason_code,
   );
+  if (
+    !reasonReady ||
+    (impactAcknowledgementRequired &&
+      !values.impact_acknowledged)
+  ) {
+    return false;
+  }
   if (decision !== "CONFIRM_EXACT") {
-    return reasonReady;
+    return true;
   }
   return (
-    reasonReady &&
     uuidSchema.safeParse(values.service_id).success &&
     values.binding_role !== "" &&
     values.impact_acknowledged
@@ -470,7 +499,14 @@ function decisionReady(
 function decisionRequest(
   decision: ConflictDecision,
   values: FormValues,
+  impactAcknowledgementRequired: boolean,
 ): ResolveAssetConflictRequest | undefined {
+  if (
+    impactAcknowledgementRequired &&
+    !values.impact_acknowledged
+  ) {
+    return undefined;
+  }
   if (decision === "CONFIRM_EXACT") {
     const service = uuidSchema.safeParse(values.service_id);
     if (

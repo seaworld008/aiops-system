@@ -155,6 +155,10 @@ export function MappingWorkbenchPage({
     visibleConflicts.find(
       (item) => item.id === canonicalSearch.conflictId,
     ) ?? null;
+  const currentPageFiltersActive =
+    canonicalSearch.risk.length > 0 ||
+    canonicalSearch.service !== undefined ||
+    canonicalSearch.age !== "ALL";
 
   useEffect(() => {
     if (conflictsQuery.data === undefined) {
@@ -282,6 +286,12 @@ export function MappingWorkbenchPage({
           onSearchChange(next);
         }}
       />
+      {currentPageFiltersActive ? (
+        <p role="status" className={styles.safeNote}>
+          风险、Service
+          和等待时长仅筛选当前服务端页；Source 和状态由服务端筛选。
+        </p>
+      ) : null}
       {navigationWarning ? (
         <p role="alert" className={styles.warningNotice}>
           当前决定尚未由服务端确认，不能切换冲突或自动重放请求。
@@ -346,6 +356,10 @@ export function MappingWorkbenchPage({
               navigationBlocked={navigationBlocked}
               resolveControlsAvailable={
                 desktopGovernance && !scopeResolutionClosed
+              }
+              currentPageFiltersActive={currentPageFiltersActive}
+              hasNextPage={
+                conflictsQuery.data.page.next_cursor !== null
               }
               onSelect={selectConflict}
               onBatchSelectionChange={(conflictId, selected) => {
