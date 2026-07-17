@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -275,6 +277,364 @@ func TestCatalogClientRejectsUnsafeResponseEnvelopes(t *testing.T) {
 			} else if strings.Contains(err.Error(), "LEAK-MARKER") ||
 				strings.Contains(err.Error(), server.URL) {
 				t.Fatalf("error leaked response/endpoint: %v", err)
+			}
+		})
+	}
+}
+
+func TestCatalogClientPreservesCallerCancellationAndDeadline(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(server.Close)
+	client := catalogClientForTLSServer(t, server)
+
+	tests := []struct {
+		name    string
+		context func() (context.Context, context.CancelFunc)
+		want    error
+	}{
+		{
+			name: "canceled",
+			context: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, func() {}
+			},
+			want: context.Canceled,
+		},
+		{
+			name: "deadline exceeded",
+			context: func() (context.Context, context.CancelFunc) {
+				return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			},
+			want: context.DeadlineExceeded,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := test.context()
+			defer cancel()
+			if _, err := client.capabilities(ctx); !errors.Is(err, test.want) {
+				t.Fatalf("capabilities() error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestCatalogClientDoesNotTreatTransportCancellationAsCallerCancellation(t *testing.T) {
+	t.Parallel()
+
+	baseURL, err := url.Parse("https://cmdb.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, transportErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		client := &catalogClient{
+			baseURL: baseURL,
+			httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, transportErr
+			})},
+		}
+		var capabilities catalogCapabilities
+		err = client.getJSON(context.Background(), capabilitiesPath, maxCapabilitiesBodyBytes, &capabilities)
+		if errors.Is(err, transportErr) || !clientErrorHasCode(err, "TRANSPORT_FAILED") {
+			t.Fatalf("getJSON() error = %v, want TRANSPORT_FAILED", err)
+		}
+	}
+}
+
+func TestCatalogClientPreservesCallerContextDuringBodyRead(t *testing.T) {
+	t.Parallel()
+
+	for _, want := range []error{context.Canceled, context.DeadlineExceeded} {
+		want := want
+		t.Run(want.Error(), func(t *testing.T) {
+			t.Parallel()
+
+			baseURL, err := url.Parse("https://cmdb.invalid")
+			if err != nil {
+				t.Fatal(err)
+			}
+			bodyRead := make(chan struct{}, 1)
+			var bodyObserved atomic.Bool
+
+			var ctx context.Context
+			var cancel context.CancelFunc
+			if errors.Is(want, context.Canceled) {
+				ctx, cancel = context.WithCancel(context.Background())
+			} else {
+				ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
+			}
+			defer cancel()
+			client := &catalogClient{
+				baseURL: baseURL,
+				httpClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{catalogContentType}},
+						Body: &blockingContextBody{
+							ctx: request.Context(), read: bodyRead, observed: &bodyObserved,
+						},
+						Request: request,
+					}, nil
+				})},
+			}
+			if errors.Is(want, context.Canceled) {
+				go func() {
+					<-bodyRead
+					cancel()
+				}()
+			}
+
+			if _, err := client.capabilities(ctx); !errors.Is(err, want) {
+				t.Fatalf("capabilities() body-read error = %v, want %v", err, want)
+			}
+			if !bodyObserved.Load() {
+				t.Fatal("capabilities() did not begin body read after response headers")
+			}
+		})
+	}
+}
+
+func TestCatalogClientDoesNotTreatBodyReadErrorAsCallerCancellation(t *testing.T) {
+	t.Parallel()
+
+	baseURL, err := url.Parse("https://cmdb.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bodyErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		client := &catalogClient{
+			baseURL: baseURL,
+			httpClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{catalogContentType}},
+					Body:       io.NopCloser(errorReader{err: bodyErr}),
+					Request:    request,
+				}, nil
+			})},
+		}
+		var capabilities catalogCapabilities
+		err = client.getJSON(context.Background(), capabilitiesPath, maxCapabilitiesBodyBytes, &capabilities)
+		if errors.Is(err, bodyErr) || !protocolErrorHasCode(err, "BODY_READ_FAILED") {
+			t.Fatalf("getJSON() body-read error = %v, want BODY_READ_FAILED", err)
+		}
+	}
+}
+
+func TestProviderValidatePreservesCallerContextByPhase(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 17, 9, 30, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		targetPath string
+		want       error
+	}{
+		{name: "capabilities canceled", targetPath: capabilitiesPath, want: context.Canceled},
+		{name: "capabilities deadline", targetPath: capabilitiesPath, want: context.DeadlineExceeded},
+		{name: "asset probe canceled", targetPath: assetsPath, want: context.Canceled},
+		{name: "asset probe deadline", targetPath: assetsPath, want: context.DeadlineExceeded},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			targetReached := make(chan struct{}, 1)
+			var targetObserved atomic.Bool
+			server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.URL.Path == test.targetPath {
+					targetObserved.Store(true)
+					targetReached <- struct{}{}
+					<-request.Context().Done()
+					return
+				}
+				writer.Header().Set("Content-Type", catalogContentType)
+				switch request.URL.Path {
+				case capabilitiesPath:
+					writeValidCapabilities(writer, now)
+				case assetsPath:
+					writeEmptyAssetPage(writer)
+				default:
+					http.NotFound(writer, request)
+				}
+			}))
+			t.Cleanup(server.Close)
+
+			factory, runtime, request := externalCMDBValidationFixture(t, server, now)
+			contractProvider, err := New(factory)
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+
+			var ctx context.Context
+			var cancel context.CancelFunc
+			if errors.Is(test.want, context.Canceled) {
+				ctx, cancel = context.WithCancel(context.Background())
+				done := make(chan struct{})
+				t.Cleanup(func() { close(done) })
+				go func() {
+					select {
+					case <-targetReached:
+						cancel()
+					case <-done:
+					}
+				}()
+			} else {
+				ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
+			}
+			defer cancel()
+
+			proof, err := contractProvider.Validate(ctx, runtime, request)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Validate() = (%#v, %v), want zero proof and %v", proof, err, test.want)
+			}
+			if proof.Outcome != "" || proof.Code != "" || len(proof.Checks) != 0 {
+				t.Fatalf("caller context returned validation proof = %#v", proof)
+			}
+			if !targetObserved.Load() {
+				t.Fatalf("Validate() did not reach %s before caller context ended", test.targetPath)
+			}
+		})
+	}
+}
+
+func TestCatalogClientReturnsTypedProviderBackoff(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 17, 9, 30, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		statusCode int
+		retryAfter string
+		operation  string
+		want       time.Duration
+	}{
+		{
+			name:       "assets 429 delta seconds",
+			statusCode: http.StatusTooManyRequests,
+			retryAfter: "17",
+			operation:  "assets",
+			want:       17 * time.Second,
+		},
+		{
+			name:       "relations 503 HTTP date",
+			statusCode: http.StatusServiceUnavailable,
+			retryAfter: now.Add(42 * time.Second).Format(http.TimeFormat),
+			operation:  "relations",
+			want:       42 * time.Second,
+		},
+		{
+			name:       "capabilities accepts zero",
+			statusCode: http.StatusTooManyRequests,
+			retryAfter: "0",
+			operation:  "capabilities",
+			want:       0,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.Header().Set("Retry-After", test.retryAfter)
+				writer.WriteHeader(test.statusCode)
+			}))
+			t.Cleanup(server.Close)
+			factory, runtime, _ := externalCMDBValidationFixture(t, server, now)
+			session, err := factory.open(runtime)
+			if err != nil {
+				t.Fatalf("open() error = %v", err)
+			}
+			t.Cleanup(session.close)
+
+			switch test.operation {
+			case "assets":
+				_, err = session.client.assets(context.Background(), catalogCursor{}, maxPageBodyBytes)
+			case "relations":
+				_, err = session.client.relations(context.Background(), catalogCursor{}, maxPageBodyBytes)
+			case "capabilities":
+				_, err = session.client.capabilities(context.Background())
+			default:
+				t.Fatalf("unknown operation %q", test.operation)
+			}
+			if got, ok := providerRetryAfter(err); !ok || got != test.want {
+				t.Fatalf("%s error = %v, retry after = (%v, %t), want %v",
+					test.operation, err, got, ok, test.want)
+			}
+			if _, marshalErr := json.Marshal(err); !errors.Is(marshalErr, discoverysource.ErrSensitiveSerialization) {
+				t.Fatalf("json.Marshal(backoff) error = %v", marshalErr)
+			}
+			rendered := fmt.Sprintf("%v %#v", err, err)
+			for _, sensitive := range []string{
+				server.URL,
+				strconv.Itoa(test.statusCode),
+				"Retry-After",
+				test.retryAfter,
+			} {
+				if sensitive != "" && strings.Contains(rendered, sensitive) {
+					t.Fatalf("backoff error leaked %q: %s", sensitive, rendered)
+				}
+			}
+		})
+	}
+}
+
+func TestCatalogClientRejectsInvalidOrInapplicableRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 17, 9, 30, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		statusCode int
+		values     []string
+	}{
+		{name: "429 missing", statusCode: http.StatusTooManyRequests},
+		{name: "503 repeated", statusCode: http.StatusServiceUnavailable, values: []string{"1", "2"}},
+		{name: "429 malformed", statusCode: http.StatusTooManyRequests, values: []string{"later"}},
+		{name: "429 negative", statusCode: http.StatusTooManyRequests, values: []string{"-1"}},
+		{name: "503 over maximum", statusCode: http.StatusServiceUnavailable, values: []string{"61"}},
+		{
+			name:       "429 past HTTP date",
+			statusCode: http.StatusTooManyRequests,
+			values:     []string{now.Add(-time.Second).Format(http.TimeFormat)},
+		},
+		{
+			name:       "503 HTTP date over maximum",
+			statusCode: http.StatusServiceUnavailable,
+			values:     []string{now.Add(61 * time.Second).Format(http.TimeFormat)},
+		},
+		{name: "other status stays rejected", statusCode: http.StatusBadGateway, values: []string{"5"}},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				for _, value := range test.values {
+					writer.Header().Add("Retry-After", value)
+				}
+				writer.WriteHeader(test.statusCode)
+			}))
+			t.Cleanup(server.Close)
+			factory, runtime, _ := externalCMDBValidationFixture(t, server, now)
+			session, err := factory.open(runtime)
+			if err != nil {
+				t.Fatalf("open() error = %v", err)
+			}
+			t.Cleanup(session.close)
+
+			_, err = session.client.capabilities(context.Background())
+			if _, ok := providerRetryAfter(err); ok || !clientErrorHasCode(err, "STATUS_REJECTED") {
+				t.Fatalf("capabilities() error = %v, want STATUS_REJECTED without backoff", err)
 			}
 		})
 	}
@@ -788,4 +1148,96 @@ func verifiedTLSConfigForServer(t *testing.T, server *httptest.Server) *tls.Conf
 		RootCAs:    roots,
 		ServerName: parsed.Hostname(),
 	}
+}
+
+func externalCMDBValidationFixture(
+	t *testing.T,
+	server *httptest.Server,
+	now time.Time,
+) (ClientFactory, discoverysource.BoundRuntime, discoverysource.ValidationRequest) {
+	t.Helper()
+
+	request := validExternalCMDBValidationRequest()
+	binding := validatingBindingForRequest(request)
+	material := RuntimeMaterial{
+		BaseURL:             server.URL,
+		TLSConfig:           verifiedTLSConfigForServer(t, server),
+		BearerToken:         []byte("test-bearer-token"),
+		ExpectedAuthorityID: "cmdb-production-01",
+		EnvironmentID:       "44444444-4444-4444-8444-444444444444",
+	}
+	runtime, err := discoverysource.BindRuntime(
+		binding,
+		&material,
+		func(*RuntimeMaterial) error { return nil },
+		func(value *RuntimeMaterial) { value.Clear() },
+	)
+	if err != nil {
+		t.Fatalf("BindRuntime() error = %v", err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+
+	factory, err := NewClientFactory(binding)
+	if err != nil {
+		t.Fatalf("NewClientFactory() error = %v", err)
+	}
+	factory.now = func() time.Time { return now }
+	return factory, runtime, request
+}
+
+func writeValidCapabilities(writer http.ResponseWriter, now time.Time) {
+	fmt.Fprintf(writer, `{
+		"protocol_version":"cmdb-catalog/v1",
+		"authority_id":"cmdb-production-01",
+		"snapshot_epoch":"snapshot-0001",
+		"max_page_size":500,
+		"supports_delta":true,
+		"supports_tombstone":true,
+		"server_time":%q,
+		"permissions":["assets.read","relations.read"]
+	}`, now.Format(time.RFC3339Nano))
+}
+
+func writeEmptyAssetPage(writer http.ResponseWriter) {
+	fmt.Fprint(writer, `{
+		"items":[],
+		"next_cursor":"",
+		"snapshot_epoch":"snapshot-0001",
+		"final_page":true,
+		"complete_snapshot":true
+	}`)
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return function(request)
+}
+
+type errorReader struct {
+	err error
+}
+
+func (reader errorReader) Read([]byte) (int, error) {
+	return 0, reader.err
+}
+
+type blockingContextBody struct {
+	ctx      context.Context
+	read     chan struct{}
+	observed *atomic.Bool
+}
+
+func (body *blockingContextBody) Read([]byte) (int, error) {
+	body.observed.Store(true)
+	select {
+	case body.read <- struct{}{}:
+	default:
+	}
+	<-body.ctx.Done()
+	return 0, body.ctx.Err()
+}
+
+func (*blockingContextBody) Close() error {
+	return nil
 }
