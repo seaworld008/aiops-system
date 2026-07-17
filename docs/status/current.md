@@ -2,7 +2,7 @@
 
 > 更新时间：2026-07-18
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前已合并实现基线：[PR #101](https://github.com/seaworld008/aiops-system/pull/101) squash merge `main@1bb383cee20df4db70ebb749c26698c4d3cdd3b6`；仓库当前主线为 docs contract [PR #107](https://github.com/seaworld008/aiops-system/pull/107) squash merge `origin/main@271d9b751744277855a792dec1351cfe5f95c9ca`。PR #107 只持久化 vSphere session-continuity 规划合同，不是业务实现；Pack 07 Task 20 vSphere fixed client/validation foundation 与 Pack 09 Task 28A provider-neutral Worker core 仍是当前最新已合并实现并保持 `BUILT_CLOSED`，这不表示 Source、Provider、Discovery Worker、HA 或生产资格已经可用
+> 当前已合并实现基线与仓库主线：[PR #109](https://github.com/seaworld008/aiops-system/pull/109) squash merge `main@cc5ba60de30a0a57f248b60195d5af2d236b6447` / `origin/main@cc5ba60de30a0a57f248b60195d5af2d236b6447`。PR #109 是 Task 28A 的 sequential C0 corrective，只为 `ResolveOpenedAttemptRequest` 增加窄 `NewClaimRuntime(provider, *checkpoint, limits, policy)` capability，并继续复用 Broker-bound 不可伪造 request/runtime cell；它不是 Task 18B、Provider、生产 Worker 或运行资格，Task 28A 继续保持 `BUILT_CLOSED`，所有相关运行能力继续 `UNAVAILABLE/CLOSED`
 
 ## 当前结论
 
@@ -108,6 +108,8 @@ vSphere session-continuity C0 合同纠偏已通过 [PR #107](https://github.com
 
 该已合并合同固定：Task 21A 只拥有同一 claim/attempt/`BoundRuntime` 内的 same-attempt bounded full inventory；Task 21B0 是 resident PropertyCollector authority 与 no-gap bootstrap 的显式前置；Task 21B 才拥有 cross-Run delta、leave/soft-delete 与 HA resume。vSphere 后继严格为 `Task 21B → Task 28C vSphere row → Task 29A vSphere HA → Task 22 gate/canary → Task 29B matrix`；上述 vSphere 专属 integration test 只由 Task 21A 创建、Task 21B 顺序修改。Task 28B 仍只拥有 exact-attempt cleanup recovery，不拥有 vSphere session/filter/version continuity。Task 21A/21B0/21B、Task 28B、vSphere registry/HA/gate/canary/matrix 的实现均保持 `NOT_STARTED/UNAVAILABLE/CLOSED`，G3/G4 全部 deferred。
 
+Task 28A claim-runtime seam sequential C0 corrective 已通过 [PR #109](https://github.com/seaworld008/aiops-system/pull/109) 于 2026-07-17T17:03:43Z 从 base `1a4384e80046da5dd2460cd2ef1836ba4ad9f61f`、head `65c10810160ba2cf588baed4e737810d66250e0d` squash merge 到 `main@cc5ba60de30a0a57f248b60195d5af2d236b6447`，状态为 `BUILT_CLOSED`。精确三文件为 `internal/discoveryworker/claim_runtime.go`、`internal/discoveryworker/claim_runtime_test.go`、`internal/discoveryworker/worker_test.go`；只增加上述窄 capability 和对应行为/边界证据，`worker.go` 未修改。主管理 fresh G1（module verify、全仓 gofmt、`go vet ./...`、五入口 build、`git diff --check`）与 discoveryworker/discoverysource/discoveryqueue/discoverycleanup/discoverylimit/discoverycheckpoint 六包普通及 race G2 均通过；GitHub `go` check 为 `SUCCESS`。current-head `65c10810160ba2cf588baed4e737810d66250e0d` 的 Codex Review 于 2026-07-17T16:52:13Z 确认无重大问题，inline threads 为 0。该 corrective 只解除 Task 18B 的公共 seam 阻塞，不实现 Task 18B/28B/28C、Provider integration、production Worker 或运行资格；G3/G4 继续 deferred。
+
 ## 当前实施进度
 
 Phase 1 Task 1 首轮 Red → Green → 独立安全复核结果仍是有效证据，范围严格限于生产资产目录的数据库基础：
@@ -172,7 +174,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
 | 现有调查/执行内核 | 基线存在 | 以现有测试、迁移和 V3 文档为准 |
-| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J/Session C0/Credential Trace C0/TypeScript C0/M1I Web Foundation/Source Revision/Create/Profile Registry/M1I Asset Catalog UI/Mapping Workbench/Navigation Scope corrective/Task 14 Source API/Task 15A CSV parser/CSV Profile Registry+runtime admission/Task 12 Source inventory/External CMDB Task 17/PR #95 Review corrective/External CMDB Task 18A/PR #99 corrective/PR #100/#102/#105 ownership contracts/PR #103/#104 Broker correctives/vSphere Task 20/Task 28A Worker core）/ UNAVAILABLE | Task 18B 因已合并 Task 28A 公共面的 opaque `ClaimRuntime` 缺少合法外部构造 seam，正在等待独立 sequential C0 corrective；该 corrective 尚未合并，Task 18B 没有实现或验收事实。Task 28B 必须继续等待 Task 18B stable `Produces`。vSphere 主线只有 Task 20 业务实现与 PR #107 规划合同，Task 21A/21B0/21B/22 尚无主线实现。Task 28A 只有 provider-neutral core，尚无 transport/registry/binary/Provider integration。CSV/CMDB/vSphere 实际运行、Task 15B、Discovery Worker 生产运行、真实 Provider gate、HA 与 G3/G4 资格仍为 `NOT_STARTED/UNAVAILABLE/CLOSED` |
+| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J/Session C0/Credential Trace C0/TypeScript C0/M1I Web Foundation/Source Revision/Create/Profile Registry/M1I Asset Catalog UI/Mapping Workbench/Navigation Scope corrective/Task 14 Source API/Task 15A CSV parser/CSV Profile Registry+runtime admission/Task 12 Source inventory/External CMDB Task 17/PR #95 Review corrective/External CMDB Task 18A/PR #99 corrective/PR #100/#102/#105 ownership contracts/PR #103/#104 Broker correctives/vSphere Task 20/Task 28A Worker core/PR #109 claim-runtime C0 corrective）/ UNAVAILABLE | PR #109 已解除 Task 18B 的公共 seam 阻塞；Task 18B 可以从最新 main 继续，但当前没有已合并实现或验收事实，仍为 `NOT_STARTED/UNAVAILABLE/CLOSED`。Task 28B 必须继续等待 Task 18B stable `Produces`。vSphere 主线只有 Task 20 业务实现与 PR #107 规划合同；Task 21A 可以从最新 main 独立实施，但当前没有已合并事实，Task 21A/21B0/21B/22 均仍为 `NOT_STARTED/UNAVAILABLE/CLOSED`。Task 28A 只有 provider-neutral core 与窄 claim-runtime corrective，尚无 transport/registry/binary/Provider integration。CSV/CMDB/vSphere 实际运行、Task 15B、Discovery Worker 生产运行、真实 Provider gate、HA 与 G3/G4 资格仍为 `NOT_STARTED/UNAVAILABLE/CLOSED` |
 | Connection 修订/验证/发布 | NOT_STARTED | 等待 Phase 2 |
 | VictoriaMetrics/Logs/Traces 全家桶 | NOT_STARTED | 等待 Phase 3 |
 | 事件/定时主动只读调查 | NOT_STARTED | 等待 Phase 4 |
@@ -192,11 +194,11 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 
 ## 下一步
 
-基于当前已合并实现基线 `main@1bb383cee20df4db70ebb749c26698c4d3cdd3b6` 与仓库当前 docs contract 主线 `origin/main@271d9b751744277855a792dec1351cfe5f95c9ca`，后续工作按以下关闭边界推进：
+基于当前已合并实现基线与仓库主线 [PR #109](https://github.com/seaworld008/aiops-system/pull/109) squash merge `main@cc5ba60de30a0a57f248b60195d5af2d236b6447` / `origin/main@cc5ba60de30a0a57f248b60195d5af2d236b6447`，后续工作按以下关闭边界推进：
 
-- Pack 06 Task 18B 当前因已合并 Task 28A 公共面的 opaque `ClaimRuntime` 缺少合法外部构造 seam，等待 sequential C0 corrective。该 corrective 正在独立可见轨道但尚未合并；未提交实现细节、RED/GREEN 或验收结论都不是当前事实。corrective 合并后，Task 18B 才能从最新 main 恢复并只消费 Task 18A、M1E/Task 27 与 Task 28A 的 stable `Produces`，拥有 External-CMDB-specific durable reconciliation/lifecycle integration 和唯一 neutral descriptor；不得重建 Queue、Worker、PageCommitter、Limiter、CleanupBroker 或 production binary。
+- PR #109 已解除 Pack 06 Task 18B 的公共 seam 阻塞。Task 18B 可以从最新 main 继续并只消费 Task 18A、M1E/Task 27 与 Task 28A 的 stable `Produces`，拥有 External-CMDB-specific durable reconciliation/lifecycle integration 和唯一 neutral descriptor；不得重建 Queue、Worker、PageCommitter、Limiter、CleanupBroker 或 production binary。Task 18B 当前没有已合并实现或验收事实，仍为 `NOT_STARTED/UNAVAILABLE/CLOSED`。
 - Pack 09 Task 28B 必须等待 Task 18B stable `Produces` 合并后再开始；随后 Task 28C 才可消费已合并 28A/28B 与 Provider descriptor 组装 registry/production binary。Task 19A/19A2a/19A2b/19A2c、Task 29A、Task 19B、Task 29B 继续严格按已合并 DAG 门禁推进，不得并行读取未合并内部实现或提前生成 HA/canary/gate/matrix 证据。
-- Pack 07 当前主线只有 Task 20 foundation 业务实现；PR #107 的三文档 corrective 已合并并成为当前合同，但没有实现 Task 21A/21B0/21B。后继只可按 `21B → 28C vSphere row → 29A vSphere HA → 22 gate/canary → 29B matrix` 推进；Task 21B0 resident authority/no-gap bootstrap 未满足前不得把 Task 21A full checkpoint 当作 incremental cursor，Task 28B exact-attempt cleanup 也不能替代该 authority。全部后继继续 `NOT_STARTED/UNAVAILABLE/CLOSED`。
+- Pack 07 当前主线只有 Task 20 foundation 业务实现；PR #107 的三文档 corrective 已合并并成为当前合同，但没有实现 Task 21A/21B0/21B。Task 21A 可以从最新 main 独立实施，但当前没有已合并事实，仍为 `NOT_STARTED/UNAVAILABLE/CLOSED`；后继依赖固定为 `Task 21A + Task 28B → Task 21B0 → Task 21B → Task 28C vSphere row → Task 29A vSphere HA → Task 22 gate/canary → Task 29B matrix`。Task 21B0 resident authority/no-gap bootstrap 未满足前不得把 Task 21A full checkpoint 当作 incremental cursor，Task 28B exact-attempt cleanup 也不能替代该 authority；全部后继继续 `NOT_STARTED/UNAVAILABLE/CLOSED`。
 
 Task 15B importer/quarantine/detached signature/HTTP/Worker 尚未启动，并且 quarantine object metadata、签名 verifier 与可信存储真值仍需要单独 C0 边界；不得用内存对象、fake storage 或测试 verifier 冒充生产实现。sealed checkpoint、fenced orchestration/Reconciler、durable backpressure 与 cleanup 也继续 `NOT_STARTED/UNAVAILABLE/CLOSED`。
 
