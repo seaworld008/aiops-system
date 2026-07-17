@@ -614,17 +614,46 @@ func TestDataClaimUsesOpenedCheckpointAndOnlyPageCommits(t *testing.T) {
 			fixture.committer.calls, fixture.queue.delayCalls,
 			fixture.provider.discoverCalls, fixture.provider.validateCalls)
 	}
-	assertOrderedEvents(t, fixture.events.snapshot(),
+	if fixture.queue.heartbeatCalls != 3 ||
+		fixture.queue.postCleanupHeartbeats != 0 ||
+		fixture.queue.completeCalls != 1 {
+		t.Fatalf(
+			"heartbeat=%d post-cleanup heartbeat=%d complete=%d, want 3,0,1",
+			fixture.queue.heartbeatCalls,
+			fixture.queue.postCleanupHeartbeats,
+			fixture.queue.completeCalls,
+		)
+	}
+	wantTerminal := discoveryqueue.TerminalCommand{
+		Coordinates:      fixture.coordinates,
+		DesiredStatus:    assetcatalog.RunStatusSucceeded,
+		WorkResultDigest: strings.Repeat("9", 64),
+		CleanupStatus:    assetcatalog.CredentialCleanupRevoked,
+		CleanupDigest:    fixture.queue.lastProof.DigestSHA256(),
+	}
+	if fixture.queue.lastCompleteCommand != wantTerminal {
+		t.Fatalf(
+			"Complete command = %#v, want exact work/cleanup tuple %#v",
+			fixture.queue.lastCompleteCommand,
+			wantTerminal,
+		)
+	}
+	events := fixture.events.snapshot()
+	assertOrderedEvents(t, events,
 		"provider-discover",
 		"advance-normalizing",
 		"apply-page",
+		"heartbeat",
 		"limiter-release",
 		"runtime-clear",
 		"revoke-session",
 		"record-cleanup",
-		"heartbeat",
 		"complete",
 	)
+	cleanupEvent := slices.Index(events, "record-cleanup")
+	if cleanupEvent < 0 || cleanupEvent+1 >= len(events) || events[cleanupEvent+1] != "complete" {
+		t.Fatalf("terminal events = %v, want record-cleanup immediately followed by complete", events)
+	}
 }
 
 func TestDataDelayPersistsIntentAndCleansBeforeQueueDelay(t *testing.T) {
@@ -1110,10 +1139,13 @@ type modeQueue struct {
 	recordCleanupCalls        int
 	reserveCalls              int
 	driftFenceAtHeartbeat     int
+	postCleanupHeartbeats     int
 	reserveResponseLoss       bool
 	recordCleanupResponseLoss bool
 	completeResponseLoss      bool
 	driftTerminalReceipt      bool
+	cleanupRecorded           bool
+	lastCompleteCommand       discoveryqueue.TerminalCommand
 	claims                    []discoveryqueue.ClaimResult
 	claimCalls                int
 	hasPendingDelay           bool
@@ -1138,6 +1170,10 @@ func (queue *modeQueue) Heartbeat(
 	_ assetcatalog.LeaseFence,
 	command discoveryqueue.HeartbeatCommand,
 ) (discoveryqueue.HeartbeatResult, error) {
+	if queue.cleanupRecorded {
+		queue.postCleanupHeartbeats++
+		return discoveryqueue.HeartbeatResult{}, discoveryqueue.ErrStateConflict
+	}
 	queue.events.add("heartbeat")
 	queue.heartbeatCalls++
 	queue.run.HeartbeatSequence = command.Sequence
@@ -1237,6 +1273,7 @@ func (queue *modeQueue) RecordCleanup(
 		Attempt: proof.Attempt(), Status: proof.Status(),
 		DigestSHA256: proof.DigestSHA256(),
 	}
+	queue.cleanupRecorded = true
 	if queue.recordCleanupResponseLoss && queue.recordCleanupCalls == 1 {
 		return result, discoveryqueue.ErrUnavailable
 	}
@@ -1264,12 +1301,13 @@ func (queue *modeQueue) Delay(
 }
 
 func (queue *modeQueue) Complete(
-	context.Context,
-	assetcatalog.LeaseFence,
-	discoveryqueue.TerminalCommand,
+	_ context.Context,
+	_ assetcatalog.LeaseFence,
+	command discoveryqueue.TerminalCommand,
 ) (discoveryqueue.TerminalResult, error) {
 	queue.events.add("complete")
 	queue.completeCalls++
+	queue.lastCompleteCommand = command
 	result := discoveryqueue.TerminalResult{
 		RunID: runtimeRunID, Status: assetcatalog.RunStatusSucceeded,
 		CommandDigest: strings.Repeat("f", 64),

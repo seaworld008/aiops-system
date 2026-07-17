@@ -573,6 +573,12 @@ func (worker *Worker) processDataRuntime(
 				_ = release("CHECKPOINT_DRIFTED")
 				return ErrClaimRejected
 			}
+			if value.FinalPage {
+				if err := worker.heartbeat(ctx, claim, coordinates); err != nil {
+					_ = release("FENCE_REJECTED")
+					return err
+				}
+			}
 			if err := release("PROVIDER_CALL_COMPLETE"); err != nil {
 				return err
 			}
@@ -591,9 +597,6 @@ func (worker *Worker) processDataRuntime(
 				return err
 			}
 			*cleaned = true
-			if err := worker.heartbeat(ctx, claim, coordinates); err != nil {
-				return err
-			}
 			work := discoveryqueue.WorkResult{
 				Kind: claim.Run.WorkResultKind, Status: claim.Run.WorkResultStatus,
 				DigestSHA256: claim.Run.WorkResultDigest, FailureCode: claim.Run.FailureCode,
