@@ -21,6 +21,41 @@ import (
 	"github.com/seaworld008/aiops-system/internal/discoverysource"
 )
 
+func TestResolveOpenedAttemptRequestExportsNewClaimRuntimeCapability(t *testing.T) {
+	requestType := reflect.TypeOf(ResolveOpenedAttemptRequest{})
+	method, ok := requestType.MethodByName("NewClaimRuntime")
+	if !ok {
+		t.Fatal("ResolveOpenedAttemptRequest.NewClaimRuntime is not exported")
+	}
+
+	providerType := reflect.TypeOf((*discoverysource.Provider)(nil)).Elem()
+	checkpointType := reflect.TypeOf((*discoverysource.Checkpoint)(nil))
+	limitsType := reflect.TypeOf(discoverysource.Limits{})
+	policyType := reflect.TypeOf(assetdiscovery.FactPolicy{})
+	runtimeType := reflect.TypeOf(ClaimRuntime{})
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	wantInputs := []reflect.Type{
+		requestType,
+		providerType,
+		checkpointType,
+		limitsType,
+		policyType,
+	}
+	if method.Type.NumIn() != len(wantInputs) {
+		t.Fatalf("NewClaimRuntime inputs = %d, want %d", method.Type.NumIn(), len(wantInputs))
+	}
+	for index, want := range wantInputs {
+		if got := method.Type.In(index); got != want {
+			t.Fatalf("NewClaimRuntime input %d = %v, want %v", index, got, want)
+		}
+	}
+	if method.Type.NumOut() != 2 ||
+		method.Type.Out(0) != runtimeType ||
+		method.Type.Out(1) != errorType {
+		t.Fatalf("NewClaimRuntime outputs = %v, want (%v, error)", method.Type, runtimeType)
+	}
+}
+
 func TestResolveOpenedAttemptRequestAndClaimRuntimeBindExactAttempt(t *testing.T) {
 	fixture := newRuntimeFixture(t)
 	material := &runtimeFixtureMaterial{canary: "runtime-secret-canary"}
@@ -57,8 +92,7 @@ func TestResolveOpenedAttemptRequestAndClaimRuntimeBindExactAttempt(t *testing.T
 	if err != nil {
 		t.Fatalf("NewCheckpoint() error = %v", err)
 	}
-	runtime, err := newClaimRuntime(
-		request,
+	runtime, err := request.NewClaimRuntime(
 		runtimeFixtureProvider{},
 		&checkpoint,
 		discoverysource.Limits{
@@ -98,6 +132,177 @@ func TestResolveOpenedAttemptRequestAndClaimRuntimeBindExactAttempt(t *testing.T
 	}
 }
 
+func TestResolveOpenedAttemptRequestNewClaimRuntimeRejectsInvalidInputsAndClearsOwnership(
+	t *testing.T,
+) {
+	validLimits := discoverysource.Limits{
+		MaxPageItems: 10, MaxPageRelations: 10,
+		MaxPageBytes: 4096, MaxDocumentBytes: 2048,
+	}
+	type builderInputs struct {
+		fixture           runtimeFixture
+		request           ResolveOpenedAttemptRequest
+		provider          runtimeFixtureProvider
+		checkpointProfile assetcatalog.ProfileCode
+		limits            discoverysource.Limits
+		policy            assetdiscovery.FactPolicy
+		nilCheckpoint     bool
+	}
+	tests := []struct {
+		name      string
+		configure func(*testing.T, *builderInputs)
+	}{
+		{
+			name: "foreign session",
+			configure: func(t *testing.T, inputs *builderInputs) {
+				t.Helper()
+				foreignAttempt := inputs.fixture.attempt
+				foreignAttempt.AttemptID = runtimeAttemptID2
+				foreignAttempt.AttemptEpoch++
+				foreignSession, err := inputs.fixture.broker.OpenAttempt(
+					context.Background(),
+					discoverycleanup.OpenAttemptRequest{
+						Coordinates: inputs.fixture.coordinates,
+						Attempt:     foreignAttempt,
+					},
+				)
+				if err != nil {
+					t.Fatalf("OpenAttempt(foreign) error = %v", err)
+				}
+				t.Cleanup(foreignSession.Destroy)
+				inputs.request.cell.session = foreignSession
+			},
+		},
+		{
+			name: "drifted binding",
+			configure: func(_ *testing.T, inputs *builderInputs) {
+				inputs.request.cell.binding.SourceRevision++
+			},
+		},
+		{
+			name: "closed request",
+			configure: func(_ *testing.T, inputs *builderInputs) {
+				inputs.request.cell.session.Destroy()
+			},
+		},
+		{
+			name: "wrong provider",
+			configure: func(_ *testing.T, inputs *builderInputs) {
+				inputs.provider.providerKind = "VSPHERE_VCENTER_V1"
+			},
+		},
+		{
+			name: "wrong profile",
+			configure: func(_ *testing.T, inputs *builderInputs) {
+				inputs.checkpointProfile = assetcatalog.ProfileCode("VSPHERE_VCENTER_V1")
+			},
+		},
+		{
+			name: "invalid limits",
+			configure: func(_ *testing.T, inputs *builderInputs) {
+				inputs.limits = discoverysource.Limits{}
+			},
+		},
+		{
+			name: "invalid policy",
+			configure: func(_ *testing.T, inputs *builderInputs) {
+				inputs.policy.EnvironmentMapping = ""
+			},
+		},
+		{
+			name: "nil checkpoint",
+			configure: func(_ *testing.T, inputs *builderInputs) {
+				inputs.nilCheckpoint = true
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRuntimeFixture(t)
+			material := &runtimeFixtureMaterial{canary: "rejected-runtime-canary"}
+			bound, err := discoverysource.BindRuntime(
+				fixture.binding,
+				material,
+				func(*runtimeFixtureMaterial) error { return nil },
+				func(value *runtimeFixtureMaterial) {
+					value.cleared = true
+					value.canary = ""
+				},
+			)
+			if err != nil {
+				t.Fatalf("BindRuntime() error = %v", err)
+			}
+			request, err := newResolveOpenedAttemptRequest(
+				fixture.session, fixture.coordinates, fixture.attempt,
+				fixture.binding, bound, assetcatalog.RunKindDiscovery,
+				0, "", fixture.codec,
+			)
+			if err != nil {
+				t.Fatalf("newResolveOpenedAttemptRequest() error = %v", err)
+			}
+			inputs := builderInputs{
+				fixture: fixture, request: request,
+				checkpointProfile: fixture.binding.ProfileCode,
+				limits:            validLimits,
+				policy:            runtimeFixturePolicy(),
+			}
+			test.configure(t, &inputs)
+			checkpoint, err := discoverysource.NewCheckpoint(inputs.checkpointProfile, nil)
+			if err != nil {
+				t.Fatalf("NewCheckpoint() error = %v", err)
+			}
+			checkpointInput := &checkpoint
+			if inputs.nilCheckpoint {
+				checkpointInput = nil
+			}
+
+			runtime, err := inputs.request.NewClaimRuntime(
+				inputs.provider, checkpointInput, inputs.limits, inputs.policy,
+			)
+			if !errors.Is(err, ErrClaimRuntimeBinding) || runtime.state != nil {
+				t.Fatalf("NewClaimRuntime() = %#v,%v, want ErrClaimRuntimeBinding", runtime, err)
+			}
+			if !material.cleared || material.canary != "" ||
+				bound.Binding() != (discoverysource.RuntimeBinding{}) {
+				t.Fatalf(
+					"rejected Broker runtime not cleared: material=%#v binding=%#v",
+					material, bound.Binding(),
+				)
+			}
+			if !inputs.nilCheckpoint && checkpoint.ProfileCode() != "" {
+				t.Fatal("rejected caller checkpoint was not cleared")
+			}
+			checkpoint.Clear()
+		})
+	}
+}
+
+func TestZeroResolveOpenedAttemptRequestNewClaimRuntimeClearsCheckpoint(t *testing.T) {
+	checkpoint, err := discoverysource.NewCheckpoint(
+		assetcatalog.ProfileCode(runtimeProvider),
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("NewCheckpoint() error = %v", err)
+	}
+	runtime, err := (ResolveOpenedAttemptRequest{}).NewClaimRuntime(
+		runtimeFixtureProvider{},
+		&checkpoint,
+		discoverysource.Limits{
+			MaxPageItems: 10, MaxPageRelations: 10,
+			MaxPageBytes: 4096, MaxDocumentBytes: 2048,
+		},
+		runtimeFixturePolicy(),
+	)
+	if !errors.Is(err, ErrClaimRuntimeBinding) || runtime.state != nil {
+		t.Fatalf("NewClaimRuntime(zero request) = %#v,%v", runtime, err)
+	}
+	if checkpoint.ProfileCode() != "" {
+		t.Fatal("zero-request failure did not clear caller checkpoint")
+	}
+}
+
 func TestClaimRuntimeRejectsAttemptAndRuntimeCellSplice(t *testing.T) {
 	fixture := newRuntimeFixture(t)
 	limits := discoverysource.Limits{
@@ -125,8 +330,8 @@ func TestClaimRuntimeRejectsAttemptAndRuntimeCellSplice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCheckpoint(attempt A) error = %v", err)
 	}
-	firstRuntime, err := newClaimRuntime(
-		firstRequest, runtimeFixtureProvider{}, &firstCheckpoint,
+	firstRuntime, err := firstRequest.NewClaimRuntime(
+		runtimeFixtureProvider{}, &firstCheckpoint,
 		limits, runtimeFixturePolicy(),
 	)
 	if err != nil {
@@ -220,8 +425,7 @@ func TestClaimRuntimeRejectsNonemptyInitialDataCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCheckpoint() error = %v", err)
 	}
-	if runtime, err := newClaimRuntime(
-		request,
+	if runtime, err := request.NewClaimRuntime(
 		runtimeFixtureProvider{},
 		&checkpoint,
 		discoverysource.Limits{
@@ -322,8 +526,7 @@ func TestClaimRuntimeAndResolverRequestCloseSensitiveSurfaces(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCheckpoint(empty) error = %v", err)
 	}
-	runtime, err := newClaimRuntime(
-		request,
+	runtime, err := request.NewClaimRuntime(
 		runtimeFixtureProvider{},
 		&checkpoint,
 		discoverysource.Limits{
@@ -463,13 +666,20 @@ type runtimeFixtureMaterial struct {
 	closed, cleared bool
 }
 
-type runtimeFixtureProvider struct{}
+type runtimeFixtureProvider struct {
+	providerKind string
+}
 
 func (runtimeFixtureProvider) Kind() assetcatalog.SourceKind {
 	return assetcatalog.SourceKindExternalCMDB
 }
 
-func (runtimeFixtureProvider) ProviderKind() string { return runtimeProvider }
+func (provider runtimeFixtureProvider) ProviderKind() string {
+	if provider.providerKind != "" {
+		return provider.providerKind
+	}
+	return runtimeProvider
+}
 
 func (runtimeFixtureProvider) Validate(
 	context.Context,
