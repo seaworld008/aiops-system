@@ -24,6 +24,7 @@ export const sourceKinds = [
 
 export type SourceSearch = {
   workspace: string;
+  environment: string;
   status: components["schemas"]["SourceStatus"][];
   kind: components["schemas"]["SourceKind"][];
   cursor?: string;
@@ -31,7 +32,10 @@ export type SourceSearch = {
   runId?: string;
 };
 
-export type SourceSearchFallback = Pick<SourceSearch, "workspace">;
+export type SourceSearchFallback = Pick<
+  SourceSearch,
+  "workspace" | "environment"
+>;
 
 export type SourceListSearch = Pick<
   SourceSearch,
@@ -48,11 +52,14 @@ export function parseSourceSearch(
 ): SourceSearch {
   const record = isRecord(input) ? input : {};
   const workspace = validUUID(record.workspace) ?? fallback.workspace;
+  const environment =
+    validUUID(record.environment) ?? fallback.environment;
   const cursor = boundedString(record.cursor, 2_048);
   const sourceId = validUUID(record.sourceId);
   const runId = validUUID(record.runId);
   return {
     workspace,
+    environment,
     status: canonicalEnumArray(
       record.status,
       statusSchema,
@@ -72,7 +79,10 @@ export function parseSourceSearch(
 export function canonicalizeSourceSearch(
   search: SourceSearch,
 ): SourceSearch {
-  return parseSourceSearch(search, { workspace: search.workspace });
+  return parseSourceSearch(search, {
+    workspace: search.workspace,
+    environment: search.environment,
+  });
 }
 
 export function sourceListSearch(
@@ -103,7 +113,10 @@ export function changeSourceFilters(
       sourceId: undefined,
       runId: undefined,
     },
-    { workspace: search.workspace },
+    {
+      workspace: search.workspace,
+      environment: search.environment,
+    },
   );
 }
 
@@ -117,7 +130,10 @@ export function selectSource(
       sourceId,
       runId: undefined,
     },
-    { workspace: search.workspace },
+    {
+      workspace: search.workspace,
+      environment: search.environment,
+    },
   );
 }
 
@@ -128,7 +144,10 @@ export function selectSourceRun(
 ): SourceSearch {
   return parseSourceSearch(
     { ...search, sourceId, runId },
-    { workspace: search.workspace },
+    {
+      workspace: search.workspace,
+      environment: search.environment,
+    },
   );
 }
 
@@ -143,7 +162,10 @@ export function nextSourcePage(
       sourceId: undefined,
       runId: undefined,
     },
-    { workspace: search.workspace },
+    {
+      workspace: search.workspace,
+      environment: search.environment,
+    },
   );
 }
 

@@ -61,8 +61,9 @@ export function AssetSourcesPage({
       canonicalizeSourceSearch({
         ...search,
         workspace: scope.workspaceId,
+        environment: scope.environmentId,
       }),
-    [scope.workspaceId, search],
+    [scope.environmentId, scope.workspaceId, search],
   );
   const canonicalIdentity = JSON.stringify(canonicalSearch);
   const canonicalReplace = useRef<string | undefined>(undefined);

@@ -1425,12 +1425,13 @@ func (management *Management) sourceActionAdmission(
 		CanPublish: latestProfile.ProfileCode != "" &&
 			source.Status == SourceStatusActive &&
 			source.GateStatus == SourceGateValidating &&
+			source.GateReasonCode == "VALIDATION_IN_PROGRESS" &&
 			revision.Status == SourceRevisionValidated &&
 			revision.ValidationRunID != "" &&
 			revision.ValidationDigest != "" &&
 			source.ValidatedRunID == revision.ValidationRunID &&
-			source.ValidationDigest == revision.ValidationDigest &&
-			source.ValidatedBindingDigest == revision.CanonicalRevisionDigest,
+			source.ValidationDigest == "" &&
+			source.ValidatedBindingDigest == "",
 	}
 	if published && source.Status == SourceStatusActive &&
 		source.GateStatus == SourceGateAvailable {

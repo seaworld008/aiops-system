@@ -623,6 +623,18 @@ func TestSourceEffectiveActionsArePermissionAndStateAware(t *testing.T) {
 		Source: source, LatestRevision: revision,
 	}
 	admin := managementPrincipal(authn.RoleAdmin)
+	publishable := func() SourceReadModel {
+		value := base.Clone()
+		value.LatestRevision.Status = SourceRevisionValidated
+		value.LatestRevision.ValidationRunID = "99999999-9999-4999-8999-999999999999"
+		value.LatestRevision.ValidationDigest = strings.Repeat("b", 64)
+		value.Source.GateStatus = SourceGateValidating
+		value.Source.GateReasonCode = "VALIDATION_IN_PROGRESS"
+		value.Source.ValidatedRunID = value.LatestRevision.ValidationRunID
+		value.Source.ValidationDigest = ""
+		value.Source.ValidatedBindingDigest = ""
+		return value
+	}
 	tests := []struct {
 		name      string
 		principal authn.Principal
@@ -665,31 +677,70 @@ func TestSourceEffectiveActionsArePermissionAndStateAware(t *testing.T) {
 			want: []EffectiveAction{},
 		},
 		{
-			name: "manual validated publishes only", principal: admin,
+			name: "repository publish preconditions expose publication", principal: admin,
+			model: publishable(),
+			want:  []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource, ActionPublishSourceRevision},
+		},
+		{
+			name: "revision state drift closes publication", principal: admin,
 			model: func() SourceReadModel {
-				value := base.Clone()
-				value.LatestRevision.Status = SourceRevisionValidated
-				value.LatestRevision.ValidationRunID = "99999999-9999-4999-8999-999999999999"
-				value.LatestRevision.ValidationDigest = strings.Repeat("b", 64)
-				value.Source.GateStatus = SourceGateValidating
-				value.Source.ValidatedRunID = value.LatestRevision.ValidationRunID
+				value := publishable()
+				value.LatestRevision.Status = SourceRevisionValidating
+				return value
+			}(),
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "gate state drift closes publication", principal: admin,
+			model: func() SourceReadModel {
+				value := publishable()
+				value.Source.GateStatus = SourceGateUnavailable
+				return value
+			}(),
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "gate reason drift closes publication", principal: admin,
+			model: func() SourceReadModel {
+				value := publishable()
+				value.Source.GateReasonCode = "VALIDATION_SUPERSEDED"
+				return value
+			}(),
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "validated run drift closes publication", principal: admin,
+			model: func() SourceReadModel {
+				value := publishable()
+				value.Source.ValidatedRunID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+				return value
+			}(),
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "source validation digest before publish closes publication", principal: admin,
+			model: func() SourceReadModel {
+				value := publishable()
 				value.Source.ValidationDigest = value.LatestRevision.ValidationDigest
+				return value
+			}(),
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "source binding digest before publish closes publication", principal: admin,
+			model: func() SourceReadModel {
+				value := publishable()
 				value.Source.ValidatedBindingDigest = value.LatestRevision.CanonicalRevisionDigest
 				return value
 			}(),
-			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource, ActionPublishSourceRevision},
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
 		},
 		{
-			name: "validation and binding digest drift close publication", principal: admin,
+			name: "legacy post-publish digests close publication", principal: admin,
 			model: func() SourceReadModel {
-				value := base.Clone()
-				value.LatestRevision.Status = SourceRevisionValidated
-				value.LatestRevision.ValidationRunID = "99999999-9999-4999-8999-999999999999"
-				value.LatestRevision.ValidationDigest = strings.Repeat("b", 64)
-				value.Source.GateStatus = SourceGateValidating
-				value.Source.ValidatedRunID = value.LatestRevision.ValidationRunID
-				value.Source.ValidationDigest = strings.Repeat("c", 64)
-				value.Source.ValidatedBindingDigest = strings.Repeat("d", 64)
+				value := publishable()
+				value.Source.ValidationDigest = value.LatestRevision.ValidationDigest
+				value.Source.ValidatedBindingDigest = value.LatestRevision.CanonicalRevisionDigest
 				return value
 			}(),
 			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},

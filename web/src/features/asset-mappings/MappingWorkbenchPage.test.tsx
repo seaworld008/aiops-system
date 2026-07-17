@@ -1210,6 +1210,88 @@ describe("MappingWorkbenchPage", () => {
     },
   );
 
+  it("review identity 变化后的成功响应只使原 Scope 冲突缓存失效", async () => {
+    const user = userEvent.setup();
+    let releasePost: () => void = () => undefined;
+    const postGate = new Promise<void>((resolve) => {
+      releasePost = resolve;
+    });
+    let postStarted = false;
+    testServer.use(
+      http.post(resolveConflictPath, async () => {
+        postStarted = true;
+        await postGate;
+        return HttpResponse.json(mutationResult(baseConflict), {
+          headers: {
+            ETag: `"asset-conflict:${primaryConflictID}:v6"`,
+            "X-Audit-ID": auditID,
+            "X-Trace-ID": traceID,
+          },
+        });
+      }),
+    );
+    const view = renderWorkbench();
+    const submittedScopeKey = [
+      "asset-conflicts",
+      workspaceID,
+      environmentID,
+      { test: "submitted-scope" },
+    ] as const;
+    const newScopeKey = [
+      "asset-conflicts",
+      workspaceID,
+      alternateEnvironmentID,
+      { test: "new-scope" },
+    ] as const;
+    view.queryClient.setQueryDefaults(
+      ["asset-conflicts", workspaceID, environmentID],
+      { gcTime: Infinity },
+    );
+    view.queryClient.setQueryDefaults(
+      ["asset-conflicts", workspaceID, alternateEnvironmentID],
+      { gcTime: Infinity },
+    );
+    view.queryClient.setQueryData(submittedScopeKey, "submitted");
+    view.queryClient.setQueryData(newScopeKey, "new");
+
+    await user.click(
+      await screen.findByRole("button", { name: "拒绝候选" }),
+    );
+    await user.type(
+      screen.getByLabelText("审计原因代码"),
+      "GOVERNANCE_REVIEWED",
+    );
+    await user.click(
+      screen.getByRole("button", {
+        name: "确认并记录决定",
+      }),
+    );
+    await waitFor(() => {
+      expect(postStarted).toBe(true);
+    });
+
+    view.setScope({
+      workspaceId: workspaceID,
+      environmentId: alternateEnvironmentID,
+    });
+    act(() => {
+      releasePost();
+    });
+
+    await waitFor(() => {
+      expect(
+        view.queryClient.getQueryState(submittedScopeKey)?.isInvalidated,
+      ).toBe(true);
+    });
+    expect(
+      view.queryClient.getQueryState(newScopeKey)?.isInvalidated,
+    ).toBe(false);
+    expect(
+      screen.queryByText("映射决定已记录"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(auditID)).not.toBeInTheDocument();
+  });
+
   it("键盘队列选择写回 conflictId 且保留其他筛选", async () => {
     const user = userEvent.setup();
     const second = conflict(secondConflictID, "payments-api-02");
