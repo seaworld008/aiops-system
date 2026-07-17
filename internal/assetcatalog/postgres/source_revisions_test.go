@@ -9,10 +9,74 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/seaworld008/aiops-system/internal/assetcatalog"
 )
 
 var _ assetcatalog.SourceRevisionRepository = (*Repository)(nil)
+var _ assetcatalog.SourceProfileAdmissionResolver = (*Repository)(nil)
+
+func TestRepositoryConsumesInjectedProfileRegistryForCreationAndAdmission(t *testing.T) {
+	if _, err := NewWithSourceProfileRegistry(
+		&pgxpool.Pool{},
+		nil,
+		func() string { return "70000000-0000-4000-8000-000000000001" },
+		nil,
+	); err == nil {
+		t.Fatal("NewWithSourceProfileRegistry accepted nil Registry")
+	}
+	profile, err := assetcatalog.CSVProfileV1("csv-signature-reference-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := assetcatalog.NewSourceProfileRegistry(assetcatalog.SourceProfileRegistration{
+		Selector: assetcatalog.SourceProfileIDCSVRFC4180V1,
+		Profile:  profile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := NewWithSourceProfileRegistry(
+		&pgxpool.Pool{},
+		nil,
+		func() string { return "70000000-0000-4000-8000-000000000001" },
+		registry,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manual, err := repository.profiles.Resolve(assetcatalog.SourceProfileIDManualV1)
+	if err != nil || manual.ProfileCode != assetcatalog.ProfileCode("MANUAL_V1") {
+		t.Fatalf("extended repository registry lost manual selector: (%#v, %v)", manual, err)
+	}
+	manualAdmission, err := repository.ResolveProfileAdmission(t.Context(), assetcatalog.ProfileCode("MANUAL_V1"))
+	if err != nil || manualAdmission.ProfileCode != assetcatalog.ProfileCode("MANUAL_V1") {
+		t.Fatalf("extended repository registry lost manual admission: (%#v, %v)", manualAdmission, err)
+	}
+	resolved, err := repository.profiles.Resolve(assetcatalog.SourceProfileIDCSVRFC4180V1)
+	if err != nil || resolved.CredentialReferenceID != profile.CredentialReferenceID {
+		t.Fatalf("creation registry Resolve() = (%#v, %v)", resolved, err)
+	}
+	admitted, err := repository.ResolveProfileAdmission(t.Context(), assetcatalog.ProfileCode("CSV_RFC4180_V1"))
+	if err != nil || admitted.CredentialReferenceID != profile.CredentialReferenceID {
+		t.Fatalf("admission registry ResolveProfileAdmission() = (%#v, %v)", admitted, err)
+	}
+}
+
+func TestResolveSourceProfileAfterReplayCheckPrioritizesConsumedCommandHash(t *testing.T) {
+	repository := &Repository{profiles: assetcatalog.NewBuiltinSourceProfileRegistry()}
+	replayChecks := 0
+	_, err := repository.resolveSourceProfileAfterReplayCheck("future-v1", func() error {
+		replayChecks++
+		return assetcatalog.ErrIdempotency
+	})
+	if !errors.Is(err, assetcatalog.ErrIdempotency) || replayChecks != 1 {
+		t.Fatalf("changed unknown-selector replay = (%v, checks:%d), want ErrIdempotency/1", err, replayChecks)
+	}
+	if _, err := repository.resolveSourceProfileAfterReplayCheck("future-v1", nil); !errors.Is(err, assetcatalog.ErrNotFound) {
+		t.Fatalf("fresh unknown selector error = %v, want ErrNotFound", err)
+	}
+}
 
 func TestMapSourceRevisionErrorPreservesStableSentinel(t *testing.T) {
 	if got := mapSourceRevisionError(assetcatalog.ErrSourceRevisionNotValidated); !errors.Is(got, assetcatalog.ErrSourceRevisionNotValidated) {
@@ -441,6 +505,23 @@ func TestRequestSyncSourceKindRejectsManualCSVAndControlPlaneAPI(t *testing.T) {
 	}
 	if !requestSyncSourceKindAllowed(assetcatalog.SourceKindExternalCMDB) {
 		t.Fatal("request sync rejected real external source")
+	}
+}
+
+func TestSourceValidationRuntimeClosedOnlyForCSVRFC4180V1(t *testing.T) {
+	for _, test := range []struct {
+		profileCode assetcatalog.ProfileCode
+		wantClosed  bool
+	}{
+		{profileCode: "CSV_RFC4180_V1", wantClosed: true},
+		{profileCode: "MANUAL_V1", wantClosed: false},
+		{profileCode: "EXTERNAL_CMDB_V1", wantClosed: false},
+		{profileCode: "FUTURE_V1", wantClosed: false},
+	} {
+		if got := sourceValidationRuntimeClosed(test.profileCode); got != test.wantClosed {
+			t.Errorf("sourceValidationRuntimeClosed(%q) = %t, want %t",
+				test.profileCode, got, test.wantClosed)
+		}
 	}
 }
 

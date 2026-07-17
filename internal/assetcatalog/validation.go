@@ -94,6 +94,8 @@ func validMappingStatus(value domain.MappingStatus) bool {
 
 const manualProfileManifestTextV1 = `{"backpressure_base_seconds":1,"backpressure_max_seconds":1,"compatibility_class":"MANUAL_V1","credential_purpose":"NONE","dlp_policy_code":"ASSET_SAFE_V1","environment_mapping_mode":"SINGLE_ENVIRONMENT","freshness_kind":"CATALOG_SEQUENCE","integration_mode":"NONE","max_document_bytes":65536,"max_page_bytes":65536,"max_page_items":1,"max_page_relations":0,"network_mode":"NONE","parser_code":"MANUAL_ASSET_V1","profile_code":"MANUAL_V1","provider_kind":"MANUAL_V1","rate_limit_requests":1,"rate_limit_window_seconds":1,"relationship_types":[],"schedule_mode":"NONE","source_kind":"MANUAL","sync_mode":"MANUAL","trust_mode":"NONE","trusted_path_codes":["MANUAL_V1_DISPLAY_NAME","MANUAL_V1_EXTERNAL_ID","MANUAL_V1_KIND"],"typed_extension_code":null,"version":"asset-source-profile-manifest.v1"}`
 const manualProviderSchemaTextV1 = `{"additionalProperties":false,"properties":{},"type":"object"}`
+const csvProfileManifestTextV1 = `{"backpressure_base_seconds":1,"backpressure_max_seconds":60,"compatibility_class":"CSV_RFC4180_V1","credential_purpose":"IMPORT_SIGNATURE_VERIFY","dlp_policy_code":"ASSET_SAFE_V1","environment_mapping_mode":"EXPLICIT_ITEM_ENVIRONMENT","freshness_kind":"OBJECT_SEQUENCE","integration_mode":"NONE","max_document_bytes":33554432,"max_page_bytes":33554432,"max_page_items":2000,"max_page_relations":2000,"network_mode":"NONE","parser_code":"CSV_RFC4180_V1","profile_code":"CSV_RFC4180_V1","provider_kind":"CSV_RFC4180_V1","rate_limit_requests":1,"rate_limit_window_seconds":1,"relationship_types":["CONTAINS","DELIVERED_BY","DEPENDS_ON","LOGS_TO","MANAGED_BY","MONITORED_BY","PRIMARY_RUNTIME_FOR","RUNS_ON","TRACES_TO"],"schedule_mode":"NONE","source_kind":"CSV_IMPORT","sync_mode":"ON_DEMAND","trust_mode":"NONE","trusted_path_codes":["CSV_V1_DISPLAY_NAME_COLUMN","CSV_V1_ENVIRONMENT_ID_COLUMN","CSV_V1_EXTERNAL_ID_COLUMN","CSV_V1_KIND_COLUMN","CSV_V1_PROVIDER_KIND_COLUMN","CSV_V1_RELATION_COLUMNS","CSV_V1_TYPE_DETAILS_EMPTY"],"typed_extension_code":null,"version":"asset-source-profile-manifest.v1"}`
+const csvProviderSchemaTextV1 = manualProviderSchemaTextV1
 
 func ManualProfileV1() BuiltinSourceProfile {
 	return BuiltinSourceProfile{
@@ -109,6 +111,49 @@ func ManualProfileV1() BuiltinSourceProfile {
 		CanonicalProviderSchemaSHA256: "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
 		RateLimitRequests:             1, RateLimitWindowSeconds: 1, BackpressureBaseSeconds: 1, BackpressureMaxSeconds: 1,
 	}
+}
+
+func CSVProfileV1(credentialReferenceID CredentialReferenceID) (BuiltinSourceProfile, error) {
+	profile := BuiltinSourceProfile{
+		SourceKind: SourceKindCSVImport, ProviderKind: "CSV_RFC4180_V1", ProfileCode: ProfileCode("CSV_RFC4180_V1"),
+		SyncMode: SyncModeOnDemand, FreshnessKind: FreshnessObjectSequence, EnvironmentMapping: EnvironmentMappingExplicitItem,
+		IntegrationMode: "NONE", CredentialPurpose: "IMPORT_SIGNATURE_VERIFY", TrustMode: "NONE", NetworkMode: "NONE", ScheduleMode: "NONE",
+		ParserCode: "CSV_RFC4180_V1", CompatibilityClass: "CSV_RFC4180_V1", DLPPolicyCode: "ASSET_SAFE_V1",
+		MaxPageItems: 2000, MaxPageRelations: 2000, MaxPageBytes: 33554432, MaxDocumentBytes: 33554432,
+		TrustedPathCodes: []string{
+			"CSV_V1_DISPLAY_NAME_COLUMN",
+			"CSV_V1_ENVIRONMENT_ID_COLUMN",
+			"CSV_V1_EXTERNAL_ID_COLUMN",
+			"CSV_V1_KIND_COLUMN",
+			"CSV_V1_PROVIDER_KIND_COLUMN",
+			"CSV_V1_RELATION_COLUMNS",
+			"CSV_V1_TYPE_DETAILS_EMPTY",
+		},
+		RelationshipTypes: []RelationshipType{
+			RelationshipContains,
+			RelationshipDeliveredBy,
+			RelationshipDependsOn,
+			RelationshipLogsTo,
+			RelationshipManagedBy,
+			RelationshipMonitoredBy,
+			RelationshipPrimaryRuntimeFor,
+			RelationshipRunsOn,
+			RelationshipTracesTo,
+		},
+		CanonicalProfileManifest:      []byte(csvProfileManifestTextV1),
+		CanonicalProviderSchema:       []byte(csvProviderSchemaTextV1),
+		ProfileManifestSHA256:         "9a9739783fbb84a66653271202e06e2e6b2cdcffc268564151d0c6035cbf4941",
+		CanonicalProviderSchemaSHA256: "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
+		CredentialReferenceID:         credentialReferenceID,
+		RateLimitRequests:             1,
+		RateLimitWindowSeconds:        1,
+		BackpressureBaseSeconds:       1,
+		BackpressureMaxSeconds:        60,
+	}
+	if validateInstalledSourceProfile(profile) != nil {
+		return BuiltinSourceProfile{}, ErrInvalidRequest
+	}
+	return profile.Clone(), nil
 }
 
 type profileManifest struct {
@@ -213,6 +258,127 @@ func validSortedCodes(values []string, minimum, maximum int) bool {
 		}
 	}
 	return true
+}
+
+func validateInstalledSourceProfile(profile BuiltinSourceProfile) error {
+	profile = profile.Clone()
+	manifestDigest, err := ProfileManifestDigest(profile.CanonicalProfileManifest)
+	if err != nil || manifestDigest != profile.ProfileManifestSHA256 ||
+		len(profile.CanonicalProviderSchema) < 2 || len(profile.CanonicalProviderSchema) > 65536 ||
+		!strictCanonicalJSONObject(profile.CanonicalProviderSchema) ||
+		sha256Hex(profile.CanonicalProviderSchema) != profile.CanonicalProviderSchemaSHA256 {
+		return ErrInvalidRequest
+	}
+	var manifest profileManifest
+	if json.Unmarshal(profile.CanonicalProfileManifest, &manifest) != nil {
+		return ErrInvalidRequest
+	}
+	relationshipTypes := make([]string, len(profile.RelationshipTypes))
+	for index, relationshipType := range profile.RelationshipTypes {
+		if !relationshipType.Valid() {
+			return ErrInvalidRequest
+		}
+		relationshipTypes[index] = string(relationshipType)
+	}
+	typedExtensionCode := ""
+	if manifest.TypedExtensionCode != nil {
+		typedExtensionCode = *manifest.TypedExtensionCode
+	}
+	if profile.SourceKind != manifest.SourceKind ||
+		profile.ProviderKind != manifest.ProviderKind ||
+		string(profile.ProfileCode) != manifest.ProfileCode ||
+		profile.SyncMode != manifest.SyncMode ||
+		profile.FreshnessKind != manifest.FreshnessKind ||
+		profile.EnvironmentMapping != manifest.EnvironmentMappingMode ||
+		profile.IntegrationMode != manifest.IntegrationMode ||
+		profile.CredentialPurpose != manifest.CredentialPurpose ||
+		profile.TrustMode != manifest.TrustMode ||
+		profile.NetworkMode != manifest.NetworkMode ||
+		profile.ScheduleMode != manifest.ScheduleMode ||
+		profile.ParserCode != manifest.ParserCode ||
+		profile.CompatibilityClass != manifest.CompatibilityClass ||
+		profile.DLPPolicyCode != manifest.DLPPolicyCode ||
+		profile.MaxPageItems != manifest.MaxPageItems ||
+		profile.MaxPageRelations != manifest.MaxPageRelations ||
+		profile.MaxPageBytes != manifest.MaxPageBytes ||
+		profile.MaxDocumentBytes != manifest.MaxDocumentBytes ||
+		profile.RateLimitRequests != manifest.RateLimitRequests ||
+		profile.RateLimitWindowSeconds != manifest.RateLimitWindowSeconds ||
+		profile.BackpressureBaseSeconds != manifest.BackpressureBaseSeconds ||
+		profile.BackpressureMaxSeconds != manifest.BackpressureMaxSeconds ||
+		!slices.Equal(profile.TrustedPathCodes, manifest.TrustedPathCodes) ||
+		!slices.Equal(relationshipTypes, manifest.RelationshipTypes) ||
+		string(profile.TypedExtensionCode) != typedExtensionCode {
+		return ErrInvalidRequest
+	}
+	if profile.IntegrationMode == "NONE" {
+		if profile.IntegrationID != "" {
+			return ErrInvalidRequest
+		}
+	} else if !validUUID(profile.IntegrationID) {
+		return ErrInvalidRequest
+	}
+	if profile.CredentialPurpose == "NONE" {
+		if profile.CredentialReferenceID != "" {
+			return ErrInvalidRequest
+		}
+	} else if !profile.CredentialReferenceID.Valid() {
+		return ErrInvalidRequest
+	}
+	if profile.TrustMode == "NONE" {
+		if profile.TrustReferenceID != "" {
+			return ErrInvalidRequest
+		}
+	} else if !profile.TrustReferenceID.Valid() {
+		return ErrInvalidRequest
+	}
+	if profile.NetworkMode == "NONE" {
+		if profile.NetworkPolicyReferenceID != "" {
+			return ErrInvalidRequest
+		}
+	} else if !profile.NetworkPolicyReferenceID.Valid() {
+		return ErrInvalidRequest
+	}
+	if profile.ScheduleMode == "NONE" {
+		if profile.ScheduleExpression != "" {
+			return ErrInvalidRequest
+		}
+	} else if !validSafeText(profile.ScheduleExpression, 1, 256) {
+		return ErrInvalidRequest
+	}
+	if profile.TypedExtensionCode == "" {
+		if profile.PreparedExtensionDigest != "" {
+			return ErrInvalidRequest
+		}
+	} else if profile.SourceKind != SourceKindKubernetesOperator ||
+		profile.TypedExtensionCode != ExtensionCode(profile.ProfileCode) ||
+		!validDigest(profile.PreparedExtensionDigest) {
+		return ErrInvalidRequest
+	}
+	revision := SourceRevision{
+		CanonicalProfileManifest: profile.CanonicalProfileManifest,
+		CanonicalProviderSchema:  profile.CanonicalProviderSchema,
+		IntegrationID:            profile.IntegrationID,
+		SyncMode:                 profile.SyncMode,
+		CredentialReferenceID:    profile.CredentialReferenceID,
+		TrustReferenceID:         profile.TrustReferenceID,
+		NetworkPolicyReferenceID: profile.NetworkPolicyReferenceID,
+		RateLimitRequests:        profile.RateLimitRequests,
+		RateLimitWindowSeconds:   profile.RateLimitWindowSeconds,
+		BackpressureBaseSeconds:  profile.BackpressureBaseSeconds,
+		BackpressureMaxSeconds:   profile.BackpressureMaxSeconds,
+		ProfileCode:              profile.ProfileCode,
+		ScheduleExpression:       profile.ScheduleExpression,
+		TypedExtensionCode:       profile.TypedExtensionCode,
+		PreparedExtensionDigest:  profile.PreparedExtensionDigest,
+	}
+	if _, err := SourceDefinitionDigest(
+		Source{Kind: profile.SourceKind, ProviderKind: profile.ProviderKind},
+		revision,
+	); err != nil {
+		return ErrInvalidRequest
+	}
+	return nil
 }
 
 func SourceDefinitionDigest(source Source, revision SourceRevision) (string, error) {

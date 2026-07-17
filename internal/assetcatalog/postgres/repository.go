@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"reflect"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -36,14 +37,29 @@ func (database *assetCatalogPool) BeginTx(ctx context.Context, options pgx.TxOpt
 }
 
 type Repository struct {
-	pool  *assetCatalogPool
-	clock func() time.Time
-	newID func() string
+	pool     *assetCatalogPool
+	clock    func() time.Time
+	newID    func() string
+	profiles assetcatalog.SourceProfileRegistry
 }
 
 func New(pool *pgxpool.Pool, clock func() time.Time, newID func() string) (*Repository, error) {
-	if pool == nil || newID == nil {
-		return nil, errors.New("asset catalog pool and id generator are required")
+	return NewWithSourceProfileRegistry(
+		pool,
+		clock,
+		newID,
+		assetcatalog.NewBuiltinSourceProfileRegistry(),
+	)
+}
+
+func NewWithSourceProfileRegistry(
+	pool *pgxpool.Pool,
+	clock func() time.Time,
+	newID func() string,
+	profiles assetcatalog.SourceProfileRegistry,
+) (*Repository, error) {
+	if pool == nil || newID == nil || nilSourceProfileRegistry(profiles) {
+		return nil, errors.New("asset catalog pool, id generator, and source profile registry are required")
 	}
 	if clock == nil {
 		clock = time.Now
@@ -53,9 +69,53 @@ func New(pool *pgxpool.Pool, clock func() time.Time, newID func() string) (*Repo
 			Pool:    pool,
 			beginTx: pool.BeginTx,
 		},
-		clock: clock,
-		newID: newID,
+		clock:    clock,
+		newID:    newID,
+		profiles: profiles,
 	}, nil
+}
+
+func nilSourceProfileRegistry(registry assetcatalog.SourceProfileRegistry) bool {
+	if registry == nil {
+		return true
+	}
+	value := reflect.ValueOf(registry)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	}
+	return false
+}
+
+func (repository *Repository) resolveSourceProfile(
+	id assetcatalog.SourceProfileID,
+) (assetcatalog.BuiltinSourceProfile, error) {
+	if repository == nil || nilSourceProfileRegistry(repository.profiles) {
+		return assetcatalog.BuiltinSourceProfile{}, assetcatalog.ErrUnavailable
+	}
+	return repository.profiles.Resolve(id)
+}
+
+func (repository *Repository) resolveSourceProfileAfterReplayCheck(
+	id assetcatalog.SourceProfileID,
+	replayCheck func() error,
+) (assetcatalog.BuiltinSourceProfile, error) {
+	if replayCheck != nil {
+		if err := replayCheck(); err != nil {
+			return assetcatalog.BuiltinSourceProfile{}, err
+		}
+	}
+	return repository.resolveSourceProfile(id)
+}
+
+func (repository *Repository) ResolveProfileAdmission(
+	ctx context.Context,
+	code assetcatalog.ProfileCode,
+) (assetcatalog.BuiltinSourceProfile, error) {
+	if repository == nil || nilSourceProfileRegistry(repository.profiles) {
+		return assetcatalog.BuiltinSourceProfile{}, assetcatalog.ErrUnavailable
+	}
+	return repository.profiles.ResolveProfileAdmission(ctx, code)
 }
 
 func (repository *Repository) withSerializable(
