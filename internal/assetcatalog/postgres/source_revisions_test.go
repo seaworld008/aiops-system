@@ -316,6 +316,35 @@ func TestSourceMutationAuditAndOutboxShapesCannotCarryProfileOrOpaqueFacts(t *te
 				"TraceID":         reflect.TypeOf(""),
 			},
 		},
+		{
+			value: sourceCreationAuditDetails{},
+			expected: map[string]reflect.Type{
+				"CommandSHA256": reflect.TypeOf(""),
+				"SourceID":      reflect.TypeOf(""),
+				"OutboxID":      reflect.TypeOf(""),
+				"ReasonCode":    reflect.TypeOf(""),
+				"Revision":      reflect.TypeOf(int64(0)),
+				"RunID":         reflect.TypeOf(""),
+				"SourceVersion": reflect.TypeOf(int64(0)),
+				"RevisionVersion": reflect.TypeOf(
+					int64(0),
+				),
+				"RunVersion": reflect.TypeOf(int64(0)),
+			},
+		},
+		{
+			value: sourceCreationOutboxPayload{},
+			expected: map[string]reflect.Type{
+				"AuditID":         reflect.TypeOf(""),
+				"SourceID":        reflect.TypeOf(""),
+				"Revision":        reflect.TypeOf(int64(0)),
+				"RunID":           reflect.TypeOf(""),
+				"SourceVersion":   reflect.TypeOf(int64(0)),
+				"RevisionVersion": reflect.TypeOf(int64(0)),
+				"RunVersion":      reflect.TypeOf(int64(0)),
+				"TraceID":         reflect.TypeOf(""),
+			},
+		},
 	} {
 		value := testCase.value
 		typ := reflect.TypeOf(value)

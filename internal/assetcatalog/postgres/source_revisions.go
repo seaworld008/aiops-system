@@ -124,6 +124,35 @@ type sourceOutboxPayload struct {
 	TraceID         string `json:"trace_id"`
 }
 
+type sourceCreationAuditDetails struct {
+	CommandSHA256   string `json:"command_sha256"`
+	SourceID        string `json:"source_id"`
+	OutboxID        string `json:"outbox_id"`
+	ReasonCode      string `json:"reason_code"`
+	Revision        int64  `json:"revision"`
+	RunID           string `json:"run_id,omitempty"`
+	SourceVersion   int64  `json:"source_version"`
+	RevisionVersion int64  `json:"revision_version"`
+	RunVersion      int64  `json:"run_version,omitempty"`
+}
+
+type sourceCreationAuditRecord struct {
+	ID, ActorID, Action, ResourceType, ResourceID string
+	PayloadHash, TraceID                          string
+	Details                                       sourceCreationAuditDetails
+}
+
+type sourceCreationOutboxPayload struct {
+	AuditID         string `json:"audit_id"`
+	SourceID        string `json:"source_id"`
+	Revision        int64  `json:"revision"`
+	RunID           string `json:"run_id,omitempty"`
+	SourceVersion   int64  `json:"source_version"`
+	RevisionVersion int64  `json:"revision_version"`
+	RunVersion      int64  `json:"run_version,omitempty"`
+	TraceID         string `json:"trace_id"`
+}
+
 func (repository *Repository) CreateSource(
 	ctx context.Context,
 	command assetcatalog.CreateSourceCommand,
@@ -487,6 +516,104 @@ func validateSourceMutationAudit(
 	return nil
 }
 
+func findSourceCreationAudit(
+	ctx context.Context,
+	tx pgx.Tx,
+	scope assetcatalog.SourceScope,
+	idempotencyKey string,
+) (sourceCreationAuditRecord, bool, error) {
+	var record sourceCreationAuditRecord
+	var traceID *string
+	var details []byte
+	err := tx.QueryRow(
+		ctx, sourceMutationAuditLookupSQL, scope.TenantID, scope.WorkspaceID, idempotencyKey,
+	).Scan(
+		&record.ID, &record.ActorID, &record.Action, &record.ResourceType, &record.ResourceID,
+		&record.PayloadHash, &traceID, &details,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return sourceCreationAuditRecord{}, false, nil
+	}
+	if err != nil {
+		return sourceCreationAuditRecord{}, false, err
+	}
+	if traceID == nil || !validUUID(record.ID) || decodeStrictJSON(details, &record.Details) != nil {
+		return sourceCreationAuditRecord{}, false, assetcatalog.ErrStateConflict
+	}
+	record.TraceID = *traceID
+	return record, true, nil
+}
+
+func validateSourceCreationAudit(
+	commandContext assetcatalog.MutationContext,
+	commandHash, sourceID string,
+	record sourceCreationAuditRecord,
+) error {
+	if record.ActorID != commandContext.ActorID() ||
+		record.Action != sourceRevisionCreatedEvent ||
+		record.ResourceType != "ASSET_SOURCE" || record.ResourceID != sourceID ||
+		record.PayloadHash != commandContext.RequestHash() ||
+		record.Details.CommandSHA256 != commandHash ||
+		record.Details.SourceID != sourceID ||
+		record.Details.ReasonCode != sourceInitialCreateReason {
+		return assetcatalog.ErrIdempotency
+	}
+	return nil
+}
+
+func insertSourceCreationSideEffects(
+	ctx context.Context,
+	tx pgx.Tx,
+	ids []string,
+	commandContext assetcatalog.MutationContext,
+	commandHash string,
+	source assetcatalog.Source,
+	revision assetcatalog.SourceRevision,
+) (assetcatalog.MutationReceipt, error) {
+	if len(ids) != 2 {
+		return assetcatalog.MutationReceipt{}, assetcatalog.ErrStateConflict
+	}
+	detailsJSON, err := json.Marshal(sourceCreationAuditDetails{
+		CommandSHA256: commandHash,
+		SourceID:      source.ID,
+		OutboxID:      ids[1],
+		ReasonCode:    sourceInitialCreateReason,
+		Revision:      revision.Revision,
+		SourceVersion: source.Version, RevisionVersion: revision.Version,
+	})
+	if err != nil {
+		return assetcatalog.MutationReceipt{}, assetcatalog.ErrStateConflict
+	}
+	if _, err := tx.Exec(
+		ctx, insertSourceMutationAuditSQL,
+		ids[0], source.TenantID, source.WorkspaceID, commandContext.ActorID(),
+		sourceRevisionCreatedEvent, source.ID, commandContext.IdempotencyKey(),
+		commandContext.TraceID(), commandContext.RequestHash(), string(detailsJSON),
+	); err != nil {
+		return assetcatalog.MutationReceipt{}, err
+	}
+	payloadJSON, err := json.Marshal(sourceCreationOutboxPayload{
+		AuditID:       ids[0],
+		SourceID:      source.ID,
+		Revision:      revision.Revision,
+		SourceVersion: source.Version, RevisionVersion: revision.Version,
+		TraceID: commandContext.TraceID(),
+	})
+	if err != nil {
+		return assetcatalog.MutationReceipt{}, assetcatalog.ErrStateConflict
+	}
+	if _, err := tx.Exec(
+		ctx, insertSourceMutationOutboxSQL,
+		ids[1], source.TenantID, source.WorkspaceID, "ASSET_SOURCE", source.ID,
+		source.Version, sourceRevisionCreatedEvent, string(payloadJSON),
+	); err != nil {
+		return assetcatalog.MutationReceipt{}, err
+	}
+	return assetcatalog.MutationReceipt{
+		AuditID: ids[0], TraceID: commandContext.TraceID(), IdempotentReplay: false,
+	}, nil
+}
+
 func insertSourceMutationSideEffects(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -561,6 +688,12 @@ func sourceReplayReceipt(record sourceMutationAuditRecord) assetcatalog.Mutation
 	}
 }
 
+func sourceCreationReplayReceipt(record sourceCreationAuditRecord) assetcatalog.MutationReceipt {
+	return assetcatalog.MutationReceipt{
+		AuditID: record.ID, TraceID: record.TraceID, IdempotentReplay: true,
+	}
+}
+
 func nullableSourceString(value string) any {
 	if value == "" {
 		return nil
@@ -583,7 +716,7 @@ func (repository *Repository) createSourceInTx(
 	if err := prepareSourceMutation(ctx, tx, scope, command.Context.IdempotencyKey()); err != nil {
 		return assetcatalog.SourceRevisionMutation{}, err
 	}
-	record, found, err := findSourceMutationAudit(ctx, tx, scope, command.Context.IdempotencyKey())
+	record, found, err := findSourceCreationAudit(ctx, tx, scope, command.Context.IdempotencyKey())
 	if err != nil {
 		return assetcatalog.SourceRevisionMutation{}, err
 	}
@@ -593,9 +726,8 @@ func (repository *Repository) createSourceInTx(
 		if !validUUID(record.ResourceID) {
 			return assetcatalog.SourceRevisionMutation{}, assetcatalog.ErrIdempotency
 		}
-		if err := validateSourceMutationAudit(
-			command.Context, commandHash, sourceRevisionCreatedEvent, record.ResourceID,
-			sourceInitialCreateReason, record,
+		if err := validateSourceCreationAudit(
+			command.Context, commandHash, record.ResourceID, record,
 		); err != nil {
 			return assetcatalog.SourceRevisionMutation{}, err
 		}
@@ -610,14 +742,14 @@ func (repository *Repository) createSourceInTx(
 		if err != nil {
 			return assetcatalog.SourceRevisionMutation{}, err
 		}
-		if err := validateSourceCreationReplay(
+		replay, err := sourceCreationReplay(
 			ctx, tx, command, source, revision, profile, authorities, record,
-		); err != nil {
+		)
+		if err != nil {
 			return assetcatalog.SourceRevisionMutation{}, err
 		}
-		return assetcatalog.SourceRevisionMutation{
-			Source: source, Revision: revision, Receipt: sourceReplayReceipt(record),
-		}.Clone(), nil
+		replay.Receipt = sourceCreationReplayReceipt(record)
+		return replay.Clone(), nil
 	}
 	if err := validateResolvedSourceAuthorities(ctx, tx, scope, profile, authorities); err != nil {
 		return assetcatalog.SourceRevisionMutation{}, err
@@ -664,9 +796,8 @@ INSERT INTO asset_sources (
 		!slices.Equal(revision.AuthorityEnvironmentIDs, authorities) {
 		return assetcatalog.SourceRevisionMutation{}, assetcatalog.ErrStateConflict
 	}
-	receipt, err := insertSourceMutationSideEffects(
-		ctx, tx, ids[2:], command.Context, commandHash, sourceRevisionCreatedEvent,
-		sourceInitialCreateReason, source, &revision, nil,
+	receipt, err := insertSourceCreationSideEffects(
+		ctx, tx, ids[2:], command.Context, commandHash, source, revision,
 	)
 	if err != nil {
 		return assetcatalog.SourceRevisionMutation{}, err
@@ -676,36 +807,104 @@ INSERT INTO asset_sources (
 	}.Clone(), nil
 }
 
-func validateSourceCreationReplay(
+func sourceCreationReplay(
 	ctx context.Context,
 	tx pgx.Tx,
 	command assetcatalog.CreateSourceCommand,
-	source assetcatalog.Source,
-	revision assetcatalog.SourceRevision,
+	currentSource assetcatalog.Source,
+	currentRevision assetcatalog.SourceRevision,
 	profile assetcatalog.BuiltinSourceProfile,
 	authorities []string,
-	record sourceMutationAuditRecord,
-) error {
+	record sourceCreationAuditRecord,
+) (assetcatalog.SourceRevisionMutation, error) {
 	var idempotencyKey, requestHash string
 	if err := tx.QueryRow(ctx, `
 SELECT create_idempotency_key,create_request_hash
 FROM asset_sources
 WHERE tenant_id=$1::uuid AND workspace_id=$2::uuid AND id=$3::uuid
-`, source.TenantID, source.WorkspaceID, source.ID).Scan(&idempotencyKey, &requestHash); err != nil {
-		return err
+`, currentSource.TenantID, currentSource.WorkspaceID, currentSource.ID).Scan(
+		&idempotencyKey, &requestHash,
+	); err != nil {
+		return assetcatalog.SourceRevisionMutation{}, err
 	}
 	if idempotencyKey != command.Context.IdempotencyKey() ||
 		requestHash != command.Context.RequestHash() {
-		return assetcatalog.ErrIdempotency
+		return assetcatalog.SourceRevisionMutation{}, assetcatalog.ErrIdempotency
 	}
-	if source.Version != record.Details.SourceVersion ||
-		revision.Version != record.Details.RevisionVersion ||
-		!sourceHasExactInitialCreateState(source, command.Name) ||
-		!sourceRevisionMatchesResolvedProfile(source, revision, profile) ||
-		revision.Revision != 1 || revision.Status != assetcatalog.SourceRevisionDraft ||
-		revision.ExpectedSourceVersion != 1 ||
-		revision.ChangeReasonCode != sourceInitialCreateReason ||
-		!slices.Equal(revision.AuthorityEnvironmentIDs, authorities) {
+	if record.Details.SourceVersion != 2 || record.Details.Revision != 1 ||
+		record.Details.RevisionVersion != 1 ||
+		record.Details.RunID != "" || record.Details.RunVersion != 0 ||
+		!validUUID(record.Details.OutboxID) ||
+		currentSource.ID != record.ResourceID ||
+		currentSource.Kind != profile.SourceKind ||
+		currentSource.ProviderKind != profile.ProviderKind ||
+		currentRevision.ID == "" || currentRevision.Revision != 1 ||
+		currentRevision.ExpectedSourceVersion != 1 ||
+		currentRevision.CreatedBy != command.Context.ActorID() ||
+		currentRevision.ChangeReasonCode != sourceInitialCreateReason ||
+		!slices.Equal(currentRevision.AuthorityEnvironmentIDs, authorities) ||
+		!sourceRevisionMatchesResolvedProfile(currentSource, currentRevision, profile) {
+		return assetcatalog.SourceRevisionMutation{}, assetcatalog.ErrStateConflict
+	}
+	if err := validateSourceCreationOutbox(ctx, tx, currentSource, record); err != nil {
+		return assetcatalog.SourceRevisionMutation{}, err
+	}
+	source := assetcatalog.Source{
+		ID: currentSource.ID, TenantID: currentSource.TenantID, WorkspaceID: currentSource.WorkspaceID,
+		ProviderKind: profile.ProviderKind, Name: command.Name, Kind: profile.SourceKind,
+		Status: assetcatalog.SourceStatusActive, GateStatus: assetcatalog.SourceGateUnavailable,
+		Version:   record.Details.SourceVersion,
+		CreatedAt: currentSource.CreatedAt, UpdatedAt: currentRevision.CreatedAt,
+	}
+	revision, err := newSourceRevision(
+		source, profile, authorities, currentRevision.ID, 1, 1,
+		command.Context.ActorID(), sourceInitialCreateReason,
+	)
+	if err != nil {
+		return assetcatalog.SourceRevisionMutation{}, err
+	}
+	revision.CreatedAt = currentRevision.CreatedAt
+	revision.UpdatedAt = currentRevision.CreatedAt
+	if !sourceHasExactInitialCreateState(source, command.Name) ||
+		source.Validate() != nil || revision.Validate() != nil {
+		return assetcatalog.SourceRevisionMutation{}, assetcatalog.ErrStateConflict
+	}
+	return assetcatalog.SourceRevisionMutation{
+		Source: source, Revision: revision,
+	}.Clone(), nil
+}
+
+func validateSourceCreationOutbox(
+	ctx context.Context,
+	tx pgx.Tx,
+	source assetcatalog.Source,
+	record sourceCreationAuditRecord,
+) error {
+	var count int
+	var outboxID string
+	var encodedPayload string
+	if err := tx.QueryRow(ctx, `
+SELECT count(*),COALESCE(min(id::text),''),COALESCE(min(payload::text),'')
+FROM outbox_events
+WHERE tenant_id=$1::uuid AND workspace_id=$2::uuid
+  AND aggregate_type='ASSET_SOURCE' AND aggregate_id=$3::uuid
+  AND aggregate_version=$4 AND event_type=$5
+`, source.TenantID, source.WorkspaceID, source.ID,
+		record.Details.SourceVersion, sourceRevisionCreatedEvent,
+	).Scan(&count, &outboxID, &encodedPayload); err != nil {
+		return err
+	}
+	var payload sourceCreationOutboxPayload
+	if count != 1 || decodeStrictJSON([]byte(encodedPayload), &payload) != nil ||
+		outboxID != record.Details.OutboxID ||
+		payload.AuditID != record.ID ||
+		payload.SourceID != source.ID ||
+		payload.Revision != record.Details.Revision ||
+		payload.RunID != "" ||
+		payload.SourceVersion != record.Details.SourceVersion ||
+		payload.RevisionVersion != record.Details.RevisionVersion ||
+		payload.RunVersion != 0 ||
+		payload.TraceID != record.TraceID {
 		return assetcatalog.ErrStateConflict
 	}
 	return nil

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -67,6 +68,223 @@ func TestSourceRevisionIntegrationCreateSourceAtomicallyCreatesRevisionOneAndRep
 		t.Fatalf("CreateSource(hash drift) error = %v", err)
 	}
 	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 1, 1, 1, 1, 1)
+}
+
+func TestSourceRevisionIntegrationCreateSourceReplayReturnsOriginalAfterLegalPublication(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	fixture := seedSourceCreationScope(t, harness.db)
+	repository, err := assetpostgres.New(
+		harness.application,
+		func() time.Time { return time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC) },
+		deterministicAssetIDGenerator(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := manualSourceCreateCommand(t, fixture, "create-source-replay-after-publish", "1")
+	created, err := repository.CreateSource(context.Background(), command)
+	if err != nil {
+		t.Fatalf("CreateSource() error = %v", err)
+	}
+	scope := assetcatalog.SourceScope{
+		TenantID: fixture.tenantID, WorkspaceID: fixture.workspaceID,
+	}
+	validated, err := repository.RequestValidation(
+		context.Background(),
+		assetcatalog.ValidateSourceRevisionCommand{
+			Context:                 sourceRevisionMutationContext(t, scope, "validate-created-source", "2"),
+			SourceID:                created.Source.ID,
+			Revision:                created.Revision.Revision,
+			ExpectedSourceVersion:   created.Source.Version,
+			ExpectedRevisionVersion: created.Revision.Version,
+			ExpectedRevisionDigest:  created.Revision.CanonicalRevisionDigest,
+		},
+	)
+	if err != nil {
+		t.Fatalf("RequestValidation() error = %v", err)
+	}
+	published, err := repository.Publish(
+		context.Background(),
+		assetcatalog.PublishSourceRevisionCommand{
+			Context:                  sourceRevisionMutationContext(t, scope, "publish-created-source", "3"),
+			SourceID:                 created.Source.ID,
+			Revision:                 created.Revision.Revision,
+			ReasonCode:               "VALIDATION_REVIEWED",
+			ExpectedSourceVersion:    validated.Source.Version,
+			ExpectedRevisionVersion:  validated.Revision.Version,
+			ExpectedRevisionDigest:   validated.Revision.CanonicalRevisionDigest,
+			ExpectedValidationRunID:  validated.Run.ID,
+			ExpectedValidationDigest: validated.Run.ValidationProofDigest,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	if published.Source.PublishedRevision != 1 ||
+		published.Source.GateStatus != assetcatalog.SourceGateAvailable ||
+		published.Revision.Status != assetcatalog.SourceRevisionPublished {
+		t.Fatalf("Publish() = %#v", published)
+	}
+
+	replay, err := repository.CreateSource(context.Background(), command)
+	if err != nil {
+		t.Fatalf("CreateSource(replay after publish) error = %v", err)
+	}
+	want := created.Clone()
+	want.Receipt.IdempotentReplay = true
+	if !reflect.DeepEqual(replay, want) {
+		t.Fatalf("CreateSource(replay after publish) = %#v, want original %#v", replay, want)
+	}
+
+	changed := command
+	changed.Name = "changed after publication"
+	if _, err := repository.CreateSource(context.Background(), changed); !errors.Is(
+		err, assetcatalog.ErrIdempotency,
+	) {
+		t.Fatalf("CreateSource(hash drift after publish) error = %v", err)
+	}
+	crossScope := command
+	crossScope.Context = sourceRevisionMutationContext(
+		t,
+		assetcatalog.SourceScope{
+			TenantID: fixture.tenantID, WorkspaceID: fixture.otherWorkspaceID,
+		},
+		command.Context.IdempotencyKey(),
+		"1",
+	)
+	if _, err := repository.CreateSource(context.Background(), crossScope); !errors.Is(
+		err, assetcatalog.ErrScopeViolation,
+	) {
+		t.Fatalf("CreateSource(cross-scope replay) error = %v", err)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 1, 1, 1, 1, 1)
+}
+
+func TestSourceRevisionIntegrationCreateSourceReplayRejectsReceiptAuditAndOutboxDrift(t *testing.T) {
+	testCases := []struct {
+		name       string
+		mutate     func(*testing.T, *pgxpool.Pool, assetcatalog.SourceRevisionMutation)
+		wantAudits int
+		wantOutbox int
+	}{
+		{
+			name: "missing receipt",
+			mutate: func(t *testing.T, database *pgxpool.Pool, created assetcatalog.SourceRevisionMutation) {
+				t.Helper()
+				execAssetSQL(t, database, `ALTER TABLE public.audit_records DISABLE TRIGGER audit_records_no_update`)
+				execAssetSQL(t, database, `DELETE FROM audit_records WHERE id=$1::uuid`, created.Receipt.AuditID)
+				execAssetSQL(t, database, `ALTER TABLE public.audit_records ENABLE TRIGGER audit_records_no_update`)
+			},
+			wantAudits: 0,
+			wantOutbox: 1,
+		},
+		{
+			name: "audit identity drift",
+			mutate: func(t *testing.T, database *pgxpool.Pool, created assetcatalog.SourceRevisionMutation) {
+				t.Helper()
+				execAssetSQL(t, database, `ALTER TABLE public.audit_records DISABLE TRIGGER audit_records_no_update`)
+				execAssetSQL(t, database, `
+UPDATE audit_records
+SET details=jsonb_set(details,'{command_sha256}',to_jsonb(repeat('f',64)::text),false)
+WHERE id=$1::uuid
+`, created.Receipt.AuditID)
+				execAssetSQL(t, database, `ALTER TABLE public.audit_records ENABLE TRIGGER audit_records_no_update`)
+			},
+			wantAudits: 1,
+			wantOutbox: 1,
+		},
+		{
+			name: "audit run tuple drift",
+			mutate: func(t *testing.T, database *pgxpool.Pool, created assetcatalog.SourceRevisionMutation) {
+				t.Helper()
+				execAssetSQL(t, database, `ALTER TABLE public.audit_records DISABLE TRIGGER audit_records_no_update`)
+				execAssetSQL(t, database, `
+UPDATE audit_records
+SET details=jsonb_set(
+	jsonb_set(details,'{run_id}',to_jsonb('70000000-0000-4000-8000-000000000005'::text),true),
+	'{run_version}','1'::jsonb,true
+)
+WHERE id=$1::uuid
+`, created.Receipt.AuditID)
+				execAssetSQL(t, database, `ALTER TABLE public.audit_records ENABLE TRIGGER audit_records_no_update`)
+			},
+			wantAudits: 1,
+			wantOutbox: 1,
+		},
+		{
+			name: "audit row identity drift",
+			mutate: func(t *testing.T, database *pgxpool.Pool, created assetcatalog.SourceRevisionMutation) {
+				t.Helper()
+				execAssetSQL(t, database, `ALTER TABLE public.audit_records DISABLE TRIGGER audit_records_no_update`)
+				execAssetSQL(t, database, `
+UPDATE audit_records
+SET id='70000000-0000-4000-8000-000000000006'::uuid
+WHERE id=$1::uuid
+`, created.Receipt.AuditID)
+				execAssetSQL(t, database, `ALTER TABLE public.audit_records ENABLE TRIGGER audit_records_no_update`)
+			},
+			wantAudits: 1,
+			wantOutbox: 1,
+		},
+		{
+			name: "outbox payload drift",
+			mutate: func(t *testing.T, database *pgxpool.Pool, created assetcatalog.SourceRevisionMutation) {
+				t.Helper()
+				execAssetSQL(t, database, `
+UPDATE outbox_events
+SET payload=jsonb_set(payload,'{source_version}','99'::jsonb,false)
+WHERE aggregate_type='ASSET_SOURCE' AND aggregate_id=$1::uuid
+  AND event_type='asset.source.revision.created.v1'
+`, created.Source.ID)
+			},
+			wantAudits: 1,
+			wantOutbox: 1,
+		},
+		{
+			name: "outbox row identity drift",
+			mutate: func(t *testing.T, database *pgxpool.Pool, created assetcatalog.SourceRevisionMutation) {
+				t.Helper()
+				execAssetSQL(t, database, `
+UPDATE outbox_events
+SET id='70000000-0000-4000-8000-000000000007'::uuid
+WHERE aggregate_type='ASSET_SOURCE' AND aggregate_id=$1::uuid
+  AND event_type='asset.source.revision.created.v1'
+`, created.Source.ID)
+			},
+			wantAudits: 1,
+			wantOutbox: 1,
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			harness := newAssetCatalogHarness(t)
+			harness.applyThroughAssetCatalog(t)
+			fixture := seedSourceCreationScope(t, harness.db)
+			repository, err := assetpostgres.New(
+				harness.application,
+				func() time.Time { return time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC) },
+				deterministicAssetIDGenerator(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			command := manualSourceCreateCommand(t, fixture, "create-source-drift", "4")
+			created, err := repository.CreateSource(context.Background(), command)
+			if err != nil {
+				t.Fatalf("CreateSource() error = %v", err)
+			}
+			testCase.mutate(t, harness.db, created)
+
+			if replay, err := repository.CreateSource(context.Background(), command); err == nil {
+				t.Fatalf("CreateSource(replay with %s) = %#v, want fail closed", testCase.name, replay)
+			}
+			assertSourceCreateClosureCounts(
+				t, harness.db, fixture.workspaceID,
+				1, 1, 1, testCase.wantAudits, testCase.wantOutbox,
+			)
+		})
+	}
 }
 
 func TestSourceRevisionIntegrationConcurrentCreateSourceHasOneAtomicClosure(t *testing.T) {
