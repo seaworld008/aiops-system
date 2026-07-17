@@ -546,7 +546,10 @@ type SourceProfileID string
 type ProfileCode string
 type ExtensionCode string
 
-const SourceProfileIDManualV1 SourceProfileID = "manual-v1"
+const (
+	SourceProfileIDManualV1     SourceProfileID = "manual-v1"
+	SourceProfileIDCSVRFC4180V1 SourceProfileID = "csv-rfc4180-v1"
+)
 
 func (value SourceProfileID) Valid() bool {
 	if len(value) < 1 || len(value) > 64 {

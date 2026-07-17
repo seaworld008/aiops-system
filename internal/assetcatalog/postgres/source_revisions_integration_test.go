@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,318 @@ import (
 	assetpostgres "github.com/seaworld008/aiops-system/internal/assetcatalog/postgres"
 	"github.com/seaworld008/aiops-system/internal/authn"
 )
+
+func TestSourceRevisionIntegrationInjectedCSVProfileCreatesClosedExactRevisions(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	fixture := seedSourceCreationScope(t, harness.db)
+	credentialReferenceID := assetcatalog.CredentialReferenceID("csv-signature-reference-v1")
+	profile, err := assetcatalog.CSVProfileV1(credentialReferenceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := assetcatalog.NewSourceProfileRegistry(assetcatalog.SourceProfileRegistration{
+		Selector: assetcatalog.SourceProfileIDCSVRFC4180V1,
+		Profile:  profile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := func() time.Time { return time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC) }
+	defaultRepository, err := assetpostgres.New(
+		harness.application,
+		clock,
+		deterministicAssetIDGenerator(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := assetcatalog.SourceScope{
+		TenantID: fixture.tenantID, WorkspaceID: fixture.workspaceID,
+	}
+	command := assetcatalog.CreateSourceCommand{
+		Context:         sourceRevisionMutationContext(t, scope, "create-csv-source", "1"),
+		Name:            "fixture csv source",
+		SourceProfileID: assetcatalog.SourceProfileIDCSVRFC4180V1,
+		AuthorityEnvironmentIDs: []string{
+			fixture.secondEnvironmentID,
+			fixture.environmentID,
+		},
+	}
+	if _, err := defaultRepository.CreateSource(t.Context(), command); !errors.Is(err, assetcatalog.ErrNotFound) {
+		t.Fatalf("default CreateSource(CSV) error = %v, want ErrNotFound", err)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 0, 0, 0, 0, 0)
+
+	newID := deterministicAssetIDGenerator()
+	repository, err := assetpostgres.NewWithSourceProfileRegistry(
+		harness.application,
+		clock,
+		newID,
+		registry,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := repository.CreateSource(t.Context(), command)
+	if err != nil {
+		t.Fatalf("injected CreateSource(CSV) error = %v", err)
+	}
+	wantAuthorities := []string{fixture.environmentID, fixture.secondEnvironmentID}
+	wantAuthorityDigest, err := assetcatalog.AuthorityScopeDigest(wantAuthorities)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Source.Kind != assetcatalog.SourceKindCSVImport ||
+		created.Source.ProviderKind != "CSV_RFC4180_V1" ||
+		created.Source.Status != assetcatalog.SourceStatusActive ||
+		created.Source.GateStatus != assetcatalog.SourceGateUnavailable ||
+		created.Source.PublishedRevision != 0 ||
+		created.Source.Version != 2 ||
+		created.Revision.Status != assetcatalog.SourceRevisionDraft ||
+		created.Revision.Revision != 1 ||
+		created.Revision.ProfileCode != "CSV_RFC4180_V1" ||
+		created.Revision.CredentialReferenceID != credentialReferenceID ||
+		created.Revision.ProfileManifestSHA256 != "9a9739783fbb84a66653271202e06e2e6b2cdcffc268564151d0c6035cbf4941" ||
+		created.Revision.CanonicalProviderSchemaSHA256 != "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa" ||
+		created.Revision.AuthorityScopeDigest != wantAuthorityDigest ||
+		!slices.Equal(created.Revision.AuthorityEnvironmentIDs, wantAuthorities) ||
+		created.Revision.CanonicalRevisionDigest != created.Revision.BindingDigest() {
+		t.Fatalf("injected CreateSource(CSV) = %#v", created)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 1, 1, 2, 1, 1)
+
+	replay, err := repository.CreateSource(t.Context(), command)
+	if err != nil || !replay.Receipt.IdempotentReplay ||
+		replay.Source.ID != created.Source.ID ||
+		replay.Revision.ID != created.Revision.ID {
+		t.Fatalf("injected CreateSource(CSV replay) = (%#v, %v)", replay, err)
+	}
+	drift := command.Clone()
+	drift.SourceProfileID = assetcatalog.SourceProfileIDManualV1
+	drift.AuthorityEnvironmentIDs = []string{fixture.environmentID}
+	if _, err := repository.CreateSource(t.Context(), drift); !errors.Is(err, assetcatalog.ErrIdempotency) ||
+		strings.Contains(err.Error(), string(credentialReferenceID)) {
+		t.Fatalf("CreateSource(CSV replay drift) error = %v", err)
+	}
+	unknownReplay := command.Clone()
+	unknownReplay.SourceProfileID = "future-v1"
+	if _, err := repository.CreateSource(t.Context(), unknownReplay); !errors.Is(err, assetcatalog.ErrIdempotency) ||
+		strings.Contains(err.Error(), string(credentialReferenceID)) {
+		t.Fatalf("CreateSource(CSV unknown-selector replay drift) error = %v", err)
+	}
+	wrongScope := command.Clone()
+	wrongScope.Context = sourceRevisionMutationContext(t, scope, "create-csv-wrong-scope", "2")
+	wrongScope.AuthorityEnvironmentIDs = []string{fixture.environmentID, fixture.otherEnvironmentID}
+	if _, err := repository.CreateSource(t.Context(), wrongScope); !errors.Is(err, assetcatalog.ErrScopeViolation) ||
+		strings.Contains(err.Error(), string(credentialReferenceID)) {
+		t.Fatalf("CreateSource(CSV wrong Scope) error = %v", err)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 1, 1, 2, 1, 1)
+
+	driftedProfile, err := assetcatalog.CSVProfileV1("csv-signature-reference-v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	driftedRegistry, err := assetcatalog.NewSourceProfileRegistry(assetcatalog.SourceProfileRegistration{
+		Selector: assetcatalog.SourceProfileIDCSVRFC4180V1,
+		Profile:  driftedProfile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	driftedRepository, err := assetpostgres.NewWithSourceProfileRegistry(
+		harness.application,
+		clock,
+		newID,
+		driftedRegistry,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSourceCommand := command.Clone()
+	secondSourceCommand.Context = sourceRevisionMutationContext(t, scope, "create-csv-drifted-source", "5")
+	secondSourceCommand.Name = "fixture drifted csv source"
+	if _, err := driftedRepository.CreateSource(t.Context(), secondSourceCommand); !errors.Is(err, assetcatalog.ErrStateConflict) ||
+		strings.Contains(err.Error(), string(credentialReferenceID)) ||
+		strings.Contains(err.Error(), string(driftedProfile.CredentialReferenceID)) {
+		t.Fatalf("CreateSource(CSV same-code reference drift) error = %v", err)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 1, 1, 2, 1, 1)
+
+	driftedRevisionCommand := assetcatalog.CreateSourceRevisionCommand{
+		Context:                 sourceRevisionMutationContext(t, scope, "create-csv-drifted-revision", "4"),
+		SourceID:                created.Source.ID,
+		SourceProfileID:         assetcatalog.SourceProfileIDCSVRFC4180V1,
+		AuthorityEnvironmentIDs: []string{fixture.environmentID, fixture.secondEnvironmentID},
+		ChangeReasonCode:        "SOURCE_CONFIGURATION_CHANGED",
+		ExpectedSourceVersion:   2,
+	}
+	if _, err := driftedRepository.CreateRevision(t.Context(), driftedRevisionCommand); !errors.Is(err, assetcatalog.ErrStateConflict) ||
+		strings.Contains(err.Error(), string(credentialReferenceID)) ||
+		strings.Contains(err.Error(), string(driftedProfile.CredentialReferenceID)) {
+		t.Fatalf("CreateRevision(CSV same-code reference drift) error = %v", err)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 1, 1, 2, 1, 1)
+
+	successorCommand := assetcatalog.CreateSourceRevisionCommand{
+		Context:                 sourceRevisionMutationContext(t, scope, "create-csv-revision", "3"),
+		SourceID:                created.Source.ID,
+		SourceProfileID:         assetcatalog.SourceProfileIDCSVRFC4180V1,
+		AuthorityEnvironmentIDs: []string{fixture.secondEnvironmentID, fixture.environmentID},
+		ChangeReasonCode:        "SOURCE_CONFIGURATION_CHANGED",
+		ExpectedSourceVersion:   2,
+	}
+	successor, err := repository.CreateRevision(t.Context(), successorCommand)
+	if err != nil {
+		t.Fatalf("injected CreateRevision(CSV) error = %v", err)
+	}
+	if successor.Source.Version != 3 ||
+		successor.Revision.Revision != 2 ||
+		successor.Revision.Status != assetcatalog.SourceRevisionDraft ||
+		successor.Revision.CredentialReferenceID != credentialReferenceID ||
+		successor.Revision.ProfileCode != "CSV_RFC4180_V1" ||
+		!slices.Equal(successor.Revision.AuthorityEnvironmentIDs, wantAuthorities) {
+		t.Fatalf("injected CreateRevision(CSV) = %#v", successor)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 1, 2, 4, 2, 2)
+	unknownRevisionReplay := successorCommand.Clone()
+	unknownRevisionReplay.SourceProfileID = "future-v1"
+	if _, err := repository.CreateRevision(t.Context(), unknownRevisionReplay); !errors.Is(err, assetcatalog.ErrIdempotency) ||
+		strings.Contains(err.Error(), string(credentialReferenceID)) {
+		t.Fatalf("CreateRevision(CSV unknown-selector replay drift) error = %v", err)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 1, 2, 4, 2, 2)
+
+	var selectorOrReferenceLeaks int
+	if err := harness.db.QueryRow(t.Context(), `
+SELECT count(*)
+FROM (
+    SELECT 'source' AS kind,row_to_json(source_row)::text AS document
+    FROM asset_sources AS source_row
+    WHERE source_row.workspace_id=$1::uuid
+    UNION ALL
+    SELECT 'revision',row_to_json(revision_row)::text
+    FROM asset_source_revisions AS revision_row
+    WHERE revision_row.workspace_id=$1::uuid
+    UNION ALL
+    SELECT 'audit',row_to_json(audit_row)::text
+    FROM audit_records AS audit_row
+    WHERE audit_row.workspace_id=$1::uuid
+    UNION ALL
+    SELECT 'outbox',row_to_json(outbox_row)::text
+    FROM outbox_events AS outbox_row
+    WHERE outbox_row.workspace_id=$1::uuid
+) AS records
+WHERE strpos(document,$2)>0
+   OR (kind IN ('audit','outbox') AND strpos(document,$3)>0)
+`, fixture.workspaceID, string(assetcatalog.SourceProfileIDCSVRFC4180V1), string(credentialReferenceID)).Scan(
+		&selectorOrReferenceLeaks,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if selectorOrReferenceLeaks != 0 {
+		t.Fatalf("selector or Credential Reference leaked into non-revision persistence: %d", selectorOrReferenceLeaks)
+	}
+}
+
+func TestSourceRevisionIntegrationConcurrentCSVProfileFirstWriteHasOneSemanticWinner(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	fixture := seedSourceCreationScope(t, harness.db)
+	clock := func() time.Time { return time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC) }
+	newID := deterministicAssetIDGenerator()
+	references := []assetcatalog.CredentialReferenceID{
+		"csv-signature-reference-v1",
+		"csv-signature-reference-v2",
+	}
+	repositories := make([]*assetpostgres.Repository, len(references))
+	for index, referenceID := range references {
+		profile, err := assetcatalog.CSVProfileV1(referenceID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		registry, err := assetcatalog.NewSourceProfileRegistry(assetcatalog.SourceProfileRegistration{
+			Selector: assetcatalog.SourceProfileIDCSVRFC4180V1,
+			Profile:  profile,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		repositories[index], err = assetpostgres.NewWithSourceProfileRegistry(
+			harness.application,
+			clock,
+			newID,
+			registry,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	scope := assetcatalog.SourceScope{
+		TenantID: fixture.tenantID, WorkspaceID: fixture.workspaceID,
+	}
+	commands := []assetcatalog.CreateSourceCommand{
+		{
+			Context:         sourceRevisionMutationContext(t, scope, "concurrent-csv-profile-v1", "6"),
+			Name:            "concurrent csv source v1",
+			SourceProfileID: assetcatalog.SourceProfileIDCSVRFC4180V1,
+			AuthorityEnvironmentIDs: []string{
+				fixture.environmentID,
+				fixture.secondEnvironmentID,
+			},
+		},
+		{
+			Context:         sourceRevisionMutationContext(t, scope, "concurrent-csv-profile-v2", "7"),
+			Name:            "concurrent csv source v2",
+			SourceProfileID: assetcatalog.SourceProfileIDCSVRFC4180V1,
+			AuthorityEnvironmentIDs: []string{
+				fixture.environmentID,
+				fixture.secondEnvironmentID,
+			},
+		},
+	}
+	type result struct {
+		mutation assetcatalog.SourceRevisionMutation
+		err      error
+	}
+	start := make(chan struct{})
+	results := make(chan result, len(commands))
+	for index := range commands {
+		index := index
+		go func() {
+			<-start
+			mutation, err := repositories[index].CreateSource(t.Context(), commands[index])
+			results <- result{mutation: mutation, err: err}
+		}()
+	}
+	close(start)
+	successes, conflicts := 0, 0
+	var winner assetcatalog.SourceRevisionMutation
+	for range commands {
+		call := <-results
+		switch {
+		case call.err == nil:
+			successes++
+			winner = call.mutation
+		case errors.Is(call.err, assetcatalog.ErrStateConflict):
+			conflicts++
+			for _, referenceID := range references {
+				if strings.Contains(call.err.Error(), string(referenceID)) {
+					t.Fatalf("concurrent semantic conflict leaked Credential Reference: %v", call.err)
+				}
+			}
+		default:
+			t.Fatalf("concurrent CSV Profile create error = %v", call.err)
+		}
+	}
+	if successes != 1 || conflicts != 1 ||
+		!slices.Contains(references, winner.Revision.CredentialReferenceID) {
+		t.Fatalf("concurrent CSV Profile outcomes = success:%d conflict:%d winner:%#v",
+			successes, conflicts, winner)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 1, 1, 2, 1, 1)
+}
 
 func TestSourceRevisionIntegrationCreateSourceAtomicallyCreatesRevisionOneAndReplays(t *testing.T) {
 	harness := newAssetCatalogHarness(t)

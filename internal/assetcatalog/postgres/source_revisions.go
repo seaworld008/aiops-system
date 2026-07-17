@@ -165,10 +165,6 @@ func (repository *Repository) CreateSource(
 	if err != nil {
 		return assetcatalog.SourceRevisionMutation{}, err
 	}
-	profile, err := assetcatalog.NewBuiltinSourceProfileRegistry().Resolve(command.SourceProfileID)
-	if err != nil {
-		return assetcatalog.SourceRevisionMutation{}, err
-	}
 	ids, err := repository.allocateIDs(4)
 	if err != nil {
 		return assetcatalog.SourceRevisionMutation{}, err
@@ -178,7 +174,7 @@ func (repository *Repository) CreateSource(
 		receiptRequired bool,
 	) (assetcatalog.SourceRevisionMutation, error) {
 		return repository.createSourceInTx(
-			ctx, tx, scope, command, commandHash, profile, ids, receiptRequired,
+			ctx, tx, scope, command, commandHash, ids, receiptRequired,
 		)
 	})
 }
@@ -193,16 +189,12 @@ func (repository *Repository) CreateRevision(
 	if err != nil {
 		return assetcatalog.SourceRevisionMutation{}, err
 	}
-	profile, err := assetcatalog.NewBuiltinSourceProfileRegistry().Resolve(command.SourceProfileID)
-	if err != nil {
-		return assetcatalog.SourceRevisionMutation{}, err
-	}
 	ids, err := repository.allocateIDs(3)
 	if err != nil {
 		return assetcatalog.SourceRevisionMutation{}, err
 	}
 	return withSourceRevisionSerializable(ctx, repository, func(tx pgx.Tx) (assetcatalog.SourceRevisionMutation, error) {
-		return repository.createRevisionInTx(ctx, tx, scope, command, commandHash, profile, ids)
+		return repository.createRevisionInTx(ctx, tx, scope, command, commandHash, ids)
 	})
 }
 
@@ -794,7 +786,6 @@ func (repository *Repository) createSourceInTx(
 	scope assetcatalog.SourceScope,
 	command assetcatalog.CreateSourceCommand,
 	commandHash string,
-	profile assetcatalog.BuiltinSourceProfile,
 	ids []string,
 	receiptRequired bool,
 ) (assetcatalog.SourceRevisionMutation, error) {
@@ -810,15 +801,31 @@ func (repository *Repository) createSourceInTx(
 	}
 	authorities := slices.Clone(command.AuthorityEnvironmentIDs)
 	slices.Sort(authorities)
+	if !found && receiptRequired {
+		return assetcatalog.SourceRevisionMutation{}, assetcatalog.ErrStateConflict
+	}
+	var replayCheck func() error
 	if found {
 		if !validUUID(record.ResourceID) {
 			return assetcatalog.SourceRevisionMutation{}, assetcatalog.ErrIdempotency
 		}
-		if err := validateSourceCreationAudit(
-			command.Context, commandHash, record.ResourceID, record,
-		); err != nil {
-			return assetcatalog.SourceRevisionMutation{}, err
+		replayCheck = func() error {
+			return validateSourceCreationAudit(
+				command.Context, commandHash, record.ResourceID, record,
+			)
 		}
+	}
+	profile, err := repository.resolveSourceProfileAfterReplayCheck(
+		command.SourceProfileID,
+		replayCheck,
+	)
+	if err != nil {
+		return assetcatalog.SourceRevisionMutation{}, err
+	}
+	if err := validateWorkspaceSourceProfileCodeSemantics(ctx, tx, scope, profile); err != nil {
+		return assetcatalog.SourceRevisionMutation{}, err
+	}
+	if found {
 		source, err := lockSourceMutation(ctx, tx, scope, record.ResourceID)
 		if err != nil {
 			return assetcatalog.SourceRevisionMutation{}, err
@@ -838,9 +845,6 @@ func (repository *Repository) createSourceInTx(
 		}
 		replay.Receipt = sourceCreationReplayReceipt(record)
 		return replay.Clone(), nil
-	}
-	if receiptRequired {
-		return assetcatalog.SourceRevisionMutation{}, assetcatalog.ErrStateConflict
 	}
 	if err := validateResolvedSourceAuthorities(ctx, tx, scope, profile, authorities); err != nil {
 		return assetcatalog.SourceRevisionMutation{}, err
@@ -1183,13 +1187,93 @@ func sourceRevisionMatchesResolvedProfile(
 		revision.CanonicalRevisionDigest == revision.BindingDigest()
 }
 
+func validateWorkspaceSourceProfileCodeSemantics(
+	ctx context.Context,
+	tx pgx.Tx,
+	scope assetcatalog.SourceScope,
+	profile assetcatalog.BuiltinSourceProfile,
+) error {
+	rows, err := tx.Query(ctx, `
+SELECT source.source_kind,source.provider_kind,
+       revision.canonical_profile_manifest,revision.profile_manifest_sha256,
+       revision.canonical_provider_schema,revision.canonical_provider_schema_sha256,
+       revision.integration_id::text,revision.sync_mode,
+       revision.credential_reference_id,revision.trust_reference_id,
+       revision.network_policy_reference_id,
+       revision.rate_limit_requests,revision.rate_limit_window_seconds,
+       revision.backpressure_base_seconds,revision.backpressure_max_seconds,
+       revision.profile_code,revision.schedule_expression,
+       revision.typed_extension_code,revision.prepared_extension_digest
+FROM asset_source_revisions AS revision
+JOIN asset_sources AS source
+  ON source.tenant_id=revision.tenant_id
+ AND source.workspace_id=revision.workspace_id
+ AND source.id=revision.source_id
+WHERE revision.tenant_id=$1::uuid
+  AND revision.workspace_id=$2::uuid
+  AND revision.profile_code=$3
+ORDER BY source.id,revision.revision
+`, scope.TenantID, scope.WorkspaceID, profile.ProfileCode)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			sourceKind                                                  assetcatalog.SourceKind
+			providerKind                                                string
+			canonicalManifest, canonicalSchema                          []byte
+			manifestSHA256, schemaSHA256                                string
+			integrationID, credentialID, trustID, networkID             *string
+			syncMode                                                    assetcatalog.SyncMode
+			rateRequests, rateWindow, backpressureBase, backpressureMax int64
+			profileCode                                                 assetcatalog.ProfileCode
+			scheduleExpression, extensionCode, extensionDigest          *string
+		)
+		if err := rows.Scan(
+			&sourceKind, &providerKind,
+			&canonicalManifest, &manifestSHA256,
+			&canonicalSchema, &schemaSHA256,
+			&integrationID, &syncMode,
+			&credentialID, &trustID, &networkID,
+			&rateRequests, &rateWindow,
+			&backpressureBase, &backpressureMax,
+			&profileCode, &scheduleExpression,
+			&extensionCode, &extensionDigest,
+		); err != nil {
+			return err
+		}
+		if sourceKind != profile.SourceKind ||
+			providerKind != profile.ProviderKind ||
+			!bytes.Equal(canonicalManifest, profile.CanonicalProfileManifest) ||
+			manifestSHA256 != profile.ProfileManifestSHA256 ||
+			!bytes.Equal(canonicalSchema, profile.CanonicalProviderSchema) ||
+			schemaSHA256 != profile.CanonicalProviderSchemaSHA256 ||
+			optionalString(integrationID) != profile.IntegrationID ||
+			syncMode != profile.SyncMode ||
+			assetcatalog.CredentialReferenceID(optionalString(credentialID)) != profile.CredentialReferenceID ||
+			assetcatalog.TrustReferenceID(optionalString(trustID)) != profile.TrustReferenceID ||
+			assetcatalog.NetworkPolicyReferenceID(optionalString(networkID)) != profile.NetworkPolicyReferenceID ||
+			rateRequests != profile.RateLimitRequests ||
+			rateWindow != profile.RateLimitWindowSeconds ||
+			backpressureBase != profile.BackpressureBaseSeconds ||
+			backpressureMax != profile.BackpressureMaxSeconds ||
+			profileCode != profile.ProfileCode ||
+			optionalString(scheduleExpression) != profile.ScheduleExpression ||
+			assetcatalog.ExtensionCode(optionalString(extensionCode)) != profile.TypedExtensionCode ||
+			optionalString(extensionDigest) != profile.PreparedExtensionDigest {
+			return assetcatalog.ErrStateConflict
+		}
+	}
+	return rows.Err()
+}
+
 func (repository *Repository) createRevisionInTx(
 	ctx context.Context,
 	tx pgx.Tx,
 	scope assetcatalog.SourceScope,
 	command assetcatalog.CreateSourceRevisionCommand,
 	commandHash string,
-	profile assetcatalog.BuiltinSourceProfile,
 	ids []string,
 ) (assetcatalog.SourceRevisionMutation, error) {
 	if len(ids) != 3 {
@@ -1202,6 +1286,25 @@ func (repository *Repository) createRevisionInTx(
 	if err != nil {
 		return assetcatalog.SourceRevisionMutation{}, err
 	}
+	var replayCheck func() error
+	if found {
+		replayCheck = func() error {
+			return validateSourceMutationAudit(
+				command.Context, commandHash, sourceRevisionCreatedEvent, command.SourceID,
+				command.ChangeReasonCode, record,
+			)
+		}
+	}
+	profile, err := repository.resolveSourceProfileAfterReplayCheck(
+		command.SourceProfileID,
+		replayCheck,
+	)
+	if err != nil {
+		return assetcatalog.SourceRevisionMutation{}, err
+	}
+	if err := validateWorkspaceSourceProfileCodeSemantics(ctx, tx, scope, profile); err != nil {
+		return assetcatalog.SourceRevisionMutation{}, err
+	}
 	source, err := lockSourceMutation(ctx, tx, scope, command.SourceID)
 	if err != nil {
 		return assetcatalog.SourceRevisionMutation{}, err
@@ -1209,12 +1312,6 @@ func (repository *Repository) createRevisionInTx(
 	authorities := slices.Clone(command.AuthorityEnvironmentIDs)
 	slices.Sort(authorities)
 	if found {
-		if err := validateSourceMutationAudit(
-			command.Context, commandHash, sourceRevisionCreatedEvent, command.SourceID,
-			command.ChangeReasonCode, record,
-		); err != nil {
-			return assetcatalog.SourceRevisionMutation{}, err
-		}
 		if record.Details.Revision <= 0 {
 			return assetcatalog.SourceRevisionMutation{}, assetcatalog.ErrIdempotency
 		}
@@ -1631,8 +1728,7 @@ RETURNING version
 		return assetcatalog.SourceRunMutation{}, err
 	}
 
-	profile, profileErr := assetcatalog.NewBuiltinSourceProfileAdmissionResolver().
-		ResolveProfileAdmission(ctx, revision.ProfileCode)
+	profile, profileErr := repository.ResolveProfileAdmission(ctx, revision.ProfileCode)
 	isManual := profileErr == nil && exactManualRevisionProfile(source, revision, profile)
 	if source.Kind == assetcatalog.SourceKindManual && !isManual {
 		return assetcatalog.SourceRunMutation{}, assetcatalog.ErrStateConflict
@@ -1804,7 +1900,7 @@ func (repository *Repository) publishRevisionInTx(
 			revision.ValidationDigest != command.ExpectedValidationDigest {
 			return assetcatalog.SourceRevisionMutation{}, assetcatalog.ErrStateConflict
 		}
-		if err := admitSourceRevisionPublication(ctx, source, revision); err != nil {
+		if err := repository.admitSourceRevisionPublication(ctx, source, revision); err != nil {
 			return assetcatalog.SourceRevisionMutation{}, err
 		}
 		return assetcatalog.SourceRevisionMutation{
@@ -1868,7 +1964,7 @@ func (repository *Repository) publishRevisionInTx(
 		run.ValidationProofDigest != revision.ValidationDigest {
 		return assetcatalog.SourceRevisionMutation{}, assetcatalog.ErrSourceRevisionNotValidated
 	}
-	if err := admitSourceRevisionPublication(ctx, source, revision); err != nil {
+	if err := repository.admitSourceRevisionPublication(ctx, source, revision); err != nil {
 		return assetcatalog.SourceRevisionMutation{}, err
 	}
 	tag, err := tx.Exec(ctx, `
@@ -1944,12 +2040,39 @@ func admitSourceRevisionPublication(
 	source assetcatalog.Source,
 	revision assetcatalog.SourceRevision,
 ) error {
+	return admitSourceRevisionPublicationWithResolver(
+		ctx,
+		assetcatalog.NewBuiltinSourceProfileAdmissionResolver(),
+		source,
+		revision,
+	)
+}
+
+func (repository *Repository) admitSourceRevisionPublication(
+	ctx context.Context,
+	source assetcatalog.Source,
+	revision assetcatalog.SourceRevision,
+) error {
+	if repository == nil {
+		return assetcatalog.ErrUnavailable
+	}
+	return admitSourceRevisionPublicationWithResolver(ctx, repository, source, revision)
+}
+
+func admitSourceRevisionPublicationWithResolver(
+	ctx context.Context,
+	resolver assetcatalog.SourceProfileAdmissionResolver,
+	source assetcatalog.Source,
+	revision assetcatalog.SourceRevision,
+) error {
 	if source.Kind != assetcatalog.SourceKindManual ||
 		revision.ProfileCode != assetcatalog.ProfileCode("MANUAL_V1") {
 		return assetcatalog.ErrUnavailable
 	}
-	profile, err := assetcatalog.NewBuiltinSourceProfileAdmissionResolver().
-		ResolveProfileAdmission(ctx, revision.ProfileCode)
+	if resolver == nil {
+		return assetcatalog.ErrUnavailable
+	}
+	profile, err := resolver.ResolveProfileAdmission(ctx, revision.ProfileCode)
 	if err != nil {
 		return assetcatalog.ErrUnavailable
 	}

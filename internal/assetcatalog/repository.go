@@ -1,6 +1,7 @@
 package assetcatalog
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"slices"
@@ -243,35 +244,149 @@ type SourceProfileAdmissionResolver interface {
 
 type SourceProfileRegistry interface {
 	Resolve(SourceProfileID) (BuiltinSourceProfile, error)
+	ResolveProfileAdmission(context.Context, ProfileCode) (BuiltinSourceProfile, error)
+	sourceProfileRegistry()
 }
 
-type builtinSourceProfileRegistry struct{}
+type SourceProfileRegistration struct {
+	Selector SourceProfileID
+	Profile  BuiltinSourceProfile
+}
+
+type immutableSourceProfileRegistry struct {
+	bySelector          map[SourceProfileID]BuiltinSourceProfile
+	byProfileCode       map[ProfileCode]BuiltinSourceProfile
+	initializationError error
+}
+
+func (*immutableSourceProfileRegistry) sourceProfileRegistry() {}
+
+func NewSourceProfileRegistry(registrations ...SourceProfileRegistration) (SourceProfileRegistry, error) {
+	registry := &immutableSourceProfileRegistry{
+		bySelector:    make(map[SourceProfileID]BuiltinSourceProfile, len(registrations)+1),
+		byProfileCode: make(map[ProfileCode]BuiltinSourceProfile, len(registrations)+1),
+	}
+	install := func(registration SourceProfileRegistration) error {
+		profile := registration.Profile.Clone()
+		if !registration.Selector.Valid() ||
+			validateInstalledSourceProfile(profile) != nil ||
+			!reservedSourceProfileMatches(registration.Selector, profile) {
+			return ErrInvalidRequest
+		}
+		if _, duplicate := registry.bySelector[registration.Selector]; duplicate {
+			return ErrInvalidRequest
+		}
+		if _, duplicate := registry.byProfileCode[profile.ProfileCode]; duplicate {
+			return ErrInvalidRequest
+		}
+		registry.bySelector[registration.Selector] = profile.Clone()
+		registry.byProfileCode[profile.ProfileCode] = profile.Clone()
+		return nil
+	}
+	if err := install(SourceProfileRegistration{
+		Selector: SourceProfileIDManualV1,
+		Profile:  ManualProfileV1(),
+	}); err != nil {
+		return nil, ErrInvalidRequest
+	}
+	for _, registration := range registrations {
+		if err := install(registration); err != nil {
+			return nil, ErrInvalidRequest
+		}
+	}
+	return registry, nil
+}
+
+func reservedSourceProfileMatches(selector SourceProfileID, profile BuiltinSourceProfile) bool {
+	switch selector {
+	case SourceProfileIDManualV1:
+		return sourceProfilesEqual(profile, ManualProfileV1())
+	case SourceProfileIDCSVRFC4180V1:
+		expected, err := CSVProfileV1(profile.CredentialReferenceID)
+		return err == nil && sourceProfilesEqual(profile, expected)
+	}
+	switch profile.ProfileCode {
+	case ProfileCode("MANUAL_V1"):
+		return selector == SourceProfileIDManualV1
+	case ProfileCode("CSV_RFC4180_V1"):
+		return selector == SourceProfileIDCSVRFC4180V1
+	}
+	return true
+}
+
+func sourceProfilesEqual(left, right BuiltinSourceProfile) bool {
+	return left.SourceKind == right.SourceKind &&
+		left.ProviderKind == right.ProviderKind &&
+		left.ProfileCode == right.ProfileCode &&
+		left.SyncMode == right.SyncMode &&
+		left.FreshnessKind == right.FreshnessKind &&
+		left.EnvironmentMapping == right.EnvironmentMapping &&
+		left.IntegrationMode == right.IntegrationMode &&
+		left.CredentialPurpose == right.CredentialPurpose &&
+		left.TrustMode == right.TrustMode &&
+		left.NetworkMode == right.NetworkMode &&
+		left.ScheduleMode == right.ScheduleMode &&
+		left.ParserCode == right.ParserCode &&
+		left.CompatibilityClass == right.CompatibilityClass &&
+		left.DLPPolicyCode == right.DLPPolicyCode &&
+		left.MaxPageItems == right.MaxPageItems &&
+		left.MaxPageRelations == right.MaxPageRelations &&
+		left.MaxPageBytes == right.MaxPageBytes &&
+		left.MaxDocumentBytes == right.MaxDocumentBytes &&
+		slices.Equal(left.TrustedPathCodes, right.TrustedPathCodes) &&
+		slices.Equal(left.RelationshipTypes, right.RelationshipTypes) &&
+		bytes.Equal(left.CanonicalProfileManifest, right.CanonicalProfileManifest) &&
+		bytes.Equal(left.CanonicalProviderSchema, right.CanonicalProviderSchema) &&
+		left.ProfileManifestSHA256 == right.ProfileManifestSHA256 &&
+		left.CanonicalProviderSchemaSHA256 == right.CanonicalProviderSchemaSHA256 &&
+		left.IntegrationID == right.IntegrationID &&
+		left.CredentialReferenceID == right.CredentialReferenceID &&
+		left.TrustReferenceID == right.TrustReferenceID &&
+		left.NetworkPolicyReferenceID == right.NetworkPolicyReferenceID &&
+		left.RateLimitRequests == right.RateLimitRequests &&
+		left.RateLimitWindowSeconds == right.RateLimitWindowSeconds &&
+		left.BackpressureBaseSeconds == right.BackpressureBaseSeconds &&
+		left.BackpressureMaxSeconds == right.BackpressureMaxSeconds &&
+		left.ScheduleExpression == right.ScheduleExpression &&
+		left.TypedExtensionCode == right.TypedExtensionCode &&
+		left.PreparedExtensionDigest == right.PreparedExtensionDigest
+}
 
 func NewBuiltinSourceProfileRegistry() SourceProfileRegistry {
-	return builtinSourceProfileRegistry{}
+	registry, err := NewSourceProfileRegistry()
+	if err != nil {
+		return &immutableSourceProfileRegistry{initializationError: ErrInvalidRequest}
+	}
+	return registry
 }
 
-func (builtinSourceProfileRegistry) Resolve(id SourceProfileID) (BuiltinSourceProfile, error) {
+func (registry *immutableSourceProfileRegistry) Resolve(id SourceProfileID) (BuiltinSourceProfile, error) {
+	if registry == nil || registry.initializationError != nil {
+		return BuiltinSourceProfile{}, ErrInvalidRequest
+	}
 	if !id.Valid() {
 		return BuiltinSourceProfile{}, ErrInvalidRequest
 	}
-	if id != SourceProfileIDManualV1 {
+	profile, found := registry.bySelector[id]
+	if !found {
 		return BuiltinSourceProfile{}, ErrNotFound
 	}
-	return ManualProfileV1().Clone(), nil
+	return profile.Clone(), nil
 }
-
-type builtinSourceProfileAdmissionResolver struct{}
 
 func NewBuiltinSourceProfileAdmissionResolver() SourceProfileAdmissionResolver {
-	return builtinSourceProfileAdmissionResolver{}
+	return NewBuiltinSourceProfileRegistry()
 }
 
-func (builtinSourceProfileAdmissionResolver) ResolveProfileAdmission(_ context.Context, code ProfileCode) (BuiltinSourceProfile, error) {
-	if code != ProfileCode("MANUAL_V1") {
+func (registry *immutableSourceProfileRegistry) ResolveProfileAdmission(_ context.Context, code ProfileCode) (BuiltinSourceProfile, error) {
+	if registry == nil || registry.initializationError != nil || !code.Valid() {
+		return BuiltinSourceProfile{}, ErrInvalidRequest
+	}
+	profile, found := registry.byProfileCode[code]
+	if !found {
 		return BuiltinSourceProfile{}, ErrNotFound
 	}
-	return ManualProfileV1().Clone(), nil
+	return profile.Clone(), nil
 }
 
 func validUniqueUUIDs(values []string, allowEmpty bool) bool {

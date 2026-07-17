@@ -30,6 +30,8 @@ const (
 
 const manualProfileManifestV1 = `{"backpressure_base_seconds":1,"backpressure_max_seconds":1,"compatibility_class":"MANUAL_V1","credential_purpose":"NONE","dlp_policy_code":"ASSET_SAFE_V1","environment_mapping_mode":"SINGLE_ENVIRONMENT","freshness_kind":"CATALOG_SEQUENCE","integration_mode":"NONE","max_document_bytes":65536,"max_page_bytes":65536,"max_page_items":1,"max_page_relations":0,"network_mode":"NONE","parser_code":"MANUAL_ASSET_V1","profile_code":"MANUAL_V1","provider_kind":"MANUAL_V1","rate_limit_requests":1,"rate_limit_window_seconds":1,"relationship_types":[],"schedule_mode":"NONE","source_kind":"MANUAL","sync_mode":"MANUAL","trust_mode":"NONE","trusted_path_codes":["MANUAL_V1_DISPLAY_NAME","MANUAL_V1_EXTERNAL_ID","MANUAL_V1_KIND"],"typed_extension_code":null,"version":"asset-source-profile-manifest.v1"}`
 const manualProviderSchemaV1 = `{"additionalProperties":false,"properties":{},"type":"object"}`
+const csvProfileManifestV1 = `{"backpressure_base_seconds":1,"backpressure_max_seconds":60,"compatibility_class":"CSV_RFC4180_V1","credential_purpose":"IMPORT_SIGNATURE_VERIFY","dlp_policy_code":"ASSET_SAFE_V1","environment_mapping_mode":"EXPLICIT_ITEM_ENVIRONMENT","freshness_kind":"OBJECT_SEQUENCE","integration_mode":"NONE","max_document_bytes":33554432,"max_page_bytes":33554432,"max_page_items":2000,"max_page_relations":2000,"network_mode":"NONE","parser_code":"CSV_RFC4180_V1","profile_code":"CSV_RFC4180_V1","provider_kind":"CSV_RFC4180_V1","rate_limit_requests":1,"rate_limit_window_seconds":1,"relationship_types":["CONTAINS","DELIVERED_BY","DEPENDS_ON","LOGS_TO","MANAGED_BY","MONITORED_BY","PRIMARY_RUNTIME_FOR","RUNS_ON","TRACES_TO"],"schedule_mode":"NONE","source_kind":"CSV_IMPORT","sync_mode":"ON_DEMAND","trust_mode":"NONE","trusted_path_codes":["CSV_V1_DISPLAY_NAME_COLUMN","CSV_V1_ENVIRONMENT_ID_COLUMN","CSV_V1_EXTERNAL_ID_COLUMN","CSV_V1_KIND_COLUMN","CSV_V1_PROVIDER_KIND_COLUMN","CSV_V1_RELATION_COLUMNS","CSV_V1_TYPE_DETAILS_EMPTY"],"typed_extension_code":null,"version":"asset-source-profile-manifest.v1"}`
+const csvProviderSchemaV1 = manualProviderSchemaV1
 
 func TestExactEnumVocabularyAndUnknownsFailClosed(t *testing.T) {
 	t.Parallel()
@@ -296,6 +298,222 @@ func TestBuiltinSourceProfileRegistryResolvesManualSelectorWithoutSemanticDrift(
 	}
 	if _, err := registry.Resolve(SourceProfileID("MANUAL_V1")); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("Resolve(invalid selector) error = %v, want ErrInvalidRequest", err)
+	}
+	if _, err := registry.Resolve(SourceProfileIDCSVRFC4180V1); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("default registry Resolve(csv-rfc4180-v1) error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestTrustedCSVProfileInstallationRejectsCredentialAndRegistryDrift(t *testing.T) {
+	t.Parallel()
+
+	for name, referenceID := range map[string]CredentialReferenceID{
+		"missing": "",
+		"invalid": "credential/path",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := CSVProfileV1(referenceID); !errors.Is(err, ErrInvalidRequest) {
+				t.Fatalf("CSVProfileV1(%q) error = %v, want ErrInvalidRequest", referenceID, err)
+			}
+		})
+	}
+
+	first, err := CSVProfileV1("csv-signature-reference-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := first.Clone()
+	invalid.CredentialReferenceID = ""
+	if _, err := NewSourceProfileRegistry(SourceProfileRegistration{
+		Selector: SourceProfileIDCSVRFC4180V1,
+		Profile:  invalid,
+	}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("registry accepted CSV profile without credential reference: %v", err)
+	}
+
+	second, err := CSVProfileV1("csv-signature-reference-v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewSourceProfileRegistry(
+		SourceProfileRegistration{Selector: SourceProfileIDCSVRFC4180V1, Profile: first},
+		SourceProfileRegistration{Selector: "csv-rfc4180-v2", Profile: second},
+	); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("registry accepted same-code credential drift: %v", err)
+	}
+	if _, err := NewSourceProfileRegistry(
+		SourceProfileRegistration{Selector: SourceProfileIDCSVRFC4180V1, Profile: first},
+		SourceProfileRegistration{Selector: SourceProfileIDCSVRFC4180V1, Profile: ManualProfileV1()},
+	); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("registry accepted duplicate selector: %v", err)
+	}
+	if _, err := NewSourceProfileRegistry(SourceProfileRegistration{
+		Selector: "future-v1",
+		Profile:  first,
+	}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("registry accepted CSV ProfileCode alias selector: %v", err)
+	}
+	differentCode := first.Clone()
+	differentCode.ProviderKind = "CSV_RFC4180_V2"
+	differentCode.ProfileCode = "CSV_RFC4180_V2"
+	differentCode.ParserCode = "CSV_RFC4180_V2"
+	differentCode.CompatibilityClass = "CSV_RFC4180_V2"
+	differentCode.CanonicalProfileManifest = []byte(strings.ReplaceAll(
+		string(differentCode.CanonicalProfileManifest),
+		"CSV_RFC4180_V1",
+		"CSV_RFC4180_V2",
+	))
+	differentCode.ProfileManifestSHA256, err = ProfileManifestDigest(differentCode.CanonicalProfileManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateInstalledSourceProfile(differentCode); err != nil {
+		t.Fatalf("different versioned CSV Profile fixture is not internally valid: %v", err)
+	}
+	if _, err := NewSourceProfileRegistry(SourceProfileRegistration{
+		Selector: SourceProfileIDCSVRFC4180V1,
+		Profile:  differentCode,
+	}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("registry accepted reserved CSV selector with different ProfileCode: %v", err)
+	}
+	semanticDrift := first.Clone()
+	semanticDrift.MaxPageItems = 1999
+	semanticDrift.CanonicalProfileManifest = []byte(strings.Replace(
+		string(semanticDrift.CanonicalProfileManifest),
+		`"max_page_items":2000`,
+		`"max_page_items":1999`,
+		1,
+	))
+	semanticDrift.ProfileManifestSHA256, err = ProfileManifestDigest(semanticDrift.CanonicalProfileManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateInstalledSourceProfile(semanticDrift); err != nil {
+		t.Fatalf("same-code CSV semantic drift fixture is not internally valid: %v", err)
+	}
+	if _, err := NewSourceProfileRegistry(SourceProfileRegistration{
+		Selector: SourceProfileIDCSVRFC4180V1,
+		Profile:  semanticDrift,
+	}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("registry accepted self-consistent reserved CSV semantic drift: %v", err)
+	}
+}
+
+func TestCSVProfileV1IsExactServerInstalledContract(t *testing.T) {
+	t.Parallel()
+
+	profile, err := CSVProfileV1("csv-signature-reference-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.SourceKind != SourceKindCSVImport ||
+		profile.ProviderKind != "CSV_RFC4180_V1" ||
+		profile.ProfileCode != ProfileCode("CSV_RFC4180_V1") ||
+		profile.SyncMode != SyncModeOnDemand ||
+		profile.FreshnessKind != FreshnessObjectSequence ||
+		profile.EnvironmentMapping != EnvironmentMappingExplicitItem ||
+		profile.ParserCode != "CSV_RFC4180_V1" ||
+		profile.CompatibilityClass != "CSV_RFC4180_V1" ||
+		profile.DLPPolicyCode != "ASSET_SAFE_V1" {
+		t.Fatalf("CSVProfileV1 identity = %#v", profile)
+	}
+	if profile.IntegrationMode != "NONE" ||
+		profile.CredentialPurpose != "IMPORT_SIGNATURE_VERIFY" ||
+		profile.TrustMode != "NONE" ||
+		profile.NetworkMode != "NONE" ||
+		profile.ScheduleMode != "NONE" ||
+		profile.IntegrationID != "" ||
+		profile.CredentialReferenceID != "csv-signature-reference-v1" ||
+		profile.TrustReferenceID != "" ||
+		profile.NetworkPolicyReferenceID != "" ||
+		profile.ScheduleExpression != "" ||
+		profile.TypedExtensionCode != "" ||
+		profile.PreparedExtensionDigest != "" {
+		t.Fatalf("CSVProfileV1 trusted references = %#v", profile)
+	}
+	if profile.RateLimitRequests != 1 ||
+		profile.RateLimitWindowSeconds != 1 ||
+		profile.BackpressureBaseSeconds != 1 ||
+		profile.BackpressureMaxSeconds != 60 ||
+		profile.MaxPageItems != 2000 ||
+		profile.MaxPageRelations != 2000 ||
+		profile.MaxPageBytes != 33554432 ||
+		profile.MaxDocumentBytes != 33554432 {
+		t.Fatalf("CSVProfileV1 limits = %#v", profile)
+	}
+	wantPaths := []string{
+		"CSV_V1_DISPLAY_NAME_COLUMN",
+		"CSV_V1_ENVIRONMENT_ID_COLUMN",
+		"CSV_V1_EXTERNAL_ID_COLUMN",
+		"CSV_V1_KIND_COLUMN",
+		"CSV_V1_PROVIDER_KIND_COLUMN",
+		"CSV_V1_RELATION_COLUMNS",
+		"CSV_V1_TYPE_DETAILS_EMPTY",
+	}
+	wantRelationships := []RelationshipType{
+		RelationshipContains,
+		RelationshipDeliveredBy,
+		RelationshipDependsOn,
+		RelationshipLogsTo,
+		RelationshipManagedBy,
+		RelationshipMonitoredBy,
+		RelationshipPrimaryRuntimeFor,
+		RelationshipRunsOn,
+		RelationshipTracesTo,
+	}
+	if !slices.Equal(profile.TrustedPathCodes, wantPaths) ||
+		!slices.Equal(profile.RelationshipTypes, wantRelationships) {
+		t.Fatalf("CSVProfileV1 closed facts = %#v/%#v", profile.TrustedPathCodes, profile.RelationshipTypes)
+	}
+	if string(profile.CanonicalProfileManifest) != csvProfileManifestV1 ||
+		len(profile.CanonicalProfileManifest) != 1100 ||
+		profile.ProfileManifestSHA256 != "9a9739783fbb84a66653271202e06e2e6b2cdcffc268564151d0c6035cbf4941" {
+		t.Fatal("CSVProfileV1 canonical manifest bytes/hash drifted")
+	}
+	if string(profile.CanonicalProviderSchema) != csvProviderSchemaV1 ||
+		len(profile.CanonicalProviderSchema) != 62 ||
+		profile.CanonicalProviderSchemaSHA256 != "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa" {
+		t.Fatal("CSVProfileV1 canonical provider schema bytes/hash drifted")
+	}
+
+	registry, err := NewSourceProfileRegistry(SourceProfileRegistration{
+		Selector: SourceProfileIDCSVRFC4180V1,
+		Profile:  profile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile.CanonicalProfileManifest[0] ^= 0xff
+	profile.CanonicalProviderSchema[0] ^= 0xff
+	profile.TrustedPathCodes[0] = "CALLER_DRIFTED"
+	profile.RelationshipTypes[0] = RelationshipRunsOn
+	bySelector, err := registry.Resolve(SourceProfileIDCSVRFC4180V1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bySelector.CanonicalProfileManifest[0] ^= 0xff
+	bySelector.CanonicalProviderSchema[0] ^= 0xff
+	bySelector.TrustedPathCodes[0] = "DRIFTED"
+	bySelector.RelationshipTypes[0] = RelationshipRunsOn
+	byCode, err := registry.ResolveProfileAdmission(t.Context(), ProfileCode("CSV_RFC4180_V1"))
+	if err != nil ||
+		string(byCode.CanonicalProfileManifest) != csvProfileManifestV1 ||
+		string(byCode.CanonicalProviderSchema) != csvProviderSchemaV1 ||
+		!slices.Equal(byCode.TrustedPathCodes, wantPaths) ||
+		!slices.Equal(byCode.RelationshipTypes, wantRelationships) ||
+		byCode.CredentialReferenceID != "csv-signature-reference-v1" {
+		t.Fatalf("registry leaked CSV profile state: (%#v, %v)", byCode, err)
+	}
+	if _, err := registry.ResolveProfileAdmission(t.Context(), ProfileCode("CSV_RFC4180_V2")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown ProfileCode error = %v, want ErrNotFound", err)
+	}
+	manualBySelector, err := registry.Resolve(SourceProfileIDManualV1)
+	if err != nil || manualBySelector.ProfileCode != ProfileCode("MANUAL_V1") {
+		t.Fatalf("extended registry lost manual selector: (%#v, %v)", manualBySelector, err)
+	}
+	manualByCode, err := registry.ResolveProfileAdmission(t.Context(), ProfileCode("MANUAL_V1"))
+	if err != nil || manualByCode.ProfileCode != ProfileCode("MANUAL_V1") {
+		t.Fatalf("extended registry lost manual admission: (%#v, %v)", manualByCode, err)
 	}
 }
 
