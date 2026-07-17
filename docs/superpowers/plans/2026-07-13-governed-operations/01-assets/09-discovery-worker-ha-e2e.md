@@ -4,22 +4,23 @@
 
 **Goal:** 创建真实 `cmd/discovery-worker`、PostgreSQL HA queue/lease/fence、加密 checkpoint、持久限流/背压与全 Provider 生产验收门，使 Source 控制面与发现数据面形成可故障转移的闭环。
 
-**Architecture:** Control Plane 只创建不可变 Source Revision 和 durable Run；Discovery Worker 通过 PostgreSQL `FOR UPDATE SKIP LOCKED` 领取 exact source/revision/gate 任务，使用单调 fence epoch/token 在 validation、runtime resolve、credential open、provider call、page reconcile、checkpoint、heartbeat 和 complete 边界复验。Provider runtime/credential 只在 Worker 内存；页结果经 Schema/DLP 后与加密 checkpoint 在一个事务提交。
+**Architecture:** Control Plane 只创建不可变 Source Revision 和 durable Run；Discovery Worker 通过 PostgreSQL `FOR UPDATE SKIP LOCKED` 领取 exact source/revision/gate 任务，使用单调 fence epoch/token 在 validation、runtime resolve、credential open、provider call、page reconcile、checkpoint、heartbeat 和 complete 边界复验。Task 28A attempt runtime/credential 只在 Worker 内存；vSphere 若要跨 Run 保持 PropertyCollector session/filter，只能由 Task 21B0 单独批准的 resident authority 持有，绝不能降级为 Worker checkpoint/cache。页结果经 Schema/DLP 后与加密 checkpoint 在一个事务提交。
 
 **Tech Stack:** Go 1.26.5、PostgreSQL 18.4、pgx v5、AES-256-GCM、mTLS workload identity、existing `workerbootstrap`/`securemanifest`、Prometheus client_golang 1.23.2。
 
 ## Global Constraints
 
-- Task 28A provider-neutral Worker core 只消费已合并 PageCommitter/Queue/Checkpoint/CleanupBroker/Limiter，不等待任一 Provider 包；它必须先独立合并。每个 Provider 的 durable integration（External CMDB 为 [Task 18B](./06-source-external-cmdb.md#task-18b-external-cmdb-durable-reconciliation-and-lifecycle-integration)）随后只消费该稳定 seam。源文件核验又确认现有 Broker attempt map 仅在进程内，因此 Task 28B 单独交付 recoverable cleanup-session transport/same-attempt authority；Task 28C production constructor/registry 才等待上述两者与 [05-source-ingestion-csv-api.md](./05-source-ingestion-csv-api.md)、[06-source-external-cmdb.md](./06-source-external-cmdb.md)、[07-source-vsphere.md](./07-source-vsphere.md)、[08-source-proxmox-openstack-cloud.md](./08-source-proxmox-openstack-cloud.md) 各自已合并的 provider-specific `Produces`。
+- Task 28A provider-neutral Worker core 只消费已合并 PageCommitter/Queue/Checkpoint/CleanupBroker/Limiter，不等待任一 Provider 包；它必须先独立合并。每个 Provider 的 durable integration（External CMDB 为 [Task 18B](./06-source-external-cmdb.md#task-18b-external-cmdb-durable-reconciliation-and-lifecycle-integration)）随后只消费该稳定 seam。vSphere [Task 21A](./07-source-vsphere.md#task-21a-same-attempt-bounded-full-inventory-and-complete-snapshot-closure) 只能在同一个 Task 28A claim/`AttemptSession`/`BoundRuntime` 内完成全量分页，单独合并仍不是 durable incremental/HA integration。源文件核验又确认现有 Broker attempt map 仅在进程内，因此 Task 28B 单独交付 recoverable cleanup-session transport/same-attempt authority；Task 28C production constructor/registry 只能注册已经满足各自 durable contract 的 exact Provider row。
 - 每个 Task 严格执行 `Red → Green → Refactor`：先运行并保留预期失败，再做最小生产实现，随后消除重复、复跑指定验证并按 Task 提交；不得跳过失败或弱化断言。
 - 生产必须有独立 `cmd/discovery-worker`；不得把 Provider SDK、Credential Resolver 或目标网络客户端装入 Control Plane、通用 `cmd/worker` 或浏览器。
 - 持久 Job/Run 只含 Source/Revision/Gate/Checkpoint digest、Scope、Run ID、预算、fence epoch/owner/token hash；不含 endpoint、Secret、raw Token、PEM、cursor plaintext、Header/Body 或 Provider 错误。完整 sealed `LeaseFence` 只由 Claim 返回到当前 Worker 内存，绝不进入 Job/Task/Batch/audit/log payload。
 - Raw lease token 只存 Worker 内存，DB 仅存 SHA-256；每次 reclaim 必须 `fence_epoch+1` 且旧 fence 无法 heartbeat/reconcile/checkpoint/complete。
 - Checkpoint 使用 AES-256-GCM；唯一 AAD 构造器与 typed `CheckpointAAD` 由 `internal/discoverycheckpoint` 拥有，并用 `FramedTupleV1("asset-source-checkpoint.v1",Tenant,Workspace,Source,Provider,Source definition revision,canonical revision digest,source definition digest,checkpoint key ID,Checkpoint version)` 的精确九字段顺序。key 只通过 workload secret binding 读取。持久 AAD 不含 gate revision/fence epoch/token，因为 checkpoint 必须跨 reclaim 和后续 Run 恢复且 Claim 不得制造 checkpoint 版本变更；每次 Open、Provider call、Reconcile、checkpoint 提交和 Complete 仍分别要求 exact live owner/token/epoch。Codec 必须有 golden bytes/hash、九字段逐项篡改、NULL/empty 和 key-rotation 测试。
+- “Checkpoint 可跨 reclaim/Run 打开”只表示 sealed provider metadata 可验证，不表示第三方服务端 cursor/session 可重建。vSphere `ContinueRetrievePropertiesEx` token 只能由产生它的同一登录 session/同一 `PropertyCollector` 使用；`WaitForUpdatesEx` filter/version 也是该 session/collector 的服务端状态。vSphere checkpoint tuple/digest、Task 28B cleanup receipt 或新登录都不能成为 continuation authority。
 - 数据库通过 `asset_source_limit_buckets` 与 append-only `asset_source_limit_permits` 分别持久每 Source/Workspace/Provider 的 token bucket 和 active permit/terminal receipt；`not_before`、queue depth 与 failure streak 仍属于 Queue/Source backpressure。进程内 semaphore 只是二次保护，不是授权事实。
 - Validation Run 可消费 `VALIDATING` revision；Discovery/Import/Ingestion Run 与普通 `RequestSync` 仅可消费 exact `PUBLISHED + ACTIVE + AVAILABLE`，需要真实资格的 Profile 还必须在每个普通 admission/data-write boundary 重载 current unexpired gate evidence。Task 19A2a/19A2b/19A2c 后继依次建立 schema/domain、persistence/rechecks 与唯一 production lane 的 `QUALIFICATION` Run 是唯一 `PUBLISHED + ACTIVE + UNAVAILABLE` 例外，只经 fixed mTLS workload qualification lane 和同一个 Task 28A Worker loop 执行零 Catalog projection 的 Provider read/protocol/DLP/cleanup/HA proof；它不能被普通 claim predicate、browser 或 sync API创建。任何漂移停止并关闭影响的 provider/source gate。
 - Validation Run 的 checkpoint 输入固定为空；它不得比较、解密或推进当前 published revision 的 Source checkpoint。Discovery/Import/Ingestion 才消费 exact current checkpoint；checkpoint-lineage-rollover 仅走 Pack 01 的受治理同一 Run 例外。
-- Credential open/session cleanup 是 terminal 成功的必要证据。每个 attempt 先持久化 Broker-owned opaque UUID，再允许 open；Broker 持有真实 revoke/session handle，Run/API/日志永不携带。cleanup 未知不能把 run 写为成功并必须暂停 Source gate。
+- Credential open/session cleanup 是 terminal 成功的必要证据。每个 attempt 先持久化 Broker-owned opaque UUID，再允许 open；Broker 持有真实 revoke/session handle，Run/API/日志永不携带。cleanup 未知不能把 run 写为成功并必须暂停 Source gate。Task 28B 的 handle/proof 只证明 exact Worker attempt cleanup；它不拥有 vSphere resident PropertyCollector session/filter，也不证明跨 Run continuity 或 no-orphan closure。
 - `MANUAL` 不进 Worker；`KUBERNETES_OPERATOR` 由 Phase 3 注册；`AWX_INVENTORY` 由 Phase 5 固定 AWX 契约注册。未注册时都是 `UNAVAILABLE`，不得用通用 Provider 替代。
 - 完成后进入 [10-overview-control-room.md](./10-overview-control-room.md)。
 
@@ -106,19 +107,29 @@ This ordering is normative: receipt lookup and semantic/checkpoint replay verifi
 ```text
 M1D Checkpoint Codec + M1E PageCommitter + Task 27 Queue/Cleanup/Limiter
   -> Task 28A provider-neutral Worker core/claim-runtime seam（先合并）
-  -> each provider durable integration（External CMDB = Task 18B）
+  -> provider durable integrations that do not require a cross-Run resident cursor
   -> Task 28B recoverable cleanup-session transport/same-attempt authority
-  -> Task 28C production constructor/registry/binary
-  -> External CMDB Task 19A Control Plane profile/validation admission
-  -> External CMDB Task 19A2a gate-evidence schema/domain/admission
-  -> External CMDB Task 19A2b gate persistence/runtime rechecks
-  -> External CMDB Task 19A2c qualification lane/API/production assembly
+  -> Task 28C production constructor/registry/binary（只注册已闭合 rows）
+  -> External CMDB Task 19A → Task 19A2a → Task 19A2b → Task 19A2c
   -> Task 29A provider-neutral two-worker HA receipt/metrics
   -> External CMDB Task 19B per-source canary/evaluator/atomic gate
   -> Task 29B signed final provider matrix/E2E/CI
+
+vSphere-specific closed lane:
+Task 28A
+  -> Task 21A same-attempt full snapshot（可独立合并，能力仍关闭）
+Task 21A + Task 28B
+  -> Task 21B0 PropertyCollector session-continuity authority
+  -> Task 21B cross-Run delta/leave/HA resume
+  -> Task 28C vSphere registry row
+  -> Task 29A vSphere-specific HA evidence
+  -> Task 22 vSphere gate/canary
+  -> Task 29B vSphere matrix row
 ```
 
-后继 Batch 只能从最新 `origin/main` 读取已合并 `Produces`。Task 18B 不得读取 Task 28A 未提交文件；Task 28B 不得读取 Task 18B 未合并 descriptor；Task 28C 不得读取 Task 28B 或其他 Provider 未合并实现。Source Gate 后半段严格为 `Task 28C → Task 19A → Task 19A2a → Task 19A2b → Task 19A2c → Task 29A → Task 19B → Task 29B`；每个 Batch 都由新窗口独立真实 G2/PR/merge，Task 29A 不消费 canary、不写 gate，Task 19B 不拥有 HA runner/metrics，Task 29B 不重建 gate/canary/HA。源文件核验发现 process-local Broker 不能满足 replacement Worker cleanup 后，原来的“Task 28A core + Task 28B production”最小拆分增加一个独立 transport Batch，并把 production 顺延为 Task 28C；后续因 canary↔AVAILABLE、Task 19B↔旧 Task 29 证据循环、46-file context risk 与 23-file persistence L Batch，最终拆成 12-file Task 19A2a、11-file Task 19A2b、19-file Task 19A2c、Task 29A 与 Task 29B，三段 Source Gate files 零重叠。
+后继 Batch 只能从最新 `origin/main` 读取已合并 `Produces`。Task 18B 不得读取 Task 28A 未提交文件；Task 28B 不得读取 Task 18B 未合并 descriptor；Task 28C 不得读取 Task 28B 或其他 Provider 未合并实现。Source Gate 后半段对 External CMDB 严格为 `Task 28C → Task 19A → Task 19A2a → Task 19A2b → Task 19A2c → Task 29A → Task 19B → Task 29B`。vSphere 是显式 closed 分支：Task 21A 不是 Task 28C 可消费的 durable descriptor；Task 21B0/21B 未真实完成前，Task 28C 必须不注册 vSphere，Task 22/29A/29B 也不得合成 vSphere availability evidence。Task 28C 可为其他已闭合 Provider 先合并；若其先合并，后续 vSphere registry extension 必须另行冻结不重叠 exact files，不能借 Task 21A 自动出现。
+
+每个 Batch 都由新窗口独立真实 G2/PR/merge，Task 29A 不消费 canary、不写 gate，Task 19B 不拥有 HA runner/metrics，Task 29B 不重建 gate/canary/HA。源文件核验发现 process-local Broker 不能满足 replacement Worker cleanup 后，原来的“Task 28A core + Task 28B production”最小拆分增加一个独立 transport Batch，并把 production 顺延为 Task 28C；这仍未解决 vSphere PropertyCollector continuity。后续因 canary↔AVAILABLE、Task 19B↔旧 Task 29 证据循环、46-file context risk 与 23-file persistence L Batch，最终拆成 12-file Task 19A2a、11-file Task 19A2b、19-file Task 19A2c、Task 29A 与 Task 29B，三段 Source Gate files 零重叠。
 
 ### Task 27: Merged durable queue, cleanup, checkpoint, and limiter primitives
 
@@ -268,6 +279,7 @@ G2 必须覆盖 dependency nil matrix、三 claim modes、exact ordered Reserve/
 - `discoverycleanup.SessionTransport` fixed mTLS client contract：已预置的外部 shared session authority 必须以 exact `(Run,attempt_id,attempt_epoch,runtime_binding_digest)` 幂等 `OpenOrRecover/Revoke`，changed tuple fail closed。Task 28B 不实现或宣称拥有该外部 authority server/binary。
 - `discoveryworker.AttemptSessionAuthority`：同一对象同时实现 Broker `SessionOpener` 与 Task 28A resolver；首次 open 只从同一 session cell 产生一个 process-local `BoundRuntime` 与一个 Broker-owned handle，replacement recovery-open 只返回同一外部 session 的 revoke handle，永不重新产生 Provider runtime。
 - 可审计 recovery contract：新进程直接对空的 process-local Broker `RevokeAttempt` 仍是 `ErrAttemptNotFound`；正确路径必须以 Queue cleanup-only claim 的 exact coordinates/attempt 重新 `OpenAttempt`，经 shared authority 找回同一 session 后 revoke/proof。
+- 明确 negative contract：Task 28B authority 的 identity/lifetime 是 exact Run attempt；它既不持有也不恢复跨 Run 的 vSphere `PropertyCollector`、filter、continuation token 或 update version。`OpenOrRecover` 不能返回 Provider runtime，因此不得解释成 [Task 21B0](#task-21b0-dependency-vsphere-propertycollector-session-continuity-authority) 的 resident authority。
 
 **Classification:**
 
@@ -293,11 +305,45 @@ git diff --check
 
 G2 必须用 test-only fixed-protocol authority fixture 证明两个独立 client/Broker 实例之间的 exact recovery-open/revoke、same-session runtime/handle/proof、changed tuple、mTLS negative、response-loss replay、zero secret payload 与 sensitive serialization；fixture 不进入 production graph，也不声称真实外部 authority 已验收。单进程 Broker test 不能代替该门。
 
-**Deferred G3/G4:** 两个真实 Worker binary、kill owner、通过 opaque lab binding 连接的已预置真实外部 shared authority及其 reconnect/recovery、Worker/数据库 restart、HA takeover 与 credential resolver/key rotation 留给 Task 29A；Provider canary 留给各 Provider gate（External CMDB 为 Task 19B），最终 matrix 留给 Task 29B。Task 28B 最多为 `BUILT_CLOSED`，不使任一 Provider 可用。
+**Deferred G3/G4:** 两个真实 Worker binary、kill owner、通过 opaque lab binding 连接的已预置真实外部 shared authority及其 reconnect/recovery、Worker/数据库 restart、HA takeover 与 credential resolver/key rotation 留给 Task 29A；Provider canary 留给各 Provider gate（External CMDB 为 Task 19B），最终 matrix 留给 Task 29B。vSphere 还必须单独完成 Task 21B0/21B；Task 28B 的真实 cleanup recovery 也不能替代它们。Task 28B 最多为 `BUILT_CLOSED`，不使任一 Provider 可用。
+
+### Task 21B0 dependency: vSphere PropertyCollector session-continuity authority
+
+**State:** `NOT_STARTED / UNAVAILABLE / CLOSED`。这是 [Pack 07 Task 21B0](./07-source-vsphere.md#task-21b0-vsphere-propertycollector-session-continuity-authority-c0-prerequisite) 的 Worker/HA half，与 Task 28B exact-attempt cleanup authority 正交；两份计划交叉引用同一个 prerequisite，不是两套实现。
+
+**Batch admission:** Task 21A 可先合并，但本 Task 开始前必须用顺序 C0 contract review 冻结 resident authority topology、production deployment/identity、私有 non-serializable ABI、exact file manifest、failure model 与 executable G2 commands。当前没有这些已合并 `Produces`，所以任何代码会话都必须停工；禁止修改公共 `discoverysource`、Queue、Task 28A Worker、migration 或 Task 28B ABI 来临时承载 cookie/token/filter/version。
+
+**Consumes:**
+
+- Task 20 fixed vSphere client/profile/identity，Task 21A same-attempt full closure，Task 28A claim/`AttemptSession`/`BoundRuntime`，Task 28B exact-attempt cleanup transport，以及已合并 Queue/fence/PageCommitter/checkpoint-lineage contracts。
+- 官方 PropertyCollector lifetime：`ContinueRetrievePropertiesEx` token 仅同一 login session/同一 collector 可用且一次性；`WaitForUpdatesEx` 依赖该 session 中 live filter/version。Checkpoint digest、Task 28B receipt 或新登录不能重建任何一项。
+- 只读 production credential resolver/workload identity 与 PostgreSQL 18.4 application identity；authority wire 不得携带 credential、endpoint、cookie、continuation token、filter handle、`BoundRuntime` 或任意 SOAP body。`collector_version` 的 fixed opaque encoding只能在 sealed checkpoint/authority protocol内作为完整性坐标，不能成为 session reconstruction authority。
+
+**Required `Produces`:**
+
+- 一个 vSphere-specific resident authority，在 authority 内持有 live login session、`PropertyCollector`、filter、continuation/update state；Worker 只持有 opaque process-local capability。Authority exact 绑定 Scope/Source/revision、validated instance UUID、root digest、collector/session/filter identity、credential revision，以及当前 Run/lease/fence owner。
+- Cross-Run ownership handoff 使用 monotonic CAS/fence。新 owner 只能接管同一 authority state；stale owner 在任何 SOAP call 前拒绝。Authority/session 丢失时不得创建新登录并复用旧 token/version，只能返回 closed evidence、`missing=0` 并进入 governed full-snapshot rollover。
+- Authority 必须拥有 no-gap bootstrap barrier：同一 resident session/collector 先创建 filter并建立 initial version，再运行 Task 21A deterministic full algorithm并保留其间 updates；只有 drain 到 non-truncated version且 full/delta均无 rejection后，才产生 authoritative complete closure与首个 incremental checkpoint。Task 21A 独立 attempt 的 completed checkpoint不能直接成为该 cursor。
+- Task 28B `RevokeAttempt` 只关闭 Worker 到 authority 的 exact attempt transport/runtime cell。普通 Run terminal cleanup 与 resident PropertyCollector final destroy 是两个不同 receipt chain：普通 Run 结束不能误销毁后继所需 filter；Source disable/supersede、instance/root drift、credential rotation、collector/session expiry、authority shutdown 或 terminal failure必须幂等 destroy session/filter并产生 no-orphan proof。任一 cleanup uncertainty 暂停 gate。
+- Credential rotation 必须先 fence/revoke old authority；new credential/new session 只能建立 successor full snapshot lineage，不能继承旧 filter/version。Authority 的 durable metadata只含 opaque authority ID、exact binding digests、monotonic owner generation 和 safe receipts；raw session/filter/token 永不持久化、序列化或记录，`collector_version` 只存在于 sealed private checkpoint/authority state且永不公开。
+
+**Classification:** C0 = resident authority identity、exact source/revision/instance/root/collector/session binding、cross-Run lease/fence、credential rotation、terminal revoke/no-orphan、secret-zero wire；C1 = ownership handoff/lifecycle；C2 = fixed authority RPC 与真实 PropertyCollector session ownership。
+
+**Mandatory RED → GREEN evidence:**
+
+- [ ] 两个独立 authority client 实例使用 distinct worker/process identity，对同一 TLS authority 的 consecutive Runs只使用一个 live vSphere session/collector/filter；owner-client termination 后 exact fence+1 takeover继续，旧 owner SOAP 零调用。
+- [ ] 在 filter creation、initial version、每个 full page、delta drain和 final closure之间分别 create/modify/delete对象；只有无间隙 drain完成的同-session closure可启用 missing detection，独立 Task 21A checkpoint、partial/truncated bootstrap均拒绝。
+- [ ] Authority crash/session expiry、credential rotation、instance/root/revision drift 都拒绝 checkpoint reconstruction/new-login reuse，旧 lineage不变、`missing=0`，仅 governed full rollover可恢复。
+- [ ] Ordinary Run cleanup只回收 Task 28B attempt cell；source disable/supersede与 terminal authority cleanup销毁 filter/session一次，response-loss exact replay复用 receipt，changed replay拒绝，最终无 orphan。
+- [ ] JSON/text/binary/log/format、wire capture 和 DLP tests 证明 authority capability/cookie/token/filter/endpoint/credential零泄露，并证明 `collector_version` 不出 sealed checkpoint/authority boundary。
+
+**Required G2:** 使用真实 TLS resident authority implementation 驱动本机 govmomi simulator 的真实 SOAP serialization，并用项目 PostgreSQL 18.4 TLS wrapper/application identity证明 lease/fence/CAS、takeover、rotation、rollover和 cleanup receipts；`AIOPS_TEST_POSTGRES_DSN` 缺失、Skip、Task 28B test fixture、process-local map 或 mock SOAP 均不能 PASS。exact packages/commands必须与 implementation file manifest 在开工前一起冻结。
+
+**Deferred G3/G4:** 真实部署 authority HA、真实非生产 vCenter、两真实 Discovery Worker/数据库 restart、long-running session expiry、canary/gate 和 provider matrix deferred。G2 代码合并仍最多 `BUILT_CLOSED`；Task 21B、Task 22 与 vSphere registry row未完成前继续 `UNAVAILABLE/CLOSED`。
 
 ### Task 28C: Production constructor and Provider registry
 
-**Batch:** C0/C1/C2，1–2 日；只能在 Task 28A、Task 28B 与需要注册的 provider-specific durable integrations 已合并后开始。
+**Batch:** C0/C1/C2，1–2 日；只能在 Task 28A、Task 28B 与需要注册的 provider-specific durable integrations 已合并后开始。vSphere Task 21A 不满足该条件；只有 Task 21B0/21B 完成后 vSphere row 才可进入 registry。
 
 **Exact files:**
 - Create: `internal/discoveryworker/registry.go`
@@ -314,14 +360,14 @@ G2 必须用 test-only fixed-protocol authority fixture 证明两个独立 clien
 **Consumes:**
 
 - 已合并 Task 28A `Worker`/claim-runtime seam、Task 28B `SessionTransport`/`AttemptSessionAuthority` 与 Task 27/M1D/M1E public constructors。
-- 每个已合并 Provider 的 exact adapter/profile/fact-policy/runtime resolver descriptor；External CMDB 必须消费 Task 18B `Produces`。
+- 每个已合并 Provider 的 exact adapter/profile/fact-policy/runtime resolver descriptor；External CMDB 必须消费 Task 18B `Produces`。vSphere descriptor必须消费 Task 21B0 resident-authority binding和 Task 21B cross-Run delta/leave/HA `Produces`；full-only Task 21A descriptor必须拒绝。
 - existing secure bootstrap/manifest/workload identity patterns；不把 Control Plane config 变成第二 owner。
 
 **Produces:**
 
-- Immutable exact Provider registry；只注册具有已合并 adapter + neutral profile descriptor/fact-policy + durable-integration evidence 的 Phase 1 row。External CMDB registry 必须比较 Task 18B `internal/sourceprofile` canonical descriptor digest，不能重建 metadata；`KUBERNETES_OPERATOR`、`AWX_INVENTORY` 和任何缺依赖 Provider 保持未注册/`UNAVAILABLE`，不得使用 family/default HTTP adapter。
+- Immutable exact Provider registry；只注册具有已合并 adapter + neutral profile descriptor/fact-policy + durable-integration evidence 的 Phase 1 row。External CMDB registry 必须比较 Task 18B `internal/sourceprofile` canonical descriptor digest，不能重建 metadata；vSphere 必须比较 Task 21B0 authority capability digest与 Task 21B durable descriptor，任一缺失时该 row完全不注册。`KUBERNETES_OPERATOR`、`AWX_INVENTORY` 和任何缺依赖 Provider 保持未注册/`UNAVAILABLE`，不得使用 family/default HTTP adapter。
 - `internal/discoveryworker.NewProduction(...)`、`cmd/discovery-worker.newProduction(Config)` 和独立 binary startup/readiness/shutdown。
-- Production constructor uses PostgreSQL Queue/PageCommitter/Limiter、Task 28B single `AttemptSessionAuthority`、由它构造的 process-local Broker、checkpoint keyring、low-cardinality metrics boundary and mTLS workload identity；constructor 不接受彼此独立的 `SessionOpener` 与 runtime resolver 注入，credential/session transport 只能由该 authority open/recover path 调用。它还产生仅含 Provider/Profile/canonical descriptor/runtime-recovery capability digest 的 safe content-addressed runtime-admission manifest，供 Task 19A Control Plane admission 只读消费；manifest 不含 endpoint、credential、socket、key 或 runtime material。
+- Production constructor uses PostgreSQL Queue/PageCommitter/Limiter、Task 28B single `AttemptSessionAuthority`、由它构造的 process-local Broker、checkpoint keyring、low-cardinality metrics boundary and mTLS workload identity；constructor 不接受彼此独立的 `SessionOpener` 与 runtime resolver 注入，credential/session transport 只能由该 authority open/recover path 调用。若 registry 包含 vSphere，Task 28B authority 只能打开到 Task 21B0 resident authority 的 exact attempt capability；resident session/filter仍由 Task 21B0 拥有，并要求独立 capability digest，不能由 Task 28B reconstruction。constructor 还产生仅含 Provider/Profile/canonical descriptor/runtime-recovery capability digest 的 safe content-addressed runtime-admission manifest，供 Task 19A Control Plane admission 只读消费；manifest 不含 endpoint、credential、socket、key 或 runtime material。
 - A production-only `WorkerObserver`/dependency-decorator extension seam in `internal/discoveryworker/production.go` and `cmd/discovery-worker/production.go`。It decorates the exact Queue/PageCommitter/Limiter dependencies injected into Task 28A and exposes one closed later slot for the Task 19A2c qualification outcome dependency，never edits or copies the Task 28A loop，and emits only closed safe enums such as Provider/result/boundary。The constructor derives an opaque worker-identity digest from the authenticated mTLS workload identity and a fresh process-instance digest from its symlink-safe startup bootstrap；CLI/config/caller values cannot supply either digest。Task 28C wires an explicit closed observer so the binary remains `BUILT_CLOSED`; Task 29A is the sole sequential owner that replaces it with real low-cardinality metrics and，after Task 19A2c，registers the HA verifier。
 
 源文件核验显示现有 `internal/config.Config` 是 Control Plane-wide 配置，生产代码当前只由 `cmd/control-plane` 消费。把 discovery credential/keyring/socket 文件加入该共享类型会制造无关 owner 和敏感配置耦合，因此 Discovery Worker 配置只由 `cmd/discovery-worker/config.go` 拥有。Task 28C 不得修改 Task 28A/28B 文件，也不得把 Provider-specific profile/fact policy 重写进 registry。
@@ -370,13 +416,13 @@ Expected: FAIL because production constructor/registry/binary do not exist；Tas
 
 - [ ] **Step 2: Compose the merged Worker core and exact Provider descriptors**
 
-Task 28C 不实现第二个 fenced run loop。它只把 Task 28A `New(Dependencies)` 与真实 PostgreSQL Queue/PageCommitter/Limiter、CheckpointCodec、Task 28B 唯一 `AttemptSessionAuthority`、immutable registry 和 mandatory production observer/decorators 组合；process-local Broker 与 resolver 必须由该同一 authority 构造，禁止分别注入、再次调用 credential resolver 或新建 session。Observer 只能包装已注入依赖并接收 server-derived safe enum，不得接收 Source/Run/external ID、endpoint、digest 或任意 labels。每个 Provider descriptor 必须来自对应已合并 Provider Batch，并与 neutral metadata digest exact 相等。缺 descriptor、Task 28B transport、observer、duplicate Provider/Profile、semantic drift、attempt binding 漂移或 unsupported kind 在创建 Worker 前 fail closed。Core 的 claim、Page/Delay、cleanup、terminal、panic 和 cancellation 行为继续由 Task 28A 四文件唯一拥有。
+Task 28C 不实现第二个 fenced run loop。它只把 Task 28A `New(Dependencies)` 与真实 PostgreSQL Queue/PageCommitter/Limiter、CheckpointCodec、Task 28B 唯一 `AttemptSessionAuthority`、immutable registry 和 mandatory production observer/decorators 组合；process-local Broker 与 resolver 必须由该同一 authority 构造，禁止分别注入、再次调用 credential resolver 或新建 session。vSphere-specific descriptor还必须验证 Task 21B0 resident-authority capability digest，并让 Task 28B attempt authority只打开受 fence 的短期 client capability；它不能把 resident authority state导入 Worker。Observer 只能包装已注入依赖并接收 server-derived safe enum，不得接收 Source/Run/external ID、endpoint、digest 或任意 labels。每个 Provider descriptor 必须来自对应已合并 Provider Batch，并与 neutral metadata digest exact 相等。缺 descriptor、Task 28B transport、observer、duplicate Provider/Profile、semantic drift、attempt binding 漂移或 unsupported kind 在创建 Worker 前 fail closed。Core 的 claim、Page/Delay、cleanup、terminal、panic 和 cancellation 行为继续由 Task 28A 四文件唯一拥有。
 
 - [ ] **Step 3: Assemble the real binary without production fake branches**
 
-`cmd/discovery-worker` requires PostgreSQL DSN file, workload identity certificate/key file, CA file, secure source-profile manifest file, Task 28B shared session-authority endpoint/socket, checkpoint keyring file and metrics private bind. Files must be absolute, owner-only where secret-bearing, symlink-safe and loaded through existing secure bootstrap patterns. The binary consumes the authenticated workload identity certificate/key only through the production mTLS bootstrap and server-derives its opaque worker-identity digest；it creates a fresh opaque process-instance digest during the same symlink-safe startup. Neither identity digest accepts a flag、environment variable、config value or caller input。Startup verifies migrations through 000015, manifest digest/signature, registry completeness, mTLS identity, DB time and dependency health before readiness.
+`cmd/discovery-worker` requires PostgreSQL DSN file, workload identity certificate/key file, CA file, secure source-profile manifest file, Task 28B shared session-authority endpoint/socket, checkpoint keyring file and metrics private bind. Files must be absolute, owner-only where secret-bearing, symlink-safe and loaded through existing secure bootstrap patterns. 若 vSphere row 被注册，还必须消费 Task 21B0 冻结的独立 opaque resident-authority binding；Task 28B endpoint或普通 credential reference不能替代它。The binary consumes the authenticated workload identity certificate/key only through the production mTLS bootstrap and server-derives its opaque worker-identity digest；it creates a fresh opaque process-instance digest during the same symlink-safe startup. Neither identity digest accepts a flag、environment variable、config value or caller input。Startup verifies migrations through 000015, manifest digest/signature, registry completeness, mTLS identity, DB time and dependency health before readiness.
 
-The binary does not import `internal/*/memory`, testdata, MSW, Control Plane handler or model/LLM packages. Add AST/import tests proving Provider SDK、Provider HTTP-client、credential/session transport packages are reachable only from `cmd/discovery-worker` production graph and never from `cmd/control-plane`；Control Plane 后续只能 import `internal/sourceprofile` neutral metadata/admission package，其既有 HTTP server graph 不受影响。
+The binary does not import `internal/*/memory`, testdata, MSW, Control Plane handler or model/LLM packages. Add AST/import tests proving Provider SDK、Provider HTTP-client、credential/session transport packages are reachable only from `cmd/discovery-worker` production graph；vSphere 是唯一条件例外，Task 21B0 若冻结独立 resident-authority graph，该 graph 也可导入 govmomi，但必须与 Control Plane/其他 Provider隔离并通过自己的 import/secret-boundary test。任何 Provider SDK/network graph 都不得从 `cmd/control-plane` 可达；Control Plane 后续只能 import `internal/sourceprofile` neutral metadata/admission package，其既有 HTTP server graph 不受影响。
 
 - [ ] **Step 4: Verify binary, race, shutdown, and commit**
 
@@ -428,7 +474,7 @@ git commit -m "feat(assetdiscovery): assemble production discovery worker"
 实现第一步必须只读核对已合并 `internal/discoveryworker/production.go`、`production_test.go`、`cmd/discovery-worker/production.go`、`production_test.go` 与 Task 19A2c `cmd/discovery-worker/qualification.go`、`qualification_test.go`。前四个必须已有不复制 Worker loop 的 observer/dependency-decorator seam，后两个必须已有 immutable verifier-registry registration + sole sink/signer seam。若任一不足，Task 29A 必须停止且不得编辑上述 12 文件；主管理先开仅修改这六个 exact files 的最小 sequential C0 seam corrective，独立新窗口、定向 RED/G2、单一 PR/merge，只补 closed extension/registration seam，不实现 metrics/HA verifier。该 corrective 合并后重新启动 Task 29A；禁止用 Task28A 修改、脚本日志、test fake 或第二 loop 代替 production seam。
 
 **Interfaces:**
-- Consumes Task 19A2a safe receipt/HA schema、Task 19A2b server-generated durable fact loader、Task 19A2c fixed `TWO_WORKER_HA` qualification lane/immutable verifier registry/sole sink+signer、Task 28C real binary/registry/observer decorators、Task 28B fixed mTLS recovery client/same-attempt composition，以及通过 opaque lab binding 预置的真实外部 shared session authority；不拥有 authority server/binary，脚本不得启动或用 fake/shared process map 代替它。
+- Consumes Task 19A2a safe receipt/HA schema、Task 19A2b server-generated durable fact loader、Task 19A2c fixed `TWO_WORKER_HA` qualification lane/immutable verifier registry/sole sink+signer、Task 28C real binary/registry/observer decorators、Task 28B fixed mTLS recovery client/same-attempt composition，以及通过 opaque lab binding 预置的真实外部 shared session authority；不拥有 authority server/binary，脚本不得启动或用 fake/shared process map 代替它。vSphere row 还必须消费 Task 21B0 的真实 resident PropertyCollector authority与 Task 21B continuity evidence；Task 28B cleanup recovery单独存在时 vSphere HA receipt必须拒绝。
 - `cmd/discovery-worker/qualification.go` registers exactly the Task 29A HA verifier into the Task 19A2c immutable registry；the sole outcome sink reloads facts、invokes it and passes the verified digest to the sole signer。`ha.go` has no persistence or signing key and cannot make a receipt from script/caller input。
 - `internal/discoveryworker/production.go` wraps the real Queue/PageCommitter/Limiter/qualification sink through Task 28C decorators，and `cmd/discovery-worker/production.go` injects the real metrics observer into both Worker processes。No metrics value comes from logs、shell parsing、test fake or a parallel Worker callback。
 - Produces one current signed `TWO_WORKER_HA` receipt bound to exact Tenant/Workspace/Source、published revision/binding、Provider/Profile descriptor、Task 28C runtime manifest、opaque lab-binding digest、distinct owner/takeover worker and process identity digests、takeover/restart/session-recovery/cleanup/pre-terminal-response-loss receipt digests、fact-chain digest and expiry。它不消费 real Provider canary receipt，不写 `asset_sources.gate_status`，不产生 per-source Provider decision 或 final matrix。
@@ -558,7 +604,7 @@ KUBERNETES_OPERATOR            -> Phase 3, UNAVAILABLE here
 AWX_INVENTORY                  -> Phase 5, UNAVAILABLE here
 ~~~
 
-Every Phase 1 row must reference the already-open exact per-source gate plus its distinct current HA/canary receipt digests；Task 29B verifies signatures/expiry/Scope/revision/binding equality and signs the aggregate. It cannot synthesize a receipt, call `AdmitGate`, infer a family status or turn a Provider on. UI and API show the same orthogonal status/reason/evidence timestamps.
+Every Phase 1 row must reference the already-open exact per-source gate plus its distinct current HA/canary receipt digests；Task 29B verifies signatures/expiry/Scope/revision/binding equality and signs the aggregate. It cannot synthesize a receipt, call `AdmitGate`, infer a family status or turn a Provider on. For `VSPHERE/VSPHERE_VCENTER_V1`, Task 21A full-only evidence is insufficient：Task 21B0 authority、Task 21B delta/leave/HA、Task 22 gate/canary任一缺失时该 row必须保持 `UNAVAILABLE`。UI and API show the same orthogonal status/reason/evidence timestamps.
 
 - [ ] **Step 3: Run final provider E2E/CI aggregation**
 
@@ -584,4 +630,4 @@ git add internal/discoveryqualification/provider_matrix.go \
 git commit -m "test(assetdiscovery): sign final provider matrix"
 ~~~
 
-**Deferred G4 in this corrective:** 本 PR 只冻结无环合同；Task 29B、final E2E/CI 和 matrix signature 未执行，所有 Provider/Worker 继续 `NOT_STARTED/UNAVAILABLE/CLOSED`。
+**Deferred G4 in this corrective:** 本 PR 只冻结无环合同；Task 29B、final E2E/CI 和 matrix signature 未执行，所有 Provider row 与 production Worker availability 继续 `UNAVAILABLE/CLOSED`。具体实现完成度只由 `docs/status/current.md` 记录，本计划不重述。
