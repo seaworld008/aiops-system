@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -13,15 +14,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/seaworld008/aiops-system/internal/assetcatalog"
 	assetpostgres "github.com/seaworld008/aiops-system/internal/assetcatalog/postgres"
 	"github.com/seaworld008/aiops-system/internal/assetdiscovery"
+	"github.com/seaworld008/aiops-system/internal/assetsource/externalcmdb"
 	"github.com/seaworld008/aiops-system/internal/discoverycheckpoint"
 	"github.com/seaworld008/aiops-system/internal/discoverysource"
 	"github.com/seaworld008/aiops-system/internal/leasefence"
+	"github.com/seaworld008/aiops-system/internal/sourceprofile"
 )
 
 func TestPageCommitterCommitsFirstPageAtomicallyIntegration(t *testing.T) {
@@ -1642,18 +1646,28 @@ func finishPageCommitRunForTest(
 	execAssetSQL(t, tx, `
 UPDATE asset_source_runs
 SET status='SUCCEEDED',stage_code='COMPLETED',terminal_command_sha256=$2,
+    completed_at=statement_timestamp(),
     version=version+1
 WHERE id=$1
 `, runID, terminalDigest)
 	execAssetSQL(t, tx, `
-UPDATE asset_sources
-SET last_success_run_id=$2,
-    last_success_at=(SELECT completed_at FROM asset_source_runs WHERE id=$2),
-    version=version+1
-WHERE id=$1
+UPDATE asset_sources AS source
+SET last_success_run_id=run.id,
+    last_success_at=run.completed_at,
+    last_complete_snapshot_run_id=CASE
+      WHEN run.effective_complete_snapshot THEN run.id
+      ELSE source.last_complete_snapshot_run_id
+    END,
+    last_complete_snapshot_at=CASE
+      WHEN run.effective_complete_snapshot THEN run.completed_at
+      ELSE source.last_complete_snapshot_at
+    END,
+    version=source.version+1
+FROM asset_source_runs AS run
+WHERE source.id=$1 AND run.id=$2
 `, fixture.sourceID, runID)
 	if err := tx.Commit(context.Background()); err != nil {
-		t.Fatal("commit page test terminal closure")
+		t.Fatalf("commit page test terminal closure: %v", err)
 	}
 }
 
@@ -1985,4 +1999,782 @@ func pageCommitConstraint(err error) string {
 		return postgresError.ConstraintName
 	}
 	return ""
+}
+
+func TestExternalCMDBTask18BPageAtomicFaultsPostgres(t *testing.T) {
+	requireExternalCMDBTask18BPostgres(t)
+	tests := []struct {
+		name      string
+		table     string
+		timing    string
+		event     string
+		condition string
+	}{
+		{name: "asset projection", table: "asset_observations", timing: "BEFORE", event: "INSERT"},
+		{name: "relation projection", table: "asset_relationships", timing: "BEFORE", event: "INSERT"},
+		{
+			name: "page receipt", table: "audit_records", timing: "BEFORE", event: "INSERT",
+			condition: "WHEN (NEW.action='PAGE_APPLIED')",
+		},
+		{
+			name: "relation receipt", table: "audit_records", timing: "BEFORE", event: "INSERT",
+			condition: "WHEN (NEW.action='RELATION_PAGE_COMMITTED')",
+		},
+		{
+			name: "checkpoint", table: "asset_sources", timing: "BEFORE", event: "UPDATE",
+			condition: "WHEN (NEW.checkpoint_version > OLD.checkpoint_version)",
+		},
+		{
+			name: "work result", table: "asset_source_runs", timing: "BEFORE", event: "UPDATE",
+			condition: "WHEN (NEW.work_result_kind IS NOT NULL AND OLD.work_result_kind IS NULL)",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			harness := newAssetCatalogHarness(t)
+			harness.applyThroughAssetCatalog(t)
+			assertExternalCMDBTask18BPostgresTLS(t, harness)
+			fixture := seedExternalCMDBTask18BPublishedSource(t, harness)
+			scenario := newExternalCMDBTask18BPageScenario(
+				t, harness, fixture, uuid.NewString(), "task18b-atomic-worker",
+			)
+			scenario.page = externalCMDBTask18BCompletePage(
+				t, fixture.environmentID, 1, scenario.page.NextCheckpoint,
+			)
+			reserveExternalCMDBTask18BCleanup(t, harness.db, scenario.runID)
+			installPageCommitFault(
+				t, scenario.harness, test.table, test.timing, test.event, test.condition,
+			)
+
+			result, err := scenario.committer.ApplyPage(
+				t.Context(), scenario.fence, scenario.coordinates, scenario.page,
+			)
+			if result != (discoverysource.PageCommitResult{}) ||
+				!errors.Is(err, discoverysource.ErrPageCommitUnavailable) ||
+				err.Error() != discoverysource.ErrPageCommitUnavailable.Error() {
+				t.Fatalf("faulted CMDB ApplyPage() = (%#v,%v)", result, err)
+			}
+			assertExternalCMDBTask18BPageState(t, scenario, 0, 0, 0, 0, 0)
+		})
+	}
+}
+
+func TestExternalCMDBTask18BPageReplayChangedDigestAndOneTransactionPostgres(t *testing.T) {
+	requireExternalCMDBTask18BPostgres(t)
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	assertExternalCMDBTask18BPostgresTLS(t, harness)
+	fixture := seedExternalCMDBTask18BPublishedSource(t, harness)
+	scenario := newExternalCMDBTask18BPageScenario(
+		t, harness, fixture, uuid.NewString(), "task18b-replay-worker",
+	)
+	scenario.page = externalCMDBTask18BCompletePage(
+		t, fixture.environmentID, 1, scenario.page.NextCheckpoint,
+	)
+	reserveExternalCMDBTask18BCleanup(t, harness.db, scenario.runID)
+	committed, err := scenario.committer.ApplyPage(
+		t.Context(), scenario.fence, scenario.coordinates, scenario.page,
+	)
+	if err != nil || committed.Replayed || !committed.FinalPage ||
+		!committed.CompleteSnapshot {
+		t.Fatalf("initial CMDB ApplyPage() = (%#v,%v)", committed, err)
+	}
+	assertExternalCMDBTask18BPageState(t, scenario, 2, 1, 1, 1, 1)
+	replayed, err := scenario.committer.ApplyPage(
+		t.Context(), scenario.fence, scenario.coordinates, scenario.page,
+	)
+	assertExactPageReplay(t, replayed, err, committed)
+
+	tests := []struct {
+		name   string
+		change func(*testing.T, *discoverysource.Page)
+	}{
+		{name: "item", change: func(_ *testing.T, page *discoverysource.Page) {
+			page.Items = append([]assetdiscovery.NormalizedItem(nil), page.Items...)
+			page.Items[0].DisplayName = "changed-name"
+		}},
+		{name: "relation", change: func(_ *testing.T, page *discoverysource.Page) {
+			page.Relations = append([]assetdiscovery.ObservedRelation(nil), page.Relations...)
+			page.Relations[0].Type = assetcatalog.RelationshipManagedBy
+		}},
+		{name: "checkpoint", change: func(t *testing.T, page *discoverysource.Page) {
+			t.Helper()
+			var err error
+			page.NextCheckpoint, err = discoverysource.NewCheckpoint(
+				"CMDB_CATALOG_V1", []byte(`{"changed":"checkpoint"}`),
+			)
+			if err != nil {
+				t.Fatalf("changed checkpoint: %v", err)
+			}
+		}},
+		{name: "final flag", change: func(_ *testing.T, page *discoverysource.Page) {
+			page.FinalPage = false
+			page.CompleteSnapshot = false
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			changed := cloneExternalCMDBTask18BPage(scenario.page)
+			test.change(t, &changed)
+			assertPageCommitError(
+				t, scenario.committer, scenario.fence, scenario.coordinates,
+				changed, discoverysource.ErrPageCommitConflict,
+			)
+			assertExternalCMDBTask18BPageState(t, scenario, 2, 1, 1, 1, 1)
+		})
+	}
+}
+
+func TestExternalCMDBTask18BCompleteOnlyMissingAndTombstoneRestorePostgres(t *testing.T) {
+	requireExternalCMDBTask18BPostgres(t)
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	assertExternalCMDBTask18BPostgresTLS(t, harness)
+	fixture := seedExternalCMDBTask18BPublishedSource(t, harness)
+
+	initial := newExternalCMDBTask18BPageScenario(
+		t, harness, fixture, uuid.NewString(), "task18b-initial-worker",
+	)
+	initial.page = externalCMDBTask18BCompletePage(
+		t, fixture.environmentID, 1, initial.page.NextCheckpoint,
+	)
+	reserveExternalCMDBTask18BCleanup(t, harness.db, initial.runID)
+	if _, err := initial.committer.ApplyPage(
+		t.Context(), initial.fence, initial.coordinates, initial.page,
+	); err != nil {
+		t.Fatalf("initial complete CMDB page: %v", err)
+	}
+	finishPageCommitRunForTest(t, harness, fixture, initial.runID)
+	execAssetSQL(t, harness.db, `
+UPDATE assets SET lifecycle='ACTIVE',version=version+1 WHERE source_id=$1::uuid
+`, fixture.sourceID)
+
+	partial := newExternalCMDBTask18BPageScenario(
+		t, harness, fixture, uuid.NewString(), "task18b-partial-worker",
+	)
+	partial.page = discoverysource.Page{
+		Items: []assetdiscovery.NormalizedItem{
+			externalCMDBTask18BLiveItem(t, fixture.environmentID, "cmdb-host-a", "host-a", 2),
+		},
+		NextCheckpoint: partial.page.NextCheckpoint,
+		FinalPage:      true,
+	}
+	reserveExternalCMDBTask18BCleanup(t, harness.db, partial.runID)
+	if _, err := partial.committer.ApplyPage(
+		t.Context(), partial.fence, partial.coordinates, partial.page,
+	); err != nil {
+		t.Fatalf("partial CMDB page: %v", err)
+	}
+	assertExternalCMDBTask18BNoImplicitMissing(t, harness, fixture, partial.runID)
+	finishPageCommitRunForTest(t, harness, fixture, partial.runID)
+
+	tombstone := newExternalCMDBTask18BPageScenario(
+		t, harness, fixture, uuid.NewString(), "task18b-tombstone-worker",
+	)
+	tombstone.page = discoverysource.Page{
+		Items: []assetdiscovery.NormalizedItem{
+			externalCMDBTask18BTombstone(
+				fixture.environmentID, "cmdb-host-b", 3, "PROVIDER_DELETED",
+			),
+		},
+		NextCheckpoint: tombstone.page.NextCheckpoint,
+		FinalPage:      true,
+	}
+	reserveExternalCMDBTask18BCleanup(t, harness.db, tombstone.runID)
+	if _, err := tombstone.committer.ApplyPage(
+		t.Context(), tombstone.fence, tombstone.coordinates, tombstone.page,
+	); err != nil {
+		t.Fatalf("fixed-wire tombstone CMDB page: %v", err)
+	}
+	var lifecycle, relationStatus string
+	var tombstoned, stale int64
+	if err := harness.db.QueryRow(t.Context(), `
+SELECT asset.lifecycle,relationship.status,run.tombstoned_count,run.stale_count
+FROM assets AS asset
+JOIN asset_relationships AS relationship
+  ON relationship.source_id=asset.source_id AND relationship.target_asset_id=asset.id
+JOIN asset_source_runs AS run ON run.id=$2::uuid
+WHERE asset.source_id=$1::uuid AND asset.external_id='cmdb-host-b'
+`, fixture.sourceID, tombstone.runID).Scan(
+		&lifecycle, &relationStatus, &tombstoned, &stale,
+	); err != nil {
+		t.Fatalf("read CMDB tombstone projection: %v", err)
+	}
+	if lifecycle != "STALE" || relationStatus != "INACTIVE" || tombstoned != 1 || stale != 1 {
+		t.Fatalf("CMDB tombstone projection = %s/%s %d/%d", lifecycle, relationStatus, tombstoned, stale)
+	}
+	finishPageCommitRunForTest(t, harness, fixture, tombstone.runID)
+
+	restore := newExternalCMDBTask18BPageScenario(
+		t, harness, fixture, uuid.NewString(), "task18b-restore-worker",
+	)
+	restore.page = discoverysource.Page{
+		Items: []assetdiscovery.NormalizedItem{
+			externalCMDBTask18BLiveItem(t, fixture.environmentID, "cmdb-host-b", "host-b", 4),
+		},
+		NextCheckpoint: restore.page.NextCheckpoint,
+		FinalPage:      true,
+	}
+	reserveExternalCMDBTask18BCleanup(t, harness.db, restore.runID)
+	if _, err := restore.committer.ApplyPage(
+		t.Context(), restore.fence, restore.coordinates, restore.page,
+	); err != nil {
+		t.Fatalf("CMDB restore page: %v", err)
+	}
+	var restored, restoreAudit, restoreOutbox int64
+	if err := harness.db.QueryRow(t.Context(), `
+SELECT asset.lifecycle,run.restored_count,
+       (SELECT count(*) FROM audit_records
+        WHERE resource_id=asset.id::text AND action='asset.source.asset.restored.v1'),
+       (SELECT count(*) FROM outbox_events
+        WHERE aggregate_id=asset.id AND event_type='asset.source.asset.restored.v1')
+FROM assets AS asset JOIN asset_source_runs AS run ON run.id=$2::uuid
+WHERE asset.source_id=$1::uuid AND asset.external_id='cmdb-host-b'
+`, fixture.sourceID, restore.runID).Scan(
+		&lifecycle, &restored, &restoreAudit, &restoreOutbox,
+	); err != nil {
+		t.Fatalf("read CMDB restore projection: %v", err)
+	}
+	if lifecycle != "STALE" || restored != 1 || restoreAudit != 1 || restoreOutbox != 1 {
+		t.Fatalf("CMDB restore projection = %s restored=%d evidence=%d/%d",
+			lifecycle, restored, restoreAudit, restoreOutbox)
+	}
+	finishPageCommitRunForTest(t, harness, fixture, restore.runID)
+
+	complete := newExternalCMDBTask18BPageScenario(
+		t, harness, fixture, uuid.NewString(), "task18b-complete-worker",
+	)
+	complete.page = discoverysource.Page{
+		Items: []assetdiscovery.NormalizedItem{
+			externalCMDBTask18BLiveItem(t, fixture.environmentID, "cmdb-host-a", "host-a", 5),
+		},
+		NextCheckpoint:   complete.page.NextCheckpoint,
+		FinalPage:        true,
+		CompleteSnapshot: true,
+	}
+	reserveExternalCMDBTask18BCleanup(t, harness.db, complete.runID)
+	if _, err := complete.committer.ApplyPage(
+		t.Context(), complete.fence, complete.coordinates, complete.page,
+	); err != nil {
+		t.Fatalf("complete-only missing CMDB page: %v", err)
+	}
+	var effective bool
+	var missing int64
+	if err := harness.db.QueryRow(t.Context(), `
+SELECT effective_complete_snapshot,missing_count,stale_count
+FROM asset_source_runs WHERE id=$1::uuid
+`, complete.runID).Scan(&effective, &missing, &stale); err != nil {
+		t.Fatalf("read CMDB complete closure: %v", err)
+	}
+	if !effective || missing != 1 || stale != 0 {
+		t.Fatalf("complete-only missing closure effective=%t missing/stale=%d/%d",
+			effective, missing, stale)
+	}
+}
+
+func TestExternalCMDBTask18BRejectedItemSuppressesImplicitMissingPostgres(t *testing.T) {
+	requireExternalCMDBTask18BPostgres(t)
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	assertExternalCMDBTask18BPostgresTLS(t, harness)
+	fixture := seedExternalCMDBTask18BPublishedSource(t, harness)
+
+	initial := newExternalCMDBTask18BPageScenario(
+		t, harness, fixture, uuid.NewString(), "task18b-rejected-initial-worker",
+	)
+	initial.page = externalCMDBTask18BCompletePage(
+		t, fixture.environmentID, 1, initial.page.NextCheckpoint,
+	)
+	reserveExternalCMDBTask18BCleanup(t, harness.db, initial.runID)
+	if _, err := initial.committer.ApplyPage(
+		t.Context(), initial.fence, initial.coordinates, initial.page,
+	); err != nil {
+		t.Fatalf("initial rejected-item CMDB page: %v", err)
+	}
+	finishPageCommitRunForTest(t, harness, fixture, initial.runID)
+	execAssetSQL(t, harness.db, `
+UPDATE assets SET lifecycle='ACTIVE',version=version+1 WHERE source_id=$1::uuid
+`, fixture.sourceID)
+
+	rejected := newExternalCMDBTask18BPageScenario(
+		t, harness, fixture, uuid.NewString(), "task18b-rejected-worker",
+	)
+	unknownTombstone := externalCMDBTask18BTombstone(
+		fixture.environmentID, "cmdb-host-unknown", 2, "PROVIDER_DELETED",
+	)
+	rejected.page = discoverysource.Page{
+		Items:            []assetdiscovery.NormalizedItem{unknownTombstone},
+		NextCheckpoint:   rejected.page.NextCheckpoint,
+		FinalPage:        true,
+		CompleteSnapshot: true,
+	}
+	reserveExternalCMDBTask18BCleanup(t, harness.db, rejected.runID)
+	result, err := rejected.committer.ApplyPage(
+		t.Context(), rejected.fence, rejected.coordinates, rejected.page,
+	)
+	if err != nil || !result.FinalPage || !result.CompleteSnapshot {
+		t.Fatalf("rejected-item CMDB ApplyPage() = (%#v,%v)", result, err)
+	}
+	var workStatus string
+	var rejectedCount, conflicts, missing, stale, activeAssets, activeRelations int64
+	var effective bool
+	if err := harness.db.QueryRow(t.Context(), `
+SELECT work_result_status,rejected_count,conflict_count,missing_count,stale_count,
+       effective_complete_snapshot,
+       (SELECT count(*) FROM assets
+        WHERE source_id=$2::uuid AND lifecycle='ACTIVE'),
+       (SELECT count(*) FROM asset_relationships
+        WHERE source_id=$2::uuid AND status='ACTIVE')
+FROM asset_source_runs WHERE id=$1::uuid
+`, rejected.runID, fixture.sourceID).Scan(
+		&workStatus, &rejectedCount, &conflicts, &missing, &stale, &effective,
+		&activeAssets, &activeRelations,
+	); err != nil {
+		t.Fatalf("read rejected-item CMDB closure: %v", err)
+	}
+	if workStatus != "PARTIAL" || rejectedCount != 1 || conflicts != 0 ||
+		missing != 1 || stale != 0 || effective ||
+		activeAssets != 2 || activeRelations != 1 {
+		t.Fatalf("rejected-item closure status=%s rejected/conflict=%d/%d missing/stale=%d/%d effective=%t active=%d/%d",
+			workStatus, rejectedCount, conflicts, missing, stale, effective,
+			activeAssets, activeRelations)
+	}
+}
+
+func requireExternalCMDBTask18BPostgres(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		"AIOPS_TEST_POSTGRES_DSN",
+		"AIOPS_TEST_POSTGRES_MIGRATION_DSN",
+		"AIOPS_TEST_POSTGRES_APPLICATION_DSN",
+	} {
+		if strings.TrimSpace(os.Getenv(name)) == "" {
+			t.Fatalf("%s is required; Task 18B PostgreSQL tests may not skip", name)
+		}
+	}
+}
+
+func assertExternalCMDBTask18BPostgresTLS(
+	t *testing.T,
+	harness *assetCatalogHarness,
+) {
+	t.Helper()
+	type expectedPool struct {
+		name     string
+		pool     *pgxpool.Pool
+		identity string
+	}
+	pools := []expectedPool{
+		{name: "migration", pool: harness.migration, identity: "aiops_migrator"},
+		{name: "application", pool: harness.application, identity: "aiops_control_plane_workload"},
+	}
+	for _, candidate := range pools {
+		var version int
+		var sessionUser, currentUser, tlsVersion string
+		var ssl bool
+		if err := candidate.pool.QueryRow(t.Context(), `
+SELECT current_setting('server_version_num')::integer,session_user,current_user,
+       ssl,version
+FROM pg_stat_ssl WHERE pid=pg_backend_pid()
+`).Scan(&version, &sessionUser, &currentUser, &ssl, &tlsVersion); err != nil {
+			t.Fatalf("read %s PostgreSQL TLS identity: %v", candidate.name, err)
+		}
+		if version < 180004 || version >= 190000 || !ssl || tlsVersion != "TLSv1.3" ||
+			sessionUser != candidate.identity || currentUser != candidate.identity {
+			t.Fatalf("%s PostgreSQL contract version=%d TLS=%t/%q identity=%q/%q",
+				candidate.name, version, ssl, tlsVersion, sessionUser, currentUser)
+		}
+	}
+}
+
+func seedExternalCMDBTask18BPublishedSource(
+	t *testing.T,
+	harness *assetCatalogHarness,
+) assetCatalogFixture {
+	t.Helper()
+	fixture := seedDraftAssetCatalog(t, harness.db)
+	fixture.sourceID = uuid.NewString()
+	fixture.revisionID = uuid.NewString()
+	fixture.validationRunID = uuid.NewString()
+	neutral := sourceprofile.ExternalCMDBV1()
+	registration, err := neutral.Registration(sourceprofile.ExternalCMDBProfileReferences{
+		IntegrationID:            fixture.integrationID,
+		CredentialReferenceID:    "task18b-cmdb-read",
+		TrustReferenceID:         "task18b-cmdb-trust",
+		NetworkPolicyReferenceID: "task18b-cmdb-network",
+	})
+	if err != nil {
+		t.Fatalf("External CMDB registration: %v", err)
+	}
+	profile := registration.Profile
+	authorityIDs := []string{fixture.environmentID}
+	authorityDigest, err := assetcatalog.AuthorityScopeDigest(authorityIDs)
+	if err != nil {
+		t.Fatalf("External CMDB authority digest: %v", err)
+	}
+	revision := assetcatalog.SourceRevision{
+		ID:                            fixture.revisionID,
+		SourceID:                      fixture.sourceID,
+		TenantID:                      fixture.tenantID,
+		WorkspaceID:                   fixture.workspaceID,
+		Revision:                      1,
+		Status:                        assetcatalog.SourceRevisionDraft,
+		CanonicalProfileManifest:      profile.CanonicalProfileManifest,
+		ProfileManifestSHA256:         profile.ProfileManifestSHA256,
+		CanonicalProviderSchema:       profile.CanonicalProviderSchema,
+		CanonicalProviderSchemaSHA256: profile.CanonicalProviderSchemaSHA256,
+		IntegrationID:                 profile.IntegrationID,
+		SyncMode:                      profile.SyncMode,
+		CredentialReferenceID:         profile.CredentialReferenceID,
+		TrustReferenceID:              profile.TrustReferenceID,
+		NetworkPolicyReferenceID:      profile.NetworkPolicyReferenceID,
+		AuthorityEnvironmentIDs:       authorityIDs,
+		AuthorityScopeDigest:          authorityDigest,
+		RateLimitRequests:             profile.RateLimitRequests,
+		RateLimitWindowSeconds:        profile.RateLimitWindowSeconds,
+		BackpressureBaseSeconds:       profile.BackpressureBaseSeconds,
+		BackpressureMaxSeconds:        profile.BackpressureMaxSeconds,
+		ProfileCode:                   profile.ProfileCode,
+		CreatedBy:                     "task18b-test",
+		ChangeReasonCode:              "INITIAL_CREATE",
+		ExpectedSourceVersion:         1,
+		Version:                       1,
+		CreatedAt:                     time.Now().UTC().Truncate(time.Microsecond),
+		UpdatedAt:                     time.Now().UTC().Truncate(time.Microsecond),
+	}
+	revision.SourceDefinitionDigest, err = assetcatalog.SourceDefinitionDigest(
+		assetcatalog.Source{
+			Kind: assetcatalog.SourceKindExternalCMDB, ProviderKind: "CMDB_CATALOG_V1",
+		},
+		revision,
+	)
+	if err != nil {
+		t.Fatalf("External CMDB source definition digest: %v", err)
+	}
+	revision.CanonicalRevisionDigest = revision.BindingDigest()
+	fixture.sourceDefinitionDigest = revision.SourceDefinitionDigest
+	fixture.revisionDigest = revision.CanonicalRevisionDigest
+
+	tx, err := harness.db.BeginTx(t.Context(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatalf("begin External CMDB definition: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	execAssetSQL(t, tx, `
+INSERT INTO asset_sources(
+ id,tenant_id,workspace_id,source_kind,provider_kind,name,
+ create_idempotency_key,create_request_hash
+) VALUES($1,$2,$3,'EXTERNAL_CMDB','CMDB_CATALOG_V1','task18b external cmdb',
+         $4,repeat('1',64))
+`, fixture.sourceID, fixture.tenantID, fixture.workspaceID, "task18b-source-"+fixture.sourceID)
+	execAssetSQL(t, tx, `
+INSERT INTO asset_source_revisions(
+ id,tenant_id,workspace_id,source_id,revision,
+ canonical_profile_manifest,profile_manifest_sha256,
+ canonical_provider_schema,canonical_provider_schema_sha256,
+ integration_id,sync_mode,authority_scope_digest,source_definition_digest,
+ canonical_revision_digest,credential_reference_id,trust_reference_id,
+ network_policy_reference_id,rate_limit_requests,rate_limit_window_seconds,
+ backpressure_base_seconds,backpressure_max_seconds,profile_code,
+ created_by,change_reason_code,expected_source_version
+) SELECT $1,$2,$3,$4,1,$5,$6,$7,$8,$9,'ON_DEMAND',$10,$11,$12,
+         $13,$14,$15,5,1,1,60,'CMDB_CATALOG_V1',
+         'task18b-test','INITIAL_CREATE',source.version
+  FROM asset_sources AS source WHERE source.id=$4
+`, fixture.revisionID, fixture.tenantID, fixture.workspaceID, fixture.sourceID,
+		profile.CanonicalProfileManifest, profile.ProfileManifestSHA256,
+		profile.CanonicalProviderSchema, profile.CanonicalProviderSchemaSHA256,
+		fixture.integrationID, authorityDigest, fixture.sourceDefinitionDigest,
+		fixture.revisionDigest, profile.CredentialReferenceID,
+		profile.TrustReferenceID, profile.NetworkPolicyReferenceID)
+	execAssetSQL(t, tx, `
+INSERT INTO asset_source_revision_authorities(
+ tenant_id,workspace_id,source_id,source_revision,environment_id,canonical_ordinal
+) VALUES($1,$2,$3,1,$4,1)
+`, fixture.tenantID, fixture.workspaceID, fixture.sourceID, fixture.environmentID)
+	if err := tx.Commit(t.Context()); err != nil {
+		t.Fatalf("commit External CMDB definition: %v", err)
+	}
+
+	execAssetSQL(t, harness.db, `
+INSERT INTO asset_source_runs(
+ id,tenant_id,workspace_id,source_id,source_revision,source_revision_digest,
+ run_kind,trigger_type,gate_revision,idempotency_key,request_hash,checkpoint_version
+) SELECT $1,$2,$3,$4,1,$5,'VALIDATION','HUMAN',gate_revision,
+         $6,repeat('2',64),0 FROM asset_sources WHERE id=$4
+`, fixture.validationRunID, fixture.tenantID, fixture.workspaceID,
+		fixture.sourceID, fixture.revisionDigest, "task18b-validation-"+fixture.sourceID)
+	execAssetSQL(t, harness.db, `
+UPDATE asset_source_revisions
+SET state='VALIDATING',validation_run_id=$2,version=version+1 WHERE id=$1
+`, fixture.revisionID, fixture.validationRunID)
+	execAssetSQL(t, harness.db, `
+UPDATE asset_sources
+SET gate_status='VALIDATING',gate_revision=gate_revision+1,
+    validated_run_id=$2,validation_digest=NULL,validated_binding_digest=NULL,
+    version=version+1 WHERE id=$1
+`, fixture.sourceID, fixture.validationRunID)
+	execAssetSQL(t, harness.db, `
+UPDATE asset_source_runs
+SET status='RUNNING',stage_code='VALIDATING',lease_owner='task18b-validation-worker',
+    lease_expires_at=statement_timestamp()+interval '10 minutes',fence_epoch=1,
+    fence_token_hash=repeat('6',64),heartbeat_sequence=1,
+    heartbeat_at=statement_timestamp(),version=version+1 WHERE id=$1
+`, fixture.validationRunID)
+	finishClosureExternalValidation(
+		t, harness.db, fixture, 1, strings.Repeat("7", 64),
+	)
+	return fixture
+}
+
+func newExternalCMDBTask18BPageScenario(
+	t *testing.T,
+	harness *assetCatalogHarness,
+	fixture assetCatalogFixture,
+	runID, owner string,
+) pageCommitScenario {
+	t.Helper()
+	descriptor, err := externalcmdb.NewReconciliationDescriptor(sourceprofile.ExternalCMDBV1())
+	if err != nil {
+		t.Fatalf("NewReconciliationDescriptor(): %v", err)
+	}
+	policy, err := descriptor.FactPolicy([]string{fixture.environmentID})
+	if err != nil {
+		t.Fatalf("External CMDB FactPolicy(): %v", err)
+	}
+	scenario := newPageCommitScenarioForFixtureWithKey(
+		t, harness, fixture, runID, owner, "task18b-page-"+runID,
+		policy, uuid.NewString,
+	)
+	scenario.resolver = nil
+	scenario.committer, err = assetpostgres.NewPageCommitter(
+		scenario.repository, scenario.keyring, descriptor,
+	)
+	if err != nil {
+		t.Fatalf("External CMDB NewPageCommitter(): %v", err)
+	}
+	scenario.page.NextCheckpoint, err = descriptor.NewCheckpoint()
+	if err != nil {
+		t.Fatalf("External CMDB NewCheckpoint(): %v", err)
+	}
+	return scenario
+}
+
+func externalCMDBTask18BCompletePage(
+	t *testing.T,
+	environmentID string,
+	sequence int64,
+	checkpoint discoverysource.Checkpoint,
+) discoverysource.Page {
+	t.Helper()
+	return discoverysource.Page{
+		Items: []assetdiscovery.NormalizedItem{
+			externalCMDBTask18BLiveItem(t, environmentID, "cmdb-host-a", "host-a", sequence),
+			externalCMDBTask18BLiveItem(t, environmentID, "cmdb-host-b", "host-b", sequence),
+		},
+		Relations: []assetdiscovery.ObservedRelation{{
+			SourceEnvironmentID: environmentID,
+			TargetEnvironmentID: environmentID,
+			FromExternalID:      "cmdb-host-a",
+			ToExternalID:        "cmdb-host-b",
+			Type:                assetcatalog.RelationshipRunsOn,
+			ProviderPathCode:    "CMDB_V1_RELATION",
+			Confidence:          100,
+			Freshness: assetdiscovery.FreshnessCandidate{
+				Kind:                  assetcatalog.FreshnessObjectTimeSequence,
+				OrderTime:             externalCMDBTask18BTime(sequence),
+				OrderSequence:         sequence,
+				ProviderVersionSHA256: strings.Repeat("9", 64),
+			},
+		}},
+		NextCheckpoint:   checkpoint,
+		FinalPage:        true,
+		CompleteSnapshot: true,
+	}
+}
+
+func externalCMDBTask18BLiveItem(
+	t *testing.T,
+	environmentID, externalID, displayName string,
+	sequence int64,
+) assetdiscovery.NormalizedItem {
+	t.Helper()
+	document := []byte(`{"architecture":"x86_64","hostname":"` + externalID + `"}`)
+	digest := sha256.Sum256(document)
+	return assetdiscovery.NormalizedItem{
+		EnvironmentID:  environmentID,
+		ProviderKind:   "CMDB_CATALOG_V1",
+		ExternalID:     externalID,
+		Kind:           assetcatalog.KindLinuxVM,
+		DisplayName:    displayName,
+		SchemaVersion:  "CMDB_CATALOG_V1",
+		Document:       document,
+		DocumentSHA256: hex.EncodeToString(digest[:]),
+		Freshness: assetdiscovery.FreshnessCandidate{
+			Kind:                  assetcatalog.FreshnessObjectTimeSequence,
+			OrderTime:             externalCMDBTask18BTime(sequence),
+			OrderSequence:         sequence,
+			ProviderVersionSHA256: strings.Repeat(strconv.FormatInt(sequence%9+1, 10), 64),
+		},
+		FieldProvenance: externalCMDBTask18BLiveProvenance(),
+		Fingerprints:    map[string]string{"provider_instance_id": externalID},
+	}
+}
+
+func externalCMDBTask18BTombstone(
+	environmentID, externalID string,
+	sequence int64,
+	reason string,
+) assetdiscovery.NormalizedItem {
+	return assetdiscovery.NormalizedItem{
+		EnvironmentID:   environmentID,
+		ProviderKind:    "CMDB_CATALOG_V1",
+		ExternalID:      externalID,
+		Tombstone:       true,
+		TombstoneReason: reason,
+		Freshness: assetdiscovery.FreshnessCandidate{
+			Kind:                  assetcatalog.FreshnessObjectTimeSequence,
+			OrderTime:             externalCMDBTask18BTime(sequence),
+			OrderSequence:         sequence,
+			ProviderVersionSHA256: strings.Repeat("8", 64),
+		},
+		FieldProvenance: []assetdiscovery.FieldProvenance{
+			{
+				FieldCode: "environment_id", ProviderPathCode: "CMDB_V1_ENVIRONMENT_ID",
+				Ownership: assetcatalog.FieldOwnershipSource, Confidence: 100,
+			},
+			{
+				FieldCode: "external_id", ProviderPathCode: "CMDB_V1_EXTERNAL_ID",
+				Ownership: assetcatalog.FieldOwnershipSource, Confidence: 100,
+			},
+			{
+				FieldCode: "provider_kind", ProviderPathCode: "CMDB_V1_PROVIDER_KIND",
+				Ownership: assetcatalog.FieldOwnershipSource, Confidence: 100,
+			},
+		},
+	}
+}
+
+func externalCMDBTask18BLiveProvenance() []assetdiscovery.FieldProvenance {
+	return []assetdiscovery.FieldProvenance{
+		{
+			FieldCode: "display_name", ProviderPathCode: "CMDB_V1_DISPLAY_NAME",
+			Ownership: assetcatalog.FieldOwnershipSource, Confidence: 100,
+		},
+		{
+			FieldCode: "environment_id", ProviderPathCode: "CMDB_V1_ENVIRONMENT_ID",
+			Ownership: assetcatalog.FieldOwnershipSource, Confidence: 100,
+		},
+		{
+			FieldCode: "external_id", ProviderPathCode: "CMDB_V1_EXTERNAL_ID",
+			Ownership: assetcatalog.FieldOwnershipSource, Confidence: 100,
+		},
+		{
+			FieldCode: "kind", ProviderPathCode: "CMDB_V1_KIND",
+			Ownership: assetcatalog.FieldOwnershipSource, Confidence: 100,
+		},
+		{
+			FieldCode: "provider_kind", ProviderPathCode: "CMDB_V1_PROVIDER_KIND",
+			Ownership: assetcatalog.FieldOwnershipSource, Confidence: 100,
+		},
+		{
+			FieldCode: "type_details", ProviderPathCode: "CMDB_V1_TYPE_DETAILS",
+			Ownership: assetcatalog.FieldOwnershipSource, Confidence: 100,
+		},
+	}
+}
+
+func externalCMDBTask18BTime(sequence int64) *time.Time {
+	value := time.Date(2026, 7, 18, 1, 0, int(sequence), 0, time.UTC)
+	return &value
+}
+
+func reserveExternalCMDBTask18BCleanup(
+	t *testing.T,
+	database *pgxpool.Pool,
+	runID string,
+) {
+	t.Helper()
+	execAssetSQL(t, database, `
+UPDATE asset_source_runs
+SET cleanup_status='PENDING',cleanup_attempt_id=gen_random_uuid(),
+    cleanup_attempt_epoch=fence_epoch,version=version+1
+WHERE id=$1
+`, runID)
+}
+
+func assertExternalCMDBTask18BNoImplicitMissing(
+	t *testing.T,
+	harness *assetCatalogHarness,
+	fixture assetCatalogFixture,
+	runID string,
+) {
+	t.Helper()
+	var missing, stale, staleAssets, inactiveRelations int64
+	if err := harness.db.QueryRow(t.Context(), `
+SELECT run.missing_count,run.stale_count,
+       (SELECT count(*) FROM assets
+        WHERE source_id=$1::uuid AND lifecycle='STALE'),
+       (SELECT count(*) FROM asset_relationships
+        WHERE source_id=$1::uuid AND status='INACTIVE')
+FROM asset_source_runs AS run WHERE run.id=$2::uuid
+`, fixture.sourceID, runID).Scan(
+		&missing, &stale, &staleAssets, &inactiveRelations,
+	); err != nil {
+		t.Fatalf("read no-missing closure: %v", err)
+	}
+	if missing != 0 || stale != 0 || staleAssets != 0 || inactiveRelations != 0 {
+		t.Fatalf("partial page caused implicit missing: counts=%d/%d assets=%d relations=%d",
+			missing, stale, staleAssets, inactiveRelations)
+	}
+}
+
+func assertExternalCMDBTask18BPageState(
+	t *testing.T,
+	scenario pageCommitScenario,
+	observations, relationships, pageReceipts, relationReceipts, checkpoint int64,
+) {
+	t.Helper()
+	var actualObservations, actualRelationships, actualPageReceipts, actualRelationReceipts int64
+	var sourceCheckpoint, runCheckpoint, pageSequence, relationSequence int64
+	if err := scenario.harness.db.QueryRow(t.Context(), `
+SELECT (SELECT count(*) FROM asset_observations WHERE run_id=$1::uuid),
+       (SELECT count(*) FROM asset_relationships WHERE last_run_id=$1::uuid),
+       (SELECT count(*) FROM audit_records
+        WHERE request_id='source-page:'||$1||':1' AND action='PAGE_APPLIED'),
+       (SELECT count(*) FROM audit_records
+        WHERE request_id='source-relation-page:'||$1||':1'
+          AND action='RELATION_PAGE_COMMITTED'),
+       source.checkpoint_version,run.checkpoint_version,
+       run.page_sequence,run.relation_page_sequence
+FROM asset_sources AS source JOIN asset_source_runs AS run ON run.source_id=source.id
+WHERE source.id=$2::uuid AND run.id=$1::uuid
+`, scenario.runID, scenario.fixture.sourceID).Scan(
+		&actualObservations, &actualRelationships,
+		&actualPageReceipts, &actualRelationReceipts,
+		&sourceCheckpoint, &runCheckpoint, &pageSequence, &relationSequence,
+	); err != nil {
+		t.Fatalf("read Task 18B page state: %v", err)
+	}
+	if actualObservations != observations || actualRelationships != relationships ||
+		actualPageReceipts != pageReceipts || actualRelationReceipts != relationReceipts ||
+		sourceCheckpoint != checkpoint || runCheckpoint != checkpoint ||
+		pageSequence != checkpoint || relationSequence != checkpoint {
+		t.Fatalf("Task 18B page state observations=%d relationships=%d receipts=%d/%d checkpoints=%d/%d sequences=%d/%d",
+			actualObservations, actualRelationships, actualPageReceipts, actualRelationReceipts,
+			sourceCheckpoint, runCheckpoint, pageSequence, relationSequence)
+	}
+}
+
+func cloneExternalCMDBTask18BPage(page discoverysource.Page) discoverysource.Page {
+	page.Items = append([]assetdiscovery.NormalizedItem(nil), page.Items...)
+	for index := range page.Items {
+		page.Items[index].Document = append([]byte(nil), page.Items[index].Document...)
+		page.Items[index].FieldProvenance = append(
+			[]assetdiscovery.FieldProvenance(nil), page.Items[index].FieldProvenance...,
+		)
+	}
+	page.Relations = append([]assetdiscovery.ObservedRelation(nil), page.Relations...)
+	page.NextCheckpoint = page.NextCheckpoint.Clone()
+	return page
 }
