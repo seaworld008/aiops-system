@@ -7,9 +7,10 @@ import {
   waitFor,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type {
-  PropsWithChildren,
-  ReactNode,
+import {
+  type PropsWithChildren,
+  type ReactNode,
+  useState,
 } from "react";
 import { describe, expect, it, vi } from "vitest";
 
@@ -59,6 +60,7 @@ function renderShell(options?: {
   onDiscardDraft?: () => void;
   queryClient?: QueryClient;
   session?: Session;
+  discardClearsDirty?: boolean;
 }) {
   const activeSession = options?.session ?? session;
   const queryClient =
@@ -66,19 +68,25 @@ function renderShell(options?: {
     new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
-  const Providers = ({ children }: PropsWithChildren) => (
-    <QueryClientProvider client={queryClient}>
-      <ScopeProvider
-        session={activeSession}
-        isDirty={options?.dirty ?? false}
-        {...(options?.onDiscardDraft === undefined
-          ? {}
-          : { onDiscardDraft: options.onDiscardDraft })}
-      >
-        {children}
-      </ScopeProvider>
-    </QueryClientProvider>
-  );
+  const Providers = ({ children }: PropsWithChildren) => {
+    const [dirty, setDirty] = useState(options?.dirty ?? false);
+    return (
+      <QueryClientProvider client={queryClient}>
+        <ScopeProvider
+          session={activeSession}
+          isDirty={dirty}
+          onDiscardDraft={() => {
+            options?.onDiscardDraft?.();
+            if (options?.discardClearsDirty !== false) {
+              setDirty(false);
+            }
+          }}
+        >
+          {children}
+        </ScopeProvider>
+      </QueryClientProvider>
+    );
+  };
   return {
     queryClient,
     ...render(
@@ -139,11 +147,49 @@ function RegisteredDirtyDraft({
 }: {
   onDiscard: () => void;
 }) {
+  const [dirty, setDirty] = useState(true);
+  useDraftGuard({
+    isDirty: () => dirty,
+    discard: () => {
+      onDiscard();
+      setDirty(false);
+    },
+  });
+  return <p>功能草稿已注册</p>;
+}
+
+function RegisteredUndiscardableDraft({
+  onDiscard,
+}: {
+  onDiscard: () => void;
+}) {
   useDraftGuard({
     isDirty: () => true,
     discard: onDiscard,
   });
-  return <p>功能草稿已注册</p>;
+  return <p>治理操作正在提交</p>;
+}
+
+function RegisteredThrowingDraft({
+  failure,
+  onDiscard,
+}: {
+  failure: "isDirty" | "discard";
+  onDiscard: () => void;
+}) {
+  useDraftGuard({
+    isDirty: () => {
+      if (failure === "isDirty") {
+        throw new Error("guard inspection failed");
+      }
+      return true;
+    },
+    discard: () => {
+      onDiscard();
+      throw new Error("guard discard failed");
+    },
+  });
+  return <p>草稿保护回调异常</p>;
 }
 
 function renderFormalApplication(
@@ -468,6 +514,75 @@ describe("AppShell", () => {
     expect(onDiscard).toHaveBeenCalledTimes(1);
   });
 
+  it("fails closed when a registered draft remains dirty after discard", async () => {
+    const currentURL =
+      `/assets?workspace=${workspaceOne}&environment=${environmentOne}` +
+      "&assetId=governed-operation-in-flight";
+    window.history.replaceState({}, "", currentURL);
+    const user = userEvent.setup();
+    const onDiscard = vi.fn();
+    renderFormalApplication(
+      <AppShell session={session}>
+        <RegisteredUndiscardableDraft onDiscard={onDiscard} />
+      </AppShell>,
+    );
+
+    await user.click(screen.getByRole("link", { name: /映射工作台/ }));
+    await user.click(screen.getByRole("button", { name: "放弃并前往" }));
+
+    expect(
+      await screen.findByRole("alertdialog", {
+        name: "无法安全离开当前页面",
+      }),
+    ).toHaveTextContent(
+      "当前操作仍在提交或草稿无法安全丢弃。为避免中断治理操作，已阻止离开当前页面。",
+    );
+    expect(window.location.href).toBe(
+      new URL(currentURL, window.location.origin).href,
+    );
+    expect(
+      screen.queryByRole("button", { name: "放弃并前往" }),
+    ).not.toBeInTheDocument();
+    expect(onDiscard).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["isDirty", "discard"] as const)(
+    "fails closed when a draft guard %s callback throws",
+    async (failure) => {
+      const currentURL =
+        `/assets?workspace=${workspaceOne}&environment=${environmentOne}`;
+      window.history.replaceState({}, "", currentURL);
+      const user = userEvent.setup();
+      const onDiscard = vi.fn();
+      renderFormalApplication(
+        <AppShell session={session}>
+          <RegisteredThrowingDraft
+            failure={failure}
+            onDiscard={onDiscard}
+          />
+        </AppShell>,
+      );
+
+      await user.click(screen.getByRole("link", { name: /映射工作台/ }));
+      await user.click(screen.getByRole("button", { name: "放弃并前往" }));
+
+      expect(
+        await screen.findByRole("alertdialog", {
+          name: "无法安全离开当前页面",
+        }),
+      ).toBeVisible();
+      expect(window.location.href).toBe(
+        new URL(currentURL, window.location.origin).href,
+      );
+      expect(
+        screen.queryByRole("button", { name: "放弃并前往" }),
+      ).not.toBeInTheDocument();
+      expect(onDiscard).toHaveBeenCalledTimes(
+        failure === "discard" ? 1 : 0,
+      );
+    },
+  );
+
   it("uses the actual current URL when returning from a same-Scope detail route", async () => {
     const listURL =
       `/assets?workspace=${workspaceOne}&environment=${environmentOne}`;
@@ -613,6 +728,87 @@ describe("AppShell", () => {
     expect(search.get("cursor")).toBeNull();
     expect(search.get("assetId")).toBeNull();
     expect(search.get("operationId")).toBeNull();
+  });
+
+  it("keeps scoped queries when a dirty guard cannot be discarded", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      `/assets?workspace=${workspaceOne}&environment=${environmentOne}`,
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const queryKey = ["assets", workspaceOne, environmentOne, {}] as const;
+    queryClient.setQueryData(queryKey, { items: ["protected"] });
+    const cancelQueries = vi.spyOn(queryClient, "cancelQueries");
+    const removeQueries = vi.spyOn(queryClient, "removeQueries");
+    const onDiscard = vi.fn();
+    const user = userEvent.setup();
+    renderFormalApplication(
+      <AppShell session={session}>
+        <RegisteredUndiscardableDraft onDiscard={onDiscard} />
+      </AppShell>,
+      { queryClient },
+    );
+
+    await user.selectOptions(screen.getByLabelText("环境"), environmentTwo);
+    await user.click(screen.getByRole("button", { name: "放弃并切换" }));
+
+    expect(
+      await screen.findByRole("alertdialog", {
+        name: "无法安全离开当前页面",
+      }),
+    ).toBeVisible();
+    expect(screen.getByLabelText("环境")).toHaveValue(environmentOne);
+    expect(new URL(window.location.href).searchParams.get("environment")).toBe(
+      environmentOne,
+    );
+    expect(cancelQueries).not.toHaveBeenCalled();
+    expect(removeQueries).not.toHaveBeenCalled();
+    expect(queryClient.getQueryData(queryKey)).toEqual({
+      items: ["protected"],
+    });
+    expect(onDiscard).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps scoped queries when provider dirty state cannot be cleared", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      `/assets?workspace=${workspaceOne}&environment=${environmentOne}`,
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const queryKey = ["assets", workspaceOne, environmentOne, {}] as const;
+    queryClient.setQueryData(queryKey, { items: ["provider-protected"] });
+    const cancelQueries = vi.spyOn(queryClient, "cancelQueries");
+    const removeQueries = vi.spyOn(queryClient, "removeQueries");
+    const onDiscardDraft = vi.fn();
+    const user = userEvent.setup();
+    renderShell({
+      dirty: true,
+      onDiscardDraft,
+      queryClient,
+      discardClearsDirty: false,
+    });
+
+    await user.selectOptions(screen.getByLabelText("环境"), environmentTwo);
+    await user.click(screen.getByRole("button", { name: "放弃并切换" }));
+
+    expect(
+      await screen.findByRole("alertdialog", {
+        name: "无法安全离开当前页面",
+      }),
+    ).toBeVisible();
+    expect(screen.getByLabelText("环境")).toHaveValue(environmentOne);
+    expect(cancelQueries).not.toHaveBeenCalled();
+    expect(removeQueries).not.toHaveBeenCalled();
+    expect(queryClient.getQueryData(queryKey)).toEqual({
+      items: ["provider-protected"],
+    });
+    expect(onDiscardDraft).toHaveBeenCalledTimes(1);
   });
 
   it("pushes UI Scope changes and restores an authorized deep link on browser back", async () => {
