@@ -1,0 +1,389 @@
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+info:
+  title: External CMDB Catalog v1
+  version: 1.0.0
+  description: Fixed, read-only protocol consumed by the CMDB_CATALOG_V1 adapter.
+servers: []
+x-aiops-provider-kind: CMDB_CATALOG_V1
+x-aiops-strict-http:
+  tls_min_version: "1.3"
+  environment_proxy: false
+  follow_redirects: false
+  connect_timeout_seconds: 5
+  request_timeout_seconds: 15
+  max_response_header_bytes: 65536
+  reject_duplicate_json_keys: true
+  reject_unknown_json_fields: true
+  reject_trailing_json_values: true
+  reject_executable_text: true
+  exact_content_type: application/json
+security:
+  - bearerAuth: []
+  - mutualTLS: []
+paths:
+  /v1/capabilities:
+    get:
+      operationId: getCatalogCapabilities
+      summary: Read the fixed protocol identity and read-only capability set.
+      responses:
+        "200":
+          description: Exact CMDB Catalog v1 capability document.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CatalogCapabilities"
+        "429":
+          $ref: "#/components/responses/Retryable"
+        "503":
+          $ref: "#/components/responses/Retryable"
+  /v1/assets:
+    get:
+      operationId: getCatalogAssets
+      summary: Read one bounded asset page.
+      parameters:
+        - $ref: "#/components/parameters/AssetLimit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Exact bounded asset page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssetPage"
+        "429":
+          $ref: "#/components/responses/Retryable"
+        "503":
+          $ref: "#/components/responses/Retryable"
+  /v1/relations:
+    get:
+      operationId: getCatalogRelations
+      summary: Read one bounded relation page.
+      parameters:
+        - $ref: "#/components/parameters/RelationLimit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Exact bounded relation page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RelationPage"
+        "429":
+          $ref: "#/components/responses/Retryable"
+        "503":
+          $ref: "#/components/responses/Retryable"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+    mutualTLS:
+      type: mutualTLS
+      description: Optional client-certificate binding selected by trusted runtime configuration.
+  parameters:
+    AssetLimit:
+      name: limit
+      in: query
+      required: true
+      schema:
+        type: integer
+        format: int32
+        const: 500
+    RelationLimit:
+      name: limit
+      in: query
+      required: true
+      schema:
+        type: integer
+        format: int32
+        const: 2000
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 2048
+        pattern: "^[A-Za-z0-9._~+/=-]+$"
+  responses:
+    Retryable:
+      description: Retryable read-only backpressure response; its body is never consumed.
+      headers:
+        Retry-After:
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 64
+  schemas:
+    CatalogCapabilities:
+      type: object
+      additionalProperties: false
+      required:
+        - protocol_version
+        - authority_id
+        - snapshot_epoch
+        - max_page_size
+        - supports_delta
+        - supports_tombstone
+        - server_time
+        - permissions
+      properties:
+        protocol_version:
+          type: string
+          const: cmdb-catalog/v1
+        authority_id:
+          $ref: "#/components/schemas/SafeIdentifier"
+        snapshot_epoch:
+          $ref: "#/components/schemas/SafeIdentifier"
+        max_page_size:
+          type: integer
+          format: int32
+          const: 500
+        supports_delta:
+          type: boolean
+          const: true
+        supports_tombstone:
+          type: boolean
+          const: true
+        server_time:
+          $ref: "#/components/schemas/UTCMicrosecond"
+        permissions:
+          type: array
+          minItems: 2
+          maxItems: 2
+          prefixItems:
+            - const: assets.read
+            - const: relations.read
+          items: false
+    CatalogAsset:
+      type: object
+      additionalProperties: false
+      required:
+        - external_id
+        - type_code
+        - display_name
+        - object_revision
+        - updated_at
+        - deleted
+        - tombstone_reason
+        - attributes
+      properties:
+        external_id:
+          $ref: "#/components/schemas/ExternalID"
+        type_code:
+          oneOf:
+            - $ref: "#/components/schemas/AssetTypeCode"
+            - const: ""
+        display_name:
+          type: string
+          maxLength: 256
+          x-aiops-safe-text: true
+        object_revision:
+          $ref: "#/components/schemas/PositiveRevision"
+        updated_at:
+          $ref: "#/components/schemas/UTCMicrosecond"
+        deleted:
+          type: boolean
+        tombstone_reason:
+          type: string
+          maxLength: 128
+          pattern: "^$|^[A-Z][A-Z0-9_]{0,127}$"
+        attributes:
+          $ref: "#/components/schemas/AssetAttributes"
+      allOf:
+        - if:
+            properties:
+              deleted:
+                const: false
+          then:
+            properties:
+              type_code:
+                $ref: "#/components/schemas/AssetTypeCode"
+              display_name:
+                type: string
+                minLength: 1
+                maxLength: 256
+                x-aiops-safe-text: true
+              tombstone_reason:
+                const: ""
+        - if:
+            properties:
+              deleted:
+                const: true
+          then:
+            properties:
+              tombstone_reason:
+                type: string
+                minLength: 1
+                maxLength: 128
+                pattern: "^[A-Z][A-Z0-9_]{0,127}$"
+    CatalogRelation:
+      type: object
+      additionalProperties: false
+      required:
+        - external_id
+        - from_external_id
+        - to_external_id
+        - type_code
+        - object_revision
+        - updated_at
+        - deleted
+      properties:
+        external_id:
+          $ref: "#/components/schemas/ExternalID"
+        from_external_id:
+          $ref: "#/components/schemas/ExternalID"
+        to_external_id:
+          $ref: "#/components/schemas/ExternalID"
+        type_code:
+          $ref: "#/components/schemas/RelationTypeCode"
+        object_revision:
+          $ref: "#/components/schemas/PositiveRevision"
+        updated_at:
+          $ref: "#/components/schemas/UTCMicrosecond"
+        deleted:
+          type: boolean
+    AssetPage:
+      type: object
+      additionalProperties: false
+      required:
+        - items
+        - next_cursor
+        - snapshot_epoch
+        - final_page
+        - complete_snapshot
+      properties:
+        items:
+          type: array
+          maxItems: 500
+          items:
+            $ref: "#/components/schemas/CatalogAsset"
+        next_cursor:
+          $ref: "#/components/schemas/NullableCursor"
+        snapshot_epoch:
+          $ref: "#/components/schemas/SafeIdentifier"
+        final_page:
+          type: boolean
+        complete_snapshot:
+          type: boolean
+    RelationPage:
+      type: object
+      additionalProperties: false
+      required:
+        - items
+        - next_cursor
+        - snapshot_epoch
+        - final_page
+        - complete_snapshot
+      properties:
+        items:
+          type: array
+          maxItems: 2000
+          items:
+            $ref: "#/components/schemas/CatalogRelation"
+        next_cursor:
+          $ref: "#/components/schemas/NullableCursor"
+        snapshot_epoch:
+          $ref: "#/components/schemas/SafeIdentifier"
+        final_page:
+          type: boolean
+        complete_snapshot:
+          type: boolean
+    AssetAttributes:
+      type: object
+      additionalProperties: false
+      maxProperties: 14
+      properties:
+        architecture:
+          $ref: "#/components/schemas/SafeAttributeValue"
+        cluster_name:
+          $ref: "#/components/schemas/SafeAttributeValue"
+        cpu_count:
+          $ref: "#/components/schemas/SafeAttributeValue"
+        database_engine:
+          $ref: "#/components/schemas/SafeAttributeValue"
+        hostname:
+          $ref: "#/components/schemas/SafeAttributeValue"
+        memory_mb:
+          $ref: "#/components/schemas/SafeAttributeValue"
+        name:
+          $ref: "#/components/schemas/SafeAttributeValue"
+        os_name:
+          $ref: "#/components/schemas/SafeAttributeValue"
+        os_version:
+          $ref: "#/components/schemas/SafeAttributeValue"
+        region:
+          $ref: "#/components/schemas/SafeAttributeValue"
+        resource_class:
+          $ref: "#/components/schemas/SafeAttributeValue"
+        runtime:
+          $ref: "#/components/schemas/SafeAttributeValue"
+        version:
+          $ref: "#/components/schemas/SafeAttributeValue"
+        zone:
+          $ref: "#/components/schemas/SafeAttributeValue"
+    AssetTypeCode:
+      type: string
+      enum:
+        - SERVICE
+        - LINUX_VM
+        - WINDOWS_VM
+        - BARE_METAL_HOST
+        - KUBERNETES_CLUSTER
+        - KUBERNETES_NAMESPACE
+        - KUBERNETES_WORKLOAD
+        - DATABASE_INSTANCE
+        - DATABASE
+        - METRICS_SOURCE
+        - LOG_SOURCE
+        - TRACE_SOURCE
+        - AWX_INVENTORY
+        - ARGO_APPLICATION
+        - CI_PIPELINE
+        - GIT_REPOSITORY
+        - CLOUD_RESOURCE
+    RelationTypeCode:
+      type: string
+      enum:
+        - RUNS_ON
+        - CONTAINS
+        - DEPENDS_ON
+        - MONITORED_BY
+        - LOGS_TO
+        - TRACES_TO
+        - DELIVERED_BY
+        - MANAGED_BY
+        - PRIMARY_RUNTIME_FOR
+    PositiveRevision:
+      type: integer
+      format: int64
+      minimum: 1
+      maximum: 9223372036854775807
+    UTCMicrosecond:
+      type: string
+      format: date-time
+      pattern: "^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,6})?Z$"
+    SafeIdentifier:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: "^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$"
+    ExternalID:
+      type: string
+      minLength: 1
+      maxLength: 512
+      x-aiops-safe-text: true
+    SafeAttributeValue:
+      type: string
+      maxLength: 1024
+      x-aiops-safe-text: true
+      x-aiops-reject-formula-prefix: true
+      x-aiops-reject-html: true
+    NullableCursor:
+      type: string
+      maxLength: 2048
+      pattern: "^$|^[A-Za-z0-9._~+/=-]+$"
