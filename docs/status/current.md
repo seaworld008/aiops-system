@@ -2,7 +2,7 @@
 
 > 更新时间：2026-07-18
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前已合并实现基线与仓库主线：[PR #113](https://github.com/seaworld008/aiops-system/pull/113) squash merge `main@bdb1d56d63cbb38715f47012efd4c7beb993e67a` / `origin/main@bdb1d56d63cbb38715f47012efd4c7beb993e67a`。该基线依次包含 PR #111 的 Worker cleanup-terminal 顺序纠偏、PR #112 的 External CMDB Task 18B durable reconciliation 与 PR #113 的 PageCommitter relationship freshness C0 corrective；它们均只形成关闭态 `Produces`，不构成 Provider、生产 Worker、Source admission 或运行资格，所有相关运行能力继续 `UNAVAILABLE/CLOSED`
+> 当前已合并业务实现基线：[PR #113](https://github.com/seaworld008/aiops-system/pull/113) squash merge `main@bdb1d56d63cbb38715f47012efd4c7beb993e67a`。该基线依次包含 PR #111 的 Worker cleanup-terminal 顺序纠偏、PR #112 的 External CMDB Task 18B durable reconciliation 与 PR #113 的 PageCommitter relationship freshness C0 corrective；它们均只形成关闭态 `Produces`，不构成 Provider、生产 Worker、Source admission 或运行资格，所有相关运行能力继续 `UNAVAILABLE/CLOSED`。本状态页必须从最新 `origin/main` 读取；后继 manager-only 文档同步提交只更新事实源，不会改变业务实现基线
 
 ## 当前结论
 
@@ -202,7 +202,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 
 ## 下一步
 
-基于当前已合并实现基线与仓库主线 [PR #113](https://github.com/seaworld008/aiops-system/pull/113) squash merge `main@bdb1d56d63cbb38715f47012efd4c7beb993e67a` / `origin/main@bdb1d56d63cbb38715f47012efd4c7beb993e67a`，后续工作按以下关闭边界推进：
+基于当前已合并业务实现基线 [PR #113](https://github.com/seaworld008/aiops-system/pull/113) squash merge `main@bdb1d56d63cbb38715f47012efd4c7beb993e67a`，后续工作按以下关闭边界推进：
 
 - Pack 06 Task 18B 已合并并只产出 External-CMDB-specific durable reconciliation/lifecycle integration 与唯一 neutral descriptor；不得把测试 fixture 的 `AVAILABLE` 前置解释为生产 admission。Pack 09 Task 28B 可从最新 main 消费 Task 18B stable `Produces` 实现 recoverable fixed-mTLS session client/composition，但当前没有已合并 transport/authority 事实。Task 28C 仍须等待 28B 合并后，才可消费已合并 28A/28B 与 Provider descriptor 组装 registry/production binary。
 - Task 19A/19A2a/19A2b/19A2c、Task 29A、Task 19B、Task 29B 继续严格按已合并 DAG 门禁推进；Task 19B 是 PR #112 P2 所指真实 `PUBLISHED + UNAVAILABLE` 拒绝、qualification/canary 与唯一 `AdmitGate` owner。不得并行读取未合并内部实现或提前生成 HA/canary/gate/matrix 证据。
