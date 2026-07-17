@@ -1,0 +1,22 @@
+{
+  "items": [
+    {
+      "external_id": "vm-0002",
+      "type_code": "LINUX_VM",
+      "display_name": "payments-api-02",
+      "object_revision": 13,
+      "updated_at": "2026-07-17T09:30:03Z",
+      "deleted": false,
+      "tombstone_reason": "",
+      "attributes": {
+        "cpu_count": "4",
+        "hostname": "payments-api-02",
+        "os_version": "24.04"
+      }
+    }
+  ],
+  "next_cursor": "",
+  "snapshot_epoch": "snapshot-2026-07-17-0001",
+  "final_page": true,
+  "complete_snapshot": true
+}

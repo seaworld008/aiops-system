@@ -1,0 +1,17 @@
+{
+  "items": [
+    {
+      "external_id": "relation-0001",
+      "from_external_id": "vm-0001",
+      "to_external_id": "service-0001",
+      "type_code": "DEPENDS_ON",
+      "object_revision": 21,
+      "updated_at": "2026-07-17T09:30:04Z",
+      "deleted": false
+    }
+  ],
+  "next_cursor": "",
+  "snapshot_epoch": "snapshot-2026-07-17-0001",
+  "final_page": true,
+  "complete_snapshot": true
+}
