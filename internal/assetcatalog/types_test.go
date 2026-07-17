@@ -242,6 +242,63 @@ func TestManualProfileV1IsExactImmutableBootstrapContract(t *testing.T) {
 	}
 }
 
+func TestSourceProfileIDUsesExactOpaqueLowercaseGrammar(t *testing.T) {
+	t.Parallel()
+
+	for _, value := range []SourceProfileID{
+		"manual-v1",
+		"csv-rfc4180-v1",
+		SourceProfileID("a" + strings.Repeat("1", 63)),
+	} {
+		if !value.Valid() {
+			t.Errorf("SourceProfileID(%q).Valid() = false", value)
+		}
+	}
+	for _, value := range []SourceProfileID{
+		"", "Manual-v1", "manual_v1", "manual.v1", "manual/v1",
+		"-manual-v1", "manual-v1-", "manual--v1", "1manual-v1",
+		SourceProfileID("a" + strings.Repeat("1", 64)),
+	} {
+		if value.Valid() {
+			t.Errorf("SourceProfileID(%q).Valid() = true", value)
+		}
+	}
+	if SourceProfileIDManualV1 != SourceProfileID("manual-v1") {
+		t.Fatalf("SourceProfileIDManualV1 = %q", SourceProfileIDManualV1)
+	}
+}
+
+func TestBuiltinSourceProfileRegistryResolvesManualSelectorWithoutSemanticDrift(t *testing.T) {
+	t.Parallel()
+
+	registry := NewBuiltinSourceProfileRegistry()
+	first, err := registry.Resolve(SourceProfileIDManualV1)
+	if err != nil {
+		t.Fatalf("Resolve(manual-v1) error = %v", err)
+	}
+	if first.SourceKind != SourceKindManual || first.ProviderKind != "MANUAL_V1" ||
+		first.ProfileCode != ProfileCode("MANUAL_V1") ||
+		first.EnvironmentMapping != EnvironmentMappingSingle {
+		t.Fatalf("Resolve(manual-v1) = %#v", first)
+	}
+	first.CanonicalProfileManifest[0] ^= 0xff
+	first.CanonicalProviderSchema[0] ^= 0xff
+	first.TrustedPathCodes[0] = "DRIFTED"
+
+	second, err := registry.Resolve(SourceProfileIDManualV1)
+	if err != nil || string(second.CanonicalProfileManifest) != manualProfileManifestV1 ||
+		string(second.CanonicalProviderSchema) != manualProviderSchemaV1 ||
+		second.TrustedPathCodes[0] != "MANUAL_V1_DISPLAY_NAME" {
+		t.Fatalf("registry leaked mutable profile semantics: (%#v, %v)", second, err)
+	}
+	if _, err := registry.Resolve(SourceProfileID("future-v1")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Resolve(unknown valid selector) error = %v, want ErrNotFound", err)
+	}
+	if _, err := registry.Resolve(SourceProfileID("MANUAL_V1")); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("Resolve(invalid selector) error = %v, want ErrInvalidRequest", err)
+	}
+}
+
 func TestProfileManifestDigestRequiresTheExactClosedCanonicalSchema(t *testing.T) {
 	t.Parallel()
 

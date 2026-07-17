@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,687 @@ import (
 	assetpostgres "github.com/seaworld008/aiops-system/internal/assetcatalog/postgres"
 	"github.com/seaworld008/aiops-system/internal/authn"
 )
+
+func TestSourceRevisionIntegrationCreateSourceAtomicallyCreatesRevisionOneAndReplays(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	fixture := seedSourceCreationScope(t, harness.db)
+	repository, err := assetpostgres.New(
+		harness.application,
+		func() time.Time { return time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC) },
+		deterministicAssetIDGenerator(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := manualSourceCreateCommand(t, fixture, "create-source", "1")
+
+	created, err := repository.CreateSource(context.Background(), command)
+	if err != nil {
+		t.Fatalf("CreateSource() error = %v", err)
+	}
+	if created.Source.ID == "" || created.Source.Version != 2 ||
+		created.Source.Status != assetcatalog.SourceStatusActive ||
+		created.Source.GateStatus != assetcatalog.SourceGateUnavailable ||
+		created.Source.GateRevision != 0 || created.Source.PublishedRevision != 0 ||
+		created.Source.CheckpointVersion != 0 ||
+		created.Revision.SourceID != created.Source.ID ||
+		created.Revision.Revision != 1 ||
+		created.Revision.Status != assetcatalog.SourceRevisionDraft ||
+		created.Revision.ExpectedSourceVersion != 1 ||
+		created.Revision.ProfileCode != assetcatalog.ProfileCode("MANUAL_V1") ||
+		created.Revision.CredentialReferenceID != "" ||
+		created.Revision.TrustReferenceID != "" ||
+		created.Revision.NetworkPolicyReferenceID != "" ||
+		created.Revision.ScheduleExpression != "" ||
+		created.Revision.CanonicalRevisionDigest != created.Revision.BindingDigest() ||
+		created.Receipt.AuditID == "" || created.Receipt.IdempotentReplay {
+		t.Fatalf("CreateSource() = %#v", created)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 1, 1, 1, 1, 1)
+	assertSourceMutationSideEffectsDLP(t, harness.db, fixture.workspaceID, "manual-v1")
+
+	replay, err := repository.CreateSource(context.Background(), command)
+	if err != nil || !replay.Receipt.IdempotentReplay ||
+		replay.Source.ID != created.Source.ID ||
+		replay.Revision.ID != created.Revision.ID ||
+		replay.Receipt.AuditID != created.Receipt.AuditID {
+		t.Fatalf("CreateSource(replay) = (%#v, %v), first = %#v", replay, err, created)
+	}
+	changed := command
+	changed.Name = "changed source"
+	if _, err := repository.CreateSource(context.Background(), changed); !errors.Is(err, assetcatalog.ErrIdempotency) {
+		t.Fatalf("CreateSource(hash drift) error = %v", err)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 1, 1, 1, 1, 1)
+}
+
+func TestSourceRevisionIntegrationCreateSourceReplayReturnsOriginalAfterLegalPublication(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	fixture := seedSourceCreationScope(t, harness.db)
+	repository, err := assetpostgres.New(
+		harness.application,
+		func() time.Time { return time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC) },
+		deterministicAssetIDGenerator(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := manualSourceCreateCommand(t, fixture, "create-source-replay-after-publish", "1")
+	created, err := repository.CreateSource(context.Background(), command)
+	if err != nil {
+		t.Fatalf("CreateSource() error = %v", err)
+	}
+	scope := assetcatalog.SourceScope{
+		TenantID: fixture.tenantID, WorkspaceID: fixture.workspaceID,
+	}
+	validated, err := repository.RequestValidation(
+		context.Background(),
+		assetcatalog.ValidateSourceRevisionCommand{
+			Context:                 sourceRevisionMutationContext(t, scope, "validate-created-source", "2"),
+			SourceID:                created.Source.ID,
+			Revision:                created.Revision.Revision,
+			ExpectedSourceVersion:   created.Source.Version,
+			ExpectedRevisionVersion: created.Revision.Version,
+			ExpectedRevisionDigest:  created.Revision.CanonicalRevisionDigest,
+		},
+	)
+	if err != nil {
+		t.Fatalf("RequestValidation() error = %v", err)
+	}
+	published, err := repository.Publish(
+		context.Background(),
+		assetcatalog.PublishSourceRevisionCommand{
+			Context:                  sourceRevisionMutationContext(t, scope, "publish-created-source", "3"),
+			SourceID:                 created.Source.ID,
+			Revision:                 created.Revision.Revision,
+			ReasonCode:               "VALIDATION_REVIEWED",
+			ExpectedSourceVersion:    validated.Source.Version,
+			ExpectedRevisionVersion:  validated.Revision.Version,
+			ExpectedRevisionDigest:   validated.Revision.CanonicalRevisionDigest,
+			ExpectedValidationRunID:  validated.Run.ID,
+			ExpectedValidationDigest: validated.Run.ValidationProofDigest,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	if published.Source.PublishedRevision != 1 ||
+		published.Source.GateStatus != assetcatalog.SourceGateAvailable ||
+		published.Revision.Status != assetcatalog.SourceRevisionPublished {
+		t.Fatalf("Publish() = %#v", published)
+	}
+
+	replay, err := repository.CreateSource(context.Background(), command)
+	if err != nil {
+		t.Fatalf("CreateSource(replay after publish) error = %v", err)
+	}
+	want := created.Clone()
+	want.Receipt.IdempotentReplay = true
+	if !reflect.DeepEqual(replay, want) {
+		t.Fatalf("CreateSource(replay after publish) = %#v, want original %#v", replay, want)
+	}
+
+	changed := command
+	changed.Name = "changed after publication"
+	if _, err := repository.CreateSource(context.Background(), changed); !errors.Is(
+		err, assetcatalog.ErrIdempotency,
+	) {
+		t.Fatalf("CreateSource(hash drift after publish) error = %v", err)
+	}
+	crossScope := command
+	crossScope.Context = sourceRevisionMutationContext(
+		t,
+		assetcatalog.SourceScope{
+			TenantID: fixture.tenantID, WorkspaceID: fixture.otherWorkspaceID,
+		},
+		command.Context.IdempotencyKey(),
+		"1",
+	)
+	if _, err := repository.CreateSource(context.Background(), crossScope); !errors.Is(
+		err, assetcatalog.ErrScopeViolation,
+	) {
+		t.Fatalf("CreateSource(cross-scope replay) error = %v", err)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 1, 1, 1, 1, 1)
+}
+
+func TestSourceRevisionIntegrationCreateSourceReplayRejectsReceiptAuditAndOutboxDrift(t *testing.T) {
+	testCases := []struct {
+		name       string
+		mutate     func(*testing.T, *pgxpool.Pool, assetcatalog.SourceRevisionMutation)
+		wantAudits int
+		wantOutbox int
+	}{
+		{
+			name: "missing receipt",
+			mutate: func(t *testing.T, database *pgxpool.Pool, created assetcatalog.SourceRevisionMutation) {
+				t.Helper()
+				execAssetSQL(t, database, `ALTER TABLE public.audit_records DISABLE TRIGGER audit_records_no_update`)
+				execAssetSQL(t, database, `DELETE FROM audit_records WHERE id=$1::uuid`, created.Receipt.AuditID)
+				execAssetSQL(t, database, `ALTER TABLE public.audit_records ENABLE TRIGGER audit_records_no_update`)
+			},
+			wantAudits: 0,
+			wantOutbox: 1,
+		},
+		{
+			name: "audit identity drift",
+			mutate: func(t *testing.T, database *pgxpool.Pool, created assetcatalog.SourceRevisionMutation) {
+				t.Helper()
+				execAssetSQL(t, database, `ALTER TABLE public.audit_records DISABLE TRIGGER audit_records_no_update`)
+				execAssetSQL(t, database, `
+UPDATE audit_records
+SET details=jsonb_set(details,'{command_sha256}',to_jsonb(repeat('f',64)::text),false)
+WHERE id=$1::uuid
+`, created.Receipt.AuditID)
+				execAssetSQL(t, database, `ALTER TABLE public.audit_records ENABLE TRIGGER audit_records_no_update`)
+			},
+			wantAudits: 1,
+			wantOutbox: 1,
+		},
+		{
+			name: "audit run tuple drift",
+			mutate: func(t *testing.T, database *pgxpool.Pool, created assetcatalog.SourceRevisionMutation) {
+				t.Helper()
+				execAssetSQL(t, database, `ALTER TABLE public.audit_records DISABLE TRIGGER audit_records_no_update`)
+				execAssetSQL(t, database, `
+UPDATE audit_records
+SET details=jsonb_set(
+	jsonb_set(details,'{run_id}',to_jsonb('70000000-0000-4000-8000-000000000005'::text),true),
+	'{run_version}','1'::jsonb,true
+)
+WHERE id=$1::uuid
+`, created.Receipt.AuditID)
+				execAssetSQL(t, database, `ALTER TABLE public.audit_records ENABLE TRIGGER audit_records_no_update`)
+			},
+			wantAudits: 1,
+			wantOutbox: 1,
+		},
+		{
+			name: "audit row identity drift",
+			mutate: func(t *testing.T, database *pgxpool.Pool, created assetcatalog.SourceRevisionMutation) {
+				t.Helper()
+				execAssetSQL(t, database, `ALTER TABLE public.audit_records DISABLE TRIGGER audit_records_no_update`)
+				execAssetSQL(t, database, `
+UPDATE audit_records
+SET id='70000000-0000-4000-8000-000000000006'::uuid
+WHERE id=$1::uuid
+`, created.Receipt.AuditID)
+				execAssetSQL(t, database, `ALTER TABLE public.audit_records ENABLE TRIGGER audit_records_no_update`)
+			},
+			wantAudits: 1,
+			wantOutbox: 1,
+		},
+		{
+			name: "outbox payload drift",
+			mutate: func(t *testing.T, database *pgxpool.Pool, created assetcatalog.SourceRevisionMutation) {
+				t.Helper()
+				execAssetSQL(t, database, `
+UPDATE outbox_events
+SET payload=jsonb_set(payload,'{source_version}','99'::jsonb,false)
+WHERE aggregate_type='ASSET_SOURCE' AND aggregate_id=$1::uuid
+  AND event_type='asset.source.revision.created.v1'
+`, created.Source.ID)
+			},
+			wantAudits: 1,
+			wantOutbox: 1,
+		},
+		{
+			name: "outbox row identity drift",
+			mutate: func(t *testing.T, database *pgxpool.Pool, created assetcatalog.SourceRevisionMutation) {
+				t.Helper()
+				execAssetSQL(t, database, `
+UPDATE outbox_events
+SET id='70000000-0000-4000-8000-000000000007'::uuid
+WHERE aggregate_type='ASSET_SOURCE' AND aggregate_id=$1::uuid
+  AND event_type='asset.source.revision.created.v1'
+`, created.Source.ID)
+			},
+			wantAudits: 1,
+			wantOutbox: 1,
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			harness := newAssetCatalogHarness(t)
+			harness.applyThroughAssetCatalog(t)
+			fixture := seedSourceCreationScope(t, harness.db)
+			repository, err := assetpostgres.New(
+				harness.application,
+				func() time.Time { return time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC) },
+				deterministicAssetIDGenerator(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			command := manualSourceCreateCommand(t, fixture, "create-source-drift", "4")
+			created, err := repository.CreateSource(context.Background(), command)
+			if err != nil {
+				t.Fatalf("CreateSource() error = %v", err)
+			}
+			testCase.mutate(t, harness.db, created)
+
+			if replay, err := repository.CreateSource(context.Background(), command); err == nil {
+				t.Fatalf("CreateSource(replay with %s) = %#v, want fail closed", testCase.name, replay)
+			}
+			assertSourceCreateClosureCounts(
+				t, harness.db, fixture.workspaceID,
+				1, 1, 1, testCase.wantAudits, testCase.wantOutbox,
+			)
+		})
+	}
+}
+
+func TestSourceRevisionIntegrationConcurrentCreateSourceHasOneAtomicClosure(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	fixture := seedSourceCreationScope(t, harness.db)
+	repository, err := assetpostgres.New(
+		harness.application,
+		func() time.Time { return time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC) },
+		deterministicAssetIDGenerator(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := manualSourceCreateCommand(t, fixture, "concurrent-create-source", "2")
+	type callResult struct {
+		value assetcatalog.SourceRevisionMutation
+		err   error
+	}
+	start := make(chan struct{})
+	results := make(chan callResult, 2)
+	for range 2 {
+		go func() {
+			<-start
+			value, callErr := repository.CreateSource(context.Background(), command)
+			results <- callResult{value: value, err: callErr}
+		}()
+	}
+	close(start)
+	var first assetcatalog.SourceRevisionMutation
+	replays := 0
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("concurrent CreateSource() error = %v", result.err)
+		}
+		if first.Source.ID == "" {
+			first = result.value
+		} else if result.value.Source.ID != first.Source.ID ||
+			result.value.Revision.ID != first.Revision.ID ||
+			result.value.Receipt.AuditID != first.Receipt.AuditID {
+			t.Fatalf("concurrent CreateSource results diverged: first=%#v other=%#v", first, result.value)
+		}
+		if result.value.Receipt.IdempotentReplay {
+			replays++
+		}
+	}
+	if replays != 1 {
+		t.Fatalf("concurrent CreateSource replay count = %d, want 1", replays)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 1, 1, 1, 1, 1)
+}
+
+func TestSourceRevisionIntegrationConcurrentCreateSourceRetriesStaleSerializableSnapshot(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	fixture := seedSourceCreationScope(t, harness.db)
+	repository, err := assetpostgres.New(
+		harness.application,
+		func() time.Time { return time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC) },
+		deterministicAssetIDGenerator(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const barrierKey int64 = 15000180081
+	execAssetSQL(t, harness.db, `
+CREATE SEQUENCE source_create_snapshot_attempts`)
+	execAssetSQL(t, harness.db, `
+GRANT USAGE,SELECT,UPDATE ON SEQUENCE source_create_snapshot_attempts
+TO aiops_control_plane_workload`)
+	execAssetSQL(t, harness.db, `
+CREATE FUNCTION source_create_snapshot_barrier() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER SET search_path=pg_catalog,public,pg_temp AS $$
+DECLARE
+	attempt bigint;
+BEGIN
+	attempt := pg_catalog.nextval('public.source_create_snapshot_attempts'::pg_catalog.regclass);
+	IF attempt=1 THEN
+		PERFORM pg_catalog.pg_advisory_xact_lock(15000180081::bigint);
+	ELSIF attempt=2 THEN
+		RAISE EXCEPTION 'controlled concurrent Source create unique race'
+			USING ERRCODE='23505',
+			      SCHEMA='public',
+			      TABLE='asset_sources',
+			      CONSTRAINT='asset_sources_workspace_id_create_idempotency_key_key';
+	END IF;
+	RETURN NEW;
+END
+$$`)
+	execAssetSQL(t, harness.db, `
+CREATE TRIGGER aaa_source_create_snapshot_barrier
+BEFORE INSERT ON asset_sources FOR EACH ROW
+EXECUTE FUNCTION source_create_snapshot_barrier()`)
+
+	holder, err := harness.db.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire Source create barrier holder: %v", err)
+	}
+	barrierHeld := true
+	t.Cleanup(func() {
+		if barrierHeld {
+			_, _ = holder.Exec(
+				context.Background(),
+				`SELECT pg_catalog.pg_advisory_unlock($1::bigint)`,
+				barrierKey,
+			)
+		}
+		holder.Release()
+	})
+	if _, err := holder.Exec(
+		context.Background(),
+		`SELECT pg_catalog.pg_advisory_lock($1::bigint)`,
+		barrierKey,
+	); err != nil {
+		t.Fatalf("hold Source create barrier: %v", err)
+	}
+
+	command := manualSourceCreateCommand(t, fixture, "controlled-concurrent-create", "8")
+	type callResult struct {
+		value assetcatalog.SourceRevisionMutation
+		err   error
+	}
+	callContext, cancelCalls := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelCalls()
+	firstResult := make(chan callResult, 1)
+	go func() {
+		value, callErr := repository.CreateSource(callContext, command)
+		firstResult <- callResult{value: value, err: callErr}
+	}()
+	firstPID := waitForSourceCreateAdvisoryWait(
+		t, harness.db, "INSERT INTO asset_sources", 0,
+	)
+
+	secondResult := make(chan callResult, 1)
+	go func() {
+		value, callErr := repository.CreateSource(callContext, command)
+		secondResult <- callResult{value: value, err: callErr}
+	}()
+	secondPID := waitForSourceCreateAdvisoryWait(
+		t, harness.db, "asset-management-idempotency.v1:", firstPID,
+	)
+	var exactWait bool
+	if err := harness.db.QueryRow(context.Background(), `
+SELECT EXISTS (
+	SELECT 1
+	FROM pg_catalog.pg_locks AS waiting
+	JOIN pg_catalog.pg_locks AS held
+	  ON held.locktype=waiting.locktype
+	 AND held.database IS NOT DISTINCT FROM waiting.database
+	 AND held.classid IS NOT DISTINCT FROM waiting.classid
+	 AND held.objid IS NOT DISTINCT FROM waiting.objid
+	 AND held.objsubid IS NOT DISTINCT FROM waiting.objsubid
+	WHERE waiting.pid=$1
+	  AND held.pid=$2
+	  AND waiting.locktype='advisory'
+	  AND NOT waiting.granted
+	  AND held.granted
+)
+`, secondPID, firstPID).Scan(&exactWait); err != nil {
+		t.Fatalf("read exact Source idempotency lock wait: %v", err)
+	}
+	if !exactWait {
+		t.Fatalf("second Source create pid %d did not wait on first pid %d exact advisory lock",
+			secondPID, firstPID)
+	}
+
+	var unlocked bool
+	if err := holder.QueryRow(
+		context.Background(),
+		`SELECT pg_catalog.pg_advisory_unlock($1::bigint)`,
+		barrierKey,
+	).Scan(&unlocked); err != nil || !unlocked {
+		t.Fatalf("release Source create barrier: unlocked=%t error=%v", unlocked, err)
+	}
+	barrierHeld = false
+
+	first := <-firstResult
+	if first.err != nil || first.value.Receipt.IdempotentReplay {
+		t.Fatalf("first controlled CreateSource() = (%#v, %v)", first.value, first.err)
+	}
+	second := <-secondResult
+	if second.err != nil ||
+		second.value.Source.ID != first.value.Source.ID ||
+		second.value.Revision.ID != first.value.Revision.ID ||
+		second.value.Receipt.AuditID != first.value.Receipt.AuditID ||
+		!second.value.Receipt.IdempotentReplay {
+		t.Fatalf("second controlled CreateSource() = (%#v, %v), want replay of %#v",
+			second.value, second.err, first.value)
+	}
+
+	changed := command
+	changed.Name = "changed controlled concurrent source"
+	if _, err := repository.CreateSource(context.Background(), changed); !errors.Is(
+		err, assetcatalog.ErrIdempotency,
+	) {
+		t.Fatalf("CreateSource(changed controlled replay) error = %v", err)
+	}
+	crossScope := command
+	crossScope.Context = sourceRevisionMutationContext(
+		t,
+		assetcatalog.SourceScope{
+			TenantID: fixture.tenantID, WorkspaceID: fixture.otherWorkspaceID,
+		},
+		command.Context.IdempotencyKey(),
+		"8",
+	)
+	if _, err := repository.CreateSource(context.Background(), crossScope); !errors.Is(
+		err, assetcatalog.ErrScopeViolation,
+	) {
+		t.Fatalf("CreateSource(cross-scope controlled replay) error = %v", err)
+	}
+	var insertAttempts int64
+	if err := harness.db.QueryRow(
+		context.Background(),
+		`SELECT last_value FROM source_create_snapshot_attempts`,
+	).Scan(&insertAttempts); err != nil || insertAttempts != 2 {
+		t.Fatalf("controlled Source insert attempts = %d, %v; want 2", insertAttempts, err)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 1, 1, 1, 1, 1)
+}
+
+func waitForSourceCreateAdvisoryWait(
+	t *testing.T,
+	database *pgxpool.Pool,
+	queryFragment string,
+	excludedPID int32,
+) int32 {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var pid int32
+	var snapshotEstablished bool
+	for time.Now().Before(deadline) {
+		err := database.QueryRow(context.Background(), `
+SELECT activity.pid,activity.backend_xmin IS NOT NULL
+FROM pg_catalog.pg_stat_activity AS activity
+JOIN pg_catalog.pg_locks AS waiting ON waiting.pid=activity.pid
+WHERE activity.datname=pg_catalog.current_database()
+  AND activity.usename='aiops_control_plane_workload'
+  AND activity.pid<>$1
+  AND waiting.locktype='advisory'
+  AND NOT waiting.granted
+  AND pg_catalog.strpos(activity.query,$2)>0
+ORDER BY activity.query_start
+LIMIT 1
+`, excludedPID, queryFragment).Scan(&pid, &snapshotEstablished)
+		if err == nil {
+			if !snapshotEstablished {
+				t.Fatalf("blocked Source create pid %d has no established serializable snapshot", pid)
+			}
+			return pid
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("observe blocked Source create: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("Source create did not reach advisory wait for query fragment %q", queryFragment)
+	return 0
+}
+
+func TestSourceRevisionIntegrationCreateSourceProfileSelectorErrorsHaveNoSideEffects(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	fixture := seedSourceCreationScope(t, harness.db)
+	repository, err := assetpostgres.New(
+		harness.application,
+		func() time.Time { return time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC) },
+		deterministicAssetIDGenerator(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unknown := manualSourceCreateCommand(t, fixture, "unknown-profile", "3")
+	unknown.SourceProfileID = "future-v1"
+	if _, err := repository.CreateSource(context.Background(), unknown); !errors.Is(err, assetcatalog.ErrNotFound) {
+		t.Fatalf("CreateSource(unknown profile) error = %v", err)
+	}
+	invalid := manualSourceCreateCommand(t, fixture, "invalid-profile", "4")
+	invalid.SourceProfileID = "MANUAL_V1"
+	if _, err := repository.CreateSource(context.Background(), invalid); !errors.Is(err, assetcatalog.ErrInvalidRequest) {
+		t.Fatalf("CreateSource(invalid profile selector) error = %v", err)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 0, 0, 0, 0, 0)
+}
+
+func TestSourceRevisionIntegrationCreateRevisionProfileSelectorErrorsPrecedeSourceLookup(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	fixture := seedSourceCreationScope(t, harness.db)
+	repository, err := assetpostgres.New(
+		harness.application,
+		func() time.Time { return time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC) },
+		deterministicAssetIDGenerator(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := assetcatalog.SourceScope{
+		TenantID: fixture.tenantID, WorkspaceID: fixture.workspaceID,
+	}
+	command := func(key, digest, selector string) assetcatalog.CreateSourceRevisionCommand {
+		return assetcatalog.CreateSourceRevisionCommand{
+			Context:                 sourceRevisionMutationContext(t, scope, key, digest),
+			SourceID:                "60000000-0000-4000-8000-000000000299",
+			SourceProfileID:         assetcatalog.SourceProfileID(selector),
+			AuthorityEnvironmentIDs: []string{fixture.environmentID},
+			ChangeReasonCode:        "SOURCE_CONFIGURATION_CHANGED",
+			ExpectedSourceVersion:   1,
+		}
+	}
+	if _, err := repository.CreateRevision(
+		context.Background(), command("unknown-revision-profile", "5", "future-v1"),
+	); !errors.Is(err, assetcatalog.ErrNotFound) {
+		t.Fatalf("CreateRevision(unknown profile) error = %v", err)
+	}
+	if _, err := repository.CreateRevision(
+		context.Background(), command("invalid-revision-profile", "6", "MANUAL_V1"),
+	); !errors.Is(err, assetcatalog.ErrInvalidRequest) {
+		t.Fatalf("CreateRevision(invalid profile selector) error = %v", err)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 0, 0, 0, 0, 0)
+}
+
+func TestSourceRevisionIntegrationCreateSourceRejectsAuthorityDriftWithoutSideEffects(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	fixture := seedSourceCreationScope(t, harness.db)
+	repository, err := assetpostgres.New(
+		harness.application,
+		func() time.Time { return time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC) },
+		deterministicAssetIDGenerator(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	crossScope := manualSourceCreateCommand(t, fixture, "cross-scope-authority", "4")
+	crossScope.AuthorityEnvironmentIDs = []string{fixture.otherEnvironmentID}
+	if _, err := repository.CreateSource(context.Background(), crossScope); !errors.Is(err, assetcatalog.ErrScopeViolation) {
+		t.Fatalf("CreateSource(cross-scope authority) error = %v", err)
+	}
+	multiple := manualSourceCreateCommand(t, fixture, "multiple-authorities", "5")
+	multiple.AuthorityEnvironmentIDs = []string{fixture.environmentID, fixture.secondEnvironmentID}
+	if _, err := repository.CreateSource(context.Background(), multiple); !errors.Is(err, assetcatalog.ErrScopeViolation) {
+		t.Fatalf("CreateSource(multiple MANUAL authorities) error = %v", err)
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 0, 0, 0, 0, 0)
+}
+
+func TestSourceRevisionIntegrationCreateSourceRollsBackWhenAuditInsertFails(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	fixture := seedSourceCreationScope(t, harness.db)
+	const conflictingAuditID = "70000000-0000-4000-8000-000000000003"
+	execAssetSQL(t, harness.db, `
+INSERT INTO audit_records (
+    id,tenant_id,workspace_id,actor_type,actor_id,action,
+    resource_type,resource_id,request_id,trace_id,payload_hash
+) VALUES (
+    $1::uuid,$2::uuid,$3::uuid,'SYSTEM','source-create-test','TEST_BLOCKER',
+    'ASSET_SOURCE',$3::text,'source-create-audit-blocker','audit-blocker-trace',repeat('a',64)
+)
+`, conflictingAuditID, fixture.tenantID, fixture.workspaceID)
+	repository, err := assetpostgres.New(
+		harness.application,
+		func() time.Time { return time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC) },
+		deterministicAssetIDGenerator(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := repository.CreateSource(
+		context.Background(),
+		manualSourceCreateCommand(t, fixture, "audit-failure", "6"),
+	); err == nil {
+		t.Fatal("CreateSource(audit failure) succeeded")
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 0, 0, 0, 0, 0)
+}
+
+func TestSourceRevisionIntegrationCreateSourceRollsBackWhenOutboxInsertFails(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	fixture := seedSourceCreationScope(t, harness.db)
+	const conflictingOutboxID = "70000000-0000-4000-8000-000000000004"
+	execAssetSQL(t, harness.db, `
+INSERT INTO outbox_events (
+    id,tenant_id,workspace_id,aggregate_type,aggregate_id,
+    aggregate_version,event_type,payload
+) VALUES ($1::uuid,$2::uuid,$3::uuid,'TEST',$3::uuid,1,'test.blocker.v1','{}'::jsonb)
+`, conflictingOutboxID, fixture.tenantID, fixture.workspaceID)
+	repository, err := assetpostgres.New(
+		harness.application,
+		func() time.Time { return time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC) },
+		deterministicAssetIDGenerator(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := repository.CreateSource(
+		context.Background(),
+		manualSourceCreateCommand(t, fixture, "outbox-failure", "6"),
+	); err == nil {
+		t.Fatal("CreateSource(outbox failure) succeeded")
+	}
+	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 0, 0, 0, 0, 0)
+}
 
 func TestSourceRevisionIntegrationManualLifecycleAndReplay(t *testing.T) {
 	harness := newAssetCatalogHarness(t)
@@ -31,7 +713,7 @@ func TestSourceRevisionIntegrationManualLifecycleAndReplay(t *testing.T) {
 
 	create := assetcatalog.CreateSourceRevisionCommand{
 		Context:  sourceRevisionMutationContext(t, scope, "create-source-revision-2", "1"),
-		SourceID: fixture.sourceID, ProfileCode: "MANUAL_V1",
+		SourceID: fixture.sourceID, SourceProfileID: assetcatalog.SourceProfileIDManualV1,
 		AuthorityEnvironmentIDs: []string{fixture.environmentID},
 		ChangeReasonCode:        "SOURCE_CONFIGURATION_CHANGED",
 		ExpectedSourceVersion:   2,
@@ -163,14 +845,14 @@ func TestSourceRevisionIntegrationConcurrentCreateRevisionHasOneCASWinner(t *tes
 	commands := []assetcatalog.CreateSourceRevisionCommand{
 		{
 			Context:  sourceRevisionMutationContext(t, scope, "concurrent-revision-a", "a"),
-			SourceID: fixture.sourceID, ProfileCode: "MANUAL_V1",
+			SourceID: fixture.sourceID, SourceProfileID: assetcatalog.SourceProfileIDManualV1,
 			AuthorityEnvironmentIDs: []string{fixture.environmentID},
 			ChangeReasonCode:        "SOURCE_CONFIGURATION_CHANGED",
 			ExpectedSourceVersion:   2,
 		},
 		{
 			Context:  sourceRevisionMutationContext(t, scope, "concurrent-revision-b", "b"),
-			SourceID: fixture.sourceID, ProfileCode: "MANUAL_V1",
+			SourceID: fixture.sourceID, SourceProfileID: assetcatalog.SourceProfileIDManualV1,
 			AuthorityEnvironmentIDs: []string{fixture.environmentID},
 			ChangeReasonCode:        "SOURCE_CONFIGURATION_CHANGED",
 			ExpectedSourceVersion:   2,
@@ -268,7 +950,7 @@ func TestSourceRevisionIntegrationCreateRevisionOwnsCallerAuthorityMemoryBeforeA
 	callerAuthorities := []string{fixture.environmentID}
 	command := assetcatalog.CreateSourceRevisionCommand{
 		Context:  sourceRevisionMutationContext(t, scope, "owned-authority-memory", "6"),
-		SourceID: fixture.sourceID, ProfileCode: "MANUAL_V1",
+		SourceID: fixture.sourceID, SourceProfileID: assetcatalog.SourceProfileIDManualV1,
 		AuthorityEnvironmentIDs: callerAuthorities,
 		ChangeReasonCode:        "SOURCE_CONFIGURATION_CHANGED",
 		ExpectedSourceVersion:   2,
@@ -1060,6 +1742,103 @@ SELECT
 		outboxCount != 1 || outboxAggregateCount != 1 {
 		t.Fatalf("concurrent RequestSync side effects = run:%d audit:%d/%d outbox:%d/%d",
 			runCount, auditResourceCount, auditCount, outboxAggregateCount, outboxCount)
+	}
+}
+
+type sourceCreationScopeFixture struct {
+	tenantID, workspaceID, environmentID string
+	secondEnvironmentID                  string
+	otherWorkspaceID, otherEnvironmentID string
+}
+
+func seedSourceCreationScope(t *testing.T, database *pgxpool.Pool) sourceCreationScopeFixture {
+	t.Helper()
+	fixture := sourceCreationScopeFixture{
+		tenantID:            "10000000-0000-4000-8000-000000000211",
+		workspaceID:         "20000000-0000-4000-8000-000000000211",
+		environmentID:       "30000000-0000-4000-8000-000000000211",
+		secondEnvironmentID: "30000000-0000-4000-8000-000000000212",
+		otherWorkspaceID:    "20000000-0000-4000-8000-000000000219",
+		otherEnvironmentID:  "30000000-0000-4000-8000-000000000219",
+	}
+	tx, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatalf("begin Source creation fixture: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	execAssetSQL(t, tx,
+		`INSERT INTO tenants (id,name) VALUES ($1,'source-create-tenant')`,
+		fixture.tenantID)
+	execAssetSQL(t, tx,
+		`INSERT INTO workspaces (id,tenant_id,name) VALUES ($1,$2,'source-create-workspace')`,
+		fixture.workspaceID, fixture.tenantID)
+	execAssetSQL(t, tx,
+		`INSERT INTO workspaces (id,tenant_id,name) VALUES ($1,$2,'other-source-workspace')`,
+		fixture.otherWorkspaceID, fixture.tenantID)
+	execAssetSQL(t, tx, `
+INSERT INTO environments (id,tenant_id,workspace_id,name,kind)
+VALUES ($1,$2,$3,'source-create-production','PROD')
+`, fixture.environmentID, fixture.tenantID, fixture.workspaceID)
+	execAssetSQL(t, tx, `
+INSERT INTO environments (id,tenant_id,workspace_id,name,kind)
+VALUES ($1,$2,$3,'source-create-staging','STAGING')
+`, fixture.secondEnvironmentID, fixture.tenantID, fixture.workspaceID)
+	execAssetSQL(t, tx, `
+INSERT INTO environments (id,tenant_id,workspace_id,name,kind)
+VALUES ($1,$2,$3,'other-source-production','PROD')
+`, fixture.otherEnvironmentID, fixture.tenantID, fixture.otherWorkspaceID)
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("commit Source creation fixture: %v", err)
+	}
+	return fixture
+}
+
+func manualSourceCreateCommand(
+	t *testing.T,
+	fixture sourceCreationScopeFixture,
+	key, digestCharacter string,
+) assetcatalog.CreateSourceCommand {
+	t.Helper()
+	scope := assetcatalog.SourceScope{
+		TenantID: fixture.tenantID, WorkspaceID: fixture.workspaceID,
+	}
+	return assetcatalog.CreateSourceCommand{
+		Context:                 sourceRevisionMutationContext(t, scope, key, digestCharacter),
+		Name:                    "fixture manual source",
+		SourceProfileID:         assetcatalog.SourceProfileIDManualV1,
+		AuthorityEnvironmentIDs: []string{fixture.environmentID},
+	}
+}
+
+func assertSourceCreateClosureCounts(
+	t *testing.T,
+	database *pgxpool.Pool,
+	workspaceID string,
+	wantSources, wantRevisions, wantAuthorities, wantAudits, wantOutbox int,
+) {
+	t.Helper()
+	var sources, revisions, authorities, audits, outbox int
+	if err := database.QueryRow(context.Background(), `
+SELECT
+  (SELECT count(*) FROM asset_sources WHERE workspace_id=$1::uuid),
+  (SELECT count(*) FROM asset_source_revisions WHERE workspace_id=$1::uuid),
+  (SELECT count(*) FROM asset_source_revision_authorities WHERE workspace_id=$1::uuid),
+  (SELECT count(*) FROM audit_records
+   WHERE workspace_id=$1::uuid AND resource_type='ASSET_SOURCE'
+     AND action='asset.source.revision.created.v1'),
+  (SELECT count(*) FROM outbox_events
+   WHERE workspace_id=$1::uuid AND aggregate_type='ASSET_SOURCE'
+     AND event_type='asset.source.revision.created.v1')
+`, workspaceID).Scan(&sources, &revisions, &authorities, &audits, &outbox); err != nil {
+		t.Fatalf("read Source creation closure counts: %v", err)
+	}
+	if sources != wantSources || revisions != wantRevisions ||
+		authorities != wantAuthorities || audits != wantAudits || outbox != wantOutbox {
+		t.Fatalf(
+			"Source creation closure = sources:%d revisions:%d authorities:%d audit:%d outbox:%d; want %d/%d/%d/%d/%d",
+			sources, revisions, authorities, audits, outbox,
+			wantSources, wantRevisions, wantAuthorities, wantAudits, wantOutbox,
+		)
 	}
 }
 

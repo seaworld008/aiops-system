@@ -542,8 +542,31 @@ type CredentialReferenceID string
 type TrustReferenceID string
 type NetworkPolicyReferenceID string
 type PolicyReferenceID string
+type SourceProfileID string
 type ProfileCode string
 type ExtensionCode string
+
+const SourceProfileIDManualV1 SourceProfileID = "manual-v1"
+
+func (value SourceProfileID) Valid() bool {
+	if len(value) < 1 || len(value) > 64 {
+		return false
+	}
+	for index, character := range []byte(value) {
+		switch {
+		case character >= 'a' && character <= 'z':
+		case index > 0 && character >= '0' && character <= '9':
+		case index > 0 && character == '-' && index+1 < len(value):
+			next := value[index+1]
+			if (next < 'a' || next > 'z') && (next < '0' || next > '9') {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
 
 type Scope struct {
 	TenantID, WorkspaceID, EnvironmentID string
