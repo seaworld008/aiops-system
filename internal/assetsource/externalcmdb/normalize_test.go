@@ -127,6 +127,22 @@ func TestNormalizeAssetRejectsUnknownTypeAndDLP(t *testing.T) {
 			wantSchemaCode: "DLP_REJECTED",
 		},
 		{
+			name: "authority userinfo with password",
+			mutate: func(asset *catalogAsset) {
+				asset.Attributes = map[string]string{"hostname": "readonly:s3cret@db.internal:5432"}
+			},
+			forbidden:      "readonly:s3cret",
+			wantSchemaCode: "DLP_REJECTED",
+		},
+		{
+			name: "authority userinfo without password",
+			mutate: func(asset *catalogAsset) {
+				asset.Attributes = map[string]string{"hostname": "readonly@db.internal:5432"}
+			},
+			forbidden:      "readonly@db.internal",
+			wantSchemaCode: "DLP_REJECTED",
+		},
+		{
 			name: "formula display name",
 			mutate: func(asset *catalogAsset) {
 				asset.DisplayName = "=HYPERLINK(\"https://example.invalid\")"
@@ -179,10 +195,11 @@ func TestEndpointDLPAllowsOrdinarySafeText(t *testing.T) {
 	t.Parallel()
 
 	asset := validCatalogAsset()
-	asset.ExternalID = "opaque:id.with-dots-01"
+	asset.ExternalID = "opaque:id.with-dots-01@tenant"
 	asset.DisplayName = "payments-api.prod - maintenance 09:30"
 	asset.Attributes = map[string]string{
 		"hostname": "db.internal",
+		"name":     "ops@example.internal",
 		"version":  "2026.07-rc1",
 	}
 	if got, err := normalizeAsset(normalizeTestEnvironmentID, asset); err != nil {

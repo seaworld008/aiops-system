@@ -419,6 +419,9 @@ func containsHostPort(value string) bool {
 		if index := strings.IndexAny(candidate, "/?#"); index >= 0 {
 			candidate = candidate[:index]
 		}
+		if authorityUserinfoHostPort(candidate) {
+			return true
+		}
 		host, port, err := net.SplitHostPort(candidate)
 		if err != nil || !endpointPort(port) || !endpointHost(host) {
 			continue
@@ -426,6 +429,15 @@ func containsHostPort(value string) bool {
 		return true
 	}
 	return false
+}
+
+func authorityUserinfoHostPort(value string) bool {
+	separator := strings.LastIndexByte(value, '@')
+	if separator <= 0 || separator == len(value)-1 {
+		return false
+	}
+	host, port, err := net.SplitHostPort(value[separator+1:])
+	return err == nil && endpointPort(port) && endpointHost(host)
 }
 
 func endpointPort(value string) bool {
