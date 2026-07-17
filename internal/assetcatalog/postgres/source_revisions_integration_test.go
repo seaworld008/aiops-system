@@ -97,6 +97,74 @@ func TestSourceRevisionIntegrationInjectedCSVProfileCreatesClosedExactRevisions(
 	}
 	assertSourceCreateClosureCounts(t, harness.db, fixture.workspaceID, 1, 1, 2, 1, 1)
 
+	var runsBefore, auditsBefore, outboxBefore int
+	if err := harness.db.QueryRow(t.Context(), `
+SELECT
+  (SELECT count(*) FROM asset_source_runs WHERE workspace_id=$1::uuid),
+  (SELECT count(*) FROM audit_records WHERE workspace_id=$1::uuid),
+  (SELECT count(*) FROM outbox_events WHERE workspace_id=$1::uuid)
+`, fixture.workspaceID).Scan(&runsBefore, &auditsBefore, &outboxBefore); err != nil {
+		t.Fatal(err)
+	}
+	rejectedValidation, err := repository.RequestValidation(
+		t.Context(),
+		assetcatalog.ValidateSourceRevisionCommand{
+			Context:  sourceRevisionMutationContext(t, scope, "validate-csv-runtime-closed", "8"),
+			SourceID: created.Source.ID, Revision: created.Revision.Revision,
+			ExpectedSourceVersion:   created.Source.Version,
+			ExpectedRevisionVersion: created.Revision.Version,
+			ExpectedRevisionDigest:  created.Revision.CanonicalRevisionDigest,
+		},
+	)
+	if !errors.Is(err, assetcatalog.ErrUnavailable) ||
+		strings.Contains(err.Error(), string(credentialReferenceID)) {
+		t.Fatalf("RequestValidation(CSV runtime closed) error = %v, want safe ErrUnavailable", err)
+	}
+	if !reflect.DeepEqual(rejectedValidation, assetcatalog.SourceRunMutation{}) {
+		t.Fatalf("RequestValidation(CSV runtime closed) mutation = %#v, want zero receipt", rejectedValidation)
+	}
+	var (
+		sourceStatus, gateStatus, revisionStatus  string
+		sourceVersion, revisionVersion            int64
+		validationRunCleared, validatedRunCleared bool
+		runsAfter, auditsAfter, outboxAfter       int
+	)
+	if err := harness.db.QueryRow(t.Context(), `
+SELECT source.status,source.gate_status,source.version,
+       revision.state,revision.version,
+       revision.validation_run_id IS NULL,source.validated_run_id IS NULL,
+       (SELECT count(*) FROM asset_source_runs WHERE workspace_id=$1::uuid),
+       (SELECT count(*) FROM audit_records WHERE workspace_id=$1::uuid),
+       (SELECT count(*) FROM outbox_events WHERE workspace_id=$1::uuid)
+FROM asset_sources AS source
+JOIN asset_source_revisions AS revision
+  ON revision.tenant_id=source.tenant_id
+ AND revision.workspace_id=source.workspace_id
+ AND revision.source_id=source.id
+WHERE source.workspace_id=$1::uuid AND source.id=$2::uuid AND revision.revision=$3
+`, fixture.workspaceID, created.Source.ID, created.Revision.Revision).Scan(
+		&sourceStatus, &gateStatus, &sourceVersion,
+		&revisionStatus, &revisionVersion,
+		&validationRunCleared, &validatedRunCleared,
+		&runsAfter, &auditsAfter, &outboxAfter,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if sourceStatus != string(assetcatalog.SourceStatusActive) ||
+		gateStatus != string(assetcatalog.SourceGateUnavailable) ||
+		sourceVersion != created.Source.Version ||
+		revisionStatus != string(assetcatalog.SourceRevisionDraft) ||
+		revisionVersion != created.Revision.Version ||
+		!validationRunCleared || !validatedRunCleared ||
+		runsAfter != runsBefore || auditsAfter != auditsBefore || outboxAfter != outboxBefore {
+		t.Fatalf(
+			"CSV validation closure = source:%s/%s/v%d revision:%s/v%d cleared:%t/%t side effects:%d/%d/%d; want ACTIVE/UNAVAILABLE/v%d DRAFT/v%d true/true %d/%d/%d",
+			sourceStatus, gateStatus, sourceVersion, revisionStatus, revisionVersion,
+			validationRunCleared, validatedRunCleared, runsAfter, auditsAfter, outboxAfter,
+			created.Source.Version, created.Revision.Version, runsBefore, auditsBefore, outboxBefore,
+		)
+	}
+
 	replay, err := repository.CreateSource(t.Context(), command)
 	if err != nil || !replay.Receipt.IdempotentReplay ||
 		replay.Source.ID != created.Source.ID ||

@@ -508,6 +508,23 @@ func TestRequestSyncSourceKindRejectsManualCSVAndControlPlaneAPI(t *testing.T) {
 	}
 }
 
+func TestSourceValidationRuntimeClosedOnlyForCSVRFC4180V1(t *testing.T) {
+	for _, test := range []struct {
+		profileCode assetcatalog.ProfileCode
+		wantClosed  bool
+	}{
+		{profileCode: "CSV_RFC4180_V1", wantClosed: true},
+		{profileCode: "MANUAL_V1", wantClosed: false},
+		{profileCode: "EXTERNAL_CMDB_V1", wantClosed: false},
+		{profileCode: "FUTURE_V1", wantClosed: false},
+	} {
+		if got := sourceValidationRuntimeClosed(test.profileCode); got != test.wantClosed {
+			t.Errorf("sourceValidationRuntimeClosed(%q) = %t, want %t",
+				test.profileCode, got, test.wantClosed)
+		}
+	}
+}
+
 func TestExactManualRevisionProfileRejectsSemanticDrift(t *testing.T) {
 	profile, err := assetcatalog.NewBuiltinSourceProfileAdmissionResolver().
 		ResolveProfileAdmission(t.Context(), "MANUAL_V1")

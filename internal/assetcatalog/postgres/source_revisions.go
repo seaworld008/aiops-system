@@ -1557,6 +1557,10 @@ INSERT INTO audit_records (
 	return err
 }
 
+func sourceValidationRuntimeClosed(profileCode assetcatalog.ProfileCode) bool {
+	return profileCode == assetcatalog.ProfileCode("CSV_RFC4180_V1")
+}
+
 func (repository *Repository) requestValidationInTx(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -1643,6 +1647,9 @@ func (repository *Repository) requestValidationInTx(
 	if revision.Status != assetcatalog.SourceRevisionDraft &&
 		revision.Status != assetcatalog.SourceRevisionRejected {
 		return assetcatalog.SourceRunMutation{}, assetcatalog.ErrStateConflict
+	}
+	if sourceValidationRuntimeClosed(revision.ProfileCode) {
+		return assetcatalog.SourceRunMutation{}, assetcatalog.ErrUnavailable
 	}
 	if source.GateStatus != assetcatalog.SourceGateUnavailable {
 		if source.GateStatus != assetcatalog.SourceGateAvailable &&
