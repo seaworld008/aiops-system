@@ -81,6 +81,10 @@ func NewRouter(deps Dependencies) http.Handler {
 	router.Post("/api/v1/integrations/{integrationID}/webhooks/{provider}", webhookHandler(deps.SignalIngestor, deps.WebhookVerifier))
 	router.Get("/api/v1/browser-config", browserConfigHandler(deps.BrowserConfig))
 	router.With(authenticationMiddleware(deps.Authenticator)).Get("/api/v1/session", sessionHandler)
+	router.Post(
+		"/api/v1/workspaces/{workspaceID}/asset-sources/{sourceID}/ingestion-batches",
+		unavailableAssetSourceIngestionHandler(),
+	)
 	router.Route("/api/v1", func(api chi.Router) {
 		api.Group(func(governed chi.Router) {
 			governed.Use(authenticationMiddleware(deps.Authenticator))
@@ -128,9 +132,37 @@ func NewRouter(deps Dependencies) http.Handler {
 				"/workspaces/{workspaceID}/asset-sources",
 				listAssetSourcesHandler(deps.AssetSources, deps.ControlPlaneCursor),
 			)
+			governed.Post(
+				"/workspaces/{workspaceID}/asset-sources",
+				createAssetSourceHandler(deps.AssetSources),
+			)
 			governed.Get(
 				"/workspaces/{workspaceID}/asset-sources/{sourceID}",
 				getAssetSourceHandler(deps.AssetSources),
+			)
+			governed.Post(
+				"/workspaces/{workspaceID}/asset-sources/{sourceID}/revisions",
+				createAssetSourceRevisionHandler(deps.AssetSources),
+			)
+			governed.Post(
+				"/workspaces/{workspaceID}/asset-sources/{sourceID}/revisions/{revision}:validate",
+				validateAssetSourceRevisionHandler(deps.AssetSources),
+			)
+			governed.Post(
+				"/workspaces/{workspaceID}/asset-sources/{sourceID}/revisions/{revision}:publish",
+				publishAssetSourceRevisionHandler(deps.AssetSources),
+			)
+			governed.Post(
+				"/workspaces/{workspaceID}/asset-sources/{sourceID}:disable",
+				disableAssetSourceHandler(deps.AssetSources),
+			)
+			governed.Post(
+				"/workspaces/{workspaceID}/asset-sources/{sourceID}:sync",
+				syncAssetSourceHandler(deps.AssetSources),
+			)
+			governed.Post(
+				"/workspaces/{workspaceID}/asset-sources/{sourceID}/imports",
+				unavailableAssetSourceImportHandler(deps.AssetSources),
 			)
 			governed.Get(
 				"/workspaces/{workspaceID}/asset-source-runs/{runID}",

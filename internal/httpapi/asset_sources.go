@@ -1,13 +1,21 @@
 package httpapi
 
 import (
+	"errors"
+	"mime"
 	"net/http"
+	"slices"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/seaworld008/aiops-system/internal/assetcatalog"
 	"github.com/seaworld008/aiops-system/internal/authn"
+	"github.com/seaworld008/aiops-system/internal/authz"
+	"github.com/seaworld008/aiops-system/internal/requestmeta"
 )
+
+var errSourceBackpressure = errors.New("source backpressure")
 
 type sourceRunCountsDTO struct {
 	Observed   int64 `json:"observed"`
@@ -48,12 +56,21 @@ type assetSourceSummaryDTO struct {
 }
 
 type sourceRevisionSummaryDTO struct {
-	Revision               int64     `json:"revision"`
-	Status                 string    `json:"status"`
-	BindingDigest          string    `json:"binding_digest"`
-	SourceDefinitionDigest string    `json:"source_definition_digest"`
-	CreatedAt              time.Time `json:"created_at"`
-	UpdatedAt              time.Time `json:"updated_at"`
+	Revision                 int64     `json:"revision"`
+	Status                   string    `json:"status"`
+	ProfileCode              string    `json:"profile_code"`
+	IntegrationID            *string   `json:"integration_id"`
+	SyncMode                 string    `json:"sync_mode"`
+	CredentialReferenceID    *string   `json:"credential_reference_id"`
+	TrustReferenceID         *string   `json:"trust_reference_id"`
+	NetworkPolicyReferenceID *string   `json:"network_policy_reference_id"`
+	AuthorityEnvironmentIDs  []string  `json:"authority_environment_ids"`
+	BindingDigest            string    `json:"binding_digest"`
+	SourceDefinitionDigest   string    `json:"source_definition_digest"`
+	Version                  int64     `json:"version"`
+	CreatedAt                time.Time `json:"created_at"`
+	UpdatedAt                time.Time `json:"updated_at"`
+	EffectiveActions         []string  `json:"effective_actions"`
 }
 
 type assetSourceDetailDTO struct {
@@ -106,6 +123,43 @@ type assetSourceRunDTO struct {
 	EffectiveActions          []string           `json:"effective_actions"`
 }
 
+type createAssetSourceRequest struct {
+	Name                    string   `json:"name"`
+	SourceProfileID         string   `json:"source_profile_id"`
+	AuthorityEnvironmentIDs []string `json:"authority_environment_ids"`
+}
+
+type createAssetSourceRevisionRequest struct {
+	SourceProfileID         string   `json:"source_profile_id"`
+	AuthorityEnvironmentIDs []string `json:"authority_environment_ids"`
+	ChangeReasonCode        string   `json:"change_reason_code"`
+}
+
+type sourceReasonRequest struct {
+	ReasonCode string `json:"reason_code"`
+}
+
+type emptySourceRequest struct{}
+
+type sourceRevisionMutationDTO struct {
+	Source          assetSourceSummaryDTO    `json:"source"`
+	Revision        sourceRevisionSummaryDTO `json:"revision"`
+	MutationReceipt mutationReceiptDTO       `json:"mutation_receipt"`
+}
+
+type sourceMutationDTO struct {
+	Source          assetSourceSummaryDTO `json:"source"`
+	MutationReceipt mutationReceiptDTO    `json:"mutation_receipt"`
+}
+
+type sourceRunMutationDTO struct {
+	Source          assetSourceSummaryDTO    `json:"source"`
+	Revision        sourceRevisionSummaryDTO `json:"revision"`
+	Run             assetSourceRunDTO        `json:"run"`
+	OperationID     string                   `json:"operation_id"`
+	MutationReceipt mutationReceiptDTO       `json:"mutation_receipt"`
+}
+
 func listAssetSourcesHandler(
 	manager assetcatalog.SourceManager,
 	codec *ControlPlaneCursorCodec,
@@ -137,7 +191,7 @@ func listAssetSourcesHandler(
 		}
 		response := assetSourcePageDTO{
 			Items: make([]assetSourceSummaryDTO, len(page.Items)),
-			Page:  pageMetaDTO{}, EffectiveActions: []string{},
+			Page:  pageMetaDTO{}, EffectiveActions: effectiveActionStrings(page.EffectiveActions),
 		}
 		for index := range page.Items {
 			response.Items[index] = toAssetSourceSummaryDTO(page.Items[index])
@@ -154,6 +208,62 @@ func listAssetSourcesHandler(
 			response.Page.NextCursor = &encoded
 		}
 		writeJSON(writer, http.StatusOK, response)
+	}
+}
+
+func createAssetSourceHandler(manager assetcatalog.SourceManager) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		if nilHTTPDependency(manager) {
+			writeSourceError(writer, request, errAssetCatalogUnavailable, "asset_source_not_found")
+			return
+		}
+		collection, err := sourceCollectionFromRequest(request)
+		if err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		idempotencyKey, err := parseIdempotencyKey(request)
+		if err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		var body createAssetSourceRequest
+		if err := decodeStrictJSON(writer, request, &body, 64<<10); err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		input, err := body.input()
+		if err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		principal, ok := authn.PrincipalFromContext(request.Context())
+		if !ok {
+			writeSourceError(writer, request, authn.ErrUnauthenticated, "asset_source_not_found")
+			return
+		}
+		metadata := assetcatalog.ServerRequestMetadata{
+			TraceID: requestmeta.From(request.Context()).TraceID, IdempotencyKey: idempotencyKey,
+		}
+		result, err := manager.CreateSource(request.Context(), principal, collection, input, metadata)
+		if err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		response, err := sourceRevisionMutationDTOFrom(result, metadata.TraceID)
+		if err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		writer.Header().Set(
+			"Location",
+			request.URL.Path+"/"+result.Source.ID,
+		)
+		writeSourceRevisionETag(
+			writer, result.Source.ID, result.Revision.Revision,
+			result.Source.Version, result.Revision.Version,
+		)
+		writeJSON(writer, http.StatusCreated, response)
 	}
 }
 
@@ -209,6 +319,215 @@ func getAssetSourceRunHandler(manager assetcatalog.SourceManager) http.HandlerFu
 	}
 }
 
+func createAssetSourceRevisionHandler(manager assetcatalog.SourceManager) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		path, metadata, principal, ok := prepareSourceVersionedMutation(writer, request, manager)
+		if !ok {
+			return
+		}
+		var body createAssetSourceRevisionRequest
+		if err := decodeStrictJSON(writer, request, &body, 64<<10); err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		input, err := body.input()
+		if err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		result, err := manager.CreateSourceRevision(
+			request.Context(), principal, path, input, metadata,
+		)
+		writeSourceRevisionMutationResponse(writer, request, result, err, http.StatusCreated)
+	}
+}
+
+func validateAssetSourceRevisionHandler(manager assetcatalog.SourceManager) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		path, metadata, principal, ok := prepareSourceRevisionMutation(writer, request, manager)
+		if !ok {
+			return
+		}
+		var body emptySourceRequest
+		if err := decodeStrictJSON(writer, request, &body, 64<<10); err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		result, err := manager.ValidateSourceRevision(
+			request.Context(), principal, path, metadata,
+		)
+		if err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		response, err := sourceRunMutationDTOFrom(result, requestmeta.From(request.Context()).TraceID)
+		if err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		writeSourceRevisionETag(
+			writer, result.Source.ID, result.Revision.Revision,
+			result.Source.Version, result.Revision.Version,
+		)
+		status := http.StatusAccepted
+		if result.Revision.ProfileCode == assetcatalog.ProfileCode("MANUAL_V1") &&
+			terminalSourceRun(result.Run.Status) {
+			status = http.StatusOK
+		}
+		writeJSON(writer, status, response)
+	}
+}
+
+func publishAssetSourceRevisionHandler(manager assetcatalog.SourceManager) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		path, metadata, principal, ok := prepareSourceRevisionMutation(writer, request, manager)
+		if !ok {
+			return
+		}
+		var body sourceReasonRequest
+		if err := decodeStrictJSON(writer, request, &body, 64<<10); err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		if !validControlPlaneReasonCode(body.ReasonCode) {
+			writeSourceError(writer, request, errInvalidControlPlaneRequest, "asset_source_not_found")
+			return
+		}
+		result, err := manager.PublishSourceRevision(
+			request.Context(), principal, path,
+			assetcatalog.SourceReasonInput{ReasonCode: body.ReasonCode}, metadata,
+		)
+		writeSourceRevisionMutationResponse(writer, request, result, err, http.StatusOK)
+	}
+}
+
+func disableAssetSourceHandler(manager assetcatalog.SourceManager) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		path, metadata, principal, ok := prepareSourceVersionedMutation(writer, request, manager)
+		if !ok {
+			return
+		}
+		var body sourceReasonRequest
+		if err := decodeStrictJSON(writer, request, &body, 64<<10); err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		if !validControlPlaneReasonCode(body.ReasonCode) {
+			writeSourceError(writer, request, errInvalidControlPlaneRequest, "asset_source_not_found")
+			return
+		}
+		result, err := manager.DisableSource(
+			request.Context(), principal, path,
+			assetcatalog.SourceReasonInput{ReasonCode: body.ReasonCode}, metadata,
+		)
+		if err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		response, err := sourceMutationDTOFrom(result, metadata.TraceID)
+		if err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		writeVersionETag(writer, "asset-source", result.Source.ID, result.Source.Version)
+		writeJSON(writer, http.StatusOK, response)
+	}
+}
+
+func syncAssetSourceHandler(manager assetcatalog.SourceManager) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		path, metadata, principal, ok := prepareSourceVersionedMutation(writer, request, manager)
+		if !ok {
+			return
+		}
+		var body emptySourceRequest
+		if err := decodeStrictJSON(writer, request, &body, 64<<10); err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		result, err := manager.SyncSource(request.Context(), principal, path, metadata)
+		if err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		response, err := sourceRunMutationDTOFrom(result, metadata.TraceID)
+		if err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		writeVersionETag(writer, "asset-source", result.Source.ID, result.Source.Version)
+		writeJSON(writer, http.StatusAccepted, response)
+	}
+}
+
+func unavailableAssetSourceImportHandler(manager assetcatalog.SourceManager) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		if nilHTTPDependency(manager) {
+			writeSourceError(writer, request, errAssetCatalogUnavailable, "asset_source_not_found")
+			return
+		}
+		if _, err := sourcePathFromRequest(request); err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		if _, err := parseIdempotencyKey(request); err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		if _, err := parseVersionETag(
+			request, "asset-source", chi.URLParam(request, "sourceID"),
+		); err != nil {
+			writeSourceError(writer, request, err, "asset_source_not_found")
+			return
+		}
+		contentTypes := request.Header.Values("Content-Type")
+		if len(contentTypes) != 1 {
+			writeSourceError(writer, request, errUnsupportedControlPlaneMediaType, "asset_source_not_found")
+			return
+		}
+		contentType, parameters, err := mime.ParseMediaType(contentTypes[0])
+		if err != nil || contentType != "multipart/form-data" ||
+			len(parameters) != 1 || parameters["boundary"] == "" {
+			writeSourceError(writer, request, errUnsupportedControlPlaneMediaType, "asset_source_not_found")
+			return
+		}
+		if _, ok := authn.PrincipalFromContext(request.Context()); !ok {
+			writeSourceError(writer, request, authn.ErrUnauthenticated, "asset_source_not_found")
+			return
+		}
+		writeRequestProblem(
+			writer, request, http.StatusServiceUnavailable,
+			"source_import_unavailable", "Source import runtime is unavailable",
+		)
+	}
+}
+
+func unavailableAssetSourceIngestionHandler() http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		if values := request.Header.Values("Authorization"); len(values) != 0 {
+			writeRequestProblem(
+				writer, request, http.StatusUnauthorized,
+				"source_workload_identity_mismatch", "A matching mutual TLS workload identity is required",
+			)
+			return
+		}
+		if request.TLS == nil || len(request.TLS.PeerCertificates) == 0 ||
+			len(request.TLS.VerifiedChains) == 0 {
+			writeRequestProblem(
+				writer, request, http.StatusUnauthorized,
+				"source_workload_identity_mismatch", "A matching mutual TLS workload identity is required",
+			)
+			return
+		}
+		// Task 16 owns the exact SAN tuple parser and durable identity binding.
+		// Until it is installed, no certificate is treated as an authorized Source identity.
+		writeRequestProblem(
+			writer, request, http.StatusServiceUnavailable,
+			"source_ingestion_unavailable", "Source ingestion runtime is unavailable",
+		)
+	}
+}
+
 func sourceCollectionFromRequest(request *http.Request) (assetcatalog.SourceCollectionRequest, error) {
 	workspaceID := chi.URLParam(request, "workspaceID")
 	if !validControlPlaneUUID(workspaceID) {
@@ -229,6 +548,21 @@ func sourcePathFromRequest(request *http.Request) (assetcatalog.SourcePathReques
 	return assetcatalog.SourcePathRequest{WorkspaceID: collection.WorkspaceID, SourceID: sourceID}, nil
 }
 
+func sourceRevisionPathFromRequest(request *http.Request) (assetcatalog.SourceRevisionPathRequest, error) {
+	path, err := sourcePathFromRequest(request)
+	if err != nil {
+		return assetcatalog.SourceRevisionPathRequest{}, err
+	}
+	rawRevision := chi.URLParam(request, "revision")
+	revision, err := strconv.ParseInt(rawRevision, 10, 64)
+	if err != nil || revision <= 0 || strconv.FormatInt(revision, 10) != rawRevision {
+		return assetcatalog.SourceRevisionPathRequest{}, errInvalidControlPlaneRequest
+	}
+	return assetcatalog.SourceRevisionPathRequest{
+		WorkspaceID: path.WorkspaceID, SourceID: path.SourceID, Revision: revision,
+	}, nil
+}
+
 func sourceRunPathFromRequest(request *http.Request) (assetcatalog.SourceRunPathRequest, error) {
 	collection, err := sourceCollectionFromRequest(request)
 	if err != nil {
@@ -239,6 +573,76 @@ func sourceRunPathFromRequest(request *http.Request) (assetcatalog.SourceRunPath
 		return assetcatalog.SourceRunPathRequest{}, errInvalidControlPlaneRequest
 	}
 	return assetcatalog.SourceRunPathRequest{WorkspaceID: collection.WorkspaceID, RunID: runID}, nil
+}
+
+func prepareSourceVersionedMutation(
+	writer http.ResponseWriter,
+	request *http.Request,
+	manager assetcatalog.SourceManager,
+) (assetcatalog.SourcePathRequest, assetcatalog.ServerRequestMetadata, authn.Principal, bool) {
+	if nilHTTPDependency(manager) {
+		writeSourceError(writer, request, errAssetCatalogUnavailable, "asset_source_not_found")
+		return assetcatalog.SourcePathRequest{}, assetcatalog.ServerRequestMetadata{}, authn.Principal{}, false
+	}
+	path, err := sourcePathFromRequest(request)
+	if err != nil {
+		writeSourceError(writer, request, err, "asset_source_not_found")
+		return assetcatalog.SourcePathRequest{}, assetcatalog.ServerRequestMetadata{}, authn.Principal{}, false
+	}
+	idempotencyKey, err := parseIdempotencyKey(request)
+	if err != nil {
+		writeSourceError(writer, request, err, "asset_source_not_found")
+		return assetcatalog.SourcePathRequest{}, assetcatalog.ServerRequestMetadata{}, authn.Principal{}, false
+	}
+	sourceVersion, err := parseVersionETag(request, "asset-source", path.SourceID)
+	if err != nil {
+		writeSourceError(writer, request, err, "asset_source_not_found")
+		return assetcatalog.SourcePathRequest{}, assetcatalog.ServerRequestMetadata{}, authn.Principal{}, false
+	}
+	principal, ok := authn.PrincipalFromContext(request.Context())
+	if !ok {
+		writeSourceError(writer, request, authn.ErrUnauthenticated, "asset_source_not_found")
+		return assetcatalog.SourcePathRequest{}, assetcatalog.ServerRequestMetadata{}, authn.Principal{}, false
+	}
+	return path, assetcatalog.ServerRequestMetadata{
+		TraceID:        requestmeta.From(request.Context()).TraceID,
+		IdempotencyKey: idempotencyKey, ExpectedVersion: sourceVersion,
+	}, principal, true
+}
+
+func prepareSourceRevisionMutation(
+	writer http.ResponseWriter,
+	request *http.Request,
+	manager assetcatalog.SourceManager,
+) (assetcatalog.SourceRevisionPathRequest, assetcatalog.ServerRequestMetadata, authn.Principal, bool) {
+	if nilHTTPDependency(manager) {
+		writeSourceError(writer, request, errAssetCatalogUnavailable, "asset_source_not_found")
+		return assetcatalog.SourceRevisionPathRequest{}, assetcatalog.ServerRequestMetadata{}, authn.Principal{}, false
+	}
+	path, err := sourceRevisionPathFromRequest(request)
+	if err != nil {
+		writeSourceError(writer, request, err, "asset_source_not_found")
+		return assetcatalog.SourceRevisionPathRequest{}, assetcatalog.ServerRequestMetadata{}, authn.Principal{}, false
+	}
+	idempotencyKey, err := parseIdempotencyKey(request)
+	if err != nil {
+		writeSourceError(writer, request, err, "asset_source_not_found")
+		return assetcatalog.SourceRevisionPathRequest{}, assetcatalog.ServerRequestMetadata{}, authn.Principal{}, false
+	}
+	sourceVersion, revisionVersion, err := parseSourceRevisionETag(request, path.SourceID, path.Revision)
+	if err != nil {
+		writeSourceError(writer, request, err, "asset_source_not_found")
+		return assetcatalog.SourceRevisionPathRequest{}, assetcatalog.ServerRequestMetadata{}, authn.Principal{}, false
+	}
+	principal, ok := authn.PrincipalFromContext(request.Context())
+	if !ok {
+		writeSourceError(writer, request, authn.ErrUnauthenticated, "asset_source_not_found")
+		return assetcatalog.SourceRevisionPathRequest{}, assetcatalog.ServerRequestMetadata{}, authn.Principal{}, false
+	}
+	return path, assetcatalog.ServerRequestMetadata{
+		TraceID: requestmeta.From(request.Context()).TraceID, IdempotencyKey: idempotencyKey,
+		ExpectedVersion: sourceVersion, ExpectedRevisionVersion: revisionVersion,
+	}, principal, true
 }
 
 func parseSourceListInput(
@@ -292,6 +696,44 @@ func parseSourceListInput(
 	return input, nil
 }
 
+func (request createAssetSourceRequest) input() (assetcatalog.CreateSourceInput, error) {
+	authorities, err := sourceAuthorityEnvironmentIDs(request.AuthorityEnvironmentIDs)
+	profileID := assetcatalog.SourceProfileID(request.SourceProfileID)
+	if err != nil || !validControlPlaneSafeText(request.Name, 1, 256) || !profileID.Valid() {
+		return assetcatalog.CreateSourceInput{}, errInvalidControlPlaneRequest
+	}
+	return assetcatalog.CreateSourceInput{
+		Name: request.Name, SourceProfileID: profileID,
+		AuthorityEnvironmentIDs: authorities,
+	}, nil
+}
+
+func (request createAssetSourceRevisionRequest) input() (assetcatalog.CreateSourceRevisionInput, error) {
+	authorities, err := sourceAuthorityEnvironmentIDs(request.AuthorityEnvironmentIDs)
+	profileID := assetcatalog.SourceProfileID(request.SourceProfileID)
+	if err != nil || !profileID.Valid() || !validControlPlaneReasonCode(request.ChangeReasonCode) {
+		return assetcatalog.CreateSourceRevisionInput{}, errInvalidControlPlaneRequest
+	}
+	return assetcatalog.CreateSourceRevisionInput{
+		SourceProfileID: profileID, AuthorityEnvironmentIDs: authorities,
+		ChangeReasonCode: request.ChangeReasonCode,
+	}, nil
+}
+
+func sourceAuthorityEnvironmentIDs(values []string) ([]string, error) {
+	result := slices.Clone(values)
+	slices.Sort(result)
+	if len(result) == 0 || len(result) > 100 {
+		return nil, errInvalidControlPlaneRequest
+	}
+	for index, value := range result {
+		if !validControlPlaneUUID(value) || index > 0 && result[index-1] == value {
+			return nil, errInvalidControlPlaneRequest
+		}
+	}
+	return result, nil
+}
+
 func toAssetSourceSummaryDTO(view assetcatalog.SourceView) assetSourceSummaryDTO {
 	source := view.ReadModel.Source
 	return assetSourceSummaryDTO{
@@ -309,29 +751,70 @@ func toAssetSourceSummaryDTO(view assetcatalog.SourceView) assetSourceSummaryDTO
 		CurrentRunCounts:          sourceRunCounts(view.ReadModel.CurrentRun),
 		LastRunCounts:             sourceRunCounts(view.ReadModel.LastSuccessfulRun),
 		Version:                   source.Version, CreatedAt: source.CreatedAt.UTC(), UpdatedAt: source.UpdatedAt.UTC(),
-		EffectiveActions: effectiveActionStrings(view.EffectiveActions),
+		EffectiveActions: sourceEffectiveActionStrings(view.EffectiveActions),
 	}
 }
 
 func toAssetSourceDetailDTO(view assetcatalog.SourceView) assetSourceDetailDTO {
 	result := assetSourceDetailDTO{
-		Summary:        toAssetSourceSummaryDTO(view),
-		LatestRevision: toSourceRevisionSummaryDTO(view.ReadModel.LatestRevision),
+		Summary: toAssetSourceSummaryDTO(view),
+		LatestRevision: toSourceRevisionSummaryDTO(
+			view.ReadModel.LatestRevision, view.EffectiveActions,
+		),
 	}
 	if view.ReadModel.PublishedRevision != nil {
-		published := toSourceRevisionSummaryDTO(*view.ReadModel.PublishedRevision)
+		published := toSourceRevisionSummaryDTO(
+			*view.ReadModel.PublishedRevision, []assetcatalog.EffectiveAction{},
+		)
 		result.PublishedRevision = &published
 	}
 	return result
 }
 
-func toSourceRevisionSummaryDTO(value assetcatalog.SourceRevision) sourceRevisionSummaryDTO {
+func toSourceRevisionSummaryDTO(
+	value assetcatalog.SourceRevision,
+	actions []assetcatalog.EffectiveAction,
+) sourceRevisionSummaryDTO {
 	return sourceRevisionSummaryDTO{
-		Revision: value.Revision, Status: string(value.Status),
-		BindingDigest:          value.CanonicalRevisionDigest,
-		SourceDefinitionDigest: value.SourceDefinitionDigest,
-		CreatedAt:              value.CreatedAt.UTC(), UpdatedAt: value.UpdatedAt.UTC(),
+		Revision: value.Revision, Status: string(value.Status), ProfileCode: string(value.ProfileCode),
+		IntegrationID: optionalString(value.IntegrationID), SyncMode: string(value.SyncMode),
+		CredentialReferenceID:    optionalString(string(value.CredentialReferenceID)),
+		TrustReferenceID:         optionalString(string(value.TrustReferenceID)),
+		NetworkPolicyReferenceID: optionalString(string(value.NetworkPolicyReferenceID)),
+		AuthorityEnvironmentIDs:  slices.Clone(value.AuthorityEnvironmentIDs),
+		BindingDigest:            value.CanonicalRevisionDigest,
+		SourceDefinitionDigest:   value.SourceDefinitionDigest,
+		Version:                  value.Version,
+		CreatedAt:                value.CreatedAt.UTC(), UpdatedAt: value.UpdatedAt.UTC(),
+		EffectiveActions: revisionEffectiveActionStrings(actions),
 	}
+}
+
+func sourceEffectiveActionStrings(actions []assetcatalog.EffectiveAction) []string {
+	filtered := make([]assetcatalog.EffectiveAction, 0, len(actions))
+	for _, action := range actions {
+		switch action {
+		case assetcatalog.ActionCreateAsset,
+			assetcatalog.ActionCreateSourceRevision,
+			assetcatalog.ActionDisableSource,
+			assetcatalog.ActionSyncSource,
+			assetcatalog.ActionImportCSV:
+			filtered = append(filtered, action)
+		}
+	}
+	return effectiveActionStrings(filtered)
+}
+
+func revisionEffectiveActionStrings(actions []assetcatalog.EffectiveAction) []string {
+	filtered := make([]assetcatalog.EffectiveAction, 0, len(actions))
+	for _, action := range actions {
+		switch action {
+		case assetcatalog.ActionValidateSourceRevision,
+			assetcatalog.ActionPublishSourceRevision:
+			filtered = append(filtered, action)
+		}
+	}
+	return effectiveActionStrings(filtered)
 }
 
 func toAssetSourceRunDTO(view assetcatalog.SourceRunView) assetSourceRunDTO {
@@ -375,6 +858,170 @@ func sourceRunCounts(run *assetcatalog.SourceRun) *sourceRunCountsDTO {
 		Observed: run.Observed, Created: run.Created, Changed: run.Changed,
 		Unchanged: run.Unchanged, Conflicts: run.Conflicts, Missing: run.Missing,
 		Stale: run.Stale, Restored: run.Restored, Tombstoned: run.Tombstoned, Rejected: run.Rejected,
+	}
+}
+
+func sourceRevisionMutationDTOFrom(
+	result assetcatalog.SourceRevisionMutationView,
+	traceID string,
+) (sourceRevisionMutationDTO, error) {
+	receipt, err := mutationReceiptFrom(result.Receipt, traceID)
+	if err != nil {
+		return sourceRevisionMutationDTO{}, err
+	}
+	view := assetcatalog.SourceView{
+		ReadModel: assetcatalog.SourceReadModel{
+			Source: result.Source.Clone(), LatestRevision: result.Revision.Clone(),
+		},
+		EffectiveActions: slices.Clone(result.EffectiveActions),
+	}
+	return sourceRevisionMutationDTO{
+		Source: toAssetSourceSummaryDTO(view),
+		Revision: toSourceRevisionSummaryDTO(
+			result.Revision, result.EffectiveActions,
+		),
+		MutationReceipt: receipt,
+	}, nil
+}
+
+func sourceMutationDTOFrom(
+	result assetcatalog.SourceMutationView,
+	traceID string,
+) (sourceMutationDTO, error) {
+	receipt, err := mutationReceiptFrom(result.Receipt, traceID)
+	if err != nil {
+		return sourceMutationDTO{}, err
+	}
+	return sourceMutationDTO{
+		Source: toAssetSourceSummaryDTO(assetcatalog.SourceView{
+			ReadModel:        assetcatalog.SourceReadModel{Source: result.Source.Clone()},
+			EffectiveActions: slices.Clone(result.EffectiveActions),
+		}),
+		MutationReceipt: receipt,
+	}, nil
+}
+
+func sourceRunMutationDTOFrom(
+	result assetcatalog.SourceRunMutationView,
+	traceID string,
+) (sourceRunMutationDTO, error) {
+	receipt, err := mutationReceiptFrom(result.Receipt, traceID)
+	if err != nil {
+		return sourceRunMutationDTO{}, err
+	}
+	currentRun := result.Run.Clone()
+	view := assetcatalog.SourceView{
+		ReadModel: assetcatalog.SourceReadModel{
+			Source: result.Source.Clone(), LatestRevision: result.Revision.Clone(),
+			CurrentRun: &currentRun,
+		},
+		EffectiveActions: slices.Clone(result.EffectiveActions),
+	}
+	return sourceRunMutationDTO{
+		Source: toAssetSourceSummaryDTO(view),
+		Revision: toSourceRevisionSummaryDTO(
+			result.Revision, result.EffectiveActions,
+		),
+		Run: toAssetSourceRunDTO(assetcatalog.SourceRunView{
+			Run: result.Run.Clone(), EffectiveActions: []assetcatalog.EffectiveAction{},
+		}),
+		OperationID: result.Run.ID, MutationReceipt: receipt,
+	}, nil
+}
+
+func writeSourceRevisionMutationResponse(
+	writer http.ResponseWriter,
+	request *http.Request,
+	result assetcatalog.SourceRevisionMutationView,
+	err error,
+	status int,
+) {
+	if err != nil {
+		writeSourceError(writer, request, err, "asset_source_not_found")
+		return
+	}
+	response, err := sourceRevisionMutationDTOFrom(
+		result, requestmeta.From(request.Context()).TraceID,
+	)
+	if err != nil {
+		writeSourceError(writer, request, err, "asset_source_not_found")
+		return
+	}
+	writeSourceRevisionETag(
+		writer, result.Source.ID, result.Revision.Revision,
+		result.Source.Version, result.Revision.Version,
+	)
+	if status == http.StatusCreated {
+		writer.Header().Set(
+			"Location",
+			"/api/v1/workspaces/"+result.Source.WorkspaceID+
+				"/asset-sources/"+result.Source.ID,
+		)
+	}
+	writeJSON(writer, status, response)
+}
+
+func terminalSourceRun(status assetcatalog.RunStatus) bool {
+	switch status {
+	case assetcatalog.RunStatusSucceeded, assetcatalog.RunStatusPartial,
+		assetcatalog.RunStatusFailed, assetcatalog.RunStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+func writeSourceError(
+	writer http.ResponseWriter,
+	request *http.Request,
+	err error,
+	notFoundCode string,
+) {
+	switch {
+	case errors.Is(err, errUnsupportedControlPlaneMediaType):
+		writeRequestProblem(
+			writer, request, http.StatusUnsupportedMediaType,
+			"unsupported_media_type", "Content-Type is not supported for this Source operation",
+		)
+	case errors.Is(err, errControlPlaneBodyTooLarge):
+		writeRequestProblem(
+			writer, request, http.StatusRequestEntityTooLarge,
+			"source_payload_rejected", "The Source request exceeds 64 KiB",
+		)
+	case errors.Is(err, errInvalidControlPlaneRequest), errors.Is(err, assetcatalog.ErrInvalidRequest):
+		writeRequestProblem(
+			writer, request, http.StatusBadRequest,
+			"source_payload_rejected", "The Source request is invalid",
+		)
+	case errors.Is(err, assetcatalog.ErrSourceRevisionNotValidated):
+		writeRequestProblem(
+			writer, request, http.StatusConflict,
+			"source_revision_not_validated", "The Source revision is not validated",
+		)
+	case errors.Is(err, assetcatalog.ErrVersionConflict):
+		writeRequestProblem(
+			writer, request, http.StatusConflict,
+			"source_binding_drift", "The Source binding changed",
+		)
+	case errors.Is(err, assetcatalog.ErrStateConflict):
+		writeRequestProblem(
+			writer, request, http.StatusConflict,
+			"source_gate_unavailable", "The Source gate does not admit this operation",
+		)
+	case errors.Is(err, errSourceBackpressure):
+		writer.Header().Set("Retry-After", "1")
+		writeRequestProblem(
+			writer, request, http.StatusTooManyRequests,
+			"source_backpressure", "The Source is temporarily backpressured",
+		)
+	case errors.Is(err, authz.ErrReauthenticationRequired):
+		writer.Header().Set("WWW-Authenticate", `Bearer error="insufficient_user_authentication"`)
+		writeRequestProblem(
+			writer, request, http.StatusUnauthorized,
+			"reauthentication_required", "Recent OIDC authentication is required",
+		)
+	default:
+		writeAssetCatalogError(writer, request, err, notFoundCode)
 	}
 }
 

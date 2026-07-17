@@ -100,10 +100,11 @@ function useControlPlaneRuntime(): ControlPlaneRuntimeValue {
 type OperationDefinition = {
   method: "GET" | "POST" | "PATCH" | "DELETE";
   path: string;
-  successStatus: 200 | 201 | 204;
+  successStatus: 200 | 201 | 202 | 204 | readonly (200 | 201 | 202 | 204)[];
+  workloadOnly?: true;
 };
 
-const operationRegistry = {
+const operationRegistry: Record<keyof operations, OperationDefinition> = {
   getBrowserConfig: { method: "GET", path: "/browser-config", successStatus: 200 },
   getSession: { method: "GET", path: "/session", successStatus: 200 },
   listAssets: {
@@ -161,10 +162,51 @@ const operationRegistry = {
     path: "/workspaces/{workspace_id}/asset-sources",
     successStatus: 200,
   },
+  createAssetSource: {
+    method: "POST",
+    path: "/workspaces/{workspace_id}/asset-sources",
+    successStatus: 201,
+  },
   getAssetSource: {
     method: "GET",
     path: "/workspaces/{workspace_id}/asset-sources/{source_id}",
     successStatus: 200,
+  },
+  createAssetSourceRevision: {
+    method: "POST",
+    path: "/workspaces/{workspace_id}/asset-sources/{source_id}/revisions",
+    successStatus: 201,
+  },
+  validateAssetSourceRevision: {
+    method: "POST",
+    path: "/workspaces/{workspace_id}/asset-sources/{source_id}/revisions/{revision}:validate",
+    successStatus: [200, 202],
+  },
+  publishAssetSourceRevision: {
+    method: "POST",
+    path: "/workspaces/{workspace_id}/asset-sources/{source_id}/revisions/{revision}:publish",
+    successStatus: 200,
+  },
+  disableAssetSource: {
+    method: "POST",
+    path: "/workspaces/{workspace_id}/asset-sources/{source_id}:disable",
+    successStatus: 200,
+  },
+  syncAssetSource: {
+    method: "POST",
+    path: "/workspaces/{workspace_id}/asset-sources/{source_id}:sync",
+    successStatus: 202,
+  },
+  createAssetSourceImport: {
+    method: "POST",
+    path: "/workspaces/{workspace_id}/asset-sources/{source_id}/imports",
+    successStatus: 202,
+  },
+  createAssetSourceIngestionBatch: {
+    method: "POST",
+    path: "/workspaces/{workspace_id}/asset-sources/{source_id}/ingestion-batches",
+    successStatus: 202,
+    workloadOnly: true,
   },
   getAssetSourceRun: {
     method: "GET",
@@ -181,7 +223,7 @@ const operationRegistry = {
     path: "/workspaces/{workspace_id}/asset-conflicts/{conflict_id}:resolve",
     successStatus: 200,
   },
-} satisfies Record<keyof operations, OperationDefinition>;
+};
 
 type RuntimeInput = {
   parameters?: {
@@ -192,6 +234,7 @@ type RuntimeInput = {
   requestBody?: {
     content?: {
       "application/json"?: unknown;
+      "multipart/form-data"?: Record<string, unknown>;
     };
   };
 };
@@ -206,6 +249,9 @@ export function createControlPlaneClient(options: ClientOptions) {
       requestOptions: ControlPlaneRequestOptions = {},
     ): Promise<OperationResult<K>> {
       const definition = operationRegistry[operation];
+      if (definition.workloadOnly === true) {
+        throw new Error("Workload-only operation is unavailable to the OIDC browser client");
+      }
       const runtimeInput = input as unknown as RuntimeInput;
       const path = renderPath(definition.path, runtimeInput.parameters?.path);
       const query = renderQuery(runtimeInput.parameters?.query);
@@ -218,9 +264,18 @@ export function createControlPlaneClient(options: ClientOptions) {
         Authorization: `Bearer ${token}`,
       });
       copyDeclaredHeaders(headers, runtimeInput.parameters?.header);
-      const bodyValue = runtimeInput.requestBody?.content?.["application/json"];
-      const body = bodyValue === undefined ? undefined : JSON.stringify(bodyValue);
-      if (body !== undefined) {
+      const jsonBody = runtimeInput.requestBody?.content?.["application/json"];
+      const multipartBody = runtimeInput.requestBody?.content?.["multipart/form-data"];
+      if (jsonBody !== undefined && multipartBody !== undefined) {
+        throw new Error("Operation request body media type is ambiguous");
+      }
+      const body =
+        jsonBody === undefined
+          ? multipartBody === undefined
+            ? undefined
+            : renderMultipartBody(multipartBody)
+          : JSON.stringify(jsonBody);
+      if (jsonBody !== undefined) {
         headers.set("Content-Type", "application/json");
       }
       const response = await fetcher(`${options.apiBasePath}${path}${query}`, {
@@ -237,7 +292,7 @@ export function createControlPlaneClient(options: ClientOptions) {
       if (!response.ok) {
         throw await responseProblem(response);
       }
-      if (response.status !== definition.successStatus) {
+      if (!acceptsSuccessStatus(definition.successStatus, response.status)) {
         throw new ControlPlaneProblemError(
           unexpectedResponseProblem(response.status, safeTraceID(response.headers)),
         );
@@ -267,11 +322,38 @@ function renderPath(
 ): string {
   return template.replace(/\{([a-z_]+)\}/g, (_match, name: string) => {
     const value = parameters?.[name];
+    if (typeof value === "number") {
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new Error("Operation path parameters are incomplete");
+      }
+      return String(value);
+    }
     if (typeof value !== "string" || value === "") {
       throw new Error("Operation path parameters are incomplete");
     }
     return encodeURIComponent(value);
   });
+}
+
+function renderMultipartBody(values: Record<string, unknown>): FormData {
+  const body = new FormData();
+  for (const [name, value] of Object.entries(values)) {
+    if (typeof value === "string" || value instanceof Blob) {
+      body.append(name, value);
+      continue;
+    }
+    throw new Error("Multipart operation contains an unsupported field");
+  }
+  return body;
+}
+
+function acceptsSuccessStatus(
+  declared: OperationDefinition["successStatus"],
+  actual: number,
+): boolean {
+  return Array.isArray(declared)
+    ? declared.some((status) => status === actual)
+    : declared === actual;
 }
 
 function renderQuery(parameters: Record<string, unknown> | undefined): string {

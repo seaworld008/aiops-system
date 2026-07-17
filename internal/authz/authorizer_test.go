@@ -171,6 +171,75 @@ func TestAssetPermissionsDoNotRequireRecentAuthentication(t *testing.T) {
 	}
 }
 
+func TestSourcePermissionMatrix(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 17, 10, 0, 0, 0, time.UTC)
+	authorizer, err := NewAuthorizer(5*time.Minute, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewAuthorizer() error = %v", err)
+	}
+	request := Request{
+		Permission:    Permission("ASSET_SOURCE_READ"),
+		WorkspaceID:   "workspace-1",
+		EnvironmentID: "PROD",
+	}
+	for _, role := range []authn.Role{
+		authn.RoleViewer,
+		authn.RoleSRE,
+		authn.RoleServiceOwner,
+		authn.RoleApprover,
+		authn.RoleAuditor,
+		authn.RoleAdmin,
+	} {
+		if err := authorizer.Authorize(principal(now, role), request); err != nil {
+			t.Errorf("%s source read error = %v", role, err)
+		}
+	}
+	for _, permission := range []Permission{
+		Permission("ASSET_SOURCE_MANAGE"),
+		Permission("ASSET_SOURCE_VALIDATE"),
+		Permission("ASSET_SOURCE_PUBLISH"),
+		Permission("ASSET_SOURCE_SYNC"),
+	} {
+		request.Permission = permission
+		if err := authorizer.Authorize(principal(now, authn.RoleAdmin), request); err != nil {
+			t.Errorf("admin %s error = %v", permission, err)
+		}
+		if err := authorizer.Authorize(principal(now, authn.RoleSRE), request); !errors.Is(err, ErrForbidden) {
+			t.Errorf("SRE %s error = %v, want forbidden", permission, err)
+		}
+	}
+}
+
+func TestSourceHighRiskMutationsRequireExplicitRecentAuthentication(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 17, 10, 0, 0, 0, time.UTC)
+	authorizer, err := NewAuthorizer(5*time.Minute, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewAuthorizer() error = %v", err)
+	}
+	admin := principal(now, authn.RoleAdmin)
+	admin.AuthenticatedAt = now.Add(-time.Hour)
+	request := Request{
+		Permission:    PermissionAssetSourceManage,
+		WorkspaceID:   "workspace-1",
+		EnvironmentID: "PROD",
+	}
+	if err := authorizer.Authorize(admin, request); err != nil {
+		t.Fatalf("ordinary source manage error = %v", err)
+	}
+	request.RequireRecentAuthentication = true
+	if err := authorizer.Authorize(admin, request); !errors.Is(err, ErrReauthenticationRequired) {
+		t.Fatalf("high-risk source manage error = %v, want reauthentication", err)
+	}
+	request.Permission = PermissionAssetSourcePublish
+	if err := authorizer.Authorize(admin, request); !errors.Is(err, ErrReauthenticationRequired) {
+		t.Fatalf("source publish error = %v, want reauthentication", err)
+	}
+}
+
 func TestAuthorizerCredentialRevocationRoleMatrixDoesNotRequireServiceScope(t *testing.T) {
 	t.Parallel()
 
