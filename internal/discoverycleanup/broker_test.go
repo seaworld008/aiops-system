@@ -12,15 +12,18 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/seaworld008/aiops-system/internal/assetcatalog"
 	"github.com/seaworld008/aiops-system/internal/discoverycleanup"
 	"github.com/seaworld008/aiops-system/internal/discoveryqueue"
+	"github.com/seaworld008/aiops-system/internal/discoverysource"
 )
 
 func TestOpenAttemptResponseLossAndConcurrentReplayCreateOneLogicalSession(t *testing.T) {
@@ -115,6 +118,589 @@ func TestDifferentAttemptsAreIsolatedAndReopenDriftFailsClosed(t *testing.T) {
 	}
 	if _, err := broker.RevokeAttempt(context.Background(), uuid(99)); !errors.Is(err, discoverycleanup.ErrAttemptNotFound) {
 		t.Fatalf("RevokeAttempt(missing) error = %v, want ErrAttemptNotFound", err)
+	}
+}
+
+func TestBindAttemptRuntimeRequiresExactBrokerIssuedSessionAndHandle(t *testing.T) {
+	t.Parallel()
+
+	binding := cleanupRuntimeBinding()
+	firstOpener := newRuntimeTestOpener(binding)
+	firstBroker := mustBroker(t, firstOpener, newTestProofAuthority())
+	request := cleanupRequest(1)
+	session, err := firstBroker.OpenAttempt(context.Background(), request)
+	if err != nil {
+		t.Fatalf("OpenAttempt() error = %v", err)
+	}
+	defer session.Destroy()
+
+	foreignOpener := newRuntimeTestOpener(binding)
+	foreignBroker := mustBroker(t, foreignOpener, newTestProofAuthority())
+	foreignSession, err := foreignBroker.OpenAttempt(context.Background(), request)
+	if err != nil {
+		t.Fatalf("foreign OpenAttempt() error = %v", err)
+	}
+	defer foreignSession.Destroy()
+
+	if _, err := foreignBroker.BindAttemptRuntime(
+		context.Background(),
+		session,
+		binding,
+	); !errors.Is(err, discoverycleanup.ErrSessionAuthentication) {
+		t.Fatalf("BindAttemptRuntime(foreign broker) error = %v, want ErrSessionAuthentication", err)
+	}
+	if got := foreignOpener.handle(request.Attempt.AttemptID).bindCount(); got != 0 {
+		t.Fatalf("foreign handle BindRuntime() calls = %d, want 0", got)
+	}
+
+	if _, err := firstBroker.BindAttemptRuntime(
+		context.Background(),
+		&discoverycleanup.AttemptSession{},
+		binding,
+	); !errors.Is(err, discoverycleanup.ErrSessionAuthentication) {
+		t.Fatalf("BindAttemptRuntime(reconstructed acknowledgement) error = %v, want ErrSessionAuthentication", err)
+	}
+
+	copied := *session
+	if _, err := firstBroker.BindAttemptRuntime(
+		context.Background(),
+		&copied,
+		binding,
+	); !errors.Is(err, discoverycleanup.ErrSessionAuthentication) {
+		t.Fatalf("BindAttemptRuntime(shallow copy) error = %v, want ErrSessionAuthentication", err)
+	}
+	if _, err := copied.Attempt(); !errors.Is(err, discoverycleanup.ErrSessionAuthentication) {
+		t.Fatalf("Attempt(shallow copy) error = %v, want ErrSessionAuthentication", err)
+	}
+	copied.Destroy()
+	if got, err := session.Attempt(); err != nil || got != request.Attempt {
+		t.Fatalf("original Attempt() after copied Destroy = %#v, %v; want %#v", got, err, request.Attempt)
+	}
+
+	bound, err := firstBroker.BindAttemptRuntime(context.Background(), session, binding)
+	if err != nil {
+		t.Fatalf("BindAttemptRuntime(exact session) error = %v", err)
+	}
+	if got := bound.Binding(); got != binding {
+		t.Fatalf("bound runtime binding = %#v, want %#v", got, binding)
+	}
+	handle := firstOpener.handle(request.Attempt.AttemptID)
+	if got := handle.bindCount(); got != 1 {
+		t.Fatalf("Broker-owned handle BindRuntime() calls = %d, want 1", got)
+	}
+	if got := firstOpener.secondHandle().bindCount(); got != 0 {
+		t.Fatalf("second runtime-producing handle BindRuntime() calls = %d, want 0", got)
+	}
+	if err := discoverysource.WithRuntime[testRuntimeMaterial](
+		bound,
+		binding,
+		func(material *testRuntimeMaterial) error {
+			if material.SessionMarker != "broker-owned-session" {
+				t.Fatalf("runtime session marker = %q, want broker-owned-session", material.SessionMarker)
+			}
+			return nil
+		},
+	); err != nil {
+		t.Fatalf("WithRuntime(exact Broker-owned runtime) error = %v", err)
+	}
+
+	session.Destroy()
+	if _, err := firstBroker.BindAttemptRuntime(
+		context.Background(),
+		session,
+		binding,
+	); !errors.Is(err, discoverycleanup.ErrSessionDestroyed) {
+		t.Fatalf("BindAttemptRuntime(destroyed acknowledgement) error = %v, want ErrSessionDestroyed", err)
+	}
+}
+
+func TestBindAttemptRuntimeCoalescesResponseLossAndRejectsBindingDrift(t *testing.T) {
+	t.Parallel()
+
+	binding := cleanupRuntimeBinding()
+	opener := newRuntimeTestOpener(binding)
+	broker := mustBroker(t, opener, newTestProofAuthority())
+	request := cleanupRequest(1)
+
+	const callers = 32
+	sessions := make([]*discoverycleanup.AttemptSession, callers)
+	for index := range sessions {
+		session, err := broker.OpenAttempt(context.Background(), request)
+		if err != nil {
+			t.Fatalf("OpenAttempt(replay %d) error = %v", index, err)
+		}
+		sessions[index] = session
+		defer session.Destroy()
+	}
+
+	start := make(chan struct{})
+	results := make(chan discoverysource.BoundRuntime, callers)
+	errs := make(chan error, callers)
+	for index := range callers {
+		go func(session *discoverycleanup.AttemptSession) {
+			<-start
+			runtimeView, bindErr := broker.BindAttemptRuntime(
+				context.Background(),
+				session,
+				binding,
+			)
+			results <- runtimeView
+			errs <- bindErr
+		}(sessions[index])
+	}
+	close(start)
+
+	runtimes := make([]discoverysource.BoundRuntime, callers)
+	for index := range callers {
+		if bindErr := <-errs; bindErr != nil {
+			t.Fatalf("BindAttemptRuntime(concurrent replay %d) error = %v", index, bindErr)
+		}
+		runtimes[index] = <-results
+		if got := runtimes[index].Binding(); got != binding {
+			t.Fatalf("runtime replay binding = %#v, want %#v", got, binding)
+		}
+	}
+	handle := opener.handle(request.Attempt.AttemptID)
+	if got := handle.bindCount(); got != 1 {
+		t.Fatalf("BindRuntime() calls after concurrent response-loss replay = %d, want 1", got)
+	}
+	if got := opener.openCount(); got != 1 {
+		t.Fatalf("OpenSession() calls after concurrent response-loss replay = %d, want 1", got)
+	}
+
+	if err := discoverysource.WithRuntime[testRuntimeMaterial](
+		runtimes[0],
+		binding,
+		func(material *testRuntimeMaterial) error {
+			material.Uses = 41
+			return nil
+		},
+	); err != nil {
+		t.Fatalf("WithRuntime(first cached view) error = %v", err)
+	}
+	if err := discoverysource.WithRuntime[testRuntimeMaterial](
+		runtimes[len(runtimes)-1],
+		binding,
+		func(material *testRuntimeMaterial) error {
+			if material.Uses != 41 {
+				t.Fatalf("cached runtime cell Uses = %d, want 41", material.Uses)
+			}
+			return nil
+		},
+	); err != nil {
+		t.Fatalf("WithRuntime(replayed cached view) error = %v", err)
+	}
+
+	drifts := []struct {
+		name   string
+		mutate func(*discoverysource.RuntimeBinding)
+	}{
+		{"tenant", func(value *discoverysource.RuntimeBinding) {
+			value.Locator.Scope.TenantID = uuid(91)
+		}},
+		{"workspace", func(value *discoverysource.RuntimeBinding) {
+			value.Locator.Scope.WorkspaceID = uuid(92)
+		}},
+		{"source", func(value *discoverysource.RuntimeBinding) {
+			value.Locator.SourceID = uuid(93)
+		}},
+		{"revision", func(value *discoverysource.RuntimeBinding) {
+			value.SourceRevision++
+		}},
+		{"revision digest", func(value *discoverysource.RuntimeBinding) {
+			value.SourceRevisionDigest = strings.Repeat("b", sha256.Size*2)
+		}},
+		{"revision status", func(value *discoverysource.RuntimeBinding) {
+			value.RevisionStatus = assetcatalog.SourceRevisionValidating
+		}},
+		{"provider", func(value *discoverysource.RuntimeBinding) {
+			value.ProviderKind = "OTHER_PROVIDER_V1"
+		}},
+		{"profile", func(value *discoverysource.RuntimeBinding) {
+			value.ProfileCode = "OTHER_PROFILE_V1"
+		}},
+	}
+	for _, drift := range drifts {
+		t.Run(drift.name, func(t *testing.T) {
+			changed := binding
+			drift.mutate(&changed)
+			if _, err := broker.BindAttemptRuntime(
+				context.Background(),
+				sessions[0],
+				changed,
+			); !errors.Is(err, discoverycleanup.ErrAttemptDrift) {
+				t.Fatalf("BindAttemptRuntime(binding drift) error = %v, want ErrAttemptDrift", err)
+			}
+		})
+	}
+	if got := handle.bindCount(); got != 1 {
+		t.Fatalf("BindRuntime() calls after changed-binding replays = %d, want 1", got)
+	}
+	if got := opener.openCount(); got != 1 {
+		t.Fatalf("OpenSession() calls after changed-binding replays = %d, want 1", got)
+	}
+	runtimes[0].Clear()
+	if got := runtimes[len(runtimes)-1].Binding(); got != (discoverysource.RuntimeBinding{}) {
+		t.Fatalf("replayed runtime binding after shared-cell Clear = %#v, want inactive", got)
+	}
+	if _, err := broker.BindAttemptRuntime(
+		context.Background(),
+		sessions[0],
+		binding,
+	); !errors.Is(err, discoverycleanup.ErrRuntimeUnavailable) {
+		t.Fatalf("BindAttemptRuntime(after cached cell Clear) error = %v, want ErrRuntimeUnavailable", err)
+	}
+	if got := handle.bindCount(); got != 1 {
+		t.Fatalf("BindRuntime() calls after cached cell Clear = %d, want 1", got)
+	}
+}
+
+func TestBindAttemptRuntimeRejectsNonRuntimeWrongInactiveAndFailedHandles(t *testing.T) {
+	t.Parallel()
+
+	binding := cleanupRuntimeBinding()
+	tests := []struct {
+		name      string
+		configure func(*runtimeTestOpener)
+		wantErr   error
+		wantBinds int
+	}{
+		{
+			name: "cleanup-only recovery handle",
+			configure: func(opener *runtimeTestOpener) {
+				opener.cleanupOnly = true
+			},
+			wantErr: discoverycleanup.ErrRuntimeUnavailable,
+		},
+		{
+			name: "wrong-bound runtime",
+			configure: func(opener *runtimeTestOpener) {
+				opener.binding.SourceRevision++
+			},
+			wantErr:   discoverycleanup.ErrAttemptDrift,
+			wantBinds: 1,
+		},
+		{
+			name: "inactive runtime",
+			configure: func(opener *runtimeTestOpener) {
+				opener.returnInactive = true
+			},
+			wantErr:   discoverycleanup.ErrRuntimeUnavailable,
+			wantBinds: 1,
+		},
+		{
+			name: "ambiguous bind result",
+			configure: func(opener *runtimeTestOpener) {
+				opener.bindErr = errors.New("sensitive runtime bind error: token=do-not-log")
+			},
+			wantErr:   discoverycleanup.ErrRuntimeUnavailable,
+			wantBinds: 1,
+		},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			opener := newRuntimeTestOpener(binding)
+			test.configure(opener)
+			broker := mustBroker(t, opener, newTestProofAuthority())
+			request := cleanupRequest(10 + index)
+			session, err := broker.OpenAttempt(context.Background(), request)
+			if err != nil {
+				t.Fatalf("OpenAttempt() error = %v", err)
+			}
+			defer session.Destroy()
+
+			_, bindErr := broker.BindAttemptRuntime(
+				context.Background(),
+				session,
+				binding,
+			)
+			if !errors.Is(bindErr, test.wantErr) {
+				t.Fatalf("BindAttemptRuntime() error = %v, want %v", bindErr, test.wantErr)
+			}
+			if strings.Contains(bindErr.Error(), "do-not-log") {
+				t.Fatalf("BindAttemptRuntime() leaked upstream error = %v", bindErr)
+			}
+			handle := opener.handle(request.Attempt.AttemptID)
+			if got := handle.bindCount(); got != test.wantBinds {
+				t.Fatalf("BindRuntime() calls = %d, want %d", got, test.wantBinds)
+			}
+			if test.wantBinds == 1 && !handle.runtimeCleared() {
+				t.Fatal("rejected runtime cell was not cleared")
+			}
+			if _, err := broker.BindAttemptRuntime(
+				context.Background(),
+				session,
+				binding,
+			); !errors.Is(err, test.wantErr) {
+				t.Fatalf("BindAttemptRuntime(replay) error = %v, want %v", err, test.wantErr)
+			}
+			if got := handle.bindCount(); got != test.wantBinds {
+				t.Fatalf("BindRuntime() calls after failed replay = %d, want %d", got, test.wantBinds)
+			}
+			proof, err := broker.RevokeAttempt(
+				context.Background(),
+				request.Attempt.AttemptID,
+			)
+			if err != nil {
+				t.Fatalf("RevokeAttempt(after runtime rejection) error = %v", err)
+			}
+			defer proof.Destroy()
+			if handle.revokeCount() != 1 || handle.destroyCount() != 1 {
+				t.Fatalf("revoke/destroy calls after runtime rejection = %d/%d, want 1/1",
+					handle.revokeCount(), handle.destroyCount())
+			}
+		})
+	}
+}
+
+func TestBindAttemptRuntimeRevokeWaitsForBindAndInvalidatesRuntime(t *testing.T) {
+	t.Parallel()
+
+	binding := cleanupRuntimeBinding()
+	opener := newRuntimeTestOpener(binding)
+	opener.blockBind = true
+	broker := mustBroker(t, opener, newTestProofAuthority())
+	request := cleanupRequest(1)
+	session, err := broker.OpenAttempt(context.Background(), request)
+	if err != nil {
+		t.Fatalf("OpenAttempt() error = %v", err)
+	}
+	defer session.Destroy()
+	handle := opener.handle(request.Attempt.AttemptID)
+
+	type bindResult struct {
+		runtime discoverysource.BoundRuntime
+		err     error
+	}
+	bindResults := make(chan bindResult, 1)
+	go func() {
+		runtimeView, bindErr := broker.BindAttemptRuntime(
+			context.Background(),
+			session,
+			binding,
+		)
+		bindResults <- bindResult{runtime: runtimeView, err: bindErr}
+	}()
+	<-handle.bindStarted
+
+	type revokeResult struct {
+		proof discoveryqueue.CleanupProof
+		err   error
+	}
+	revokeResults := make(chan revokeResult, 1)
+	go func() {
+		proof, revokeErr := broker.RevokeAttempt(
+			context.Background(),
+			request.Attempt.AttemptID,
+		)
+		revokeResults <- revokeResult{proof: proof, err: revokeErr}
+	}()
+
+	select {
+	case result := <-revokeResults:
+		result.proof.Destroy()
+		t.Fatalf("RevokeAttempt() completed before BindRuntime: %v", result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := handle.revokeCount(); got != 0 {
+		t.Fatalf("Revoke() calls while bind is blocked = %d, want 0", got)
+	}
+	close(handle.bindRelease)
+
+	bound := <-bindResults
+	if bound.err != nil {
+		t.Fatalf("BindAttemptRuntime() error = %v", bound.err)
+	}
+	revoked := <-revokeResults
+	if revoked.err != nil {
+		t.Fatalf("RevokeAttempt() error = %v", revoked.err)
+	}
+	defer revoked.proof.Destroy()
+	if got := bound.runtime.Binding(); got != (discoverysource.RuntimeBinding{}) {
+		t.Fatalf("runtime binding after revoke = %#v, want inactive", got)
+	}
+	if err := discoverysource.WithRuntime[testRuntimeMaterial](
+		bound.runtime,
+		binding,
+		func(*testRuntimeMaterial) error { return nil },
+	); !errors.Is(err, discoverysource.ErrRuntimeBindingMismatch) {
+		t.Fatalf("WithRuntime(after revoke) error = %v, want ErrRuntimeBindingMismatch", err)
+	}
+	if _, err := broker.BindAttemptRuntime(
+		context.Background(),
+		session,
+		binding,
+	); !errors.Is(err, discoverycleanup.ErrAttemptClosed) {
+		t.Fatalf("BindAttemptRuntime(after revoke) error = %v, want ErrAttemptClosed", err)
+	}
+	if handle.bindCount() != 1 || handle.revokeCount() != 1 || handle.destroyCount() != 1 {
+		t.Fatalf("bind/revoke/destroy calls = %d/%d/%d, want 1/1/1",
+			handle.bindCount(), handle.revokeCount(), handle.destroyCount())
+	}
+}
+
+func TestBindAttemptRuntimeBrokerDestroyCancelsBindAndInvalidatesRuntime(t *testing.T) {
+	t.Parallel()
+
+	t.Run("destroy after bind", func(t *testing.T) {
+		binding := cleanupRuntimeBinding()
+		opener := newRuntimeTestOpener(binding)
+		broker := mustBroker(t, opener, newTestProofAuthority())
+		request := cleanupRequest(1)
+		session, err := broker.OpenAttempt(context.Background(), request)
+		if err != nil {
+			t.Fatalf("OpenAttempt() error = %v", err)
+		}
+		defer session.Destroy()
+		bound, err := broker.BindAttemptRuntime(context.Background(), session, binding)
+		if err != nil {
+			t.Fatalf("BindAttemptRuntime() error = %v", err)
+		}
+
+		broker.Destroy()
+		if got := bound.Binding(); got != (discoverysource.RuntimeBinding{}) {
+			t.Fatalf("runtime binding after Broker Destroy = %#v, want inactive", got)
+		}
+		if _, err := broker.BindAttemptRuntime(
+			context.Background(),
+			session,
+			binding,
+		); !errors.Is(err, discoverycleanup.ErrBrokerUnavailable) {
+			t.Fatalf("BindAttemptRuntime(after Broker Destroy) error = %v, want ErrBrokerUnavailable", err)
+		}
+		handle := opener.handle(request.Attempt.AttemptID)
+		if handle.destroyCount() != 1 || !handle.runtimeCleared() {
+			t.Fatalf("handle destroy/runtime clear = %d/%t, want 1/true",
+				handle.destroyCount(), handle.runtimeCleared())
+		}
+	})
+
+	t.Run("destroy cancels in-flight bind", func(t *testing.T) {
+		binding := cleanupRuntimeBinding()
+		opener := newRuntimeTestOpener(binding)
+		opener.blockBind = true
+		broker := mustBroker(t, opener, newTestProofAuthority())
+		request := cleanupRequest(2)
+		session, err := broker.OpenAttempt(context.Background(), request)
+		if err != nil {
+			t.Fatalf("OpenAttempt() error = %v", err)
+		}
+		defer session.Destroy()
+		handle := opener.handle(request.Attempt.AttemptID)
+
+		type result struct {
+			runtime discoverysource.BoundRuntime
+			err     error
+		}
+		results := make(chan result, 1)
+		go func() {
+			runtimeView, bindErr := broker.BindAttemptRuntime(
+				context.Background(),
+				session,
+				binding,
+			)
+			results <- result{runtime: runtimeView, err: bindErr}
+		}()
+		<-handle.bindStarted
+
+		broker.Destroy()
+		bound := <-results
+		if !errors.Is(bound.err, discoverycleanup.ErrBrokerUnavailable) {
+			t.Fatalf("BindAttemptRuntime(destroyed in flight) error = %v, want ErrBrokerUnavailable", bound.err)
+		}
+		if got := bound.runtime.Binding(); got != (discoverysource.RuntimeBinding{}) {
+			t.Fatalf("runtime binding after cancelled bind = %#v, want inactive", got)
+		}
+		if handle.bindCount() != 1 || handle.destroyCount() != 1 {
+			t.Fatalf("bind/destroy calls = %d/%d, want 1/1",
+				handle.bindCount(), handle.destroyCount())
+		}
+	})
+}
+
+func TestBindAttemptRuntimeSensitiveBoundaryDoesNotLeak(t *testing.T) {
+	t.Parallel()
+
+	const (
+		handleSecret  = "runtime-handle-secret-do-not-leak"
+		runtimeSecret = "runtime-material-secret-do-not-leak"
+	)
+	binding := cleanupRuntimeBinding()
+	opener := newRuntimeTestOpener(binding)
+	opener.handleSecret = handleSecret
+	opener.runtimeSecret = runtimeSecret
+	broker := mustBroker(t, opener, newTestProofAuthority())
+	request := cleanupRequest(1)
+	session, err := broker.OpenAttempt(context.Background(), request)
+	if err != nil {
+		t.Fatalf("OpenAttempt() error = %v", err)
+	}
+	defer session.Destroy()
+	bound, err := broker.BindAttemptRuntime(context.Background(), session, binding)
+	if err != nil {
+		t.Fatalf("BindAttemptRuntime() error = %v", err)
+	}
+
+	assertSensitiveBoundary(
+		t,
+		session,
+		request.Attempt.AttemptID,
+		binding.Locator.SourceID,
+		binding.SourceRevisionDigest,
+		binding.ProviderKind,
+		string(binding.ProfileCode),
+		handleSecret,
+		runtimeSecret,
+	)
+	assertSensitiveBoundary(
+		t,
+		*session,
+		request.Attempt.AttemptID,
+		binding.Locator.SourceID,
+		binding.SourceRevisionDigest,
+		handleSecret,
+		runtimeSecret,
+	)
+	assertAttemptSessionHasNoRuntimeOrHandleReference(t)
+	assertRuntimeSensitiveBoundary(
+		t,
+		bound,
+		request.Attempt.AttemptID,
+		binding.Locator.SourceID,
+		binding.SourceRevisionDigest,
+		binding.ProviderKind,
+		string(binding.ProfileCode),
+		handleSecret,
+		runtimeSecret,
+	)
+}
+
+func assertAttemptSessionHasNoRuntimeOrHandleReference(t *testing.T) {
+	t.Helper()
+	sessionType := reflect.TypeOf(discoverycleanup.AttemptSession{})
+	if sessionType.NumField() != 1 {
+		t.Fatalf("AttemptSession fields = %d, want one opaque state pointer", sessionType.NumField())
+	}
+	for index := range sessionType.NumField() {
+		field := sessionType.Field(index)
+		if field.PkgPath == "" {
+			t.Fatalf("AttemptSession exported field = %s", field.Name)
+		}
+	}
+	stateType := sessionType.Field(0).Type.Elem()
+	for index := range stateType.NumField() {
+		fieldType := stateType.Field(index).Type.String()
+		for _, forbidden := range []string{
+			"brokerState",
+			"attemptState",
+			"SessionHandle",
+			"RuntimeBinding",
+			"BoundRuntime",
+		} {
+			if strings.Contains(fieldType, forbidden) {
+				t.Fatalf("AttemptSession state field type %q references %s", fieldType, forbidden)
+			}
+		}
 	}
 }
 
@@ -708,6 +1294,23 @@ func cleanupRequest(sequence int) discoverycleanup.OpenAttemptRequest {
 	}
 }
 
+func cleanupRuntimeBinding() discoverysource.RuntimeBinding {
+	return discoverysource.RuntimeBinding{
+		Locator: assetcatalog.SourceLocator{
+			Scope: assetcatalog.SourceScope{
+				TenantID:    uuid(1),
+				WorkspaceID: uuid(2),
+			},
+			SourceID: uuid(40),
+		},
+		SourceRevision:       7,
+		SourceRevisionDigest: strings.Repeat("a", sha256.Size*2),
+		RevisionStatus:       assetcatalog.SourceRevisionPublished,
+		ProviderKind:         "CMDB_CATALOG_V1",
+		ProfileCode:          "CMDB_CATALOG_V1",
+	}
+}
+
 func uuid(value int) string {
 	return fmt.Sprintf("00000000-0000-4000-8000-%012x", value)
 }
@@ -832,6 +1435,223 @@ func (handle *testSessionHandle) destroyCount() int {
 	defer handle.mu.Unlock()
 	return handle.destroyCalls
 }
+
+type runtimeTestOpener struct {
+	mu             sync.Mutex
+	binding        discoverysource.RuntimeBinding
+	cleanupOnly    bool
+	returnInactive bool
+	bindErr        error
+	blockBind      bool
+	handleSecret   string
+	runtimeSecret  string
+	openCalls      int
+	handles        map[string]*runtimeTestSessionHandle
+	second         *runtimeTestSessionHandle
+}
+
+func newRuntimeTestOpener(binding discoverysource.RuntimeBinding) *runtimeTestOpener {
+	return &runtimeTestOpener{
+		binding: binding,
+		handles: make(map[string]*runtimeTestSessionHandle),
+		second: newRuntimeTestSessionHandle(
+			binding,
+			"second-runtime-producing-session",
+			"second-runtime-secret",
+			"",
+			false,
+			false,
+		),
+	}
+}
+
+func (opener *runtimeTestOpener) OpenSession(
+	_ context.Context,
+	request discoverycleanup.OpenAttemptRequest,
+) (discoverycleanup.SessionHandle, error) {
+	opener.mu.Lock()
+	defer opener.mu.Unlock()
+	opener.openCalls++
+	handle := newRuntimeTestSessionHandle(
+		opener.binding,
+		"broker-owned-session",
+		opener.runtimeSecret,
+		opener.handleSecret,
+		opener.returnInactive,
+		opener.blockBind,
+	)
+	handle.bindErr = opener.bindErr
+	opener.handles[request.Attempt.AttemptID] = handle
+	if opener.cleanupOnly {
+		return &cleanupOnlyTestSessionHandle{handle: handle}, nil
+	}
+	return handle, nil
+}
+
+func (opener *runtimeTestOpener) handle(attemptID string) *runtimeTestSessionHandle {
+	opener.mu.Lock()
+	defer opener.mu.Unlock()
+	return opener.handles[attemptID]
+}
+
+func (opener *runtimeTestOpener) secondHandle() *runtimeTestSessionHandle {
+	opener.mu.Lock()
+	defer opener.mu.Unlock()
+	return opener.second
+}
+
+func (opener *runtimeTestOpener) openCount() int {
+	opener.mu.Lock()
+	defer opener.mu.Unlock()
+	return opener.openCalls
+}
+
+type cleanupOnlyTestSessionHandle struct {
+	handle *runtimeTestSessionHandle
+}
+
+func (handle *cleanupOnlyTestSessionHandle) Revoke(ctx context.Context) error {
+	return handle.handle.Revoke(ctx)
+}
+
+func (handle *cleanupOnlyTestSessionHandle) Destroy() {
+	handle.handle.Destroy()
+}
+
+type testRuntimeMaterial struct {
+	SessionMarker string
+	Secret        string
+	Uses          int
+	Cleared       bool
+}
+
+type runtimeTestSessionHandle struct {
+	base           *testSessionHandle
+	mu             sync.Mutex
+	binding        discoverysource.RuntimeBinding
+	sessionMarker  string
+	runtimeSecret  string
+	bindCalls      int
+	bindErr        error
+	returnInactive bool
+	blockBind      bool
+	bindStarted    chan struct{}
+	bindRelease    chan struct{}
+	bindOnce       sync.Once
+	material       *testRuntimeMaterial
+	runtime        discoverysource.BoundRuntime
+}
+
+func newRuntimeTestSessionHandle(
+	binding discoverysource.RuntimeBinding,
+	sessionMarker string,
+	runtimeSecret string,
+	handleSecret string,
+	returnInactive bool,
+	blockBind bool,
+) *runtimeTestSessionHandle {
+	return &runtimeTestSessionHandle{
+		base: &testSessionHandle{
+			secret:           handleSecret,
+			revokeStarted:    make(chan struct{}),
+			destroyStarted:   make(chan struct{}),
+			destroyRelease:   make(chan struct{}),
+			destroyCompleted: make(chan struct{}),
+		},
+		binding:        binding,
+		sessionMarker:  sessionMarker,
+		runtimeSecret:  runtimeSecret,
+		returnInactive: returnInactive,
+		blockBind:      blockBind,
+		bindStarted:    make(chan struct{}),
+		bindRelease:    make(chan struct{}),
+	}
+}
+
+func (handle *runtimeTestSessionHandle) BindRuntime(
+	ctx context.Context,
+	_ discoverysource.RuntimeBinding,
+) (discoverysource.BoundRuntime, error) {
+	handle.mu.Lock()
+	handle.bindCalls++
+	binding := handle.binding
+	sessionMarker := handle.sessionMarker
+	runtimeSecret := handle.runtimeSecret
+	bindErr := handle.bindErr
+	returnInactive := handle.returnInactive
+	blockBind := handle.blockBind
+	handle.mu.Unlock()
+	handle.bindOnce.Do(func() { close(handle.bindStarted) })
+
+	if blockBind {
+		select {
+		case <-ctx.Done():
+			return discoverysource.BoundRuntime{}, ctx.Err()
+		case <-handle.bindRelease:
+		}
+	}
+
+	material := &testRuntimeMaterial{
+		SessionMarker: sessionMarker,
+		Secret:        runtimeSecret,
+	}
+	runtimeView, err := discoverysource.BindRuntime(
+		binding,
+		material,
+		func(*testRuntimeMaterial) error { return nil },
+		func(value *testRuntimeMaterial) {
+			value.Secret = ""
+			value.SessionMarker = ""
+			value.Uses = 0
+			value.Cleared = true
+		},
+	)
+	if err != nil {
+		return discoverysource.BoundRuntime{}, err
+	}
+	handle.mu.Lock()
+	handle.material = material
+	handle.runtime = runtimeView
+	handle.mu.Unlock()
+	if returnInactive {
+		runtimeView.Clear()
+	}
+	if bindErr != nil {
+		return runtimeView, bindErr
+	}
+	return runtimeView, nil
+}
+
+func (handle *runtimeTestSessionHandle) Revoke(ctx context.Context) error {
+	return handle.base.Revoke(ctx)
+}
+
+func (handle *runtimeTestSessionHandle) Destroy() {
+	handle.base.Destroy()
+}
+
+func (handle *runtimeTestSessionHandle) bindCount() int {
+	handle.mu.Lock()
+	defer handle.mu.Unlock()
+	return handle.bindCalls
+}
+
+func (handle *runtimeTestSessionHandle) runtimeCleared() bool {
+	handle.mu.Lock()
+	defer handle.mu.Unlock()
+	return handle.material != nil && handle.material.Cleared
+}
+
+func (handle *runtimeTestSessionHandle) revokeCount() int {
+	return handle.base.revokeCount()
+}
+
+func (handle *runtimeTestSessionHandle) destroyCount() int {
+	return handle.base.destroyCount()
+}
+
+var _ discoverycleanup.SessionHandle = (*cleanupOnlyTestSessionHandle)(nil)
+var _ discoverycleanup.RuntimeSessionHandle = (*runtimeTestSessionHandle)(nil)
 
 type testProofAuthority struct {
 	mu            sync.Mutex
@@ -997,5 +1817,55 @@ func assertSensitiveBoundary(t *testing.T, value sensitiveBoundary, forbidden ..
 	}
 	if !strings.Contains(rendered, "[REDACTED_") {
 		t.Fatalf("sensitive boundary did not use stable redaction: %q", rendered)
+	}
+}
+
+func assertRuntimeSensitiveBoundary(
+	t *testing.T,
+	value discoverysource.BoundRuntime,
+	forbidden ...string,
+) {
+	t.Helper()
+	if _, err := value.MarshalJSON(); !errors.Is(err, discoverysource.ErrSensitiveSerialization) {
+		t.Fatalf("runtime MarshalJSON() error = %v, want ErrSensitiveSerialization", err)
+	}
+	if err := value.UnmarshalJSON([]byte(`{}`)); !errors.Is(err, discoverysource.ErrSensitiveSerialization) {
+		t.Fatalf("runtime UnmarshalJSON() error = %v, want ErrSensitiveSerialization", err)
+	}
+	if _, err := value.MarshalText(); !errors.Is(err, discoverysource.ErrSensitiveSerialization) {
+		t.Fatalf("runtime MarshalText() error = %v, want ErrSensitiveSerialization", err)
+	}
+	if err := value.UnmarshalText([]byte("unsafe")); !errors.Is(err, discoverysource.ErrSensitiveSerialization) {
+		t.Fatalf("runtime UnmarshalText() error = %v, want ErrSensitiveSerialization", err)
+	}
+	if _, err := value.MarshalBinary(); !errors.Is(err, discoverysource.ErrSensitiveSerialization) {
+		t.Fatalf("runtime MarshalBinary() error = %v, want ErrSensitiveSerialization", err)
+	}
+	if err := value.UnmarshalBinary([]byte("unsafe")); !errors.Is(err, discoverysource.ErrSensitiveSerialization) {
+		t.Fatalf("runtime UnmarshalBinary() error = %v, want ErrSensitiveSerialization", err)
+	}
+	if _, err := json.Marshal(value); !errors.Is(err, discoverysource.ErrSensitiveSerialization) {
+		t.Fatalf("json.Marshal(runtime) error = %v, want ErrSensitiveSerialization", err)
+	}
+
+	var log bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&log, nil))
+	logger.Info("runtime-boundary", "value", value)
+	rendered := strings.Join([]string{
+		value.String(),
+		value.GoString(),
+		fmt.Sprintf("%s", value),
+		fmt.Sprintf("%v", value),
+		fmt.Sprintf("%+v", value),
+		fmt.Sprintf("%#v", value),
+		log.String(),
+	}, "\n")
+	for _, secret := range forbidden {
+		if strings.Contains(rendered, secret) {
+			t.Fatalf("runtime boundary leaked %q in %q", secret, rendered)
+		}
+	}
+	if !strings.Contains(rendered, "[REDACTED_") {
+		t.Fatalf("runtime boundary did not use stable redaction: %q", rendered)
 	}
 }

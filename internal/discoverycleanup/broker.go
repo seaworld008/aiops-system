@@ -14,9 +14,11 @@ import (
 	"reflect"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/seaworld008/aiops-system/internal/assetcatalog"
 	"github.com/seaworld008/aiops-system/internal/discoveryqueue"
+	"github.com/seaworld008/aiops-system/internal/discoverysource"
 )
 
 const (
@@ -32,6 +34,7 @@ var (
 	ErrAttemptDrift           = errors.New("cleanup broker attempt drift")
 	ErrAttemptClosed          = errors.New("cleanup broker attempt closed")
 	ErrAttemptUncertain       = errors.New("cleanup broker attempt result uncertain")
+	ErrRuntimeUnavailable     = errors.New("cleanup broker attempt runtime unavailable")
 	ErrSessionAuthentication  = errors.New("cleanup broker session authentication failed")
 	ErrSessionDestroyed       = errors.New("cleanup broker session destroyed")
 	ErrProofAuthentication    = errors.New("cleanup broker proof authentication failed")
@@ -75,6 +78,21 @@ type SessionHandle interface {
 	Destroy()
 }
 
+// RuntimeSessionHandle is an optional process-local extension implemented only
+// by handles that can expose Provider runtime for their exact opened session.
+// Cleanup-only recovery handles deliberately implement SessionHandle alone.
+// The Broker invokes BindRuntime itself; callers never receive the raw handle
+// and cannot submit a separately opened runtime. Implementations must reject
+// an expected binding that is not the binding of that same opened session and
+// must return a BoundRuntime backed by that session's own runtime cell.
+type RuntimeSessionHandle interface {
+	SessionHandle
+	BindRuntime(
+		context.Context,
+		discoverysource.RuntimeBinding,
+	) (discoverysource.BoundRuntime, error)
+}
+
 // ProofAuthority signs and verifies the raw SHA-256 digest of the canonical
 // cleanup proof tuple. Implementations must be concurrency-safe, honor context
 // cancellation, and neither retain nor mutate digest/signature input slices.
@@ -103,12 +121,20 @@ type brokerState struct {
 }
 
 type attemptState struct {
-	request OpenAttemptRequest
+	request  OpenAttemptRequest
+	sessions map[*attemptSessionTicket]struct{}
 
 	openDone     chan struct{}
 	openComplete bool
 	openErr      error
 	handle       SessionHandle
+
+	bindDone     chan struct{}
+	bindStarted  bool
+	bindComplete bool
+	bindBinding  discoverysource.RuntimeBinding
+	bindRuntime  discoverysource.BoundRuntime
+	bindErr      error
 
 	revokeDone     chan struct{}
 	revokeStarted  bool
@@ -182,8 +208,9 @@ func (broker *CleanupBroker) OpenAttempt(
 				private.mu.Unlock()
 				return nil, ErrAttemptUncertain
 			}
+			session := newAttemptSession(state)
 			private.mu.Unlock()
-			return newAttemptSession(request.Attempt), nil
+			return session, nil
 		}
 
 		state = &attemptState{
@@ -215,13 +242,143 @@ func (broker *CleanupBroker) OpenAttempt(
 		state.openErr = mappedErr
 		state.openComplete = true
 		close(state.openDone)
+		var session *AttemptSession
+		if mappedErr == nil {
+			session = newAttemptSession(state)
+		}
 		private.mu.Unlock()
 		private.operations.Done()
 
 		if mappedErr != nil {
 			return nil, mappedErr
 		}
-		return newAttemptSession(request.Attempt), nil
+		return session, nil
+	}
+}
+
+// BindAttemptRuntime asks the exact Broker-owned handle for the Provider
+// runtime of an opened attempt. The acknowledgement authenticates only the
+// exact wrapper issued by this Broker; same-session runtime provenance comes
+// exclusively from invoking the handle stored in that attempt state.
+func (broker *CleanupBroker) BindAttemptRuntime(
+	ctx context.Context,
+	session *AttemptSession,
+	expected discoverysource.RuntimeBinding,
+) (discoverysource.BoundRuntime, error) {
+	if ctx == nil {
+		return discoverysource.BoundRuntime{}, ErrInvalidInput
+	}
+	if err := ctx.Err(); err != nil {
+		return discoverysource.BoundRuntime{}, err
+	}
+	if broker == nil || broker.state == nil {
+		return discoverysource.BoundRuntime{}, ErrBrokerUnavailable
+	}
+	private := broker.state
+
+	for {
+		private.mu.Lock()
+		if private.destroyed {
+			private.mu.Unlock()
+			return discoverysource.BoundRuntime{}, ErrBrokerUnavailable
+		}
+		state, acknowledgement, sessionErr := authenticateAttemptSession(private, session)
+		if sessionErr != nil {
+			private.mu.Unlock()
+			return discoverysource.BoundRuntime{}, sessionErr
+		}
+		if state.revokeStarted || state.revokeComplete {
+			acknowledgement.mu.RUnlock()
+			private.mu.Unlock()
+			return discoverysource.BoundRuntime{}, ErrAttemptClosed
+		}
+		if !state.openComplete || state.openErr != nil || nilInterface(state.handle) {
+			acknowledgement.mu.RUnlock()
+			private.mu.Unlock()
+			return discoverysource.BoundRuntime{}, ErrRuntimeUnavailable
+		}
+		if state.bindComplete {
+			if state.bindBinding != expected {
+				acknowledgement.mu.RUnlock()
+				private.mu.Unlock()
+				return discoverysource.BoundRuntime{}, ErrAttemptDrift
+			}
+			if state.bindErr != nil {
+				bindErr := state.bindErr
+				acknowledgement.mu.RUnlock()
+				private.mu.Unlock()
+				return discoverysource.BoundRuntime{}, bindErr
+			}
+			runtimeView := state.bindRuntime
+			acknowledgement.mu.RUnlock()
+			private.mu.Unlock()
+			if runtimeView.Binding() != expected {
+				return discoverysource.BoundRuntime{}, ErrRuntimeUnavailable
+			}
+			return runtimeView, nil
+		}
+		if state.bindStarted {
+			if state.bindBinding != expected {
+				acknowledgement.mu.RUnlock()
+				private.mu.Unlock()
+				return discoverysource.BoundRuntime{}, ErrAttemptDrift
+			}
+			done := state.bindDone
+			acknowledgement.mu.RUnlock()
+			private.mu.Unlock()
+			if err := waitFor(ctx, private.lifetime, done); err != nil {
+				return discoverysource.BoundRuntime{}, err
+			}
+			continue
+		}
+
+		state.bindStarted = true
+		state.bindBinding = expected
+		state.bindDone = make(chan struct{})
+		runtimeHandle, runtimeCapable := state.handle.(RuntimeSessionHandle)
+		if !runtimeCapable || nilInterface(runtimeHandle) {
+			state.bindComplete = true
+			state.bindErr = ErrRuntimeUnavailable
+			close(state.bindDone)
+			acknowledgement.mu.RUnlock()
+			private.mu.Unlock()
+			return discoverysource.BoundRuntime{}, ErrRuntimeUnavailable
+		}
+		private.operations.Add(1)
+		acknowledgement.mu.RUnlock()
+		private.mu.Unlock()
+
+		operationCtx, releaseOperation := linkedContext(ctx, private.lifetime)
+		runtimeView, bindErr := runtimeHandle.BindRuntime(operationCtx, expected)
+		releaseOperation()
+		mappedErr := classifyRuntimeBindResult(runtimeView, expected, bindErr)
+
+		private.mu.Lock()
+		state.bindComplete = true
+		if private.destroyed {
+			state.bindErr = ErrBrokerUnavailable
+			close(state.bindDone)
+			private.mu.Unlock()
+			runtimeView.Clear()
+			private.operations.Done()
+			return discoverysource.BoundRuntime{}, ErrBrokerUnavailable
+		}
+		if mappedErr != nil {
+			state.bindErr = mappedErr
+		} else {
+			state.bindRuntime = runtimeView
+		}
+		close(state.bindDone)
+		private.mu.Unlock()
+		if mappedErr != nil {
+			runtimeView.Clear()
+		}
+		private.operations.Done()
+
+		if mappedErr != nil {
+			return discoverysource.BoundRuntime{}, mappedErr
+		}
+		return runtimeView, nil
 	}
 }
 
@@ -260,6 +417,14 @@ func (broker *CleanupBroker) RevokeAttempt(
 			}
 			continue
 		}
+		if state.bindStarted && !state.bindComplete {
+			done := state.bindDone
+			private.mu.Unlock()
+			if err := waitFor(ctx, private.lifetime, done); err != nil {
+				return discoveryqueue.CleanupProof{}, err
+			}
+			continue
+		}
 		if state.revokeComplete {
 			if state.revokeErr != nil {
 				revokeErr := state.revokeErr
@@ -282,6 +447,8 @@ func (broker *CleanupBroker) RevokeAttempt(
 		hasHandle := !nilInterface(handle)
 		request := state.request
 		openErr := state.openErr
+		runtimeView := state.bindRuntime
+		state.bindRuntime = discoverysource.BoundRuntime{}
 		state.revokeStarted = true
 		state.revokeDone = make(chan struct{})
 		private.operations.Add(1)
@@ -294,6 +461,7 @@ func (broker *CleanupBroker) RevokeAttempt(
 			releaseOperation()
 			handle.Destroy()
 		}
+		runtimeView.Clear()
 		status := assetcatalog.CredentialCleanupUncertain
 		if hasHandle && openErr == nil && revokeErr == nil {
 			status = assetcatalog.CredentialCleanupRevoked
@@ -432,11 +600,14 @@ func (broker *CleanupBroker) Destroy() {
 
 	private.mu.Lock()
 	handles := make([]SessionHandle, 0, len(private.attempts))
+	runtimes := make([]discoverysource.BoundRuntime, 0, len(private.attempts))
 	for _, state := range private.attempts {
 		if !nilInterface(state.handle) {
 			handles = append(handles, state.handle)
 			state.handle = nil
 		}
+		runtimes = append(runtimes, state.bindRuntime)
+		state.bindRuntime = discoverysource.BoundRuntime{}
 		state.proof.Destroy()
 	}
 	private.attempts = nil
@@ -444,6 +615,9 @@ func (broker *CleanupBroker) Destroy() {
 
 	for _, handle := range handles {
 		handle.Destroy()
+	}
+	for _, runtimeView := range runtimes {
+		runtimeView.Clear()
 	}
 	close(private.destroyDone)
 }
@@ -454,14 +628,40 @@ type AttemptSession struct {
 	state *attemptSessionState
 }
 
+// attemptSessionTicket is an identity-only acknowledgement marker. It contains
+// no tuple, token, secret, runtime, owner, attempt state, or handle reference.
+type attemptSessionTicket struct {
+	active atomic.Bool
+}
+
 type attemptSessionState struct {
 	mu        sync.RWMutex
 	attempt   discoveryqueue.CleanupAttempt
+	ticket    *attemptSessionTicket
+	issued    *AttemptSession
 	destroyed bool
 }
 
-func newAttemptSession(attempt discoveryqueue.CleanupAttempt) *AttemptSession {
-	return &AttemptSession{state: &attemptSessionState{attempt: attempt}}
+// newAttemptSession is called only while the owning broker mutex is held.
+func newAttemptSession(attempt *attemptState) *AttemptSession {
+	if attempt.sessions == nil {
+		attempt.sessions = make(map[*attemptSessionTicket]struct{})
+	}
+	for ticket := range attempt.sessions {
+		if !ticket.active.Load() {
+			delete(attempt.sessions, ticket)
+		}
+	}
+	ticket := &attemptSessionTicket{}
+	ticket.active.Store(true)
+	attempt.sessions[ticket] = struct{}{}
+	private := &attemptSessionState{
+		attempt: attempt.request.Attempt,
+		ticket:  ticket,
+	}
+	session := &AttemptSession{state: private}
+	private.issued = session
+	return session
 }
 
 func (session *AttemptSession) Attempt() (discoveryqueue.CleanupAttempt, error) {
@@ -473,6 +673,9 @@ func (session *AttemptSession) Attempt() (discoveryqueue.CleanupAttempt, error) 
 	defer private.mu.RUnlock()
 	if private.destroyed {
 		return discoveryqueue.CleanupAttempt{}, ErrSessionDestroyed
+	}
+	if private.issued != session {
+		return discoveryqueue.CleanupAttempt{}, ErrSessionAuthentication
 	}
 	return private.attempt, nil
 }
@@ -487,8 +690,14 @@ func (session *AttemptSession) Destroy() {
 	if private.destroyed {
 		return
 	}
+	if private.issued != session {
+		return
+	}
+	private.ticket.active.Store(false)
 	private.destroyed = true
 	private.attempt = discoveryqueue.CleanupAttempt{}
+	private.ticket = nil
+	private.issued = nil
 }
 
 func (AttemptSession) MarshalJSON() ([]byte, error) {
@@ -567,6 +776,41 @@ func sameRequest(left, right OpenAttemptRequest) bool {
 		left.Attempt == right.Attempt
 }
 
+// authenticateAttemptSession must be called while owner.mu is held. On success
+// it returns the acknowledgement state with its read lock held so the caller
+// can atomically admit or reject the bind before Destroy can invalidate it.
+// Wrapper identity authenticates only the exact Broker-issued acknowledgement;
+// runtime provenance still comes solely from the returned attempt's handle.
+func authenticateAttemptSession(
+	owner *brokerState,
+	session *AttemptSession,
+) (*attemptState, *attemptSessionState, error) {
+	if owner == nil || session == nil || session.state == nil {
+		return nil, nil, ErrSessionAuthentication
+	}
+	private := session.state
+	private.mu.RLock()
+	if private.destroyed {
+		private.mu.RUnlock()
+		return nil, nil, ErrSessionDestroyed
+	}
+	if private.issued != session || private.ticket == nil ||
+		!private.ticket.active.Load() {
+		private.mu.RUnlock()
+		return nil, nil, ErrSessionAuthentication
+	}
+	state, exists := owner.attempts[private.attempt.AttemptID]
+	if !exists || state.request.Attempt != private.attempt {
+		private.mu.RUnlock()
+		return nil, nil, ErrSessionAuthentication
+	}
+	if _, exists := state.sessions[private.ticket]; !exists {
+		private.mu.RUnlock()
+		return nil, nil, ErrSessionAuthentication
+	}
+	return state, private, nil
+}
+
 func classifyOpenResult(handle SessionHandle, err error) error {
 	if err == nil && !nilInterface(handle) {
 		return nil
@@ -575,6 +819,24 @@ func classifyOpenResult(handle SessionHandle, err error) error {
 		return ErrSessionAuthentication
 	}
 	return ErrAttemptUncertain
+}
+
+func classifyRuntimeBindResult(
+	runtimeView discoverysource.BoundRuntime,
+	expected discoverysource.RuntimeBinding,
+	err error,
+) error {
+	if err != nil {
+		return ErrRuntimeUnavailable
+	}
+	binding := runtimeView.Binding()
+	if binding == (discoverysource.RuntimeBinding{}) {
+		return ErrRuntimeUnavailable
+	}
+	if binding != expected {
+		return ErrAttemptDrift
+	}
+	return nil
 }
 
 func linkedContext(
