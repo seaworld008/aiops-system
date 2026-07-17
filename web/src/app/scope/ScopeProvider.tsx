@@ -29,6 +29,17 @@ type ScopeTransition = {
   targetURL?: string;
 };
 
+type PendingTransition =
+  | {
+      kind: "scope";
+      transition: ScopeTransition;
+    }
+  | {
+      kind: "navigation";
+      targetURL: string;
+      preserveTargetSearch: boolean;
+    };
+
 const scopeSpecificSearchKeys = [
   "cursor",
   "trail",
@@ -50,7 +61,7 @@ export function ScopeProvider({
   const [scope, setScope] = useState<Scope | undefined>(() =>
     initialScope(session),
   );
-  const [pending, setPending] = useState<ScopeTransition | undefined>();
+  const [pending, setPending] = useState<PendingTransition | undefined>();
   const draftGuards = useRef(new Set<DraftGuardRegistration>());
   const currentURL = useRef(window.location.href);
   const registerDraftGuard = useCallback(
@@ -70,6 +81,42 @@ export function ScopeProvider({
       ),
     [isDirty],
   );
+  const discardDirtyDrafts = useCallback(() => {
+    onDiscardDraft?.();
+    for (const registration of draftGuards.current) {
+      if (draftIsDirty(registration)) {
+        registration.discard();
+      }
+    }
+  }, [onDiscardDraft]);
+
+  useEffect(() => {
+    const history = window.history;
+    const originalPushState = history.pushState.bind(history);
+    const originalReplaceState = history.replaceState.bind(history);
+    const trackedPushState: History["pushState"] = (data, unused, url) => {
+      originalPushState(data, unused, url);
+      currentURL.current = window.location.href;
+    };
+    const trackedReplaceState: History["replaceState"] = (
+      data,
+      unused,
+      url,
+    ) => {
+      originalReplaceState(data, unused, url);
+      currentURL.current = window.location.href;
+    };
+    history.pushState = trackedPushState;
+    history.replaceState = trackedReplaceState;
+    return () => {
+      if (history.pushState === trackedPushState) {
+        history.pushState = originalPushState;
+      }
+      if (history.replaceState === trackedReplaceState) {
+        history.replaceState = originalReplaceState;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (scope !== undefined) {
@@ -120,12 +167,7 @@ export function ScopeProvider({
         query.queryKey[2] === previous.environmentId,
     });
     try {
-      onDiscardDraft?.();
-      for (const registration of draftGuards.current) {
-        if (draftIsDirty(registration)) {
-          registration.discard();
-        }
-      }
+      discardDirtyDrafts();
     } catch {
       setPending(undefined);
       return;
@@ -136,7 +178,63 @@ export function ScopeProvider({
     currentURL.current = destination.href;
     setScope(transition.next);
     setPending(undefined);
-  }, [onDiscardDraft, queryClient, scope, session]);
+  }, [discardDirtyDrafts, queryClient, scope, session]);
+
+  const applyNavigation = useCallback(
+    (
+      targetURL: string,
+      discardDrafts: boolean,
+      preserveTargetSearch: boolean,
+    ) => {
+      if (scope === undefined) {
+        return;
+      }
+      const destination = preserveTargetSearch
+        ? validatedTransitionURL(session, scope, targetURL)
+        : validatedNavigationURL(session, scope, targetURL);
+      if (destination === undefined) {
+        setPending(undefined);
+        return;
+      }
+      if (discardDrafts) {
+        try {
+          discardDirtyDrafts();
+        } catch {
+          setPending(undefined);
+          return;
+        }
+      }
+      currentURL.current = destination.href;
+      setPending(undefined);
+      window.history.pushState(window.history.state, "", destination.href);
+    },
+    [discardDirtyDrafts, scope, session],
+  );
+
+  const requestNavigation = useCallback(
+    (targetURL: string) => {
+      if (scope === undefined) {
+        return;
+      }
+      const destination = validatedNavigationURL(session, scope, targetURL);
+      if (
+        destination === undefined ||
+        destination.href === new URL(window.location.href).href
+      ) {
+        return;
+      }
+      if (hasDirtyDraft()) {
+        setPending({
+          kind: "navigation",
+          targetURL: destination.href,
+          preserveTargetSearch: false,
+        });
+        return;
+      }
+      applyNavigation(destination.href, false, false);
+    },
+    [applyNavigation, hasDirtyDraft, scope, session],
+  );
 
   const requestScopeChange = (next: Scope) => {
     if (scope === undefined) {
@@ -159,7 +257,10 @@ export function ScopeProvider({
       history: "push",
     };
     if (hasDirtyDraft()) {
-      setPending(transition);
+      setPending({
+        kind: "scope",
+        transition,
+      });
       return;
     }
     void applyScope(transition);
@@ -177,15 +278,27 @@ export function ScopeProvider({
         return;
       }
       if (sameScope(scope, next)) {
+        if (hasDirtyDraft()) {
+          replaceHistoryURL(currentURL.current);
+          setPending({
+            kind: "navigation",
+            targetURL: targetURL.href,
+            preserveTargetSearch: true,
+          });
+          return;
+        }
         currentURL.current = targetURL.href;
         return;
       }
       if (hasDirtyDraft()) {
         replaceHistoryURL(currentURL.current);
         setPending({
-          next,
-          history: "push",
-          targetURL: targetURL.href,
+          kind: "scope",
+          transition: {
+            next,
+            history: "push",
+            targetURL: targetURL.href,
+          },
         });
         return;
       }
@@ -214,6 +327,7 @@ export function ScopeProvider({
     <ScopeRuntimeProvider
       scope={scope}
       requestScopeChange={requestScopeChange}
+      requestNavigation={requestNavigation}
       registerDraftGuard={registerDraftGuard}
     >
       {children}
@@ -231,9 +345,13 @@ export function ScopeProvider({
             className="dialog-content"
             aria-describedby="scope-switch-description"
           >
-            <AlertDialog.Title>切换作用域</AlertDialog.Title>
+            <AlertDialog.Title>
+              {pending?.kind === "navigation" ? "离开当前页面" : "切换作用域"}
+            </AlertDialog.Title>
             <AlertDialog.Description id="scope-switch-description">
-              当前存在未保存草稿。切换会只放弃本地草稿，并清理旧作用域查询。
+              {pending?.kind === "navigation"
+                ? "当前存在未保存草稿。前往其他页面会只放弃本地草稿。"
+                : "当前存在未保存草稿。切换会只放弃本地草稿，并清理旧作用域查询。"}
             </AlertDialog.Description>
             <div className="dialog-actions">
               <AlertDialog.Cancel asChild>
@@ -243,12 +361,20 @@ export function ScopeProvider({
                 <button
                   type="button"
                   onClick={() => {
-                    if (pending !== undefined) {
-                      void applyScope(pending);
+                    if (pending?.kind === "navigation") {
+                      applyNavigation(
+                        pending.targetURL,
+                        true,
+                        pending.preserveTargetSearch,
+                      );
+                    } else if (pending?.kind === "scope") {
+                      void applyScope(pending.transition);
                     }
                   }}
                 >
-                  放弃并切换
+                  {pending?.kind === "navigation"
+                    ? "放弃并前往"
+                    : "放弃并切换"}
                 </button>
               </AlertDialog.Action>
             </div>
@@ -319,6 +445,23 @@ function validatedTransitionURL(
   ) {
     return undefined;
   }
+  return url;
+}
+
+function validatedNavigationURL(
+  session: Session,
+  scope: Scope,
+  value: string,
+): URL | undefined {
+  const url = validatedTransitionURL(session, scope, value);
+  if (url === undefined) {
+    return undefined;
+  }
+  url.search = new URLSearchParams({
+    workspace: scope.workspaceId,
+    environment: scope.environmentId,
+  }).toString();
+  url.hash = "";
   return url;
 }
 

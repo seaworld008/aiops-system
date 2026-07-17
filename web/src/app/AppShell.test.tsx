@@ -58,7 +58,9 @@ function renderShell(options?: {
   dirty?: boolean;
   onDiscardDraft?: () => void;
   queryClient?: QueryClient;
+  session?: Session;
 }) {
+  const activeSession = options?.session ?? session;
   const queryClient =
     options?.queryClient ??
     new QueryClient({
@@ -67,7 +69,7 @@ function renderShell(options?: {
   const Providers = ({ children }: PropsWithChildren) => (
     <QueryClientProvider client={queryClient}>
       <ScopeProvider
-        session={session}
+        session={activeSession}
         isDirty={options?.dirty ?? false}
         {...(options?.onDiscardDraft === undefined
           ? {}
@@ -80,7 +82,7 @@ function renderShell(options?: {
   return {
     queryClient,
     ...render(
-      <AppShell session={session}>
+      <AppShell session={activeSession}>
         <h1>应用基础已加载</h1>
       </AppShell>,
       { wrapper: Providers },
@@ -360,6 +362,186 @@ describe("AppShell", () => {
     await user.click(screen.getByRole("link", { name: "跳到主内容" }));
     expect(screen.getByRole("main")).toHaveFocus();
     expect(screen.getByText("张三")).toBeVisible();
+  });
+
+  it("links only implemented asset pages with the current Scope and no role inference", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      `/assets?workspace=${workspaceOne}&environment=${environmentOne}` +
+        "&cursor=private-page&assetId=private-selection",
+    );
+    renderShell({
+      session: {
+        ...session,
+        roles: [],
+      },
+    });
+
+    expect(
+      screen.getByRole("link", { name: /资产目录/ }),
+    ).toHaveAttribute(
+      "href",
+      `/assets?workspace=${workspaceOne}&environment=${environmentOne}`,
+    );
+    expect(
+      screen.getByRole("link", { name: /映射工作台/ }),
+    ).toHaveAttribute(
+      "href",
+      `/asset-mappings?workspace=${workspaceOne}&environment=${environmentOne}`,
+    );
+
+    for (const label of [
+      "总览",
+      "事件处置",
+      "调查记录",
+      "主动调查",
+      "受治理动作",
+      "连接与数据源",
+      "发现与同步",
+      "凭据引用",
+      "Runner 与能力",
+      "授权与策略",
+      "审计日志",
+      "生产发布",
+    ]) {
+      expect(
+        screen.getByText(label).closest("[aria-disabled='true']"),
+      ).not.toBeNull();
+      expect(
+        screen.queryByRole("link", { name: new RegExp(label) }),
+      ).not.toBeInTheDocument();
+    }
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("link", { name: /映射工作台/ }));
+    await waitFor(() => {
+      expect(window.location.pathname).toBe("/asset-mappings");
+    });
+    const search = new URL(window.location.href).searchParams;
+    expect(search.get("workspace")).toBe(workspaceOne);
+    expect(search.get("environment")).toBe(environmentOne);
+    expect(search.get("cursor")).toBeNull();
+    expect(search.get("assetId")).toBeNull();
+  });
+
+  it("guards dirty drafts before navigating to another implemented page", async () => {
+    const currentURL =
+      `/assets?workspace=${workspaceOne}&environment=${environmentOne}` +
+      "&cursor=private-page&assetId=private-selection";
+    window.history.replaceState({}, "", currentURL);
+    const user = userEvent.setup();
+    const onDiscard = vi.fn();
+    renderFormalApplication(
+      <AppShell session={session}>
+        <RegisteredDirtyDraft onDiscard={onDiscard} />
+      </AppShell>,
+    );
+
+    await user.click(screen.getByRole("link", { name: /映射工作台/ }));
+
+    expect(
+      screen.getByRole("alertdialog", { name: "离开当前页面" }),
+    ).toBeVisible();
+    expect(window.location.href).toBe(
+      new URL(currentURL, window.location.origin).href,
+    );
+    expect(onDiscard).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    expect(window.location.href).toBe(
+      new URL(currentURL, window.location.origin).href,
+    );
+    expect(onDiscard).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("link", { name: /映射工作台/ }));
+    await user.click(screen.getByRole("button", { name: "放弃并前往" }));
+
+    await waitFor(() => {
+      expect(window.location.pathname).toBe("/asset-mappings");
+    });
+    const search = new URL(window.location.href).searchParams;
+    expect(search.get("workspace")).toBe(workspaceOne);
+    expect(search.get("environment")).toBe(environmentOne);
+    expect(search.get("cursor")).toBeNull();
+    expect(search.get("assetId")).toBeNull();
+    expect(onDiscard).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the actual current URL when returning from a same-Scope detail route", async () => {
+    const listURL =
+      `/assets?workspace=${workspaceOne}&environment=${environmentOne}`;
+    window.history.replaceState({}, "", listURL);
+    const user = userEvent.setup();
+    renderShell();
+
+    act(() => {
+      window.history.pushState(
+        {},
+        "",
+        `/assets/77777777-7777-4777-8777-777777777777` +
+          `?workspace=${workspaceOne}&environment=${environmentOne}` +
+          "&tab=relations",
+      );
+    });
+    await user.click(screen.getByRole("link", { name: /资产目录/ }));
+
+    await waitFor(() => {
+      expect(window.location.pathname).toBe("/assets");
+    });
+    expect(window.location.search).toBe(
+      `?workspace=${workspaceOne}&environment=${environmentOne}`,
+    );
+  });
+
+  it("guards dirty drafts on same-Scope browser history navigation", async () => {
+    const targetURL =
+      `/assets?workspace=${workspaceOne}&environment=${environmentOne}` +
+      "&assetId=same-scope-history-target";
+    const currentURL =
+      `/asset-mappings?workspace=${workspaceOne}&environment=${environmentOne}` +
+      "&conflictId=dirty-same-scope";
+    window.history.replaceState({}, "", targetURL);
+    const onDiscard = vi.fn();
+    const user = userEvent.setup();
+    renderFormalApplication(
+      <AppShell session={session}>
+        <RegisteredDirtyDraft onDiscard={onDiscard} />
+      </AppShell>,
+    );
+    act(() => {
+      window.history.pushState({}, "", currentURL);
+    });
+
+    await navigateBack();
+    expect(
+      await screen.findByRole("alertdialog", { name: "离开当前页面" }),
+    ).toBeVisible();
+    expect(window.location.href).toBe(
+      new URL(currentURL, window.location.origin).href,
+    );
+    expect(onDiscard).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    expect(window.location.href).toBe(
+      new URL(currentURL, window.location.origin).href,
+    );
+    expect(onDiscard).not.toHaveBeenCalled();
+
+    window.history.pushState({}, "", targetURL);
+    window.history.pushState({}, "", currentURL);
+    await navigateBack();
+    await user.click(screen.getByRole("button", { name: "放弃并前往" }));
+
+    await waitFor(() => {
+      expect(window.location.pathname).toBe("/assets");
+    });
+    expect(onDiscard).toHaveBeenCalledTimes(1);
+    const search = new URL(window.location.href).searchParams;
+    expect(search.get("workspace")).toBe(workspaceOne);
+    expect(search.get("environment")).toBe(environmentOne);
+    expect(search.get("assetId")).toBe("same-scope-history-target");
+    expect(search.get("conflictId")).toBeNull();
   });
 
   it("adds a missing authorized Scope without deleting deep-link parameters on refresh", () => {
