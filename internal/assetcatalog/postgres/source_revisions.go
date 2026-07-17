@@ -1558,7 +1558,7 @@ INSERT INTO audit_records (
 }
 
 func sourceValidationRuntimeClosed(profileCode assetcatalog.ProfileCode) bool {
-	return profileCode == assetcatalog.ProfileCode("CSV_RFC4180_V1")
+	return profileCode != assetcatalog.ProfileCode("MANUAL_V1")
 }
 
 func (repository *Repository) requestValidationInTx(

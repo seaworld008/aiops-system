@@ -1637,14 +1637,47 @@ func TestSourceRevisionIntegrationPublishRejectsVisibleValidationGateBindingDrif
 		t.Fatal(err)
 	}
 	scope := assetcatalog.SourceScope{TenantID: fixture.tenantID, WorkspaceID: fixture.workspaceID}
-	var sourceVersion int64
-	if err := harness.db.QueryRow(context.Background(),
-		`SELECT version FROM asset_sources WHERE id=$1::uuid`,
-		fixture.sourceID,
-	).Scan(&sourceVersion); err != nil {
+	var sourceVersion, revisionOneVersion int64
+	if err := harness.db.QueryRow(context.Background(), `
+SELECT source.version,revision.version
+FROM asset_sources AS source
+JOIN asset_source_revisions AS revision ON revision.id=$2::uuid
+WHERE source.id=$1::uuid AND revision.source_id=source.id
+`, fixture.sourceID, revisionOneID).Scan(&sourceVersion, &revisionOneVersion); err != nil {
 		t.Fatal(err)
 	}
-	revisionTwoValidation, err := repository.RequestValidation(
+	type databaseSnapshot struct {
+		source, revisions, runs string
+		audits, outbox          int64
+	}
+	readSnapshot := func() databaseSnapshot {
+		var snapshot databaseSnapshot
+		if err := harness.db.QueryRow(context.Background(), `
+SELECT source::text,
+       COALESCE((
+         SELECT array_agg(revision_row ORDER BY revision_row.revision)::text
+         FROM asset_source_revisions AS revision_row
+         WHERE revision_row.source_id=source.id
+       ),'{}'),
+       COALESCE((
+         SELECT array_agg(run_row ORDER BY run_row.id)::text
+         FROM asset_source_runs AS run_row
+         WHERE run_row.source_id=source.id
+       ),'{}'),
+       (SELECT count(*) FROM audit_records WHERE workspace_id=$2::uuid),
+       (SELECT count(*) FROM outbox_events WHERE workspace_id=$2::uuid)
+FROM asset_sources AS source
+WHERE source.id=$1::uuid
+`, fixture.sourceID, fixture.workspaceID).Scan(
+			&snapshot.source, &snapshot.revisions, &snapshot.runs,
+			&snapshot.audits, &snapshot.outbox,
+		); err != nil {
+			t.Fatal(err)
+		}
+		return snapshot
+	}
+	before := readSnapshot()
+	rejected, err := repository.RequestValidation(
 		context.Background(),
 		assetcatalog.ValidateSourceRevisionCommand{
 			Context:  sourceRevisionMutationContext(t, scope, "validate-revision-two-gate-drift", "4"),
@@ -1653,56 +1686,50 @@ func TestSourceRevisionIntegrationPublishRejectsVisibleValidationGateBindingDrif
 			ExpectedRevisionDigest: fixture.revisionDigest,
 		},
 	)
-	if err != nil {
-		t.Fatalf("RequestValidation(revision two) error = %v", err)
+	if !errors.Is(err, assetcatalog.ErrUnavailable) {
+		t.Fatalf("RequestValidation(revision two) error = %v, want ErrUnavailable", err)
 	}
-	if revisionTwoValidation.Run.Status != assetcatalog.RunStatusQueued {
-		t.Fatalf("revision two validation run = %#v", revisionTwoValidation.Run)
+	if rejected.Source.ID != "" || rejected.Revision.ID != "" ||
+		rejected.Run.ID != "" || rejected.Receipt.AuditID != "" {
+		t.Fatalf("RequestValidation(revision two) returned a mutation")
 	}
-	before := readSourceRevisionGateBindingSnapshot(
-		t, harness.db, fixture.sourceID, revisionOneID, fixture.revisionID,
-	)
-	if before.GateStatus != "VALIDATING" ||
-		before.GateReasonCode != "VALIDATION_IN_PROGRESS" ||
-		before.SourceValidationDigest != "" || before.SourceBindingDigest != "" ||
-		before.SourceValidationRunID != revisionTwoValidation.Run.ID ||
-		before.RevisionOneValidationRunID != revisionOneRunID ||
-		before.RevisionOneStatus != "VALIDATED" ||
-		before.RevisionTwoStatus != "VALIDATING" ||
-		before.RevisionTwoRunStatus != "QUEUED" {
-		t.Fatalf("gate-binding drift fixture = %#v", before)
+	afterValidation := readSnapshot()
+	if afterValidation != before {
+		t.Fatalf(
+			"RequestValidation(revision two) side effects = source:%t revisions:%t runs:%t audits:%t outbox:%t",
+			afterValidation.source != before.source,
+			afterValidation.revisions != before.revisions,
+			afterValidation.runs != before.runs,
+			afterValidation.audits != before.audits,
+			afterValidation.outbox != before.outbox,
+		)
 	}
 	command := assetcatalog.PublishSourceRevisionCommand{
 		Context:  sourceRevisionMutationContext(t, scope, "publish-gate-binding-drift", "3"),
 		SourceID: fixture.sourceID, Revision: 1, ReasonCode: "VALIDATION_REVIEWED",
-		ExpectedSourceVersion:   before.SourceVersion,
-		ExpectedRevisionVersion: before.RevisionOneVersion,
+		ExpectedSourceVersion:   sourceVersion,
+		ExpectedRevisionVersion: revisionOneVersion,
 		ExpectedRevisionDigest:  revisionOneDigest,
 		ExpectedValidationRunID: revisionOneRunID, ExpectedValidationDigest: revisionOneProof,
 	}
-	if _, err := repository.Publish(context.Background(), command); !errors.Is(
-		err, assetcatalog.ErrStateConflict,
-	) {
-		t.Fatalf("Publish(gate binding drift) error = %v", err)
+	published, err := repository.Publish(context.Background(), command)
+	if !errors.Is(err, assetcatalog.ErrUnavailable) {
+		t.Fatalf("Publish(gate binding drift) error = %v, want ErrUnavailable", err)
 	}
-	after := readSourceRevisionGateBindingSnapshot(
-		t, harness.db, fixture.sourceID, revisionOneID, fixture.revisionID,
-	)
-	var auditCount, outboxCount int
-	if err := harness.db.QueryRow(context.Background(), `
-SELECT
-  (SELECT count(*) FROM audit_records
-   WHERE workspace_id=$1::uuid AND request_id=$2),
-  (SELECT count(*) FROM outbox_events
-   WHERE workspace_id=$1::uuid AND event_type='asset.source.revision.published.v1')
-`, fixture.workspaceID, command.Context.IdempotencyKey()).Scan(
-		&auditCount, &outboxCount,
-	); err != nil {
-		t.Fatal(err)
+	if published.Source.ID != "" || published.Revision.ID != "" ||
+		published.Receipt.AuditID != "" {
+		t.Fatalf("Publish(gate binding drift) returned a mutation")
 	}
-	if after != before || auditCount != 0 || outboxCount != 0 {
-		t.Fatalf("Publish(gate binding drift) side effects = before:%#v after:%#v audit:%d outbox:%d",
-			before, after, auditCount, outboxCount)
+	afterPublish := readSnapshot()
+	if afterPublish != before {
+		t.Fatalf(
+			"Publish(gate binding drift) side effects = source:%t revisions:%t runs:%t audits:%t outbox:%t",
+			afterPublish.source != before.source,
+			afterPublish.revisions != before.revisions,
+			afterPublish.runs != before.runs,
+			afterPublish.audits != before.audits,
+			afterPublish.outbox != before.outbox,
+		)
 	}
 }
 
@@ -1901,6 +1928,37 @@ INSERT INTO asset_source_runs (
   FROM asset_sources WHERE id=$4
 `, fixture.runID, fixture.tenantID, fixture.workspaceID, fixture.sourceID)
 
+	type databaseSnapshot struct {
+		source, revisions, runs string
+		audits, outbox          int64
+	}
+	readSnapshot := func() databaseSnapshot {
+		var snapshot databaseSnapshot
+		if err := harness.db.QueryRow(context.Background(), `
+SELECT source::text,
+       COALESCE((
+         SELECT array_agg(revision_row ORDER BY revision_row.revision)::text
+         FROM asset_source_revisions AS revision_row
+         WHERE revision_row.source_id=source.id
+       ),'{}'),
+       COALESCE((
+         SELECT array_agg(run_row ORDER BY run_row.id)::text
+         FROM asset_source_runs AS run_row
+         WHERE run_row.source_id=source.id
+       ),'{}'),
+       (SELECT count(*) FROM audit_records WHERE workspace_id=$2::uuid),
+       (SELECT count(*) FROM outbox_events WHERE workspace_id=$2::uuid)
+FROM asset_sources AS source
+WHERE source.id=$1::uuid
+`, fixture.sourceID, fixture.workspaceID).Scan(
+			&snapshot.source, &snapshot.revisions, &snapshot.runs,
+			&snapshot.audits, &snapshot.outbox,
+		); err != nil {
+			t.Fatal(err)
+		}
+		return snapshot
+	}
+	before := readSnapshot()
 	validated, err := repository.RequestValidation(context.Background(), assetcatalog.ValidateSourceRevisionCommand{
 		Context:  sourceRevisionMutationContext(t, scope, "replace-queued-with-validation", "7"),
 		SourceID: fixture.sourceID, Revision: 2,
@@ -1908,17 +1966,23 @@ INSERT INTO asset_source_runs (
 		ExpectedRevisionVersion: 1,
 		ExpectedRevisionDigest:  fixture.revisionDigest,
 	})
-	if err != nil {
-		t.Fatalf("RequestValidation() error = %v", err)
+	if !errors.Is(err, assetcatalog.ErrUnavailable) {
+		t.Fatalf("RequestValidation() error = %v, want ErrUnavailable", err)
 	}
-	var oldStatus string
-	if err := harness.db.QueryRow(context.Background(),
-		`SELECT status FROM asset_source_runs WHERE id=$1`, fixture.runID).Scan(&oldStatus); err != nil {
-		t.Fatal(err)
+	if validated.Source.ID != "" || validated.Revision.ID != "" ||
+		validated.Run.ID != "" || validated.Receipt.AuditID != "" {
+		t.Fatalf("RequestValidation() returned a mutation")
 	}
-	if oldStatus != "CANCELLED" || validated.Source.GateStatus != assetcatalog.SourceGateValidating ||
-		validated.Run.Status != assetcatalog.RunStatusQueued {
-		t.Fatalf("replacement = old:%s new:%#v", oldStatus, validated)
+	after := readSnapshot()
+	if after != before {
+		t.Fatalf(
+			"RequestValidation() side effects = source:%t revisions:%t runs:%t audits:%t outbox:%t",
+			after.source != before.source,
+			after.revisions != before.revisions,
+			after.runs != before.runs,
+			after.audits != before.audits,
+			after.outbox != before.outbox,
+		)
 	}
 }
 

@@ -23,11 +23,13 @@ const (
 	connectTimeout         = 5 * time.Second
 	maxRequestTimeout      = 15 * time.Second
 	maxResponseHeaderBytes = 64 << 10
+	maxProviderRetryAfter  = 60 * time.Second
 
 	providerKind = "CMDB_CATALOG_V1"
 	profileCode  = assetcatalog.ProfileCode("CMDB_CATALOG_V1")
 
 	runtimeMaterialRedaction = "[REDACTED_EXTERNAL_CMDB_RUNTIME]"
+	providerBackoffRedaction = "[REDACTED_EXTERNAL_CMDB_BACKOFF]"
 	assetPageLimit           = 500
 	relationPageLimit        = 2_000
 )
@@ -42,12 +44,14 @@ type catalogClientConfig struct {
 	TLSConfig      *tls.Config
 	BearerToken    []byte
 	RequestTimeout time.Duration
+	Now            func() time.Time
 }
 
 type catalogClient struct {
 	baseURL     *url.URL
 	bearerToken []byte
 	httpClient  *http.Client
+	now         func() time.Time
 }
 
 type catalogCursor struct {
@@ -86,6 +90,52 @@ func (err *clientContractError) Error() string {
 
 func (*clientContractError) Unwrap() error {
 	return errClientContract
+}
+
+type providerBackoffError struct {
+	delay time.Duration
+}
+
+func (*providerBackoffError) Error() string {
+	return providerBackoffRedaction
+}
+
+func (*providerBackoffError) Unwrap() error {
+	return errClientContract
+}
+
+func (*providerBackoffError) MarshalJSON() ([]byte, error) {
+	return nil, discoverysource.ErrSensitiveSerialization
+}
+func (*providerBackoffError) UnmarshalJSON([]byte) error {
+	return discoverysource.ErrSensitiveSerialization
+}
+func (*providerBackoffError) MarshalText() ([]byte, error) {
+	return nil, discoverysource.ErrSensitiveSerialization
+}
+func (*providerBackoffError) UnmarshalText([]byte) error {
+	return discoverysource.ErrSensitiveSerialization
+}
+func (*providerBackoffError) MarshalBinary() ([]byte, error) {
+	return nil, discoverysource.ErrSensitiveSerialization
+}
+func (*providerBackoffError) UnmarshalBinary([]byte) error {
+	return discoverysource.ErrSensitiveSerialization
+}
+func (*providerBackoffError) String() string       { return providerBackoffRedaction }
+func (*providerBackoffError) GoString() string     { return providerBackoffRedaction }
+func (*providerBackoffError) LogValue() slog.Value { return slog.StringValue(providerBackoffRedaction) }
+func (*providerBackoffError) Format(state fmt.State, _ rune) {
+	_, _ = io.WriteString(state, providerBackoffRedaction)
+}
+
+func providerRetryAfter(err error) (time.Duration, bool) {
+	var backoff *providerBackoffError
+	if !errors.As(err, &backoff) || backoff == nil ||
+		backoff.delay < 0 || backoff.delay > maxProviderRetryAfter {
+		return 0, false
+	}
+	return backoff.delay, true
 }
 
 // RuntimeMaterial contains one already-resolved, process-local connection
@@ -168,6 +218,7 @@ func (factory ClientFactory) open(runtime discoverysource.BoundRuntime) (runtime
 			TLSConfig:      material.TLSConfig,
 			BearerToken:    material.BearerToken,
 			RequestTimeout: maxRequestTimeout,
+			Now:            factory.now,
 		})
 		if err != nil {
 			return err
@@ -234,6 +285,9 @@ func (value *provider) Validate(
 
 	capabilities, err := session.client.capabilities(ctx)
 	if err != nil {
+		if contextErr := callerContextError(ctx); contextErr != nil {
+			return discoverysource.ValidationProof{}, contextErr
+		}
 		if clientErrorHasCode(err, "TLS_TRUST_REJECTED") {
 			return validationFailure(
 				discoverysource.ValidationCheckTrustOrSignature,
@@ -255,6 +309,9 @@ func (value *provider) Validate(
 	pageBodyLimit := min(maxPageBodyBytes, request.Limits.MaxPageBytes)
 	page, err := session.client.assets(ctx, catalogCursor{}, pageBodyLimit)
 	if err != nil {
+		if contextErr := callerContextError(ctx); contextErr != nil {
+			return discoverysource.ValidationProof{}, contextErr
+		}
 		if protocolErrorHasCode(err, "BODY_LIMIT_EXCEEDED") {
 			return validationFailure(
 				discoverysource.ValidationCheckBudget,
@@ -335,11 +392,16 @@ func newCatalogClient(config catalogClientConfig) (*catalogClient, error) {
 		},
 	}
 
+	now := config.Now
+	if now == nil {
+		now = time.Now
+	}
 	baseURL.Path = ""
 	return &catalogClient{
 		baseURL:     baseURL,
 		bearerToken: append([]byte(nil), config.BearerToken...),
 		httpClient:  httpClient,
+		now:         now,
 	}, nil
 }
 
@@ -449,6 +511,9 @@ func (client *catalogClient) getJSONWithFixedQuery(
 
 	response, err := client.httpClient.Do(request)
 	if err != nil {
+		if contextErr := callerContextError(ctx); contextErr != nil {
+			return contextErr
+		}
 		if isTLSVerificationError(err) {
 			return clientError("TLS_TRUST_REJECTED")
 		}
@@ -457,6 +522,12 @@ func (client *catalogClient) getJSONWithFixedQuery(
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
+		if response.StatusCode == http.StatusTooManyRequests ||
+			response.StatusCode == http.StatusServiceUnavailable {
+			if delay, ok := parseProviderRetryAfter(response.Header.Values("Retry-After"), client.now); ok {
+				return &providerBackoffError{delay: delay}
+			}
+		}
 		return clientError("STATUS_REJECTED")
 	}
 	if response.Header.Get("Content-Encoding") != "" {
@@ -466,6 +537,9 @@ func (client *catalogClient) getJSONWithFixedQuery(
 		return clientError("CONTENT_TYPE_REJECTED")
 	}
 	if err := decodeStrictJSON(response.Body, maxBodyBytes, destination); err != nil {
+		if contextErr := callerContextError(ctx); contextErr != nil {
+			return contextErr
+		}
 		return err
 	}
 	return nil
@@ -482,6 +556,51 @@ func (client *catalogClient) close() {
 	}
 	client.baseURL = nil
 	client.httpClient = nil
+	client.now = nil
+}
+
+func callerContextError(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	switch err := ctx.Err(); {
+	case errors.Is(err, context.Canceled):
+		return context.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func parseProviderRetryAfter(values []string, now func() time.Time) (time.Duration, bool) {
+	if len(values) != 1 || values[0] == "" || now == nil {
+		return 0, false
+	}
+	value := values[0]
+	deltaSeconds := true
+	for index := range len(value) {
+		if value[index] < '0' || value[index] > '9' {
+			deltaSeconds = false
+			break
+		}
+	}
+	if deltaSeconds {
+		seconds, err := strconv.ParseUint(value, 10, 64)
+		if err != nil || seconds > uint64(maxProviderRetryAfter/time.Second) {
+			return 0, false
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+	retryAt, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false
+	}
+	delay := retryAt.Sub(now())
+	if delay < 0 || delay > maxProviderRetryAfter {
+		return 0, false
+	}
+	return delay, true
 }
 
 func closedCatalogRequest(path string, rawQuery string) bool {
