@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- 前置完成 [05-source-ingestion-csv-api.md](./05-source-ingestion-csv-api.md)、[06-source-external-cmdb.md](./06-source-external-cmdb.md)、[07-source-vsphere.md](./07-source-vsphere.md) 与 [08-source-proxmox-openstack-cloud.md](./08-source-proxmox-openstack-cloud.md)。
+- Task 28A provider-neutral Worker core 只消费已合并 PageCommitter/Queue/Checkpoint/CleanupBroker/Limiter，不等待任一 Provider 包；它必须先独立合并。每个 Provider 的 durable integration（External CMDB 为 [Task 18B](./06-source-external-cmdb.md#task-18b-external-cmdb-durable-reconciliation-and-lifecycle-integration)）随后只消费该稳定 seam。源文件核验又确认现有 Broker attempt map 仅在进程内，因此 Task 28B 单独交付 recoverable cleanup-session transport/same-attempt authority；Task 28C production constructor/registry 才等待上述两者与 [05-source-ingestion-csv-api.md](./05-source-ingestion-csv-api.md)、[06-source-external-cmdb.md](./06-source-external-cmdb.md)、[07-source-vsphere.md](./07-source-vsphere.md)、[08-source-proxmox-openstack-cloud.md](./08-source-proxmox-openstack-cloud.md) 各自已合并的 provider-specific `Produces`。
 - 每个 Task 严格执行 `Red → Green → Refactor`：先运行并保留预期失败，再做最小生产实现，随后消除重复、复跑指定验证并按 Task 提交；不得跳过失败或弱化断言。
 - 生产必须有独立 `cmd/discovery-worker`；不得把 Provider SDK、Credential Resolver 或目标网络客户端装入 Control Plane、通用 `cmd/worker` 或浏览器。
 - 持久 Job/Run 只含 Source/Revision/Gate/Checkpoint digest、Scope、Run ID、预算、fence epoch/owner/token hash；不含 endpoint、Secret、raw Token、PEM、cursor plaintext、Header/Body 或 Provider 错误。完整 sealed `LeaseFence` 只由 Claim 返回到当前 Worker 内存，绝不进入 Job/Task/Batch/audit/log payload。
@@ -99,144 +99,61 @@ This ordering is normative: receipt lookup and semantic/checkpoint replay verifi
 
 ---
 
-### Task 27: PostgreSQL source queue, lease/fence, encrypted checkpoint, and global backpressure
+## Frozen ownership and dependency order
 
-**Files:**
-- Create: `internal/discoveryqueue/queue.go`
-- Create: `internal/discoveryqueue/postgres/repository.go`
-- Create: `internal/discoveryqueue/postgres/repository_test.go`
-- Create: `internal/discoveryqueue/postgres/repository_integration_test.go`
-- Create: `internal/discoverycheckpoint/codec.go`
-- Create: `internal/discoverycheckpoint/codec_test.go`
-- Create: `internal/discoverylimit/limiter.go`
-- Create: `internal/discoverylimit/postgres/limiter.go`
-- Create: `internal/discoverylimit/postgres/limiter_integration_test.go`
-- Create: `internal/discoverycleanup/broker.go`
-- Create: `internal/discoverycleanup/broker_test.go`
+当前主线已经分别合并 Checkpoint Codec、PageCommitter、Queue、CleanupBroker 和 Limiter。它们是后继 Worker 的稳定 `Consumes`，不是 Task 28 可重写的内部草稿。唯一依赖顺序为：
 
-**Interfaces:**
-- Produces `Queue.Claim/Reclaim/ReclaimFinalizing/ReapDrifted/CancelIneligible/Heartbeat/AdvanceStage/ReserveCleanupAttempt/RecordCleanup/Delay/ProposeValidationResult/PrepareFailureIntent/BeginCheckpointLineageRollover/Complete/Fail` and `PageCommitter.ApplyPage(ctx, LeaseFence, Batch)` with exact sealed `LeaseFence`; raw token is never a Batch field.
-- Produces `CleanupBroker.OpenAttempt/RevokeAttempt`；only the Broker owns the revocation/session handle，while Queue stores a random opaque attempt UUID/epoch and verifies signed cleanup proof.
-- Produces `CheckpointCodec.Seal/Open` and `Limiter.Acquire/Release/Delay` bound to Source/Workspace/Provider.
-- Consumes twelve-table `000015` schema, including immutable `asset_source_revision_authorities`、`asset_source_limit_buckets` and `asset_source_limit_permits`; the later Limiter Go implementation creates no migration.
+```text
+M1D Checkpoint Codec + M1E PageCommitter + Task 27 Queue/Cleanup/Limiter
+  -> Task 28A provider-neutral Worker core/claim-runtime seam（先合并）
+  -> each provider durable integration（External CMDB = Task 18B）
+  -> Task 28B recoverable cleanup-session transport/same-attempt authority
+  -> Task 28C production constructor/registry/binary
+  -> External CMDB Task 19A Control Plane profile/validation admission
+  -> Task 29 two-worker HA/provider qualification
+```
 
-- [ ] **Step 1: Write failing reclaim, stale-fence, checkpoint-tamper, and global-limit tests**
+后继 Batch 只能从最新 `origin/main` 读取已合并 `Produces`。Task 18B 不得读取 Task 28A 未提交文件；Task 28B 不得读取 Task 18B 未合并 descriptor；Task 28C 不得读取 Task 28B 或其他 Provider 未合并实现。源文件核验发现 process-local Broker 不能满足 replacement Worker cleanup 后，原来的“Task 28A core + Task 28B production”最小拆分增加一个独立 transport Batch，并把 production 顺延为 Task 28C；所有新 Batch exact files 互不重叠，且都以 1–2 日为上限。
 
-~~~go
-func TestExpiredRunReclaimInvalidatesOldFence(t *testing.T) {
-	queue := openQueue(t)
-	first := claimRun(t, queue, "worker-a", 30*time.Second)
-	advanceClock(t, 31*time.Second)
-	second := claimRun(t, queue, "worker-b", 30*time.Second)
-	if second.Epoch != first.Epoch+1 {
-		t.Fatalf("epochs = %d, %d", first.Epoch, second.Epoch)
-	}
-	if _, err := queue.Heartbeat(context.Background(), first.Fence, 1, 30*time.Second); !errors.Is(err, discoveryqueue.ErrStaleFence) {
-		t.Fatalf("old heartbeat error = %v", err)
-	}
-}
+### Task 27: Merged durable queue, cleanup, checkpoint, and limiter primitives
 
-func TestCheckpointCannotOpenInAnotherScopeOrRevision(t *testing.T) {
-	codec := newCheckpointCodec(t)
-	sealed := sealCheckpoint(t, codec, scopeA(), sourceRevision(3))
-	if _, err := codec.Open(context.Background(), scopeB(), sourceRevision(3), sealed); !errors.Is(err, discoverycheckpoint.ErrAuthentication) {
-		t.Fatalf("cross-scope open error = %v", err)
-	}
-	if _, err := codec.Open(context.Background(), scopeA(), sourceRevision(4), sealed); !errors.Is(err, discoverycheckpoint.ErrAuthentication) {
-		t.Fatalf("cross-revision open error = %v", err)
-	}
-}
+**Stable files and owners:**
 
-func TestValidationRunNeverReadsOrChangesPublishedCheckpoint(t *testing.T) {
-	fixture := sourceWithPublishedCheckpointAndNewDraftValidation(t)
-	codec := failOnCallCheckpointCodec(t)
-	before := fixture.rawSourceCheckpoint(t)
-	claim := fixture.claimValidation(t, codec)
-	fixture.heartbeatValidation(t, claim)
-	fixture.proposeAndCompleteValidation(t, claim)
-	if codec.Calls() != 0 || !bytes.Equal(before, fixture.rawSourceCheckpoint(t)) {
-		t.Fatal("Validation touched the published Source checkpoint")
-	}
-}
+| Stable `Produces` | Exact files | Merge owner |
+|---|---|---|
+| Checkpoint Codec | `internal/discoverycheckpoint/codec.go`、`codec_test.go` | M1D / PR #44 |
+| Atomic PageCommitter/projection | `internal/discoverysource/page_commit.go`、`page_commit_test.go`、`internal/assetcatalog/postgres/page_committer.go`、`page_projection.go`、`page_committer_integration_test.go` | [M1E](./13-m1e-page-commit-transaction.md) / PR #53；不是 Task 27 owner |
+| Queue ABI/PostgreSQL lifecycle | `internal/discoveryqueue/queue.go`、`internal/discoveryqueue/postgres/repository.go`、`repository_test.go`、`repository_integration_test.go` | Task 27 Queue slice / PR #55 |
+| Process-local CleanupBroker boundary | `internal/discoverycleanup/broker.go`、`broker_test.go` | Task 27 cleanup slice / PR #57；attempt map 不跨进程，不是 HA recovery transport |
+| Limiter ABI/PostgreSQL lifecycle | `internal/discoverylimit/limiter.go`、`internal/discoverylimit/postgres/limiter.go`、`limiter_integration_test.go` | Task 27 limiter slice / PR #64 |
 
-func TestCleanupReceiptCrashConsumesExactPersistedNextIntent(t *testing.T) {
-	fixture := runningRunWithAttempt(t)
-	fixture.persistDelayIntent(t, "TRANSPORT_BACKOFF")
-	fixture.recordRevokedCleanupThenCrash(t)
-	reclaimed := fixture.reclaim(t)
-	fixture.assertCleanupOnly(t, reclaimed)
-	fixture.consumeDelayIntent(t, reclaimed)
-	fixture.assertOneAttemptReceiptAndDelayed(t)
-}
+**Interfaces（冻结，不得扩宽）:**
 
-func TestCleanupUncertainOverridesPersistedSuccessWithoutReplacingIt(t *testing.T) {
-	for _, kind := range []string{"DATA_PROJECTION", "VALIDATION_PROOF"} {
-		fixture := finalizingSuccessfulRun(t, kind)
-		original := fixture.workResultDigest(t)
-		fixture.failCleanupUncertain(t)
-		fixture.assertTerminal(t, "FAILED", "SUSPENDED")
-		if fixture.workResultDigest(t) != original || fixture.failureOverride(t) != "CLEANUP_UNCERTAIN" {
-			t.Fatalf("%s result was replaced", kind)
-		}
-		fixture.assertNoSuccessPointerAndValidationRejectedWhenApplicable(t)
-	}
-}
+- Produces `Queue.Claim/Reclaim/ReclaimFinalizing/ReapDrifted/CancelIneligible/Heartbeat/AdvanceStage/ReserveCleanupAttempt/RecordCleanup/Delay/ProposeValidationResult/PrepareFailureIntent/BeginCheckpointLineageRollover/Complete/Fail`；process-local non-serializable `ClaimResult` 是唯一可携带 sealed `LeaseFence` 的 Queue value，raw token 永不进入 durable command/row。
+- Produces process-local `CleanupBroker.OpenAttempt/RevokeAttempt/VerifyCleanupProof`；only the Broker owns the revocation/session handle，Queue 只保存 random opaque attempt UUID/epoch 并验证 signed cleanup proof。新的 Broker 实例对旧 attempt 直接 `RevokeAttempt` 会 `ErrAttemptNotFound`；跨 Worker recovery 由 Task 28B 唯一拥有。
+- Produces `CheckpointCodec.Seal/Open/ReplayIdentity` 和 `Limiter.Acquire/Release/Delay` bound to exact Source/Workspace/Provider。
+- Consumes twelve-table `000015` schema，including immutable `asset_source_revision_authorities`、`asset_source_limit_buckets` and `asset_source_limit_permits`；Limiter Go runtime 不创建 migration。
+- `PageCommitter.ApplyPage` 由 M1E 唯一拥有。Task 27/28 只能调用，不得创建第二 PageCommitter、projection SQL、receipt owner 或 nested transaction。
 
-func TestFailureIntentSurvivesCrashesBeforeAndAfterCleanup(t *testing.T) {
-	assertReclaimFinalizesPreparedFailureIntent(t, crashBeforeCleanup)
-	assertReclaimFinalizesPreparedFailureIntent(t, crashAfterCleanupReceipt)
-}
+**Classification:** C0 = fence/receipt/checkpoint/cleanup/permit truth；C1 = Queue/Cleanup/Limiter durable slices；C2 = none。上述代码已分别以 `BUILT_CLOSED` 合并，但这不等于旧 Task 27 的两 Worker/HA/restart/recovery 最终 checkbox 已完成。
 
-func TestReserveCleanupAttemptResponseLossReturnsSameAttempt(t *testing.T) {
-	fixture := claimedRun(t)
-	first := fixture.reserveThenLoseResponse(t)
-	replay := fixture.reserveAgain(t)
-	if replay.AttemptID != first.AttemptID || fixture.attemptCount(t) != 1 {
-		t.Fatalf("reserve replay = %#v, first = %#v", replay, first)
-	}
-}
+**Retained RED evidence:** reclaim increments the persisted epoch and invalidates the old sealed fence；cross-Scope/revision checkpoint open authenticates fail closed；Validation never reads or changes the published checkpoint；cleanup/failure intent survives crashes；attempt/open/revoke/terminal response loss returns the exact persisted attempt/proof/receipt；cleanup uncertainty preserves the sealed work result and closes the Source. These REDs were closed by the independent merge slices above. The superseded pre-merge code sketch is removed because it exposed fields that are not part of the frozen `ClaimResult` ABI；future tests must consume the actual merged types rather than recreate that sketch.
 
-func TestOpenAttemptResponseLossRevokesKnownAttemptBeforeDelay(t *testing.T) {
-	fixture := claimedRun(t)
-	attempt := fixture.reserve(t)
-	fixture.brokerOpenThenLoseResponse(t, attempt)
-	fixture.assertNoSecondOpenOrAttempt(t)
-	fixture.revokeRecordAndDelayTransportBackoff(t, attempt)
-	fixture.assertBrokerHasNoLiveSession(t, attempt)
-}
-
-func TestRevokeAttemptResponseLossReturnsSameProofAndOneReceipt(t *testing.T) {
-	fixture := claimedRunWithOpenedAttempt(t)
-	first := fixture.brokerRevokeThenLoseResponse(t)
-	replay := fixture.brokerRevokeAgain(t)
-	if replay.Digest != first.Digest || replay.Status != first.Status {
-		t.Fatalf("revoke replay = %#v, first = %#v", replay, first)
-	}
-	fixture.recordCleanup(t, replay)
-	fixture.recordCleanupReplay(t, first)
-	fixture.assertAttemptCleanedReceiptCount(t, 1)
-}
-~~~
-
-Run: `go test ./internal/discoveryqueue/... ./internal/discoverycheckpoint ./internal/discoverylimit/... ./internal/discoverycleanup -count=1`
-
-Expected: FAIL because durable queue/checkpoint/limiter are absent.
-
-- [ ] **Step 2: Implement exact HA claim and fenced state transitions**
+**Frozen Queue/Cleanup behavior:**
 
 `Claim` uses one serializable transaction and `FOR UPDATE SKIP LOCKED`, filters `QUEUED|DELAYED` supported Provider Runs, `not_before<=now`, run-kind-specific source/gate/revision/checkpoint eligibility and persisted capacity. It generates 32 random bytes, returns a sealed process-local fence once, stores only token SHA-256, sets owner/lease/heartbeat sequence, increments epoch and moves stage to `VALIDATING` or `READING`. Validation binds its `VALIDATING` revision but neither compares nor returns the published Source checkpoint. Normal reclaim accepts only an expired `RUNNING` lease whose Source remains exact eligible. If the old attempt is `NOT_OPENED|NO_CREDENTIAL`, it may continue under the new fence；if an opaque attempt is `PENDING`, reclaim sets `CLEANING_UP`, persists/uses a bounded `TRANSPORT_BACKOFF` delay intent and returns cleanup-only work that must revoke then delay before a fresh claim—no Provider/checkpoint/page admission is available. If cleanup is already `REVOKED|NO_CREDENTIAL`, reclaim verifies `ATTEMPT_CLEANED` and executes the previously persisted delay intent；it never resumes Provider work. `ReclaimFinalizing` accepts only an expired `FINALIZING` row, increments the fence and returns cleanup-only work；an already-clean receipt goes directly to the persisted work-result `Complete|Fail`. `CancelIneligible` serializably cancels no-lease `QUEUED|DELAYED` rows after disable/drift and, for an exact Validation Run, atomically rejects the still-bound Revision with stable proof. For an expired drifted `RUNNING` row, `ReapDrifted` advances the fence without Provider/checkpoint access and fails directly only if no credential was opened；otherwise it enters cleanup-only work and requires Broker revocation before terminal failure. `Heartbeat` repeats run-kind-specific exact facts plus token/epoch/owner/strict-sequence：Validation verifies only its empty checkpoint shape，data Runs verify the current Source checkpoint. Maximum extension is 30s. The current holder may fail/clean up before expiry after drift but cannot extend.
 
-`ReserveCleanupAttempt` must commit a random opaque attempt UUID plus the current fence epoch before `CleanupBroker.OpenAttempt` may resolve/open credentials or sessions. It is idempotent for exact `(run,fence epoch)`；a lost response is retried to retrieve the same UUID, never to allocate another. Broker `OpenAttempt(attempt_id)` creates at most one logical session and `RevokeAttempt(attempt_id)` returns one idempotent signed proof. If Open succeeds but its response is lost/ambiguous, Worker must not Open again for work, create a new attempt or make a Provider call；it persists `TRANSPORT_BACKOFF`, revokes the known attempt, records proof and delays. `RecordCleanup` accepts only a signed Broker proof bound to the same Run/attempt/epoch and writes an append-only `ATTEMPT_CLEANED` receipt；the current Run summary is not the history owner. A new Worker can therefore call `RevokeAttempt` using only the opaque UUID, without runtime、checkpoint、credential reference or endpoint. `REVOKED|NO_CREDENTIAL` are clean；missing/invalid/`UNCERTAIN` proof fails the Run and sets gate `SUSPENDED`.
+`ReserveCleanupAttempt` must commit a random opaque attempt UUID plus the current fence epoch before `CleanupBroker.OpenAttempt` may resolve/open credentials or sessions. It is idempotent for exact `(run,fence epoch)`；a lost response is retried to retrieve the same UUID, never to allocate another. The current process-local Broker creates at most one logical session for its local attempt state and `RevokeAttempt(attempt_id)` returns one idempotent signed proof. If Open succeeds but its response is lost/ambiguous, Worker must not Open again for work, create a new attempt or make a Provider call；it persists `TRANSPORT_BACKOFF`, revokes the known attempt, records proof and delays. `RecordCleanup` accepts only a signed Broker proof bound to the same Run/attempt/epoch and writes an append-only `ATTEMPT_CLEANED` receipt；the current Run summary is not the history owner. Replacement Worker 不能对新的 process-local Broker 只传 opaque UUID 就声称可 revoke；它必须从 Queue cleanup-only claim 取得 exact `RunCoordinates + CleanupAttempt`，经 Task 28B fixed mTLS transport recovery-open 同一外部 session，再由本地 Broker handle revoke。该路径不得解析 Provider runtime/checkpoint，也不得携带 endpoint、credential 或其他 secret payload。`REVOKED|NO_CREDENTIAL` are clean；missing/invalid/`UNCERTAIN` proof fails the Run and sets gate `SUSPENDED`.
 
 `Delay` requires the current attempt's clean proof, then atomically transitions cleanup-only `RUNNING→DELAYED`, consumes the persisted closed reason `PROVIDER_RETRY_AFTER|TRANSPORT_BACKOFF` and bounded `not_before`, releases capacity and clears the lease while preserving committed page/checkpoint/count progress plus the immutable attempt receipt. The next claim creates a new fence and may clear the current cleanup summary to `NOT_OPENED` only after verifying that receipt. `ProposeValidationResult` persists exact revision/canonical/binding/outcome/proof digest as `VALIDATION_PROOF` and transitions `RUNNING→FINALIZING`；the invalid outcome proposes `FAILED`, never `PARTIAL`. Any other fatal path must call fenced `PrepareFailureIntent` **before cleanup** to persist stable code/digest and transition `RUNNING→FINALIZING/CLEANING_UP`；it cannot overwrite an existing data/validation result. `Complete/Fail` accept a safe terminal command containing Run ID、work-result/intent digest and cleanup digest. They first look up the immutable `TERMINAL_COMMITTED` receipt；an exact replay returns read-only even after the first call destroyed every fence copy, while any changed tuple is rejected. Only the first terminal mutation requires current fence, writes the receipt and atomically updates the bound Revision validation state. If cleanup is `UNCERTAIN` after a success result, `Fail` preserves that result and writes the sole `CLEANUP_UNCERTAIN` override/digest, producing `FAILED + SUSPENDED` and no success pointer. Both terminal methods release capacity, destroy the raw token and freeze terminal Run while preserving owner/token-hash/epoch/heartbeat evidence.
 
-- [ ] **Step 3: Implement atomic page/checkpoint and persisted rate/backpressure**
+**Frozen cross-component behavior:**
 
 Provider discovery returns the Pack 05 closed `DiscoverOutcome` with concrete `Page|Delay`, never a struct in which retry and data coexist. `Delay{Reason=PROVIDER_RETRY_AFTER,RetryAfter}` requires `0 < RetryAfter <= 60s` and by construction has no Items、Relations、next checkpoint or final flags. `Page` has no delay and contains the page/checkpoint/final fields. Transport ambiguity is created only by the Worker as Queue `TRANSPORT_BACKOFF` intent（exponential, max 15m）after stopping Provider calls and before cleanup. Neither delay path calls `ApplyPage` or changes checkpoint/counts.
 
 Pack 05 `Checkpoint`/`BoundRuntime` raw access remains process-local and call-site allow-listed：Provider code may decode only temporary callback bytes into a private typed cursor；Worker and `PageCommitter` treat the cursor as opaque and only the checkpoint codec seals/opens canonical bytes. No raw checkpoint/runtime value enters Queue、job、Temporal、audit、receipt、error or log. Validation likewise remains three separate closures：the Worker first validates and recomputes the immutable Provider `ValidationProof` digest，then independently records Broker cleanup/`ATTEMPT_CLEANED`，and only terminal `Complete|Fail` combines the already-sealed validation work-result digest with the cleanup digest. No later cleanup fact may rewrite the Provider proof.
 
-`ApplyPage(ctx, fence, batch)` outer order is fixed：perform exact persisted receipt lookup and semantic/keyed-checkpoint replay verification before any live-fence admission or seal；an exact receipt returns its persisted result. Only after confirming a genuinely new page may it verify the process-local sealed fence and call checkpoint `Seal` exactly once. It then starts the bounded serializable SQL attempt：lock run/source/revision；repeat the receipt guard；verify gate/revision/digest、stage、page sequence and checkpoint-before；call scoped Reconciler, which derives Source revision and Catalog acceptance time rather than accepting them from Provider items；revalidate the same live fence with database `clock_timestamp()`；persist that already-sealed ciphertext/key ID/hash/version、page digest and safe receipt；a final page persists `DATA_PROJECTION` and transitions only to `FINALIZING/CLEANING_UP`；commit. A serialization retry reuses the exact same sealed envelope；an ambiguous commit returns to receipt lookup before any possible reseal. Claim/reclaim never decrypt-and-reseal or bump checkpoint version. A crash before commit changes nothing；after commit an exact replay returns the persisted result even when final cleanup has already made the Run terminal. Checkpoint key rotation reads previous key IDs but every confirmed new page writes the current key.
+`ApplyPage(ctx, fence, PageCommitCoordinates, Page)` outer order is fixed：perform exact persisted receipt lookup and semantic/keyed-checkpoint replay verification before any live-fence admission or seal；an exact receipt returns its persisted result. Only after confirming a genuinely new page may it verify the process-local sealed fence and call checkpoint `Seal` exactly once. It then starts the bounded serializable SQL attempt：lock Run/Source/Revision；repeat the receipt guard；verify gate/revision/digest、stage、page sequence and checkpoint-before；call M1E package-private projection helper, which derives Source revision and Catalog acceptance time rather than accepting them from Provider items；revalidate the same live fence with database `clock_timestamp()`；persist that already-sealed ciphertext/key ID/hash/version、page digest and safe receipt；a final page persists `DATA_PROJECTION` and transitions only to `FINALIZING/CLEANING_UP`；commit. A serialization retry reuses the exact same sealed envelope；an ambiguous commit returns to receipt lookup before any possible reseal. Claim/reclaim never decrypt-and-reseal or bump checkpoint version. A crash before commit changes nothing；after commit an exact replay returns the persisted result even when final cleanup has already made the Run terminal. Checkpoint key rotation reads previous key IDs but every confirmed new page writes the current key.
 
 `BeginCheckpointLineageRollover` is available only to Profiles with a closed expiry reason and a verified Adapter evidence digest. It binds that proof to the exact current fence/Run/revision/checkpoint, degrades the gate and leaves the old checkpoint untouched；the same Run must then emit an authoritative full-snapshot `Page` whose first commit CASes from the old hash into a new lineage. No API/Worker can clear、rewind or create a side Run. Recoverable Provider/transport failure cleans and delays this same Run. Only terminal `SUCCEEDED + effective complete snapshot` seals rollover and restores the gate；any terminal failure or cleanup/checkpoint uncertainty suspends it and requires a newly validated/published revision.
 
@@ -246,29 +163,138 @@ Limiter defaults come from the exact immutable Source Profile and are clamped by
 
 Queue depth beyond 10,000 runs/Workspace rejects new sync with `SOURCE_BACKPRESSURE`; no run is silently dropped. Provider `Retry-After` max 60s and exponential transport backoff max 15m are persisted by Queue/Source backpressure and are not Limiter bucket truth.
 
-- [ ] **Step 4: Verify PostgreSQL failover behavior and commit**
+**Retained G2 regression gate:**
 
 Run:
 
 ~~~bash
 gofmt -w $(rg --files internal/discoveryqueue internal/discoverycheckpoint internal/discoverylimit internal/discoverycleanup -g '*.go')
-go test -race ./internal/discoveryqueue/... ./internal/discoverycheckpoint ./internal/discoverylimit/... ./internal/discoverycleanup -count=1
-TEST_DATABASE_URL="$TEST_DATABASE_URL" \
-  go test -race ./internal/discoveryqueue/postgres ./internal/discoverylimit/postgres -run Integration -count=1
+go test -race ./internal/discoveryqueue ./internal/discoverycheckpoint \
+  ./internal/discoverylimit ./internal/discoverycleanup -count=1
+test -n "${AIOPS_TEST_POSTGRES_DSN:-}"
+go test -race ./internal/discoveryqueue/postgres \
+  ./internal/discoverylimit/postgres -run Integration -count=1
 ~~~
 
-Expected: PASS for concurrent claims, lease expiry/reclaim, stale fence at every boundary, crash-before/after-page commit, crash after `RecordCleanup` but before `Delay|Complete|Fail`, exact attempt/terminal receipt recovery, checkpoint tamper/rotation, Source/Workspace/Provider bucket concurrency and response-loss replay across replicas, Provider/transport delay, queue overflow and PostgreSQL reconnect.
+`AIOPS_TEST_POSTGRES_DSN` 缺失或任何 integration test Skip 都不能记为 PostgreSQL PASS。Expected: concurrent claims、lease expiry/reclaim、stale fence、exact attempt/terminal receipt recovery、checkpoint tamper/rotation、三 bucket concurrency 和 response-loss replay 继续通过。两 Worker、进程/数据库 restart、HA takeover 和完整 recovery 保留到 Task 29/G3；不得把单进程 G2 写成这些证据已完成。
 
-~~~bash
-git add internal/discoveryqueue internal/discoverycheckpoint internal/discoverylimit internal/discoverycleanup
-git commit -m "feat(assetdiscovery): add fenced discovery queue"
-~~~
+### Task 28A: Provider-neutral Worker core and claim-runtime seam
 
-### Task 28: Real discovery-worker production constructor and fail-closed provider runtime
+**Batch:** C0/C1，1–2 日，必须先于任一 provider durable integration 合并。
 
-**Files:**
+**Exact files:**
+
 - Create: `internal/discoveryworker/worker.go`
 - Create: `internal/discoveryworker/worker_test.go`
+- Create: `internal/discoveryworker/claim_runtime.go`
+- Create: `internal/discoveryworker/claim_runtime_test.go`
+
+源文件核验时 `internal/discoveryworker/` 与 `cmd/discovery-worker/` 均不存在。该最小 Batch 只建立通用 core 与 process-local seam；不创建 registry、production constructor、binary、config、metrics 或 Provider integration test。
+
+**Consumes（只读已合并）:**
+
+- Task 27 frozen `discoveryqueue.Queue`、`ClaimResult`、`CleanupBroker`、`Limiter`。
+- M1E `discoverysource.PageCommitter`、M1D `CheckpointCodec`。
+- M1C `discoverysource.Provider`、`BoundRuntime`、`Checkpoint`、closed concrete `Page|Delay` 和 validation proof。
+
+**Produces:**
+
+- `discoveryworker.New(Dependencies) (*Worker, error)` 和一个 provider-neutral `Worker` run/stop boundary。
+- `ClaimRuntimeResolver` 与 opaque process-local `ClaimRuntime` seam：Provider path 固定为 `Queue.ReserveCleanupAttempt(exact Run/epoch) → CleanupBroker.OpenAttempt(exact request) → resolver.ResolveOpenedAttempt(same AttemptSession + expected RuntimeBinding) → Provider`。resolver 只能取得由该次 `SessionOpener.OpenSession` 创建并与同一 Broker-owned `SessionHandle` 共享 attempt cell 的 `BoundRuntime`；runtime view 的 close/clear 与 handle 的 revoke/destroy 清理同一 cell，但只有 Broker revoke/proof 可证明 cleanup。resolver 不得独立解析/打开第二份 credential、endpoint 或 session。`ClaimRuntime` 在内部不可变绑定 Run/attempt/epoch/runtime binding，并只向 core 提供 same-attempt Provider、opened checkpoint/empty validation checkpoint、immutable limits 与 non-serializable `BoundRuntime`。
+- 唯一通用状态机：claim-mode dispatch、heartbeat/fence revalidation、Limiter acquire/terminal、上述 exact ordered open/resolve、Provider Validate/Discover、PageCommitter call、persisted next intent、same-attempt Broker cleanup/proof、Queue Delay/Complete/Fail 和 bounded shutdown。`CLEANUP_ONLY|TERMINAL` 只执行 exact recovery-open/revoke/proof path，绝不调用 resolver 或 Provider。
+
+Core 必须直接调用已合并 interfaces；不得复制 Queue stage/gate enums、lease/fence matching、Limiter bucket math、cleanup proof、PageCommitter replay/SQL 或 Provider-specific pagination。`ClaimRuntimeResolver` 只是 Broker attempt-bound 的受信 process view seam，不是新的 registry、credential store 或 transport；runtime view 的 close/clear 不能替代 Broker `RevokeAttempt`，terminal/delay 只能接受同一 attempt 的 verified cleanup proof。
+
+**Classification:**
+
+- **C0:** process-local sensitive boundary、stale fence、cleanup-before-terminal/delay、receipt replay、panic/cancel fail closed。
+- **C1:** provider-neutral claim → work → cleanup → terminal loop。
+- **C2:** 无；所有 Provider import/registration 留给 provider Batch/Task 28C。
+
+**RED → GREEN:**
+
+- [ ] RED：任一 Queue/PageCommitter/Limiter/CleanupBroker/Checkpoint/ClaimRuntime dependency 缺失时 `New` fail closed；production core 无 fake fallback。
+- [ ] RED：`ClaimRuntime`、`ClaimResult`、fence/checkpoint/runtime 的 JSON/text/binary/log/format 与 forbidden exported-field tests 全部关闭。
+- [ ] RED：`PROVIDER|CLEANUP_ONLY|TERMINAL` 三种 claim mode 各走唯一合法路径；cleanup-only/terminal 不解析 Provider runtime 或 checkpoint。
+- [ ] RED：未先成功 `ReserveCleanupAttempt → OpenAttempt` 时 resolver 拒绝且 Provider 零调用；resolver 不得自行触发 credential/session open，cleanup-only/terminal 永不调用 resolver。
+- [ ] RED：resolver request、`AttemptSession.Attempt()`、Queue persisted `CleanupAttempt`、expected `RuntimeBinding` 或 returned `ClaimRuntime` 的 Run ID/attempt ID/attempt epoch/Source revision/binding digest 任一漂移均 fail closed；同一 opener/session/runtime cell 与 Broker handle/proof 不一致也拒绝，不能用另一 attempt/session 的 proof 关闭实际 Provider runtime。
+- [ ] RED：Validation 使用 exact empty checkpoint 且不读取 published checkpoint；data Run 只用 resolver 返回的 exact opened checkpoint。
+- [ ] RED：每次 Provider call 前后 heartbeat/fence drift 停止；stale fence 不调用 `ApplyPage` 或 terminal success。
+- [ ] RED：concrete `Page` 才调用 `ApplyPage`；concrete `Delay` 不调用 `ApplyPage`、不推进 checkpoint/count，先 persist intent/cleanup 再 Queue `Delay`。
+- [ ] RED：open/revoke/terminal response loss 只按已合并 attempt/cleanup/terminal receipts replay；changed tuple fail closed。
+- [ ] RED：panic/context cancellation 只停止新 claim、清理当前 attempt 并降级健康，不标记 success。
+- [ ] GREEN：实现最小 provider-neutral loop 和 claim-runtime seam；测试 fake 只存在 `_test.go`。
+
+**G2:**
+
+~~~bash
+go test -race ./internal/discoveryworker ./internal/discoverysource \
+  ./internal/discoveryqueue ./internal/discoverycleanup \
+  ./internal/discoverylimit ./internal/discoverycheckpoint -count=1
+go vet ./internal/discoveryworker
+git diff --check
+~~~
+
+G2 必须覆盖 dependency nil matrix、三 claim modes、exact ordered Reserve/Open/Resolve、same-opener/session/runtime-cell/handle/proof binding、Run/attempt/epoch/runtime-binding drift、validation/data split、Page/Delay XOR、fence drift、cleanup ordering、response-loss replay、panic/cancel 和 sensitive serialization。该 Batch 不声称真实 PostgreSQL/provider integration 或跨进程 attempt recovery；每个 Provider 在后继 integration Batch 以 `AIOPS_TEST_POSTGRES_DSN` 取得自己的真库 G2，跨进程 recovery 由 Task 28B/Task 29 证明。
+
+**Deferred G3/G4:** 两 Worker、多进程 takeover、Worker/数据库 restart、HA/recovery、真实 Provider、production identity/config/binary 和 provider gate 全部 deferred。Task 28A 合并后只能记 `BUILT_CLOSED`，所有 Source/Worker 能力继续 `UNAVAILABLE/CLOSED`。
+
+### Task 28B: Recoverable cleanup-session transport and attempt authority
+
+**Batch:** C0/C1，1–2 日；只能消费已合并 Task 28A 与至少一个已合并 Provider descriptor/integration，必须先于 production constructor 与 Task 29 合并。
+
+**Exact files:**
+
+- Create: `internal/discoverycleanup/session_transport.go`
+- Create: `internal/discoverycleanup/session_transport_test.go`
+- Create: `internal/discoveryworker/attempt_session.go`
+- Create: `internal/discoveryworker/attempt_session_test.go`
+
+不得修改 Task 27 `broker.go`/`broker_test.go`、Task 28A 四文件或任一 Provider 文件。该额外 Batch 是源文件核验发现 process-local `attempts` map 与新进程 `ErrAttemptNotFound` 后的最小必要拆分，不把跨进程 recovery 伪装成 Task 29 脚本行为。
+
+**Consumes（只读已合并）:**
+
+- Task 27 exact `OpenAttemptRequest`、`SessionOpener`、`SessionHandle`、`AttemptSession`、proof verifier 与 Queue-owned `RunCoordinates/CleanupAttempt`。
+- Task 28A `ClaimRuntimeResolver`/opaque `ClaimRuntime` seam，以及各 Provider 已合并的 neutral descriptor/runtime factory。
+- 固定协议、mTLS workload identity 与共享 session authority endpoint；wire 只携带 exact Run/attempt/epoch/runtime-binding digest 和 opaque receipt，不携带 endpoint、credential、token、TLS key、`BoundRuntime` 或 raw `SessionHandle`。
+
+**Produces:**
+
+- `discoverycleanup.SessionTransport` fixed mTLS client contract：已预置的外部 shared session authority 必须以 exact `(Run,attempt_id,attempt_epoch,runtime_binding_digest)` 幂等 `OpenOrRecover/Revoke`，changed tuple fail closed。Task 28B 不实现或宣称拥有该外部 authority server/binary。
+- `discoveryworker.AttemptSessionAuthority`：同一对象同时实现 Broker `SessionOpener` 与 Task 28A resolver；首次 open 只从同一 session cell 产生一个 process-local `BoundRuntime` 与一个 Broker-owned handle，replacement recovery-open 只返回同一外部 session 的 revoke handle，永不重新产生 Provider runtime。
+- 可审计 recovery contract：新进程直接对空的 process-local Broker `RevokeAttempt` 仍是 `ErrAttemptNotFound`；正确路径必须以 Queue cleanup-only claim 的 exact coordinates/attempt 重新 `OpenAttempt`，经 shared authority 找回同一 session 后 revoke/proof。
+
+**Classification:**
+
+- **C0:** mTLS peer identity、exact attempt/runtime binding、same-session runtime/handle/proof、secret-zero-payload 和 recovery fail closed。
+- **C1:** shared session transport client、same-attempt authority composition 与 response-loss replay。
+- **C2:** 无；不拥有 Provider protocol、Queue/Worker state machine、production registry/binary、shared authority server/binary 或 migration。
+
+**RED → GREEN:**
+
+- [ ] RED：Worker A 首次 open 后销毁本地 Broker，Worker B 对新 Broker 直接 `RevokeAttempt` 得 `ErrAttemptNotFound`；只有 exact recovery-open 后才能 revoke 原 session，且 open/revoke 各一次。
+- [ ] RED：Run/attempt/epoch/runtime-binding digest、mTLS peer 或 opaque receipt 任一漂移均在 resolver/Provider 前拒绝；recovery-open 不返回 `BoundRuntime`，cleanup-only Provider 零调用。
+- [ ] RED：首次 Provider runtime、Broker handle 与 cleanup proof 必须来自同一 session cell；独立 credential/session open、另一 session proof 或任何 secret-bearing/loggable/serializable wire field均拒绝。
+- [ ] GREEN：实现 fixed mTLS transport 与同一对象的 `SessionOpener + ClaimRuntimeResolver` composition；测试 fixture 只在 `_test.go`，缺 transport/identity/descriptor 一律 fail closed。
+
+**G2:**
+
+~~~bash
+go test -race ./internal/discoverycleanup ./internal/discoveryworker \
+  -run 'SessionTransport|AttemptSession|Recovery|SameAttempt|Secret' -count=1
+go vet ./internal/discoverycleanup ./internal/discoveryworker
+git diff --check
+~~~
+
+G2 必须用 test-only fixed-protocol authority fixture 证明两个独立 client/Broker 实例之间的 exact recovery-open/revoke、same-session runtime/handle/proof、changed tuple、mTLS negative、response-loss replay、zero secret payload 与 sensitive serialization；fixture 不进入 production graph，也不声称真实外部 authority 已验收。单进程 Broker test 不能代替该门。
+
+**Deferred G3/G4:** 两个真实 Worker binary、kill owner、通过 opaque lab binding 连接的已预置真实外部 shared authority及其 reconnect/recovery、Worker/数据库 restart、HA takeover、credential resolver/key rotation 与 Provider canary 留给 Task 29/G3/G4。Task 28B 最多为 `BUILT_CLOSED`，不使任一 Provider 可用。
+
+### Task 28C: Production constructor and Provider registry
+
+**Batch:** C0/C1/C2，1–2 日；只能在 Task 28A、Task 28B 与需要注册的 provider-specific durable integrations 已合并后开始。
+
+**Exact files:**
 - Create: `internal/discoveryworker/registry.go`
 - Create: `internal/discoveryworker/registry_test.go`
 - Create: `internal/discoveryworker/production.go`
@@ -276,85 +302,97 @@ git commit -m "feat(assetdiscovery): add fenced discovery queue"
 - Create: `cmd/discovery-worker/main.go`
 - Create: `cmd/discovery-worker/main_test.go`
 - Create: `cmd/discovery-worker/config.go`
+- Create: `cmd/discovery-worker/config_test.go`
 - Create: `cmd/discovery-worker/production.go`
 - Create: `cmd/discovery-worker/production_test.go`
-- Modify: `internal/config/config.go`
-- Modify: `internal/config/config_test.go`
 
-**Interfaces:**
-- Produces `discoveryworker.New(Dependencies) (*Worker,error)` and `cmd/discovery-worker.newProduction(Config) (*Worker,error)`.
-- Registry contains exact adapters `CSV_IMPORT`, `CONTROL_PLANE_API`, `EXTERNAL_CMDB/CMDB_CATALOG_V1`, `VSPHERE_VCENTER_V1`, `PROXMOX_VE_V1`, `OPENSTACK_NOVA_V2_1`, `AWS_EC2_V1`, `AZURE_COMPUTE_V1`, `GCP_COMPUTE_V1`.
-- Production constructor uses PostgreSQL Queue/Reconciler, secure Source Profile resolver, Broker-backed workload Credential/Trust resolver, checkpoint keyring, metrics and mTLS workload identity; no fake fallback exists.
+**Consumes:**
+
+- 已合并 Task 28A `Worker`/claim-runtime seam、Task 28B `SessionTransport`/`AttemptSessionAuthority` 与 Task 27/M1D/M1E public constructors。
+- 每个已合并 Provider 的 exact adapter/profile/fact-policy/runtime resolver descriptor；External CMDB 必须消费 Task 18B `Produces`。
+- existing secure bootstrap/manifest/workload identity patterns；不把 Control Plane config 变成第二 owner。
+
+**Produces:**
+
+- Immutable exact Provider registry；只注册具有已合并 adapter + neutral profile descriptor/fact-policy + durable-integration evidence 的 Phase 1 row。External CMDB registry 必须比较 Task 18B `internal/sourceprofile` canonical descriptor digest，不能重建 metadata；`KUBERNETES_OPERATOR`、`AWX_INVENTORY` 和任何缺依赖 Provider 保持未注册/`UNAVAILABLE`，不得使用 family/default HTTP adapter。
+- `internal/discoveryworker.NewProduction(...)`、`cmd/discovery-worker.newProduction(Config)` 和独立 binary startup/readiness/shutdown。
+- Production constructor uses PostgreSQL Queue/PageCommitter/Limiter、Task 28B single `AttemptSessionAuthority`、由它构造的 process-local Broker、checkpoint keyring、low-cardinality metrics boundary and mTLS workload identity；constructor 不接受彼此独立的 `SessionOpener` 与 runtime resolver 注入，credential/session transport 只能由该 authority open/recover path 调用。它还产生仅含 Provider/Profile/canonical descriptor/runtime-recovery capability digest 的 safe content-addressed runtime-admission manifest，供 Task 19A Control Plane admission 只读消费；manifest 不含 endpoint、credential、socket、key 或 runtime material。
+
+源文件核验显示现有 `internal/config.Config` 是 Control Plane-wide 配置，生产代码当前只由 `cmd/control-plane` 消费。把 discovery credential/keyring/socket 文件加入该共享类型会制造无关 owner 和敏感配置耦合，因此 Discovery Worker 配置只由 `cmd/discovery-worker/config.go` 拥有。Task 28C 不得修改 Task 28A/28B 文件，也不得把 Provider-specific profile/fact policy 重写进 registry。
+
+**Classification:** C0 = secret-bearing config/identity/manifest/graph isolation；C1 = production assembly/readiness/shutdown；C2 = exact registry composition only。
+
+**RED → GREEN:**
 
 - [ ] **Step 1: Write failing production dependency and secret-boundary tests**
 
 ~~~go
 func TestProductionConstructorFailsClosedForEveryMissingDependency(t *testing.T) {
 	valid := validProductionDependencies(t)
-	for _, mutate := range []func(*Dependencies){
-		func(d *Dependencies) { d.Queue = nil },
-		func(d *Dependencies) { d.Reconciler = nil },
-		func(d *Dependencies) { d.RuntimeResolver = nil },
-		func(d *Dependencies) { d.CleanupBroker = nil },
-		func(d *Dependencies) { d.Checkpoints = nil },
-		func(d *Dependencies) { d.Registry = nil },
+	for _, mutate := range []func(*ProductionDependencies){
+		func(d *ProductionDependencies) { d.Queue = nil },
+		func(d *ProductionDependencies) { d.PageCommitter = nil },
+		func(d *ProductionDependencies) { d.Limiter = nil },
+		func(d *ProductionDependencies) { d.AttemptAuthority = nil },
+		func(d *ProductionDependencies) { d.SessionTransport = nil },
+		func(d *ProductionDependencies) { d.Checkpoints = nil },
+		func(d *ProductionDependencies) { d.Registry = nil },
+		func(d *ProductionDependencies) { d.WorkloadIdentity = nil },
 	} {
 		candidate := valid.Clone()
 		mutate(&candidate)
-		if _, err := New(candidate); err == nil {
+		if _, err := NewProduction(candidate); err == nil {
 			t.Fatal("constructor accepted missing production dependency")
 		}
 	}
 }
 
-func TestDiscoveryWorkerRunPayloadHasNoSensitiveTransportFields(t *testing.T) {
-	assertNoExportedFields(t, discoveryqueue.Claim{}, "Endpoint", "URL", "Credential", "Secret", "Token", "PEM", "Header", "Body", "Cursor")
+func TestProductionRegistryRejectsUnavailableOrDriftedProvider(t *testing.T) {
+	registry := newRegistryFromMergedDescriptors(t)
+	assertUnavailable(t, registry, "KUBERNETES_OPERATOR")
+	assertUnavailable(t, registry, "AWX_INVENTORY")
+	assertSemanticDriftRejected(t, registry, "CMDB_CATALOG_V1")
 }
 ~~~
 
 Run: `go test ./internal/discoveryworker ./cmd/discovery-worker -count=1`
 
-Expected: FAIL because Worker and production constructor do not exist.
+Expected: FAIL because production constructor/registry/binary do not exist；Task 28A core itself is an already-merged `Consumes` and is not changed by this RED。
 
-- [ ] **Step 2: Implement one fenced run loop with terminal cleanup**
+- [ ] **Step 2: Compose the merged Worker core and exact Provider descriptors**
 
-For every claim:
-
-1. revalidate workload identity, Scope, source, exact revision/profile/gate and fence;
-2. for Validation, construct an empty checkpoint input and never read the published Source checkpoint；for data Runs, decrypt the exact checkpoint through keyring；then resolve the non-serializable RuntimeBinding;
-3. call `ReserveCleanupAttempt` and only then `CleanupBroker.OpenAttempt` for this source/revision/run/epoch；the Worker receives a non-serializable process handle, never a durable secret payload;
-4. advance the stable stage and, for Validation, call fixed `Validate` then fenced `ProposeValidationResult` with exact proof；for discovery, consume only the closed `DiscoverOutcome` (`Page|Delay`) and call `Discover` page-by-page;
-5. before and after every network call heartbeat and revalidate the run-kind-specific fence/gate/revision/checkpoint facts;
-6. for a Page outcome, advance `NORMALIZING→APPLYING`, perform DLP/schema/budget checks, then `ApplyPage`；cycle to `READING` only for another page;
-7. for Provider Retry-After or transport ambiguity, stop all Provider calls；never combine it with data or guess/retry side effects；a verified token-expiry reason may only call `BeginCheckpointLineageRollover` and continue the same authoritative full Run;
-8. before cleanup, persist exactly one next path：bounded delay intent for retry、`PrepareFailureIntent` for fatal error、or the already-recorded data/validation work result；then advance `CLEANING_UP`, close/zero runtime and provider response buffers, call Broker `RevokeAttempt`, and persist its signed cleanup proof/immutable attempt receipt;
-9. call fenced `Delay` for the persisted `PROVIDER_RETRY_AFTER|TRANSPORT_BACKOFF` intent only after clean proof；otherwise call `Complete/Fail` using the already persisted work result/intent. Cleanup uncertainty preserves any prior work result and uses the closed failure override. Exact terminal replay is served from its receipt before fence matching.
-
-Panic recovery only performs Broker cleanup/failure recording and process health degradation；it cannot mark success. Context cancellation stops new claims and gives current runs at most one lease interval to clean up. A reclaimed pending attempt is cleanup-only, then delayed or failed；it never resumes Provider work under the replacement fence. Unsupported provider closes only its source gate with `SOURCE_PROVIDER_UNAVAILABLE`.
+Task 28C 不实现第二个 fenced run loop。它只把 Task 28A `New(Dependencies)` 与真实 PostgreSQL Queue/PageCommitter/Limiter、CheckpointCodec、Task 28B 唯一 `AttemptSessionAuthority` 和 immutable registry 组合；process-local Broker 与 resolver 必须由该同一 authority 构造，禁止分别注入、再次调用 credential resolver 或新建 session。每个 Provider descriptor 必须来自对应已合并 Provider Batch，并与 neutral metadata digest exact 相等。缺 descriptor、Task 28B transport、duplicate Provider/Profile、semantic drift、attempt binding 漂移或 unsupported kind 在创建 Worker 前 fail closed。Core 的 claim、Page/Delay、cleanup、terminal、panic 和 cancellation 行为继续由 Task 28A 四文件唯一拥有。
 
 - [ ] **Step 3: Assemble the real binary without production fake branches**
 
-`cmd/discovery-worker` requires PostgreSQL DSN file, workload identity certificate/key file, CA file, secure source-profile manifest file, credential resolver socket, checkpoint keyring file, metrics private bind and worker ID. Files must be absolute, owner-only where secret-bearing, symlink-safe and loaded through existing secure bootstrap patterns. Startup verifies migrations through 000015, manifest digest/signature, registry completeness, mTLS identity, DB time and dependency health before readiness.
+`cmd/discovery-worker` requires PostgreSQL DSN file, workload identity certificate/key file, CA file, secure source-profile manifest file, Task 28B shared session-authority endpoint/socket, checkpoint keyring file, metrics private bind and worker ID. Files must be absolute, owner-only where secret-bearing, symlink-safe and loaded through existing secure bootstrap patterns. Startup verifies migrations through 000015, manifest digest/signature, registry completeness, mTLS identity, DB time and dependency health before readiness.
 
-The binary does not import `internal/*/memory`, testdata, MSW, Control Plane handler or model/LLM packages. Add AST/import tests proving Provider SDK packages are reachable only from `cmd/discovery-worker` production graph and never from `cmd/control-plane`.
+The binary does not import `internal/*/memory`, testdata, MSW, Control Plane handler or model/LLM packages. Add AST/import tests proving Provider SDK、Provider HTTP-client、credential/session transport packages are reachable only from `cmd/discovery-worker` production graph and never from `cmd/control-plane`；Control Plane 后续只能 import `internal/sourceprofile` neutral metadata/admission package，其既有 HTTP server graph 不受影响。
 
 - [ ] **Step 4: Verify binary, race, shutdown, and commit**
+
+**G2:**
 
 Run:
 
 ~~~bash
-gofmt -w $(rg --files internal/discoveryworker cmd/discovery-worker internal/config -g '*.go')
-go test -race ./internal/discoveryworker ./cmd/discovery-worker ./internal/config -count=1
+gofmt -w $(rg --files internal/discoveryworker cmd/discovery-worker -g '*.go')
+go test -race ./internal/discoveryworker ./cmd/discovery-worker -count=1
 go build ./cmd/discovery-worker
-go test ./cmd/control-plane ./cmd/discovery-worker -run 'Production|Boundary|Secret' -count=1
+go test ./cmd/control-plane ./cmd/discovery-worker -run 'Production|Registry|Boundary|Secret' -count=1
+git diff --check
 ~~~
 
 Expected: PASS; missing/stale configuration fails before ready, shutdown cleans credentials/leases, Control Plane has no Provider network/secret dependency and no test fake is production-reachable.
 
 ~~~bash
-git add internal/discoveryworker cmd/discovery-worker internal/config/config.go internal/config/config_test.go
+git add internal/discoveryworker/registry.go internal/discoveryworker/registry_test.go \
+  internal/discoveryworker/production.go internal/discoveryworker/production_test.go \
+  cmd/discovery-worker
 git commit -m "feat(assetdiscovery): assemble production discovery worker"
 ~~~
+
+**Deferred G3/G4:** 两个真实 binary、PostgreSQL reconnect/restart、HA takeover、real workload identity/credential resolver/keyring rotation、全 Provider lab matrix 和发布资格由 Task 29/G3/G4 执行。Task 28C 最多为 `BUILT_CLOSED`；binary 存在不代表任一 Provider 或 Worker 可用。
 
 ### Task 29: Multi-provider HA drills, final gate matrix, telemetry, and E2E evidence
 
@@ -370,9 +408,10 @@ git commit -m "feat(assetdiscovery): assemble production discovery worker"
 - Modify: `.github/workflows/ci.yml`
 
 **Interfaces:**
+- Consumes Task 28C real binary/registry、Task 28B fixed mTLS recovery client/same-attempt composition、each Provider's merged G2 evidence，以及通过 opaque lab binding 预置的真实外部 shared session authority；Task 29 不拥有 authority server/binary，脚本不得启动或用 fake session map 代替它。
 - Produces low-cardinality metrics `asset_source_claims_total{provider,result}`, `asset_source_pages_total{provider,result}`, `asset_source_backpressure_total{provider,reason}`, `asset_source_fence_rejections_total{boundary}`, `asset_source_gate_status{provider,status}`, `asset_source_checkpoint_age_seconds{provider}`.
 - Produces signed provider acceptance matrix keyed by exact Provider profile/revision; missing providers remain explicitly `UNAVAILABLE`.
-- HA scripts consume only test/lab binding IDs from environment and never print their values.
+- HA scripts consume only test/lab binding IDs（包括 `AIOPS_DISCOVERY_SESSION_AUTHORITY_LAB_BINDING`）from environment and never print their values；missing binding、mTLS identity failure 或 authority unavailable 必须 fail closed，不能 Skip。
 
 - [ ] **Step 1: Write failing provider-matrix and metric-cardinality tests**
 
@@ -418,12 +457,13 @@ Each Phase 1 row requires current validation, real protocol, negative, DLP, prov
 
 - [ ] **Step 3: Execute kill/failover/backpressure and full provider E2E**
 
-`verify-discovery-worker-ha.sh` starts two real Worker processes and PostgreSQL, queues validation and discovery for every CI protocol provider, kills the lease owner during Provider read、after final page commit and after `RecordCleanup` but before each of `Delay|Complete|Fail`, expires the lease, verifies one reclaim/epoch increment, cleanup-only Broker revocation/receipt consumption by opaque attempt ID, deterministic persisted next intent, no runtime/checkpoint access during that cleanup, no duplicate same-Run Observation/relation, one append-only unchanged Observation in a later Run, no stale checkpoint commit, one terminal receipt and correct gate. It separately loses the first `Complete/Fail` response and proves exact receipt-first replay succeeds after `LeaseFence.Destroy` while a changed digest is rejected. It also drifts a Source under an expired lease and proves `ReapDrifted` closes the Run/slot without any Provider call；cleanup uncertainty deterministically yields `FAILED + SUSPENDED`. It restarts PostgreSQL, saturates source/workspace/provider limits and proves durable Provider Retry-After/transport backoff/queue rejection/recovery.
+`verify-discovery-worker-ha.sh` starts two real Worker processes and PostgreSQL，then uses only `AIOPS_DISCOVERY_SESSION_AUTHORITY_LAB_BINDING` to connect through Task 28B production client to an already-provisioned real external shared session authority；the script neither starts nor implements that authority and never accepts its endpoint/credential as a flag。It queues validation and discovery for every CI protocol provider，kills the lease owner during Provider read、after final page commit and after `RecordCleanup` but before each of `Delay|Complete|Fail`。Replacement Worker 必须取得一个 reclaim/epoch increment 和 exact cleanup-only `RunCoordinates + CleanupAttempt`，先证明其新 process-local Broker 直接 revoke 会 `ErrAttemptNotFound`，再经 production recovery-open 找回同一外部 session 的 revoke handle；它不得获得 `BoundRuntime`、checkpoint、endpoint 或 credential，随后只完成 revoke/proof/receipt 与 deterministic persisted next intent。The drill proves no duplicate same-Run Observation/relation、one append-only unchanged Observation in a later Run、no stale checkpoint commit、one terminal receipt and correct gate. It separately loses the first `Complete/Fail` response and proves exact receipt-first replay succeeds after `LeaseFence.Destroy` while a changed digest is rejected. It also drifts a Source under an expired lease and proves `ReapDrifted` closes the Run/slot without any Provider call；cleanup uncertainty deterministically yields `FAILED + SUSPENDED`. The owned matrix restarts PostgreSQL/Workers and verifies authority reconnect/recovery through the external lab binding，saturates source/workspace/provider limits and proves durable Provider Retry-After/transport backoff/queue rejection/recovery。Missing/unreachable authority、mTLS failure、Skip 或任何脚本内 shared map/fake proof 均不得算 G3 PASS。
 
 Run:
 
 ~~~bash
 go test -race ./internal/discoveryworker ./internal/discoveryqueue/... ./internal/assetsource/... -count=1
+test -n "${AIOPS_DISCOVERY_SESSION_AUTHORITY_LAB_BINDING:-}"
 scripts/verify-discovery-worker-ha.sh
 scripts/verify-asset-source-provider-matrix.sh
 corepack pnpm@10.34.0 --dir web test:e2e -- --grep "source provider gate|source failover"

@@ -9,7 +9,7 @@
 | 1–2 摘要、当前事实与动机 | [总实施计划](../2026-07-13-governed-operations-program.md)、[阶段总索引](README.md) | V4 继承/替代图与最终状态源 |
 | 3 核心概念与最高不变量 | [Phase 1](01-assets/README.md)、[Phase 4](04-proactive-grants/README.md)、[Phase 7](07-governed-actions/README.md) | 身份、范围、快照、计划、凭据、验证、审计全链负向测试 |
 | 4 四层架构 | [Phase 1](01-assets/README.md)、[Phase 2](02-connections/README.md)、[Phase 4](04-proactive-grants/README.md)、[Phase 6](06-production-platform/README.md)、[Phase 7](07-governed-actions/README.md) | 真实 Control Plane/Gateway/READ-WRITE Runner/credential/Temporal 双修订装配 |
-| 5 资产目录 | [Phase 1](01-assets/README.md)，尤其 [Source/API](01-assets/05-source-ingestion-csv-api.md)、[CMDB](01-assets/06-source-external-cmdb.md)、[vSphere](01-assets/07-source-vsphere.md)、[云/虚拟化](01-assets/08-source-proxmox-openstack-cloud.md)、[Discovery Worker](01-assets/09-discovery-worker-ha-e2e.md) | 十二表 PostgreSQL、不可变 authority child、独立 Limiter bucket + permit/receipt truth、runtime-only exact Service/legacy-binding lock、三摘要 PostgreSQL 重算/direct-SQL/ACL/恢复负向证据、真实 Provider、发现合并、映射治理、OIDC/API/UI、HA/E2E、逐 Provider gate |
+| 5 资产目录 | [Phase 1](01-assets/README.md)，尤其 [Source/API](01-assets/05-source-ingestion-csv-api.md)、[CMDB](01-assets/06-source-external-cmdb.md)、[vSphere](01-assets/07-source-vsphere.md)、[云/虚拟化](01-assets/08-source-proxmox-openstack-cloud.md)、[Discovery Worker](01-assets/09-discovery-worker-ha-e2e.md) | 十二表 PostgreSQL、不可变 authority child、独立 Limiter bucket + permit/receipt truth、runtime-only exact Service/legacy-binding lock、三摘要 PostgreSQL 重算/direct-SQL/ACL/恢复负向证据；既有 PageCommitter/Task 27 primitives → Task 28A provider-neutral Worker core → 各 Provider durable integration（CMDB Task 18B）→ Task 28B recoverable session transport → Task 28C production registry → CMDB Task 19A Control Plane admission → Task 29 HA/E2E/逐 Provider gate |
 | 6 VictoriaMetrics 全家桶 | [Phase 3](03-victoriametrics/README.md) | Operator 全资源投影、Metrics/Logs/Traces 类型化 READ、ingestion/tool 零能力 |
 | 7 主机、远程方式与数据库 | [Phase 5](05-host-postgresql/README.md)，[Provider 发布](05-host-postgresql/02-provider-publication-runtime.md)、[API/Web/E2E](05-host-postgresql/03-provider-api-web-e2e.md)、[AWX enrollment](../../../contracts/awx-host-identity-enrollment-v1.md)、[governed launch](../../../contracts/awx-governed-launch-admission-v1.md)、[host attestor](../../../contracts/host-identity-attestor-v1.md) | Host Probe/AWX/PostgreSQL 三 Provider 全 Connection/Runtime 链、mapping-only→enrollment→N+1 identity、serializable governed Job admission、hardware-backed host identity、固定诊断、READ credential、DLP |
 | 8 ConnectionProfile 与发布 | [Phase 2](02-connections/README.md)，[连接向导](02-connections/06-web-publication-flow.md)、[凭据/Realm 库存](02-connections/07-governance-inventory-web.md) | 六步修订/验证/发布、mTLS Validation Runner、Runtime N/N+1、安全凭据引用/Realm/binding 库存 |
@@ -44,7 +44,7 @@
 |---|---|---|---|
 | `MANUAL` | [Phase 1 基础资产](01-assets/04-web-foundation-assets.md) | OIDC/Scope/ETag/Idempotency/Audit；只登记引用 | 不进入 Discovery Worker |
 | `CSV_RFC4180_V1` / `API_BATCH_V1` | [CSV/API](01-assets/05-source-ingestion-csv-api.md) | 签名或 mTLS/JWS、stream/sequence、DLP、checkpoint、HA/cleanup | `UNAVAILABLE` |
-| `CMDB_CATALOG_V1` | [External CMDB](01-assets/06-source-external-cmdb.md) | 身份/TLS/只读协议、增量/关系/provenance、staging canary | `UNAVAILABLE` |
+| `CMDB_CATALOG_V1` | [External CMDB](01-assets/06-source-external-cmdb.md) + [provider-neutral Worker/HA](01-assets/09-discovery-worker-ha-e2e.md) | Task 18A 身份/TLS/固定协议/paging；Task 18B 消费已合并 Worker core/Task 27/PageCommitter，证明增量关系/provenance/lifecycle并产出 neutral descriptor；Task 28B/28C 关闭 same-session recovery/production；Task 19A 才装配 Control Plane validation admission；Task 29 两 Worker HA 与 staging canary | `UNAVAILABLE` |
 | `VSPHERE_VCENTER_V1` | [vSphere](01-assets/07-source-vsphere.md) | vCenter UUID/TLS/最小权限、SOAP full+delta、lab canary | `UNAVAILABLE` |
 | `PROXMOX_VE_V1` / `OPENSTACK_NOVA_V2_1` | [虚拟化/云](01-assets/08-source-proxmox-openstack-cloud.md) | authority identity、只读分页/快照、缺失/恢复、lab canary | `UNAVAILABLE` |
 | `AWS_EC2_V1` / `AZURE_COMPUTE_V1` / `GCP_COMPUTE_V1` | [虚拟化/云](01-assets/08-source-proxmox-openstack-cloud.md) | workload identity、逐账号/订阅/项目分页、配额/HA、sandbox canary | `UNAVAILABLE` |
@@ -52,6 +52,27 @@
 | `AWX_INVENTORY` | [Phase 5 Provider Runtime](05-host-postgresql/02-provider-publication-runtime.md) | exact AWX Runtime、cursor/fence/429/provenance/full reconcile | Phase 1 显式 `UNAVAILABLE` |
 
 Source kind、SDK 或注册表条目本身不是开门证据；Gate 必须绑定 exact Scope、Source/Profile/Revision、Credential/Runtime binding 和未过期签名 receipt。
+
+### Discovery Worker / External CMDB 唯一所有权映射
+
+本表只纠正 Phase 1 内部 Batch owner，没有改变规范、总计划的跨阶段归属或迁移/OpenAPI 契约，因此无需创建第五份平行事实源。
+
+| 能力 | 唯一计划 owner | 稳定 `Consumes → Produces` | 未完成门 |
+|---|---|---|---|
+| Atomic page/relation projection + sealed checkpoint + receipts | [M1E PageCommitter](01-assets/13-m1e-page-commit-transaction.md)，已合并 PR #53 | M1C/M1D/`000015` → `discoverysource.PageCommitter` + PostgreSQL transaction | commit ambiguity、HA/recovery 为 G3/G4 |
+| Queue lease/fence/run lifecycle | [Pack 09 Task 27](01-assets/09-discovery-worker-ha-e2e.md#task-27-merged-durable-queue-cleanup-checkpoint-and-limiter-primitives)，已合并 PR #55 | `000015`/LeaseFence → frozen `discoveryqueue.Queue` ABI/PostgreSQL lifecycle | 两 Worker/restart/recovery |
+| Process-local cleanup attempt/session proof | Pack 09 Task 27，已合并 PR #57 | Queue opaque attempt → process-local `CleanupBroker` signed `REVOKED|UNCERTAIN` proof | 新进程旧 attempt 为 `ErrAttemptNotFound`；不构成 HA |
+| Source/Workspace/Provider limiter | Pack 09 Task 27，已合并 PR #64 | bucket/permit ledger + installed profile → `Limiter.Acquire/Release/Delay` | multi-process/system qualification |
+| Provider-neutral claim/runtime loop | [Pack 09 Task 28A](01-assets/09-discovery-worker-ha-e2e.md#task-28a-provider-neutral-worker-core-and-claim-runtime-seam) | frozen Queue/PageCommitter/Cleanup/Limiter/Provider ABI → ordered Reserve/Open/Resolve + same-opener/session/runtime-cell/handle/proof `discoveryworker.Worker` seam | PostgreSQL/provider integration、recoverable transport、binary、HA |
+| External CMDB durable lifecycle + neutral descriptor | [Pack 06 Task 18B](01-assets/06-source-external-cmdb.md#task-18b-external-cmdb-durable-reconciliation-and-lifecycle-integration) | merged Task 18A + Task 27/PageCommitter + merged Task 28A → `internal/sourceprofile` canonical descriptor、CMDB fact-policy/runtime factory and PostgreSQL 18.4 TLS G2 evidence | 两 Worker/HA/restart/recovery G3；real canary G4 |
+| Recoverable cleanup-session client/composition | [Pack 09 Task 28B](01-assets/09-discovery-worker-ha-e2e.md#task-28b-recoverable-cleanup-session-transport-and-attempt-authority) | exact opaque Run/attempt/epoch/binding digest + fixed mTLS external-authority client → same-session recovery handle，zero secret payload；不产生 authority server/binary | opaque lab binding 的真实外部 authority、two-process/restart 为 G3 |
+| Exact Provider registry/production binary | [Pack 09 Task 28C](01-assets/09-discovery-worker-ha-e2e.md#task-28c-production-constructor-and-provider-registry) | merged Task 28A/28B + each merged neutral/provider descriptor/integration → production constructor、safe runtime-admission manifest + `cmd/discovery-worker` | Task 19A、Task 29/G3/G4 |
+| Control Plane CMDB profile/validation admission | [Pack 06 Task 19A](01-assets/06-source-external-cmdb.md#task-19a-control-plane-cmdb-profile-installation-and-validation-admission) | Task 18B neutral descriptor + Task 28C safe runtime manifest → exact `SourceProfileRegistry`/Repository admission | successful validation、publish/sync、gate/canary仍关闭 |
+| Two-worker HA/provider matrix | [Pack 09 Task 29](01-assets/09-discovery-worker-ha-e2e.md#task-29-multi-provider-ha-drills-final-gate-matrix-telemetry-and-e2e-evidence) | production binary + opaque lab binding 的已预置真实外部 authority + all current Provider proofs → signed per-row acceptance evidence；脚本不实现 authority | G4 real dependencies/release |
+
+Task 18B 不拥有 Queue、Worker common state machine、PageCommitter SQL、production registry 或 binary；Task 28A 不 import/注册 Provider；Task 28B 不修改 core/Provider；Task 28C 不重建 neutral/provider descriptor。Task 19A 的 Control Plane 只 import `internal/sourceprofile` metadata/admission，不得 import External CMDB Provider/Provider HTTP-client/credential-session graph，也不得拥有 endpoint、credential 或 runtime material；既有 Control Plane HTTP server不在此禁令内。所有后继只消费已合并 `Produces`。External CMDB G2 必须使用 PostgreSQL 18.4 TLS 和 `AIOPS_TEST_POSTGRES_DSN`，缺环境或 Skip 不得算 PASS；两 Worker/production recovery/HA/restart 未跑前旧 Task 18 不可勾完，能力继续 `UNAVAILABLE/CLOSED`。
+
+本次纠偏不修改完成度状态；PR #97 已在本纠偏前单独合并并继续是 `docs/status/current.md` 的唯一 owner。它对 Task 18B deferred PostgreSQL/Worker/HA 范围的宽泛列举不是文件所有权合同；本四文件 PR 合并后只能由后续 manager/status 同步把该措辞收敛到本表，不能由上述任何实现 owner或本 PR 改写状态页。
 
 ### Future Source gate successor 证据
 
