@@ -45,10 +45,31 @@ func TestControlPlaneContractHasExactRoutes(t *testing.T) {
 			"delete",
 		},
 		"/api/v1/workspaces/{workspace_id}/asset-sources": {
-			"get",
+			"get", "post",
 		},
 		"/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}": {
 			"get",
+		},
+		"/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/revisions": {
+			"post",
+		},
+		"/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/revisions/{revision}:validate": {
+			"post",
+		},
+		"/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/revisions/{revision}:publish": {
+			"post",
+		},
+		"/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}:disable": {
+			"post",
+		},
+		"/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}:sync": {
+			"post",
+		},
+		"/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/imports": {
+			"post",
+		},
+		"/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/ingestion-batches": {
+			"post",
 		},
 		"/api/v1/workspaces/{workspace_id}/asset-source-runs/{run_id}": {
 			"get",
@@ -88,6 +109,112 @@ func TestControlPlaneContractHasExactRoutes(t *testing.T) {
 	} {
 		if strings.Contains(lower, forbidden+":") {
 			t.Errorf("browser contract contains forbidden field %s", forbidden)
+		}
+	}
+}
+
+func TestControlPlaneSourceMutationAndIngestionRoutes(t *testing.T) {
+	_, document := readControlPlaneContract(t)
+	paths := mustMap(t, document["paths"], "#/paths")
+	required := map[string]string{
+		"/api/v1/workspaces/{workspace_id}/asset-sources":                                           "createAssetSource",
+		"/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/revisions":                     "createAssetSourceRevision",
+		"/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/revisions/{revision}:validate": "validateAssetSourceRevision",
+		"/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/revisions/{revision}:publish":  "publishAssetSourceRevision",
+		"/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}:disable":                       "disableAssetSource",
+		"/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}:sync":                          "syncAssetSource",
+		"/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/imports":                       "createAssetSourceImport",
+		"/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/ingestion-batches":             "createAssetSourceIngestionBatch",
+	}
+	for path, operationID := range required {
+		pathItem, exists := paths[path]
+		if !exists {
+			t.Errorf("missing Source path %s", path)
+			continue
+		}
+		operation := mustMap(t, mustMap(t, pathItem, path)["post"], path+" post")
+		if got := operation["operationId"]; got != operationID {
+			t.Errorf("POST %s operationId = %#v, want %q", path, got, operationID)
+		}
+		responses := mustMap(t, operation["responses"], path+" responses")
+		if _, exists := responses["503"]; !exists {
+			t.Errorf("POST %s lacks current fail-closed 503 response", path)
+		}
+	}
+}
+
+func TestControlPlaneSourceIngestionUsesOnlyMutualTLSAndClosedSchemas(t *testing.T) {
+	_, document := readControlPlaneContract(t)
+	components := mustMap(t, document["components"], "#/components")
+	securitySchemes := mustMap(t, components["securitySchemes"], "#/components/securitySchemes")
+	mutualTLS := mustMap(t, securitySchemes["mutualTLS"], "mutualTLS")
+	if mutualTLS["type"] != "mutualTLS" {
+		t.Fatalf("mutualTLS scheme = %#v", mutualTLS)
+	}
+
+	paths := mustMap(t, document["paths"], "#/paths")
+	const ingestionPath = "/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/ingestion-batches"
+	ingestion := mustMap(
+		t,
+		mustMap(t, paths[ingestionPath], ingestionPath)["post"],
+		ingestionPath+" post",
+	)
+	security, ok := ingestion["security"].([]any)
+	if !ok || len(security) != 1 {
+		t.Fatalf("ingestion security = %#v", ingestion["security"])
+	}
+	requirement := mustMap(t, security[0], "ingestion security requirement")
+	if len(requirement) != 1 {
+		t.Fatalf("ingestion security requirement = %#v", requirement)
+	}
+	scopes, ok := requirement["mutualTLS"].([]any)
+	if !ok || len(scopes) != 0 {
+		t.Fatalf("ingestion mutualTLS scopes = %#v", requirement["mutualTLS"])
+	}
+	if _, hasOIDC := requirement["oidc"]; hasOIDC {
+		t.Fatalf("ingestion security unexpectedly includes OIDC: %#v", requirement)
+	}
+	if body, exists := ingestion["requestBody"]; exists {
+		t.Fatalf("Task 14 must not predeclare Task 16 ingestion body: %#v", body)
+	}
+	for _, operationID := range []string{
+		"createAssetSource",
+		"createAssetSourceRevision",
+		"validateAssetSourceRevision",
+		"publishAssetSourceRevision",
+		"disableAssetSource",
+		"syncAssetSource",
+		"createAssetSourceImport",
+	} {
+		for path, rawPathItem := range paths {
+			pathItem := mustMap(t, rawPathItem, path)
+			post, exists := pathItem["post"]
+			if !exists {
+				continue
+			}
+			operation := mustMap(t, post, path+" post")
+			if operation["operationId"] == operationID {
+				if securityOverride, overridden := operation["security"]; overridden {
+					t.Fatalf("%s security override = %#v, want inherited OIDC", operationID, securityOverride)
+				}
+			}
+		}
+	}
+
+	schemas := mustMap(t, components["schemas"], "#/components/schemas")
+	for _, name := range []string{
+		"CreateAssetSourceRequest",
+		"CreateAssetSourceRevisionRequest",
+		"SourceReasonRequest",
+		"EmptySourceRequest",
+		"CreateAssetSourceImportRequest",
+		"AssetSourceRevisionMutationResult",
+		"AssetSourceMutationResult",
+		"AssetSourceRunMutationResult",
+	} {
+		schema := mustMap(t, schemas[name], "#/components/schemas/"+name)
+		if schema["type"] != "object" || schema["additionalProperties"] != false {
+			t.Errorf("%s is not a closed object: %#v", name, schema)
 		}
 	}
 }

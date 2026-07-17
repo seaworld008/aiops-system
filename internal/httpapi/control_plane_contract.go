@@ -29,7 +29,7 @@ var (
 	errControlPlaneBodyTooLarge         = errors.New("control plane body too large")
 )
 
-const controlPlaneContractDigest = "sha256:f90439561a1b0fb266dd8f2a8f08f15d97421851ae2857e461981c2d6cadfab3"
+const controlPlaneContractDigest = "sha256:5f3d4bb6c3b7473f2655f4c7b4839e9d4cb3bf3b115a2ce2e2dd47b32e020082"
 
 type controlPlaneCursor struct {
 	Kind        string `json:"kind"`
@@ -159,6 +159,71 @@ func parseVersionETag(request *http.Request, resourceType, resourceID string) (i
 		return 0, errInvalidControlPlaneRequest
 	}
 	return version, nil
+}
+
+func sourceVersionETag(sourceID string, sourceVersion int64) string {
+	if !validControlPlaneUUID(sourceID) || sourceVersion <= 0 {
+		return ""
+	}
+	return `"asset-source:` + sourceID + `:v` + strconv.FormatInt(sourceVersion, 10) + `"`
+}
+
+func sourceRevisionETag(
+	sourceID string,
+	revision int64,
+	sourceVersion int64,
+	revisionVersion int64,
+) string {
+	if !validControlPlaneUUID(sourceID) || revision <= 0 ||
+		sourceVersion <= 0 || revisionVersion <= 0 {
+		return ""
+	}
+	return `"asset-source-revision:` + sourceID +
+		`:r` + strconv.FormatInt(revision, 10) +
+		`:sv` + strconv.FormatInt(sourceVersion, 10) +
+		`:rv` + strconv.FormatInt(revisionVersion, 10) + `"`
+}
+
+func parseSourceRevisionETag(
+	request *http.Request,
+	sourceID string,
+	revision int64,
+) (int64, int64, error) {
+	values := request.Header.Values("If-Match")
+	if len(values) != 1 || !validControlPlaneUUID(sourceID) || revision <= 0 {
+		return 0, 0, errInvalidControlPlaneRequest
+	}
+	value := values[0]
+	prefix := `"asset-source-revision:` + sourceID +
+		`:r` + strconv.FormatInt(revision, 10) + `:sv`
+	if !strings.HasPrefix(value, prefix) || !strings.HasSuffix(value, `"`) ||
+		strings.HasPrefix(value, `W/`) || strings.Contains(value, ",") {
+		return 0, 0, errInvalidControlPlaneRequest
+	}
+	versions := strings.Split(strings.TrimSuffix(strings.TrimPrefix(value, prefix), `"`), ":rv")
+	if len(versions) != 2 {
+		return 0, 0, errInvalidControlPlaneRequest
+	}
+	sourceVersion, sourceErr := strconv.ParseInt(versions[0], 10, 64)
+	revisionVersion, revisionErr := strconv.ParseInt(versions[1], 10, 64)
+	if sourceErr != nil || revisionErr != nil || sourceVersion <= 0 || revisionVersion <= 0 ||
+		strconv.FormatInt(sourceVersion, 10) != versions[0] ||
+		strconv.FormatInt(revisionVersion, 10) != versions[1] {
+		return 0, 0, errInvalidControlPlaneRequest
+	}
+	return sourceVersion, revisionVersion, nil
+}
+
+func writeSourceRevisionETag(
+	writer http.ResponseWriter,
+	sourceID string,
+	revision int64,
+	sourceVersion int64,
+	revisionVersion int64,
+) {
+	if value := sourceRevisionETag(sourceID, revision, sourceVersion, revisionVersion); value != "" {
+		writer.Header().Set("ETag", value)
+	}
 }
 
 func writeVersionETag(writer http.ResponseWriter, resourceType, resourceID string, version int64) {

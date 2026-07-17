@@ -553,6 +553,36 @@ paths:
           $ref: "#/components/responses/Problem500"
         "503":
           $ref: "#/components/responses/Problem503"
+    post:
+      tags: [AssetSources]
+      operationId: createAssetSource
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAssetSourceRequest"
+      responses:
+        "201":
+          $ref: "#/components/responses/AssetSourceRevisionCreated"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "409":
+          $ref: "#/components/responses/Problem409"
+        "413":
+          $ref: "#/components/responses/Problem413"
+        "415":
+          $ref: "#/components/responses/Problem415"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
   /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}:
     parameters:
       - $ref: "#/components/parameters/WorkspaceID"
@@ -571,6 +601,266 @@ paths:
           $ref: "#/components/responses/Problem403"
         "404":
           $ref: "#/components/responses/Problem404"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/revisions:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/SourceID"
+    post:
+      tags: [AssetSources]
+      operationId: createAssetSourceRevision
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAssetSourceRevisionRequest"
+      responses:
+        "201":
+          $ref: "#/components/responses/AssetSourceRevisionCreated"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "404":
+          $ref: "#/components/responses/Problem404"
+        "409":
+          $ref: "#/components/responses/Problem409"
+        "413":
+          $ref: "#/components/responses/Problem413"
+        "415":
+          $ref: "#/components/responses/Problem415"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/revisions/{revision}:validate:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/SourceID"
+      - $ref: "#/components/parameters/Revision"
+    post:
+      tags: [AssetSources]
+      operationId: validateAssetSourceRevision
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptySourceRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AssetSourceRunMutationOK"
+        "202":
+          $ref: "#/components/responses/AssetSourceRunMutationAccepted"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "404":
+          $ref: "#/components/responses/Problem404"
+        "409":
+          $ref: "#/components/responses/Problem409"
+        "413":
+          $ref: "#/components/responses/Problem413"
+        "415":
+          $ref: "#/components/responses/Problem415"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/revisions/{revision}:publish:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/SourceID"
+      - $ref: "#/components/parameters/Revision"
+    post:
+      tags: [AssetSources]
+      operationId: publishAssetSourceRevision
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SourceReasonRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AssetSourceRevisionMutationOK"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "404":
+          $ref: "#/components/responses/Problem404"
+        "409":
+          $ref: "#/components/responses/Problem409"
+        "413":
+          $ref: "#/components/responses/Problem413"
+        "415":
+          $ref: "#/components/responses/Problem415"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}:disable:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/SourceID"
+    post:
+      tags: [AssetSources]
+      operationId: disableAssetSource
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SourceReasonRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/AssetSourceMutationOK"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "404":
+          $ref: "#/components/responses/Problem404"
+        "409":
+          $ref: "#/components/responses/Problem409"
+        "413":
+          $ref: "#/components/responses/Problem413"
+        "415":
+          $ref: "#/components/responses/Problem415"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}:sync:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/SourceID"
+    post:
+      tags: [AssetSources]
+      operationId: syncAssetSource
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptySourceRequest"
+      responses:
+        "202":
+          $ref: "#/components/responses/AssetSourceRunMutationAccepted"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "404":
+          $ref: "#/components/responses/Problem404"
+        "409":
+          $ref: "#/components/responses/Problem409"
+        "413":
+          $ref: "#/components/responses/Problem413"
+        "415":
+          $ref: "#/components/responses/Problem415"
+        "429":
+          $ref: "#/components/responses/Problem429"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/imports:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/SourceID"
+    post:
+      tags: [AssetSources]
+      operationId: createAssetSourceImport
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/CreateAssetSourceImportRequest"
+      responses:
+        "202":
+          $ref: "#/components/responses/AssetSourceRunMutationAccepted"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "404":
+          $ref: "#/components/responses/Problem404"
+        "409":
+          $ref: "#/components/responses/Problem409"
+        "413":
+          $ref: "#/components/responses/Problem413"
+        "415":
+          $ref: "#/components/responses/Problem415"
+        "429":
+          $ref: "#/components/responses/Problem429"
+        "500":
+          $ref: "#/components/responses/Problem500"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/ingestion-batches:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/SourceID"
+    post:
+      tags: [AssetSources]
+      operationId: createAssetSourceIngestionBatch
+      security:
+        - mutualTLS: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "202":
+          $ref: "#/components/responses/AssetSourceRunMutationAccepted"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "409":
+          $ref: "#/components/responses/Problem409"
+        "413":
+          $ref: "#/components/responses/Problem413"
+        "415":
+          $ref: "#/components/responses/Problem415"
+        "429":
+          $ref: "#/components/responses/Problem429"
         "500":
           $ref: "#/components/responses/Problem500"
         "503":
@@ -686,6 +976,8 @@ components:
     oidc:
       type: openIdConnect
       openIdConnectUrl: https://identity.example.com/realms/aiops/.well-known/openid-configuration
+    mutualTLS:
+      type: mutualTLS
   parameters:
     WorkspaceID:
       name: workspace_id
@@ -717,6 +1009,14 @@ components:
       required: true
       schema:
         $ref: "#/components/schemas/UUID"
+    Revision:
+      name: revision
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
     ConflictID:
       name: conflict_id
       in: path
@@ -806,6 +1106,13 @@ components:
       schema:
         type: string
         enum: ["true", "false"]
+    RetryAfter:
+      required: true
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+        maximum: 60
   responses:
     BrowserConfigOK:
       description: Public browser bootstrap metadata.
@@ -1018,6 +1325,93 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/AssetSourceRun"
+    AssetSourceRevisionCreated:
+      description: Stable Source and immutable revision created atomically.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+        ETag:
+          $ref: "#/components/headers/ETag"
+        Location:
+          $ref: "#/components/headers/Location"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AssetSourceRevisionMutationResult"
+    AssetSourceRevisionMutationOK:
+      description: Governed Source revision mutation result.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+        ETag:
+          $ref: "#/components/headers/ETag"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AssetSourceRevisionMutationResult"
+    AssetSourceMutationOK:
+      description: Governed stable Source mutation result.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+        ETag:
+          $ref: "#/components/headers/ETag"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AssetSourceMutationResult"
+    AssetSourceRunMutationOK:
+      description: Synchronous terminal Source validation result.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+        ETag:
+          $ref: "#/components/headers/ETag"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AssetSourceRunMutationResult"
+    AssetSourceRunMutationAccepted:
+      description: Durable Source Run accepted; a currently unimplemented runtime returns Problem503 instead.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+        ETag:
+          $ref: "#/components/headers/ETag"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AssetSourceRunMutationResult"
     AssetConflictPageOK:
       description: Scoped conflict page.
       headers:
@@ -1155,6 +1549,23 @@ components:
         application/problem+json:
           schema:
             $ref: "#/components/schemas/Problem"
+    Problem429:
+      description: Source or Workspace backpressure rejected this request.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+        Retry-After:
+          $ref: "#/components/headers/RetryAfter"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
     Problem500:
       description: Request failed without exposing internal detail.
       headers:
@@ -1220,6 +1631,13 @@ components:
         - CREATE_BINDING
         - DELETE_BINDING
         - RESOLVE_CONFLICT
+        - CREATE_SOURCE
+        - CREATE_SOURCE_REVISION
+        - VALIDATE_SOURCE_REVISION
+        - PUBLISH_SOURCE_REVISION
+        - DISABLE_SOURCE
+        - SYNC_SOURCE
+        - IMPORT_CSV
     AssetKind:
       type: string
       enum:
@@ -1302,6 +1720,9 @@ components:
     SourceRevisionStatus:
       type: string
       enum: [DRAFT, VALIDATING, VALIDATED, REJECTED, PUBLISHED, SUPERSEDED]
+    SourceSyncMode:
+      type: string
+      enum: [MANUAL, ON_DEMAND, SCHEDULED]
     RunKind:
       type: string
       enum: [VALIDATION, DISCOVERY, CSV_IMPORT, API_INGESTION, MANUAL_MUTATION]
@@ -2000,6 +2421,75 @@ components:
           $ref: "#/components/schemas/ServiceAssetBindingSummary"
         mutation_receipt:
           $ref: "#/components/schemas/MutationReceipt"
+    CreateAssetSourceRequest:
+      type: object
+      additionalProperties: false
+      required: [name, source_profile_id, authority_environment_ids]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        source_profile_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+        authority_environment_ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/UUID"
+    CreateAssetSourceRevisionRequest:
+      type: object
+      additionalProperties: false
+      required: [source_profile_id, authority_environment_ids, change_reason_code]
+      properties:
+        source_profile_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+        authority_environment_ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/UUID"
+        change_reason_code:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Z][A-Z0-9_]{0,127}$"
+    SourceReasonRequest:
+      type: object
+      additionalProperties: false
+      required: [reason_code]
+      properties:
+        reason_code:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Z][A-Z0-9_]{0,127}$"
+    EmptySourceRequest:
+      type: object
+      additionalProperties: false
+      required: []
+      properties: {}
+    CreateAssetSourceImportRequest:
+      type: object
+      additionalProperties: false
+      required: [file, detached_signature]
+      properties:
+        file:
+          type: string
+          format: binary
+        detached_signature:
+          type: string
+          format: binary
     SourceRunCounts:
       type: object
       additionalProperties: false
@@ -2141,7 +2631,22 @@ components:
     SourceRevisionSummary:
       type: object
       additionalProperties: false
-      required: [revision, status, binding_digest, source_definition_digest, created_at, updated_at]
+      required:
+        - revision
+        - status
+        - profile_code
+        - integration_id
+        - sync_mode
+        - credential_reference_id
+        - trust_reference_id
+        - network_policy_reference_id
+        - authority_environment_ids
+        - binding_digest
+        - source_definition_digest
+        - version
+        - created_at
+        - updated_at
+        - effective_actions
       properties:
         revision:
           type: integer
@@ -2149,16 +2654,48 @@ components:
           minimum: 1
         status:
           $ref: "#/components/schemas/SourceRevisionStatus"
+        profile_code:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: "^[A-Z][A-Z0-9_]{0,63}$"
+        integration_id:
+          $ref: "#/components/schemas/NullableUUID"
+        sync_mode:
+          $ref: "#/components/schemas/SourceSyncMode"
+        credential_reference_id:
+          $ref: "#/components/schemas/NullableUUID"
+        trust_reference_id:
+          $ref: "#/components/schemas/NullableUUID"
+        network_policy_reference_id:
+          $ref: "#/components/schemas/NullableUUID"
+        authority_environment_ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/UUID"
         binding_digest:
           $ref: "#/components/schemas/Digest"
         source_definition_digest:
           $ref: "#/components/schemas/Digest"
+        version:
+          type: integer
+          format: int64
+          minimum: 1
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
+        effective_actions:
+          type: array
+          maxItems: 7
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/EffectiveAction"
     AssetSourceDetail:
       type: object
       additionalProperties: false
@@ -2186,7 +2723,8 @@ components:
           $ref: "#/components/schemas/PageMeta"
         effective_actions:
           type: array
-          maxItems: 0
+          maxItems: 1
+          uniqueItems: true
           items:
             $ref: "#/components/schemas/EffectiveAction"
     AssetSourceRun:
@@ -2322,6 +2860,41 @@ components:
           maxItems: 0
           items:
             $ref: "#/components/schemas/EffectiveAction"
+    AssetSourceRevisionMutationResult:
+      type: object
+      additionalProperties: false
+      required: [source, revision, mutation_receipt]
+      properties:
+        source:
+          $ref: "#/components/schemas/AssetSourceSummary"
+        revision:
+          $ref: "#/components/schemas/SourceRevisionSummary"
+        mutation_receipt:
+          $ref: "#/components/schemas/MutationReceipt"
+    AssetSourceMutationResult:
+      type: object
+      additionalProperties: false
+      required: [source, mutation_receipt]
+      properties:
+        source:
+          $ref: "#/components/schemas/AssetSourceSummary"
+        mutation_receipt:
+          $ref: "#/components/schemas/MutationReceipt"
+    AssetSourceRunMutationResult:
+      type: object
+      additionalProperties: false
+      required: [source, revision, run, operation_id, mutation_receipt]
+      properties:
+        source:
+          $ref: "#/components/schemas/AssetSourceSummary"
+        revision:
+          $ref: "#/components/schemas/SourceRevisionSummary"
+        run:
+          $ref: "#/components/schemas/AssetSourceRun"
+        operation_id:
+          $ref: "#/components/schemas/UUID"
+        mutation_receipt:
+          $ref: "#/components/schemas/MutationReceipt"
     ConflictAssetReference:
       type: object
       additionalProperties: false
