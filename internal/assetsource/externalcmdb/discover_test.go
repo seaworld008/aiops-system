@@ -84,6 +84,123 @@ func TestDiscoverResumesAssetsThenRelationsAtExactCheckpoint(t *testing.T) {
 	}
 }
 
+func TestDiscoverCompleteCheckpointStartsNextRunAtCapabilities(t *testing.T) {
+	t.Parallel()
+
+	fixtures := externalCMDBFixtures{
+		capabilities: loadExternalCMDBFixture(t, "capabilities.json"),
+		assetPage1:   loadExternalCMDBFixture(t, "assets-page-1.json"),
+		assetPage2:   loadExternalCMDBFixture(t, "assets-page-2.json"),
+		relations:    loadExternalCMDBFixture(t, "relations.json"),
+	}
+	const nextSnapshotEpoch = "snapshot-2026-07-17-0002"
+	nextCapabilities := mutateExternalCMDBFixture(t, fixtures.capabilities, func(root map[string]any) {
+		root["snapshot_epoch"] = nextSnapshotEpoch
+	})
+	nextAssetPage := mutateExternalCMDBFixture(t, fixtures.assetPage1, func(root map[string]any) {
+		root["snapshot_epoch"] = nextSnapshotEpoch
+		root["next_cursor"] = "asset-cursor-next-run-0002"
+		for index, value := range root["items"].([]any) {
+			value.(map[string]any)["updated_at"] = fmt.Sprintf("2026-07-17T09:00:0%dZ", index+1)
+		}
+	})
+
+	var requests []string
+	capabilityCalls := 0
+	firstAssetCalls := 0
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests = append(requests, request.URL.RequestURI())
+		writer.Header().Set("Content-Type", catalogContentType)
+		switch request.URL.RequestURI() {
+		case capabilitiesPath:
+			capabilityCalls++
+			if capabilityCalls == 1 {
+				_, _ = writer.Write(fixtures.capabilities)
+			} else {
+				_, _ = writer.Write(nextCapabilities)
+			}
+		case assetsPath + "?limit=500":
+			firstAssetCalls++
+			if firstAssetCalls == 1 {
+				_, _ = writer.Write(fixtures.assetPage1)
+			} else {
+				_, _ = writer.Write(nextAssetPage)
+			}
+		case assetsPath + "?cursor=asset-cursor-0002&limit=500":
+			_, _ = writer.Write(fixtures.assetPage2)
+		case relationsPath + "?limit=2000":
+			_, _ = writer.Write(fixtures.relations)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	contractProvider, runtimeBinding, request := newDiscoveryProviderFixture(t, server)
+	first := requireDiscoverPage(t, contractProvider, runtimeBinding, request)
+	request.Checkpoint = first.NextCheckpoint.Clone()
+	second := requireDiscoverPage(t, contractProvider, runtimeBinding, request)
+	request.Checkpoint = second.NextCheckpoint.Clone()
+	final := requireDiscoverPage(t, contractProvider, runtimeBinding, request)
+	if !final.FinalPage || !final.CompleteSnapshot {
+		t.Fatalf("final page = %#v", final)
+	}
+	completed, err := decodeCMDBCheckpoint(final.NextCheckpoint)
+	if err != nil {
+		t.Fatalf("decode complete checkpoint: %v", err)
+	}
+	if completed.phase != cmdbPhaseComplete || !completed.assetsComplete ||
+		!completed.assetLast.present || !completed.relationLast.present {
+		t.Fatalf("complete checkpoint = %#v", completed)
+	}
+
+	var persistedCanonical []byte
+	if err := discoverysource.WithCheckpointBytes(final.NextCheckpoint, profileCode, func(value []byte) error {
+		persistedCanonical = append([]byte(nil), value...)
+		return nil
+	}); err != nil {
+		t.Fatalf("read persisted checkpoint: %v", err)
+	}
+	persisted, err := discoverysource.NewCheckpoint(profileCode, persistedCanonical)
+	if err != nil {
+		t.Fatalf("restore persisted checkpoint: %v", err)
+	}
+	t.Cleanup(persisted.Clear)
+	request.Checkpoint = persisted
+	completedBeforeNextRun := request.Checkpoint.Clone()
+	t.Cleanup(completedBeforeNextRun.Clear)
+
+	next := requireDiscoverPage(t, contractProvider, runtimeBinding, request)
+	if !request.Checkpoint.Equal(completedBeforeNextRun) {
+		t.Fatal("next run mutated the persisted complete checkpoint")
+	}
+	if len(next.Items) != 2 || len(next.Relations) != 0 || next.FinalPage || next.CompleteSnapshot {
+		t.Fatalf("next run first page = %#v", next)
+	}
+	resumed, err := decodeCMDBCheckpoint(next.NextCheckpoint)
+	if err != nil {
+		t.Fatalf("decode next run checkpoint: %v", err)
+	}
+	if resumed.phase != cmdbPhaseAssets || resumed.snapshotEpoch != nextSnapshotEpoch ||
+		resumed.assetCursor != "asset-cursor-next-run-0002" ||
+		resumed.assetLast.externalID != "vm-0001" ||
+		resumed.relationCursor != "" || resumed.relationLast.present || resumed.assetsComplete {
+		t.Fatalf("next run checkpoint leaked prior state: %#v", resumed)
+	}
+
+	wantRequests := []string{
+		capabilitiesPath,
+		assetsPath + "?limit=500",
+		assetsPath + "?cursor=asset-cursor-0002&limit=500",
+		relationsPath + "?limit=2000",
+		capabilitiesPath,
+		assetsPath + "?limit=500",
+	}
+	if fmt.Sprint(requests) != fmt.Sprint(wantRequests) {
+		t.Fatalf("wire requests = %v, want %v", requests, wantRequests)
+	}
+}
+
 func TestDiscoverRejectsSnapshotCursorAndOrderRegression(t *testing.T) {
 	t.Parallel()
 
