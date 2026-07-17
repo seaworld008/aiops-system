@@ -259,15 +259,27 @@ export function ResolveConflictDialog({
       return;
     }
     const submittedIdentity = identity;
+    const submittedScope: Scope = {
+      workspaceId: scope.workspaceId,
+      environmentId: scope.environmentId,
+    };
     const results = await mutation.mutateAsync({
       request,
       submittedIdentity,
     });
-    if (!isCurrentIdentity(lifecycleRef, submittedIdentity)) {
-      return;
+    const currentIdentity = isCurrentIdentity(
+      lifecycleRef,
+      submittedIdentity,
+    );
+    if (currentIdentity) {
+      onResults(results);
     }
-    onResults(results);
-    await invalidateMappingScope(queryClient, scope);
+    if (
+      currentIdentity ||
+      results.some((result) => result.status === "success")
+    ) {
+      await invalidateMappingScope(queryClient, submittedScope);
+    }
     if (!isCurrentIdentity(lifecycleRef, submittedIdentity)) {
       return;
     }

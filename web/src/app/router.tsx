@@ -71,8 +71,7 @@ export function createAppRouter(session: Session) {
   const assetSourcesRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: "/asset-sources",
-    validateSearch: (search) =>
-      parseSourceSearch(search, { workspace: fallback.workspace }),
+    validateSearch: (search) => parseSourceSearch(search, fallback),
     component: AssetSourcesRoute,
   });
 
@@ -159,7 +158,7 @@ export function createAppRouter(session: Session) {
   function AssetSourcesRoute() {
     const search = parseSourceSearch(
       assetSourcesRoute.useSearch() as unknown,
-      { workspace: fallback.workspace },
+      fallback,
     );
     const navigate = assetSourcesRoute.useNavigate();
     return (

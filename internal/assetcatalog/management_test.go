@@ -619,10 +619,36 @@ func TestSourceEffectiveActionsArePermissionAndStateAware(t *testing.T) {
 
 	manager := mustManagement(t, &recordingManagementRepository{scope: managementScope()})
 	source, revision := exactManagementManualSourceRevision(t)
+	csvSource, csvRevision, csvProfile := exactManagementClosedValidationSourceRevision(
+		t, ProfileCode("CSV_RFC4180_V1"),
+	)
+	futureSource, futureRevision, futureProfile := exactManagementClosedValidationSourceRevision(
+		t, ProfileCode("FUTURE_RUNTIME_V1"),
+	)
+	manager.profiles = managementSourceProfileResolver{
+		ProfileCode("MANUAL_V1"):         ManualProfileV1(),
+		ProfileCode("CSV_RFC4180_V1"):    csvProfile,
+		ProfileCode("FUTURE_RUNTIME_V1"): futureProfile,
+	}
 	base := SourceReadModel{
 		Source: source, LatestRevision: revision,
 	}
 	admin := managementPrincipal(authn.RoleAdmin)
+	publishableProfile := func(model SourceReadModel) SourceReadModel {
+		value := model.Clone()
+		value.LatestRevision.Status = SourceRevisionValidated
+		value.LatestRevision.ValidationRunID = "99999999-9999-4999-8999-999999999999"
+		value.LatestRevision.ValidationDigest = strings.Repeat("b", 64)
+		value.Source.GateStatus = SourceGateValidating
+		value.Source.GateReasonCode = "VALIDATION_IN_PROGRESS"
+		value.Source.ValidatedRunID = value.LatestRevision.ValidationRunID
+		value.Source.ValidationDigest = ""
+		value.Source.ValidatedBindingDigest = ""
+		return value
+	}
+	publishable := func() SourceReadModel {
+		return publishableProfile(base)
+	}
 	tests := []struct {
 		name      string
 		principal authn.Principal
@@ -632,6 +658,16 @@ func TestSourceEffectiveActionsArePermissionAndStateAware(t *testing.T) {
 		{
 			name: "manual draft validates", principal: admin, model: base,
 			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource, ActionValidateSourceRevision},
+		},
+		{
+			name: "installed CSV draft keeps closed validation runtime hidden", principal: admin,
+			model: SourceReadModel{Source: csvSource, LatestRevision: csvRevision},
+			want:  []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "future installed profile defaults validation runtime closed", principal: admin,
+			model: SourceReadModel{Source: futureSource, LatestRevision: futureRevision},
+			want:  []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
 		},
 		{
 			name: "installed profile canonical drift closes validation", principal: admin,
@@ -665,31 +701,80 @@ func TestSourceEffectiveActionsArePermissionAndStateAware(t *testing.T) {
 			want: []EffectiveAction{},
 		},
 		{
-			name: "manual validated publishes only", principal: admin,
+			name: "manual runtime and repository publish preconditions expose publication", principal: admin,
+			model: publishable(),
+			want:  []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource, ActionPublishSourceRevision},
+		},
+		{
+			name: "installed CSV publishable state keeps closed publication runtime hidden", principal: admin,
+			model: publishableProfile(SourceReadModel{Source: csvSource, LatestRevision: csvRevision}),
+			want:  []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "future installed profile defaults publication runtime closed", principal: admin,
+			model: publishableProfile(SourceReadModel{Source: futureSource, LatestRevision: futureRevision}),
+			want:  []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "revision state drift closes publication", principal: admin,
 			model: func() SourceReadModel {
-				value := base.Clone()
-				value.LatestRevision.Status = SourceRevisionValidated
-				value.LatestRevision.ValidationRunID = "99999999-9999-4999-8999-999999999999"
-				value.LatestRevision.ValidationDigest = strings.Repeat("b", 64)
-				value.Source.GateStatus = SourceGateValidating
-				value.Source.ValidatedRunID = value.LatestRevision.ValidationRunID
+				value := publishable()
+				value.LatestRevision.Status = SourceRevisionValidating
+				return value
+			}(),
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "gate state drift closes publication", principal: admin,
+			model: func() SourceReadModel {
+				value := publishable()
+				value.Source.GateStatus = SourceGateUnavailable
+				return value
+			}(),
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "gate reason drift closes publication", principal: admin,
+			model: func() SourceReadModel {
+				value := publishable()
+				value.Source.GateReasonCode = "VALIDATION_SUPERSEDED"
+				return value
+			}(),
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "validated run drift closes publication", principal: admin,
+			model: func() SourceReadModel {
+				value := publishable()
+				value.Source.ValidatedRunID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+				return value
+			}(),
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "source validation digest before publish closes publication", principal: admin,
+			model: func() SourceReadModel {
+				value := publishable()
 				value.Source.ValidationDigest = value.LatestRevision.ValidationDigest
+				return value
+			}(),
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "source binding digest before publish closes publication", principal: admin,
+			model: func() SourceReadModel {
+				value := publishable()
 				value.Source.ValidatedBindingDigest = value.LatestRevision.CanonicalRevisionDigest
 				return value
 			}(),
-			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource, ActionPublishSourceRevision},
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
 		},
 		{
-			name: "validation and binding digest drift close publication", principal: admin,
+			name: "legacy post-publish digests close publication", principal: admin,
 			model: func() SourceReadModel {
-				value := base.Clone()
-				value.LatestRevision.Status = SourceRevisionValidated
-				value.LatestRevision.ValidationRunID = "99999999-9999-4999-8999-999999999999"
-				value.LatestRevision.ValidationDigest = strings.Repeat("b", 64)
-				value.Source.GateStatus = SourceGateValidating
-				value.Source.ValidatedRunID = value.LatestRevision.ValidationRunID
-				value.Source.ValidationDigest = strings.Repeat("c", 64)
-				value.Source.ValidatedBindingDigest = strings.Repeat("d", 64)
+				value := publishable()
+				value.Source.ValidationDigest = value.LatestRevision.ValidationDigest
+				value.Source.ValidatedBindingDigest = value.LatestRevision.CanonicalRevisionDigest
 				return value
 			}(),
 			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
@@ -954,6 +1039,91 @@ func exactManagementManualSourceRevision(t *testing.T) (Source, SourceRevision) 
 		t.Fatal("exact management Source revision has empty BindingDigest")
 	}
 	return source, revision
+}
+
+func exactManagementClosedValidationSourceRevision(
+	t *testing.T,
+	profileCode ProfileCode,
+) (Source, SourceRevision, BuiltinSourceProfile) {
+	t.Helper()
+	source, revision := validLocallyClosedUninstalledBinding(t)
+	previousProfileCode := string(revision.ProfileCode)
+	source.ID = managementSourceID
+	source.ProviderKind = string(profileCode)
+	source.GateStatus = SourceGateUnavailable
+	source.GateReasonCode = ""
+	source.PublishedRevision = 0
+	source.PublishedRevisionDigest = ""
+	source.ValidatedRunID = ""
+	source.ValidationDigest = ""
+	source.ValidatedBindingDigest = ""
+	revision.SourceID = source.ID
+	revision.Status = SourceRevisionDraft
+	revision.ProfileCode = profileCode
+	revision.CanonicalProfileManifest = []byte(strings.ReplaceAll(
+		string(revision.CanonicalProfileManifest), previousProfileCode, string(profileCode),
+	))
+	revision.AuthorityEnvironmentIDs = []string{managementEnvironmentID}
+	revision.ValidationRunID = ""
+	revision.ValidationDigest = ""
+	var err error
+	revision.ProfileManifestSHA256, err = ProfileManifestDigest(revision.CanonicalProfileManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision.AuthorityScopeDigest, err = AuthorityScopeDigest(revision.AuthorityEnvironmentIDs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision.SourceDefinitionDigest, err = SourceDefinitionDigest(source, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision.CanonicalRevisionDigest = revision.BindingDigest()
+	if revision.CanonicalRevisionDigest == "" {
+		t.Fatal("exact closed-validation Source revision has empty BindingDigest")
+	}
+	profile := BuiltinSourceProfile{
+		SourceKind: source.Kind, ProviderKind: source.ProviderKind, ProfileCode: revision.ProfileCode,
+		SyncMode: revision.SyncMode, FreshnessKind: FreshnessObjectSequence,
+		EnvironmentMapping: EnvironmentMappingExplicitItem,
+		IntegrationMode:    "NONE", CredentialPurpose: "NONE", TrustMode: "NONE", NetworkMode: "NONE", ScheduleMode: "NONE",
+		ParserCode: string(profileCode), CompatibilityClass: string(profileCode), DLPPolicyCode: "ASSET_SAFE_V1",
+		MaxPageItems: 100, MaxPageRelations: 0, MaxPageBytes: 1048576, MaxDocumentBytes: 65536,
+		TrustedPathCodes:              []string{string(profileCode) + "_DISPLAY_NAME"},
+		RelationshipTypes:             []RelationshipType{},
+		CanonicalProfileManifest:      slices.Clone(revision.CanonicalProfileManifest),
+		CanonicalProviderSchema:       slices.Clone(revision.CanonicalProviderSchema),
+		ProfileManifestSHA256:         revision.ProfileManifestSHA256,
+		CanonicalProviderSchemaSHA256: revision.CanonicalProviderSchemaSHA256,
+		IntegrationID:                 revision.IntegrationID,
+		CredentialReferenceID:         revision.CredentialReferenceID,
+		TrustReferenceID:              revision.TrustReferenceID,
+		NetworkPolicyReferenceID:      revision.NetworkPolicyReferenceID,
+		RateLimitRequests:             revision.RateLimitRequests,
+		RateLimitWindowSeconds:        revision.RateLimitWindowSeconds,
+		BackpressureBaseSeconds:       revision.BackpressureBaseSeconds,
+		BackpressureMaxSeconds:        revision.BackpressureMaxSeconds,
+		ScheduleExpression:            revision.ScheduleExpression,
+		TypedExtensionCode:            revision.TypedExtensionCode,
+		PreparedExtensionDigest:       revision.PreparedExtensionDigest,
+	}
+	revision.CanonicalProfileManifest = nil
+	revision.CanonicalProviderSchema = nil
+	return source, revision, profile
+}
+
+type managementSourceProfileResolver map[ProfileCode]BuiltinSourceProfile
+
+func (resolver managementSourceProfileResolver) ResolveProfileAdmission(
+	_ context.Context,
+	code ProfileCode,
+) (BuiltinSourceProfile, error) {
+	profile, ok := resolver[code]
+	if !ok {
+		return BuiltinSourceProfile{}, ErrNotFound
+	}
+	return profile.Clone(), nil
 }
 
 func validManagementCreateAssetInput() CreateAssetInput {

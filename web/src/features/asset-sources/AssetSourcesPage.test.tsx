@@ -16,6 +16,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import type { PropsWithChildren } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -40,7 +41,14 @@ import {
 import { testServer } from "@/test/msw/server";
 
 import { AssetSourcesPage } from "./AssetSourcesPage";
-import { parseSourceSearch } from "./sourceSearch";
+import {
+  canonicalizeSourceSearch,
+  changeSourceFilters,
+  nextSourcePage,
+  parseSourceSearch,
+  selectSource,
+  selectSourceRun,
+} from "./sourceSearch";
 
 const apiRunPath =
   "/api/v1/workspaces/:workspaceId/asset-source-runs/:runId";
@@ -57,7 +65,10 @@ function renderSources(path: string) {
     apiBasePath: "/api/v1",
     getAccessToken: vi.fn().mockResolvedValue("ephemeral-test-token"),
   });
-  const fallback = { workspace: workspaceID };
+  const fallback = {
+    workspace: workspaceID,
+    environment: environmentID,
+  };
   const rootRoute = createRootRoute({ component: Outlet });
   const sourcesRoute = createRoute({
     getParentRoute: () => rootRoute,
@@ -105,7 +116,7 @@ function renderSources(path: string) {
     );
   }
 
-  return render(
+  const view = render(
     <QueryClientProvider client={queryClient}>
       <ControlPlaneRuntimeProvider
         client={client}
@@ -121,6 +132,7 @@ function renderSources(path: string) {
       </ControlPlaneRuntimeProvider>
     </QueryClientProvider>,
   );
+  return { ...view, queryClient, router };
 }
 
 beforeEach(() => {
@@ -146,6 +158,7 @@ describe("AssetSourcesPage", () => {
       parseSourceSearch(
         {
           workspace: workspaceID,
+          environment: environmentID,
           status: JSON.stringify([
             "ACTIVE",
             "ACTIVE",
@@ -160,16 +173,140 @@ describe("AssetSourcesPage", () => {
           sourceId: discoverySourceID,
           runId: sourceRunID,
         },
-        { workspace: "workspace-fallback" },
+        {
+          workspace: "workspace-fallback",
+          environment: "environment-fallback",
+        },
       ),
     ).toEqual({
       workspace: workspaceID,
+      environment: environmentID,
       status: ["ACTIVE"],
       kind: ["MANUAL"],
       cursor: "cursor-2",
       sourceId: discoverySourceID,
       runId: sourceRunID,
     });
+  });
+
+  it("canonicalize、筛选、选择与翻页始终保留 workspace 和 environment", () => {
+    const scoped = parseSourceSearch(
+      {
+        workspace: workspaceID,
+        environment: environmentID,
+        status: ["ACTIVE"],
+        sourceId: discoverySourceID,
+        runId: sourceRunID,
+      },
+      {
+        workspace: "workspace-fallback",
+        environment: "environment-fallback",
+      },
+    );
+
+    const transformations = [
+      canonicalizeSourceSearch(scoped),
+      changeSourceFilters(scoped, { kind: ["EXTERNAL_CMDB"] }),
+      selectSource(scoped, manualSourceID),
+      selectSourceRun(scoped, discoverySourceID, sourceRunID),
+      nextSourcePage(scoped, "cursor-next"),
+    ];
+    for (const transformed of transformations) {
+      expect(transformed).toEqual(
+        expect.objectContaining({
+          workspace: workspaceID,
+          environment: environmentID,
+        }),
+      );
+    }
+  });
+
+  it("以 live 双 Scope 规范化深链并保留筛选、选择和运行", async () => {
+    const otherWorkspaceID =
+      "27272727-2727-4272-8272-272727272727";
+    const otherEnvironmentID =
+      "28282828-2828-4282-8282-282828282828";
+    renderSources(
+      `/asset-sources?workspace=${otherWorkspaceID}` +
+        `&environment=${otherEnvironmentID}&status=ACTIVE` +
+        `&sourceId=${discoverySourceID}&runId=${sourceRunID}`,
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "发现来源" }),
+    ).toBeVisible();
+    await waitFor(() => {
+      const search = new URL(window.location.href).searchParams;
+      expect(search.get("workspace")).toBe(workspaceID);
+      expect(search.get("environment")).toBe(environmentID);
+      expect(search.get("sourceId")).toBe(discoverySourceID);
+      expect(search.get("runId")).toBe(sourceRunID);
+      expect(search.get("status")).toContain("ACTIVE");
+    });
+  });
+
+  it("筛选、选择、Back、Forward 和 refresh 保留完整 URL Scope", async () => {
+    const user = userEvent.setup();
+    const view = renderSources(
+      `/asset-sources?workspace=${workspaceID}` +
+        `&environment=${environmentID}`,
+    );
+    expect(
+      await screen.findByRole("heading", { name: "发现来源" }),
+    ).toBeVisible();
+
+    await user.selectOptions(
+      screen.getByLabelText("来源状态"),
+      "ACTIVE",
+    );
+    await waitFor(() => {
+      const search = new URL(window.location.href).searchParams;
+      expect(search.get("workspace")).toBe(workspaceID);
+      expect(search.get("environment")).toBe(environmentID);
+      expect(search.get("status")).toContain("ACTIVE");
+      expect(search.get("sourceId")).toBeNull();
+    });
+
+    await user.click(
+      await screen.findByRole("button", { name: "生产 CMDB 目录" }),
+    );
+    await waitFor(() => {
+      const search = new URL(window.location.href).searchParams;
+      expect(search.get("workspace")).toBe(workspaceID);
+      expect(search.get("environment")).toBe(environmentID);
+      expect(search.get("sourceId")).toBe(discoverySourceID);
+    });
+
+    await traverseHistory("back");
+    await waitFor(() => {
+      const search = new URL(window.location.href).searchParams;
+      expect(search.get("workspace")).toBe(workspaceID);
+      expect(search.get("environment")).toBe(environmentID);
+      expect(search.get("status")).toContain("ACTIVE");
+      expect(search.get("sourceId")).toBeNull();
+    });
+
+    await traverseHistory("forward");
+    await waitFor(() => {
+      const search = new URL(window.location.href).searchParams;
+      expect(search.get("workspace")).toBe(workspaceID);
+      expect(search.get("environment")).toBe(environmentID);
+      expect(search.get("sourceId")).toBe(discoverySourceID);
+    });
+
+    const refreshPath =
+      window.location.pathname + window.location.search;
+    view.unmount();
+    renderSources(refreshPath);
+    expect(
+      await screen.findByRole("heading", {
+        name: "生产 CMDB 目录",
+      }),
+    ).toBeVisible();
+    const refreshedSearch = new URL(window.location.href).searchParams;
+    expect(refreshedSearch.get("workspace")).toBe(workspaceID);
+    expect(refreshedSearch.get("environment")).toBe(environmentID);
+    expect(refreshedSearch.get("sourceId")).toBe(discoverySourceID);
   });
 
   it("恢复终态运行，分开显示最近成功与当前运行计数且不暴露 payload", async () => {
@@ -202,6 +339,7 @@ describe("AssetSourcesPage", () => {
 
     renderSources(
       `/asset-sources?workspace=${workspaceID}` +
+        `&environment=${environmentID}` +
         `&sourceId=${discoverySourceID}&runId=${sourceRunID}`,
     );
 
@@ -439,3 +577,14 @@ describe("AssetSourcesPage", () => {
     expect(requests).toBe(3);
   });
 });
+
+async function traverseHistory(direction: "back" | "forward") {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      window.addEventListener("popstate", () => resolve(), {
+        once: true,
+      });
+      window.history[direction]();
+    });
+  });
+}

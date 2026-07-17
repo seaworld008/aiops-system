@@ -1417,20 +1417,21 @@ func (management *Management) sourceActionAdmission(
 	}
 	publishedProfile, published := management.installedPublishedProfile(ctx, model)
 	admission := SourceActionAdmission{
-		CanValidate: latestProfile.ProfileCode != "" &&
+		CanValidate: sourceValidationRuntimeAvailable(latestProfile.ProfileCode) &&
 			source.Status == SourceStatusActive &&
 			source.GateStatus != SourceGateDegraded &&
 			source.GateStatus != SourceGateSuspended &&
 			(revision.Status == SourceRevisionDraft || revision.Status == SourceRevisionRejected),
-		CanPublish: latestProfile.ProfileCode != "" &&
+		CanPublish: sourcePublicationRuntimeAvailable(latestProfile.ProfileCode) &&
 			source.Status == SourceStatusActive &&
 			source.GateStatus == SourceGateValidating &&
+			source.GateReasonCode == "VALIDATION_IN_PROGRESS" &&
 			revision.Status == SourceRevisionValidated &&
 			revision.ValidationRunID != "" &&
 			revision.ValidationDigest != "" &&
 			source.ValidatedRunID == revision.ValidationRunID &&
-			source.ValidationDigest == revision.ValidationDigest &&
-			source.ValidatedBindingDigest == revision.CanonicalRevisionDigest,
+			source.ValidationDigest == "" &&
+			source.ValidatedBindingDigest == "",
 	}
 	if published && source.Status == SourceStatusActive &&
 		source.GateStatus == SourceGateAvailable {
@@ -1440,6 +1441,24 @@ func (management *Management) sourceActionAdmission(
 		admission.CanImport = publishedProfile.SourceKind == SourceKindCSVImport
 	}
 	return admission
+}
+
+func sourceValidationRuntimeAvailable(profileCode ProfileCode) bool {
+	switch profileCode {
+	case ProfileCode("MANUAL_V1"):
+		return true
+	default:
+		return false
+	}
+}
+
+func sourcePublicationRuntimeAvailable(profileCode ProfileCode) bool {
+	switch profileCode {
+	case ProfileCode("MANUAL_V1"):
+		return true
+	default:
+		return false
+	}
 }
 
 func (management *Management) installedPublishedProfile(
