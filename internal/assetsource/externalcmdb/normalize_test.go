@@ -111,6 +111,22 @@ func TestNormalizeAssetRejectsUnknownTypeAndDLP(t *testing.T) {
 			wantSchemaCode: "DLP_REJECTED",
 		},
 		{
+			name: "JDBC Oracle thin DSN",
+			mutate: func(asset *catalogAsset) {
+				asset.Attributes = map[string]string{"hostname": "jdbc:oracle:thin:@db.internal:1521/prod"}
+			},
+			forbidden:      "db.internal:1521",
+			wantSchemaCode: "DLP_REJECTED",
+		},
+		{
+			name: "mixed-case JDBC Derby DSN",
+			mutate: func(asset *catalogAsset) {
+				asset.Attributes = map[string]string{"hostname": "JDBC:Derby:memory:inventory;create=true"}
+			},
+			forbidden:      "JDBC:Derby",
+			wantSchemaCode: "DLP_REJECTED",
+		},
+		{
 			name: "formula display name",
 			mutate: func(asset *catalogAsset) {
 				asset.DisplayName = "=HYPERLINK(\"https://example.invalid\")"

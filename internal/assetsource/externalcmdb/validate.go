@@ -323,10 +323,28 @@ func endpointShapedText(value string) bool {
 		return false
 	}
 	lower := strings.ToLower(trimmed)
-	if containsEndpointScheme(lower) || containsDSNMarker(lower) {
+	if containsEndpointScheme(lower) || containsClosedEndpointPrefix(lower) || containsDSNMarker(lower) {
 		return true
 	}
 	return containsHostPort(trimmed)
+}
+
+func containsClosedEndpointPrefix(value string) bool {
+	for _, prefix := range []string{"jdbc:"} {
+		offset := 0
+		for offset < len(value) {
+			index := strings.Index(value[offset:], prefix)
+			if index < 0 {
+				break
+			}
+			index += offset
+			if index == 0 || value[index-1] == '=' || endpointBoundary(value[index-1]) {
+				return true
+			}
+			offset = index + 1
+		}
+	}
+	return false
 }
 
 func containsEndpointScheme(value string) bool {
