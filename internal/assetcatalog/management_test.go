@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,6 +44,12 @@ func TestManagementInterfacesHaveExactNarrowShape(t *testing.T) {
 		ListSources(context.Context, authn.Principal, SourceCollectionRequest, SourceListInput) (SourceViewPage, error)
 		GetSource(context.Context, authn.Principal, SourcePathRequest) (SourceView, error)
 		GetSourceRun(context.Context, authn.Principal, SourceRunPathRequest) (SourceRunView, error)
+		CreateSource(context.Context, authn.Principal, SourceCollectionRequest, CreateSourceInput, ServerRequestMetadata) (SourceRevisionMutationView, error)
+		CreateSourceRevision(context.Context, authn.Principal, SourcePathRequest, CreateSourceRevisionInput, ServerRequestMetadata) (SourceRevisionMutationView, error)
+		ValidateSourceRevision(context.Context, authn.Principal, SourceRevisionPathRequest, ServerRequestMetadata) (SourceRunMutationView, error)
+		PublishSourceRevision(context.Context, authn.Principal, SourceRevisionPathRequest, SourceReasonInput, ServerRequestMetadata) (SourceRevisionMutationView, error)
+		DisableSource(context.Context, authn.Principal, SourcePathRequest, SourceReasonInput, ServerRequestMetadata) (SourceMutationView, error)
+		SyncSource(context.Context, authn.Principal, SourcePathRequest, ServerRequestMetadata) (SourceRunMutationView, error)
 	})(nil)).Elem())
 	assertExactInterface(t, reflect.TypeOf((*ConflictManager)(nil)).Elem(), reflect.TypeOf((*interface {
 		ListConflicts(context.Context, authn.Principal, ConflictCollectionRequest, ConflictListInput) (ConflictViewPage, error)
@@ -55,6 +62,79 @@ func TestManagementInterfacesHaveExactNarrowShape(t *testing.T) {
 	})(nil)).Elem())
 }
 
+func TestSourceManagerOwnsCreateSourceMutation(t *testing.T) {
+	t.Parallel()
+
+	sourceManager := reflect.TypeOf((*SourceManager)(nil)).Elem()
+	if _, exists := sourceManager.MethodByName("CreateSource"); !exists {
+		t.Fatal("SourceManager lacks CreateSource; Management is not the Source mutation owner")
+	}
+}
+
+func TestManagementCreateSourceCallsAtomicRepositoryOwner(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 17, 10, 0, 0, 0, time.UTC)
+	revision := SourceRevision{
+		ID:       "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		SourceID: managementSourceID, TenantID: managementTenantID, WorkspaceID: managementWorkspaceID,
+		Revision: 1, Status: SourceRevisionDraft, ProfileCode: "MANUAL_V1",
+		CanonicalRevisionDigest: strings.Repeat("a", 64),
+		AuthorityEnvironmentIDs: []string{managementEnvironmentID},
+		Version:                 1, CreatedAt: now, UpdatedAt: now,
+	}
+	source := Source{
+		ID: managementSourceID, TenantID: managementTenantID, WorkspaceID: managementWorkspaceID,
+		Kind: SourceKindManual, ProviderKind: "MANUAL_V1", Name: "Manual",
+		Status: SourceStatusActive, GateStatus: SourceGateUnavailable, Version: 2,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	repository := &recordingManagementRepository{
+		scope: managementScope(),
+		sourceRevisionResult: SourceRevisionMutation{
+			Source: source, Revision: revision,
+			Receipt: MutationReceipt{
+				AuditID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+				TraceID: "source-create-trace",
+			},
+		},
+	}
+	manager := mustManagement(t, repository)
+	input := CreateSourceInput{
+		Name: "Manual", SourceProfileID: SourceProfileIDManualV1,
+		AuthorityEnvironmentIDs: []string{managementEnvironmentID},
+	}
+	metadata := ServerRequestMetadata{
+		TraceID: "source-create-trace", IdempotencyKey: "source-create-1",
+	}
+	result, err := manager.CreateSource(
+		context.Background(), managementPrincipal(authn.RoleAdmin),
+		SourceCollectionRequest{WorkspaceID: managementWorkspaceID}, input, metadata,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repository.createSourceCalls != 1 || repository.createAssetCalls != 0 ||
+		repository.lastCreateSource.Name != input.Name ||
+		repository.lastCreateSource.SourceProfileID != input.SourceProfileID ||
+		!slices.Equal(repository.lastCreateSource.AuthorityEnvironmentIDs, input.AuthorityEnvironmentIDs) {
+		t.Fatalf("CreateSource repository ownership drifted: calls=%d/%d command=%#v",
+			repository.createSourceCalls, repository.createAssetCalls, repository.lastCreateSource)
+	}
+	scope := SourceScope{TenantID: managementTenantID, WorkspaceID: managementWorkspaceID}
+	wantHash, err := createSourceRequestHash(scope, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repository.lastCreateSource.Context.SourceScope() != scope ||
+		repository.lastCreateSource.Context.RequestHash() != wantHash ||
+		repository.lastCreateSource.Context.IdempotencyKey() != metadata.IdempotencyKey ||
+		result.Source.ID != managementSourceID || result.Revision.Revision != 1 {
+		t.Fatalf("CreateSource trusted closure drifted: command=%#v result=%#v",
+			repository.lastCreateSource, result)
+	}
+}
+
 func TestManagementFailsClosedWhenAnyDependencyIsMissing(t *testing.T) {
 	t.Parallel()
 
@@ -64,7 +144,7 @@ func TestManagementFailsClosedWhenAnyDependencyIsMissing(t *testing.T) {
 		name       string
 		assets     Repository
 		mappings   MappingRepository
-		sources    SourceReadRepository
+		sources    SourceManagementRepository
 		authorizer *authz.Authorizer
 	}{
 		{name: "assets", mappings: repository, sources: repository, authorizer: authorizer},
@@ -442,6 +522,12 @@ func TestManagementRejectsMalformedListInputsBeforeScopeResolution(t *testing.T)
 func TestManagementProjectsMappingAndSourceActionsFromAuthorizationAndState(t *testing.T) {
 	t.Parallel()
 
+	manualSource, manualRevision := exactManagementManualSourceRevision(t)
+	manualSource.GateStatus = SourceGateAvailable
+	manualSource.PublishedRevision = manualRevision.Revision
+	manualSource.PublishedRevisionDigest = manualRevision.CanonicalRevisionDigest
+	manualRevision.Status = SourceRevisionPublished
+	publishedRevision := manualRevision.Clone()
 	repository := &recordingManagementRepository{
 		scope: managementScope(),
 		bindingPage: BindingPage{Items: []ServiceAssetBinding{
@@ -456,7 +542,8 @@ func TestManagementProjectsMappingAndSourceActionsFromAuthorizationAndState(t *t
 			}},
 		}},
 		sourcePage: SourcePage{Items: []SourceReadModel{{
-			Source: Source{ID: managementSourceID, TenantID: managementTenantID, WorkspaceID: managementWorkspaceID},
+			Source: manualSource, LatestRevision: manualRevision,
+			PublishedRevision: &publishedRevision,
 		}}},
 		relationPage: RelationshipPage{Items: []Relationship{{
 			ID: "99999999-9999-4999-8999-999999999999",
@@ -505,8 +592,11 @@ func TestManagementProjectsMappingAndSourceActionsFromAuthorizationAndState(t *t
 		t.Fatal(err)
 	}
 	if len(sources.Items) != 1 ||
-		!slices.Equal(sources.Items[0].EffectiveActions, []EffectiveAction{ActionCreateAsset}) {
-		t.Fatalf("source effective actions = %#v", sources.Items)
+		!slices.Equal(sources.EffectiveActions, []EffectiveAction{ActionCreateSource}) ||
+		!slices.Equal(sources.Items[0].EffectiveActions, []EffectiveAction{
+			ActionCreateAsset, ActionCreateSourceRevision, ActionDisableSource,
+		}) {
+		t.Fatalf("source effective actions = %#v / %#v", sources.EffectiveActions, sources.Items)
 	}
 
 	relationships, err := manager.ListRelationships(
@@ -521,6 +611,178 @@ func TestManagementProjectsMappingAndSourceActionsFromAuthorizationAndState(t *t
 		t.Fatalf("mapping/source projections or calls drifted: %#v, calls=%d/%d/%d/%d",
 			relationships, repository.listRelationshipCalls, repository.listBindingCalls,
 			repository.listConflictCalls, repository.listSourceCalls)
+	}
+}
+
+func TestSourceEffectiveActionsArePermissionAndStateAware(t *testing.T) {
+	t.Parallel()
+
+	manager := mustManagement(t, &recordingManagementRepository{scope: managementScope()})
+	source, revision := exactManagementManualSourceRevision(t)
+	base := SourceReadModel{
+		Source: source, LatestRevision: revision,
+	}
+	admin := managementPrincipal(authn.RoleAdmin)
+	tests := []struct {
+		name      string
+		principal authn.Principal
+		model     SourceReadModel
+		want      []EffectiveAction
+	}{
+		{
+			name: "manual draft validates", principal: admin, model: base,
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource, ActionValidateSourceRevision},
+		},
+		{
+			name: "installed profile canonical drift closes validation", principal: admin,
+			model: func() SourceReadModel {
+				value := base.Clone()
+				value.LatestRevision.ProfileManifestSHA256 = strings.Repeat("f", 64)
+				return value
+			}(),
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "nonprojection canonical bytes drift closes validation", principal: admin,
+			model: func() SourceReadModel {
+				value := base.Clone()
+				value.LatestRevision.CanonicalProfileManifest = []byte(`{"drift":true}`)
+				return value
+			}(),
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "viewer has no mutations", principal: managementPrincipal(authn.RoleViewer), model: base,
+			want: []EffectiveAction{},
+		},
+		{
+			name: "disabled has no mutations", principal: admin,
+			model: func() SourceReadModel {
+				value := base.Clone()
+				value.Source.Status = SourceStatusDisabled
+				return value
+			}(),
+			want: []EffectiveAction{},
+		},
+		{
+			name: "manual validated publishes only", principal: admin,
+			model: func() SourceReadModel {
+				value := base.Clone()
+				value.LatestRevision.Status = SourceRevisionValidated
+				value.LatestRevision.ValidationRunID = "99999999-9999-4999-8999-999999999999"
+				value.LatestRevision.ValidationDigest = strings.Repeat("b", 64)
+				value.Source.GateStatus = SourceGateValidating
+				value.Source.ValidatedRunID = value.LatestRevision.ValidationRunID
+				value.Source.ValidationDigest = value.LatestRevision.ValidationDigest
+				value.Source.ValidatedBindingDigest = value.LatestRevision.CanonicalRevisionDigest
+				return value
+			}(),
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource, ActionPublishSourceRevision},
+		},
+		{
+			name: "validation and binding digest drift close publication", principal: admin,
+			model: func() SourceReadModel {
+				value := base.Clone()
+				value.LatestRevision.Status = SourceRevisionValidated
+				value.LatestRevision.ValidationRunID = "99999999-9999-4999-8999-999999999999"
+				value.LatestRevision.ValidationDigest = strings.Repeat("b", 64)
+				value.Source.GateStatus = SourceGateValidating
+				value.Source.ValidatedRunID = value.LatestRevision.ValidationRunID
+				value.Source.ValidationDigest = strings.Repeat("c", 64)
+				value.Source.ValidatedBindingDigest = strings.Repeat("d", 64)
+				return value
+			}(),
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "manual published never syncs or imports", principal: admin,
+			model: func() SourceReadModel {
+				value := base.Clone()
+				value.LatestRevision.Status = SourceRevisionPublished
+				value.Source.GateStatus = SourceGateAvailable
+				value.Source.PublishedRevision = 1
+				value.Source.PublishedRevisionDigest = value.LatestRevision.CanonicalRevisionDigest
+				published := value.LatestRevision.Clone()
+				value.PublishedRevision = &published
+				return value
+			}(),
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "missing installed profile exposes no runtime action", principal: admin,
+			model: func() SourceReadModel {
+				value := base.Clone()
+				value.Source.Kind = SourceKindCSVImport
+				value.Source.ProviderKind = "CSV_RFC4180_V1"
+				value.Source.GateStatus = SourceGateAvailable
+				value.Source.PublishedRevision = 1
+				value.Source.PublishedRevisionDigest = value.LatestRevision.CanonicalRevisionDigest
+				value.LatestRevision.Status = SourceRevisionPublished
+				value.LatestRevision.ProfileCode = "CSV_RFC4180_V1"
+				return value
+			}(),
+			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := manager.sourceActions(context.Background(), test.principal, test.model); !slices.Equal(got, test.want) {
+				t.Fatalf("sourceActions() = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestSourcePublishAndDisableRequireRecentAuthenticationBeforeRepositoryMutation(t *testing.T) {
+	t.Parallel()
+	repository := &recordingManagementRepository{
+		scope: managementScope(),
+		sourceModel: SourceReadModel{
+			Source: Source{
+				ID: managementSourceID, TenantID: managementTenantID, WorkspaceID: managementWorkspaceID,
+				Kind: SourceKindManual, ProviderKind: "MANUAL_V1", Status: SourceStatusActive,
+				GateStatus: SourceGateValidating, Version: 3,
+			},
+			LatestRevision: SourceRevision{
+				SourceID: managementSourceID, TenantID: managementTenantID, WorkspaceID: managementWorkspaceID,
+				Revision: 1, Status: SourceRevisionValidated, ProfileCode: "MANUAL_V1",
+				AuthorityEnvironmentIDs: []string{managementEnvironmentID},
+				CanonicalRevisionDigest: strings.Repeat("a", 64), Version: 1,
+			},
+		},
+	}
+	manager := mustManagement(t, repository)
+	staleAdmin := managementPrincipal(authn.RoleAdmin)
+	staleAdmin.AuthenticatedAt = time.Date(2026, 7, 16, 9, 0, 0, 0, time.UTC)
+	metadata := ServerRequestMetadata{
+		TraceID: "source-high-risk-trace", IdempotencyKey: "source-high-risk-1",
+		ExpectedVersion: 3, ExpectedRevisionVersion: 1,
+	}
+
+	_, err := manager.PublishSourceRevision(
+		context.Background(), staleAdmin,
+		SourceRevisionPathRequest{
+			WorkspaceID: managementWorkspaceID, SourceID: managementSourceID, Revision: 1,
+		},
+		SourceReasonInput{ReasonCode: "SOURCE_VALIDATED"}, metadata,
+	)
+	if !errors.Is(err, authz.ErrReauthenticationRequired) {
+		t.Fatalf("PublishSourceRevision(stale) error = %v, want reauthentication", err)
+	}
+	_, err = manager.DisableSource(
+		context.Background(), staleAdmin,
+		SourcePathRequest{WorkspaceID: managementWorkspaceID, SourceID: managementSourceID},
+		SourceReasonInput{ReasonCode: "SOURCE_RETIRED"}, ServerRequestMetadata{
+			TraceID: "source-high-risk-trace", IdempotencyKey: "source-high-risk-2",
+			ExpectedVersion: 3,
+		},
+	)
+	if !errors.Is(err, authz.ErrReauthenticationRequired) {
+		t.Fatalf("DisableSource(stale) error = %v, want reauthentication", err)
+	}
+	if repository.publishSourceCalls != 0 || repository.disableSourceCalls != 0 {
+		t.Fatalf("high-risk repository calls = publish:%d disable:%d, want zero",
+			repository.publishSourceCalls, repository.disableSourceCalls)
 	}
 }
 
@@ -646,6 +908,54 @@ func managementScope() Scope {
 	}
 }
 
+func exactManagementManualSourceRevision(t *testing.T) (Source, SourceRevision) {
+	t.Helper()
+	profile := ManualProfileV1()
+	source := Source{
+		ID: managementSourceID, TenantID: managementTenantID, WorkspaceID: managementWorkspaceID,
+		Kind: SourceKindManual, ProviderKind: profile.ProviderKind,
+		Status: SourceStatusActive, GateStatus: SourceGateUnavailable,
+	}
+	revision := SourceRevision{
+		SourceID: managementSourceID, TenantID: managementTenantID, WorkspaceID: managementWorkspaceID,
+		Revision: 1, Status: SourceRevisionDraft,
+		CanonicalProfileManifest:      slices.Clone(profile.CanonicalProfileManifest),
+		ProfileManifestSHA256:         profile.ProfileManifestSHA256,
+		CanonicalProviderSchema:       slices.Clone(profile.CanonicalProviderSchema),
+		CanonicalProviderSchemaSHA256: profile.CanonicalProviderSchemaSHA256,
+		IntegrationID:                 profile.IntegrationID,
+		SyncMode:                      profile.SyncMode,
+		CredentialReferenceID:         profile.CredentialReferenceID,
+		TrustReferenceID:              profile.TrustReferenceID,
+		NetworkPolicyReferenceID:      profile.NetworkPolicyReferenceID,
+		AuthorityEnvironmentIDs:       []string{managementEnvironmentID},
+		RateLimitRequests:             profile.RateLimitRequests,
+		RateLimitWindowSeconds:        profile.RateLimitWindowSeconds,
+		BackpressureBaseSeconds:       profile.BackpressureBaseSeconds,
+		BackpressureMaxSeconds:        profile.BackpressureMaxSeconds,
+		ProfileCode:                   profile.ProfileCode,
+		ScheduleExpression:            profile.ScheduleExpression,
+		TypedExtensionCode:            profile.TypedExtensionCode,
+		PreparedExtensionDigest:       profile.PreparedExtensionDigest,
+	}
+	var err error
+	revision.AuthorityScopeDigest, err = AuthorityScopeDigest(revision.AuthorityEnvironmentIDs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision.SourceDefinitionDigest, err = SourceDefinitionDigest(source, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision.CanonicalProfileManifest = nil
+	revision.CanonicalProviderSchema = nil
+	revision.CanonicalRevisionDigest = revision.BindingDigest()
+	if revision.CanonicalRevisionDigest == "" {
+		t.Fatal("exact management Source revision has empty BindingDigest")
+	}
+	return source, revision
+}
+
 func validManagementCreateAssetInput() CreateAssetInput {
 	return CreateAssetInput{
 		SourceID: managementSourceID, Kind: KindLinuxVM,
@@ -662,18 +972,21 @@ type recordingManagementRepository struct {
 	scope       Scope
 	sourceScope SourceScope
 
-	assetDetail    AssetDetailReadModel
-	assetPage      AssetPage
-	bindingPage    BindingPage
-	conflictPage   ConflictPage
-	relationPage   RelationshipPage
-	sourcePage     SourcePage
-	sourceModel    SourceReadModel
-	sourceRun      SourceRun
-	assetResult    AssetMutationResult
-	bindingResult  BindingMutationResult
-	conflictResult MappingDecisionResult
-	receipt        MutationReceipt
+	assetDetail          AssetDetailReadModel
+	assetPage            AssetPage
+	bindingPage          BindingPage
+	conflictPage         ConflictPage
+	relationPage         RelationshipPage
+	sourcePage           SourcePage
+	sourceModel          SourceReadModel
+	sourceRun            SourceRun
+	sourceRevisionResult SourceRevisionMutation
+	sourceMutationResult SourceMutation
+	sourceRunResult      SourceRunMutation
+	assetResult          AssetMutationResult
+	bindingResult        BindingMutationResult
+	conflictResult       MappingDecisionResult
+	receipt              MutationReceipt
 
 	resolveScopeCalls         int
 	resolveSourceScopeCalls   int
@@ -692,12 +1005,24 @@ type recordingManagementRepository struct {
 	listSourceCalls           int
 	getSourceCalls            int
 	getSourceRunCalls         int
+	createSourceCalls         int
+	createSourceRevisionCalls int
+	validateSourceCalls       int
+	publishSourceCalls        int
+	disableSourceCalls        int
+	syncSourceCalls           int
 
-	lastAssetList   ListAssetsRequest
-	lastDecision    MappingDecision
-	lastCreateAsset CreateAssetCommand
-	lastUpdateAsset UpdateGovernanceCommand
-	lastTransitions []TransitionCommand
+	lastAssetList            ListAssetsRequest
+	lastDecision             MappingDecision
+	lastCreateAsset          CreateAssetCommand
+	lastUpdateAsset          UpdateGovernanceCommand
+	lastTransitions          []TransitionCommand
+	lastCreateSource         CreateSourceCommand
+	lastCreateSourceRevision CreateSourceRevisionCommand
+	lastValidateSource       ValidateSourceRevisionCommand
+	lastPublishSource        PublishSourceRevisionCommand
+	lastDisableSource        DisableSourceCommand
+	lastSyncSource           RequestSyncCommand
 }
 
 func (repository *recordingManagementRepository) ResolveScope(_ context.Context, workspaceID, environmentID string) (Scope, error) {
@@ -801,4 +1126,40 @@ func (repository *recordingManagementRepository) ListSources(_ context.Context, 
 func (repository *recordingManagementRepository) GetSourceRun(_ context.Context, locator SourceRunLocator, access SourceReadConstraint) (SourceRun, error) {
 	repository.getSourceRunCalls++
 	return repository.sourceRun.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) CreateSource(_ context.Context, command CreateSourceCommand) (SourceRevisionMutation, error) {
+	repository.createSourceCalls++
+	repository.lastCreateSource = command.Clone()
+	return repository.sourceRevisionResult.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) CreateRevision(_ context.Context, command CreateSourceRevisionCommand) (SourceRevisionMutation, error) {
+	repository.createSourceRevisionCalls++
+	repository.lastCreateSourceRevision = command.Clone()
+	return repository.sourceRevisionResult.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) RequestValidation(_ context.Context, command ValidateSourceRevisionCommand) (SourceRunMutation, error) {
+	repository.validateSourceCalls++
+	repository.lastValidateSource = command
+	return repository.sourceRunResult.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) Publish(_ context.Context, command PublishSourceRevisionCommand) (SourceRevisionMutation, error) {
+	repository.publishSourceCalls++
+	repository.lastPublishSource = command
+	return repository.sourceRevisionResult.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) Disable(_ context.Context, command DisableSourceCommand) (SourceMutation, error) {
+	repository.disableSourceCalls++
+	repository.lastDisableSource = command
+	return repository.sourceMutationResult.Clone(), nil
+}
+
+func (repository *recordingManagementRepository) RequestSync(_ context.Context, command RequestSyncCommand) (SourceRunMutation, error) {
+	repository.syncSourceCalls++
+	repository.lastSyncSource = command
+	return repository.sourceRunResult.Clone(), nil
 }

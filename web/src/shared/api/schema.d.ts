@@ -190,7 +190,7 @@ export interface paths {
         };
         get: operations["listAssetSources"];
         put?: never;
-        post?: never;
+        post: operations["createAssetSource"];
         delete?: never;
         options?: never;
         head?: never;
@@ -210,6 +210,141 @@ export interface paths {
         get: operations["getAssetSource"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/revisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceID"];
+                source_id: components["parameters"]["SourceID"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["createAssetSourceRevision"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/revisions/{revision}:validate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceID"];
+                source_id: components["parameters"]["SourceID"];
+                revision: components["parameters"]["Revision"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["validateAssetSourceRevision"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/revisions/{revision}:publish": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceID"];
+                source_id: components["parameters"]["SourceID"];
+                revision: components["parameters"]["Revision"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["publishAssetSourceRevision"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}:disable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceID"];
+                source_id: components["parameters"]["SourceID"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["disableAssetSource"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}:sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceID"];
+                source_id: components["parameters"]["SourceID"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["syncAssetSource"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/imports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceID"];
+                source_id: components["parameters"]["SourceID"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["createAssetSourceImport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/workspaces/{workspace_id}/asset-sources/{source_id}/ingestion-batches": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceID"];
+                source_id: components["parameters"]["SourceID"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["createAssetSourceIngestionBatch"];
         delete?: never;
         options?: never;
         head?: never;
@@ -290,7 +425,7 @@ export interface components {
         NullableDateTime: string | null;
         NullableSafeText: string | null;
         /** @enum {string} */
-        EffectiveAction: "CREATE_ASSET" | "EDIT_GOVERNANCE" | "QUARANTINE" | "RETIRE" | "CREATE_BINDING" | "DELETE_BINDING" | "RESOLVE_CONFLICT";
+        EffectiveAction: "CREATE_ASSET" | "EDIT_GOVERNANCE" | "QUARANTINE" | "RETIRE" | "CREATE_BINDING" | "DELETE_BINDING" | "RESOLVE_CONFLICT" | "CREATE_SOURCE" | "CREATE_SOURCE_REVISION" | "VALIDATE_SOURCE_REVISION" | "PUBLISH_SOURCE_REVISION" | "DISABLE_SOURCE" | "SYNC_SOURCE" | "IMPORT_CSV";
         /** @enum {string} */
         AssetKind: "SERVICE" | "LINUX_VM" | "WINDOWS_VM" | "BARE_METAL_HOST" | "KUBERNETES_CLUSTER" | "KUBERNETES_NAMESPACE" | "KUBERNETES_WORKLOAD" | "DATABASE_INSTANCE" | "DATABASE" | "METRICS_SOURCE" | "LOG_SOURCE" | "TRACE_SOURCE" | "AWX_INVENTORY" | "ARGO_APPLICATION" | "CI_PIPELINE" | "GIT_REPOSITORY" | "CLOUD_RESOURCE";
         /** @enum {string} */
@@ -324,6 +459,8 @@ export interface components {
         SourceGateStatus: "UNAVAILABLE" | "VALIDATING" | "AVAILABLE" | "DEGRADED" | "SUSPENDED";
         /** @enum {string} */
         SourceRevisionStatus: "DRAFT" | "VALIDATING" | "VALIDATED" | "REJECTED" | "PUBLISHED" | "SUPERSEDED";
+        /** @enum {string} */
+        SourceSyncMode: "MANUAL" | "ON_DEMAND" | "SCHEDULED";
         /** @enum {string} */
         RunKind: "VALIDATION" | "DISCOVERY" | "CSV_IMPORT" | "API_INGESTION" | "MANUAL_MUTATION";
         /** @enum {string} */
@@ -564,6 +701,26 @@ export interface components {
             binding: components["schemas"]["ServiceAssetBindingSummary"];
             mutation_receipt: components["schemas"]["MutationReceipt"];
         };
+        CreateAssetSourceRequest: {
+            name: string;
+            source_profile_id: string;
+            authority_environment_ids: components["schemas"]["UUID"][];
+        };
+        CreateAssetSourceRevisionRequest: {
+            source_profile_id: string;
+            authority_environment_ids: components["schemas"]["UUID"][];
+            change_reason_code: string;
+        };
+        SourceReasonRequest: {
+            reason_code: string;
+        };
+        EmptySourceRequest: Record<string, never>;
+        CreateAssetSourceImportRequest: {
+            /** Format: binary */
+            file: string;
+            /** Format: binary */
+            detached_signature: string;
+        };
         SourceRunCounts: {
             /** Format: int64 */
             observed: number;
@@ -620,12 +777,22 @@ export interface components {
             /** Format: int64 */
             revision: number;
             status: components["schemas"]["SourceRevisionStatus"];
+            profile_code: string;
+            integration_id: components["schemas"]["NullableUUID"];
+            sync_mode: components["schemas"]["SourceSyncMode"];
+            credential_reference_id: components["schemas"]["NullableUUID"];
+            trust_reference_id: components["schemas"]["NullableUUID"];
+            network_policy_reference_id: components["schemas"]["NullableUUID"];
+            authority_environment_ids: components["schemas"]["UUID"][];
             binding_digest: components["schemas"]["Digest"];
             source_definition_digest: components["schemas"]["Digest"];
+            /** Format: int64 */
+            version: number;
             /** Format: date-time */
             created_at: string;
             /** Format: date-time */
             updated_at: string;
+            effective_actions: components["schemas"]["EffectiveAction"][];
         };
         AssetSourceDetail: {
             summary: components["schemas"]["AssetSourceSummary"];
@@ -685,6 +852,22 @@ export interface components {
             heartbeat_at: components["schemas"]["NullableDateTime"];
             completed_at: components["schemas"]["NullableDateTime"];
             effective_actions: components["schemas"]["EffectiveAction"][];
+        };
+        AssetSourceRevisionMutationResult: {
+            source: components["schemas"]["AssetSourceSummary"];
+            revision: components["schemas"]["SourceRevisionSummary"];
+            mutation_receipt: components["schemas"]["MutationReceipt"];
+        };
+        AssetSourceMutationResult: {
+            source: components["schemas"]["AssetSourceSummary"];
+            mutation_receipt: components["schemas"]["MutationReceipt"];
+        };
+        AssetSourceRunMutationResult: {
+            source: components["schemas"]["AssetSourceSummary"];
+            revision: components["schemas"]["SourceRevisionSummary"];
+            run: components["schemas"]["AssetSourceRun"];
+            operation_id: components["schemas"]["UUID"];
+            mutation_receipt: components["schemas"]["MutationReceipt"];
         };
         ConflictAssetReference: {
             id: components["schemas"]["UUID"];
@@ -964,6 +1147,77 @@ export interface components {
                 "application/json": components["schemas"]["AssetSourceRun"];
             };
         };
+        /** @description Stable Source and immutable revision created atomically. */
+        AssetSourceRevisionCreated: {
+            headers: {
+                "Cache-Control": components["headers"]["CacheControl"];
+                "X-Content-Type-Options": components["headers"]["ContentTypeOptions"];
+                "Referrer-Policy": components["headers"]["ReferrerPolicy"];
+                "X-Trace-ID": components["headers"]["TraceID"];
+                ETag: components["headers"]["ETag"];
+                Location: components["headers"]["Location"];
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["AssetSourceRevisionMutationResult"];
+            };
+        };
+        /** @description Governed Source revision mutation result. */
+        AssetSourceRevisionMutationOK: {
+            headers: {
+                "Cache-Control": components["headers"]["CacheControl"];
+                "X-Content-Type-Options": components["headers"]["ContentTypeOptions"];
+                "Referrer-Policy": components["headers"]["ReferrerPolicy"];
+                "X-Trace-ID": components["headers"]["TraceID"];
+                ETag: components["headers"]["ETag"];
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["AssetSourceRevisionMutationResult"];
+            };
+        };
+        /** @description Governed stable Source mutation result. */
+        AssetSourceMutationOK: {
+            headers: {
+                "Cache-Control": components["headers"]["CacheControl"];
+                "X-Content-Type-Options": components["headers"]["ContentTypeOptions"];
+                "Referrer-Policy": components["headers"]["ReferrerPolicy"];
+                "X-Trace-ID": components["headers"]["TraceID"];
+                ETag: components["headers"]["ETag"];
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["AssetSourceMutationResult"];
+            };
+        };
+        /** @description Synchronous terminal Source validation result. */
+        AssetSourceRunMutationOK: {
+            headers: {
+                "Cache-Control": components["headers"]["CacheControl"];
+                "X-Content-Type-Options": components["headers"]["ContentTypeOptions"];
+                "Referrer-Policy": components["headers"]["ReferrerPolicy"];
+                "X-Trace-ID": components["headers"]["TraceID"];
+                ETag: components["headers"]["ETag"];
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["AssetSourceRunMutationResult"];
+            };
+        };
+        /** @description Durable Source Run accepted; a currently unimplemented runtime returns Problem503 instead. */
+        AssetSourceRunMutationAccepted: {
+            headers: {
+                "Cache-Control": components["headers"]["CacheControl"];
+                "X-Content-Type-Options": components["headers"]["ContentTypeOptions"];
+                "Referrer-Policy": components["headers"]["ReferrerPolicy"];
+                "X-Trace-ID": components["headers"]["TraceID"];
+                ETag: components["headers"]["ETag"];
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["AssetSourceRunMutationResult"];
+            };
+        };
         /** @description Scoped conflict page. */
         AssetConflictPageOK: {
             headers: {
@@ -1082,6 +1336,20 @@ export interface components {
                 "application/problem+json": components["schemas"]["Problem"];
             };
         };
+        /** @description Source or Workspace backpressure rejected this request. */
+        Problem429: {
+            headers: {
+                "Cache-Control": components["headers"]["CacheControl"];
+                "X-Content-Type-Options": components["headers"]["ContentTypeOptions"];
+                "Referrer-Policy": components["headers"]["ReferrerPolicy"];
+                "X-Trace-ID": components["headers"]["TraceID"];
+                "Retry-After": components["headers"]["RetryAfter"];
+                [name: string]: unknown;
+            };
+            content: {
+                "application/problem+json": components["schemas"]["Problem"];
+            };
+        };
         /** @description Request failed without exposing internal detail. */
         Problem500: {
             headers: {
@@ -1115,6 +1383,7 @@ export interface components {
         AssetID: components["schemas"]["UUID"];
         SourceID: components["schemas"]["UUID"];
         RunID: components["schemas"]["UUID"];
+        Revision: number;
         ConflictID: components["schemas"]["UUID"];
         BindingID: components["schemas"]["UUID"];
         Limit: number;
@@ -1132,6 +1401,7 @@ export interface components {
         Location: string;
         AuditID: components["schemas"]["UUID"];
         IdempotentReplay: "true" | "false";
+        RetryAfter: number;
     };
     pathItems: never;
 }
@@ -1489,6 +1759,34 @@ export interface operations {
             503: components["responses"]["Problem503"];
         };
     };
+    createAssetSource: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                workspace_id: components["parameters"]["WorkspaceID"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateAssetSourceRequest"];
+            };
+        };
+        responses: {
+            201: components["responses"]["AssetSourceRevisionCreated"];
+            400: components["responses"]["Problem400"];
+            401: components["responses"]["Problem401"];
+            403: components["responses"]["Problem403"];
+            409: components["responses"]["Problem409"];
+            413: components["responses"]["Problem413"];
+            415: components["responses"]["Problem415"];
+            500: components["responses"]["Problem500"];
+            503: components["responses"]["Problem503"];
+        };
+    };
     getAssetSource: {
         parameters: {
             query?: never;
@@ -1506,6 +1804,222 @@ export interface operations {
             401: components["responses"]["Problem401"];
             403: components["responses"]["Problem403"];
             404: components["responses"]["Problem404"];
+            500: components["responses"]["Problem500"];
+            503: components["responses"]["Problem503"];
+        };
+    };
+    createAssetSourceRevision: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                "If-Match": components["parameters"]["IfMatch"];
+            };
+            path: {
+                workspace_id: components["parameters"]["WorkspaceID"];
+                source_id: components["parameters"]["SourceID"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateAssetSourceRevisionRequest"];
+            };
+        };
+        responses: {
+            201: components["responses"]["AssetSourceRevisionCreated"];
+            400: components["responses"]["Problem400"];
+            401: components["responses"]["Problem401"];
+            403: components["responses"]["Problem403"];
+            404: components["responses"]["Problem404"];
+            409: components["responses"]["Problem409"];
+            413: components["responses"]["Problem413"];
+            415: components["responses"]["Problem415"];
+            500: components["responses"]["Problem500"];
+            503: components["responses"]["Problem503"];
+        };
+    };
+    validateAssetSourceRevision: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                "If-Match": components["parameters"]["IfMatch"];
+            };
+            path: {
+                workspace_id: components["parameters"]["WorkspaceID"];
+                source_id: components["parameters"]["SourceID"];
+                revision: components["parameters"]["Revision"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EmptySourceRequest"];
+            };
+        };
+        responses: {
+            200: components["responses"]["AssetSourceRunMutationOK"];
+            202: components["responses"]["AssetSourceRunMutationAccepted"];
+            400: components["responses"]["Problem400"];
+            401: components["responses"]["Problem401"];
+            403: components["responses"]["Problem403"];
+            404: components["responses"]["Problem404"];
+            409: components["responses"]["Problem409"];
+            413: components["responses"]["Problem413"];
+            415: components["responses"]["Problem415"];
+            500: components["responses"]["Problem500"];
+            503: components["responses"]["Problem503"];
+        };
+    };
+    publishAssetSourceRevision: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                "If-Match": components["parameters"]["IfMatch"];
+            };
+            path: {
+                workspace_id: components["parameters"]["WorkspaceID"];
+                source_id: components["parameters"]["SourceID"];
+                revision: components["parameters"]["Revision"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SourceReasonRequest"];
+            };
+        };
+        responses: {
+            200: components["responses"]["AssetSourceRevisionMutationOK"];
+            400: components["responses"]["Problem400"];
+            401: components["responses"]["Problem401"];
+            403: components["responses"]["Problem403"];
+            404: components["responses"]["Problem404"];
+            409: components["responses"]["Problem409"];
+            413: components["responses"]["Problem413"];
+            415: components["responses"]["Problem415"];
+            500: components["responses"]["Problem500"];
+            503: components["responses"]["Problem503"];
+        };
+    };
+    disableAssetSource: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                "If-Match": components["parameters"]["IfMatch"];
+            };
+            path: {
+                workspace_id: components["parameters"]["WorkspaceID"];
+                source_id: components["parameters"]["SourceID"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SourceReasonRequest"];
+            };
+        };
+        responses: {
+            200: components["responses"]["AssetSourceMutationOK"];
+            400: components["responses"]["Problem400"];
+            401: components["responses"]["Problem401"];
+            403: components["responses"]["Problem403"];
+            404: components["responses"]["Problem404"];
+            409: components["responses"]["Problem409"];
+            413: components["responses"]["Problem413"];
+            415: components["responses"]["Problem415"];
+            500: components["responses"]["Problem500"];
+            503: components["responses"]["Problem503"];
+        };
+    };
+    syncAssetSource: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                "If-Match": components["parameters"]["IfMatch"];
+            };
+            path: {
+                workspace_id: components["parameters"]["WorkspaceID"];
+                source_id: components["parameters"]["SourceID"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EmptySourceRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AssetSourceRunMutationAccepted"];
+            400: components["responses"]["Problem400"];
+            401: components["responses"]["Problem401"];
+            403: components["responses"]["Problem403"];
+            404: components["responses"]["Problem404"];
+            409: components["responses"]["Problem409"];
+            413: components["responses"]["Problem413"];
+            415: components["responses"]["Problem415"];
+            429: components["responses"]["Problem429"];
+            500: components["responses"]["Problem500"];
+            503: components["responses"]["Problem503"];
+        };
+    };
+    createAssetSourceImport: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                "If-Match": components["parameters"]["IfMatch"];
+            };
+            path: {
+                workspace_id: components["parameters"]["WorkspaceID"];
+                source_id: components["parameters"]["SourceID"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["CreateAssetSourceImportRequest"];
+            };
+        };
+        responses: {
+            202: components["responses"]["AssetSourceRunMutationAccepted"];
+            400: components["responses"]["Problem400"];
+            401: components["responses"]["Problem401"];
+            403: components["responses"]["Problem403"];
+            404: components["responses"]["Problem404"];
+            409: components["responses"]["Problem409"];
+            413: components["responses"]["Problem413"];
+            415: components["responses"]["Problem415"];
+            429: components["responses"]["Problem429"];
+            500: components["responses"]["Problem500"];
+            503: components["responses"]["Problem503"];
+        };
+    };
+    createAssetSourceIngestionBatch: {
+        parameters: {
+            query?: never;
+            header: {
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                workspace_id: components["parameters"]["WorkspaceID"];
+                source_id: components["parameters"]["SourceID"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: components["responses"]["AssetSourceRunMutationAccepted"];
+            400: components["responses"]["Problem400"];
+            401: components["responses"]["Problem401"];
+            409: components["responses"]["Problem409"];
+            413: components["responses"]["Problem413"];
+            415: components["responses"]["Problem415"];
+            429: components["responses"]["Problem429"];
             500: components["responses"]["Problem500"];
             503: components["responses"]["Problem503"];
         };

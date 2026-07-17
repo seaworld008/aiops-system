@@ -8,6 +8,7 @@ import type { OperationID } from "./operation";
 
 const workspaceID = "33333333-3333-4333-8333-333333333333";
 const environmentID = "44444444-4444-4444-8444-444444444444";
+const sourceID = "55555555-5555-4555-8555-555555555555";
 
 function assertCompileTimeContract(
   client: ReturnType<typeof createControlPlaneClient>,
@@ -33,7 +34,7 @@ function assertCompileTimeContract(
 
 void assertCompileTimeContract;
 
-const authenticatedOperationIDs = {
+const controlPlaneOperationIDs = {
   getSession: true,
   listAssets: true,
   createAsset: true,
@@ -46,7 +47,15 @@ const authenticatedOperationIDs = {
   createServiceAssetBinding: true,
   deleteServiceAssetBinding: true,
   listAssetSources: true,
+  createAssetSource: true,
   getAssetSource: true,
+  createAssetSourceRevision: true,
+  validateAssetSourceRevision: true,
+  publishAssetSourceRevision: true,
+  disableAssetSource: true,
+  syncAssetSource: true,
+  createAssetSourceImport: true,
+  createAssetSourceIngestionBatch: true,
   getAssetSourceRun: true,
   listAssetConflicts: true,
   resolveAssetConflict: true,
@@ -65,7 +74,7 @@ describe("createControlPlaneClient", () => {
       path: "/api/v1/browser-config",
       successStatus: 200,
     });
-    const expectedIDs = Object.keys(authenticatedOperationIDs).sort();
+    const expectedIDs = Object.keys(controlPlaneOperationIDs).sort();
     const actualIDs = [...openAPI.keys()]
       .filter((operation) => operation !== "getBrowserConfig")
       .sort();
@@ -85,21 +94,36 @@ describe("createControlPlaneClient", () => {
               headers: { "Content-Type": "application/json" },
             }),
       );
+      const getAccessToken = vi.fn().mockResolvedValue("ephemeral-token");
       const client = createControlPlaneClient({
         apiBasePath: "/api/v1",
-        getAccessToken: vi.fn().mockResolvedValue("ephemeral-token"),
+        getAccessToken,
         fetcher,
       });
-      const pathParameters: Record<string, string> = {};
+      const pathParameters: Record<string, string | number> = {};
       for (const match of contract.path.matchAll(/\{([a-z_]+)\}/g)) {
         const name = match[1];
         if (name !== undefined) {
-          pathParameters[name] = "55555555-5555-4555-8555-555555555555";
+          pathParameters[name] =
+            name === "revision"
+              ? 1
+              : "55555555-5555-4555-8555-555555555555";
         }
       }
       const input = {
         parameters: { path: pathParameters },
-        ...(contract.method === "POST" || contract.method === "PATCH"
+        ...(operation === "createAssetSourceImport"
+          ? {
+              requestBody: {
+                content: {
+                  "multipart/form-data": {
+                    file: "csv-bytes",
+                    detached_signature: "detached-signature",
+                  },
+                },
+              },
+            }
+          : contract.method === "POST" || contract.method === "PATCH"
           ? {
               requestBody: {
                 content: { "application/json": {} },
@@ -107,6 +131,19 @@ describe("createControlPlaneClient", () => {
             }
           : {}),
       };
+      if (operation === "createAssetSourceIngestionBatch") {
+        await expect(
+          (
+            client.execute as unknown as (
+              operation: OperationID,
+              input: unknown,
+            ) => Promise<unknown>
+          )(operation, input),
+        ).rejects.toThrow("Workload-only operation");
+        expect(getAccessToken).not.toHaveBeenCalled();
+        expect(fetcher).not.toHaveBeenCalled();
+        continue;
+      }
       await (
         client.execute as unknown as (
           operation: OperationID,
@@ -115,14 +152,53 @@ describe("createControlPlaneClient", () => {
       )(operation as OperationID, input);
 
       const expectedPath = contract.path.replace(
-        /\{[a-z_]+\}/g,
-        "55555555-5555-4555-8555-555555555555",
+        /\{([a-z_]+)\}/g,
+        (_match, name: string) =>
+          name === "revision"
+            ? "1"
+            : "55555555-5555-4555-8555-555555555555",
       );
       expect(fetcher).toHaveBeenCalledWith(
         expectedPath,
         expect.objectContaining({ method: contract.method }),
       );
+      if (operation === "createAssetSourceImport") {
+        const request = fetcher.mock.calls[0]?.[1] as RequestInit | undefined;
+        expect(request?.body).toBeInstanceOf(FormData);
+        expect(new Headers(request?.headers).get("Content-Type")).toBeNull();
+      }
     }
+  });
+
+  it("accepts both synchronous and queued statuses declared for Source validation", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response("{}", {
+        status: 202,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const client = createControlPlaneClient({
+      apiBasePath: "/api/v1",
+      getAccessToken: vi.fn().mockResolvedValue("ephemeral-token"),
+      fetcher,
+    });
+
+    const result = await client.execute("validateAssetSourceRevision", {
+      parameters: {
+        path: { workspace_id: workspaceID, source_id: sourceID, revision: 1 },
+        header: {
+          "Idempotency-Key": "source:validate-1",
+          "If-Match": `"asset-source-revision:${sourceID}:r1:sv3:rv1"`,
+        },
+      },
+      requestBody: { content: { "application/json": {} } },
+    });
+
+    expect(result.status).toBe(202);
+    expect(fetcher).toHaveBeenCalledWith(
+      `/api/v1/workspaces/${workspaceID}/asset-sources/${sourceID}/revisions/1:validate`,
+      expect.objectContaining({ method: "POST" }),
+    );
   });
 
   it("refreshes the token and executes a generated method/path with safe fetch options", async () => {

@@ -14,7 +14,7 @@ const (
 	contractTestAssetID            = "11111111-1111-4111-8111-111111111111"
 	contractTestDigest             = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	contractTestTraceID            = "0123456789abcdef0123456789abcdef"
-	contractTestControlPlaneDigest = "sha256:f90439561a1b0fb266dd8f2a8f08f15d97421851ae2857e461981c2d6cadfab3"
+	contractTestControlPlaneDigest = "sha256:5f3d4bb6c3b7473f2655f4c7b4839e9d4cb3bf3b115a2ce2e2dd47b32e020082"
 )
 
 func TestControlPlaneContractDigestPinsSessionContractRevision(t *testing.T) {
@@ -167,6 +167,58 @@ func TestWriteVersionETagEmitsExactStrongValidator(t *testing.T) {
 	writeVersionETag(recorder, "asset", contractTestAssetID, 9)
 	if got := recorder.Header().Get("ETag"); got != `"asset:`+contractTestAssetID+`:v9"` {
 		t.Fatalf("ETag = %q", got)
+	}
+}
+
+func TestSourceRevisionETagBindsSourceRevisionAndBothCASVersions(t *testing.T) {
+	t.Parallel()
+
+	valid := httptest.NewRequest(http.MethodPost, "/", nil)
+	valid.Header.Set(
+		"If-Match",
+		`"asset-source-revision:`+contractTestAssetID+`:r2:sv3:rv4"`,
+	)
+	sourceVersion, revisionVersion, err := parseSourceRevisionETag(
+		valid, contractTestAssetID, 2,
+	)
+	if err != nil || sourceVersion != 3 || revisionVersion != 4 {
+		t.Fatalf(
+			"parseSourceRevisionETag(valid) = (%d, %d, %v)",
+			sourceVersion,
+			revisionVersion,
+			err,
+		)
+	}
+
+	cases := map[string][]string{
+		"missing":        nil,
+		"weak":           {`W/"asset-source-revision:` + contractTestAssetID + `:r2:sv3:rv4"`},
+		"wildcard":       {"*"},
+		"wrong source":   {`"asset-source-revision:22222222-2222-4222-8222-222222222222:r2:sv3:rv4"`},
+		"wrong revision": {`"asset-source-revision:` + contractTestAssetID + `:r3:sv3:rv4"`},
+		"leading zero":   {`"asset-source-revision:` + contractTestAssetID + `:r2:sv03:rv4"`},
+		"multiple": {
+			`"asset-source-revision:` + contractTestAssetID + `:r2:sv3:rv4"`,
+			`"asset-source-revision:` + contractTestAssetID + `:r2:sv3:rv4"`,
+		},
+	}
+	for name, values := range cases {
+		request := httptest.NewRequest(http.MethodPost, "/", nil)
+		for _, value := range values {
+			request.Header.Add("If-Match", value)
+		}
+		if _, _, err := parseSourceRevisionETag(
+			request, contractTestAssetID, 2,
+		); !errors.Is(err, errInvalidControlPlaneRequest) {
+			t.Errorf("%s error = %v, want invalid request", name, err)
+		}
+	}
+
+	recorder := httptest.NewRecorder()
+	writeSourceRevisionETag(recorder, contractTestAssetID, 2, 3, 4)
+	if got := recorder.Header().Get("ETag"); got !=
+		`"asset-source-revision:`+contractTestAssetID+`:r2:sv3:rv4"` {
+		t.Fatalf("source revision ETag = %q", got)
 	}
 }
 
