@@ -1204,7 +1204,12 @@ SELECT EXISTS (
 UPDATE asset_relationships
 SET source_revision=$4,canonical_revision_digest=$5,last_run_id=$6::uuid,
     last_page_sequence=$7,accepted_checkpoint_version=$8,run_fence_epoch=$9,
-    relation_page_sha256=$10,status='INACTIVE',version=version+1
+    relation_page_sha256=$10,
+    freshness_order_sequence=CASE
+        WHEN freshness_kind IN ('CATALOG_SEQUENCE','CHECKPOINT_SEQUENCE') THEN $8
+        ELSE freshness_order_sequence
+    END,
+    status='INACTIVE',version=version+1
 WHERE tenant_id=$1::uuid AND workspace_id=$2::uuid AND source_id=$3::uuid
   AND status='ACTIVE' AND provenance='DISCOVERED' AND provenance_source_id=source_id
   AND last_run_id<>$6::uuid`
