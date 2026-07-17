@@ -2,7 +2,7 @@
 
 > 更新时间：2026-07-17
 > 状态：`SPEC_APPROVED / FAST_BUILD_IN_PROGRESS / RUNTIME_CLOSED`
-> 当前集成基线：本分支基于最新 `origin/main@fbdcbea5cb508a007499f7d6c29d5daffc7b54e6`（PR #88）；PR #84–#88 已合并并保持 `BUILT_CLOSED`；当前仅有两个可见 Batch 为 `BUILDING_CLOSED`：Pack 06 Task 17 External CMDB fixed-protocol foundation 与 C0 CSV profile registry/admission corrective
+> 当前集成基线：本分支基于最新 `origin/main@fbdcbea5cb508a007499f7d6c29d5daffc7b54e6`（PR #88）；PR #84–#88 已合并并保持 `BUILT_CLOSED`；当前仅有三个可见 Batch 为 `BUILDING_CLOSED`：Pack 06 Task 17 External CMDB fixed-protocol foundation、C0 CSV profile registry/admission corrective 与 C0/C1 review-and-provider-contract corrective
 
 ## 当前结论
 
@@ -68,7 +68,7 @@ Pack 05 Task 15A bounded CSV parser/checkpoint intermediate 已通过 PR #86 squ
 
 Pack 05 Task 14/15/15A 契约纠偏已通过 PR #87 squash merge 到 `origin/main@27ba219`，状态为 `BUILT_CLOSED`：公共 create/revision 的 resolved facts 只归 server-installed `SourceProfileRegistry` 所有，CSV V1 relation 固定同 Environment，Task 15A 与 15B 的完成边界已明确。G1 的 GitHub 快速 `go` 通过；本次文档范围 G2 的定向 RED/GREEN 断言、UTF-8/末尾换行、Markdown fence、本地链接、不完整标记扫描、`git diff --check`、单文件边界和独立只读复核通过，按范围未运行 Go/Web/数据库测试。Task 15B 与 CSV Source 运行能力继续 `NOT_STARTED/UNAVAILABLE/CLOSED`，G3/G4 继续 deferred。
 
-Pack 04 Task 12 只读 Source inventory/detail 与 Run timeline 已通过 PR #88 squash merge 到 `origin/main@fbdcbea`，状态为 `BUILT_CLOSED`：`/asset-sources` 深链路由已存在，URL 持有安全 Scope/筛选/选择状态，Run 计数与轮询保持 bounded 且不渲染 raw cursor、credential、endpoint 或上游错误；顶级 navigation 仍 disabled。G1 的 GitHub 快速 `go` 与 `git diff --check` 通过；受影响 Web G2 的 106 个回归测试、目标 6 个测试、typecheck/lint/build、十文件边界、Secret/forbidden-field scan 和 P0/P1 复核通过。GitNexus commit-bound verify 因另一 worktree 的 registry alias 占用未记为 PASS，已记录十文件人工影响分析；真实浏览器/Keycloak、Playwright/axe、HA 和 G3/G4 仍 deferred。
+Pack 04 Task 12 只读 Source inventory/detail 与 Run timeline 已通过 PR #88 squash merge 到 `origin/main@fbdcbea`，状态为 `BUILT_CLOSED`：`/asset-sources` 深链路由已存在，URL 持有安全 Scope/筛选/选择状态，Run 计数与轮询保持 bounded 且不渲染 raw cursor、credential、endpoint 或上游错误；顶级 navigation 仍 disabled。G1 的 GitHub 快速 `go` 与 `git diff --check` 通过；受影响 Web G2 的 106 个回归测试、目标 6 个测试、typecheck/lint/build、十文件边界、Secret/forbidden-field scan 和 P0/P1 复核通过。GitNexus commit-bound verify 因另一 worktree 的 registry alias 占用未记为 PASS，已记录十文件人工影响分析；真实浏览器/Keycloak、Playwright/axe、HA 和 G3/G4 仍 deferred。该 PR merge 后约 2 分钟才收到仍未解决的 Codex Review P2 `discussion_r3600320748`：`sourceSearch.ts` 丢弃 URL `environment` Scope；该有效反馈不追溯阻断已经完成的合并，而是进入下述非阻塞 C0/C1 修复闭环，能力继续关闭。
 
 ## 当前实施进度
 
@@ -133,7 +133,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
 | 现有调查/执行内核 | 基线存在 | 以现有测试、迁移和 V3 文档为准 |
-| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J/Session C0/Credential Trace C0/TypeScript C0/M1I Web Foundation/Source Revision/Create/Profile Registry/M1I Asset Catalog UI/Mapping Workbench/Navigation Scope corrective/Task 14 Source API/Task 15A CSV parser/Task 12 Source inventory）/ BUILDING_CLOSED（CSV Profile C0/External CMDB Task 17）/ UNAVAILABLE | Task 14、Task 15A 与只读 Source inventory 已合并；当前两个 Batch 仅构建 CSV profile registry/admission 与 External CMDB 固定协议基础。Task 15B、Discovery Worker、真实 Provider gate 与运行资格仍未完成 |
+| 新资产目录与发现 | BUILT_CLOSED（M0/M1A/M1B/M1C/M1D/M1E0/M1C1/M1E/Queue/CleanupBroker/Limiter C0/M1F/M1G/M1H/M1J/Session C0/Credential Trace C0/TypeScript C0/M1I Web Foundation/Source Revision/Create/Profile Registry/M1I Asset Catalog UI/Mapping Workbench/Navigation Scope corrective/Task 14 Source API/Task 15A CSV parser/Task 12 Source inventory）/ BUILDING_CLOSED（CSV Profile C0/External CMDB Task 17/Review + Provider Contract C0/C1）/ UNAVAILABLE | Task 14、Task 15A 与只读 Source inventory 已合并；当前三个 Batch 分别构建 CSV profile registry/admission、暂停在 C0 文档冲突上的 External CMDB 固定协议基础，以及 PR #88 environment URL continuity + Provider 文档合同 corrective。Task 15B、Discovery Worker、真实 Provider gate 与运行资格仍未完成 |
 | Connection 修订/验证/发布 | NOT_STARTED | 等待 Phase 2 |
 | VictoriaMetrics/Logs/Traces 全家桶 | NOT_STARTED | 等待 Phase 3 |
 | 事件/定时主动只读调查 | NOT_STARTED | 等待 Phase 4 |
@@ -141,7 +141,7 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 | HA 生产只读路径 | NOT_STARTED | 等待 Phase 6 |
 | 四类初始受治理生产 Action | CLOSED | 等待 Phase 7 逐类型演练与 Canary |
 | 生产发布与持续运维 | NOT_STARTED | 等待 Phase 8 |
-| 新 React 前端 | BUILT_CLOSED Foundation + Asset UI + Mapping UI + Navigation Scope corrective + read-only Source inventory / UNAVAILABLE | `/assets` 与 `/asset-mappings` 已进入受控导航；`/asset-sources` 可直接深链但顶级 navigation 仍 disabled。真实 Keycloak/浏览器、Playwright/axe 与 G3/G4 未通过前仍不可用 |
+| 新 React 前端 | BUILT_CLOSED Foundation + Asset UI + Mapping UI + Navigation Scope corrective + read-only Source inventory / BUILDING_CLOSED Review + Provider Contract C0/C1 / UNAVAILABLE | `/assets` 与 `/asset-mappings` 已进入受控导航；`/asset-sources` 可直接深链但顶级 navigation 仍 disabled，且 environment URL continuity 等待短 corrective。真实 Keycloak/浏览器、Playwright/axe 与 G3/G4 未通过前仍不可用 |
 
 ## 已知基线注意事项
 
@@ -153,10 +153,15 @@ Task 1 只建立后续实现所需的数据库安全底座。没有任何真实 
 
 ## 下一步
 
-从最新 `origin/main@fbdcbea5cb508a007499f7d6c29d5daffc7b54e6` 仅并行执行以下两个可见 Batch；两者尚未合并，状态只记录为 `BUILDING_CLOSED`，不记录 commit、G1/G2 通过或完成事实：
+从最新 `origin/main@fbdcbea5cb508a007499f7d6c29d5daffc7b54e6` 仅并行执行以下三个可见 Batch；三者尚未合并，状态只记录为 `BUILDING_CLOSED`，不记录 commit、G1/G2 通过或完成事实：
 
-- Pack 06 Task 17 External CMDB fixed-protocol foundation：只建立 `EXTERNAL_CMDB/CMDB_CATALOG_V1` 的固定 Catalog v1 safe schema、TLS/identity/read-only capability probe、规范化边界与窄 `discoverysource.Provider`；wire operation 只允许 `GET /v1/capabilities`、`GET /v1/assets`、`GET /v1/relations`，不建立通用 HTTP/endpoint/header/body/query 能力。
+- Pack 06 Task 17 External CMDB fixed-protocol foundation：只建立 `EXTERNAL_CMDB/CMDB_CATALOG_V1` 的固定 Catalog v1 safe schema、TLS/identity/read-only capability probe、规范化边界与窄 `discoverysource.Provider`；wire operation 只允许 `GET /v1/capabilities`、`GET /v1/assets`、`GET /v1/relations`，不建立通用 HTTP/endpoint/header/body/query 能力。实现轨已暂停于下述 C0 文档合同冲突；内部 P0/P1 收敛完成后仍须等待合同 corrective 合并，才能 commit/PR。
 - C0 CSV profile registry/admission corrective：只把 exact server-owned `CSV_IMPORT/CSV_RFC4180_V1` profile 纳入唯一 registry，并闭合 Source create/revision/action admission 对已安装 profile 与 runtime-closed 状态的 parity；不实现或开放 CSV import 执行路径。
+- C0/C1 review-and-provider-contract corrective：C1 只修复 PR #88 `sourceSearch.ts` 在规范化、筛选和选择导航中保留 `workspace` 却丢弃 `environment` 的 URL Scope continuity，并在快速计划中持久化“merge 后到达的有效 Codex Review 进入非阻塞修复闭环”规则；C0 只对 Task 17 及含同类示例的后续 Provider pack 做最小文档合同修正，使顶层 authority failure code 符合已合并 `discoverysource` 仅接受的 `AUTHORITY_*_{REJECTED|FAILED|INCOMPATIBLE|UNSUPPORTED}` grammar，并把实际必需的 `permissions` 补入 closed Capability 字段表。由下一可见窗口修改 Web/快速计划/Provider 计划，本状态同步不实施这些修复。
+
+`discussion_r3600320748` 在 PR #88 merge 后约 2 分钟到达，故不追溯改写其已合并 `BUILT_CLOSED` 事实；该 P2 不阻塞文件无重叠的 External CMDB 与 CSV Profile Batch，修复完成前 Source 页面和真实浏览器能力仍保持关闭。
+
+Task 17 当前冲突的精确事实是：计划示例要求顶层 `AUTHORITY_MISMATCH`，但已合并 proof grammar 不接受该 suffix；同一计划的 closed Capability 字段表又遗漏其 validation 文案要求的 `permissions`，且后续 Provider pack 仍有同类 `AUTHORITY_MISMATCH` 示例。三个可见窗口继续保持文件所有权无重叠；合同纠偏合并前不得把 Task 17 实现提交、PR 或可用性写成完成事实。
 
 Task 15B importer、quarantine、detached signature、sealed checkpoint、fenced orchestration/Reconciler、HTTP upload、backpressure 与 cleanup 继续 `NOT_STARTED/UNAVAILABLE/CLOSED`。External CMDB server-installed registry/creation admission、Task 18 incremental checkpoint/provenance/delete/restore、Task 19 真实 staging canary 与 per-source availability gate 同样保持 `NOT_STARTED/UNAVAILABLE/CLOSED`。
 
