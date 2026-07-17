@@ -32,9 +32,10 @@ var (
 )
 
 // ClaimRuntimeResolver assembles only the Provider, checkpoint, limits, and
-// fact policy after CleanupBroker has bound the exact Queue-owned attempt
-// represented by request. The Broker-bound runtime is hidden in request and
-// cannot be supplied or replaced by the resolver.
+// fact policy through ResolveOpenedAttemptRequest.NewClaimRuntime after
+// CleanupBroker has bound the exact Queue-owned attempt represented by request.
+// The Broker-bound runtime is hidden in request and cannot be supplied or
+// replaced by the resolver.
 type ClaimRuntimeResolver interface {
 	ResolveOpenedAttempt(context.Context, ResolveOpenedAttemptRequest) (ClaimRuntime, error)
 }
@@ -168,6 +169,18 @@ func (request ResolveOpenedAttemptRequest) CheckpointCodec() *discoverycheckpoin
 		return nil
 	}
 	return request.cell.checkpoints
+}
+
+// NewClaimRuntime mints the only opaque Provider runtime Worker accepts for
+// this exact opened attempt. The request retains the Broker-bound runtime and
+// attempt cell; resolvers can supply only Provider-owned data-plane policy.
+func (request ResolveOpenedAttemptRequest) NewClaimRuntime(
+	provider discoverysource.Provider,
+	checkpoint *discoverysource.Checkpoint,
+	limits discoverysource.Limits,
+	policy assetdiscovery.FactPolicy,
+) (ClaimRuntime, error) {
+	return newClaimRuntime(request, provider, checkpoint, limits, policy)
 }
 
 func (ResolveOpenedAttemptRequest) MarshalJSON() ([]byte, error) {

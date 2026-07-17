@@ -1473,9 +1473,7 @@ func (authority *modeAttemptAuthority) ResolveOpenedAttempt(
 			checkpoint: ownedCheckpoint, limits: limits, policy: policy, active: true,
 		}}, nil
 	}
-	return newClaimRuntime(
-		request, authority.provider, &checkpoint, limits, policy,
-	)
+	return request.NewClaimRuntime(authority.provider, &checkpoint, limits, policy)
 }
 
 type modeSessionCell struct {
