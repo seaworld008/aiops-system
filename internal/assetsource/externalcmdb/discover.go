@@ -113,7 +113,7 @@ func (value *provider) Discover(
 	}
 
 	switch checkpoint.phase {
-	case cmdbPhaseCapabilities:
+	case cmdbPhaseCapabilities, cmdbPhaseComplete:
 		capabilities, err := session.client.capabilities(ctx)
 		if err != nil {
 			return discoverFailureOrDelay(ctx, request, err, "CAPABILITIES_FAILED")
@@ -137,8 +137,6 @@ func (value *provider) Discover(
 		return discoverAssetPage(ctx, session, request, checkpoint)
 	case cmdbPhaseRelations:
 		return discoverRelationPage(ctx, session, request, checkpoint)
-	case cmdbPhaseComplete:
-		return nil, providerError("DISCOVERY_ALREADY_COMPLETE")
 	default:
 		return nil, providerError("CHECKPOINT_PHASE_REJECTED")
 	}
