@@ -619,6 +619,17 @@ func TestSourceEffectiveActionsArePermissionAndStateAware(t *testing.T) {
 
 	manager := mustManagement(t, &recordingManagementRepository{scope: managementScope()})
 	source, revision := exactManagementManualSourceRevision(t)
+	csvSource, csvRevision, csvProfile := exactManagementClosedValidationSourceRevision(
+		t, ProfileCode("CSV_RFC4180_V1"),
+	)
+	futureSource, futureRevision, futureProfile := exactManagementClosedValidationSourceRevision(
+		t, ProfileCode("FUTURE_RUNTIME_V1"),
+	)
+	manager.profiles = managementSourceProfileResolver{
+		ProfileCode("MANUAL_V1"):         ManualProfileV1(),
+		ProfileCode("CSV_RFC4180_V1"):    csvProfile,
+		ProfileCode("FUTURE_RUNTIME_V1"): futureProfile,
+	}
 	base := SourceReadModel{
 		Source: source, LatestRevision: revision,
 	}
@@ -644,6 +655,16 @@ func TestSourceEffectiveActionsArePermissionAndStateAware(t *testing.T) {
 		{
 			name: "manual draft validates", principal: admin, model: base,
 			want: []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource, ActionValidateSourceRevision},
+		},
+		{
+			name: "installed CSV draft keeps closed validation runtime hidden", principal: admin,
+			model: SourceReadModel{Source: csvSource, LatestRevision: csvRevision},
+			want:  []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
+		},
+		{
+			name: "future installed profile defaults validation runtime closed", principal: admin,
+			model: SourceReadModel{Source: futureSource, LatestRevision: futureRevision},
+			want:  []EffectiveAction{ActionCreateSourceRevision, ActionDisableSource},
 		},
 		{
 			name: "installed profile canonical drift closes validation", principal: admin,
@@ -1005,6 +1026,91 @@ func exactManagementManualSourceRevision(t *testing.T) (Source, SourceRevision) 
 		t.Fatal("exact management Source revision has empty BindingDigest")
 	}
 	return source, revision
+}
+
+func exactManagementClosedValidationSourceRevision(
+	t *testing.T,
+	profileCode ProfileCode,
+) (Source, SourceRevision, BuiltinSourceProfile) {
+	t.Helper()
+	source, revision := validLocallyClosedUninstalledBinding(t)
+	previousProfileCode := string(revision.ProfileCode)
+	source.ID = managementSourceID
+	source.ProviderKind = string(profileCode)
+	source.GateStatus = SourceGateUnavailable
+	source.GateReasonCode = ""
+	source.PublishedRevision = 0
+	source.PublishedRevisionDigest = ""
+	source.ValidatedRunID = ""
+	source.ValidationDigest = ""
+	source.ValidatedBindingDigest = ""
+	revision.SourceID = source.ID
+	revision.Status = SourceRevisionDraft
+	revision.ProfileCode = profileCode
+	revision.CanonicalProfileManifest = []byte(strings.ReplaceAll(
+		string(revision.CanonicalProfileManifest), previousProfileCode, string(profileCode),
+	))
+	revision.AuthorityEnvironmentIDs = []string{managementEnvironmentID}
+	revision.ValidationRunID = ""
+	revision.ValidationDigest = ""
+	var err error
+	revision.ProfileManifestSHA256, err = ProfileManifestDigest(revision.CanonicalProfileManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision.AuthorityScopeDigest, err = AuthorityScopeDigest(revision.AuthorityEnvironmentIDs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision.SourceDefinitionDigest, err = SourceDefinitionDigest(source, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision.CanonicalRevisionDigest = revision.BindingDigest()
+	if revision.CanonicalRevisionDigest == "" {
+		t.Fatal("exact closed-validation Source revision has empty BindingDigest")
+	}
+	profile := BuiltinSourceProfile{
+		SourceKind: source.Kind, ProviderKind: source.ProviderKind, ProfileCode: revision.ProfileCode,
+		SyncMode: revision.SyncMode, FreshnessKind: FreshnessObjectSequence,
+		EnvironmentMapping: EnvironmentMappingExplicitItem,
+		IntegrationMode:    "NONE", CredentialPurpose: "NONE", TrustMode: "NONE", NetworkMode: "NONE", ScheduleMode: "NONE",
+		ParserCode: string(profileCode), CompatibilityClass: string(profileCode), DLPPolicyCode: "ASSET_SAFE_V1",
+		MaxPageItems: 100, MaxPageRelations: 0, MaxPageBytes: 1048576, MaxDocumentBytes: 65536,
+		TrustedPathCodes:              []string{string(profileCode) + "_DISPLAY_NAME"},
+		RelationshipTypes:             []RelationshipType{},
+		CanonicalProfileManifest:      slices.Clone(revision.CanonicalProfileManifest),
+		CanonicalProviderSchema:       slices.Clone(revision.CanonicalProviderSchema),
+		ProfileManifestSHA256:         revision.ProfileManifestSHA256,
+		CanonicalProviderSchemaSHA256: revision.CanonicalProviderSchemaSHA256,
+		IntegrationID:                 revision.IntegrationID,
+		CredentialReferenceID:         revision.CredentialReferenceID,
+		TrustReferenceID:              revision.TrustReferenceID,
+		NetworkPolicyReferenceID:      revision.NetworkPolicyReferenceID,
+		RateLimitRequests:             revision.RateLimitRequests,
+		RateLimitWindowSeconds:        revision.RateLimitWindowSeconds,
+		BackpressureBaseSeconds:       revision.BackpressureBaseSeconds,
+		BackpressureMaxSeconds:        revision.BackpressureMaxSeconds,
+		ScheduleExpression:            revision.ScheduleExpression,
+		TypedExtensionCode:            revision.TypedExtensionCode,
+		PreparedExtensionDigest:       revision.PreparedExtensionDigest,
+	}
+	revision.CanonicalProfileManifest = nil
+	revision.CanonicalProviderSchema = nil
+	return source, revision, profile
+}
+
+type managementSourceProfileResolver map[ProfileCode]BuiltinSourceProfile
+
+func (resolver managementSourceProfileResolver) ResolveProfileAdmission(
+	_ context.Context,
+	code ProfileCode,
+) (BuiltinSourceProfile, error) {
+	profile, ok := resolver[code]
+	if !ok {
+		return BuiltinSourceProfile{}, ErrNotFound
+	}
+	return profile.Clone(), nil
 }
 
 func validManagementCreateAssetInput() CreateAssetInput {

@@ -1417,7 +1417,7 @@ func (management *Management) sourceActionAdmission(
 	}
 	publishedProfile, published := management.installedPublishedProfile(ctx, model)
 	admission := SourceActionAdmission{
-		CanValidate: latestProfile.ProfileCode != "" &&
+		CanValidate: sourceValidationRuntimeAvailable(latestProfile.ProfileCode) &&
 			source.Status == SourceStatusActive &&
 			source.GateStatus != SourceGateDegraded &&
 			source.GateStatus != SourceGateSuspended &&
@@ -1441,6 +1441,15 @@ func (management *Management) sourceActionAdmission(
 		admission.CanImport = publishedProfile.SourceKind == SourceKindCSVImport
 	}
 	return admission
+}
+
+func sourceValidationRuntimeAvailable(profileCode ProfileCode) bool {
+	switch profileCode {
+	case ProfileCode("MANUAL_V1"):
+		return true
+	default:
+		return false
+	}
 }
 
 func (management *Management) installedPublishedProfile(
