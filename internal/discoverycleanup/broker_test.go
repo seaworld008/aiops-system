@@ -206,9 +206,10 @@ func TestRevokeUncertainIsSignedOnceAndCannotBecomeClean(t *testing.T) {
 		t.Fatalf("uncertain proof was not stable: first=%s/%s replay=%s/%s",
 			first.Status(), first.DigestSHA256(), replayed.Status(), replayed.DigestSHA256())
 	}
-	if opener.handle(request.Attempt.AttemptID).revokeCount() != 1 || authority.signCount() != 1 {
-		t.Fatalf("uncertain revoke/sign calls = %d/%d, want 1/1",
-			opener.handle(request.Attempt.AttemptID).revokeCount(), authority.signCount())
+	handle := opener.handle(request.Attempt.AttemptID)
+	if handle.revokeCount() != 1 || handle.destroyCount() != 1 || authority.signCount() != 1 {
+		t.Fatalf("uncertain revoke/destroy/sign calls = %d/%d/%d, want 1/1/1",
+			handle.revokeCount(), handle.destroyCount(), authority.signCount())
 	}
 	if err := broker.VerifyCleanupProof(context.Background(), replayed); err != nil {
 		t.Fatalf("VerifyCleanupProof(uncertain) error = %v", err)
@@ -235,33 +236,150 @@ func TestAmbiguousOpenHandleCanOnlyProduceUncertainProof(t *testing.T) {
 	if proof.Status() != assetcatalog.CredentialCleanupUncertain {
 		t.Fatalf("ambiguous open cleanup status = %s, want UNCERTAIN", proof.Status())
 	}
-	if opener.handle(request.Attempt.AttemptID).revokeCount() != 1 || authority.signCount() != 1 {
-		t.Fatalf("ambiguous open revoke/sign calls = %d/%d, want 1/1",
-			opener.handle(request.Attempt.AttemptID).revokeCount(), authority.signCount())
+	handle := opener.handle(request.Attempt.AttemptID)
+	if handle.revokeCount() != 1 || handle.destroyCount() != 1 || authority.signCount() != 1 {
+		t.Fatalf("ambiguous open revoke/destroy/sign calls = %d/%d/%d, want 1/1/1",
+			handle.revokeCount(), handle.destroyCount(), authority.signCount())
 	}
 }
 
-func TestAuthenticationFailedOpenNeverProducesCleanProof(t *testing.T) {
+func TestOpenFailureRevokeProducesStableUncertainProof(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		openErr         error
+		nilHandle       bool
+		wantOpenErr     error
+		wantHandleCalls int
+	}{
+		{
+			name:        "generic nil-handle error",
+			openErr:     errors.New("sensitive upstream open failure: token=do-not-log"),
+			nilHandle:   true,
+			wantOpenErr: discoverycleanup.ErrAttemptUncertain,
+		},
+		{
+			name:        "authentication nil-handle error",
+			openErr:     discoverycleanup.ErrSessionAuthentication,
+			nilHandle:   true,
+			wantOpenErr: discoverycleanup.ErrSessionAuthentication,
+		},
+		{
+			name:            "handle plus authentication error",
+			openErr:         discoverycleanup.ErrSessionAuthentication,
+			wantOpenErr:     discoverycleanup.ErrSessionAuthentication,
+			wantHandleCalls: 1,
+		},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			opener := newTestOpener()
+			opener.openErr = test.openErr
+			opener.returnNilHandle = test.nilHandle
+			authority := newTestProofAuthority()
+			broker := mustBroker(t, opener, authority)
+			request := cleanupRequest(index + 1)
+
+			if _, err := broker.OpenAttempt(context.Background(), request); !errors.Is(err, test.wantOpenErr) {
+				t.Fatalf("OpenAttempt() error = %v, want %v", err, test.wantOpenErr)
+			}
+
+			const callers = 16
+			type revokeResult struct {
+				proof discoveryqueue.CleanupProof
+				err   error
+			}
+			start := make(chan struct{})
+			results := make(chan revokeResult, callers)
+			for range callers {
+				go func() {
+					<-start
+					proof, err := broker.RevokeAttempt(context.Background(), request.Attempt.AttemptID)
+					results <- revokeResult{proof: proof, err: err}
+				}()
+			}
+			close(start)
+
+			var wantDigest string
+			var wantAuthentication []byte
+			defer clear(wantAuthentication)
+			for range callers {
+				result := <-results
+				if result.err != nil {
+					t.Fatalf("RevokeAttempt() error = %v", result.err)
+				}
+				if result.proof.Status() != assetcatalog.CredentialCleanupUncertain {
+					t.Fatalf("cleanup status = %s, want UNCERTAIN", result.proof.Status())
+				}
+				if err := broker.VerifyCleanupProof(context.Background(), result.proof); err != nil {
+					t.Fatalf("VerifyCleanupProof() error = %v", err)
+				}
+				authentication := result.proof.Authentication()
+				if wantDigest == "" {
+					wantDigest = result.proof.DigestSHA256()
+					wantAuthentication = bytes.Clone(authentication)
+				} else if result.proof.DigestSHA256() != wantDigest ||
+					!bytes.Equal(authentication, wantAuthentication) {
+					t.Fatal("concurrent revoke returned a different UNCERTAIN proof")
+				}
+				clear(authentication)
+				result.proof.Destroy()
+			}
+
+			replayed, err := broker.RevokeAttempt(context.Background(), request.Attempt.AttemptID)
+			if err != nil {
+				t.Fatalf("RevokeAttempt(response-loss replay) error = %v", err)
+			}
+			replayedAuthentication := replayed.Authentication()
+			if replayed.Status() != assetcatalog.CredentialCleanupUncertain ||
+				replayed.DigestSHA256() != wantDigest ||
+				!bytes.Equal(replayedAuthentication, wantAuthentication) {
+				t.Fatal("response-loss replay returned a different UNCERTAIN proof")
+			}
+			clear(replayedAuthentication)
+			replayed.Destroy()
+
+			handle := opener.handle(request.Attempt.AttemptID)
+			if handle.revokeCount() != test.wantHandleCalls ||
+				handle.destroyCount() != test.wantHandleCalls ||
+				authority.signCount() != 1 {
+				t.Fatalf("revoke/destroy/sign calls = %d/%d/%d, want %d/%d/1",
+					handle.revokeCount(), handle.destroyCount(), authority.signCount(),
+					test.wantHandleCalls, test.wantHandleCalls)
+			}
+		})
+	}
+}
+
+func TestOpenFailureSignerFailureDoesNotProduceProof(t *testing.T) {
 	t.Parallel()
 
 	opener := newTestOpener()
-	opener.openErr = discoverycleanup.ErrSessionAuthentication
+	opener.openErr = errors.New("sensitive upstream open failure: token=do-not-log")
+	opener.returnNilHandle = true
 	authority := newTestProofAuthority()
+	authority.signErr = errors.New("sensitive signer failure: key=do-not-log")
 	broker := mustBroker(t, opener, authority)
 	request := cleanupRequest(1)
 
-	if _, err := broker.OpenAttempt(context.Background(), request); !errors.Is(err, discoverycleanup.ErrSessionAuthentication) {
-		t.Fatalf("OpenAttempt(authentication failure) error = %v, want ErrSessionAuthentication", err)
+	if _, err := broker.OpenAttempt(context.Background(), request); !errors.Is(err, discoverycleanup.ErrAttemptUncertain) {
+		t.Fatalf("OpenAttempt() error = %v, want ErrAttemptUncertain", err)
 	}
-	if _, err := broker.RevokeAttempt(context.Background(), request.Attempt.AttemptID); !errors.Is(err, discoverycleanup.ErrSessionAuthentication) {
-		t.Fatalf("RevokeAttempt(authentication failure) error = %v, want ErrSessionAuthentication", err)
-	}
-	if _, err := broker.RevokeAttempt(context.Background(), request.Attempt.AttemptID); !errors.Is(err, discoverycleanup.ErrSessionAuthentication) {
-		t.Fatalf("RevokeAttempt(authentication replay) error = %v, want ErrSessionAuthentication", err)
+	for range 2 {
+		proof, err := broker.RevokeAttempt(context.Background(), request.Attempt.AttemptID)
+		authentication := proof.Authentication()
+		if !errors.Is(err, discoverycleanup.ErrProofAuthentication) ||
+			proof.Status() != "" || proof.DigestSHA256() != "" || len(authentication) != 0 {
+			t.Fatalf("RevokeAttempt() = %s/%q/%d, %v; want empty proof and ErrProofAuthentication",
+				proof.Status(), proof.DigestSHA256(), len(authentication), err)
+		}
+		clear(authentication)
+		proof.Destroy()
 	}
 	handle := opener.handle(request.Attempt.AttemptID)
-	if handle.revokeCount() != 1 || handle.destroyCount() != 1 || authority.signCount() != 0 {
-		t.Fatalf("authentication failure revoke/destroy/sign calls = %d/%d/%d, want 1/1/0",
+	if handle.revokeCount() != 0 || handle.destroyCount() != 0 || authority.signCount() != 1 {
+		t.Fatalf("revoke/destroy/sign calls = %d/%d/%d, want 0/0/1",
 			handle.revokeCount(), handle.destroyCount(), authority.signCount())
 	}
 }
@@ -595,17 +713,18 @@ func uuid(value int) string {
 }
 
 type testOpener struct {
-	mu           sync.Mutex
-	openCalls    map[string]int
-	handles      map[string]*testSessionHandle
-	openErr      error
-	revokeErr    error
-	handleSecret string
-	blockOpen    bool
-	blockRevoke  bool
-	blockDestroy bool
-	openStarted  chan struct{}
-	openOnce     sync.Once
+	mu              sync.Mutex
+	openCalls       map[string]int
+	handles         map[string]*testSessionHandle
+	openErr         error
+	revokeErr       error
+	handleSecret    string
+	blockOpen       bool
+	blockRevoke     bool
+	blockDestroy    bool
+	returnNilHandle bool
+	openStarted     chan struct{}
+	openOnce        sync.Once
 }
 
 func newTestOpener() *testOpener {
@@ -640,6 +759,9 @@ func (opener *testOpener) OpenSession(
 	if blockOpen {
 		<-ctx.Done()
 		return handle, ctx.Err()
+	}
+	if opener.returnNilHandle {
+		return nil, openErr
 	}
 	return handle, openErr
 }
@@ -716,6 +838,7 @@ type testProofAuthority struct {
 	key           []byte
 	signCalls     int
 	signedData    []byte
+	signErr       error
 	blockSign     bool
 	signStarted   chan struct{}
 	signRelease   chan struct{}
@@ -740,6 +863,7 @@ func (authority *testProofAuthority) SignCleanupProof(ctx context.Context, diges
 	authority.mu.Lock()
 	authority.signCalls++
 	authority.signedData = bytes.Clone(digest)
+	signErr := authority.signErr
 	blockSign := authority.blockSign
 	authority.mu.Unlock()
 	authority.signOnce.Do(func() { close(authority.signStarted) })
@@ -749,6 +873,9 @@ func (authority *testProofAuthority) SignCleanupProof(ctx context.Context, diges
 			return nil, ctx.Err()
 		case <-authority.signRelease:
 		}
+	}
+	if signErr != nil {
+		return nil, signErr
 	}
 	mac := hmac.New(sha256.New, authority.key)
 	_, _ = mac.Write(digest)

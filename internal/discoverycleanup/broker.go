@@ -59,8 +59,9 @@ func (request OpenAttemptRequest) Validate() error {
 // SessionOpener is the narrow trusted adapter invoked once for an exact
 // attempt. Implementations must be safe for concurrent attempts, honor context
 // cancellation before returning, and must not return a transport or credential
-// payload. A non-nil handle returned with an error remains Broker-owned and can
-// produce only an UNCERTAIN cleanup result.
+// payload. A non-nil handle returned with an error remains Broker-owned; a nil
+// handle records that no revoke is possible. Either open failure can produce
+// only an UNCERTAIN cleanup result.
 type SessionOpener interface {
 	OpenSession(context.Context, OpenAttemptRequest) (SessionHandle, error)
 }
@@ -225,9 +226,9 @@ func (broker *CleanupBroker) OpenAttempt(
 }
 
 // RevokeAttempt requires only the opaque attempt ID. The first call consumes
-// the Broker-owned handle and seals one signed REVOKED or UNCERTAIN proof;
-// every replay returns an exact clone of that proof without another revoke or
-// signature.
+// the Broker-owned handle when one exists, or seals a no-handle open failure,
+// and produces one signed REVOKED or UNCERTAIN proof. Every replay returns an
+// exact clone of that proof without another revoke or signature.
 func (broker *CleanupBroker) RevokeAttempt(
 	ctx context.Context,
 	attemptID string,
@@ -277,16 +278,8 @@ func (broker *CleanupBroker) RevokeAttempt(
 			}
 			continue
 		}
-		if nilInterface(state.handle) {
-			openErr := state.openErr
-			private.mu.Unlock()
-			if openErr != nil {
-				return discoveryqueue.CleanupProof{}, openErr
-			}
-			return discoveryqueue.CleanupProof{}, ErrAttemptUncertain
-		}
-
 		handle := state.handle
+		hasHandle := !nilInterface(handle)
 		request := state.request
 		openErr := state.openErr
 		state.revokeStarted = true
@@ -294,21 +287,18 @@ func (broker *CleanupBroker) RevokeAttempt(
 		private.operations.Add(1)
 		private.mu.Unlock()
 
-		operationCtx, releaseOperation := linkedContext(ctx, private.lifetime)
-		revokeErr := handle.Revoke(operationCtx)
-		releaseOperation()
-		handle.Destroy()
-		status := assetcatalog.CredentialCleanupRevoked
-		if openErr != nil || revokeErr != nil {
-			status = assetcatalog.CredentialCleanupUncertain
+		var revokeErr error
+		if hasHandle {
+			operationCtx, releaseOperation := linkedContext(ctx, private.lifetime)
+			revokeErr = handle.Revoke(operationCtx)
+			releaseOperation()
+			handle.Destroy()
 		}
-		var proof discoveryqueue.CleanupProof
-		var proofErr error
-		if errors.Is(openErr, ErrSessionAuthentication) {
-			proofErr = ErrSessionAuthentication
-		} else {
-			proof, proofErr = broker.signProof(private.lifetime, request, status)
+		status := assetcatalog.CredentialCleanupUncertain
+		if hasHandle && openErr == nil && revokeErr == nil {
+			status = assetcatalog.CredentialCleanupRevoked
 		}
+		proof, proofErr := broker.signProof(private.lifetime, request, status)
 		resultProof := proof.Clone()
 
 		private.mu.Lock()
