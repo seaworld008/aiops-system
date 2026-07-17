@@ -11,14 +11,16 @@
 3. [03-mapping-auth-api.md](./03-mapping-auth-api.md) — 实现关系/冲突/Service Binding、Browser/API OIDC 边界、runtime Browser Config、OpenAPI/HTTP 基线和真实 Control Plane 装配。
 4. [04-web-foundation-assets.md](./04-web-foundation-assets.md) — 建立唯一 `web/`、`app → features → shared`、真实浏览器 OIDC、typed API/shared Operation/治理 UI、Go SPA、资产/映射/来源基线和持久前端 Foundation 规范。
 5. [05-source-ingestion-csv-api.md](./05-source-ingestion-csv-api.md) — 实现 Source `draft→canonical revision→validate→publish/disable→sync`、权限/OpenAPI/effective_actions、CSV 与 mTLS API ingestion、六步 Source 向导。
-6. [06-source-external-cmdb.md](./06-source-external-cmdb.md) — 实现固定 External CMDB Catalog v1 协议、增量资产/关系、负向测试与独立 gate。
+6. [06-source-external-cmdb.md](./06-source-external-cmdb.md) — 实现固定 External CMDB Catalog v1 协议；Task 18A 只拥有 Provider paging/checkpoint，Task 18B 在 Pack 09 provider-neutral Worker core 合并后只拥有 CMDB durable reconciliation/lifecycle integration 和唯一 neutral metadata descriptor，Task 19A 单独装配 Control Plane profile/validation admission，Task 19B 再进入独立 gate。
 7. [07-source-vsphere.md](./07-source-vsphere.md) — 实现 govmomi SOAP/PropertyCollector 全量+增量库存、删除/恢复、非生产 vCenter canary 和 gate。
 8. [08-source-proxmox-openstack-cloud.md](./08-source-proxmox-openstack-cloud.md) — 实现 Proxmox、OpenStack、AWS、Azure、GCP 五个独立计算资产 Provider/gate。
-9. [09-discovery-worker-ha-e2e.md](./09-discovery-worker-ha-e2e.md) — 创建真实 `cmd/discovery-worker`、PostgreSQL queue/lease/fence、checkpoint keyring、持久限流/背压和全 Provider HA 证据。
+9. [09-discovery-worker-ha-e2e.md](./09-discovery-worker-ha-e2e.md) — Task 27 只冻结自身已合并的 PostgreSQL Queue/process-local CleanupBroker/Limiter，M1E 继续唯一拥有既有 PageCommitter ABI/SQL；Task 28A 先交付 provider-neutral Worker core/claim-runtime seam，Task 28B 再交付 recoverable cleanup-session transport/same-attempt authority，Task 28C 才拥有 registry/production constructor/`cmd/discovery-worker`，Task 29 承担全 Provider HA 证据。
 10. [10-overview-control-room.md](./10-overview-control-room.md) — 闭合 `/overview` 安全聚合 API/UI，分维显示 Assets/Sources/Connections/Investigations/Actions/Releases，未实现项显式 `NOT_STARTED/UNAVAILABLE`。
 11. [11-e2e-docs.md](./11-e2e-docs.md) — 完成指标、真实 Keycloak/PostgreSQL/Playwright、视觉/axe/安全、CI、备份恢复、HA、持久文档和 Phase 1 签名验收。
 
-快速构建桥接任务包 [12-m1e0-relation-page-corrective.md](./12-m1e0-relation-page-corrective.md) 已由 PR #46 关闭 fixed canonical empty relation digest 与 `000015` trigger 的 C0 冲突；[14-m1c1-normalized-fact-contract-corrective.md](./14-m1c1-normalized-fact-contract-corrective.md) 已由 PR #49 关闭 normalized fact/Asset/SQL parity 与 page-byte accounting；[13-m1e-page-commit-transaction.md](./13-m1e-page-commit-transaction.md)、Queue lifecycle 与 CleanupBroker 已由 PR #53/#55/#57 合并并保持运行能力关闭。当前并行推进 [03-mapping-auth-api.md](./03-mapping-auth-api.md) Tasks 5–6 的 Mapping/Management Batch 与 [09-discovery-worker-ha-e2e.md](./09-discovery-worker-ha-e2e.md) Task 27 的 Limiter 持久化契约 corrective；后者在权威契约和 `000015` 修正通过前不得创建 Limiter 生产实现。这些快速 Batch 都不改变上述最终验收顺序。
+快速构建桥接任务包 [12-m1e0-relation-page-corrective.md](./12-m1e0-relation-page-corrective.md) 已由 PR #46 关闭 fixed canonical empty relation digest 与 `000015` trigger 的 C0 冲突；[14-m1c1-normalized-fact-contract-corrective.md](./14-m1c1-normalized-fact-contract-corrective.md) 已由 PR #49 关闭 normalized fact/Asset/SQL parity 与 page-byte accounting；[13-m1e-page-commit-transaction.md](./13-m1e-page-commit-transaction.md)、Queue lifecycle、CleanupBroker 与 Limiter runtime 已由 PR #53/#55/#57/#64 分别合并并保持运行能力关闭。External CMDB Task 18A paging/checkpoint 已由 PR #98 合并并由 PR #99 修正 complete-checkpoint next-run restart；这仍不是 Task 18 durable lifecycle、Worker 或 gate 完成证据。
+
+Task 18B 与 Task 27/28 的权威顺序现固定为：已合并 PageCommitter/Queue/process-local CleanupBroker/Limiter → [Task 28A provider-neutral Worker core](./09-discovery-worker-ha-e2e.md#task-28a-provider-neutral-worker-core-and-claim-runtime-seam) → [External CMDB Task 18B](./06-source-external-cmdb.md#task-18b-external-cmdb-durable-reconciliation-and-lifecycle-integration) provider-specific 真库集成 + neutral descriptor → [Task 28B recoverable session transport](./09-discovery-worker-ha-e2e.md#task-28b-recoverable-cleanup-session-transport-and-attempt-authority) → [Task 28C production](./09-discovery-worker-ha-e2e.md#task-28c-production-constructor-and-provider-registry) → [Task 19A Control Plane admission](./06-source-external-cmdb.md#task-19a-control-plane-cmdb-profile-installation-and-validation-admission) → Task 29 HA。新增 transport Batch 是因为现有 Broker attempt map 不跨进程；任何后继只读已合并接口，不读取其他会话未提交实现，exact files 没有 parallel owner。
 
 存在前置依赖的代码只能消费已合并的稳定 `Produces` 接口。快速构建可按覆盖计划聚合 2–4 个相关旧 Task，并在接口冻结后并行 Provider/Web 轨道；任务包顺序继续约束 Phase 1 最终验收，不再强制每个 checkbox 独立 Red/Green/commit。C0 契约保留定向 RED，所有延后的真库、HA、恢复、安全、真实 Provider 与 E2E 证据必须在 G3/G4 补齐，补齐前能力保持 `UNAVAILABLE`。
 
@@ -34,7 +36,7 @@
 - `assetcatalog.Scope`、`AssetLocator`、`Reader.Get(context.Context, AssetLocator) (Asset,error)` 和 `assets UNIQUE (tenant_id,workspace_id,environment_id,id)`。
 - 稳定 `asset_sources` + append-only/content-addressed `asset_source_revisions`，以及 fenced Run、encrypted checkpoint、独立 `asset_source_limit_buckets`/append-only `asset_source_limit_permits`、Observation/provenance、Asset/Conflict/Relationship/Binding 事实。
 - `source_revision` 唯一表示 Source definition revision；Provider 事实新鲜度用 profile-locked `FreshnessCandidate` 与 append-only Observation chain 持久，不同 Run 可追加同一未变事实，同 Run 漂移重放、时间/序列回退或碰撞整页关闭。
-- `SourceRevisionRepository`、`discoverysource.Provider`、`discoveryqueue.Queue`、`discoveryworker.Worker` 和真实 `cmd/discovery-worker`。
+- `SourceRevisionRepository`、`discoverysource.Provider`、已合并 `discoveryqueue.Queue`；Task 28A 唯一产生 provider-neutral `discoveryworker.Worker`/claim-runtime seam，Task 28B 唯一产生 fixed-mTLS recoverable session transport/same-attempt authority，Task 28C 唯一产生 exact Provider registry、production constructor 与真实 `cmd/discovery-worker`。
 - 严格 Control Plane OpenAPI、no-store closed-schema `GET /api/v1/browser-config`、`ASSET_*`/`ASSET_SOURCE_*` 权限、`effective_actions`、签名 Cursor、ETag/Idempotency/RFC 9457 和唯一生成 TypeScript 契约。
 - 唯一 `web/` 壳层和 `app → features → shared` 模块边界、仅 `shared/api` 的类型化 transport、共享 Operation/治理 UI、Scope-aware 状态所有权、Go 同源 SPA，以及 `/overview`、`/assets`、`/asset-mappings`、`/asset-sources` 与 Source revision wizard；持久设计文档 `foundation-assets.md`、`asset-sources.md`、`overview.md`。
 - 逐 Provider 正向/负向/真实协议/非生产 canary/HA/DLP/rate-limit/checkpoint/delete-recovery 证据和独立 `AVAILABLE` gate。
@@ -104,7 +106,9 @@ Phase 1 只有在以下全部成立时才可记录 `ASSET_CONTROL_PLANE_ACCEPTED
 - Source 六步向导、`ASSET_SOURCE_*` 权限、OpenAPI 严格 Schema、ETag/Idempotency/reauth、`effective_actions` 与唯一生成类型通过。
 - Browser Config 无 Secret/私有 Endpoint 且 malformed fail closed；浏览器/API OIDC `iss/aud/azp/auth_time` 分别验证，生产不依赖 `VITE_OIDC_*` 注入身份配置。
 - CSV/API/CMDB/vSphere/Proxmox/OpenStack/AWS/Azure/GCP 均有真实 protocol serialization、negative/DLP/provenance、incremental checkpoint、soft delete/recovery、rate/backpressure、credential cleanup、两副本 HA/fence 与非生产 canary 签名证据。
-- `cmd/discovery-worker` 生产构造器仅使用真实 PostgreSQL、workload identity、secure profile/credential resolver、checkpoint keyring 和 Provider registry；任一依赖缺失 fail closed。
+- `cmd/discovery-worker` 生产构造器仅使用真实 PostgreSQL、workload identity、secure profile/session transport、checkpoint keyring 和 Provider registry；Broker `SessionOpener` 与 runtime resolver 只能来自同一 Task 28B attempt authority。Task 28B 只拥有 fixed-mTLS client/本地 composition，不拥有 shared authority server。Worker A 被 kill 后，replacement Worker 必须通过 opaque lab binding 连接已预置真实外部 authority，以 exact Run/attempt/epoch recovery-open 同一 session 再 revoke；新 process-local Broker 直接按 UUID revoke不算证据，缺 binding/不可达/mTLS 失败或任一依赖缺失均 fail closed。
+- External CMDB Task 18B G2 必须使用 PostgreSQL 18.4 TLS 与 `AIOPS_TEST_POSTGRES_DSN`，缺环境或 Skip 不得算 PASS；partial/timeout、same-attempt runtime/handle/proof、stale fence、one-transaction page/relation/checkpoint/receipt、replay、complete-only missing、fixed-wire tombstone/restore、crash/reclaim 与 cleanup-before-Delay 全部通过。两 Worker/HA/restart/recovery 未完成 G3 前旧 Task 18 不得勾选。
+- Task 19A 必须从 Task 18B neutral `internal/sourceprofile` descriptor 与 Task 28C safe runtime-admission manifest 装配 Control Plane registry/admission；`cmd/control-plane` 不得 import External CMDB Provider、Provider HTTP-client、credential/session/network graph，也不得读取 endpoint、credential 或 runtime material；其既有 HTTP server graph 不受影响。缺 descriptor/runtime/gate prerequisite 时公共 validation path 零写并保持关闭。
 - `/overview` 和资产/映射/来源页在 1440/1024/390、键盘、axe、真实 Keycloak/PostgreSQL E2E 通过；未实现后续能力显示 `NOT_STARTED/UNAVAILABLE`，无伪绿。
 - 前端静态门证明 `app → features → shared`、仅 `shared/api` 网络访问、generated contract 无漂移、Scope 切换清理 Query；治理 mutation 不 optimistic/自动重试，公共治理组件由各 feature 复用。
 - 生产 Web E2E 从 Go 同源入口加载；`/api/*`/health/readiness 不被 SPA fallback，最终 Control Plane 产物从 `/opt/aiops/web` 服务且无 Node/Vite/MSW/source map/独立 BFF 运行时。
@@ -112,6 +116,8 @@ Phase 1 只有在以下全部成立时才可记录 `ASSET_CONTROL_PLANE_ACCEPTED
 - secret/DLP、生成类型漂移、代码围栏、本地链接、不完整标记、`git diff --check`、Go/race/vet/build、Web/E2E 和恢复门全部通过。
 
 已实现 Provider 软件不等于某个生产 Source 已开门；没有 exact 当前证据的 source 仍保持 `UNAVAILABLE/SUSPENDED`。Phase 1 验收也不等于整个项目生产闭环；只有 Phase 8 独立签名的 `PRODUCTION_CLOSED_LOOP_ACCEPTED` 才可这样描述。
+
+本次所有权纠偏只更新本阶段计划与覆盖映射，不拥有 `docs/status/current.md`，也不据此勾选任何实现 checkbox。PR #97 已在本纠偏前单独合并，只负责同步 Task 18A/PR #99 等完成度事实；其中把 Task 18B 后续证据宽泛列为 PostgreSQL/Worker/HA 的文字不得继续解释为文件或通用状态机 owner。当前四文件契约合并后，主管理/状态窗口再单独同步该措辞，不能由本 PR 改写 `current.md`。
 
 ## 唯一前端扩展契约
 
