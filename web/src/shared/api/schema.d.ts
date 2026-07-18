@@ -36,6 +36,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/workspaces/{workspace_id}/environments/{environment_id}/overview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceID"];
+                environment_id: components["parameters"]["EnvironmentID"];
+            };
+            cookie?: never;
+        };
+        get: operations["getOverview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets": {
         parameters: {
             query?: never;
@@ -506,6 +525,85 @@ export interface components {
             authenticated_at: string;
             /** Format: date-time */
             expires_at: string;
+        };
+        /** @enum {string} */
+        OverviewImplementationState: "NOT_STARTED" | "UNAVAILABLE" | "PARTIAL" | "AVAILABLE" | "DEGRADED" | "SUSPENDED";
+        /** @enum {string} */
+        OverviewSectionCode: "NOT_IMPLEMENTED" | "MODULE_UNAVAILABLE" | "AGGREGATE_PARTIAL" | "READY" | "STALE_EVIDENCE" | "SUSPENDED";
+        /** @enum {string} */
+        OverviewFeature: "ASSETS" | "SOURCES" | "CONNECTIONS" | "INVESTIGATIONS" | "ACTIONS" | "RELEASES";
+        /** @enum {string} */
+        OverviewEffectiveAction: "VIEW_ASSETS" | "VIEW_SOURCES" | "VIEW_CONNECTIONS" | "VIEW_INVESTIGATIONS" | "VIEW_ACTIONS" | "VIEW_RELEASES";
+        /** @enum {string} */
+        OverviewWorkQueueKey: "OPEN_CONFLICTS" | "STALE_ASSETS" | "UNAVAILABLE_SOURCES" | "DEGRADED_SOURCES";
+        OverviewScope: {
+            workspace_id: components["schemas"]["UUID"];
+            environment_id: components["schemas"]["UUID"];
+        };
+        OverviewStateCount: {
+            state: string;
+            /** Format: int64 */
+            count: number;
+        };
+        OverviewProviderGateSummary: {
+            provider_kind: string;
+            gate_status: components["schemas"]["SourceGateStatus"];
+            /** Format: int64 */
+            source_count: number;
+            evidence_at: components["schemas"]["NullableDateTime"];
+        };
+        OverviewAssetFacts: {
+            /** Format: int64 */
+            total: number;
+            lifecycles: components["schemas"]["OverviewStateCount"][];
+            mapping_statuses: components["schemas"]["OverviewStateCount"][];
+            /** Format: int64 */
+            stale_count: number;
+            oldest_stale_at: components["schemas"]["NullableDateTime"];
+            /** Format: int64 */
+            open_conflict_count: number;
+        };
+        OverviewSourceFacts: {
+            /** Format: int64 */
+            total: number;
+            statuses: components["schemas"]["OverviewStateCount"][];
+            revision_statuses: components["schemas"]["OverviewStateCount"][];
+            gate_statuses: components["schemas"]["OverviewStateCount"][];
+            run_statuses: components["schemas"]["OverviewStateCount"][];
+            /** Format: int64 */
+            backpressured_count: number;
+            provider_gates: components["schemas"]["OverviewProviderGateSummary"][];
+        };
+        OverviewSection: {
+            state: components["schemas"]["OverviewImplementationState"];
+            code: components["schemas"]["OverviewSectionCode"];
+            /** Format: date-time */
+            observed_at: string;
+            asset_facts: components["schemas"]["OverviewAssetFacts"] | null;
+            source_facts: components["schemas"]["OverviewSourceFacts"] | null;
+        };
+        OverviewSections: {
+            ASSETS: components["schemas"]["OverviewSection"];
+            SOURCES: components["schemas"]["OverviewSection"];
+            CONNECTIONS: components["schemas"]["OverviewSection"];
+            INVESTIGATIONS: components["schemas"]["OverviewSection"];
+            ACTIONS: components["schemas"]["OverviewSection"];
+            RELEASES: components["schemas"]["OverviewSection"];
+        };
+        OverviewWorkQueue: {
+            key: components["schemas"]["OverviewWorkQueueKey"];
+            section: components["schemas"]["OverviewFeature"];
+            state: components["schemas"]["OverviewImplementationState"];
+            /** Format: int64 */
+            count: number | null;
+        };
+        OverviewSnapshot: {
+            scope: components["schemas"]["OverviewScope"];
+            /** Format: date-time */
+            generated_at: string;
+            sections: components["schemas"]["OverviewSections"];
+            work_queues: components["schemas"]["OverviewWorkQueue"][];
+            effective_actions: components["schemas"]["OverviewEffectiveAction"][];
         };
         PageMeta: {
             next_cursor: string | null;
@@ -996,6 +1094,20 @@ export interface components {
                 "application/json": components["schemas"]["Session"];
             };
         };
+        /** @description Scope-safe governed operations readiness snapshot. */
+        OverviewOK: {
+            headers: {
+                "Cache-Control": components["headers"]["CacheControl"];
+                "X-Content-Type-Options": components["headers"]["ContentTypeOptions"];
+                "Referrer-Policy": components["headers"]["ReferrerPolicy"];
+                "X-Trace-ID": components["headers"]["TraceID"];
+                ETag: components["headers"]["ETag"];
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["OverviewSnapshot"];
+            };
+        };
         /** @description Scoped asset page. */
         AssetPageOK: {
             headers: {
@@ -1431,6 +1543,27 @@ export interface operations {
         responses: {
             200: components["responses"]["SessionOK"];
             401: components["responses"]["Problem401"];
+            503: components["responses"]["Problem503"];
+        };
+    };
+    getOverview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                workspace_id: components["parameters"]["WorkspaceID"];
+                environment_id: components["parameters"]["EnvironmentID"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: components["responses"]["OverviewOK"];
+            400: components["responses"]["Problem400"];
+            401: components["responses"]["Problem401"];
+            403: components["responses"]["Problem403"];
+            404: components["responses"]["Problem404"];
+            500: components["responses"]["Problem500"];
             503: components["responses"]["Problem503"];
         };
     };

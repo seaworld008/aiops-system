@@ -30,12 +30,25 @@ function assertCompileTimeContract(
     // @ts-expect-error Session success data does not expose AssetPage fields.
     void result.data.items;
   });
+  void client.execute("getOverview", {
+    parameters: {
+      path: {
+        workspace_id: workspaceID,
+        environment_id: environmentID,
+      },
+    },
+  }).then((result) => {
+    void result.data.sections.ASSETS.state;
+    // @ts-expect-error Overview scope intentionally never exposes Tenant.
+    void result.data.scope.tenant_id;
+  });
 }
 
 void assertCompileTimeContract;
 
 const controlPlaneOperationIDs = {
   getSession: true,
+  getOverview: true,
   listAssets: true,
   createAsset: true,
   getAsset: true,

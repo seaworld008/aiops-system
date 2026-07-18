@@ -3,6 +3,7 @@ package openapi_test
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -25,6 +26,9 @@ func TestControlPlaneContractHasExactRoutes(t *testing.T) {
 		"/api/v1/session":        {"get"},
 		"/api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets": {
 			"get", "post",
+		},
+		"/api/v1/workspaces/{workspace_id}/environments/{environment_id}/overview": {
+			"get",
 		},
 		"/api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets/{asset_id}": {
 			"get", "patch",
@@ -109,6 +113,92 @@ func TestControlPlaneContractHasExactRoutes(t *testing.T) {
 	} {
 		if strings.Contains(lower, forbidden+":") {
 			t.Errorf("browser contract contains forbidden field %s", forbidden)
+		}
+	}
+}
+
+func TestOverviewContractIsClosedScopeSafeAndFailClosed(t *testing.T) {
+	raw, document := readControlPlaneContract(t)
+	paths := mustMap(t, document["paths"], "#/paths")
+	const overviewPath = "/api/v1/workspaces/{workspace_id}/environments/{environment_id}/overview"
+	overview := mustMap(t, mustMap(t, paths[overviewPath], overviewPath)["get"], overviewPath+" get")
+	if got := overview["operationId"]; got != "getOverview" {
+		t.Fatalf("overview operationId = %#v, want getOverview", got)
+	}
+	assertExactStrings(t, overview["tags"], []string{"Overview"}, "overview tags")
+
+	responses := mustMap(t, overview["responses"], "overview responses")
+	for _, status := range []string{"200", "400", "401", "403", "404", "500", "503"} {
+		if _, ok := responses[status]; !ok {
+			t.Errorf("overview lacks response %s", status)
+		}
+	}
+
+	components := mustMap(t, document["components"], "#/components")
+	schemas := mustMap(t, components["schemas"], "#/components/schemas")
+	snapshot := mustMap(t, schemas["OverviewSnapshot"], "#/components/schemas/OverviewSnapshot")
+	if snapshot["type"] != "object" || snapshot["additionalProperties"] != false {
+		t.Fatalf("OverviewSnapshot is not closed: %#v", snapshot)
+	}
+	snapshotProperties := mustMap(t, snapshot["properties"], "OverviewSnapshot properties")
+	assertExactMapKeys(
+		t,
+		snapshotProperties,
+		[]string{"scope", "generated_at", "sections", "work_queues", "effective_actions"},
+		"OverviewSnapshot properties",
+	)
+
+	scope := mustMap(t, schemas["OverviewScope"], "#/components/schemas/OverviewScope")
+	scopeProperties := mustMap(t, scope["properties"], "OverviewScope properties")
+	assertExactMapKeys(
+		t,
+		scopeProperties,
+		[]string{"workspace_id", "environment_id"},
+		"OverviewScope properties",
+	)
+
+	sections := mustMap(t, schemas["OverviewSections"], "#/components/schemas/OverviewSections")
+	sectionProperties := mustMap(t, sections["properties"], "OverviewSections properties")
+	assertExactMapKeys(
+		t,
+		sectionProperties,
+		[]string{"ASSETS", "SOURCES", "CONNECTIONS", "INVESTIGATIONS", "ACTIONS", "RELEASES"},
+		"OverviewSections properties",
+	)
+
+	state := mustMap(t, schemas["OverviewImplementationState"], "#/components/schemas/OverviewImplementationState")
+	assertExactStrings(
+		t,
+		state["enum"],
+		[]string{"NOT_STARTED", "UNAVAILABLE", "PARTIAL", "AVAILABLE", "DEGRADED", "SUSPENDED"},
+		"OverviewImplementationState enum",
+	)
+
+	actions := mustMap(t, schemas["OverviewEffectiveAction"], "#/components/schemas/OverviewEffectiveAction")
+	assertExactStrings(
+		t,
+		actions["enum"],
+		[]string{"VIEW_ASSETS", "VIEW_SOURCES", "VIEW_CONNECTIONS", "VIEW_INVESTIGATIONS", "VIEW_ACTIONS", "VIEW_RELEASES"},
+		"OverviewEffectiveAction enum",
+	)
+
+	_ = raw
+	lower := strings.ToLower(fmt.Sprint([]any{
+		snapshot,
+		scope,
+		sections,
+		schemas["OverviewSection"],
+		schemas["OverviewAssetFacts"],
+		schemas["OverviewSourceFacts"],
+		schemas["OverviewProviderGateSummary"],
+		schemas["OverviewWorkQueue"],
+	}))
+	for _, forbidden := range []string{
+		"tenant_id:", "endpoint:", "credential:", "checkpoint:", "lease:", "fence:",
+		"provider_error:", "external_id:",
+	} {
+		if strings.Contains(lower, forbidden) {
+			t.Errorf("overview contract contains forbidden field %s", forbidden)
 		}
 	}
 }
