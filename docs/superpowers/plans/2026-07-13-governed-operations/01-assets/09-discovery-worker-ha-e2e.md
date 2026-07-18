@@ -341,6 +341,67 @@ G2 必须用 test-only fixed-protocol authority fixture 证明两个独立 clien
 
 **Deferred G3/G4:** 真实部署 authority HA、真实非生产 vCenter、两真实 Discovery Worker/数据库 restart、long-running session expiry、canary/gate 和 provider matrix deferred。G2 代码合并仍最多 `BUILT_CLOSED`；Task 21B、Task 22 与 vSphere registry row未完成前继续 `UNAVAILABLE/CLOSED`。
 
+### Task 28C prerequisite C0: same-attempt process-local External CMDB runtime-material authority
+
+**Batch:** C0 corrective，Task 28C 开工前独立合并；只关闭 External CMDB runtime material 的生产解析 seam，不创建 registry、production constructor、binary、migration、公共 API 或运行资格。
+
+**Exact files:**
+
+- Modify: `internal/discoveryworker/attempt_session.go`
+- Modify: `internal/discoveryworker/attempt_session_test.go`
+- Create: `internal/discoveryruntime/external_cmdb.go`
+- Create: `internal/discoveryruntime/external_cmdb_test.go`
+- Create: `internal/discoveryruntime/postgres.go`
+- Create: `internal/discoveryruntime/postgres_integration_test.go`
+- Modify: `docs/superpowers/plans/2026-07-13-governed-operations/01-assets/09-discovery-worker-ha-e2e.md`
+
+不得修改 Task 28A Worker、Task 28B `SessionTransport`、CleanupBroker、Task 18B Provider/reconciliation、migration、OpenAPI/generated types、Web、Control Plane 或 Task 28C 十文件。若 exact PostgreSQL facts 或服务端 material resolver 需要新的数据库/secret-store ABI，必须停止并另行冻结 owner，不能扩宽本 Batch。
+
+**Consumes（只读已合并 `Produces`）:**
+
+- Task 28B `InitialRuntimeRequest`、`SessionBoundRuntime` 与同一 `AttemptSessionAuthority` cell；`SessionTransport` 继续只携带 exact Run/attempt/epoch/runtime-binding digest 和 opaque receipt，绝不携带 Provider 或 credential material。
+- Task 18B `internal/sourceprofile.ExternalCMDBDescriptor`、`externalcmdb.ReconciliationDescriptor`、`externalcmdb.RuntimeMaterial` 与既有 Provider/checkpoint/limits/fact-policy constructors；不得重建 descriptor 语义或创建第二 Provider/session。
+- `000015` 的 exact Source/Revision/Run/authority 与 opaque Integration/Credential/Trust/Network reference IDs；PostgreSQL resolver 只通过 TLS application identity 读取这些安全事实，绝不读取 `integrations.secret_ref/config`、endpoint、credential、CA、Vault path 或任意 payload。
+- 一个 mandatory、server-only、process-local External CMDB material resolver；它只接受从 PostgreSQL exact snapshot 派生的一次性 capability并返回单一 owner 的 runtime material/revoke/destroy capability。缺 resolver、返回可复制/可序列化 material、或任一 reference/binding drift 均 fail closed。
+
+**Produces:**
+
+- Task 28B `InitialRuntimeRequest` 增加同一内部 cell 签发的一次性、不可重建、不可复制、不可序列化 initial-runtime tuple/callback；tuple 只包含 server-derived exact `{scope,run_id,attempt_id,attempt_epoch}` 与 immutable `RuntimeBinding`，callback 返回的 runtime/lifecycle 必须绑定同一 request/cell。
+- `ResolveRuntimeBinding` 的 safe binding lookup 必须允许 exact cleanup-only recovery 在 Source 已 disabled/paused/suspended 或 gate 漂移后继续认证同一 Task 28B SessionTransport session；该 snapshot 必须标记 `initialAllowed=false`、不得携带 opened checkpoint/runtime，且只能产生 recovery revoke handle。任何 `Initial=true` 结果仍须在 material resolver/Provider/network 前拒绝。
+- `internal/discoveryruntime` 的 External CMDB authority：按 exact Source/Revision/binding 与 attempt tuple 从真实 PostgreSQL 重载四类 opaque refs，在任何 credential/network access 前比较 immutable descriptor/profile/admission；material resolver 必须在持有 exact Run/Source/Revision row locks 的同一个 serializable admission callback 内执行，把数据库 lease remaining 转换为数据库查询发起时的本地 monotonic absolute deadline（不得在 `Scan` 后重新起算），并在 cell 返回前按数据库时间 post-resolve 重验；随后每 attempt 只调用 material resolver 一次并立即把 `externalcmdb.RuntimeMaterial` 绑定到该 initial cell。
+- 同一 runtime cell 唯一拥有 material 的 clear/revoke/destroy/zeroization。Broker revoke、authority destroy、cancel、open failure 或 foreign/reconstructed result 都只能终结该 cell 一次；所有内部 revoke/close 必须使用有限 deadline，callback 超时后仍继续 destroy/zeroize/tombstone；caller 不能取得可重建、可复制或可序列化的 runtime-material carrier。
+- 后续 `ResolveClaimRuntime` 只从已打开的 exact cell 生成 Task 18B Provider、checkpoint、limits 与 fact policy；不得再次调用 PostgreSQL/material resolver、SessionOpener、credential resolver 或网络。
+- Task 28C 只能消费该已合并 authority 作为单一 `SessionOpener + ClaimRuntimeResolver` composition 的 runtime-material owner；safe runtime-admission manifest 继续只含 opaque IDs/digests，不含 endpoint、token、CA、credential、path 或 material。
+
+**RED → GREEN:**
+
+- [ ] RED：Scope/Run/attempt/epoch、immutable Source/Revision tuple、canonical binding、Integration/Credential/Trust/Network ref 任一漂移在 SessionTransport 前拒绝；Source disabled/stale/gate-drift 的 exact cleanup recovery只能取得 `initialAllowed=false` safe binding，任何 initial material admission 均在 material resolver/Provider/network 前拒绝。
+- [ ] RED：material resolver 阻塞期间的 Source disable、Gate 漂移、fence/reclaim 或 lease expiry 不能与 admission 交错；post-resolve 重验失败必须 revoke/destroy/zeroize，且不得返回 opened cell 或 Provider。
+- [ ] RED：数据库 query/transport/scan/校验耗时不得延长 material deadline；deadline 已过时 material resolver 必须零调用。revoke callback 等待 `ctx.Done()` 时必须在有限 cleanup deadline 后继续 destroy/zeroize/tombstone，不能卡死 authority shutdown。
+- [ ] RED：foreign、reconstructed、value-copied initial tuple/request/session-bound runtime 或 runtime-material capability拒绝；initial callback 与 material resolver 每 attempt 最多各一次。
+- [ ] RED：`InitialRuntimeRequest`、initial tuple、session-bound runtime、External CMDB authority/material capability 的 JSON/text/binary、`String/GoString/LogValue/Format` 与 DLP capture 均不出现 endpoint、token、CA、credential、path、raw material 或内部 cell。
+- [ ] RED：cancel/revoke/destroy 并发只执行一次 material revoke/destroy/zeroization；任一不确定结果保持 cleanup fail closed，不能产生 Provider success。
+- [ ] RED：initial open response loss按 exact attempt/cell安全重放，不重新解析 material；changed replay拒绝。
+- [ ] RED：真实 PostgreSQL 18.4 TLS application identity读取 exact immutable refs/authority/checkpoint facts；wrong Scope、stale attempt/fence epoch、Revision/ref/binding drift全部拒绝。disabled Source 必须仍返回 exact cleanup-recovery binding，但 initial material resolver保持零调用。
+- [ ] GREEN：只实现上述窄 seam/authority/PostgreSQL resolver；不复用 cleanup mTLS certificate，不读取 direct config secret，不引入 fake/test server、第二 opener/resolver/session或删除 registry row伪绿。
+
+**G2 — required, no Skip:**
+
+~~~bash
+go test -race ./internal/discoveryworker ./internal/discoveryruntime \
+  -run 'InitialRuntime|ExternalCMDB|RuntimeMaterial|Authority|Postgres' -count=1
+test -n "${AIOPS_TEST_POSTGRES_DSN:-}"
+test -n "${AIOPS_TEST_POSTGRES_MIGRATION_DSN:-}"
+test -n "${AIOPS_TEST_POSTGRES_APPLICATION_DSN:-}"
+go test -race ./internal/discoveryruntime -run 'Postgres.*Integration' -count=1
+go test -race ./internal/assetsource/externalcmdb ./internal/sourceprofile \
+  ./internal/discoverycleanup ./internal/discoverysource ./internal/discoveryqueue \
+  ./internal/discoverycheckpoint -count=1
+git diff --check
+~~~
+
+PostgreSQL test 必须证明 Server `18.4+ 18.x`、TLS 1.3、独立 migration/application identity 和零 Skip；unit fake 只可证明接口负例，不能替代真实 PostgreSQL resolver。G3/G4、真实 secret store/credential issuer、两 Worker/authority restart、Provider canary/gate 和 Task 28C production assembly继续 deferred；本 corrective 最多 `BUILT_CLOSED`，所有能力保持 `UNAVAILABLE/CLOSED`。
+
 ### Task 28C: Production constructor and Provider registry
 
 **Batch:** C0/C1/C2，1–2 日；只能在 Task 28A、Task 28B 与需要注册的 provider-specific durable integrations 已合并后开始。vSphere Task 21A 不满足该条件；只有 Task 21B0/21B 完成后 vSphere row 才可进入 registry。

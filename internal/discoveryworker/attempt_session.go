@@ -14,6 +14,7 @@ import (
 	"github.com/seaworld008/aiops-system/internal/assetcatalog"
 	"github.com/seaworld008/aiops-system/internal/assetdiscovery"
 	"github.com/seaworld008/aiops-system/internal/discoverycleanup"
+	"github.com/seaworld008/aiops-system/internal/discoveryqueue"
 	"github.com/seaworld008/aiops-system/internal/discoverysource"
 )
 
@@ -21,8 +22,10 @@ const (
 	attemptSessionDigestDomain       = "discovery-attempt-runtime-binding.v1"
 	attemptSessionAuthorityRedaction = "[REDACTED_ATTEMPT_SESSION_AUTHORITY]"
 	initialRuntimeRequestRedaction   = "[REDACTED_INITIAL_RUNTIME_REQUEST]"
+	initialRuntimeTupleRedaction     = "[REDACTED_INITIAL_RUNTIME_TUPLE]"
 	sessionBoundRuntimeRedaction     = "[REDACTED_SESSION_BOUND_RUNTIME]"
 	attemptSessionAuthoritySeal      = uint64(0x5f92a614c37bd8e1)
+	initialRuntimeTupleSeal          = uint64(0x8a43c90e72f15bd6)
 )
 
 var ErrAttemptSessionAuthority = errors.New(
@@ -63,6 +66,28 @@ type AttemptRuntimeFactory interface {
 	)
 }
 
+// InitialRuntimeLifecycle is the non-serializable lifecycle paired with the
+// runtime material minted by one InitialRuntimeRequest callback. Revoke is
+// included in the Broker handle result; Destroy must release and zero every
+// remaining process-local owner without claiming successful revocation.
+type InitialRuntimeLifecycle interface {
+	Revoke(context.Context) error
+	Destroy()
+}
+
+// InitialRuntimeResolver receives a one-use tuple that can only be minted from
+// the exact internal attempt cell. It returns runtime material and its
+// lifecycle together, so no independent opener or resolver can be paired with
+// the Broker handle.
+type InitialRuntimeResolver func(
+	context.Context,
+	*InitialRuntimeTuple,
+) (
+	discoverysource.BoundRuntime,
+	InitialRuntimeLifecycle,
+	error,
+)
+
 // AttemptSessionAuthority implements both Broker SessionOpener and Worker
 // ClaimRuntimeResolver. The shared object is the process-local authority that
 // joins one external attempt lease to exactly one runtime cell.
@@ -102,6 +127,7 @@ type attemptSessionCell struct {
 	binding    discoverysource.RuntimeBinding
 	digest     string
 	runtime    discoverysource.BoundRuntime
+	lifecycle  InitialRuntimeLifecycle
 	handle     *initialAttemptSessionHandle
 	revokeDone chan struct{}
 	revokeErr  error
@@ -109,9 +135,9 @@ type attemptSessionCell struct {
 	active     bool
 }
 
-// InitialRuntimeRequest is a one-use, same-cell capability. RuntimeBinding
-// exposes only immutable safe metadata; BindRuntime accepts a BoundRuntime only
-// for this exact request and can be called once.
+// InitialRuntimeRequest is a one-use, same-cell capability. ResolveRuntime
+// invokes one callback with an unforgeable exact tuple and accepts runtime plus
+// lifecycle ownership only for this request's internal attempt cell.
 type InitialRuntimeRequest struct {
 	state *initialRuntimeRequestState
 }
@@ -126,6 +152,25 @@ type initialRuntimeRequestState struct {
 	active  bool
 }
 
+// InitialRuntimeTuple is a callback-scoped capability containing only the
+// server-derived exact attempt tuple and immutable RuntimeBinding. A struct
+// copy or reconstructed value is inert; the originating callback invalidates
+// the tuple before returning.
+type InitialRuntimeTuple struct {
+	self  *InitialRuntimeTuple
+	seal  uint64
+	state *initialRuntimeTupleState
+}
+
+type initialRuntimeTupleState struct {
+	mu          sync.Mutex
+	issued      *InitialRuntimeTuple
+	coordinates discoveryqueue.RunCoordinates
+	attempt     discoveryqueue.CleanupAttempt
+	binding     discoverysource.RuntimeBinding
+	active      bool
+}
+
 // SessionBoundRuntime is the factory's proof that its runtime was bound
 // through the exact InitialRuntimeRequest. It is consumed immediately by the
 // authority and never crosses the Broker ABI.
@@ -134,11 +179,17 @@ type SessionBoundRuntime struct {
 }
 
 type sessionBoundRuntimeState struct {
-	issued  *SessionBoundRuntime
-	request *initialRuntimeRequestState
-	cell    *attemptSessionCell
-	runtime discoverysource.BoundRuntime
-	active  bool
+	issued    *SessionBoundRuntime
+	request   *initialRuntimeRequestState
+	cell      *attemptSessionCell
+	runtime   discoverysource.BoundRuntime
+	lifecycle InitialRuntimeLifecycle
+	active    bool
+}
+
+type initialRuntimeOwnership struct {
+	runtime   discoverysource.BoundRuntime
+	lifecycle InitialRuntimeLifecycle
 }
 
 type initialAttemptSessionHandle struct {
@@ -250,22 +301,27 @@ func (authority *AttemptSessionAuthority) OpenSession(
 	initialRequest := newInitialRuntimeRequest(cell, binding)
 	result, openErr := private.factory.OpenInitialRuntime(operationContext, initialRequest)
 	if openErr != nil {
-		runtime := invalidateInitialRuntimeRequest(initialRequest)
-		runtime.Clear()
+		releaseInitialRuntime(
+			operationContext,
+			invalidateInitialRuntimeRequest(initialRequest),
+		)
 		return handle, boundedAttemptAuthorityError(openErr)
 	}
-	runtime, consumeErr := consumeSessionBoundRuntime(initialRequest, result)
+	ownership, consumeErr := consumeSessionBoundRuntime(initialRequest, result)
 	if consumeErr != nil {
-		runtime.Clear()
+		releaseInitialRuntime(operationContext, ownership)
 		return handle, ErrAttemptSessionAuthority
 	}
 	cell.mu.Lock()
-	if !cell.active || cell.handle != handle || cell.binding != runtime.Binding() {
+	if !cell.active || cell.handle != handle ||
+		cell.binding != ownership.runtime.Binding() ||
+		nilDependency(ownership.lifecycle) {
 		cell.mu.Unlock()
-		runtime.Clear()
+		releaseInitialRuntime(operationContext, ownership)
 		return handle, ErrAttemptSessionAuthority
 	}
-	cell.runtime = runtime
+	cell.runtime = ownership.runtime
+	cell.lifecycle = ownership.lifecycle
 	cell.mu.Unlock()
 	return handle, nil
 }
@@ -312,40 +368,111 @@ func (authority *AttemptSessionAuthority) ResolveOpenedAttempt(
 	return runtime, nil
 }
 
-func (request *InitialRuntimeRequest) RuntimeBinding() discoverysource.RuntimeBinding {
-	if request == nil || request.state == nil {
-		return discoverysource.RuntimeBinding{}
+func (request *InitialRuntimeRequest) ResolveRuntime(
+	ctx context.Context,
+	resolve InitialRuntimeResolver,
+) (*SessionBoundRuntime, error) {
+	if ctx == nil || resolve == nil || request == nil || request.state == nil {
+		return nil, ErrAttemptSessionAuthority
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	private := request.state
 	private.mu.Lock()
+	if !private.active || private.issued != request || private.cell == nil ||
+		private.used || private.bound != nil ||
+		private.binding != private.cell.binding {
+		private.mu.Unlock()
+		return nil, ErrAttemptSessionAuthority
+	}
+	private.used = true
+	cell, binding := private.cell, private.binding
+	private.mu.Unlock()
+
+	tuple := newInitialRuntimeTuple(cell.request, binding)
+	runtime, lifecycle, resolveErr := resolve(ctx, tuple)
+	tuple.destroy()
+	if resolveErr != nil || runtime.Binding() != binding ||
+		nilDependency(lifecycle) {
+		releaseInitialRuntime(
+			ctx,
+			initialRuntimeOwnership{runtime: runtime, lifecycle: lifecycle},
+		)
+		invalidateInitialRuntimeRequest(request)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		return nil, ErrAttemptSessionAuthority
+	}
+
+	private.mu.Lock()
+	if !private.active || private.issued != request || private.cell != cell ||
+		!private.used || private.bound != nil || private.binding != binding {
+		private.mu.Unlock()
+		releaseInitialRuntime(
+			ctx,
+			initialRuntimeOwnership{runtime: runtime, lifecycle: lifecycle},
+		)
+		invalidateInitialRuntimeRequest(request)
+		return nil, ErrAttemptSessionAuthority
+	}
+	boundState := &sessionBoundRuntimeState{
+		request: private, cell: cell, runtime: runtime,
+		lifecycle: lifecycle, active: true,
+	}
+	result := &SessionBoundRuntime{state: boundState}
+	boundState.issued = result
+	private.bound = boundState
+	private.mu.Unlock()
+	return result, nil
+}
+
+func (tuple *InitialRuntimeTuple) Coordinates() discoveryqueue.RunCoordinates {
+	private := tuple.private()
+	if private == nil {
+		return discoveryqueue.RunCoordinates{}
+	}
+	private.mu.Lock()
 	defer private.mu.Unlock()
-	if !private.active || private.issued != request || private.cell == nil {
+	if !private.active || private.issued != tuple {
+		return discoveryqueue.RunCoordinates{}
+	}
+	return private.coordinates
+}
+
+func (tuple *InitialRuntimeTuple) Attempt() discoveryqueue.CleanupAttempt {
+	private := tuple.private()
+	if private == nil {
+		return discoveryqueue.CleanupAttempt{}
+	}
+	private.mu.Lock()
+	defer private.mu.Unlock()
+	if !private.active || private.issued != tuple {
+		return discoveryqueue.CleanupAttempt{}
+	}
+	return private.attempt
+}
+
+func (tuple *InitialRuntimeTuple) RuntimeBinding() discoverysource.RuntimeBinding {
+	private := tuple.private()
+	if private == nil {
+		return discoverysource.RuntimeBinding{}
+	}
+	private.mu.Lock()
+	defer private.mu.Unlock()
+	if !private.active || private.issued != tuple {
 		return discoverysource.RuntimeBinding{}
 	}
 	return private.binding
 }
 
-func (request *InitialRuntimeRequest) BindRuntime(
-	runtime discoverysource.BoundRuntime,
-) (*SessionBoundRuntime, error) {
-	if request == nil || request.state == nil {
-		return nil, ErrAttemptSessionAuthority
+func (tuple *InitialRuntimeTuple) private() *initialRuntimeTupleState {
+	if tuple == nil || tuple.self != tuple ||
+		tuple.seal != initialRuntimeTupleSeal || tuple.state == nil {
+		return nil
 	}
-	private := request.state
-	private.mu.Lock()
-	defer private.mu.Unlock()
-	if !private.active || private.issued != request || private.cell == nil ||
-		private.used || runtime.Binding() != private.binding {
-		return nil, ErrAttemptSessionAuthority
-	}
-	private.used = true
-	boundState := &sessionBoundRuntimeState{
-		request: private, cell: private.cell, runtime: runtime, active: true,
-	}
-	result := &SessionBoundRuntime{state: boundState}
-	boundState.issued = result
-	private.bound = boundState
-	return result, nil
+	return tuple.state
 }
 
 func (handle *initialAttemptSessionHandle) BindRuntime(
@@ -545,6 +672,7 @@ func (cell *attemptSessionCell) matchesResolveRequestLocked(
 		cell.request.Coordinates == request.cell.coordinates &&
 		cell.request.Attempt == request.cell.attempt &&
 		cell.binding == request.cell.binding &&
+		!nilDependency(cell.lifecycle) &&
 		cell.runtime == request.cell.runtime &&
 		cell.runtime.Binding() == cell.binding
 }
@@ -596,32 +724,47 @@ func (cell *attemptSessionCell) revoke(
 		transport, lease := cell.transport, cell.lease
 		cell.mu.Unlock()
 
-		revokeErr := transport.Revoke(ctx, lease)
+		transportErr := transport.Revoke(ctx, lease)
+		lifecycleErr := cell.revokeRuntimeLifecycle(ctx)
+		revokeErr := errors.Join(transportErr, lifecycleErr)
 		var runtime discoverysource.BoundRuntime
+		var lifecycle InitialRuntimeLifecycle
 		var owner *attemptSessionAuthorityState
 		cell.mu.Lock()
-		cell.revoking = false
 		cell.revokeErr = revokeErr
-		if revokeErr == nil {
-			cell.active = false
-			runtime = cell.runtime
-			cell.runtime = discoverysource.BoundRuntime{}
-			owner = cell.owner
-			cell.owner = nil
-			cell.transport = nil
-			cell.lease = nil
-			cell.handle = nil
-			cell.binding = discoverysource.RuntimeBinding{}
-			cell.digest = ""
+		if revokeErr != nil {
+			cell.revoking = false
+			close(cell.revokeDone)
+			cell.mu.Unlock()
+			return revokeErr
 		}
-		close(cell.revokeDone)
+		cell.active = false
+		runtime = cell.runtime
+		cell.runtime = discoverysource.BoundRuntime{}
+		lifecycle = cell.lifecycle
+		cell.lifecycle = nil
+		owner = cell.owner
+		cell.owner = nil
+		cell.transport = nil
+		cell.lease = nil
+		cell.binding = discoverysource.RuntimeBinding{}
+		cell.digest = ""
+		revokeDone := cell.revokeDone
 		cell.mu.Unlock()
-		if revokeErr == nil {
-			runtime.Clear()
-			lease.Destroy()
-			owner.remove(cell)
+
+		runtime.Clear()
+		if !nilDependency(lifecycle) {
+			lifecycle.Destroy()
 		}
-		return revokeErr
+		lease.Destroy()
+		owner.remove(cell)
+
+		cell.mu.Lock()
+		cell.handle = nil
+		cell.revoking = false
+		close(revokeDone)
+		cell.mu.Unlock()
+		return nil
 	}
 }
 
@@ -647,7 +790,9 @@ func (cell *attemptSessionCell) destroy(handle *initialAttemptSessionHandle) {
 		}
 		cell.active = false
 		runtime, lease, owner := cell.runtime, cell.lease, cell.owner
+		lifecycle := cell.lifecycle
 		cell.runtime = discoverysource.BoundRuntime{}
+		cell.lifecycle = nil
 		cell.owner = nil
 		cell.transport = nil
 		cell.lease = nil
@@ -656,12 +801,25 @@ func (cell *attemptSessionCell) destroy(handle *initialAttemptSessionHandle) {
 		cell.digest = ""
 		cell.mu.Unlock()
 		runtime.Clear()
+		if lifecycle != nil {
+			lifecycle.Destroy()
+		}
 		if lease != nil {
 			lease.Destroy()
 		}
 		owner.remove(cell)
 		return
 	}
+}
+
+func (cell *attemptSessionCell) revokeRuntimeLifecycle(ctx context.Context) error {
+	cell.mu.Lock()
+	lifecycle := cell.lifecycle
+	cell.mu.Unlock()
+	if nilDependency(lifecycle) {
+		return nil
+	}
+	return lifecycle.Revoke(ctx)
 }
 
 func newRecoveryAttemptSessionHandle(
@@ -781,12 +939,47 @@ func newInitialRuntimeRequest(
 	return request
 }
 
+func newInitialRuntimeTuple(
+	request discoverycleanup.OpenAttemptRequest,
+	binding discoverysource.RuntimeBinding,
+) *InitialRuntimeTuple {
+	private := &initialRuntimeTupleState{
+		coordinates: request.Coordinates,
+		attempt:     request.Attempt,
+		binding:     binding,
+		active:      true,
+	}
+	tuple := &InitialRuntimeTuple{
+		seal:  initialRuntimeTupleSeal,
+		state: private,
+	}
+	tuple.self = tuple
+	private.issued = tuple
+	return tuple
+}
+
+func (tuple *InitialRuntimeTuple) destroy() {
+	private := tuple.private()
+	if private == nil {
+		return
+	}
+	private.mu.Lock()
+	if private.issued == tuple {
+		private.active = false
+		private.issued = nil
+		private.coordinates = discoveryqueue.RunCoordinates{}
+		private.attempt = discoveryqueue.CleanupAttempt{}
+		private.binding = discoverysource.RuntimeBinding{}
+	}
+	private.mu.Unlock()
+}
+
 func consumeSessionBoundRuntime(
 	request *InitialRuntimeRequest,
 	result *SessionBoundRuntime,
-) (discoverysource.BoundRuntime, error) {
+) (initialRuntimeOwnership, error) {
 	if request == nil || request.state == nil {
-		return discoverysource.BoundRuntime{}, ErrAttemptSessionAuthority
+		return initialRuntimeOwnership{}, ErrAttemptSessionAuthority
 	}
 	private := request.state
 	private.mu.Lock()
@@ -796,13 +989,17 @@ func consumeSessionBoundRuntime(
 		bound == nil || result == nil || result.state != bound ||
 		bound.issued != result || !bound.active ||
 		bound.request != private || bound.cell != private.cell ||
-		bound.runtime.Binding() != private.binding {
-		runtime := invalidateInitialRuntimeState(private)
-		return runtime, ErrAttemptSessionAuthority
+		bound.runtime.Binding() != private.binding ||
+		nilDependency(bound.lifecycle) {
+		ownership := invalidateInitialRuntimeState(private)
+		return ownership, ErrAttemptSessionAuthority
 	}
-	runtime := bound.runtime
+	ownership := initialRuntimeOwnership{
+		runtime: bound.runtime, lifecycle: bound.lifecycle,
+	}
 	bound.active = false
 	bound.runtime = discoverysource.BoundRuntime{}
+	bound.lifecycle = nil
 	bound.request = nil
 	bound.cell = nil
 	bound.issued = nil
@@ -811,14 +1008,14 @@ func consumeSessionBoundRuntime(
 	private.cell = nil
 	private.binding = discoverysource.RuntimeBinding{}
 	private.bound = nil
-	return runtime, nil
+	return ownership, nil
 }
 
 func invalidateInitialRuntimeRequest(
 	request *InitialRuntimeRequest,
-) discoverysource.BoundRuntime {
+) initialRuntimeOwnership {
 	if request == nil || request.state == nil {
-		return discoverysource.BoundRuntime{}
+		return initialRuntimeOwnership{}
 	}
 	private := request.state
 	private.mu.Lock()
@@ -828,15 +1025,17 @@ func invalidateInitialRuntimeRequest(
 
 func invalidateInitialRuntimeState(
 	private *initialRuntimeRequestState,
-) discoverysource.BoundRuntime {
+) initialRuntimeOwnership {
 	if private == nil {
-		return discoverysource.BoundRuntime{}
+		return initialRuntimeOwnership{}
 	}
-	var runtime discoverysource.BoundRuntime
+	var ownership initialRuntimeOwnership
 	if private.bound != nil {
-		runtime = private.bound.runtime
+		ownership.runtime = private.bound.runtime
+		ownership.lifecycle = private.bound.lifecycle
 		private.bound.active = false
 		private.bound.runtime = discoverysource.BoundRuntime{}
+		private.bound.lifecycle = nil
 		private.bound.request = nil
 		private.bound.cell = nil
 		private.bound.issued = nil
@@ -846,7 +1045,24 @@ func invalidateInitialRuntimeState(
 	private.cell = nil
 	private.binding = discoverysource.RuntimeBinding{}
 	private.bound = nil
-	return runtime
+	return ownership
+}
+
+func releaseInitialRuntime(
+	ctx context.Context,
+	ownership initialRuntimeOwnership,
+) {
+	if !nilDependency(ownership.lifecycle) {
+		revokeContext := ctx
+		if revokeContext == nil {
+			revokeContext = context.Background()
+		}
+		_ = ownership.lifecycle.Revoke(revokeContext)
+	}
+	ownership.runtime.Clear()
+	if !nilDependency(ownership.lifecycle) {
+		ownership.lifecycle.Destroy()
+	}
 }
 
 func (profile attemptProfileSnapshot) valid() bool {
@@ -1008,6 +1224,33 @@ func (InitialRuntimeRequest) LogValue() slog.Value {
 }
 func (InitialRuntimeRequest) Format(state fmt.State, _ rune) {
 	_, _ = io.WriteString(state, initialRuntimeRequestRedaction)
+}
+
+func (InitialRuntimeTuple) MarshalJSON() ([]byte, error) {
+	return nil, ErrSensitiveSerialization
+}
+func (*InitialRuntimeTuple) UnmarshalJSON([]byte) error {
+	return ErrSensitiveSerialization
+}
+func (InitialRuntimeTuple) MarshalText() ([]byte, error) {
+	return nil, ErrSensitiveSerialization
+}
+func (*InitialRuntimeTuple) UnmarshalText([]byte) error {
+	return ErrSensitiveSerialization
+}
+func (InitialRuntimeTuple) MarshalBinary() ([]byte, error) {
+	return nil, ErrSensitiveSerialization
+}
+func (*InitialRuntimeTuple) UnmarshalBinary([]byte) error {
+	return ErrSensitiveSerialization
+}
+func (InitialRuntimeTuple) String() string   { return initialRuntimeTupleRedaction }
+func (InitialRuntimeTuple) GoString() string { return initialRuntimeTupleRedaction }
+func (InitialRuntimeTuple) LogValue() slog.Value {
+	return slog.StringValue(initialRuntimeTupleRedaction)
+}
+func (InitialRuntimeTuple) Format(state fmt.State, _ rune) {
+	_, _ = io.WriteString(state, initialRuntimeTupleRedaction)
 }
 
 func (SessionBoundRuntime) MarshalJSON() ([]byte, error) {
