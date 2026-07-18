@@ -125,8 +125,8 @@ func TestAttemptSessionRecoveryRequiresExactOpenAndNeverRecreatesRuntime(t *test
 	if factoryA.openRuntimeCalls != 1 || factoryA.resolveClaimCalls != 1 {
 		t.Fatalf("worker A factory calls = open:%d resolve:%d", factoryA.openRuntimeCalls, factoryA.resolveClaimCalls)
 	}
-	if len(factoryA.serializationErrors) != 2 {
-		t.Fatalf("initial runtime serialization checks = %d, want 2", len(factoryA.serializationErrors))
+	if len(factoryA.serializationErrors) != 5 {
+		t.Fatalf("initial runtime serialization checks = %d, want 5", len(factoryA.serializationErrors))
 	}
 	for _, serializationErr := range factoryA.serializationErrors {
 		if !errors.Is(serializationErr, ErrSensitiveSerialization) {
@@ -273,6 +273,207 @@ func TestAttemptSessionSecretSerializationAndMissingDependenciesFailClosed(t *te
 	}
 }
 
+func TestInitialRuntimeCallbackIsSameCellOneUseAndOwnsLifecycle(t *testing.T) {
+	server := newAttemptSessionAuthorityServer(t)
+	request := attemptSessionOpenRequest()
+	binding := attemptSessionBinding(request)
+	factory := newAttemptSessionRuntimeFactory(t, binding)
+	transport := server.newTransport(t, "worker-initial-runtime")
+	t.Cleanup(transport.Destroy)
+	authority := mustAttemptSessionAuthority(t, transport, factory)
+	t.Cleanup(authority.Destroy)
+	proofAuthority := &attemptSessionProofAuthority{
+		key: []byte("task28b-proof-authority-key-0004"),
+	}
+	broker, err := discoverycleanup.NewCleanupBroker(authority, proofAuthority)
+	if err != nil {
+		t.Fatalf("NewCleanupBroker() error = %v", err)
+	}
+	t.Cleanup(broker.Destroy)
+
+	session, err := broker.OpenAttempt(t.Context(), request)
+	if err != nil {
+		t.Fatalf("OpenAttempt() error = %v", err)
+	}
+	if factory.initialCallbackCalls != 1 || factory.secondCallbackError == nil ||
+		!errors.Is(factory.secondCallbackError, ErrAttemptSessionAuthority) {
+		t.Fatalf(
+			"initial callback calls/error = %d/%v, want 1/rejected",
+			factory.initialCallbackCalls,
+			factory.secondCallbackError,
+		)
+	}
+	if !factory.copiedTupleRejected || !factory.reconstructedTupleRejected {
+		t.Fatalf(
+			"tuple copy/reconstruction rejection = %t/%t",
+			factory.copiedTupleRejected,
+			factory.reconstructedTupleRejected,
+		)
+	}
+	proof, err := broker.RevokeAttempt(t.Context(), request.Attempt.AttemptID)
+	if err != nil || proof.Status() != assetcatalog.CredentialCleanupRevoked {
+		proof.Destroy()
+		t.Fatalf("RevokeAttempt() = %#v,%v", proof, err)
+	}
+	proof.Destroy()
+	session.Destroy()
+
+	lifecycle := factory.lifecycle
+	if lifecycle == nil {
+		t.Fatal("initial runtime lifecycle was not installed")
+	}
+	lifecycle.mu.Lock()
+	revokeCalls, destroyCalls := lifecycle.revokeCalls, lifecycle.destroyCalls
+	lifecycle.mu.Unlock()
+	if revokeCalls != 1 || destroyCalls != 1 || !factory.material.cleared {
+		t.Fatalf(
+			"runtime lifecycle revoke/destroy/clear = %d/%d/%t, want 1/1/true",
+			revokeCalls,
+			destroyCalls,
+			factory.material.cleared,
+		)
+	}
+}
+
+func TestAttemptSessionTransportRevokeSucceedsBeforeLifecycleInstall(t *testing.T) {
+	server := newAttemptSessionAuthorityServer(t)
+	request := attemptSessionOpenRequest()
+	binding := attemptSessionBinding(request)
+	factory := newAttemptSessionRuntimeFactory(t, binding)
+	factory.openRuntimeErr = errors.New("runtime admission rejected")
+	transport := server.newTransport(t, "worker-runtime-admission-rejected")
+	t.Cleanup(transport.Destroy)
+	authority := mustAttemptSessionAuthority(t, transport, factory)
+	t.Cleanup(authority.Destroy)
+
+	handle, openErr := authority.OpenSession(t.Context(), request)
+	if handle == nil || !errors.Is(openErr, ErrAttemptSessionAuthority) {
+		t.Fatalf("OpenSession(runtime rejection) = %#v,%v", handle, openErr)
+	}
+	if err := handle.Revoke(t.Context()); err != nil {
+		handle.Destroy()
+		t.Fatalf("Revoke(runtime rejection) error = %v", err)
+	}
+	handle.Destroy()
+	if authority.state.lookup(request.Attempt.AttemptID) != nil {
+		t.Fatal("revoked runtime-rejection cell remained registered")
+	}
+	openCalls, revokeCalls := server.logicalCalls()
+	if openCalls != 1 || revokeCalls != 1 {
+		t.Fatalf(
+			"runtime-rejection authority calls = open:%d revoke:%d, want 1/1",
+			openCalls,
+			revokeCalls,
+		)
+	}
+}
+
+func TestAttemptSessionDestroyWaitsForRevocationLifecycleFinalizer(t *testing.T) {
+	server := newAttemptSessionAuthorityServer(t)
+	request := attemptSessionOpenRequest()
+	binding := attemptSessionBinding(request)
+	factory := newAttemptSessionRuntimeFactory(t, binding)
+	transport := server.newTransport(t, "worker-revoke-destroy-race")
+	t.Cleanup(transport.Destroy)
+	authority := mustAttemptSessionAuthority(t, transport, factory)
+	proofAuthority := &attemptSessionProofAuthority{
+		key: []byte("task28b-proof-authority-key-0005"),
+	}
+	broker, err := discoverycleanup.NewCleanupBroker(authority, proofAuthority)
+	if err != nil {
+		t.Fatalf("NewCleanupBroker() error = %v", err)
+	}
+	t.Cleanup(broker.Destroy)
+
+	session, err := broker.OpenAttempt(t.Context(), request)
+	if err != nil {
+		t.Fatalf("OpenAttempt() error = %v", err)
+	}
+	cell := authority.state.lookup(request.Attempt.AttemptID)
+	if cell == nil {
+		t.Fatal("attempt cell was not installed")
+	}
+	cell.mu.Lock()
+	handle := cell.handle
+	cell.mu.Unlock()
+	if handle == nil || factory.lifecycle == nil {
+		t.Fatal("attempt handle or runtime lifecycle was not installed")
+	}
+	factory.lifecycle.mu.Lock()
+	factory.lifecycle.destroyStarted = make(chan struct{})
+	factory.lifecycle.destroyRelease = make(chan struct{})
+	destroyStarted := factory.lifecycle.destroyStarted
+	destroyRelease := factory.lifecycle.destroyRelease
+	factory.lifecycle.mu.Unlock()
+
+	type revokeResult struct {
+		proof discoveryqueue.CleanupProof
+		err   error
+	}
+	revoked := make(chan revokeResult, 1)
+	go func() {
+		proof, revokeErr := broker.RevokeAttempt(
+			t.Context(),
+			request.Attempt.AttemptID,
+		)
+		revoked <- revokeResult{proof: proof, err: revokeErr}
+	}()
+	<-destroyStarted
+
+	handleDestroyDone := make(chan struct{})
+	go func() {
+		handle.Destroy()
+		close(handleDestroyDone)
+	}()
+	authorityDestroyDone := make(chan struct{})
+	go func() {
+		authority.Destroy()
+		close(authorityDestroyDone)
+	}()
+
+	handleReturnedBeforeFinalizer := false
+	select {
+	case <-handleDestroyDone:
+		handleReturnedBeforeFinalizer = true
+	case <-time.After(25 * time.Millisecond):
+	}
+	authorityReturnedBeforeFinalizer := false
+	select {
+	case <-authorityDestroyDone:
+		authorityReturnedBeforeFinalizer = true
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(destroyRelease)
+	result := <-revoked
+	<-handleDestroyDone
+	<-authorityDestroyDone
+	session.Destroy()
+	result.proof.Destroy()
+	if result.err != nil {
+		t.Fatalf("RevokeAttempt() error = %v", result.err)
+	}
+	if handleReturnedBeforeFinalizer || authorityReturnedBeforeFinalizer {
+		t.Fatalf(
+			"Destroy returned before lifecycle finalizer: handle=%t authority=%t",
+			handleReturnedBeforeFinalizer,
+			authorityReturnedBeforeFinalizer,
+		)
+	}
+	factory.lifecycle.mu.Lock()
+	revokeCalls := factory.lifecycle.revokeCalls
+	destroyCalls := factory.lifecycle.destroyCalls
+	factory.lifecycle.mu.Unlock()
+	if revokeCalls != 1 || destroyCalls != 1 || !factory.material.cleared {
+		t.Fatalf(
+			"runtime lifecycle revoke/destroy/clear = %d/%d/%t, want 1/1/true",
+			revokeCalls,
+			destroyCalls,
+			factory.material.cleared,
+		)
+	}
+}
+
 func mustAttemptSessionAuthority(
 	t *testing.T,
 	transport *discoverycleanup.SessionTransport,
@@ -386,7 +587,14 @@ type attemptSessionRuntimeFactory struct {
 	resolveClaimCalls               int
 	returnForeignBoundRuntime       bool
 	returnReconstructedBoundRuntime bool
+	openRuntimeErr                  error
 	serializationErrors             []error
+	initialCallbackCalls            int
+	secondCallbackError             error
+	copiedTupleRejected             bool
+	reconstructedTupleRejected      bool
+	lifecycle                       *attemptSessionRuntimeLifecycle
+	material                        *attemptSessionRuntimeMaterial
 }
 
 func newAttemptSessionRuntimeFactory(
@@ -411,34 +619,69 @@ func (factory *attemptSessionRuntimeFactory) ResolveRuntimeBinding(
 }
 
 func (factory *attemptSessionRuntimeFactory) OpenInitialRuntime(
-	_ context.Context,
+	ctx context.Context,
 	request *InitialRuntimeRequest,
 ) (*SessionBoundRuntime, error) {
 	factory.openRuntimeCalls++
 	if _, err := json.Marshal(request); err != nil {
 		factory.serializationErrors = append(factory.serializationErrors, err)
 	}
-	material := &attemptSessionRuntimeMaterial{}
-	bound, err := discoverysource.BindRuntime(
-		request.RuntimeBinding(), material,
-		func(*attemptSessionRuntimeMaterial) error { return nil },
-		func(value *attemptSessionRuntimeMaterial) { value.cleared = true },
-	)
+	if factory.openRuntimeErr != nil {
+		return nil, factory.openRuntimeErr
+	}
+	callback := func(
+		_ context.Context,
+		tuple *InitialRuntimeTuple,
+	) (
+		discoverysource.BoundRuntime,
+		InitialRuntimeLifecycle,
+		error,
+	) {
+		factory.initialCallbackCalls++
+		if tuple.Coordinates() != attemptSessionOpenRequest().Coordinates ||
+			tuple.Attempt() != attemptSessionOpenRequest().Attempt ||
+			tuple.RuntimeBinding() != factory.binding {
+			return discoverysource.BoundRuntime{}, nil, errors.New("initial tuple drift")
+		}
+		copied := *tuple
+		factory.copiedTupleRejected =
+			!copied.Coordinates().Valid() &&
+				!copied.Attempt().Valid() &&
+				copied.RuntimeBinding() == (discoverysource.RuntimeBinding{})
+		reconstructed := &InitialRuntimeTuple{}
+		factory.reconstructedTupleRejected =
+			!reconstructed.Coordinates().Valid() &&
+				!reconstructed.Attempt().Valid() &&
+				reconstructed.RuntimeBinding() == (discoverysource.RuntimeBinding{})
+		for _, candidate := range []any{tuple, copied, reconstructed} {
+			if _, err := json.Marshal(candidate); err != nil {
+				factory.serializationErrors = append(factory.serializationErrors, err)
+			}
+		}
+		material := &attemptSessionRuntimeMaterial{}
+		lifecycle := &attemptSessionRuntimeLifecycle{}
+		factory.material = material
+		factory.lifecycle = lifecycle
+		bound, err := discoverysource.BindRuntime(
+			factory.binding,
+			material,
+			func(*attemptSessionRuntimeMaterial) error { return nil },
+			func(value *attemptSessionRuntimeMaterial) { value.cleared = true },
+		)
+		if err != nil {
+			return discoverysource.BoundRuntime{}, nil, err
+		}
+		return bound, lifecycle, nil
+	}
+	result, err := request.ResolveRuntime(ctx, callback)
 	if err != nil {
 		return nil, err
+	}
+	if factory.initialCallbackCalls == 1 {
+		_, factory.secondCallbackError = request.ResolveRuntime(ctx, callback)
 	}
 	if factory.returnForeignBoundRuntime {
-		foreign := &InitialRuntimeRequest{}
-		result, bindErr := foreign.BindRuntime(bound)
-		if bindErr != nil {
-			bound.Clear()
-		}
-		return result, bindErr
-	}
-	result, err := request.BindRuntime(bound)
-	if err != nil {
-		bound.Clear()
-		return nil, err
+		return &SessionBoundRuntime{state: result.state}, nil
 	}
 	if _, marshalErr := json.Marshal(result); marshalErr != nil {
 		factory.serializationErrors = append(factory.serializationErrors, marshalErr)
@@ -474,6 +717,37 @@ func (factory *attemptSessionRuntimeFactory) ResolveClaimRuntime(
 
 type attemptSessionRuntimeMaterial struct {
 	cleared bool
+}
+
+type attemptSessionRuntimeLifecycle struct {
+	mu             sync.Mutex
+	revokeCalls    int
+	destroyCalls   int
+	destroyStarted chan struct{}
+	destroyRelease chan struct{}
+}
+
+func (lifecycle *attemptSessionRuntimeLifecycle) Revoke(context.Context) error {
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	lifecycle.revokeCalls++
+	return nil
+}
+
+func (lifecycle *attemptSessionRuntimeLifecycle) Destroy() {
+	lifecycle.mu.Lock()
+	lifecycle.destroyCalls++
+	started := lifecycle.destroyStarted
+	release := lifecycle.destroyRelease
+	lifecycle.destroyStarted = nil
+	lifecycle.destroyRelease = nil
+	lifecycle.mu.Unlock()
+	if started != nil {
+		close(started)
+	}
+	if release != nil {
+		<-release
+	}
 }
 
 type attemptSessionProvider struct {
