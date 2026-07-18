@@ -818,6 +818,159 @@ func TestSourceEffectiveActionsArePermissionAndStateAware(t *testing.T) {
 	}
 }
 
+func TestSourceEffectiveActionsConsumeExactValidationActionAdmission(t *testing.T) {
+	t.Parallel()
+
+	source, revision, profile := exactManagementCMDBSourceRevision(t)
+	revision.IntegrationID = ""
+	revision.CredentialReferenceID = ""
+	revision.TrustReferenceID = ""
+	revision.NetworkPolicyReferenceID = ""
+	expectedDefinitionDigest := revision.SourceDefinitionDigest
+	expectedBindingDigest := revision.CanonicalRevisionDigest
+	baseRepository := &recordingManagementRepository{scope: managementScope()}
+	profileRepository := &managementSourceProfileRepository{
+		recordingManagementRepository: baseRepository,
+		profiles: managementSourceProfileResolver{
+			ProfileCode("MANUAL_V1"): ManualProfileV1(),
+			profile.ProfileCode:      profile,
+		},
+	}
+	admittedRepository := &managementSourceValidationActionRepository{
+		managementSourceProfileRepository: profileRepository,
+		admit: func(_ context.Context, candidateSource Source, candidateRevision SourceRevision) error {
+			if candidateSource.Kind != SourceKindExternalCMDB ||
+				candidateSource.ProviderKind != "CMDB_CATALOG_V1" ||
+				candidateRevision.ProfileCode != ProfileCode("CMDB_CATALOG_V1") ||
+				candidateRevision.CanonicalProfileManifest != nil ||
+				candidateRevision.CanonicalProviderSchema != nil ||
+				candidateRevision.IntegrationID != "" ||
+				candidateRevision.CredentialReferenceID != "" ||
+				candidateRevision.TrustReferenceID != "" ||
+				candidateRevision.NetworkPolicyReferenceID != "" ||
+				candidateRevision.SourceDefinitionDigest != expectedDefinitionDigest ||
+				candidateRevision.CanonicalRevisionDigest != expectedBindingDigest {
+				return ErrUnavailable
+			}
+			switch candidateRevision.Status {
+			case SourceRevisionDraft, SourceRevisionRejected:
+				if candidateSource.Status == SourceStatusActive &&
+					candidateSource.GateStatus == SourceGateUnavailable {
+					return nil
+				}
+			case SourceRevisionValidated:
+				if candidateSource.Status == SourceStatusActive &&
+					candidateSource.GateStatus == SourceGateValidating &&
+					candidateSource.GateReasonCode == "VALIDATION_IN_PROGRESS" &&
+					candidateSource.ValidatedRunID == candidateRevision.ValidationRunID &&
+					candidateSource.ValidationDigest == "" &&
+					candidateSource.ValidatedBindingDigest == "" {
+					return nil
+				}
+			}
+			return ErrUnavailable
+		},
+	}
+	manager, err := NewManagement(
+		baseRepository, baseRepository, admittedRepository, managementAuthorizer(t),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin := managementPrincipal(authn.RoleAdmin)
+	draft := SourceReadModel{Source: source, LatestRevision: revision}
+	publishable := draft.Clone()
+	publishable.LatestRevision.Status = SourceRevisionValidated
+	publishable.LatestRevision.ValidationRunID = "99999999-9999-4999-8999-999999999999"
+	publishable.LatestRevision.ValidationDigest = strings.Repeat("b", 64)
+	publishable.Source.GateStatus = SourceGateValidating
+	publishable.Source.GateReasonCode = "VALIDATION_IN_PROGRESS"
+	publishable.Source.ValidatedRunID = publishable.LatestRevision.ValidationRunID
+
+	for _, test := range []struct {
+		name  string
+		model SourceReadModel
+		want  []EffectiveAction
+	}{
+		{
+			name:  "exact configured CMDB draft exposes validation",
+			model: draft,
+			want: []EffectiveAction{
+				ActionCreateSourceRevision, ActionDisableSource, ActionValidateSourceRevision,
+			},
+		},
+		{
+			name:  "exact configured CMDB validated revision exposes publication",
+			model: publishable,
+			want: []EffectiveAction{
+				ActionCreateSourceRevision, ActionDisableSource, ActionPublishSourceRevision,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := manager.sourceActions(t.Context(), admin, test.model)
+			if !slices.Equal(got, test.want) {
+				t.Fatalf("sourceActions() = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+
+	closedAdmissionRepository := &managementSourceValidationActionRepository{
+		managementSourceProfileRepository: profileRepository,
+		admit: func(context.Context, Source, SourceRevision) error {
+			return ErrUnavailable
+		},
+	}
+	closedAdmissionManager, err := NewManagement(
+		baseRepository, baseRepository, closedAdmissionRepository, managementAuthorizer(t),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingAdmissionManager, err := NewManagement(
+		baseRepository, baseRepository, profileRepository, managementAuthorizer(t),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drifted := draft.Clone()
+	drifted.LatestRevision.CanonicalRevisionDigest = strings.Repeat("f", 64)
+	degraded := draft.Clone()
+	degraded.Source.GateStatus = SourceGateDegraded
+	suspended := draft.Clone()
+	suspended.Source.GateStatus = SourceGateSuspended
+
+	for _, test := range []struct {
+		name    string
+		manager *Management
+		model   SourceReadModel
+	}{
+		{name: "registry only stays closed", manager: missingAdmissionManager, model: draft},
+		{name: "missing runtime admission stays closed", manager: closedAdmissionManager, model: draft},
+		{name: "binding drift stays closed", manager: manager, model: drifted},
+		{name: "degraded gate stays closed", manager: manager, model: degraded},
+		{name: "suspended gate stays closed", manager: manager, model: suspended},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			actions := test.manager.sourceActions(t.Context(), admin, test.model)
+			if slices.Contains(actions, ActionValidateSourceRevision) ||
+				slices.Contains(actions, ActionPublishSourceRevision) ||
+				slices.Contains(actions, ActionSyncSource) {
+				t.Fatalf("sourceActions() exposed closed runtime action: %#v", actions)
+			}
+		})
+	}
+
+	manualSource, manualRevision := exactManagementManualSourceRevision(t)
+	manualActions := missingAdmissionManager.sourceActions(
+		t.Context(), admin,
+		SourceReadModel{Source: manualSource, LatestRevision: manualRevision},
+	)
+	if !slices.Contains(manualActions, ActionValidateSourceRevision) {
+		t.Fatalf("MANUAL_V1 validation action regressed: %#v", manualActions)
+	}
+}
+
 func TestSourcePublishAndDisableRequireRecentAuthenticationBeforeRepositoryMutation(t *testing.T) {
 	t.Parallel()
 	repository := &recordingManagementRepository{
@@ -1113,6 +1266,95 @@ func exactManagementClosedValidationSourceRevision(
 	return source, revision, profile
 }
 
+func exactManagementCMDBSourceRevision(
+	t *testing.T,
+) (Source, SourceRevision, BuiltinSourceProfile) {
+	t.Helper()
+
+	const manifest = `{"backpressure_base_seconds":1,"backpressure_max_seconds":60,"compatibility_class":"CMDB_CATALOG_V1","credential_purpose":"DISCOVERY_READ","dlp_policy_code":"ASSET_SAFE_V1","environment_mapping_mode":"SINGLE_ENVIRONMENT","freshness_kind":"OBJECT_TIME_SEQUENCE","integration_mode":"REQUIRED","max_document_bytes":65536,"max_page_bytes":4194304,"max_page_items":500,"max_page_relations":2000,"network_mode":"REQUIRED","parser_code":"CMDB_CATALOG_V1","profile_code":"CMDB_CATALOG_V1","provider_kind":"CMDB_CATALOG_V1","rate_limit_requests":5,"rate_limit_window_seconds":1,"relationship_types":["CONTAINS","DELIVERED_BY","DEPENDS_ON","LOGS_TO","MANAGED_BY","MONITORED_BY","PRIMARY_RUNTIME_FOR","RUNS_ON","TRACES_TO"],"schedule_mode":"NONE","source_kind":"EXTERNAL_CMDB","sync_mode":"ON_DEMAND","trust_mode":"REQUIRED","trusted_path_codes":["CMDB_V1_DISPLAY_NAME","CMDB_V1_ENVIRONMENT_ID","CMDB_V1_EXTERNAL_ID","CMDB_V1_KIND","CMDB_V1_PROVIDER_KIND","CMDB_V1_RELATION","CMDB_V1_TYPE_DETAILS"],"typed_extension_code":null,"version":"asset-source-profile-manifest.v1"}`
+	const schema = `{"additionalProperties":false,"properties":{},"type":"object"}`
+
+	source, revision, _ := exactManagementClosedValidationSourceRevision(
+		t, ProfileCode("CMDB_CATALOG_V1"),
+	)
+	source.Kind = SourceKindExternalCMDB
+	source.ProviderKind = "CMDB_CATALOG_V1"
+	revision.SyncMode = SyncModeOnDemand
+	revision.CanonicalProfileManifest = []byte(manifest)
+	revision.CanonicalProviderSchema = []byte(schema)
+	revision.IntegrationID = "44444444-4444-4444-8444-444444444444"
+	revision.CredentialReferenceID = "55555555-5555-4555-8555-555555555556"
+	revision.TrustReferenceID = "66666666-6666-4666-8666-666666666667"
+	revision.NetworkPolicyReferenceID = "77777777-7777-4777-8777-777777777778"
+	revision.RateLimitRequests = 5
+	revision.RateLimitWindowSeconds = 1
+	revision.BackpressureBaseSeconds = 1
+	revision.BackpressureMaxSeconds = 60
+	revision.ScheduleExpression = ""
+	revision.TypedExtensionCode = ""
+	revision.PreparedExtensionDigest = ""
+	var err error
+	revision.ProfileManifestSHA256, err = ProfileManifestDigest(revision.CanonicalProfileManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision.CanonicalProviderSchemaSHA256 = testSHA256Hex(revision.CanonicalProviderSchema)
+	revision.SourceDefinitionDigest, err = SourceDefinitionDigest(source, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision.CanonicalRevisionDigest = revision.BindingDigest()
+	profile := BuiltinSourceProfile{
+		SourceKind: SourceKindExternalCMDB, ProviderKind: "CMDB_CATALOG_V1",
+		ProfileCode: ProfileCode("CMDB_CATALOG_V1"), SyncMode: SyncModeOnDemand,
+		FreshnessKind: FreshnessObjectTimeSequence, EnvironmentMapping: EnvironmentMappingSingle,
+		IntegrationMode: "REQUIRED", CredentialPurpose: "DISCOVERY_READ",
+		TrustMode: "REQUIRED", NetworkMode: "REQUIRED", ScheduleMode: "NONE",
+		ParserCode: "CMDB_CATALOG_V1", CompatibilityClass: "CMDB_CATALOG_V1",
+		DLPPolicyCode: "ASSET_SAFE_V1", MaxPageItems: 500, MaxPageRelations: 2_000,
+		MaxPageBytes: 4 << 20, MaxDocumentBytes: 64 << 10,
+		TrustedPathCodes: []string{
+			"CMDB_V1_DISPLAY_NAME", "CMDB_V1_ENVIRONMENT_ID", "CMDB_V1_EXTERNAL_ID",
+			"CMDB_V1_KIND", "CMDB_V1_PROVIDER_KIND", "CMDB_V1_RELATION",
+			"CMDB_V1_TYPE_DETAILS",
+		},
+		RelationshipTypes: []RelationshipType{
+			RelationshipContains, RelationshipDeliveredBy, RelationshipDependsOn,
+			RelationshipLogsTo, RelationshipManagedBy, RelationshipMonitoredBy,
+			RelationshipPrimaryRuntimeFor, RelationshipRunsOn, RelationshipTracesTo,
+		},
+		CanonicalProfileManifest:      []byte(manifest),
+		CanonicalProviderSchema:       []byte(schema),
+		ProfileManifestSHA256:         revision.ProfileManifestSHA256,
+		CanonicalProviderSchemaSHA256: revision.CanonicalProviderSchemaSHA256,
+		IntegrationID:                 revision.IntegrationID,
+		CredentialReferenceID:         revision.CredentialReferenceID,
+		TrustReferenceID:              revision.TrustReferenceID,
+		NetworkPolicyReferenceID:      revision.NetworkPolicyReferenceID,
+		RateLimitRequests:             revision.RateLimitRequests,
+		RateLimitWindowSeconds:        revision.RateLimitWindowSeconds,
+		BackpressureBaseSeconds:       revision.BackpressureBaseSeconds,
+		BackpressureMaxSeconds:        revision.BackpressureMaxSeconds,
+	}
+	registry, err := NewSourceProfileRegistry(SourceProfileRegistration{
+		Selector: SourceProfileID("external-cmdb-catalog-v1"),
+		Profile:  profile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err = registry.Resolve(SourceProfileID("external-cmdb-catalog-v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision.CanonicalProfileManifest = nil
+	revision.CanonicalProviderSchema = nil
+	if !exactInstalledRevisionProfile(source, revision, profile) {
+		t.Fatal("exact CMDB management fixture is not an installed-profile match")
+	}
+	return source, revision, profile
+}
+
 type managementSourceProfileResolver map[ProfileCode]BuiltinSourceProfile
 
 func (resolver managementSourceProfileResolver) ResolveProfileAdmission(
@@ -1124,6 +1366,34 @@ func (resolver managementSourceProfileResolver) ResolveProfileAdmission(
 		return BuiltinSourceProfile{}, ErrNotFound
 	}
 	return profile.Clone(), nil
+}
+
+type managementSourceProfileRepository struct {
+	*recordingManagementRepository
+	profiles managementSourceProfileResolver
+}
+
+func (repository *managementSourceProfileRepository) ResolveProfileAdmission(
+	ctx context.Context,
+	code ProfileCode,
+) (BuiltinSourceProfile, error) {
+	return repository.profiles.ResolveProfileAdmission(ctx, code)
+}
+
+type managementSourceValidationActionRepository struct {
+	*managementSourceProfileRepository
+	admit func(context.Context, Source, SourceRevision) error
+}
+
+func (repository *managementSourceValidationActionRepository) AdmitSourceValidationAction(
+	ctx context.Context,
+	source Source,
+	revision SourceRevision,
+) error {
+	if repository == nil || repository.admit == nil {
+		return ErrUnavailable
+	}
+	return repository.admit(ctx, source.Clone(), revision.Clone())
 }
 
 func validManagementCreateAssetInput() CreateAssetInput {

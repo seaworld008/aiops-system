@@ -160,6 +160,12 @@ type SourceActionAdmission struct {
 	CanImport   bool
 }
 
+// SourceValidationActionAdmissionResolver decides whether the same locked
+// Source/Revision facts may enter the validation or publication mutation path.
+type SourceValidationActionAdmissionResolver interface {
+	AdmitSourceValidationAction(context.Context, Source, SourceRevision) error
+}
+
 type SourceRevisionMutationView struct {
 	Source           Source
 	Revision         SourceRevision
@@ -298,11 +304,12 @@ type BindingManager interface {
 }
 
 type Management struct {
-	assets     Repository
-	mappings   MappingRepository
-	sources    SourceManagementRepository
-	profiles   SourceProfileAdmissionResolver
-	authorizer *authz.Authorizer
+	assets            Repository
+	mappings          MappingRepository
+	sources           SourceManagementRepository
+	profiles          SourceProfileAdmissionResolver
+	validationActions SourceValidationActionAdmissionResolver
+	authorizer        *authz.Authorizer
 }
 
 func NewManagement(
@@ -320,9 +327,14 @@ func NewManagement(
 		!nilManagementDependency(installed) {
 		profiles = installed
 	}
+	var validationActions SourceValidationActionAdmissionResolver
+	if installed, ok := any(sources).(SourceValidationActionAdmissionResolver); ok &&
+		!nilManagementDependency(installed) {
+		validationActions = installed
+	}
 	return &Management{
 		assets: assets, mappings: mappings, sources: sources,
-		profiles: profiles, authorizer: authorizer,
+		profiles: profiles, validationActions: validationActions, authorizer: authorizer,
 	}, nil
 }
 
@@ -1412,17 +1424,24 @@ func (management *Management) sourceActionAdmission(
 		return SourceActionAdmission{}
 	}
 	latestProfile, err := management.profiles.ResolveProfileAdmission(ctx, revision.ProfileCode)
-	if err != nil || !exactInstalledRevisionProfile(source, revision, latestProfile) {
+	latestProfileInstalled := err == nil &&
+		exactInstalledRevisionProfile(source, revision, latestProfile)
+	manualValidationRuntimeAvailable := latestProfileInstalled &&
+		latestProfile.ProfileCode == ProfileCode("MANUAL_V1")
+	if !latestProfileInstalled {
 		latestProfile = BuiltinSourceProfile{}
 	}
 	publishedProfile, published := management.installedPublishedProfile(ctx, model)
+	validationRuntimeAvailable := management.sourceValidationActionRuntimeAvailable(
+		ctx, source, revision, manualValidationRuntimeAvailable,
+	)
 	admission := SourceActionAdmission{
-		CanValidate: sourceValidationRuntimeAvailable(latestProfile.ProfileCode) &&
+		CanValidate: validationRuntimeAvailable &&
 			source.Status == SourceStatusActive &&
 			source.GateStatus != SourceGateDegraded &&
 			source.GateStatus != SourceGateSuspended &&
 			(revision.Status == SourceRevisionDraft || revision.Status == SourceRevisionRejected),
-		CanPublish: sourcePublicationRuntimeAvailable(latestProfile.ProfileCode) &&
+		CanPublish: validationRuntimeAvailable &&
 			source.Status == SourceStatusActive &&
 			source.GateStatus == SourceGateValidating &&
 			source.GateReasonCode == "VALIDATION_IN_PROGRESS" &&
@@ -1443,22 +1462,18 @@ func (management *Management) sourceActionAdmission(
 	return admission
 }
 
-func sourceValidationRuntimeAvailable(profileCode ProfileCode) bool {
-	switch profileCode {
-	case ProfileCode("MANUAL_V1"):
-		return true
-	default:
-		return false
+func (management *Management) sourceValidationActionRuntimeAvailable(
+	ctx context.Context,
+	source Source,
+	revision SourceRevision,
+	manualFallback bool,
+) bool {
+	if management == nil || nilManagementDependency(management.validationActions) {
+		return manualFallback
 	}
-}
-
-func sourcePublicationRuntimeAvailable(profileCode ProfileCode) bool {
-	switch profileCode {
-	case ProfileCode("MANUAL_V1"):
-		return true
-	default:
-		return false
-	}
+	return management.validationActions.AdmitSourceValidationAction(
+		ctx, source.Clone(), revision.Clone(),
+	) == nil
 }
 
 func (management *Management) installedPublishedProfile(

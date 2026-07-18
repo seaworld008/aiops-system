@@ -19,6 +19,7 @@ import (
 
 var _ assetcatalog.SourceRevisionRepository = (*Repository)(nil)
 var _ assetcatalog.SourceProfileAdmissionResolver = (*Repository)(nil)
+var _ assetcatalog.SourceValidationActionAdmissionResolver = (*Repository)(nil)
 
 func TestRepositoryConsumesInjectedProfileRegistryForCreationAndAdmission(t *testing.T) {
 	if _, err := NewWithSourceProfileRegistry(
@@ -588,6 +589,143 @@ func TestRepositoryValidationAdmissionKeepsUnknownAndDriftedProfilesClosed(t *te
 	); !errors.Is(err, assetcatalog.ErrUnavailable) {
 		t.Fatalf("drifted admitSourceValidationRequest() error = %v", err)
 	}
+}
+
+func TestRepositorySourceValidationActionAdmissionReusesExactInstalledRuntime(t *testing.T) {
+	registry, admission := exactCMDBValidationAdmissionForRepositoryTest(t)
+	repository, err := NewWithSourceProfileRegistry(
+		&pgxpool.Pool{},
+		nil,
+		func() string { return "70000000-0000-4000-8000-000000000001" },
+		registry,
+		admission,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, revision := exactCMDBSourceRevisionForRepositoryTest(t, registry)
+	if err := repository.AdmitSourceValidationAction(
+		t.Context(), source, revision,
+	); err != nil {
+		t.Fatalf("AdmitSourceValidationAction(full CMDB draft) error = %v", err)
+	}
+	revision = sourceValidationActionProjectionForRepositoryTest(revision)
+	if err := repository.AdmitSourceValidationAction(
+		t.Context(), source, revision,
+	); err != nil {
+		t.Fatalf("AdmitSourceValidationAction(exact CMDB draft) error = %v", err)
+	}
+	setRepositoryTestRevisionValidated(&source, &revision)
+	if err := repository.AdmitSourceValidationAction(
+		t.Context(), source, revision,
+	); err != nil {
+		t.Fatalf("AdmitSourceValidationAction(exact CMDB publishable) error = %v", err)
+	}
+
+	closedRepository, err := NewWithSourceProfileRegistry(
+		&pgxpool.Pool{},
+		nil,
+		func() string { return "70000000-0000-4000-8000-000000000002" },
+		registry,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closedRepository.AdmitSourceValidationAction(
+		t.Context(), source, revision,
+	); !errors.Is(err, assetcatalog.ErrUnavailable) {
+		t.Fatalf("registry-only action admission error = %v", err)
+	}
+
+	drifted := revision.Clone()
+	drifted.CanonicalRevisionDigest = strings.Repeat("f", 64)
+	if err := repository.AdmitSourceValidationAction(
+		t.Context(), source, drifted,
+	); !errors.Is(err, assetcatalog.ErrUnavailable) {
+		t.Fatalf("drifted action admission error = %v", err)
+	}
+	referenceDrifted := revision.Clone()
+	referenceDrifted.CredentialReferenceID = "changed-credential-reference"
+	if err := repository.AdmitSourceValidationAction(
+		t.Context(), source, referenceDrifted,
+	); !errors.Is(err, assetcatalog.ErrUnavailable) {
+		t.Fatalf("caller reference drift action admission error = %v", err)
+	}
+
+	cmdbProfile, err := registry.Resolve(sourceprofile.ExternalCMDBProfileSelector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csvProfile, err := assetcatalog.CSVProfileV1("csv-signature-reference-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	combinedRegistry, err := assetcatalog.NewSourceProfileRegistry(
+		assetcatalog.SourceProfileRegistration{
+			Selector: sourceprofile.ExternalCMDBProfileSelector,
+			Profile:  cmdbProfile,
+		},
+		assetcatalog.SourceProfileRegistration{
+			Selector: assetcatalog.SourceProfileIDCSVRFC4180V1,
+			Profile:  csvProfile,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combinedRepository, err := NewWithSourceProfileRegistry(
+		&pgxpool.Pool{},
+		nil,
+		func() string { return "70000000-0000-4000-8000-000000000004" },
+		combinedRegistry,
+		admission,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csvSource, csvRevision := exactSourceRevisionForRepositoryTest(t, csvProfile)
+	csvRevision = sourceValidationActionProjectionForRepositoryTest(csvRevision)
+	if err := combinedRepository.AdmitSourceValidationAction(
+		t.Context(), csvSource, csvRevision,
+	); !errors.Is(err, assetcatalog.ErrUnavailable) {
+		t.Fatalf("CSV action admission error = %v", err)
+	}
+	unknownRevision := csvRevision.Clone()
+	unknownRevision.ProfileCode = "UNKNOWN_V1"
+	if err := combinedRepository.AdmitSourceValidationAction(
+		t.Context(), csvSource, unknownRevision,
+	); !errors.Is(err, assetcatalog.ErrUnavailable) {
+		t.Fatalf("unknown action admission error = %v", err)
+	}
+
+	manualRepository, err := New(
+		&pgxpool.Pool{},
+		nil,
+		func() string { return "70000000-0000-4000-8000-000000000003" },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manualSource, manualRevision := exactManualSourceRevisionForRepositoryTest(t)
+	manualRevision = sourceValidationActionProjectionForRepositoryTest(manualRevision)
+	if err := manualRepository.AdmitSourceValidationAction(
+		t.Context(), manualSource, manualRevision,
+	); err != nil {
+		t.Fatalf("AdmitSourceValidationAction(MANUAL_V1) error = %v", err)
+	}
+}
+
+func sourceValidationActionProjectionForRepositoryTest(
+	revision assetcatalog.SourceRevision,
+) assetcatalog.SourceRevision {
+	revision = revision.Clone()
+	revision.CanonicalProfileManifest = nil
+	revision.CanonicalProviderSchema = nil
+	revision.IntegrationID = ""
+	revision.CredentialReferenceID = ""
+	revision.TrustReferenceID = ""
+	revision.NetworkPolicyReferenceID = ""
+	return revision
 }
 
 func TestRepositoryPublishClosedDiscriminatesManualAndExactCMDB(t *testing.T) {

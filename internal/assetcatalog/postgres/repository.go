@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	cryptorand "crypto/rand"
 	"errors"
@@ -154,6 +155,59 @@ func (repository *Repository) ResolveProfileAdmission(
 		return assetcatalog.BuiltinSourceProfile{}, assetcatalog.ErrUnavailable
 	}
 	return repository.profiles.ResolveProfileAdmission(ctx, code)
+}
+
+func (repository *Repository) AdmitSourceValidationAction(
+	ctx context.Context,
+	source assetcatalog.Source,
+	revision assetcatalog.SourceRevision,
+) error {
+	if repository == nil || ctx == nil {
+		return assetcatalog.ErrUnavailable
+	}
+	profile, err := repository.ResolveProfileAdmission(ctx, revision.ProfileCode)
+	if err != nil {
+		return assetcatalog.ErrUnavailable
+	}
+	revision, ok := sourceValidationActionRevision(revision, profile)
+	if !ok {
+		return assetcatalog.ErrUnavailable
+	}
+	_, err = repository.admitSourceValidationRequest(
+		ctx, source.Clone(), revision.Clone(),
+	)
+	return err
+}
+
+// sourceValidationActionRevision restores only the server-installed fields
+// deliberately omitted from Source read projections. Any non-empty caller
+// value must already equal the installed profile before the exact mutation
+// admission is reused.
+func sourceValidationActionRevision(
+	revision assetcatalog.SourceRevision,
+	profile assetcatalog.BuiltinSourceProfile,
+) (assetcatalog.SourceRevision, bool) {
+	if revision.CanonicalProfileManifest != nil &&
+		!bytes.Equal(revision.CanonicalProfileManifest, profile.CanonicalProfileManifest) ||
+		revision.CanonicalProviderSchema != nil &&
+			!bytes.Equal(revision.CanonicalProviderSchema, profile.CanonicalProviderSchema) ||
+		revision.IntegrationID != "" && revision.IntegrationID != profile.IntegrationID ||
+		revision.CredentialReferenceID != "" &&
+			revision.CredentialReferenceID != profile.CredentialReferenceID ||
+		revision.TrustReferenceID != "" &&
+			revision.TrustReferenceID != profile.TrustReferenceID ||
+		revision.NetworkPolicyReferenceID != "" &&
+			revision.NetworkPolicyReferenceID != profile.NetworkPolicyReferenceID {
+		return assetcatalog.SourceRevision{}, false
+	}
+	revision = revision.Clone()
+	revision.CanonicalProfileManifest = bytes.Clone(profile.CanonicalProfileManifest)
+	revision.CanonicalProviderSchema = bytes.Clone(profile.CanonicalProviderSchema)
+	revision.IntegrationID = profile.IntegrationID
+	revision.CredentialReferenceID = profile.CredentialReferenceID
+	revision.TrustReferenceID = profile.TrustReferenceID
+	revision.NetworkPolicyReferenceID = profile.NetworkPolicyReferenceID
+	return revision, true
 }
 
 func (repository *Repository) withSerializable(
