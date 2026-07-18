@@ -46,7 +46,12 @@ func TestAssetCatalogMigrationFinalOperationalContract(t *testing.T) {
 			runColumns = append(runColumns, qualificationFixtureRunColumns...)
 		}
 		finalRequireColumns(t, harness.db, "asset_source_runs", runColumns)
-		finalForbidColumns(t, harness.db, "asset_source_runs", []string{"definition_revision"})
+		finalForbidColumns(t, harness.db, "asset_source_runs", []string{
+			"definition_revision",
+			"qualification_descriptor_digest",
+			"qualification_prior_receipt_digests_sha256",
+			"qualification_issued_at",
+		})
 
 		runKinds := []string{
 			"VALIDATION", "DISCOVERY", "CSV_IMPORT", "API_INGESTION", "MANUAL_MUTATION",
@@ -92,6 +97,16 @@ func TestAssetCatalogMigrationFinalOperationalContract(t *testing.T) {
 			"work_result_digest", "work_result_recorded_at", "validation_proof_digest",
 		})
 		if qualificationSchema == qualificationFixtureSchemaFull {
+			for index, column := range qualificationFixtureRunColumns {
+				finalRequireColumnShape(
+					t,
+					harness.db,
+					"asset_source_runs",
+					column,
+					qualificationFixtureRunColumnTypes[index],
+					true,
+				)
+			}
 			finalRequireExactVocabulary(
 				t,
 				harness.db,
@@ -298,6 +313,41 @@ func TestAssetCatalogMigrationFinalOperationalContract(t *testing.T) {
 		finalRequirePattern(t, triggerBody, `(?i)status\s*=\s*'SUCCEEDED'`,
 			"success pointer guard must accept only SUCCEEDED runs")
 		if qualificationSchema == qualificationFixtureSchemaFull {
+			for index, column := range qualificationFixtureSourceColumns {
+				finalRequireColumnShape(
+					t,
+					harness.db,
+					"asset_sources",
+					column,
+					qualificationFixtureSourceColumnTypes[index],
+					true,
+				)
+			}
+			finalRequireConstraintColumns(
+				t,
+				harness.db,
+				"asset_sources_gate_evidence_run_fk",
+				qualificationFixtureGateForeignKeyColumns,
+			)
+			finalRequireForeignKey(
+				t,
+				harness.db,
+				"asset_sources_gate_evidence_run_fk",
+				"asset_source_runs",
+				qualificationFixtureGateForeignKeyReferences,
+			)
+			finalRequireDeferredConstraint(
+				t,
+				harness.db,
+				"asset_sources_gate_evidence_run_fk",
+				"f",
+			)
+			finalRequireDeferredConstraintTrigger(
+				t,
+				harness.db,
+				"asset_sources",
+				"asset_sources_gate_evidence_closure_guard",
+			)
 			finalRequireExplicitDataRunKindAllowlist(t, triggerBody)
 			finalRequireTableCheckTokens(
 				t,
@@ -416,6 +466,114 @@ func finalRequireNullable(t *testing.T, database *pgxpool.Pool, table, column st
 	}
 	if nullable != "YES" {
 		t.Errorf("%s.%s must be nullable for tombstones, got is_nullable=%s", table, column, nullable)
+	}
+}
+
+func finalRequireColumnShape(
+	t *testing.T,
+	database *pgxpool.Pool,
+	table string,
+	column string,
+	expectedDataType string,
+	expectedNullable bool,
+) {
+	t.Helper()
+	var dataType, nullable string
+	if err := database.QueryRow(context.Background(), `
+		SELECT data_type,is_nullable
+		FROM information_schema.columns
+		WHERE table_schema='public' AND table_name=$1 AND column_name=$2
+	`, table, column).Scan(&dataType, &nullable); err != nil {
+		t.Fatalf("read exact column shape for %s.%s: %v", table, column, err)
+	}
+	wantNullable := "NO"
+	if expectedNullable {
+		wantNullable = "YES"
+	}
+	if dataType != expectedDataType || nullable != wantNullable {
+		t.Errorf(
+			"%s.%s shape=(%s,%s), want exactly (%s,%s)",
+			table,
+			column,
+			dataType,
+			nullable,
+			expectedDataType,
+			wantNullable,
+		)
+	}
+}
+
+func finalRequireDeferredConstraint(
+	t *testing.T,
+	database *pgxpool.Pool,
+	constraint string,
+	constraintType string,
+) {
+	t.Helper()
+	var deferrable, initiallyDeferred, validated, enforced bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT c.condeferrable,c.condeferred,c.convalidated,c.conenforced
+		FROM pg_constraint AS c
+		JOIN pg_namespace AS n ON n.oid=c.connamespace
+		WHERE n.nspname='public' AND c.conname=$1 AND c.contype::text=$2
+	`, constraint, constraintType).Scan(
+		&deferrable,
+		&initiallyDeferred,
+		&validated,
+		&enforced,
+	); err != nil {
+		t.Fatalf("read deferred constraint %s: %v", constraint, err)
+	}
+	if !deferrable || !initiallyDeferred || !validated || !enforced {
+		t.Errorf(
+			"constraint %s deferred/validated/enforced=(%v,%v,%v,%v), want all true",
+			constraint,
+			deferrable,
+			initiallyDeferred,
+			validated,
+			enforced,
+		)
+	}
+}
+
+func finalRequireDeferredConstraintTrigger(
+	t *testing.T,
+	database *pgxpool.Pool,
+	table string,
+	trigger string,
+) {
+	t.Helper()
+	var deferrable, initiallyDeferred, enabled, validated, enforced bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT trigger_record.tgdeferrable,trigger_record.tginitdeferred,
+			trigger_record.tgenabled='O',
+			constraint_record.convalidated,constraint_record.conenforced
+		FROM pg_trigger AS trigger_record
+		JOIN pg_class AS relation ON relation.oid=trigger_record.tgrelid
+		JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+		JOIN pg_constraint AS constraint_record
+		  ON constraint_record.oid=trigger_record.tgconstraint
+		WHERE namespace.nspname='public' AND relation.relname=$1
+		  AND trigger_record.tgname=$2 AND trigger_record.tgconstraint<>0
+	`, table, trigger).Scan(
+		&deferrable,
+		&initiallyDeferred,
+		&enabled,
+		&validated,
+		&enforced,
+	); err != nil {
+		t.Fatalf("read deferred constraint trigger %s: %v", trigger, err)
+	}
+	if !deferrable || !initiallyDeferred || !enabled || !validated || !enforced {
+		t.Errorf(
+			"trigger %s deferred/enabled/validated/enforced=(%v,%v,%v,%v,%v), want all true",
+			trigger,
+			deferrable,
+			initiallyDeferred,
+			enabled,
+			validated,
+			enforced,
+		)
 	}
 }
 

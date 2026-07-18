@@ -320,15 +320,23 @@ func verifyQualificationRecoveryReadiness(
 			canary.work_result_status='SUCCEEDED' AND
 			ha.work_result_digest=ha.qualification_result_digest AND
 			canary.work_result_digest=canary.qualification_result_digest AND
+			ha.qualification_receipt_issued_at>ha.work_result_recorded_at AND
+			canary.qualification_receipt_issued_at>canary.work_result_recorded_at AND
+			ha.qualification_receipt_expires_at>ha.qualification_receipt_issued_at AND
+			canary.qualification_receipt_expires_at>
+				canary.qualification_receipt_issued_at AND
+			position('=' IN ha.qualification_signature)=0 AND
+			position('=' IN canary.qualification_signature)=0 AND
 			ha.qualification_evidence_kind='TWO_WORKER_HA' AND
 			canary.qualification_evidence_kind='PROVIDER_CANARY' AND
 			ha.qualification_scope_digest=canary.qualification_scope_digest AND
 			ha.qualification_binding_digest=canary.qualification_binding_digest AND
-			ha.qualification_descriptor_digest=canary.qualification_descriptor_digest AND
+			ha.qualification_profile_descriptor_digest=
+				canary.qualification_profile_descriptor_digest AND
 			ha.qualification_runtime_manifest_digest=
 				canary.qualification_runtime_manifest_digest AND
 			ha.qualification_lab_binding_digest=canary.qualification_lab_binding_digest AND
-			canary.qualification_prior_receipt_digests_sha256=$2 AND
+			canary.qualification_prior_receipts_digest=$2 AND
 			ha.qualification_receipt_digest=$3 AND
 			num_nonnulls(
 				ha.cursor_before_sha256,ha.cursor_after_sha256,
@@ -783,7 +791,9 @@ func verifyCatalogForeignKeyClosure(
 
 	var foreignKeys, invalidForeignKeys int64
 	if err := database.QueryRow(context.Background(), `
-		SELECT count(*), count(*) FILTER (WHERE NOT constraint_record.convalidated)
+		SELECT count(*), count(*) FILTER (
+			WHERE NOT constraint_record.convalidated OR NOT constraint_record.conenforced
+		)
 		FROM pg_catalog.pg_constraint AS constraint_record
 		JOIN pg_catalog.pg_class AS relation ON relation.oid=constraint_record.conrelid
 		JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid=relation.relnamespace
