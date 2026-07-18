@@ -2,15 +2,19 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/seaworld008/aiops-system/internal/assetcatalog"
+	"github.com/seaworld008/aiops-system/internal/sourceprofile"
 )
 
 var _ assetcatalog.SourceRevisionRepository = (*Repository)(nil)
@@ -508,23 +512,223 @@ func TestRequestSyncSourceKindRejectsManualCSVAndControlPlaneAPI(t *testing.T) {
 	}
 }
 
-func TestSourceValidationRuntimeClosedOnlyAllowsManualV1(t *testing.T) {
-	for _, test := range []struct {
-		profileCode assetcatalog.ProfileCode
-		wantClosed  bool
-	}{
-		{profileCode: "MANUAL_V1", wantClosed: false},
-		{profileCode: "CSV_RFC4180_V1", wantClosed: true},
-		{profileCode: "CMDB_CATALOG_V1", wantClosed: true},
-		{profileCode: "EXTERNAL_CMDB_V1", wantClosed: true},
-		{profileCode: "FUTURE_V1", wantClosed: true},
-		{profileCode: "MANUAL_V2", wantClosed: true},
-	} {
-		if got := sourceValidationRuntimeClosed(test.profileCode); got != test.wantClosed {
-			t.Errorf("sourceValidationRuntimeClosed(%q) = %t, want %t",
-				test.profileCode, got, test.wantClosed)
-		}
+func TestRepositoryValidationAdmissionRequiresExactInjectedCMDBRuntime(t *testing.T) {
+	registry, admission := exactCMDBValidationAdmissionForRepositoryTest(t)
+	pool := &pgxpool.Pool{}
+	newID := func() string { return "70000000-0000-4000-8000-000000000001" }
+
+	closedRepository, err := NewWithSourceProfileRegistry(pool, nil, newID, registry)
+	if err != nil {
+		t.Fatalf("NewWithSourceProfileRegistry(closed) error = %v", err)
 	}
+	if closedRepository.validationAdmission.Valid() {
+		t.Fatal("legacy repository constructor opened non-MANUAL validation")
+	}
+
+	repository, err := NewWithSourceProfileRegistry(pool, nil, newID, registry, admission)
+	if err != nil {
+		t.Fatalf("NewWithSourceProfileRegistry(exact admission) error = %v", err)
+	}
+	if !repository.validationAdmission.Valid() ||
+		repository.validationAdmission.RuntimeManifestDigestSHA256() !=
+			admission.RuntimeManifestDigestSHA256() {
+		t.Fatalf("repository validation admission = %#v", repository.validationAdmission)
+	}
+
+	if _, err := NewWithSourceProfileRegistry(
+		pool, nil, newID, registry, sourceprofile.SourceValidationRuntimeAdmission{},
+	); err == nil {
+		t.Fatal("NewWithSourceProfileRegistry accepted an explicit zero admission")
+	}
+	if _, err := NewWithSourceProfileRegistry(
+		pool, nil, newID, registry, admission, admission,
+	); err == nil {
+		t.Fatal("NewWithSourceProfileRegistry accepted multiple admissions")
+	}
+}
+
+func TestRepositoryValidationAdmissionKeepsUnknownAndDriftedProfilesClosed(t *testing.T) {
+	registry, admission := exactCMDBValidationAdmissionForRepositoryTest(t)
+	repository, err := NewWithSourceProfileRegistry(
+		&pgxpool.Pool{},
+		nil,
+		func() string { return "70000000-0000-4000-8000-000000000001" },
+		registry,
+		admission,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, revision := exactCMDBSourceRevisionForRepositoryTest(t, registry)
+	if _, err := repository.admitSourceValidationRequest(
+		t.Context(), source, revision,
+	); err != nil {
+		t.Fatalf("admitSourceValidationRequest(exact CMDB) error = %v", err)
+	}
+
+	closedRepository, err := NewWithSourceProfileRegistry(
+		&pgxpool.Pool{},
+		nil,
+		func() string { return "70000000-0000-4000-8000-000000000002" },
+		registry,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := closedRepository.admitSourceValidationRequest(
+		t.Context(), source, revision,
+	); !errors.Is(err, assetcatalog.ErrUnavailable) {
+		t.Fatalf("closed admitSourceValidationRequest() error = %v", err)
+	}
+
+	drifted := revision.Clone()
+	drifted.CanonicalRevisionDigest = strings.Repeat("f", 64)
+	if _, err := repository.admitSourceValidationRequest(
+		t.Context(), source, drifted,
+	); !errors.Is(err, assetcatalog.ErrUnavailable) {
+		t.Fatalf("drifted admitSourceValidationRequest() error = %v", err)
+	}
+}
+
+func TestRepositoryPublishClosedDiscriminatesManualAndExactCMDB(t *testing.T) {
+	registry, admission := exactCMDBValidationAdmissionForRepositoryTest(t)
+	repository, err := NewWithSourceProfileRegistry(
+		&pgxpool.Pool{},
+		nil,
+		func() string { return "70000000-0000-4000-8000-000000000001" },
+		registry,
+		admission,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmdbSource, cmdbRevision := exactCMDBSourceRevisionForRepositoryTest(t, registry)
+	setRepositoryTestRevisionValidated(&cmdbSource, &cmdbRevision)
+	opens, err := repository.sourceRevisionPublicationOpensGate(
+		t.Context(), cmdbSource, cmdbRevision,
+	)
+	if err != nil || opens {
+		t.Fatalf("CMDB publication disposition = (%t, %v), want closed", opens, err)
+	}
+
+	manualSource, manualRevision := exactManualSourceRevisionForRepositoryTest(t)
+	setRepositoryTestRevisionValidated(&manualSource, &manualRevision)
+	opens, err = repository.sourceRevisionPublicationOpensGate(
+		t.Context(), manualSource, manualRevision,
+	)
+	if err != nil || !opens {
+		t.Fatalf("MANUAL publication disposition = (%t, %v), want open", opens, err)
+	}
+}
+
+func exactCMDBValidationAdmissionForRepositoryTest(
+	t *testing.T,
+) (assetcatalog.SourceProfileRegistry, sourceprofile.SourceValidationRuntimeAdmission) {
+	t.Helper()
+	descriptor := sourceprofile.ExternalCMDBV1()
+	registration, err := descriptor.Registration(sourceprofile.ExternalCMDBProfileReferences{
+		IntegrationID:            "44444444-4444-4444-8444-444444444444",
+		CredentialReferenceID:    "55555555-5555-4555-8555-555555555555",
+		TrustReferenceID:         "66666666-6666-4666-8666-666666666666",
+		NetworkPolicyReferenceID: "77777777-7777-4777-8777-777777777777",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := assetcatalog.NewSourceProfileRegistry(registration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical := []byte(
+		`{"schema_version":"discovery-worker-runtime-admission.v1","providers":[{"provider_kind":"CMDB_CATALOG_V1","profile_code":"CMDB_CATALOG_V1","canonical_descriptor_digest":"04a55074842e641d87ad67c42f1020b9b097ad15c3e781aaeffa3887837fdd08","runtime_recovery_capability_digest":"92f56dca945425f4129703183c71ba9c0aa08f47c3f8e8ec2ed6cdea2951f5aa"}]}`,
+	)
+	digest := sha256.Sum256(canonical)
+	admission, err := sourceprofile.NewSourceValidationRuntimeAdmission(
+		descriptor,
+		sourceprofile.SourceValidationRuntimeManifest{
+			CanonicalJSON: canonical,
+			DigestSHA256:  hex.EncodeToString(digest[:]),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return registry, admission
+}
+
+func exactCMDBSourceRevisionForRepositoryTest(
+	t *testing.T,
+	registry assetcatalog.SourceProfileRegistry,
+) (assetcatalog.Source, assetcatalog.SourceRevision) {
+	t.Helper()
+	profile, err := registry.Resolve(sourceprofile.ExternalCMDBProfileSelector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return exactSourceRevisionForRepositoryTest(t, profile)
+}
+
+func exactManualSourceRevisionForRepositoryTest(
+	t *testing.T,
+) (assetcatalog.Source, assetcatalog.SourceRevision) {
+	t.Helper()
+	profile, err := assetcatalog.NewBuiltinSourceProfileRegistry().
+		Resolve(assetcatalog.SourceProfileIDManualV1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return exactSourceRevisionForRepositoryTest(t, profile)
+}
+
+func exactSourceRevisionForRepositoryTest(
+	t *testing.T,
+	profile assetcatalog.BuiltinSourceProfile,
+) (assetcatalog.Source, assetcatalog.SourceRevision) {
+	t.Helper()
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	source := assetcatalog.Source{
+		ID:           "11111111-1111-4111-8111-111111111111",
+		TenantID:     "22222222-2222-4222-8222-222222222222",
+		WorkspaceID:  "33333333-3333-4333-8333-333333333333",
+		ProviderKind: profile.ProviderKind,
+		Name:         "repository admission fixture",
+		Kind:         profile.SourceKind,
+		Status:       assetcatalog.SourceStatusActive,
+		GateStatus:   assetcatalog.SourceGateUnavailable,
+		Version:      1,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	revision, err := newSourceRevision(
+		source,
+		profile,
+		[]string{"88888888-8888-4888-8888-888888888888"},
+		"99999999-9999-4999-8999-999999999999",
+		1,
+		1,
+		"operator",
+		"INITIAL_CREATE",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision.CreatedAt = now
+	revision.UpdatedAt = now
+	return source, revision
+}
+
+func setRepositoryTestRevisionValidated(
+	source *assetcatalog.Source,
+	revision *assetcatalog.SourceRevision,
+) {
+	runID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	revision.Status = assetcatalog.SourceRevisionValidated
+	revision.ValidationRunID = runID
+	revision.ValidationDigest = strings.Repeat("a", 64)
+	source.GateStatus = assetcatalog.SourceGateValidating
+	source.GateReasonCode = "VALIDATION_IN_PROGRESS"
+	source.GateRevision = 1
+	source.ValidatedRunID = runID
 }
 
 func TestExactManualRevisionProfileRejectsSemanticDrift(t *testing.T) {

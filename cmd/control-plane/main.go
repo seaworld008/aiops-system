@@ -24,6 +24,7 @@ import (
 	"github.com/seaworld008/aiops-system/internal/httpapi"
 	"github.com/seaworld008/aiops-system/internal/ids"
 	signalservice "github.com/seaworld008/aiops-system/internal/signal"
+	"github.com/seaworld008/aiops-system/internal/sourceprofile"
 	postgresstore "github.com/seaworld008/aiops-system/internal/store/postgres"
 	"github.com/seaworld008/aiops-system/internal/webhook"
 )
@@ -157,6 +158,7 @@ func run() error {
 	assemblyCtx, assemblyCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	assetAssembly, assemblyErr := newAssetCatalogAssembly(
 		assemblyCtx, databasePool, authorizer, cursorCodec, assetCatalogAdmission,
+		cfg.ExternalCMDBProfile,
 	)
 	assemblyCancel()
 	if assemblyErr != nil {
@@ -303,20 +305,94 @@ type assetCatalogAssembly struct {
 	Admission            *assetpostgres.SchemaAdmission
 }
 
+type sourceProfileAssembly struct {
+	registry            assetcatalog.SourceProfileRegistry
+	validationAdmission sourceprofile.SourceValidationRuntimeAdmission
+}
+
+func newSourceProfileAssembly(
+	externalCMDB *config.ExternalCMDBProfileConfig,
+) (sourceProfileAssembly, error) {
+	if externalCMDB == nil {
+		return sourceProfileAssembly{
+			registry: assetcatalog.NewBuiltinSourceProfileRegistry(),
+		}, nil
+	}
+	descriptor := sourceprofile.ExternalCMDBV1()
+	registration, err := descriptor.Registration(sourceprofile.ExternalCMDBProfileReferences{
+		IntegrationID: externalCMDB.IntegrationID,
+		CredentialReferenceID: assetcatalog.CredentialReferenceID(
+			externalCMDB.CredentialReferenceID,
+		),
+		TrustReferenceID: assetcatalog.TrustReferenceID(
+			externalCMDB.TrustReferenceID,
+		),
+		NetworkPolicyReferenceID: assetcatalog.NetworkPolicyReferenceID(
+			externalCMDB.NetworkPolicyReferenceID,
+		),
+	})
+	if err != nil {
+		return sourceProfileAssembly{}, errors.New("external CMDB profile registration is unavailable")
+	}
+	registry, err := assetcatalog.NewSourceProfileRegistry(registration)
+	if err != nil {
+		return sourceProfileAssembly{}, errors.New("external CMDB profile registry is unavailable")
+	}
+	validationAdmission, err := sourceprofile.NewSourceValidationRuntimeAdmission(
+		descriptor,
+		sourceprofile.SourceValidationRuntimeManifest{
+			CanonicalJSON: externalCMDB.RuntimeAdmissionManifestJSON,
+			DigestSHA256:  externalCMDB.RuntimeAdmissionManifestSHA256,
+		},
+	)
+	if err != nil {
+		return sourceProfileAssembly{}, errors.New("external CMDB validation admission is unavailable")
+	}
+	return sourceProfileAssembly{
+		registry: registry, validationAdmission: validationAdmission,
+	}, nil
+}
+
 func newAssetCatalogAssembly(
 	ctx context.Context,
 	databasePool *pgxpool.Pool,
 	authorizer *authz.Authorizer,
 	cursorCodec *httpapi.ControlPlaneCursorCodec,
 	admission *assetpostgres.SchemaAdmission,
+	externalCMDBProfiles ...*config.ExternalCMDBProfileConfig,
 ) (assetCatalogAssembly, error) {
-	if ctx == nil || databasePool == nil || authorizer == nil || cursorCodec == nil || admission == nil {
+	if ctx == nil || databasePool == nil || authorizer == nil || cursorCodec == nil ||
+		admission == nil || len(externalCMDBProfiles) > 1 {
 		return assetCatalogAssembly{}, errors.New("asset catalog dependencies are unavailable")
 	}
 	if err := admission.Check(ctx); err != nil {
 		return assetCatalogAssembly{}, errors.New("asset catalog schema is unavailable")
 	}
-	repository, err := assetpostgres.New(databasePool, time.Now, ids.NewUUID)
+	var externalCMDBProfile *config.ExternalCMDBProfileConfig
+	if len(externalCMDBProfiles) == 1 {
+		externalCMDBProfile = externalCMDBProfiles[0]
+	}
+	profiles, err := newSourceProfileAssembly(externalCMDBProfile)
+	if err != nil {
+		return assetCatalogAssembly{}, errors.New("asset catalog source profiles are unavailable")
+	}
+	var repository *assetpostgres.Repository
+	if profiles.validationAdmission.Valid() {
+		repository, err = assetpostgres.NewWithSourceProfileRegistry(
+			databasePool,
+			time.Now,
+			ids.NewUUID,
+			profiles.registry,
+			profiles.validationAdmission,
+		)
+	} else {
+		repository, err = assetpostgres.NewWithSourceProfileRegistry(
+			databasePool,
+			time.Now,
+			ids.NewUUID,
+			profiles.registry,
+		)
+	}
 	if err != nil {
 		return assetCatalogAssembly{}, errors.New("asset catalog repository is unavailable")
 	}

@@ -1,6 +1,9 @@
 package config
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -37,6 +40,15 @@ type RunnerGatewayConfig struct {
 	TrustDomain           string
 }
 
+type ExternalCMDBProfileConfig struct {
+	IntegrationID                  string
+	CredentialReferenceID          string
+	TrustReferenceID               string
+	NetworkPolicyReferenceID       string
+	RuntimeAdmissionManifestJSON   []byte
+	RuntimeAdmissionManifestSHA256 string
+}
+
 type Config struct {
 	HTTPAddr                     string
 	Environment                  string
@@ -56,6 +68,7 @@ type Config struct {
 	OIDCRecentAuthWindow         time.Duration
 	WriteExecutionMode           WriteExecutionMode
 	RunnerGateway                *RunnerGatewayConfig
+	ExternalCMDBProfile          *ExternalCMDBProfileConfig
 }
 
 func Load() (Config, error) {
@@ -150,6 +163,11 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.RunnerGateway = runnerGateway
+	externalCMDBProfile, err := loadExternalCMDBProfileConfig()
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ExternalCMDBProfile = externalCMDBProfile
 	if cfg.Environment == "production" && len(cfg.WebhookHMACSecrets) == 0 {
 		return Config{}, fmt.Errorf("AIOPS_WEBHOOK_HMAC_SECRETS_JSON is required in production")
 	}
@@ -164,6 +182,57 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func loadExternalCMDBProfileConfig() (*ExternalCMDBProfileConfig, error) {
+	values := []string{
+		os.Getenv("AIOPS_EXTERNAL_CMDB_INTEGRATION_ID"),
+		os.Getenv("AIOPS_EXTERNAL_CMDB_CREDENTIAL_REFERENCE_ID"),
+		os.Getenv("AIOPS_EXTERNAL_CMDB_TRUST_REFERENCE_ID"),
+		os.Getenv("AIOPS_EXTERNAL_CMDB_NETWORK_POLICY_REFERENCE_ID"),
+		os.Getenv("AIOPS_DISCOVERY_RUNTIME_ADMISSION_MANIFEST_JSON"),
+		os.Getenv("AIOPS_DISCOVERY_RUNTIME_ADMISSION_MANIFEST_SHA256"),
+	}
+	configured := 0
+	for _, value := range values {
+		if value != "" {
+			configured++
+		}
+	}
+	if configured == 0 {
+		return nil, nil
+	}
+	if configured != len(values) {
+		return nil, fmt.Errorf("all external CMDB profile admission metadata must be configured together")
+	}
+	for _, value := range values[:4] {
+		if value != strings.TrimSpace(value) || len(value) > 256 || containsControl(value) {
+			return nil, fmt.Errorf("external CMDB profile references are invalid")
+		}
+	}
+	canonical := []byte(values[4])
+	digest := values[5]
+	if len(canonical) == 0 || len(canonical) > 64<<10 ||
+		digest != strings.TrimSpace(digest) || len(digest) != sha256.Size*2 {
+		return nil, fmt.Errorf("external CMDB runtime admission manifest is invalid")
+	}
+	rawDigest, err := hex.DecodeString(digest)
+	if err != nil || len(rawDigest) != sha256.Size ||
+		hex.EncodeToString(rawDigest) != digest {
+		return nil, fmt.Errorf("external CMDB runtime admission manifest digest is invalid")
+	}
+	actual := sha256.Sum256(canonical)
+	if subtle.ConstantTimeCompare(rawDigest, actual[:]) != 1 {
+		return nil, fmt.Errorf("external CMDB runtime admission manifest digest does not match")
+	}
+	return &ExternalCMDBProfileConfig{
+		IntegrationID:                  values[0],
+		CredentialReferenceID:          values[1],
+		TrustReferenceID:               values[2],
+		NetworkPolicyReferenceID:       values[3],
+		RuntimeAdmissionManifestJSON:   append([]byte(nil), canonical...),
+		RuntimeAdmissionManifestSHA256: digest,
+	}, nil
 }
 
 func validWebRoot(value string) bool {
