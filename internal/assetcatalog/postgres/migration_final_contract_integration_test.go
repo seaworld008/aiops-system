@@ -14,9 +14,15 @@ import (
 func TestAssetCatalogMigrationFinalOperationalContract(t *testing.T) {
 	harness := newAssetCatalogHarness(t)
 	harness.applyThroughAssetCatalog(t)
+	qualificationSchema, err := qualificationFixtureSchemaStateFor(
+		context.Background(), harness.db,
+	)
+	if err != nil {
+		t.Fatalf("inspect final qualification schema contract: %v", err)
+	}
 
 	t.Run("run state and cleanup proof", func(t *testing.T) {
-		finalRequireColumns(t, harness.db, "asset_source_runs", []string{
+		runColumns := []string{
 			"source_revision", "source_revision_digest", "run_kind", "status",
 			"stage_code", "stage_changed_at", "trigger_type", "gate_revision",
 			"cursor_before_sha256", "cursor_after_sha256", "page_sequence", "page_digest",
@@ -35,12 +41,25 @@ func TestAssetCatalogMigrationFinalOperationalContract(t *testing.T) {
 			"terminal_failure_override", "terminal_failure_override_digest",
 			"terminal_command_sha256",
 			"failure_code", "trace_id", "started_at", "heartbeat_at", "completed_at",
+		}
+		if qualificationSchema == qualificationFixtureSchemaFull {
+			runColumns = append(runColumns, qualificationFixtureRunColumns...)
+		}
+		finalRequireColumns(t, harness.db, "asset_source_runs", runColumns)
+		finalForbidColumns(t, harness.db, "asset_source_runs", []string{
+			"definition_revision",
+			"qualification_descriptor_digest",
+			"qualification_prior_receipt_digests_sha256",
+			"qualification_issued_at",
 		})
-		finalForbidColumns(t, harness.db, "asset_source_runs", []string{"definition_revision"})
 
-		finalRequireExactVocabulary(t, harness.db, "asset_source_runs", "run_kind", []string{
+		runKinds := []string{
 			"VALIDATION", "DISCOVERY", "CSV_IMPORT", "API_INGESTION", "MANUAL_MUTATION",
-		})
+		}
+		if qualificationSchema == qualificationFixtureSchemaFull {
+			runKinds = append(runKinds, "QUALIFICATION")
+		}
+		finalRequireExactVocabulary(t, harness.db, "asset_source_runs", "run_kind", runKinds)
 		finalRequireExactVocabulary(t, harness.db, "asset_source_runs", "status", []string{
 			"QUEUED", "DELAYED", "RUNNING", "FINALIZING",
 			"SUCCEEDED", "PARTIAL", "FAILED", "CANCELLED",
@@ -52,9 +71,15 @@ func TestAssetCatalogMigrationFinalOperationalContract(t *testing.T) {
 		finalRequireExactVocabulary(t, harness.db, "asset_source_runs", "cleanup_status", []string{
 			"NOT_OPENED", "PENDING", "REVOKED", "NO_CREDENTIAL", "UNCERTAIN",
 		})
-		finalRequireExactVocabulary(t, harness.db, "asset_source_runs", "work_result_kind", []string{
+		workResultKinds := []string{
 			"DATA_PROJECTION", "VALIDATION_PROOF", "FAILURE_INTENT",
-		})
+		}
+		if qualificationSchema == qualificationFixtureSchemaFull {
+			workResultKinds = append(workResultKinds, "QUALIFICATION_PROOF")
+		}
+		finalRequireExactVocabulary(
+			t, harness.db, "asset_source_runs", "work_result_kind", workResultKinds,
+		)
 		finalRequireExactVocabulary(t, harness.db, "asset_source_runs", "work_result_status", []string{
 			"SUCCEEDED", "PARTIAL", "FAILED",
 		})
@@ -71,6 +96,44 @@ func TestAssetCatalogMigrationFinalOperationalContract(t *testing.T) {
 			"DATA_PROJECTION", "VALIDATION_PROOF", "FAILURE_INTENT",
 			"work_result_digest", "work_result_recorded_at", "validation_proof_digest",
 		})
+		if qualificationSchema == qualificationFixtureSchemaFull {
+			for index, column := range qualificationFixtureRunColumns {
+				finalRequireColumnShape(
+					t,
+					harness.db,
+					"asset_source_runs",
+					column,
+					qualificationFixtureRunColumnTypes[index],
+					true,
+				)
+			}
+			finalRequireExactVocabulary(
+				t,
+				harness.db,
+				"asset_source_runs",
+				"qualification_evidence_kind",
+				[]string{"TWO_WORKER_HA", "PROVIDER_CANARY"},
+			)
+			finalRequireConstraintTokens(
+				t,
+				harness.db,
+				"asset_source_runs_work_result_ck",
+				[]string{"QUALIFICATION", "QUALIFICATION_PROOF"},
+			)
+			finalRequireTableCheckTokens(
+				t,
+				harness.db,
+				"asset_source_runs",
+				append(
+					slices.Clone(qualificationFixtureRunColumns),
+					"TWO_WORKER_HA",
+					"PROVIDER_CANARY",
+					"QUALIFICATION_PROOF",
+				),
+			)
+			runTriggerBody := finalTableTriggerBody(t, harness.db, "asset_source_runs")
+			finalRequireExplicitDataRunKindAllowlist(t, runTriggerBody)
+		}
 		finalRequireConstraintTokens(t, harness.db, "asset_source_runs_cleanup_ck", []string{
 			"cleanup_attempt_id", "cleanup_attempt_epoch", "cleanup_digest",
 			"NOT_OPENED", "PENDING", "REVOKED", "NO_CREDENTIAL", "UNCERTAIN",
@@ -220,10 +283,14 @@ func TestAssetCatalogMigrationFinalOperationalContract(t *testing.T) {
 	})
 
 	t.Run("success pointers bind exact completed runs", func(t *testing.T) {
-		finalRequireColumns(t, harness.db, "asset_sources", []string{
+		sourceColumns := []string{
 			"last_success_run_id", "last_success_at",
 			"last_complete_snapshot_run_id", "last_complete_snapshot_at",
-		})
+		}
+		if qualificationSchema == qualificationFixtureSchemaFull {
+			sourceColumns = append(sourceColumns, qualificationFixtureSourceColumns...)
+		}
+		finalRequireColumns(t, harness.db, "asset_sources", sourceColumns)
 		finalForbidColumns(t, harness.db, "asset_sources", []string{"last_successful_run_id"})
 		finalRequireConstraintColumns(t, harness.db, "asset_sources_last_success_run_fk", []string{
 			"tenant_id", "workspace_id", "id", "last_success_run_id",
@@ -245,8 +312,53 @@ func TestAssetCatalogMigrationFinalOperationalContract(t *testing.T) {
 		triggerBody := finalTableTriggerBody(t, harness.db, "asset_sources")
 		finalRequirePattern(t, triggerBody, `(?i)status\s*=\s*'SUCCEEDED'`,
 			"success pointer guard must accept only SUCCEEDED runs")
-		finalRequirePattern(t, triggerBody, `(?i)run_kind\s*(?:<>|!=)\s*'VALIDATION'`,
-			"success pointer guard must reject Validation runs")
+		if qualificationSchema == qualificationFixtureSchemaFull {
+			for index, column := range qualificationFixtureSourceColumns {
+				finalRequireColumnShape(
+					t,
+					harness.db,
+					"asset_sources",
+					column,
+					qualificationFixtureSourceColumnTypes[index],
+					true,
+				)
+			}
+			finalRequireConstraintColumns(
+				t,
+				harness.db,
+				"asset_sources_gate_evidence_run_fk",
+				qualificationFixtureGateForeignKeyColumns,
+			)
+			finalRequireForeignKey(
+				t,
+				harness.db,
+				"asset_sources_gate_evidence_run_fk",
+				"asset_source_runs",
+				qualificationFixtureGateForeignKeyReferences,
+			)
+			finalRequireDeferredConstraint(
+				t,
+				harness.db,
+				"asset_sources_gate_evidence_run_fk",
+				"f",
+			)
+			finalRequireDeferredConstraintTrigger(
+				t,
+				harness.db,
+				"asset_sources",
+				"asset_sources_gate_evidence_closure_guard",
+			)
+			finalRequireExplicitDataRunKindAllowlist(t, triggerBody)
+			finalRequireTableCheckTokens(
+				t,
+				harness.db,
+				"asset_sources",
+				append(slices.Clone(qualificationFixtureSourceColumns), "IS NULL", "IS NOT NULL"),
+			)
+		} else {
+			finalRequirePattern(t, triggerBody, `(?i)run_kind\s*(?:<>|!=)\s*'VALIDATION'`,
+				"success pointer guard must reject Validation runs")
+		}
 		for _, token := range []string{
 			"last_success_run_id", "last_success_at", "last_complete_snapshot_run_id",
 			"last_complete_snapshot_at", "effective_complete_snapshot", "completed_at",
@@ -354,6 +466,114 @@ func finalRequireNullable(t *testing.T, database *pgxpool.Pool, table, column st
 	}
 	if nullable != "YES" {
 		t.Errorf("%s.%s must be nullable for tombstones, got is_nullable=%s", table, column, nullable)
+	}
+}
+
+func finalRequireColumnShape(
+	t *testing.T,
+	database *pgxpool.Pool,
+	table string,
+	column string,
+	expectedDataType string,
+	expectedNullable bool,
+) {
+	t.Helper()
+	var dataType, nullable string
+	if err := database.QueryRow(context.Background(), `
+		SELECT data_type,is_nullable
+		FROM information_schema.columns
+		WHERE table_schema='public' AND table_name=$1 AND column_name=$2
+	`, table, column).Scan(&dataType, &nullable); err != nil {
+		t.Fatalf("read exact column shape for %s.%s: %v", table, column, err)
+	}
+	wantNullable := "NO"
+	if expectedNullable {
+		wantNullable = "YES"
+	}
+	if dataType != expectedDataType || nullable != wantNullable {
+		t.Errorf(
+			"%s.%s shape=(%s,%s), want exactly (%s,%s)",
+			table,
+			column,
+			dataType,
+			nullable,
+			expectedDataType,
+			wantNullable,
+		)
+	}
+}
+
+func finalRequireDeferredConstraint(
+	t *testing.T,
+	database *pgxpool.Pool,
+	constraint string,
+	constraintType string,
+) {
+	t.Helper()
+	var deferrable, initiallyDeferred, validated, enforced bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT c.condeferrable,c.condeferred,c.convalidated,c.conenforced
+		FROM pg_constraint AS c
+		JOIN pg_namespace AS n ON n.oid=c.connamespace
+		WHERE n.nspname='public' AND c.conname=$1 AND c.contype::text=$2
+	`, constraint, constraintType).Scan(
+		&deferrable,
+		&initiallyDeferred,
+		&validated,
+		&enforced,
+	); err != nil {
+		t.Fatalf("read deferred constraint %s: %v", constraint, err)
+	}
+	if !deferrable || !initiallyDeferred || !validated || !enforced {
+		t.Errorf(
+			"constraint %s deferred/validated/enforced=(%v,%v,%v,%v), want all true",
+			constraint,
+			deferrable,
+			initiallyDeferred,
+			validated,
+			enforced,
+		)
+	}
+}
+
+func finalRequireDeferredConstraintTrigger(
+	t *testing.T,
+	database *pgxpool.Pool,
+	table string,
+	trigger string,
+) {
+	t.Helper()
+	var deferrable, initiallyDeferred, enabled, validated, enforced bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT trigger_record.tgdeferrable,trigger_record.tginitdeferred,
+			trigger_record.tgenabled='O',
+			constraint_record.convalidated,constraint_record.conenforced
+		FROM pg_trigger AS trigger_record
+		JOIN pg_class AS relation ON relation.oid=trigger_record.tgrelid
+		JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+		JOIN pg_constraint AS constraint_record
+		  ON constraint_record.oid=trigger_record.tgconstraint
+		WHERE namespace.nspname='public' AND relation.relname=$1
+		  AND trigger_record.tgname=$2 AND trigger_record.tgconstraint<>0
+	`, table, trigger).Scan(
+		&deferrable,
+		&initiallyDeferred,
+		&enabled,
+		&validated,
+		&enforced,
+	); err != nil {
+		t.Fatalf("read deferred constraint trigger %s: %v", trigger, err)
+	}
+	if !deferrable || !initiallyDeferred || !enabled || !validated || !enforced {
+		t.Errorf(
+			"trigger %s deferred/enabled/validated/enforced=(%v,%v,%v,%v,%v), want all true",
+			trigger,
+			deferrable,
+			initiallyDeferred,
+			enabled,
+			validated,
+			enforced,
+		)
 	}
 }
 
@@ -562,4 +782,30 @@ func finalRequirePattern(t *testing.T, value, pattern, message string) {
 	if !matched {
 		t.Errorf("%s; pattern=%s", message, pattern)
 	}
+}
+
+func finalRequireExplicitDataRunKindAllowlist(t *testing.T, value string) {
+	t.Helper()
+	const unsafePattern = `(?i)run_kind\s*(?:<>|!=)\s*'VALIDATION'`
+	matched, err := regexp.MatchString(unsafePattern, value)
+	if err != nil {
+		t.Fatalf("compile data-kind negative-list pattern %q: %v", unsafePattern, err)
+	}
+	if matched {
+		t.Errorf("data-run admission retains an open-ended negative kind check; pattern=%s", unsafePattern)
+	}
+
+	allowlistPattern := regexp.MustCompile(`(?is)run_kind\s+IN\s*\(([^)]*)\)`)
+	want := []string{"API_INGESTION", "CSV_IMPORT", "DISCOVERY", "MANUAL_MUTATION"}
+	for _, candidate := range allowlistPattern.FindAllStringSubmatch(value, -1) {
+		var got []string
+		for _, code := range finalQuotedCode.FindAllStringSubmatch(candidate[1], -1) {
+			got = append(got, code[1])
+		}
+		sort.Strings(got)
+		if slices.Equal(got, want) {
+			return
+		}
+	}
+	t.Error("data-run admission lacks exact DISCOVERY/CSV_IMPORT/API_INGESTION/MANUAL_MUTATION allowlist")
 }

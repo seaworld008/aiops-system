@@ -803,8 +803,23 @@ func TestAssetCatalogMigration(t *testing.T) {
 	`, assetCatalogTableNames()).Scan(&foreignKeyCount); err != nil {
 		t.Fatal(err)
 	}
-	if foreignKeyCount != 44 {
-		t.Fatalf("asset catalog foreign key count=%d, want 44", foreignKeyCount)
+	qualificationSchema, err := qualificationFixtureSchemaStateFor(
+		context.Background(), harness.db,
+	)
+	if err != nil {
+		t.Fatalf("inspect migration qualification schema contract: %v", err)
+	}
+	expectedForeignKeys := 44
+	if qualificationSchema == qualificationFixtureSchemaFull {
+		expectedForeignKeys = 45
+	}
+	if foreignKeyCount != expectedForeignKeys {
+		t.Fatalf(
+			"asset catalog foreign key count=%d, want %d for %s qualification schema",
+			foreignKeyCount,
+			expectedForeignKeys,
+			qualificationSchema,
+		)
 	}
 	roleAdmission := storepostgres.NewDatabaseRoleAdmission(harness.application, "public")
 	if err := roleAdmission.Check(context.Background()); err != nil {

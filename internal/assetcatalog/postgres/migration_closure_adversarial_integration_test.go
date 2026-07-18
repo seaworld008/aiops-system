@@ -3,9 +3,11 @@ package postgres_test
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -15,6 +17,268 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+func TestQualificationFixtureExactPersistentABI(t *testing.T) {
+	wantSourceColumns := []string{
+		"gate_evidence_run_id",
+		"gate_evidence_digest",
+		"gate_evidence_expires_at",
+	}
+	wantRunColumns := []string{
+		"qualification_evidence_kind",
+		"qualification_scope_digest",
+		"qualification_binding_digest",
+		"qualification_profile_descriptor_digest",
+		"qualification_runtime_manifest_digest",
+		"qualification_lab_binding_digest",
+		"qualification_prior_receipts_digest",
+		"qualification_result_digest",
+		"qualification_receipt_issued_at",
+		"qualification_receipt_expires_at",
+		"qualification_signing_key_id",
+		"qualification_signature",
+		"qualification_receipt_digest",
+		"ha_owner_worker_identity_digest",
+		"ha_takeover_worker_identity_digest",
+		"ha_owner_process_instance_digest",
+		"ha_takeover_process_instance_digest",
+		"ha_takeover_receipt_digest",
+		"ha_restart_receipt_digest",
+		"ha_session_recovery_receipt_digest",
+		"ha_cleanup_receipt_digest",
+		"ha_response_loss_receipt_digest",
+		"ha_fact_chain_digest",
+	}
+	if got, want := strings.Join(qualificationFixtureSourceColumns, "\n"),
+		strings.Join(wantSourceColumns, "\n"); got != want {
+		t.Fatalf("qualification Source columns:\n%s\nwant exact:\n%s", got, want)
+	}
+	if got, want := strings.Join(qualificationFixtureRunColumns, "\n"),
+		strings.Join(wantRunColumns, "\n"); got != want {
+		t.Fatalf("qualification Run columns:\n%s\nwant exact:\n%s", got, want)
+	}
+	wantSourceTypes := []string{"uuid", "text", "timestamp with time zone"}
+	if got, want := strings.Join(qualificationFixtureSourceColumnTypes, "\n"),
+		strings.Join(wantSourceTypes, "\n"); got != want {
+		t.Fatalf("qualification Source column types:\n%s\nwant exact:\n%s", got, want)
+	}
+	wantRunTypes := make([]string, len(wantRunColumns))
+	for index := range wantRunTypes {
+		wantRunTypes[index] = "text"
+	}
+	wantRunTypes[8] = "timestamp with time zone"
+	wantRunTypes[9] = "timestamp with time zone"
+	if got, want := strings.Join(qualificationFixtureRunColumnTypes, "\n"),
+		strings.Join(wantRunTypes, "\n"); got != want {
+		t.Fatalf("qualification Run column types:\n%s\nwant exact:\n%s", got, want)
+	}
+}
+
+func TestAssetCatalogQualificationFixtureSchemaContract(t *testing.T) {
+	t.Run("old schema no-op or full exact fixture", func(t *testing.T) {
+		harness := newAssetCatalogHarness(t)
+		harness.applyThroughAssetCatalog(t)
+		state, err := qualificationFixtureSchemaStateFor(context.Background(), harness.db)
+		if err != nil {
+			t.Fatalf("inspect qualification fixture schema: %v", err)
+		}
+		fixture := seedDraftAssetCatalog(t, harness.db)
+		fixture = seedClosureExternalValidationOnFixture(t, harness.db, fixture)
+		finishClosureExternalValidation(t, harness.db, fixture, 1, strings.Repeat("7", 64))
+
+		if state == qualificationFixtureSchemaOld {
+			var total int
+			if err := harness.db.QueryRow(context.Background(), `
+				SELECT count(*) FROM asset_source_runs
+				WHERE source_id=$1 AND run_kind='QUALIFICATION'
+			`, fixture.sourceID).Scan(&total); err != nil {
+				t.Fatalf("count old-schema qualification runs: %v", err)
+			}
+			if total != 0 {
+				t.Fatalf("old schema qualification fixture wrote %d runs, want exact no-op", total)
+			}
+			return
+		}
+
+		var total, ha, canary int
+		if err := harness.db.QueryRow(context.Background(), `
+			SELECT count(*),
+				count(*) FILTER (WHERE qualification_evidence_kind='TWO_WORKER_HA'),
+				count(*) FILTER (WHERE qualification_evidence_kind='PROVIDER_CANARY')
+			FROM asset_source_runs
+			WHERE source_id=$1 AND run_kind='QUALIFICATION' AND
+				status='SUCCEEDED' AND stage_code='COMPLETED'
+		`, fixture.sourceID).Scan(&total, &ha, &canary); err != nil {
+			t.Fatalf("count full-schema qualification fixture runs: %v", err)
+		}
+		if total != 2 || ha != 1 || canary != 1 {
+			t.Fatalf(
+				"full schema qualification fixtures=(total:%d HA:%d canary:%d), want (2,1,1)",
+				total,
+				ha,
+				canary,
+			)
+		}
+	})
+
+	t.Run("partial schema fails closed", func(t *testing.T) {
+		harness := newAssetCatalogHarness(t)
+		harness.applyThroughAssetCatalog(t)
+		state, err := qualificationFixtureSchemaStateFor(context.Background(), harness.db)
+		if err != nil {
+			t.Fatalf("read qualification schema before partial mutation: %v", err)
+		}
+		if state == qualificationFixtureSchemaOld {
+			execAssetSQL(t, harness.db, `
+				ALTER TABLE asset_sources ADD COLUMN gate_evidence_run_id uuid
+			`)
+		} else {
+			execAssetSQL(t, harness.db, `
+				ALTER TABLE asset_sources DROP COLUMN gate_evidence_run_id CASCADE
+			`)
+		}
+
+		if _, err = qualificationFixtureSchemaStateFor(
+			context.Background(), harness.db,
+		); err == nil || !strings.Contains(err.Error(), "partial qualification fixture schema") {
+			t.Fatalf("partial qualification fixture schema error=%v, want fail-closed classification", err)
+		}
+	})
+
+	for _, shape := range []struct {
+		name       string
+		definition string
+	}{
+		{name: "wrong marker type", definition: "text"},
+		{name: "wrong marker nullability", definition: "uuid NOT NULL"},
+	} {
+		t.Run(shape.name+" fails closed", func(t *testing.T) {
+			harness := newAssetCatalogHarness(t)
+			harness.applyThroughAssetCatalog(t)
+			state, err := qualificationFixtureSchemaStateFor(context.Background(), harness.db)
+			if err != nil {
+				t.Fatalf("read qualification schema before marker-shape mutation: %v", err)
+			}
+			if state == qualificationFixtureSchemaFull {
+				return
+			}
+			execAssetSQL(t, harness.db, fmt.Sprintf(`
+				ALTER TABLE asset_sources
+					ADD COLUMN gate_evidence_run_id %s
+			`, shape.definition))
+			if _, err := qualificationFixtureSchemaStateFor(
+				context.Background(), harness.db,
+			); err == nil || !strings.Contains(err.Error(), "partial qualification fixture schema") {
+				t.Fatalf("%s error=%v, want fail-closed classification", shape.name, err)
+			}
+		})
+	}
+
+	t.Run("unknown marker fails closed", func(t *testing.T) {
+		harness := newAssetCatalogHarness(t)
+		harness.applyThroughAssetCatalog(t)
+		execAssetSQL(t, harness.db, `
+			ALTER TABLE asset_source_runs ADD COLUMN qualification_unknown_digest text
+		`)
+
+		if _, err := qualificationFixtureSchemaStateFor(
+			context.Background(), harness.db,
+		); err == nil || !strings.Contains(err.Error(), "partial qualification fixture schema") {
+			t.Fatalf("unknown qualification fixture marker error=%v, want fail-closed classification", err)
+		}
+	})
+
+	vocabularyReplacements := []struct {
+		name    string
+		oldSQL  string
+		fullSQL string
+	}{
+		{
+			name: "run kind",
+			oldSQL: `
+				ALTER TABLE asset_source_runs
+					DROP CONSTRAINT asset_source_runs_run_kind_check;
+				ALTER TABLE asset_source_runs
+					ADD CONSTRAINT asset_source_runs_run_kind_check CHECK (run_kind IN (
+						'VALIDATION','DISCOVERY','CSV_IMPORT','API_INGESTION','UNKNOWN_DATA'
+					));
+			`,
+			fullSQL: `
+				ALTER TABLE asset_source_runs
+					DROP CONSTRAINT asset_source_runs_run_kind_check;
+				ALTER TABLE asset_source_runs
+					ADD CONSTRAINT asset_source_runs_run_kind_check CHECK (run_kind IN (
+						'VALIDATION','DISCOVERY','CSV_IMPORT','API_INGESTION',
+						'QUALIFICATION','UNKNOWN_DATA'
+					));
+			`,
+		},
+		{
+			name: "work result kind",
+			oldSQL: `
+				ALTER TABLE asset_source_runs
+					DROP CONSTRAINT asset_source_runs_work_result_kind_check;
+				ALTER TABLE asset_source_runs
+					ADD CONSTRAINT asset_source_runs_work_result_kind_check CHECK (
+						work_result_kind IS NULL OR work_result_kind IN (
+							'DATA_PROJECTION','VALIDATION_PROOF','UNKNOWN_PROOF'
+						)
+					);
+			`,
+			fullSQL: `
+				ALTER TABLE asset_source_runs
+					DROP CONSTRAINT asset_source_runs_work_result_kind_check;
+				ALTER TABLE asset_source_runs
+					ADD CONSTRAINT asset_source_runs_work_result_kind_check CHECK (
+						work_result_kind IS NULL OR work_result_kind IN (
+							'DATA_PROJECTION','VALIDATION_PROOF',
+							'QUALIFICATION_PROOF','UNKNOWN_PROOF'
+						)
+					);
+			`,
+		},
+	}
+	for _, replacement := range vocabularyReplacements {
+		t.Run("same-count "+replacement.name+" replacement fails closed", func(t *testing.T) {
+			harness := newAssetCatalogHarness(t)
+			harness.applyThroughAssetCatalog(t)
+			state, err := qualificationFixtureSchemaStateFor(context.Background(), harness.db)
+			if err != nil {
+				t.Fatalf("read qualification schema before vocabulary replacement: %v", err)
+			}
+			statement := replacement.oldSQL
+			if state == qualificationFixtureSchemaFull {
+				statement = replacement.fullSQL
+			}
+			execAssetSQL(t, harness.db, statement)
+
+			if _, err = qualificationFixtureSchemaStateFor(
+				context.Background(), harness.db,
+			); err == nil || !strings.Contains(err.Error(), "partial qualification fixture schema") {
+				t.Fatalf(
+					"same-count %s replacement error=%v, want fail-closed classification",
+					replacement.name,
+					err,
+				)
+			}
+		})
+	}
+
+	t.Run("not-valid closure fails closed", func(t *testing.T) {
+		harness := newAssetCatalogHarness(t)
+		harness.applyThroughAssetCatalog(t)
+		execAssetSQL(t, harness.db, `
+			ALTER TABLE asset_source_runs
+				ADD CONSTRAINT qualification_fixture_not_valid_ck CHECK (true) NOT VALID
+		`)
+
+		if _, err := qualificationFixtureSchemaStateFor(
+			context.Background(), harness.db,
+		); err == nil || !strings.Contains(err.Error(), "partial qualification fixture schema") {
+			t.Fatalf("not-valid qualification fixture closure error=%v, want fail-closed classification", err)
+		}
+	})
+}
 
 func TestAssetCatalogFutureSourceHookPersistentContractMatrix(t *testing.T) {
 	harness := newAssetCatalogHarness(t)
@@ -1436,6 +1700,329 @@ const (
 	closureExternalValidationID = "8f000000-0000-4000-8000-000000000003"
 )
 
+type qualificationFixtureSchemaState string
+
+const (
+	qualificationFixtureSchemaOld  qualificationFixtureSchemaState = "OLD"
+	qualificationFixtureSchemaFull qualificationFixtureSchemaState = "FULL"
+)
+
+var qualificationFixtureSourceColumns = []string{
+	"gate_evidence_run_id",
+	"gate_evidence_digest",
+	"gate_evidence_expires_at",
+}
+
+var qualificationFixtureRunColumns = []string{
+	"qualification_evidence_kind",
+	"qualification_scope_digest",
+	"qualification_binding_digest",
+	"qualification_profile_descriptor_digest",
+	"qualification_runtime_manifest_digest",
+	"qualification_lab_binding_digest",
+	"qualification_prior_receipts_digest",
+	"qualification_result_digest",
+	"qualification_receipt_issued_at",
+	"qualification_receipt_expires_at",
+	"qualification_signing_key_id",
+	"qualification_signature",
+	"qualification_receipt_digest",
+	"ha_owner_worker_identity_digest",
+	"ha_takeover_worker_identity_digest",
+	"ha_owner_process_instance_digest",
+	"ha_takeover_process_instance_digest",
+	"ha_takeover_receipt_digest",
+	"ha_restart_receipt_digest",
+	"ha_session_recovery_receipt_digest",
+	"ha_cleanup_receipt_digest",
+	"ha_response_loss_receipt_digest",
+	"ha_fact_chain_digest",
+}
+
+var qualificationFixtureSourceColumnTypes = []string{
+	"uuid",
+	"text",
+	"timestamp with time zone",
+}
+
+var qualificationFixtureRunColumnTypes = []string{
+	"text",
+	"text",
+	"text",
+	"text",
+	"text",
+	"text",
+	"text",
+	"text",
+	"timestamp with time zone",
+	"timestamp with time zone",
+	"text",
+	"text",
+	"text",
+	"text",
+	"text",
+	"text",
+	"text",
+	"text",
+	"text",
+	"text",
+	"text",
+	"text",
+	"text",
+}
+
+var qualificationFixtureGateForeignKeyColumns = []string{
+	"tenant_id",
+	"workspace_id",
+	"id",
+	"gate_evidence_run_id",
+}
+
+var qualificationFixtureGateForeignKeyReferences = []string{
+	"tenant_id",
+	"workspace_id",
+	"source_id",
+	"id",
+}
+
+func qualificationFixtureSchemaStateFor(
+	ctx context.Context,
+	database *pgxpool.Pool,
+) (qualificationFixtureSchemaState, error) {
+	var (
+		sourceExpectedColumns int
+		sourceUnknownColumns  int
+		runExpectedColumns    int
+		runUnknownColumns     int
+		exactSourceShapes     int
+		exactRunShapes        int
+		foreignKeyCount       int
+		invalidClosureCount   int
+		exactGateForeignKeys  int
+		exactClosureTriggers  int
+		oldVocabulary         bool
+		fullVocabulary        bool
+		fullConstraintClosure bool
+	)
+	if err := database.QueryRow(ctx, `
+		WITH
+		expected_source(column_name) AS (
+			SELECT unnest($1::text[])
+		),
+		expected_run(column_name) AS (
+			SELECT unnest($2::text[])
+		),
+		expected_source_shape(column_name, data_type) AS (
+			SELECT * FROM unnest($1::text[], $6::text[])
+		),
+		expected_run_shape(column_name, data_type) AS (
+			SELECT * FROM unnest($2::text[], $7::text[])
+		),
+		actual_source(column_name, data_type, is_nullable) AS (
+			SELECT column_name,data_type,is_nullable
+			FROM information_schema.columns
+			WHERE table_schema='public' AND table_name='asset_sources'
+			  AND column_name LIKE 'gate_evidence_%'
+		),
+		actual_run(column_name, data_type, is_nullable) AS (
+			SELECT column_name,data_type,is_nullable
+			FROM information_schema.columns
+			WHERE table_schema='public' AND table_name='asset_source_runs'
+			  AND (column_name LIKE 'qualification_%' OR column_name LIKE 'ha_%')
+		),
+		vocabulary AS (
+			SELECT a.attname,
+				COALESCE(string_agg(pg_get_constraintdef(c.oid, true), E'\n'), '') AS definition
+			FROM pg_class r
+			JOIN pg_namespace n ON n.oid=r.relnamespace
+			JOIN pg_attribute a ON a.attrelid=r.oid AND NOT a.attisdropped
+			LEFT JOIN pg_constraint c
+			  ON c.conrelid=r.oid AND c.contype='c'
+			 AND c.conkey=ARRAY[a.attnum]::smallint[]
+			WHERE n.nspname='public' AND r.relname='asset_source_runs'
+			  AND a.attname IN ('run_kind','work_result_kind','qualification_evidence_kind')
+			GROUP BY a.attname
+		),
+		table_checks AS (
+			SELECT r.relname,
+				lower(COALESCE(string_agg(pg_get_constraintdef(c.oid, true), E'\n'), '')) AS definition
+			FROM pg_class r
+			JOIN pg_namespace n ON n.oid=r.relnamespace
+			LEFT JOIN pg_constraint c ON c.conrelid=r.oid AND c.contype='c'
+			WHERE n.nspname='public'
+			  AND r.relname IN ('asset_sources','asset_source_runs')
+			GROUP BY r.relname
+		),
+		definitions AS (
+			SELECT
+				COALESCE((SELECT definition FROM vocabulary WHERE attname='run_kind'), '') AS run_kind,
+				COALESCE((SELECT definition FROM vocabulary WHERE attname='work_result_kind'), '') AS work_result_kind,
+				COALESCE((SELECT definition FROM vocabulary WHERE attname='qualification_evidence_kind'), '') AS evidence_kind,
+				COALESCE((SELECT definition FROM table_checks WHERE relname='asset_sources'), '') AS source_checks,
+				COALESCE((SELECT definition FROM table_checks WHERE relname='asset_source_runs'), '') AS run_checks
+		)
+		SELECT
+			(SELECT count(*) FROM actual_source JOIN expected_source USING (column_name)),
+			(SELECT count(*) FROM actual_source LEFT JOIN expected_source USING (column_name)
+			 WHERE expected_source.column_name IS NULL),
+			(SELECT count(*) FROM actual_run JOIN expected_run USING (column_name)),
+			(SELECT count(*) FROM actual_run LEFT JOIN expected_run USING (column_name)
+			 WHERE expected_run.column_name IS NULL),
+			(SELECT count(*)
+			 FROM actual_source
+			 JOIN expected_source_shape USING (column_name,data_type)
+			 WHERE actual_source.is_nullable='YES'),
+			(SELECT count(*)
+			 FROM actual_run
+			 JOIN expected_run_shape USING (column_name,data_type)
+			 WHERE actual_run.is_nullable='YES'),
+			(SELECT count(*)
+			 FROM pg_constraint c
+			 JOIN pg_class r ON r.oid=c.conrelid
+			 JOIN pg_namespace n ON n.oid=r.relnamespace
+			 WHERE n.nspname='public' AND r.relname=ANY($3::text[]) AND c.contype='f'),
+			(SELECT count(*)
+			 FROM pg_constraint c
+			 JOIN pg_class r ON r.oid=c.conrelid
+			 JOIN pg_namespace n ON n.oid=r.relnamespace
+			 WHERE n.nspname='public'
+			   AND (
+					(c.contype='f' AND r.relname=ANY($3::text[])) OR
+					(c.contype='c' AND r.relname IN ('asset_sources','asset_source_runs'))
+			   )
+			   AND (NOT c.convalidated OR NOT c.conenforced)),
+			(SELECT count(*)
+			 FROM pg_constraint c
+			 JOIN pg_class source_table ON source_table.oid=c.conrelid
+			 JOIN pg_namespace source_namespace ON source_namespace.oid=source_table.relnamespace
+			 JOIN pg_class target_table ON target_table.oid=c.confrelid
+			 JOIN pg_namespace target_namespace ON target_namespace.oid=target_table.relnamespace
+			 WHERE source_namespace.nspname='public'
+			   AND target_namespace.nspname='public'
+			   AND source_table.relname='asset_sources'
+			   AND target_table.relname='asset_source_runs'
+			   AND c.contype='f'
+			   AND c.conname='asset_sources_gate_evidence_run_fk'
+			   AND c.condeferrable AND c.condeferred
+			   AND c.convalidated AND c.conenforced
+			   AND ARRAY(
+					SELECT attribute.attname::text
+					FROM unnest(c.conkey) WITH ORDINALITY AS key(attnum, position)
+					JOIN pg_attribute attribute
+					  ON attribute.attrelid=c.conrelid AND attribute.attnum=key.attnum
+					ORDER BY key.position
+			   )=$4::text[]
+			   AND ARRAY(
+					SELECT attribute.attname::text
+					FROM unnest(c.confkey) WITH ORDINALITY AS key(attnum, position)
+					JOIN pg_attribute attribute
+					  ON attribute.attrelid=c.confrelid AND attribute.attnum=key.attnum
+					ORDER BY key.position
+			   )=$5::text[]),
+			(SELECT count(*)
+			 FROM pg_trigger trigger_record
+			 JOIN pg_class relation ON relation.oid=trigger_record.tgrelid
+			 JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+			 JOIN pg_constraint constraint_record
+			   ON constraint_record.oid=trigger_record.tgconstraint
+			 WHERE namespace.nspname='public'
+			   AND relation.relname='asset_sources'
+			   AND trigger_record.tgname='asset_sources_gate_evidence_closure_guard'
+			   AND trigger_record.tgconstraint<>0
+			   AND trigger_record.tgdeferrable
+			   AND trigger_record.tginitdeferred
+			   AND trigger_record.tgenabled='O'
+			   AND constraint_record.convalidated
+			   AND constraint_record.conenforced),
+			regexp_count(run_kind, '''[A-Z][A-Z0-9_]*''')=5 AND
+				run_kind LIKE '%''VALIDATION''%' AND run_kind LIKE '%''DISCOVERY''%' AND
+				run_kind LIKE '%''CSV_IMPORT''%' AND run_kind LIKE '%''API_INGESTION''%' AND
+				run_kind LIKE '%''MANUAL_MUTATION''%' AND
+				regexp_count(work_result_kind, '''[A-Z][A-Z0-9_]*''')=3 AND
+				work_result_kind LIKE '%''DATA_PROJECTION''%' AND
+				work_result_kind LIKE '%''VALIDATION_PROOF''%' AND
+				work_result_kind LIKE '%''FAILURE_INTENT''%' AND evidence_kind='',
+			regexp_count(run_kind, '''[A-Z][A-Z0-9_]*''')=6 AND
+				run_kind LIKE '%''VALIDATION''%' AND run_kind LIKE '%''DISCOVERY''%' AND
+				run_kind LIKE '%''CSV_IMPORT''%' AND run_kind LIKE '%''API_INGESTION''%' AND
+				run_kind LIKE '%''MANUAL_MUTATION''%' AND
+				run_kind LIKE '%''QUALIFICATION''%' AND
+				regexp_count(work_result_kind, '''[A-Z][A-Z0-9_]*''')=4 AND
+				work_result_kind LIKE '%''DATA_PROJECTION''%' AND
+				work_result_kind LIKE '%''VALIDATION_PROOF''%' AND
+				work_result_kind LIKE '%''FAILURE_INTENT''%' AND
+				work_result_kind LIKE '%''QUALIFICATION_PROOF''%' AND
+				regexp_count(evidence_kind, '''[A-Z][A-Z0-9_]*''')=2 AND
+				evidence_kind LIKE '%''TWO_WORKER_HA''%' AND
+				evidence_kind LIKE '%''PROVIDER_CANARY''%',
+			(SELECT bool_and(position(column_name IN source_checks)>0) FROM expected_source) AND
+				(SELECT bool_and(position(column_name IN run_checks)>0) FROM expected_run)
+		FROM definitions
+	`, qualificationFixtureSourceColumns, qualificationFixtureRunColumns, assetCatalogTableNames(),
+		qualificationFixtureGateForeignKeyColumns,
+		qualificationFixtureGateForeignKeyReferences,
+		qualificationFixtureSourceColumnTypes,
+		qualificationFixtureRunColumnTypes,
+	).Scan(
+		&sourceExpectedColumns,
+		&sourceUnknownColumns,
+		&runExpectedColumns,
+		&runUnknownColumns,
+		&exactSourceShapes,
+		&exactRunShapes,
+		&foreignKeyCount,
+		&invalidClosureCount,
+		&exactGateForeignKeys,
+		&exactClosureTriggers,
+		&oldVocabulary,
+		&fullVocabulary,
+		&fullConstraintClosure,
+	); err != nil {
+		return "", fmt.Errorf("inspect qualification fixture schema closure: %w", err)
+	}
+
+	if sourceExpectedColumns == 0 && sourceUnknownColumns == 0 &&
+		runExpectedColumns == 0 && runUnknownColumns == 0 &&
+		exactSourceShapes == 0 && exactRunShapes == 0 &&
+		foreignKeyCount == 44 && invalidClosureCount == 0 &&
+		exactGateForeignKeys == 0 && exactClosureTriggers == 0 &&
+		oldVocabulary {
+		return qualificationFixtureSchemaOld, nil
+	}
+	if sourceExpectedColumns == len(qualificationFixtureSourceColumns) &&
+		sourceUnknownColumns == 0 &&
+		exactSourceShapes == len(qualificationFixtureSourceColumns) &&
+		runExpectedColumns == len(qualificationFixtureRunColumns) &&
+		runUnknownColumns == 0 &&
+		exactRunShapes == len(qualificationFixtureRunColumns) &&
+		foreignKeyCount == 45 &&
+		invalidClosureCount == 0 &&
+		exactGateForeignKeys == 1 &&
+		exactClosureTriggers == 1 &&
+		fullVocabulary &&
+		fullConstraintClosure {
+		return qualificationFixtureSchemaFull, nil
+	}
+	return "", fmt.Errorf(
+		"partial qualification fixture schema: source_columns=%d+%d/%d run_columns=%d+%d/%d "+
+			"foreign_keys=%d invalid_closure=%d exact_gate_fk=%d exact_closure_trigger=%d "+
+			"old_vocabulary=%t full_vocabulary=%t closure=%t",
+		sourceExpectedColumns,
+		sourceUnknownColumns,
+		exactSourceShapes,
+		runExpectedColumns,
+		runUnknownColumns,
+		exactRunShapes,
+		foreignKeyCount,
+		invalidClosureCount,
+		exactGateForeignKeys,
+		exactClosureTriggers,
+		oldVocabulary,
+		fullVocabulary,
+		fullConstraintClosure,
+	)
+}
+
 const closureExternalProfileManifestV1 = `{"backpressure_base_seconds":1,"backpressure_max_seconds":60,"compatibility_class":"EXTERNAL_V1","credential_purpose":"DISCOVERY_READ","dlp_policy_code":"ASSET_SAFE_V1","environment_mapping_mode":"SINGLE_ENVIRONMENT","freshness_kind":"OBJECT_SEQUENCE","integration_mode":"REQUIRED","max_document_bytes":65536,"max_page_bytes":1048576,"max_page_items":100,"max_page_relations":100,"network_mode":"NONE","parser_code":"EXTERNAL_V1","profile_code":"EXTERNAL_V1","provider_kind":"EXTERNAL_V1","rate_limit_requests":100,"rate_limit_window_seconds":60,"relationship_types":["DEPENDS_ON"],"schedule_mode":"NONE","source_kind":"EXTERNAL_CMDB","sync_mode":"ON_DEMAND","trust_mode":"NONE","trusted_path_codes":["DISPLAY_NAME","EXTERNAL_ID","KIND"],"typed_extension_code":null,"version":"asset-source-profile-manifest.v1"}`
 
 func startClosureManualValidationRunInTx(
@@ -2442,6 +3029,900 @@ func closeClosureExternalRolloverRun(
 	}
 }
 
+type qualificationFixtureSharedFacts struct {
+	gateRevision            int64
+	sourceCheckpointVersion int64
+	sourceCheckpointSHA256  *string
+	sourceLastSuccessRunID  *string
+	sourceLastSuccessAt     *time.Time
+	sourceLastCompleteRunID *string
+	sourceLastCompleteAt    *time.Time
+	providerKind            string
+	sourceDefinitionDigest  string
+	scopeDigest             string
+	bindingDigest           string
+	profileDescriptorDigest string
+	runtimeManifestDigest   string
+	labBindingDigest        string
+	receiptExpiresAt        time.Time
+}
+
+type qualificationFixtureReceipt struct {
+	runID         string
+	receiptDigest string
+}
+
+type qualificationFixtureReceipts struct {
+	facts  qualificationFixtureSharedFacts
+	ha     qualificationFixtureReceipt
+	canary qualificationFixtureReceipt
+}
+
+type qualificationFixtureSeal struct {
+	evidenceKind            string
+	scopeDigest             string
+	bindingDigest           string
+	profileDescriptorDigest string
+	runtimeManifestDigest   string
+	labBindingDigest        string
+	priorReceiptsDigest     string
+	resultDigest            string
+	issuedAt                time.Time
+	expiresAt               time.Time
+	signingKeyID            string
+	signature               string
+	receiptDigest           string
+	haOwnerWorker           *string
+	haTakeoverWorker        *string
+	haOwnerProcess          *string
+	haTakeoverProcess       *string
+	haTakeoverReceipt       *string
+	haRestartReceipt        *string
+	haSessionRecovery       *string
+	haCleanupReceipt        *string
+	haResponseLossReceipt   *string
+	haFactChain             *string
+}
+
+func sealSyntheticQualificationFixtures(
+	t *testing.T,
+	database *pgxpool.Pool,
+	fixture assetCatalogFixture,
+	revision int64,
+) qualificationFixtureReceipts {
+	t.Helper()
+	var facts qualificationFixtureSharedFacts
+	if err := database.QueryRow(context.Background(), `
+		SELECT source.gate_revision,source.checkpoint_version,source.checkpoint_sha256,
+			source.last_success_run_id,source.last_success_at,
+			source.last_complete_snapshot_run_id,source.last_complete_snapshot_at,
+			source.provider_kind,revision.source_definition_digest,
+			clock_timestamp()+interval '30 minutes'
+		FROM asset_sources AS source
+		JOIN asset_source_revisions AS revision
+		  ON revision.tenant_id=source.tenant_id
+		 AND revision.workspace_id=source.workspace_id
+		 AND revision.source_id=source.id
+		 AND revision.revision=source.published_revision
+		 AND revision.canonical_revision_digest=source.published_revision_digest
+		WHERE source.id=$1 AND revision.id=$2
+	`, fixture.sourceID, fixture.revisionID).Scan(
+		&facts.gateRevision,
+		&facts.sourceCheckpointVersion,
+		&facts.sourceCheckpointSHA256,
+		&facts.sourceLastSuccessRunID,
+		&facts.sourceLastSuccessAt,
+		&facts.sourceLastCompleteRunID,
+		&facts.sourceLastCompleteAt,
+		&facts.providerKind,
+		&facts.sourceDefinitionDigest,
+		&facts.receiptExpiresAt,
+	); err != nil {
+		t.Fatalf("read synthetic-test-only qualification fixture facts: %v", err)
+	}
+	facts.bindingDigest = fixture.revisionDigest
+	facts.scopeDigest = assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-qualification-scope.v1"),
+		[]byte(fixture.tenantID),
+		[]byte(fixture.workspaceID),
+		[]byte(fixture.sourceID),
+	)
+	facts.profileDescriptorDigest = facts.sourceDefinitionDigest
+	facts.runtimeManifestDigest = assetCatalogCorrectiveFramedDigest(
+		[]byte("synthetic-test-only-qualification-runtime-manifest.v1"),
+		[]byte(facts.providerKind),
+		assetCatalogCorrectiveDecodeDigest(t, facts.profileDescriptorDigest),
+	)
+	facts.labBindingDigest = assetCatalogCorrectiveFramedDigest(
+		[]byte("synthetic-test-only-qualification-lab-binding.v1"),
+		[]byte(fixture.sourceID),
+		[]byte(strconv.FormatInt(revision, 10)),
+	)
+
+	haReceipt := sealSyntheticQualificationReceipt(
+		t,
+		database,
+		fixture,
+		revision,
+		facts,
+		"TWO_WORKER_HA",
+		nil,
+	)
+	canaryReceipt := sealSyntheticQualificationReceipt(
+		t,
+		database,
+		fixture,
+		revision,
+		facts,
+		"PROVIDER_CANARY",
+		[]string{haReceipt.receiptDigest},
+	)
+	qualificationFixtureRequireClosedTerminals(
+		t, database, fixture, facts, haReceipt, canaryReceipt,
+	)
+	return qualificationFixtureReceipts{
+		facts:  facts,
+		ha:     haReceipt,
+		canary: canaryReceipt,
+	}
+}
+
+func beginSyntheticQualificationOwnerTx(
+	t *testing.T,
+	database *pgxpool.Pool,
+	stage string,
+) pgx.Tx {
+	t.Helper()
+	tx, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatalf("begin synthetic-test-only qualification %s: %v", stage, err)
+	}
+	if _, err := tx.Exec(context.Background(), `SET LOCAL ROLE aiops_schema_owner`); err != nil {
+		_ = tx.Rollback(context.Background())
+		t.Fatalf("assume migration owner for synthetic-test-only qualification %s: %v", stage, err)
+	}
+	return tx
+}
+
+func execSyntheticQualificationOwnerTransition(
+	t *testing.T,
+	database *pgxpool.Pool,
+	stage string,
+	statement string,
+	arguments ...any,
+) {
+	t.Helper()
+	tx := beginSyntheticQualificationOwnerTx(t, database, stage)
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	execAssetSQL(t, tx, statement, arguments...)
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("commit synthetic-test-only qualification %s: %v", stage, err)
+	}
+}
+
+func sealSyntheticQualificationReceipt(
+	t *testing.T,
+	database *pgxpool.Pool,
+	fixture assetCatalogFixture,
+	revision int64,
+	facts qualificationFixtureSharedFacts,
+	evidenceKind string,
+	priorReceiptDigests []string,
+) qualificationFixtureReceipt {
+	t.Helper()
+	leaseOwner := "synthetic-test-only-qualification-owner"
+	if evidenceKind == "PROVIDER_CANARY" {
+		leaseOwner = "synthetic-test-only-qualification-canary"
+	}
+	idempotencyKey := fmt.Sprintf(
+		"synthetic-test-only-%s-%s-%d",
+		strings.ToLower(strings.ReplaceAll(evidenceKind, "_", "-")),
+		fixture.sourceID,
+		revision,
+	)
+	requestDigest := assetCatalogCorrectiveFramedDigest(
+		[]byte("synthetic-test-only-qualification-request.v1"),
+		[]byte(fixture.sourceID),
+		[]byte(strconv.FormatInt(revision, 10)),
+		[]byte(evidenceKind),
+	)
+	priorDigest := qualificationFixturePriorReceiptsDigest(t, priorReceiptDigests)
+	queueTx := beginSyntheticQualificationOwnerTx(t, database, "queue binding")
+	defer func() { _ = queueTx.Rollback(context.Background()) }()
+	var runID string
+	if err := queueTx.QueryRow(context.Background(), `
+		INSERT INTO asset_source_runs (
+			id,tenant_id,workspace_id,source_id,source_revision,source_revision_digest,
+			run_kind,trigger_type,gate_revision,idempotency_key,request_hash,
+			cursor_before_sha256,checkpoint_version,
+			qualification_evidence_kind,qualification_scope_digest,
+			qualification_binding_digest,qualification_profile_descriptor_digest,
+			qualification_runtime_manifest_digest,qualification_lab_binding_digest,
+			qualification_prior_receipts_digest
+		) VALUES (
+			gen_random_uuid(),$1,$2,$3,$4,$5,'QUALIFICATION','API',$6,$7,$8,NULL,0,
+			$9,$10,$11,$12,$13,$14,$15
+		)
+		RETURNING id
+	`, fixture.tenantID, fixture.workspaceID, fixture.sourceID, revision,
+		fixture.revisionDigest, facts.gateRevision, idempotencyKey,
+		requestDigest, evidenceKind, facts.scopeDigest, facts.bindingDigest,
+		facts.profileDescriptorDigest, facts.runtimeManifestDigest,
+		facts.labBindingDigest, priorDigest).Scan(&runID); err != nil {
+		t.Fatalf("create synthetic-test-only qualification run: %v", err)
+	}
+	if err := queueTx.Commit(context.Background()); err != nil {
+		t.Fatalf("commit synthetic-test-only qualification queue binding: %v", err)
+	}
+	qualificationFixtureRequireQueuedBinding(t, database, runID, evidenceKind, priorDigest)
+
+	execSyntheticQualificationOwnerTransition(t, database, "claim", `
+		UPDATE asset_source_runs
+		SET status='RUNNING',stage_code='READING',lease_owner=$2,
+			lease_expires_at=clock_timestamp()+interval '10 minutes',
+			fence_epoch=1,fence_token_hash=$3,heartbeat_sequence=1,
+			heartbeat_at=clock_timestamp(),version=version+1
+		WHERE id=$1
+	`, runID, leaseOwner, assetCatalogCorrectiveFramedDigest(
+		[]byte("synthetic-test-only-qualification-fence.v1"),
+		[]byte(runID),
+		[]byte("1"),
+	))
+
+	execSyntheticQualificationOwnerTransition(t, database, "cleanup reservation", `
+		UPDATE asset_source_runs
+		SET stage_code='CLEANING_UP',cleanup_status='PENDING',
+			cleanup_attempt_id=gen_random_uuid(),
+			cleanup_attempt_epoch=fence_epoch,version=version+1
+		WHERE id=$1
+	`, runID)
+	var cleanupAttemptEpoch int64
+	if err := database.QueryRow(context.Background(), `
+		SELECT cleanup_attempt_epoch
+		FROM asset_source_runs
+		WHERE id=$1 AND cleanup_status='PENDING'
+	`, runID).Scan(&cleanupAttemptEpoch); err != nil {
+		t.Fatalf("read synthetic-test-only cleanup attempt epoch: %v", err)
+	}
+	cleanupDigest := assetCatalogCorrectiveFramedDigest(
+		[]byte("synthetic-test-only-qualification-cleanup.v1"),
+		[]byte(runID),
+		[]byte(evidenceKind),
+		[]byte(strconv.FormatInt(cleanupAttemptEpoch, 10)),
+	)
+	haFacts := qualificationFixtureHAFacts(
+		t,
+		fixture,
+		revision,
+		runID,
+		evidenceKind,
+		cleanupAttemptEpoch,
+		cleanupDigest,
+	)
+	resultFields := [][]byte{
+		[]byte("synthetic-test-only-qualification-result.v1"),
+		[]byte(runID),
+		[]byte(evidenceKind),
+		[]byte(strconv.FormatInt(cleanupAttemptEpoch, 10)),
+	}
+	if haFacts.factChain != "" {
+		resultFields = append(
+			resultFields,
+			assetCatalogCorrectiveDecodeDigest(t, haFacts.factChain),
+		)
+	}
+	resultDigest := assetCatalogCorrectiveFramedDigest(resultFields...)
+	execSyntheticQualificationOwnerTransition(t, database, "WorkResult", `
+		UPDATE asset_source_runs
+		SET status='FINALIZING',work_result_kind='QUALIFICATION_PROOF',
+			work_result_status='SUCCEEDED',work_result_digest=$2,
+			work_result_recorded_at=statement_timestamp(),
+			qualification_result_digest=$2,version=version+1
+		WHERE id=$1
+	`, runID, resultDigest)
+	qualificationFixtureRequireUnsealedFinalizing(t, database, runID, "PENDING")
+
+	var (
+		recordedAt   time.Time
+		currentFence int64
+	)
+	if err := database.QueryRow(context.Background(), `
+		SELECT work_result_recorded_at,fence_epoch
+		FROM asset_source_runs
+		WHERE id=$1 AND status='FINALIZING' AND cleanup_status='PENDING'
+	`, runID).Scan(&recordedAt, &currentFence); err != nil {
+		t.Fatalf("read synthetic-test-only qualification result time: %v", err)
+	}
+	seal := closeSyntheticQualificationReceipt(
+		t,
+		database,
+		fixture,
+		runID,
+		revision,
+		facts,
+		evidenceKind,
+		priorDigest,
+		resultDigest,
+		cleanupDigest,
+		haFacts,
+		recordedAt,
+		currentFence,
+		cleanupAttemptEpoch,
+	)
+	return qualificationFixtureReceipt{runID: runID, receiptDigest: seal.receiptDigest}
+}
+
+func closeSyntheticQualificationReceipt(
+	t *testing.T,
+	database *pgxpool.Pool,
+	fixture assetCatalogFixture,
+	runID string,
+	revision int64,
+	facts qualificationFixtureSharedFacts,
+	evidenceKind string,
+	priorDigest string,
+	resultDigest string,
+	cleanupDigest string,
+	haFacts qualificationFixtureHASeal,
+	recordedAt time.Time,
+	currentFence int64,
+	cleanupAttemptEpoch int64,
+) qualificationFixtureSeal {
+	t.Helper()
+	tx := beginSyntheticQualificationOwnerTx(t, database, "final closure")
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	insertCleanupAudit(t, tx, fixture, runID, cleanupAttemptEpoch, cleanupDigest)
+	var revoked bool
+	if err := tx.QueryRow(context.Background(), `
+		UPDATE asset_source_runs
+		SET cleanup_status='REVOKED',cleanup_digest=$2,version=version+1
+		WHERE id=$1 AND status='FINALIZING' AND cleanup_status='PENDING'
+		  AND fence_epoch=$3 AND cleanup_attempt_epoch=$4
+		  AND qualification_result_digest=$5
+		RETURNING true
+	`, runID, cleanupDigest, currentFence, cleanupAttemptEpoch, resultDigest).Scan(&revoked); err != nil {
+		t.Fatalf("record synthetic-test-only qualification cleanup proof: %v", err)
+	}
+	if !revoked {
+		t.Fatal("synthetic-test-only qualification cleanup CAS returned false")
+	}
+	qualificationFixtureRequireUnsealedFinalizing(t, tx, runID, "REVOKED")
+
+	var issuedAt time.Time
+	if err := tx.QueryRow(context.Background(), `
+		SELECT date_trunc(
+			'microseconds',
+			GREATEST(clock_timestamp(),$1::timestamptz+interval '1 microsecond')
+		)
+	`, recordedAt).Scan(&issuedAt); err != nil {
+		t.Fatalf("derive independent synthetic-test-only receipt issued time: %v", err)
+	}
+	if !issuedAt.After(recordedAt) {
+		t.Fatalf("qualification receipt issued_at=%s must be after WorkResult recorded_at=%s",
+			issuedAt, recordedAt)
+	}
+	if !facts.receiptExpiresAt.After(issuedAt) {
+		t.Fatalf("qualification receipt expiry=%s must be after issued_at=%s",
+			facts.receiptExpiresAt, issuedAt)
+	}
+
+	signingKeyID := "synthetic-test-only-signing-key-v1"
+	receiptDigest := assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-qualification-receipt.v1"),
+		[]byte(fixture.tenantID),
+		[]byte(fixture.workspaceID),
+		[]byte(fixture.sourceID),
+		[]byte(strconv.FormatInt(revision, 10)),
+		assetCatalogCorrectiveDecodeDigest(t, facts.bindingDigest),
+		assetCatalogCorrectiveDecodeDigest(t, facts.profileDescriptorDigest),
+		assetCatalogCorrectiveDecodeDigest(t, facts.runtimeManifestDigest),
+		assetCatalogCorrectiveDecodeDigest(t, facts.labBindingDigest),
+		[]byte(evidenceKind),
+		assetCatalogCorrectiveDecodeDigest(t, priorDigest),
+		assetCatalogCorrectiveDecodeDigest(t, resultDigest),
+		[]byte(qualificationFixtureTimestamp(issuedAt)),
+		[]byte(qualificationFixtureTimestamp(facts.receiptExpiresAt)),
+		[]byte(signingKeyID),
+	)
+	signatureMaterial := append(
+		assetCatalogCorrectiveDecodeDigest(t, receiptDigest),
+		assetCatalogCorrectiveDecodeDigest(t, receiptDigest)...,
+	)
+	seal := qualificationFixtureSeal{
+		evidenceKind:            evidenceKind,
+		scopeDigest:             facts.scopeDigest,
+		bindingDigest:           facts.bindingDigest,
+		profileDescriptorDigest: facts.profileDescriptorDigest,
+		runtimeManifestDigest:   facts.runtimeManifestDigest,
+		labBindingDigest:        facts.labBindingDigest,
+		priorReceiptsDigest:     priorDigest,
+		resultDigest:            resultDigest,
+		issuedAt:                issuedAt,
+		expiresAt:               facts.receiptExpiresAt,
+		signingKeyID:            signingKeyID,
+		signature:               base64.RawURLEncoding.EncodeToString(signatureMaterial),
+		receiptDigest:           receiptDigest,
+		haOwnerWorker:           qualificationFixtureOptionalDigest(haFacts.ownerWorker),
+		haTakeoverWorker:        qualificationFixtureOptionalDigest(haFacts.takeoverWorker),
+		haOwnerProcess:          qualificationFixtureOptionalDigest(haFacts.ownerProcess),
+		haTakeoverProcess:       qualificationFixtureOptionalDigest(haFacts.takeoverProcess),
+		haTakeoverReceipt:       qualificationFixtureOptionalDigest(haFacts.takeoverReceipt),
+		haRestartReceipt:        qualificationFixtureOptionalDigest(haFacts.restartReceipt),
+		haSessionRecovery:       qualificationFixtureOptionalDigest(haFacts.sessionRecovery),
+		haCleanupReceipt:        qualificationFixtureOptionalDigest(haFacts.cleanupReceipt),
+		haResponseLossReceipt:   qualificationFixtureOptionalDigest(haFacts.responseLossReceipt),
+		haFactChain:             qualificationFixtureOptionalDigest(haFacts.factChain),
+	}
+
+	var sealed bool
+	if err := tx.QueryRow(context.Background(), `
+		UPDATE asset_source_runs
+		SET qualification_receipt_issued_at=$2,qualification_receipt_expires_at=$3,
+			qualification_signing_key_id=$4,qualification_signature=$5,
+			qualification_receipt_digest=$6,
+			ha_owner_worker_identity_digest=$7,ha_takeover_worker_identity_digest=$8,
+			ha_owner_process_instance_digest=$9,ha_takeover_process_instance_digest=$10,
+			ha_takeover_receipt_digest=$11,ha_restart_receipt_digest=$12,
+			ha_session_recovery_receipt_digest=$13,ha_cleanup_receipt_digest=$14,
+			ha_response_loss_receipt_digest=$15,ha_fact_chain_digest=$16,
+			version=version+1
+		WHERE id=$1 AND status='FINALIZING' AND cleanup_status='REVOKED'
+		  AND fence_epoch=$17 AND cleanup_attempt_epoch=$18
+		  AND qualification_evidence_kind=$19 AND qualification_scope_digest=$20
+		  AND qualification_binding_digest=$21
+		  AND qualification_profile_descriptor_digest=$22
+		  AND qualification_runtime_manifest_digest=$23
+		  AND qualification_lab_binding_digest=$24
+		  AND qualification_prior_receipts_digest=$25
+		  AND qualification_result_digest=$26
+		  AND num_nonnulls(
+			qualification_receipt_issued_at,qualification_receipt_expires_at,
+			qualification_signing_key_id,
+			qualification_signature,qualification_receipt_digest,
+			ha_owner_worker_identity_digest,ha_takeover_worker_identity_digest,
+			ha_owner_process_instance_digest,ha_takeover_process_instance_digest,
+			ha_takeover_receipt_digest,ha_restart_receipt_digest,
+			ha_session_recovery_receipt_digest,ha_cleanup_receipt_digest,
+			ha_response_loss_receipt_digest,ha_fact_chain_digest
+		  )=0
+		RETURNING true
+	`, runID, seal.issuedAt, seal.expiresAt, seal.signingKeyID, seal.signature,
+		seal.receiptDigest,
+		seal.haOwnerWorker, seal.haTakeoverWorker,
+		seal.haOwnerProcess, seal.haTakeoverProcess, seal.haTakeoverReceipt,
+		seal.haRestartReceipt, seal.haSessionRecovery, seal.haCleanupReceipt,
+		seal.haResponseLossReceipt, seal.haFactChain, currentFence,
+		cleanupAttemptEpoch, seal.evidenceKind, seal.scopeDigest, seal.bindingDigest,
+		seal.profileDescriptorDigest, seal.runtimeManifestDigest, seal.labBindingDigest,
+		seal.priorReceiptsDigest, seal.resultDigest).Scan(&sealed); err != nil {
+		t.Fatalf("seal synthetic-test-only qualification receipt: %v", err)
+	}
+	if !sealed {
+		t.Fatal("synthetic-test-only qualification receipt CAS returned false")
+	}
+	qualificationFixtureRequireSealedFinalizing(t, tx, runID, seal)
+
+	terminalDigest := sourceRunTerminalDigest(t, tx, runID, "SUCCEEDED", nil)
+	insertTerminalAudit(t, tx, fixture, runID, terminalDigest)
+	var terminal bool
+	if err := tx.QueryRow(context.Background(), `
+		UPDATE asset_source_runs
+		SET status='SUCCEEDED',stage_code='COMPLETED',
+			terminal_command_sha256=$2,version=version+1
+		WHERE id=$1 AND status='FINALIZING'
+		  AND qualification_receipt_digest=$3
+		RETURNING true
+	`, runID, terminalDigest, seal.receiptDigest).Scan(&terminal); err != nil {
+		t.Fatalf("close synthetic-test-only qualification terminal: %v", err)
+	}
+	if !terminal {
+		t.Fatal("synthetic-test-only qualification terminal CAS returned false")
+	}
+
+	var terminalClosed bool
+	if err := tx.QueryRow(context.Background(), `
+		SELECT run.status='SUCCEEDED' AND run.stage_code='COMPLETED' AND
+			run.cleanup_status='REVOKED' AND
+			run.qualification_receipt_digest=$3 AND
+			source.gate_status='UNAVAILABLE' AND
+			num_nonnulls(
+				source.gate_evidence_run_id,
+				source.gate_evidence_digest,
+				source.gate_evidence_expires_at
+			)=0
+		FROM asset_source_runs AS run
+		JOIN asset_sources AS source
+		  ON source.tenant_id=run.tenant_id
+		 AND source.workspace_id=run.workspace_id
+		 AND source.id=run.source_id
+		WHERE run.id=$1 AND source.id=$2
+	`, runID, fixture.sourceID, seal.receiptDigest).Scan(&terminalClosed); err != nil {
+		t.Fatalf("verify qualification terminal kept Source gate closed: %v", err)
+	}
+	if !terminalClosed {
+		t.Fatal("qualification terminal fixture wrote Source pointer or AVAILABLE")
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("commit synthetic-test-only qualification final closure: %v", err)
+	}
+	return seal
+}
+
+type qualificationFixtureHASeal struct {
+	ownerWorker         string
+	takeoverWorker      string
+	ownerProcess        string
+	takeoverProcess     string
+	takeoverReceipt     string
+	restartReceipt      string
+	sessionRecovery     string
+	cleanupReceipt      string
+	responseLossReceipt string
+	factChain           string
+}
+
+func qualificationFixtureHAFacts(
+	t *testing.T,
+	fixture assetCatalogFixture,
+	revision int64,
+	runID string,
+	evidenceKind string,
+	cleanupAttemptEpoch int64,
+	cleanupDigest string,
+) qualificationFixtureHASeal {
+	t.Helper()
+	if evidenceKind != "TWO_WORKER_HA" {
+		return qualificationFixtureHASeal{}
+	}
+	factDigest := func(label string, eventFence int64) string {
+		return assetCatalogCorrectiveFramedDigest(
+			[]byte("synthetic-test-only-qualification-"+label+".v1"),
+			[]byte(runID),
+			[]byte(fixture.sourceID),
+			[]byte(strconv.FormatInt(revision, 10)),
+			[]byte(strconv.FormatInt(eventFence, 10)),
+			[]byte(strconv.FormatInt(cleanupAttemptEpoch, 10)),
+		)
+	}
+	facts := qualificationFixtureHASeal{
+		ownerWorker:         factDigest("ha-owner-worker", 1),
+		takeoverWorker:      factDigest("ha-takeover-worker", 2),
+		ownerProcess:        factDigest("ha-owner-process", 1),
+		takeoverProcess:     factDigest("ha-takeover-process", 2),
+		takeoverReceipt:     factDigest("ha-takeover-receipt", 2),
+		restartReceipt:      factDigest("ha-restart-receipt", 2),
+		sessionRecovery:     factDigest("ha-session-recovery-receipt", 2),
+		cleanupReceipt:      cleanupDigest,
+		responseLossReceipt: factDigest("ha-response-loss-receipt", 2),
+	}
+	facts.factChain = assetCatalogCorrectiveFramedDigest(
+		[]byte("asset-source-qualification-ha-fact-chain.v1"),
+		[]byte(runID),
+		[]byte(fixture.sourceID),
+		[]byte(strconv.FormatInt(revision, 10)),
+		[]byte(strconv.FormatInt(cleanupAttemptEpoch, 10)),
+		assetCatalogCorrectiveDecodeDigest(t, facts.ownerWorker),
+		assetCatalogCorrectiveDecodeDigest(t, facts.takeoverWorker),
+		assetCatalogCorrectiveDecodeDigest(t, facts.ownerProcess),
+		assetCatalogCorrectiveDecodeDigest(t, facts.takeoverProcess),
+		assetCatalogCorrectiveDecodeDigest(t, facts.takeoverReceipt),
+		assetCatalogCorrectiveDecodeDigest(t, facts.restartReceipt),
+		assetCatalogCorrectiveDecodeDigest(t, facts.sessionRecovery),
+		assetCatalogCorrectiveDecodeDigest(t, facts.cleanupReceipt),
+		assetCatalogCorrectiveDecodeDigest(t, facts.responseLossReceipt),
+	)
+	return facts
+}
+
+func qualificationFixtureOptionalDigest(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func qualificationFixturePriorReceiptsDigest(t *testing.T, receipts []string) string {
+	t.Helper()
+	fields := [][]byte{
+		[]byte("qualification-prior-receipts.v1"),
+		[]byte(strconv.Itoa(len(receipts))),
+	}
+	for _, receipt := range receipts {
+		fields = append(fields, assetCatalogCorrectiveDecodeDigest(t, receipt))
+	}
+	return assetCatalogCorrectiveFramedDigest(fields...)
+}
+
+func qualificationFixtureTimestamp(value time.Time) string {
+	return value.UTC().Truncate(time.Microsecond).Format("2006-01-02T15:04:05.000000Z")
+}
+
+func qualificationFixtureRequireQueuedBinding(
+	t *testing.T,
+	database assetSQLQuerier,
+	runID string,
+	evidenceKind string,
+	priorReceiptsDigest string,
+) {
+	t.Helper()
+	var exact bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT run.status='QUEUED' AND run.stage_code='WAITING' AND
+			run.cleanup_status='NOT_OPENED' AND run.run_kind='QUALIFICATION' AND
+			run.qualification_evidence_kind=$2 AND
+			run.qualification_prior_receipts_digest=$3 AND
+			num_nonnulls(
+				run.qualification_evidence_kind,run.qualification_scope_digest,
+				run.qualification_binding_digest,run.qualification_profile_descriptor_digest,
+				run.qualification_runtime_manifest_digest,run.qualification_lab_binding_digest,
+				run.qualification_prior_receipts_digest
+			)=7 AND
+			num_nonnulls(
+				run.qualification_result_digest,
+				run.qualification_receipt_issued_at,run.qualification_receipt_expires_at,
+				run.qualification_signing_key_id,run.qualification_signature,
+				run.qualification_receipt_digest,
+				run.ha_owner_worker_identity_digest,run.ha_takeover_worker_identity_digest,
+				run.ha_owner_process_instance_digest,run.ha_takeover_process_instance_digest,
+				run.ha_takeover_receipt_digest,run.ha_restart_receipt_digest,
+				run.ha_session_recovery_receipt_digest,run.ha_cleanup_receipt_digest,
+				run.ha_response_loss_receipt_digest,run.ha_fact_chain_digest
+			)=0 AND
+			run.work_result_kind IS NULL AND run.work_result_status IS NULL AND
+			run.work_result_digest IS NULL AND run.work_result_recorded_at IS NULL AND
+			run.cursor_before_sha256 IS NULL AND run.cursor_after_sha256 IS NULL AND
+			run.checkpoint_version=0 AND run.page_sequence=0 AND
+			run.relation_page_sequence=0
+		FROM asset_source_runs AS run
+		WHERE run.id=$1
+	`, runID, evidenceKind, priorReceiptsDigest).Scan(&exact); err != nil {
+		t.Fatalf("read immutable synthetic-test-only qualification queue binding: %v", err)
+	}
+	if !exact {
+		t.Fatal("qualification queue fixture omitted or presealed immutable binding facts")
+	}
+}
+
+func qualificationFixtureRequireUnsealedFinalizing(
+	t *testing.T,
+	database assetSQLQuerier,
+	runID string,
+	cleanupStatus string,
+) {
+	t.Helper()
+	var exact bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT run.status='FINALIZING' AND
+			run.cleanup_status=$2 AND
+			run.work_result_kind='QUALIFICATION_PROOF' AND
+			run.work_result_status='SUCCEEDED' AND
+			run.work_result_digest=run.qualification_result_digest AND
+			run.work_result_recorded_at IS NOT NULL AND
+			run.cursor_before_sha256 IS NULL AND run.cursor_after_sha256 IS NULL AND
+			run.checkpoint_version=0 AND
+			run.page_sequence=0 AND run.page_digest IS NULL AND
+			run.relation_page_sequence=0 AND run.relation_page_digest IS NULL AND
+			NOT run.final_page AND NOT run.complete_snapshot AND
+			NOT run.effective_complete_snapshot AND
+			run.observed_count=0 AND run.created_count=0 AND run.changed_count=0 AND
+			run.unchanged_count=0 AND run.conflict_count=0 AND run.missing_count=0 AND
+			run.stale_count=0 AND run.restored_count=0 AND
+			run.tombstoned_count=0 AND run.rejected_count=0 AND
+			num_nonnulls(
+				run.qualification_evidence_kind,run.qualification_scope_digest,
+				run.qualification_binding_digest,run.qualification_profile_descriptor_digest,
+				run.qualification_runtime_manifest_digest,run.qualification_lab_binding_digest,
+				run.qualification_prior_receipts_digest,run.qualification_result_digest
+			)=8 AND
+			num_nonnulls(
+				run.qualification_receipt_issued_at,run.qualification_receipt_expires_at,
+				run.qualification_signing_key_id,
+				run.qualification_signature,run.qualification_receipt_digest,
+				run.ha_owner_worker_identity_digest,run.ha_takeover_worker_identity_digest,
+				run.ha_owner_process_instance_digest,run.ha_takeover_process_instance_digest,
+				run.ha_takeover_receipt_digest,run.ha_restart_receipt_digest,
+				run.ha_session_recovery_receipt_digest,run.ha_cleanup_receipt_digest,
+				run.ha_response_loss_receipt_digest,run.ha_fact_chain_digest
+			)=0
+		FROM asset_source_runs AS run
+		WHERE run.id=$1
+	`, runID, cleanupStatus).Scan(&exact); err != nil {
+		t.Fatalf("read unsealed synthetic-test-only qualification result: %v", err)
+	}
+	if !exact {
+		t.Fatal("qualification WorkResult/cleanup fixture changed queue facts or presealed receipt/HA facts")
+	}
+}
+
+func qualificationFixtureRequireSealedFinalizing(
+	t *testing.T,
+	database assetSQLQuerier,
+	runID string,
+	seal qualificationFixtureSeal,
+) {
+	t.Helper()
+	var exact bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT run.status='FINALIZING' AND run.stage_code='CLEANING_UP' AND
+			run.terminal_command_sha256 IS NULL AND
+			run.run_kind='QUALIFICATION' AND run.work_result_kind='QUALIFICATION_PROOF' AND
+			run.work_result_status='SUCCEEDED' AND run.work_result_digest=$3 AND
+			run.cleanup_status='REVOKED' AND run.qualification_evidence_kind=$2 AND
+			run.qualification_result_digest=$3 AND run.qualification_receipt_digest=$4 AND
+			run.qualification_receipt_issued_at>run.work_result_recorded_at AND
+			run.qualification_receipt_expires_at>run.qualification_receipt_issued_at AND
+			position('=' IN run.qualification_signature)=0 AND
+			num_nonnulls(
+				run.qualification_evidence_kind,run.qualification_scope_digest,
+				run.qualification_binding_digest,run.qualification_profile_descriptor_digest,
+				run.qualification_runtime_manifest_digest,run.qualification_lab_binding_digest,
+				run.qualification_prior_receipts_digest,run.qualification_result_digest,
+				run.qualification_receipt_issued_at,run.qualification_receipt_expires_at,
+				run.qualification_signing_key_id,
+				run.qualification_signature,run.qualification_receipt_digest
+			)=13 AND
+			run.page_sequence=0 AND run.page_digest IS NULL AND
+			run.relation_page_sequence=0 AND run.relation_page_digest IS NULL AND
+			NOT run.final_page AND NOT run.complete_snapshot AND
+			NOT run.effective_complete_snapshot AND
+			run.cursor_before_sha256 IS NULL AND run.cursor_after_sha256 IS NULL AND
+			run.checkpoint_version=0 AND
+			run.observed_count=0 AND run.created_count=0 AND run.changed_count=0 AND
+			run.unchanged_count=0 AND run.conflict_count=0 AND run.missing_count=0 AND
+			run.stale_count=0 AND run.restored_count=0 AND
+			run.tombstoned_count=0 AND run.rejected_count=0 AND
+			CASE WHEN $2='PROVIDER_CANARY' THEN
+				num_nonnulls(
+					run.ha_owner_worker_identity_digest,run.ha_takeover_worker_identity_digest,
+					run.ha_owner_process_instance_digest,run.ha_takeover_process_instance_digest,
+					run.ha_takeover_receipt_digest,run.ha_restart_receipt_digest,
+					run.ha_session_recovery_receipt_digest,run.ha_cleanup_receipt_digest,
+					run.ha_response_loss_receipt_digest,run.ha_fact_chain_digest
+				)=0
+			ELSE
+				num_nonnulls(
+					run.ha_owner_worker_identity_digest,run.ha_takeover_worker_identity_digest,
+					run.ha_owner_process_instance_digest,run.ha_takeover_process_instance_digest,
+					run.ha_takeover_receipt_digest,run.ha_restart_receipt_digest,
+					run.ha_session_recovery_receipt_digest,run.ha_cleanup_receipt_digest,
+					run.ha_response_loss_receipt_digest,run.ha_fact_chain_digest
+				)=10 AND
+				run.ha_owner_worker_identity_digest<>run.ha_takeover_worker_identity_digest AND
+				run.ha_owner_process_instance_digest<>run.ha_takeover_process_instance_digest
+			END
+		FROM asset_source_runs AS run
+		WHERE run.id=$1
+	`, runID, seal.evidenceKind, seal.resultDigest, seal.receiptDigest).Scan(&exact); err != nil {
+		t.Fatalf("read sealed synthetic-test-only qualification receipt: %v", err)
+	}
+	if !exact {
+		t.Fatalf(
+			"FINALIZING qualification %s receipt did not seal exact safe facts",
+			seal.evidenceKind,
+		)
+	}
+}
+
+func qualificationFixtureRequireClosedTerminals(
+	t *testing.T,
+	database *pgxpool.Pool,
+	fixture assetCatalogFixture,
+	facts qualificationFixtureSharedFacts,
+	ha qualificationFixtureReceipt,
+	canary qualificationFixtureReceipt,
+) {
+	t.Helper()
+	runIDs := []string{ha.runID, canary.runID}
+	var exact bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT source.status='ACTIVE' AND source.gate_status='UNAVAILABLE' AND
+			source.gate_revision=$2 AND
+			num_nonnulls(
+				source.gate_evidence_run_id,
+				source.gate_evidence_digest,
+				source.gate_evidence_expires_at
+			)=0 AND
+			source.checkpoint_version=$3 AND
+			source.checkpoint_sha256 IS NOT DISTINCT FROM $4 AND
+			source.last_success_run_id IS NOT DISTINCT FROM $5 AND
+			source.last_success_at IS NOT DISTINCT FROM $6 AND
+			source.last_complete_snapshot_run_id IS NOT DISTINCT FROM $7 AND
+			source.last_complete_snapshot_at IS NOT DISTINCT FROM $8 AND
+			NOT COALESCE(source.last_success_run_id::text=ANY($9::text[]),false) AND
+			NOT COALESCE(source.last_complete_snapshot_run_id::text=ANY($9::text[]),false) AND
+			(SELECT count(*)
+			 FROM asset_source_runs AS run
+			 WHERE run.id::text=ANY($9::text[]) AND
+				run.status='SUCCEEDED' AND run.stage_code='COMPLETED' AND
+				run.run_kind='QUALIFICATION' AND
+				run.work_result_kind='QUALIFICATION_PROOF' AND
+				run.work_result_status='SUCCEEDED' AND
+				run.work_result_digest=run.qualification_result_digest AND
+				run.cleanup_status='REVOKED' AND
+				run.qualification_receipt_issued_at>run.work_result_recorded_at AND
+				run.qualification_receipt_expires_at>run.qualification_receipt_issued_at AND
+				run.terminal_command_sha256 IS NOT NULL)=2
+		FROM asset_sources AS source
+		WHERE source.id=$1
+	`, fixture.sourceID, facts.gateRevision, facts.sourceCheckpointVersion,
+		facts.sourceCheckpointSHA256, facts.sourceLastSuccessRunID,
+		facts.sourceLastSuccessAt, facts.sourceLastCompleteRunID,
+		facts.sourceLastCompleteAt, runIDs).Scan(&exact); err != nil {
+		t.Fatalf("read synthetic-test-only closed qualification terminals: %v", err)
+	}
+	if !exact {
+		t.Fatal("qualification terminal closure opened the Source gate or changed Catalog pointers")
+	}
+}
+
+func qualificationFixtureRequireTerminalClosure(
+	t *testing.T,
+	database *pgxpool.Pool,
+	fixture assetCatalogFixture,
+	facts qualificationFixtureSharedFacts,
+	ha qualificationFixtureReceipt,
+	canary qualificationFixtureReceipt,
+) {
+	t.Helper()
+	runIDs := []string{ha.runID, canary.runID}
+	priorReceiptsDigest := qualificationFixturePriorReceiptsDigest(
+		t, []string{ha.receiptDigest},
+	)
+	var exact bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT source.status='ACTIVE' AND source.gate_status='AVAILABLE' AND
+			source.gate_reason_code IS NULL AND source.gate_revision=$2+1 AND
+			source.checkpoint_version=$3 AND
+			source.checkpoint_sha256 IS NOT DISTINCT FROM $4 AND
+			source.last_success_run_id IS NOT DISTINCT FROM $5 AND
+			source.last_success_at IS NOT DISTINCT FROM $6 AND
+			source.last_complete_snapshot_run_id IS NOT DISTINCT FROM $7 AND
+			source.last_complete_snapshot_at IS NOT DISTINCT FROM $8 AND
+			NOT COALESCE(source.last_success_run_id::text=ANY($9::text[]),false) AND
+			NOT COALESCE(source.last_complete_snapshot_run_id::text=ANY($9::text[]),false) AND
+			source.gate_evidence_run_id::text=$10 AND
+			source.gate_evidence_digest=$11 AND
+			source.gate_evidence_expires_at=$12 AND
+			source.gate_evidence_expires_at>clock_timestamp() AND
+			(SELECT count(*)
+			 FROM asset_source_runs AS run
+			 WHERE run.id::text=ANY($9::text[]) AND
+				run.status='SUCCEEDED' AND run.stage_code='COMPLETED' AND
+				run.run_kind='QUALIFICATION' AND run.cleanup_status='REVOKED' AND
+				run.cursor_before_sha256 IS NULL AND run.cursor_after_sha256 IS NULL AND
+				run.checkpoint_version=0 AND
+				run.page_sequence=0 AND run.page_digest IS NULL AND
+				run.relation_page_sequence=0 AND run.relation_page_digest IS NULL AND
+				NOT run.final_page AND NOT run.complete_snapshot AND
+				NOT run.effective_complete_snapshot AND
+				run.qualification_receipt_issued_at>run.work_result_recorded_at AND
+				run.qualification_receipt_expires_at>run.qualification_receipt_issued_at AND
+				run.observed_count=0 AND run.created_count=0 AND run.changed_count=0 AND
+				run.unchanged_count=0 AND run.conflict_count=0 AND run.missing_count=0 AND
+				run.stale_count=0 AND run.restored_count=0 AND
+				run.tombstoned_count=0 AND run.rejected_count=0)=2 AND
+			(SELECT qualification_prior_receipts_digest
+			 FROM asset_source_runs WHERE id=$10)=$13 AND
+			(SELECT count(*) FROM asset_observations
+			 WHERE run_id::text=ANY($9::text[]))=0 AND
+			(SELECT count(*) FROM asset_relationships
+			 WHERE last_run_id::text=ANY($9::text[]))=0
+		FROM asset_sources AS source
+		WHERE source.id=$1
+	`, fixture.sourceID, facts.gateRevision, facts.sourceCheckpointVersion,
+		facts.sourceCheckpointSHA256, facts.sourceLastSuccessRunID,
+		facts.sourceLastSuccessAt, facts.sourceLastCompleteRunID,
+		facts.sourceLastCompleteAt, runIDs, canary.runID,
+		canary.receiptDigest, facts.receiptExpiresAt,
+		priorReceiptsDigest).Scan(&exact); err != nil {
+		t.Fatalf("read synthetic-test-only qualification terminal closure: %v", err)
+	}
+	if !exact {
+		t.Fatal("terminal qualification fixtures changed checkpoint, projection, or success pointers")
+	}
+}
+
 func finishClosureExternalValidation(
 	t *testing.T,
 	database *pgxpool.Pool,
@@ -2450,6 +3931,12 @@ func finishClosureExternalValidation(
 	proof string,
 ) {
 	t.Helper()
+	qualificationSchema, err := qualificationFixtureSchemaStateFor(
+		context.Background(), database,
+	)
+	if err != nil {
+		t.Fatalf("inspect qualification fixture schema before validation closure: %v", err)
+	}
 	execAssetSQL(t, database, `
 		UPDATE asset_source_runs
 		SET stage_code='CLEANING_UP',cleanup_status='PENDING',cleanup_attempt_id=gen_random_uuid(),
@@ -2504,19 +3991,59 @@ func finishClosureExternalValidation(
 	if !publicationClosed {
 		t.Fatal("external publication did not close the visible validation gate at its exact epoch")
 	}
+	var qualificationReceipts qualificationFixtureReceipts
+	if qualificationSchema == qualificationFixtureSchemaFull {
+		qualificationReceipts = sealSyntheticQualificationFixtures(
+			t, database, fixture, revision,
+		)
+	}
 	available, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		t.Fatalf("begin external validation AVAILABLE gate: %v", err)
 	}
 	defer func() { _ = available.Rollback(context.Background()) }()
-	execAssetSQL(t, available, `
-		UPDATE asset_sources
-		SET gate_status='AVAILABLE',gate_reason_code=NULL,gate_revision=gate_revision+1,
-			validated_run_id=$2,validation_digest=$3,validated_binding_digest=$4,
-			version=version+1 WHERE id=$1
-	`, fixture.sourceID, fixture.validationRunID, proof, fixture.revisionDigest)
+	if qualificationSchema == qualificationFixtureSchemaFull {
+		// This disposable migration-owner fixture proves only structural closure/recovery.
+		// It is never Task 19A2a/19A2b, G2/G4, or Provider availability evidence.
+		execAssetSQL(t, available, `SET LOCAL ROLE aiops_schema_owner`)
+		execAssetSQL(t, available, `
+			UPDATE asset_sources
+			SET gate_status='AVAILABLE',gate_reason_code=NULL,gate_revision=gate_revision+1,
+				validated_run_id=$2,validation_digest=$3,validated_binding_digest=$4,
+				gate_evidence_run_id=$5,gate_evidence_digest=$6,
+				gate_evidence_expires_at=$7,version=version+1
+			WHERE id=$1 AND gate_status='UNAVAILABLE' AND
+				gate_revision=$8 AND
+				num_nonnulls(
+					gate_evidence_run_id,
+					gate_evidence_digest,
+					gate_evidence_expires_at
+				)=0
+		`, fixture.sourceID, fixture.validationRunID, proof, fixture.revisionDigest,
+			qualificationReceipts.canary.runID,
+			qualificationReceipts.canary.receiptDigest,
+			qualificationReceipts.facts.receiptExpiresAt,
+			qualificationReceipts.facts.gateRevision)
+	} else {
+		execAssetSQL(t, available, `
+			UPDATE asset_sources
+			SET gate_status='AVAILABLE',gate_reason_code=NULL,gate_revision=gate_revision+1,
+				validated_run_id=$2,validation_digest=$3,validated_binding_digest=$4,
+				version=version+1 WHERE id=$1
+		`, fixture.sourceID, fixture.validationRunID, proof, fixture.revisionDigest)
+	}
 	if err := available.Commit(context.Background()); err != nil {
 		t.Fatalf("commit external validation AVAILABLE gate: %v", err)
+	}
+	if qualificationSchema == qualificationFixtureSchemaFull {
+		qualificationFixtureRequireTerminalClosure(
+			t,
+			database,
+			fixture,
+			qualificationReceipts.facts,
+			qualificationReceipts.ha,
+			qualificationReceipts.canary,
+		)
 	}
 }
 
