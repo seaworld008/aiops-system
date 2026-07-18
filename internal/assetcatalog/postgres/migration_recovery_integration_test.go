@@ -36,8 +36,11 @@ func TestAssetCatalogRecovery(t *testing.T) {
 	authoritativeSeed.bindingID = "6e000000-0000-4000-8000-000000000201"
 	authoritativeFixture := seedClosureAuthoritativeCompleteCatalogOnFixture(t, source, authoritativeSeed)
 	assertRecoveryAdmissions(t, pair.sourceHarness)
+	sourceQualificationSchema := verifyQualificationRecoveryReadiness(
+		t, source, authoritativeFixture,
+	)
 	sourceProof := collectAssetCatalogProof(t, source)
-	verifyAssetCatalogClosure(t, source, fixture)
+	verifyAssetCatalogClosure(t, source, fixture, sourceQualificationSchema)
 	verifyAuthoritativeCompletePointer(t, source, authoritativeFixture)
 	assertRecoveryCatalogOwners(t, pair.sourceHarness.admin)
 
@@ -51,6 +54,9 @@ func TestAssetCatalogRecovery(t *testing.T) {
 	restoreLogicalDump(t, pair.target, backup)
 	target := pair.targetPool
 	assertRecoveryAdmissions(t, pair.targetHarness)
+	targetQualificationSchema := verifyQualificationRecoveryReadiness(
+		t, target, authoritativeFixture,
+	)
 	targetProof := collectAssetCatalogProof(t, target)
 	if len(sourceProof) != len(targetProof) {
 		t.Fatalf("restored proof table count=%d, want %d", len(targetProof), len(sourceProof))
@@ -61,7 +67,7 @@ func TestAssetCatalogRecovery(t *testing.T) {
 			t.Errorf("restored %s proof=%+v present=%v, want %+v", table, got, ok, want)
 		}
 	}
-	verifyAssetCatalogClosure(t, target, fixture)
+	verifyAssetCatalogClosure(t, target, fixture, targetQualificationSchema)
 	verifyAuthoritativeCompletePointer(t, target, authoritativeFixture)
 	verifyRecoveryAdmissionDriftMatrix(t, pair.targetHarness, pair.target, targetProof)
 	verifyRestoredMutationGuards(t, target, fixture)
@@ -244,6 +250,162 @@ func verifyAuthoritativeCompletePointer(
 	if !exact {
 		t.Fatal("authoritative complete pointer is not bound to the exact current revision and completion")
 	}
+}
+
+func verifyQualificationRecoveryReadiness(
+	t *testing.T,
+	database *pgxpool.Pool,
+	fixture assetCatalogFixture,
+) qualificationFixtureSchemaState {
+	t.Helper()
+	state, err := qualificationFixtureSchemaStateFor(context.Background(), database)
+	if err != nil {
+		t.Fatalf("inspect recovery qualification fixture schema: %v", err)
+	}
+	if state == qualificationFixtureSchemaOld {
+		var qualificationRuns int
+		if err := database.QueryRow(context.Background(), `
+			SELECT count(*) FROM asset_source_runs
+			WHERE source_id=$1 AND run_kind='QUALIFICATION'
+		`, fixture.sourceID).Scan(&qualificationRuns); err != nil {
+			t.Fatalf("verify old-schema recovery qualification no-op: %v", err)
+		}
+		if qualificationRuns != 0 {
+			t.Fatalf(
+				"old-schema recovery contains %d qualification runs, want exact no-op",
+				qualificationRuns,
+			)
+		}
+		return state
+	}
+
+	var haReceiptDigest string
+	if err := database.QueryRow(context.Background(), `
+		SELECT qualification_receipt_digest
+		FROM asset_source_runs
+		WHERE source_id=$1 AND run_kind='QUALIFICATION'
+		  AND qualification_evidence_kind='TWO_WORKER_HA'
+	`, fixture.sourceID).Scan(&haReceiptDigest); err != nil {
+		t.Fatalf("read restored HA receipt digest: %v", err)
+	}
+	expectedPriorReceiptsDigest := qualificationFixturePriorReceiptsDigest(
+		t, []string{haReceiptDigest},
+	)
+	var ready bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT
+			source.status='ACTIVE' AND
+			source.gate_status='AVAILABLE' AND source.gate_reason_code IS NULL AND
+			source.gate_evidence_run_id=canary.id AND
+			source.gate_evidence_digest=canary.qualification_receipt_digest AND
+			source.gate_evidence_expires_at=canary.qualification_receipt_expires_at AND
+			source.gate_evidence_expires_at>clock_timestamp() AND
+			source.gate_revision=canary.gate_revision+1 AND
+			ha.gate_revision=canary.gate_revision AND
+			ha.source_revision=source.published_revision AND
+			canary.source_revision=source.published_revision AND
+			ha.source_revision_digest=source.published_revision_digest AND
+			canary.source_revision_digest=source.published_revision_digest AND
+			ha.qualification_binding_digest=source.published_revision_digest AND
+			canary.qualification_binding_digest=source.published_revision_digest AND
+			ha.run_kind='QUALIFICATION' AND canary.run_kind='QUALIFICATION' AND
+			ha.status='SUCCEEDED' AND canary.status='SUCCEEDED' AND
+			ha.stage_code='COMPLETED' AND canary.stage_code='COMPLETED' AND
+			ha.cleanup_status='REVOKED' AND canary.cleanup_status='REVOKED' AND
+			ha.cleanup_digest IS NOT NULL AND canary.cleanup_digest IS NOT NULL AND
+			ha.ha_cleanup_receipt_digest=ha.cleanup_digest AND
+			ha.work_result_kind='QUALIFICATION_PROOF' AND
+			canary.work_result_kind='QUALIFICATION_PROOF' AND
+			ha.work_result_status='SUCCEEDED' AND
+			canary.work_result_status='SUCCEEDED' AND
+			ha.work_result_digest=ha.qualification_result_digest AND
+			canary.work_result_digest=canary.qualification_result_digest AND
+			ha.qualification_evidence_kind='TWO_WORKER_HA' AND
+			canary.qualification_evidence_kind='PROVIDER_CANARY' AND
+			ha.qualification_scope_digest=canary.qualification_scope_digest AND
+			ha.qualification_binding_digest=canary.qualification_binding_digest AND
+			ha.qualification_descriptor_digest=canary.qualification_descriptor_digest AND
+			ha.qualification_runtime_manifest_digest=
+				canary.qualification_runtime_manifest_digest AND
+			ha.qualification_lab_binding_digest=canary.qualification_lab_binding_digest AND
+			canary.qualification_prior_receipt_digests_sha256=$2 AND
+			ha.qualification_receipt_digest=$3 AND
+			num_nonnulls(
+				ha.cursor_before_sha256,ha.cursor_after_sha256,
+				canary.cursor_before_sha256,canary.cursor_after_sha256
+			)=0 AND
+			ha.checkpoint_version=0 AND canary.checkpoint_version=0 AND
+			ha.page_sequence=0 AND canary.page_sequence=0 AND
+			ha.page_digest IS NULL AND canary.page_digest IS NULL AND
+			ha.relation_page_sequence=0 AND canary.relation_page_sequence=0 AND
+			ha.relation_page_digest IS NULL AND canary.relation_page_digest IS NULL AND
+			NOT ha.final_page AND NOT canary.final_page AND
+			NOT ha.complete_snapshot AND NOT canary.complete_snapshot AND
+			NOT ha.effective_complete_snapshot AND NOT canary.effective_complete_snapshot AND
+			ha.observed_count+canary.observed_count=0 AND
+			ha.created_count+canary.created_count=0 AND
+			ha.changed_count+canary.changed_count=0 AND
+			ha.unchanged_count+canary.unchanged_count=0 AND
+			ha.conflict_count+canary.conflict_count=0 AND
+			ha.missing_count+canary.missing_count=0 AND
+			ha.stale_count+canary.stale_count=0 AND
+			ha.restored_count+canary.restored_count=0 AND
+			ha.tombstoned_count+canary.tombstoned_count=0 AND
+			ha.rejected_count+canary.rejected_count=0 AND
+			source.last_success_run_id=success.id AND
+			source.last_complete_snapshot_run_id=success.id AND success.id=$4 AND
+			success.run_kind IN ('DISCOVERY','CSV_IMPORT','API_INGESTION','MANUAL_MUTATION') AND
+			success.id<>ha.id AND success.id<>canary.id AND
+			source.checkpoint_revision=source.published_revision AND
+			source.checkpoint_version=success.checkpoint_version AND
+			source.checkpoint_sha256=success.cursor_after_sha256 AND
+			(SELECT count(*) FROM asset_observations AS observation
+			 WHERE observation.run_id IN (ha.id,canary.id))=0 AND
+			(SELECT count(*) FROM asset_relationships AS relationship
+			 WHERE relationship.last_run_id IN (ha.id,canary.id))=0 AND
+			num_nonnulls(
+				ha.ha_owner_worker_identity_digest,ha.ha_takeover_worker_identity_digest,
+				ha.ha_owner_process_instance_digest,ha.ha_takeover_process_instance_digest,
+				ha.ha_takeover_receipt_digest,ha.ha_restart_receipt_digest,
+				ha.ha_session_recovery_receipt_digest,ha.ha_cleanup_receipt_digest,
+				ha.ha_response_loss_receipt_digest,ha.ha_fact_chain_digest
+			)=10 AND
+			ha.ha_owner_worker_identity_digest<>ha.ha_takeover_worker_identity_digest AND
+			ha.ha_owner_process_instance_digest<>ha.ha_takeover_process_instance_digest AND
+			num_nonnulls(
+				canary.ha_owner_worker_identity_digest,
+				canary.ha_takeover_worker_identity_digest,
+				canary.ha_owner_process_instance_digest,
+				canary.ha_takeover_process_instance_digest,
+				canary.ha_takeover_receipt_digest,canary.ha_restart_receipt_digest,
+				canary.ha_session_recovery_receipt_digest,canary.ha_cleanup_receipt_digest,
+				canary.ha_response_loss_receipt_digest,canary.ha_fact_chain_digest
+			)=0
+		FROM asset_sources AS source
+		JOIN asset_source_runs AS canary
+		  ON canary.tenant_id=source.tenant_id
+		 AND canary.workspace_id=source.workspace_id
+		 AND canary.source_id=source.id
+		 AND canary.id=source.gate_evidence_run_id
+		JOIN asset_source_runs AS ha
+		  ON ha.tenant_id=canary.tenant_id
+		 AND ha.workspace_id=canary.workspace_id
+		 AND ha.source_id=canary.source_id
+		 AND ha.qualification_evidence_kind='TWO_WORKER_HA'
+		 AND ha.qualification_receipt_expires_at=canary.qualification_receipt_expires_at
+		JOIN asset_source_runs AS success
+		  ON success.tenant_id=source.tenant_id
+		 AND success.workspace_id=source.workspace_id
+		 AND success.source_id=source.id
+		 AND success.id=source.last_success_run_id
+		WHERE source.id=$1
+	`, fixture.sourceID, expectedPriorReceiptsDigest, haReceiptDigest, fixture.runID).Scan(&ready); err != nil {
+		t.Fatalf("verify restored qualification gate/HA/canary readiness: %v", err)
+	}
+	if !ready {
+		t.Fatal("restored qualification gate pointer and HA/canary receipts are not ready")
+	}
+	return state
 }
 
 func seedRecoveryProjection(t *testing.T, database *pgxpool.Pool, fixture assetCatalogFixture) {
@@ -430,9 +592,14 @@ func collectAssetCatalogProof(t *testing.T, database *pgxpool.Pool) map[string]r
 	return proof
 }
 
-func verifyAssetCatalogClosure(t *testing.T, database *pgxpool.Pool, fixture assetCatalogFixture) {
+func verifyAssetCatalogClosure(
+	t *testing.T,
+	database *pgxpool.Pool,
+	fixture assetCatalogFixture,
+	qualificationSchema qualificationFixtureSchemaState,
+) {
 	t.Helper()
-	verifyCatalogForeignKeyClosure(t, database)
+	verifyCatalogForeignKeyClosure(t, database, qualificationSchema)
 	verifyCatalogContentHashes(t, database, fixture)
 	verifyCatalogFactCoordinates(t, database, fixture)
 	verifyCatalogSourcePointers(t, database, fixture)
@@ -440,7 +607,11 @@ func verifyAssetCatalogClosure(t *testing.T, database *pgxpool.Pool, fixture ass
 	verifyRecoveryAuditOutboxLink(t, database)
 }
 
-func verifyCatalogForeignKeyClosure(t *testing.T, database *pgxpool.Pool) {
+func verifyCatalogForeignKeyClosure(
+	t *testing.T,
+	database *pgxpool.Pool,
+	qualificationSchema qualificationFixtureSchemaState,
+) {
 	t.Helper()
 	var brokenReferences int64
 	if err := database.QueryRow(context.Background(), `
@@ -627,9 +798,18 @@ func verifyCatalogForeignKeyClosure(t *testing.T, database *pgxpool.Pool) {
 	}).Scan(&foreignKeys, &invalidForeignKeys); err != nil {
 		t.Fatalf("verify restored foreign-key validation state: %v", err)
 	}
-	if foreignKeys != 44 || invalidForeignKeys != 0 {
-		t.Fatalf("asset catalog foreign keys=(total:%d unvalidated:%d), want (44,0)",
-			foreignKeys, invalidForeignKeys)
+	expectedForeignKeys := int64(44)
+	if qualificationSchema == qualificationFixtureSchemaFull {
+		expectedForeignKeys = 45
+	}
+	if foreignKeys != expectedForeignKeys || invalidForeignKeys != 0 {
+		t.Fatalf(
+			"asset catalog foreign keys=(total:%d unvalidated:%d), want (%d,0) for %s qualification schema",
+			foreignKeys,
+			invalidForeignKeys,
+			expectedForeignKeys,
+			qualificationSchema,
+		)
 	}
 }
 
@@ -763,7 +943,9 @@ func verifyCatalogSourcePointers(t *testing.T, database *pgxpool.Pool, fixture a
 			s.last_success_run_id=$5 AND s.last_success_at=success.completed_at AND
 			s.last_complete_snapshot_run_id IS NULL AND
 			s.last_complete_snapshot_at IS NULL AND
-			success.status='SUCCEEDED' AND success.run_kind<>'VALIDATION' AND
+			success.status='SUCCEEDED' AND success.run_kind IN (
+				'DISCOVERY','CSV_IMPORT','API_INGESTION','MANUAL_MUTATION'
+			) AND
 			NOT success.complete_snapshot AND NOT success.effective_complete_snapshot AND
 			a.lifecycle='ACTIVE' AND a.version=2
 		FROM asset_sources s

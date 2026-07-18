@@ -14,9 +14,15 @@ import (
 func TestAssetCatalogMigrationFinalOperationalContract(t *testing.T) {
 	harness := newAssetCatalogHarness(t)
 	harness.applyThroughAssetCatalog(t)
+	qualificationSchema, err := qualificationFixtureSchemaStateFor(
+		context.Background(), harness.db,
+	)
+	if err != nil {
+		t.Fatalf("inspect final qualification schema contract: %v", err)
+	}
 
 	t.Run("run state and cleanup proof", func(t *testing.T) {
-		finalRequireColumns(t, harness.db, "asset_source_runs", []string{
+		runColumns := []string{
 			"source_revision", "source_revision_digest", "run_kind", "status",
 			"stage_code", "stage_changed_at", "trigger_type", "gate_revision",
 			"cursor_before_sha256", "cursor_after_sha256", "page_sequence", "page_digest",
@@ -35,12 +41,20 @@ func TestAssetCatalogMigrationFinalOperationalContract(t *testing.T) {
 			"terminal_failure_override", "terminal_failure_override_digest",
 			"terminal_command_sha256",
 			"failure_code", "trace_id", "started_at", "heartbeat_at", "completed_at",
-		})
+		}
+		if qualificationSchema == qualificationFixtureSchemaFull {
+			runColumns = append(runColumns, qualificationFixtureRunColumns...)
+		}
+		finalRequireColumns(t, harness.db, "asset_source_runs", runColumns)
 		finalForbidColumns(t, harness.db, "asset_source_runs", []string{"definition_revision"})
 
-		finalRequireExactVocabulary(t, harness.db, "asset_source_runs", "run_kind", []string{
+		runKinds := []string{
 			"VALIDATION", "DISCOVERY", "CSV_IMPORT", "API_INGESTION", "MANUAL_MUTATION",
-		})
+		}
+		if qualificationSchema == qualificationFixtureSchemaFull {
+			runKinds = append(runKinds, "QUALIFICATION")
+		}
+		finalRequireExactVocabulary(t, harness.db, "asset_source_runs", "run_kind", runKinds)
 		finalRequireExactVocabulary(t, harness.db, "asset_source_runs", "status", []string{
 			"QUEUED", "DELAYED", "RUNNING", "FINALIZING",
 			"SUCCEEDED", "PARTIAL", "FAILED", "CANCELLED",
@@ -52,9 +66,15 @@ func TestAssetCatalogMigrationFinalOperationalContract(t *testing.T) {
 		finalRequireExactVocabulary(t, harness.db, "asset_source_runs", "cleanup_status", []string{
 			"NOT_OPENED", "PENDING", "REVOKED", "NO_CREDENTIAL", "UNCERTAIN",
 		})
-		finalRequireExactVocabulary(t, harness.db, "asset_source_runs", "work_result_kind", []string{
+		workResultKinds := []string{
 			"DATA_PROJECTION", "VALIDATION_PROOF", "FAILURE_INTENT",
-		})
+		}
+		if qualificationSchema == qualificationFixtureSchemaFull {
+			workResultKinds = append(workResultKinds, "QUALIFICATION_PROOF")
+		}
+		finalRequireExactVocabulary(
+			t, harness.db, "asset_source_runs", "work_result_kind", workResultKinds,
+		)
 		finalRequireExactVocabulary(t, harness.db, "asset_source_runs", "work_result_status", []string{
 			"SUCCEEDED", "PARTIAL", "FAILED",
 		})
@@ -71,6 +91,34 @@ func TestAssetCatalogMigrationFinalOperationalContract(t *testing.T) {
 			"DATA_PROJECTION", "VALIDATION_PROOF", "FAILURE_INTENT",
 			"work_result_digest", "work_result_recorded_at", "validation_proof_digest",
 		})
+		if qualificationSchema == qualificationFixtureSchemaFull {
+			finalRequireExactVocabulary(
+				t,
+				harness.db,
+				"asset_source_runs",
+				"qualification_evidence_kind",
+				[]string{"TWO_WORKER_HA", "PROVIDER_CANARY"},
+			)
+			finalRequireConstraintTokens(
+				t,
+				harness.db,
+				"asset_source_runs_work_result_ck",
+				[]string{"QUALIFICATION", "QUALIFICATION_PROOF"},
+			)
+			finalRequireTableCheckTokens(
+				t,
+				harness.db,
+				"asset_source_runs",
+				append(
+					slices.Clone(qualificationFixtureRunColumns),
+					"TWO_WORKER_HA",
+					"PROVIDER_CANARY",
+					"QUALIFICATION_PROOF",
+				),
+			)
+			runTriggerBody := finalTableTriggerBody(t, harness.db, "asset_source_runs")
+			finalRequireExplicitDataRunKindAllowlist(t, runTriggerBody)
+		}
 		finalRequireConstraintTokens(t, harness.db, "asset_source_runs_cleanup_ck", []string{
 			"cleanup_attempt_id", "cleanup_attempt_epoch", "cleanup_digest",
 			"NOT_OPENED", "PENDING", "REVOKED", "NO_CREDENTIAL", "UNCERTAIN",
@@ -220,10 +268,14 @@ func TestAssetCatalogMigrationFinalOperationalContract(t *testing.T) {
 	})
 
 	t.Run("success pointers bind exact completed runs", func(t *testing.T) {
-		finalRequireColumns(t, harness.db, "asset_sources", []string{
+		sourceColumns := []string{
 			"last_success_run_id", "last_success_at",
 			"last_complete_snapshot_run_id", "last_complete_snapshot_at",
-		})
+		}
+		if qualificationSchema == qualificationFixtureSchemaFull {
+			sourceColumns = append(sourceColumns, qualificationFixtureSourceColumns...)
+		}
+		finalRequireColumns(t, harness.db, "asset_sources", sourceColumns)
 		finalForbidColumns(t, harness.db, "asset_sources", []string{"last_successful_run_id"})
 		finalRequireConstraintColumns(t, harness.db, "asset_sources_last_success_run_fk", []string{
 			"tenant_id", "workspace_id", "id", "last_success_run_id",
@@ -245,8 +297,18 @@ func TestAssetCatalogMigrationFinalOperationalContract(t *testing.T) {
 		triggerBody := finalTableTriggerBody(t, harness.db, "asset_sources")
 		finalRequirePattern(t, triggerBody, `(?i)status\s*=\s*'SUCCEEDED'`,
 			"success pointer guard must accept only SUCCEEDED runs")
-		finalRequirePattern(t, triggerBody, `(?i)run_kind\s*(?:<>|!=)\s*'VALIDATION'`,
-			"success pointer guard must reject Validation runs")
+		if qualificationSchema == qualificationFixtureSchemaFull {
+			finalRequireExplicitDataRunKindAllowlist(t, triggerBody)
+			finalRequireTableCheckTokens(
+				t,
+				harness.db,
+				"asset_sources",
+				append(slices.Clone(qualificationFixtureSourceColumns), "IS NULL", "IS NOT NULL"),
+			)
+		} else {
+			finalRequirePattern(t, triggerBody, `(?i)run_kind\s*(?:<>|!=)\s*'VALIDATION'`,
+				"success pointer guard must reject Validation runs")
+		}
 		for _, token := range []string{
 			"last_success_run_id", "last_success_at", "last_complete_snapshot_run_id",
 			"last_complete_snapshot_at", "effective_complete_snapshot", "completed_at",
@@ -562,4 +624,30 @@ func finalRequirePattern(t *testing.T, value, pattern, message string) {
 	if !matched {
 		t.Errorf("%s; pattern=%s", message, pattern)
 	}
+}
+
+func finalRequireExplicitDataRunKindAllowlist(t *testing.T, value string) {
+	t.Helper()
+	const unsafePattern = `(?i)run_kind\s*(?:<>|!=)\s*'VALIDATION'`
+	matched, err := regexp.MatchString(unsafePattern, value)
+	if err != nil {
+		t.Fatalf("compile data-kind negative-list pattern %q: %v", unsafePattern, err)
+	}
+	if matched {
+		t.Errorf("data-run admission retains an open-ended negative kind check; pattern=%s", unsafePattern)
+	}
+
+	allowlistPattern := regexp.MustCompile(`(?is)run_kind\s+IN\s*\(([^)]*)\)`)
+	want := []string{"API_INGESTION", "CSV_IMPORT", "DISCOVERY", "MANUAL_MUTATION"}
+	for _, candidate := range allowlistPattern.FindAllStringSubmatch(value, -1) {
+		var got []string
+		for _, code := range finalQuotedCode.FindAllStringSubmatch(candidate[1], -1) {
+			got = append(got, code[1])
+		}
+		sort.Strings(got)
+		if slices.Equal(got, want) {
+			return
+		}
+	}
+	t.Error("data-run admission lacks exact DISCOVERY/CSV_IMPORT/API_INGESTION/MANUAL_MUTATION allowlist")
 }
