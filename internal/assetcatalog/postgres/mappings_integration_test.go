@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -659,8 +660,17 @@ func TestMappingIntegrationOutboxFailureRollsBackBindingAndAudit(t *testing.T) {
 		ServiceID: secondServiceID, AssetID: fixture.secondAssetID,
 		Role: assetcatalog.BindingRoleManagedTarget, ReasonCode: "MANUAL_BIND",
 	}
-	if _, err := repository.CreateBinding(context.Background(), command); !errors.Is(err, assetcatalog.ErrStateConflict) {
-		t.Fatalf("CreateBinding(outbox failure) error = %v, want ErrStateConflict", err)
+	_, createErr := repository.CreateBinding(context.Background(), command)
+	if createErr == nil || createErr.Error() != "asset catalog repository failure" {
+		t.Fatalf("CreateBinding(outbox failure) error = %v, want sanitized repository failure", createErr)
+	}
+	if errors.Is(createErr, assetcatalog.ErrStateConflict) ||
+		errors.Is(createErr, assetcatalog.ErrUnavailable) {
+		t.Fatalf("CreateBinding(outbox failure) error = %v, must not masquerade as state conflict or unavailable", createErr)
+	}
+	if strings.Contains(createErr.Error(), "test mapping outbox rejection") ||
+		strings.Contains(createErr.Error(), "55000") {
+		t.Fatalf("CreateBinding(outbox failure) leaked injected PostgreSQL detail: %v", createErr)
 	}
 	var bindingCount, auditCount int
 	if err := harness.db.QueryRow(context.Background(), `
