@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/seaworld008/aiops-system/internal/assetcatalog"
 	"github.com/seaworld008/aiops-system/internal/discoverysource"
+	"github.com/seaworld008/aiops-system/internal/sourceprofile"
 )
 
 const (
@@ -1557,8 +1558,34 @@ INSERT INTO audit_records (
 	return err
 }
 
-func sourceValidationRuntimeClosed(profileCode assetcatalog.ProfileCode) bool {
-	return profileCode != assetcatalog.ProfileCode("MANUAL_V1")
+func (repository *Repository) admitSourceValidationRequest(
+	ctx context.Context,
+	source assetcatalog.Source,
+	revision assetcatalog.SourceRevision,
+) (assetcatalog.BuiltinSourceProfile, error) {
+	if repository == nil || ctx == nil {
+		return assetcatalog.BuiltinSourceProfile{}, assetcatalog.ErrUnavailable
+	}
+	profile, err := repository.ResolveProfileAdmission(ctx, revision.ProfileCode)
+	if err != nil {
+		return assetcatalog.BuiltinSourceProfile{}, assetcatalog.ErrUnavailable
+	}
+	if profile.ProfileCode == assetcatalog.ProfileCode("MANUAL_V1") {
+		if !sourceRevisionMatchesResolvedProfile(source, revision, profile) ||
+			!exactManualRevisionProfile(source, revision, profile) {
+			return assetcatalog.BuiltinSourceProfile{}, assetcatalog.ErrStateConflict
+		}
+		return profile.Clone(), nil
+	}
+	if err := repository.validationAdmission.Admit(
+		ctx,
+		sourceprofile.SourceValidationAdmissionRequest{
+			Source: source, Revision: revision, Profile: profile,
+		},
+	); err != nil {
+		return assetcatalog.BuiltinSourceProfile{}, err
+	}
+	return profile.Clone(), nil
 }
 
 func (repository *Repository) requestValidationInTx(
@@ -1611,6 +1638,9 @@ func (repository *Repository) requestValidationInTx(
 			run.SourceRevisionDigest != revision.CanonicalRevisionDigest {
 			return assetcatalog.SourceRunMutation{}, assetcatalog.ErrStateConflict
 		}
+		if _, err := repository.admitSourceValidationRequest(ctx, source, revision); err != nil {
+			return assetcatalog.SourceRunMutation{}, err
+		}
 		return assetcatalog.SourceRunMutation{
 			Source: source, Revision: revision, Run: run, Receipt: sourceReplayReceipt(record),
 		}.Clone(), nil
@@ -1648,8 +1678,9 @@ func (repository *Repository) requestValidationInTx(
 		revision.Status != assetcatalog.SourceRevisionRejected {
 		return assetcatalog.SourceRunMutation{}, assetcatalog.ErrStateConflict
 	}
-	if sourceValidationRuntimeClosed(revision.ProfileCode) {
-		return assetcatalog.SourceRunMutation{}, assetcatalog.ErrUnavailable
+	profile, err := repository.admitSourceValidationRequest(ctx, source, revision)
+	if err != nil {
+		return assetcatalog.SourceRunMutation{}, err
 	}
 	if source.GateStatus != assetcatalog.SourceGateUnavailable {
 		if source.GateStatus != assetcatalog.SourceGateAvailable &&
@@ -1735,8 +1766,7 @@ RETURNING version
 		return assetcatalog.SourceRunMutation{}, err
 	}
 
-	profile, profileErr := repository.ResolveProfileAdmission(ctx, revision.ProfileCode)
-	isManual := profileErr == nil && exactManualRevisionProfile(source, revision, profile)
+	isManual := exactManualRevisionProfile(source, revision, profile)
 	if source.Kind == assetcatalog.SourceKindManual && !isManual {
 		return assetcatalog.SourceRunMutation{}, assetcatalog.ErrStateConflict
 	}
@@ -1907,7 +1937,9 @@ func (repository *Repository) publishRevisionInTx(
 			revision.ValidationDigest != command.ExpectedValidationDigest {
 			return assetcatalog.SourceRevisionMutation{}, assetcatalog.ErrStateConflict
 		}
-		if err := repository.admitSourceRevisionPublication(ctx, source, revision); err != nil {
+		if _, err := repository.sourceRevisionPublicationOpensGate(
+			ctx, source, revision,
+		); err != nil {
 			return assetcatalog.SourceRevisionMutation{}, err
 		}
 		return assetcatalog.SourceRevisionMutation{
@@ -1971,7 +2003,8 @@ func (repository *Repository) publishRevisionInTx(
 		run.ValidationProofDigest != revision.ValidationDigest {
 		return assetcatalog.SourceRevisionMutation{}, assetcatalog.ErrSourceRevisionNotValidated
 	}
-	if err := repository.admitSourceRevisionPublication(ctx, source, revision); err != nil {
+	opensGate, err := repository.sourceRevisionPublicationOpensGate(ctx, source, revision)
+	if err != nil {
 		return assetcatalog.SourceRevisionMutation{}, err
 	}
 	tag, err := tx.Exec(ctx, `
@@ -2001,8 +2034,9 @@ WHERE tenant_id=$1::uuid AND workspace_id=$2::uuid AND source_id=$3::uuid
 	if err != nil {
 		return assetcatalog.SourceRevisionMutation{}, err
 	}
-	var openedVersion int64
-	if err := tx.QueryRow(ctx, `
+	if opensGate {
+		var openedVersion int64
+		if err := tx.QueryRow(ctx, `
 UPDATE asset_sources
 SET gate_status='AVAILABLE',gate_reason_code=NULL,gate_revision=gate_revision+1,
     validated_run_id=$5::uuid,validation_digest=$6,validated_binding_digest=$7,
@@ -2012,16 +2046,28 @@ WHERE tenant_id=$1::uuid AND workspace_id=$2::uuid AND id=$3::uuid
   AND published_revision=$8 AND published_revision_digest=$7
 RETURNING version
 `, scope.TenantID, scope.WorkspaceID, source.ID, source.Version,
-		run.ID, revision.ValidationDigest, revision.CanonicalRevisionDigest,
-		revision.Revision).Scan(&openedVersion); err != nil {
-		return assetcatalog.SourceRevisionMutation{}, err
-	}
-	source, err = lockSourceMutation(ctx, tx, scope, source.ID)
-	if err != nil || source.Version != openedVersion {
-		if err != nil {
+			run.ID, revision.ValidationDigest, revision.CanonicalRevisionDigest,
+			revision.Revision).Scan(&openedVersion); err != nil {
 			return assetcatalog.SourceRevisionMutation{}, err
 		}
-		return assetcatalog.SourceRevisionMutation{}, assetcatalog.ErrStateConflict
+		source, err = lockSourceMutation(ctx, tx, scope, source.ID)
+		if err != nil || source.Version != openedVersion {
+			if err != nil {
+				return assetcatalog.SourceRevisionMutation{}, err
+			}
+			return assetcatalog.SourceRevisionMutation{}, assetcatalog.ErrStateConflict
+		}
+	} else {
+		if _, err := repository.sourceRevisionPublicationOpensGate(
+			ctx, source, revision,
+		); err != nil {
+			return assetcatalog.SourceRevisionMutation{}, err
+		}
+		if err := exactNonManualPublicationCheckpointClosure(
+			ctx, tx, scope, source, revision,
+		); err != nil {
+			return assetcatalog.SourceRevisionMutation{}, err
+		}
 	}
 	receipt, err := insertSourceMutationSideEffects(
 		ctx, tx, ids, command.Context, commandHash, sourceRevisionPublishedEvent,
@@ -2055,15 +2101,88 @@ func admitSourceRevisionPublication(
 	)
 }
 
-func (repository *Repository) admitSourceRevisionPublication(
+func (repository *Repository) sourceRevisionPublicationOpensGate(
 	ctx context.Context,
 	source assetcatalog.Source,
 	revision assetcatalog.SourceRevision,
-) error {
-	if repository == nil {
-		return assetcatalog.ErrUnavailable
+) (bool, error) {
+	if repository == nil || ctx == nil {
+		return false, assetcatalog.ErrUnavailable
 	}
-	return admitSourceRevisionPublicationWithResolver(ctx, repository, source, revision)
+	profile, err := repository.ResolveProfileAdmission(ctx, revision.ProfileCode)
+	if err != nil {
+		return false, assetcatalog.ErrUnavailable
+	}
+	if profile.ProfileCode == assetcatalog.ProfileCode("MANUAL_V1") {
+		if !sourceRevisionMatchesResolvedProfile(source, revision, profile) ||
+			!exactManualRevisionProfile(source, revision, profile) ||
+			!exactManualPublicationGate(source, revision) {
+			return false, assetcatalog.ErrStateConflict
+		}
+		return true, nil
+	}
+	if err := repository.validationAdmission.Admit(
+		ctx,
+		sourceprofile.SourceValidationAdmissionRequest{
+			Source: source, Revision: revision, Profile: profile,
+		},
+	); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func exactManualPublicationGate(
+	source assetcatalog.Source,
+	revision assetcatalog.SourceRevision,
+) bool {
+	switch revision.Status {
+	case assetcatalog.SourceRevisionValidated:
+		return source.GateStatus == assetcatalog.SourceGateValidating &&
+			source.GateReasonCode == "VALIDATION_IN_PROGRESS" &&
+			source.ValidatedRunID == revision.ValidationRunID &&
+			source.ValidationDigest == "" &&
+			source.ValidatedBindingDigest == ""
+	case assetcatalog.SourceRevisionPublished:
+		return source.GateStatus == assetcatalog.SourceGateAvailable &&
+			source.GateReasonCode == "" &&
+			source.PublishedRevision == revision.Revision &&
+			source.PublishedRevisionDigest == revision.CanonicalRevisionDigest &&
+			source.ValidatedRunID == revision.ValidationRunID &&
+			source.ValidationDigest == revision.ValidationDigest &&
+			source.ValidatedBindingDigest == revision.CanonicalRevisionDigest
+	default:
+		return false
+	}
+}
+
+func exactNonManualPublicationCheckpointClosure(
+	ctx context.Context,
+	tx pgx.Tx,
+	scope assetcatalog.SourceScope,
+	source assetcatalog.Source,
+	revision assetcatalog.SourceRevision,
+) error {
+	var closed bool
+	if err := tx.QueryRow(ctx, `
+SELECT checkpoint_ciphertext IS NULL
+   AND checkpoint_key_id IS NULL
+   AND checkpoint_sha256 IS NULL
+   AND checkpoint_revision=$4
+   AND checkpoint_version=0
+   AND last_success_run_id IS NULL
+   AND last_success_at IS NULL
+   AND last_complete_snapshot_run_id IS NULL
+   AND last_complete_snapshot_at IS NULL
+FROM asset_sources
+WHERE tenant_id=$1::uuid AND workspace_id=$2::uuid AND id=$3::uuid
+`, scope.TenantID, scope.WorkspaceID, source.ID, revision.Revision).Scan(&closed); err != nil {
+		return err
+	}
+	if !closed {
+		return assetcatalog.ErrStateConflict
+	}
+	return nil
 }
 
 func admitSourceRevisionPublicationWithResolver(

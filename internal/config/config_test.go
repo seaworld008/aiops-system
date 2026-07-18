@@ -1,6 +1,8 @@
 package config_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"path/filepath"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 func TestLoadUsesSafeDefaults(t *testing.T) {
 	clearRunnerGatewayEnvironment(t)
 	clearControlPlaneOIDCEnvironment(t)
+	clearExternalCMDBProfileEnvironment(t)
 	t.Setenv("AIOPS_HTTP_ADDR", "")
 	t.Setenv("AIOPS_SHUTDOWN_TIMEOUT", "")
 	t.Setenv("AIOPS_ENVIRONMENT", "")
@@ -53,6 +56,67 @@ func TestLoadUsesSafeDefaults(t *testing.T) {
 	if cfg.WebRoot != "" {
 		t.Fatalf("WebRoot = %q, want disabled", cfg.WebRoot)
 	}
+	if cfg.ExternalCMDBProfile != nil {
+		t.Fatalf("ExternalCMDBProfile = %#v, want disabled", cfg.ExternalCMDBProfile)
+	}
+}
+
+func TestLoadCMDBProfileAcceptsOnlyCompleteContentAddressedSafeMetadata(t *testing.T) {
+	clearExternalCMDBProfileEnvironment(t)
+	canonical := `{"schema_version":"discovery-worker-runtime-admission.v1","providers":[{"provider_kind":"CMDB_CATALOG_V1","profile_code":"CMDB_CATALOG_V1","canonical_descriptor_digest":"04a55074842e641d87ad67c42f1020b9b097ad15c3e781aaeffa3887837fdd08","runtime_recovery_capability_digest":"92f56dca945425f4129703183c71ba9c0aa08f47c3f8e8ec2ed6cdea2951f5aa"}]}`
+	digest := sha256.Sum256([]byte(canonical))
+	values := map[string]string{
+		"AIOPS_EXTERNAL_CMDB_INTEGRATION_ID":                "40000000-0000-4000-8000-000000000211",
+		"AIOPS_EXTERNAL_CMDB_CREDENTIAL_REFERENCE_ID":       "50000000-0000-4000-8000-000000000211",
+		"AIOPS_EXTERNAL_CMDB_TRUST_REFERENCE_ID":            "60000000-0000-4000-8000-000000000211",
+		"AIOPS_EXTERNAL_CMDB_NETWORK_POLICY_REFERENCE_ID":   "70000000-0000-4000-8000-000000000211",
+		"AIOPS_DISCOVERY_RUNTIME_ADMISSION_MANIFEST_JSON":   canonical,
+		"AIOPS_DISCOVERY_RUNTIME_ADMISSION_MANIFEST_SHA256": hex.EncodeToString(digest[:]),
+	}
+	for key, value := range values {
+		t.Setenv(key, value)
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load(exact CMDB profile metadata) error = %v", err)
+	}
+	if cfg.ExternalCMDBProfile == nil ||
+		cfg.ExternalCMDBProfile.IntegrationID != values["AIOPS_EXTERNAL_CMDB_INTEGRATION_ID"] ||
+		cfg.ExternalCMDBProfile.CredentialReferenceID !=
+			values["AIOPS_EXTERNAL_CMDB_CREDENTIAL_REFERENCE_ID"] ||
+		cfg.ExternalCMDBProfile.TrustReferenceID !=
+			values["AIOPS_EXTERNAL_CMDB_TRUST_REFERENCE_ID"] ||
+		cfg.ExternalCMDBProfile.NetworkPolicyReferenceID !=
+			values["AIOPS_EXTERNAL_CMDB_NETWORK_POLICY_REFERENCE_ID"] ||
+		string(cfg.ExternalCMDBProfile.RuntimeAdmissionManifestJSON) != canonical ||
+		cfg.ExternalCMDBProfile.RuntimeAdmissionManifestSHA256 !=
+			values["AIOPS_DISCOVERY_RUNTIME_ADMISSION_MANIFEST_SHA256"] {
+		t.Fatalf("ExternalCMDBProfile = %#v", cfg.ExternalCMDBProfile)
+	}
+
+	for missing := range values {
+		t.Run("missing "+missing, func(t *testing.T) {
+			for key, value := range values {
+				t.Setenv(key, value)
+			}
+			t.Setenv(missing, "")
+			if _, err := config.Load(); err == nil {
+				t.Fatalf("Load() accepted partial CMDB profile without %s", missing)
+			}
+		})
+	}
+	t.Run("manifest digest drift", func(t *testing.T) {
+		for key, value := range values {
+			t.Setenv(key, value)
+		}
+		t.Setenv(
+			"AIOPS_DISCOVERY_RUNTIME_ADMISSION_MANIFEST_SHA256",
+			"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+		)
+		if _, err := config.Load(); err == nil {
+			t.Fatal("Load() accepted drifted runtime admission manifest digest")
+		}
+	})
 }
 
 func TestLoadAcceptsOnlySafeAbsoluteWebRoots(t *testing.T) {
@@ -550,6 +614,20 @@ func clearRunnerGatewayEnvironment(t *testing.T) {
 		"AIOPS_RUNNER_GATEWAY_WRITE_CLIENT_CA_FILE",
 		"AIOPS_CREDENTIAL_PROTECTION_KEYRING_FILE",
 		"AIOPS_RUNNER_TRUST_DOMAIN",
+	} {
+		t.Setenv(key, "")
+	}
+}
+
+func clearExternalCMDBProfileEnvironment(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"AIOPS_EXTERNAL_CMDB_INTEGRATION_ID",
+		"AIOPS_EXTERNAL_CMDB_CREDENTIAL_REFERENCE_ID",
+		"AIOPS_EXTERNAL_CMDB_TRUST_REFERENCE_ID",
+		"AIOPS_EXTERNAL_CMDB_NETWORK_POLICY_REFERENCE_ID",
+		"AIOPS_DISCOVERY_RUNTIME_ADMISSION_MANIFEST_JSON",
+		"AIOPS_DISCOVERY_RUNTIME_ADMISSION_MANIFEST_SHA256",
 	} {
 		t.Setenv(key, "")
 	}

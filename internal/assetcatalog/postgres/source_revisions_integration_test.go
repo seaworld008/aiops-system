@@ -2,7 +2,9 @@ package postgres_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"reflect"
 	"slices"
@@ -15,7 +17,402 @@ import (
 	"github.com/seaworld008/aiops-system/internal/assetcatalog"
 	assetpostgres "github.com/seaworld008/aiops-system/internal/assetcatalog/postgres"
 	"github.com/seaworld008/aiops-system/internal/authn"
+	"github.com/seaworld008/aiops-system/internal/sourceprofile"
 )
+
+func TestSourceRevisionIntegrationCMDBProfileValidationAdmissionPublicPath(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	assembly := newCMDBProfileIntegrationAssembly(t, harness)
+	closedRepository, err := assetpostgres.NewWithSourceProfileRegistry(
+		harness.application,
+		assembly.clock,
+		assembly.newID,
+		assembly.registry,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownCommand := assetcatalog.CreateSourceCommand{
+		Context: sourceRevisionMutationContext(
+			t, assembly.scope, "cmdb-validation-unknown-profile", "0",
+		),
+		Name:            "unknown profile must remain closed",
+		SourceProfileID: "future-cmdb-profile-v1",
+		AuthorityEnvironmentIDs: []string{
+			assembly.environmentID,
+		},
+	}
+	if mutation, err := assembly.repository.CreateSource(
+		t.Context(), unknownCommand,
+	); !errors.Is(err, assetcatalog.ErrNotFound) ||
+		!reflect.DeepEqual(mutation, assetcatalog.SourceRevisionMutation{}) {
+		t.Fatalf("CreateSource(unknown profile) = (%#v, %v)", mutation, err)
+	}
+	assertSourceCreateClosureCounts(
+		t, harness.db, assembly.scope.WorkspaceID, 0, 0, 0, 0, 0,
+	)
+
+	closedCreated := createCMDBProfileSource(
+		t, closedRepository, assembly.scope, assembly.environmentID,
+		"cmdb-validation-closed-create", "CMDB validation closed fixture",
+	)
+	closedCommand := assetcatalog.ValidateSourceRevisionCommand{
+		Context: sourceRevisionMutationContext(
+			t, assembly.scope, "cmdb-validation-missing-runtime", "1",
+		),
+		SourceID:                closedCreated.Source.ID,
+		Revision:                closedCreated.Revision.Revision,
+		ExpectedSourceVersion:   closedCreated.Source.Version,
+		ExpectedRevisionVersion: closedCreated.Revision.Version,
+		ExpectedRevisionDigest:  closedCreated.Revision.CanonicalRevisionDigest,
+	}
+	if mutation, err := closedRepository.RequestValidation(
+		t.Context(), closedCommand,
+	); !errors.Is(err, assetcatalog.ErrUnavailable) ||
+		!reflect.DeepEqual(mutation, assetcatalog.SourceRunMutation{}) {
+		t.Fatalf("RequestValidation(missing runtime) = (%#v, %v)", mutation, err)
+	}
+	assertCMDBValidationZeroWrites(
+		t, harness.db, closedCreated, closedCommand.Context.IdempotencyKey(),
+	)
+	driftedRegistration, err := sourceprofile.ExternalCMDBV1().Registration(
+		sourceprofile.ExternalCMDBProfileReferences{
+			IntegrationID:            assembly.integrationID,
+			CredentialReferenceID:    assembly.credentialReferenceID,
+			TrustReferenceID:         assembly.trustReferenceID,
+			NetworkPolicyReferenceID: "70000000-0000-4000-8000-000000000212",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driftedRegistry, err := assetcatalog.NewSourceProfileRegistry(driftedRegistration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driftedRepository, err := assetpostgres.NewWithSourceProfileRegistry(
+		harness.application,
+		assembly.clock,
+		assembly.newID,
+		driftedRegistry,
+		assembly.validationAdmission,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driftedProfileCommand := closedCommand
+	driftedProfileCommand.Context = sourceRevisionMutationContext(
+		t, assembly.scope, "cmdb-validation-profile-drift", "d",
+	)
+	if mutation, err := driftedRepository.RequestValidation(
+		t.Context(), driftedProfileCommand,
+	); !errors.Is(err, assetcatalog.ErrUnavailable) ||
+		!reflect.DeepEqual(mutation, assetcatalog.SourceRunMutation{}) {
+		t.Fatalf("RequestValidation(installed profile drift) = (%#v, %v)", mutation, err)
+	}
+	assertCMDBValidationZeroWrites(
+		t, harness.db, closedCreated,
+		driftedProfileCommand.Context.IdempotencyKey(),
+	)
+
+	driftedBindingCommand := closedCommand
+	driftedBindingCommand.Context = sourceRevisionMutationContext(
+		t, assembly.scope, "cmdb-validation-binding-drift", "e",
+	)
+	driftedBindingCommand.ExpectedRevisionDigest = strings.Repeat("f", 64)
+	if mutation, err := assembly.repository.RequestValidation(
+		t.Context(), driftedBindingCommand,
+	); !errors.Is(err, assetcatalog.ErrStateConflict) ||
+		!reflect.DeepEqual(mutation, assetcatalog.SourceRunMutation{}) {
+		t.Fatalf("RequestValidation(binding drift) = (%#v, %v)", mutation, err)
+	}
+	assertCMDBValidationZeroWrites(
+		t, harness.db, closedCreated,
+		driftedBindingCommand.Context.IdempotencyKey(),
+	)
+
+	created := createCMDBProfileSource(
+		t, assembly.repository, assembly.scope, assembly.environmentID,
+		"cmdb-validation-public-create", "CMDB validation public fixture",
+	)
+	commands := []assetcatalog.ValidateSourceRevisionCommand{
+		{
+			Context: sourceRevisionMutationContext(
+				t, assembly.scope, "cmdb-validation-concurrent-a", "2",
+			),
+			SourceID: created.Source.ID, Revision: created.Revision.Revision,
+			ExpectedSourceVersion:   created.Source.Version,
+			ExpectedRevisionVersion: created.Revision.Version,
+			ExpectedRevisionDigest:  created.Revision.CanonicalRevisionDigest,
+		},
+		{
+			Context: sourceRevisionMutationContext(
+				t, assembly.scope, "cmdb-validation-concurrent-b", "3",
+			),
+			SourceID: created.Source.ID, Revision: created.Revision.Revision,
+			ExpectedSourceVersion:   created.Source.Version,
+			ExpectedRevisionVersion: created.Revision.Version,
+			ExpectedRevisionDigest:  created.Revision.CanonicalRevisionDigest,
+		},
+	}
+	type validationResult struct {
+		index    int
+		mutation assetcatalog.SourceRunMutation
+		err      error
+	}
+	start := make(chan struct{})
+	results := make(chan validationResult, len(commands))
+	for index, command := range commands {
+		index, command := index, command
+		go func() {
+			<-start
+			mutation, callErr := assembly.repository.RequestValidation(t.Context(), command)
+			results <- validationResult{index: index, mutation: mutation, err: callErr}
+		}()
+	}
+	close(start)
+	var winner validationResult
+	successes, conflicts := 0, 0
+	for range commands {
+		result := <-results
+		switch {
+		case result.err == nil:
+			successes++
+			winner = result
+		case errors.Is(result.err, assetcatalog.ErrVersionConflict),
+			errors.Is(result.err, assetcatalog.ErrStateConflict):
+			conflicts++
+		default:
+			t.Fatalf("concurrent RequestValidation() error = %v", result.err)
+		}
+	}
+	if successes != 1 || conflicts != 1 ||
+		winner.mutation.Source.GateStatus != assetcatalog.SourceGateValidating ||
+		winner.mutation.Revision.Status != assetcatalog.SourceRevisionValidating ||
+		winner.mutation.Run.Kind != assetcatalog.RunKindValidation ||
+		winner.mutation.Run.Status != assetcatalog.RunStatusQueued {
+		t.Fatalf(
+			"concurrent CMDB validation = success:%d conflict:%d winner:%#v",
+			successes, conflicts, winner.mutation,
+		)
+	}
+	replay, err := assembly.repository.RequestValidation(
+		t.Context(), commands[winner.index],
+	)
+	if err != nil || !replay.Receipt.IdempotentReplay ||
+		replay.Run.ID != winner.mutation.Run.ID {
+		t.Fatalf("RequestValidation(exact replay) = (%#v, %v)", replay, err)
+	}
+	changedDigest := commands[winner.index]
+	changedDigest.ExpectedRevisionDigest = strings.Repeat("f", 64)
+	if mutation, err := assembly.repository.RequestValidation(
+		t.Context(), changedDigest,
+	); !errors.Is(err, assetcatalog.ErrIdempotency) ||
+		!reflect.DeepEqual(mutation, assetcatalog.SourceRunMutation{}) {
+		t.Fatalf("RequestValidation(changed digest replay) = (%#v, %v)", mutation, err)
+	}
+	var runCount, auditCount, outboxCount int
+	if err := harness.db.QueryRow(t.Context(), `
+SELECT
+  (SELECT count(*) FROM asset_source_runs
+   WHERE source_id=$1::uuid AND run_kind='VALIDATION'),
+  (SELECT count(*) FROM audit_records
+   WHERE resource_id=$1 AND action='asset.source.validation.requested.v1'),
+  (SELECT count(*) FROM outbox_events
+   WHERE workspace_id=$2::uuid AND event_type='asset.source.validation.requested.v1')
+`, created.Source.ID, created.Source.WorkspaceID).Scan(
+		&runCount, &auditCount, &outboxCount,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if runCount != 1 || auditCount != 1 || outboxCount != 1 {
+		t.Fatalf("CMDB validation side effects = run:%d audit:%d outbox:%d",
+			runCount, auditCount, outboxCount)
+	}
+}
+
+func TestSourceRevisionIntegrationCMDBPublishClosedAndManualAvailable(t *testing.T) {
+	harness := newAssetCatalogHarness(t)
+	harness.applyThroughAssetCatalog(t)
+	assembly := newCMDBProfileIntegrationAssembly(t, harness)
+	created := createCMDBProfileSource(
+		t, assembly.repository, assembly.scope, assembly.environmentID,
+		"cmdb-publish-closed-create", "CMDB publish closed fixture",
+	)
+	validating, err := assembly.repository.RequestValidation(
+		t.Context(),
+		assetcatalog.ValidateSourceRevisionCommand{
+			Context: sourceRevisionMutationContext(
+				t, assembly.scope, "cmdb-publish-closed-validate", "4",
+			),
+			SourceID: created.Source.ID, Revision: created.Revision.Revision,
+			ExpectedSourceVersion:   created.Source.Version,
+			ExpectedRevisionVersion: created.Revision.Version,
+			ExpectedRevisionDigest:  created.Revision.CanonicalRevisionDigest,
+		},
+	)
+	if err != nil {
+		t.Fatalf("RequestValidation(CMDB publish fixture) error = %v", err)
+	}
+	proof := strings.Repeat("7", 64)
+	completeDeferredCMDBValidationFixture(t, harness.db, assembly, validating, proof)
+
+	var sourceVersion, revisionVersion int64
+	if err := harness.db.QueryRow(t.Context(), `
+SELECT source.version,revision.version
+FROM asset_sources AS source
+JOIN asset_source_revisions AS revision
+  ON revision.source_id=source.id AND revision.revision=$2
+WHERE source.id=$1::uuid
+`, created.Source.ID, created.Revision.Revision).Scan(
+		&sourceVersion, &revisionVersion,
+	); err != nil {
+		t.Fatal(err)
+	}
+	publishCommand := assetcatalog.PublishSourceRevisionCommand{
+		Context: sourceRevisionMutationContext(
+			t, assembly.scope, "cmdb-publish-closed", "5",
+		),
+		SourceID: created.Source.ID, Revision: created.Revision.Revision,
+		ReasonCode:               "VALIDATION_REVIEWED",
+		ExpectedSourceVersion:    sourceVersion,
+		ExpectedRevisionVersion:  revisionVersion,
+		ExpectedRevisionDigest:   created.Revision.CanonicalRevisionDigest,
+		ExpectedValidationRunID:  validating.Run.ID,
+		ExpectedValidationDigest: proof,
+	}
+	published, err := assembly.repository.Publish(t.Context(), publishCommand)
+	if err != nil {
+		t.Fatalf("Publish(CMDB) error = %v", err)
+	}
+	if published.Revision.Status != assetcatalog.SourceRevisionPublished ||
+		published.Source.GateStatus != assetcatalog.SourceGateUnavailable ||
+		published.Source.GateReasonCode != "PUBLISHED_VALIDATION_REFERENCE_DRIFT" ||
+		published.Source.PublishedRevision != published.Revision.Revision ||
+		published.Source.PublishedRevisionDigest != published.Revision.CanonicalRevisionDigest ||
+		published.Source.ValidatedRunID != "" ||
+		published.Source.ValidationDigest != "" ||
+		published.Source.ValidatedBindingDigest != "" ||
+		published.Source.CheckpointSourceRevision != published.Revision.Revision ||
+		published.Source.CheckpointVersion != 0 ||
+		published.Source.CheckpointSHA256 != "" {
+		t.Fatalf("Publish(CMDB) opened or retained binding: %#v", published)
+	}
+	var durableCheckpointClosure bool
+	if err := harness.db.QueryRow(t.Context(), `
+SELECT checkpoint_ciphertext IS NULL
+   AND checkpoint_key_id IS NULL
+   AND checkpoint_sha256 IS NULL
+   AND checkpoint_revision=$2
+   AND checkpoint_version=0
+   AND last_success_run_id IS NULL
+   AND last_success_at IS NULL
+   AND last_complete_snapshot_run_id IS NULL
+   AND last_complete_snapshot_at IS NULL
+FROM asset_sources
+WHERE id=$1::uuid
+`, published.Source.ID, published.Revision.Revision).Scan(
+		&durableCheckpointClosure,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !durableCheckpointClosure {
+		t.Fatal("Publish(CMDB) retained a non-MANUAL checkpoint binding")
+	}
+	replay, err := assembly.repository.Publish(t.Context(), publishCommand)
+	if err != nil || !replay.Receipt.IdempotentReplay ||
+		replay.Source.GateStatus != assetcatalog.SourceGateUnavailable {
+		t.Fatalf("Publish(CMDB replay) = (%#v, %v)", replay, err)
+	}
+
+	syncCommand := assetcatalog.RequestSyncCommand{
+		Context: sourceRevisionMutationContext(
+			t, assembly.scope, "cmdb-publish-closed-sync", "6",
+		),
+		SourceID: created.Source.ID, ExpectedSourceVersion: published.Source.Version,
+		ExpectedRevision:          published.Revision.Revision,
+		ExpectedRevisionDigest:    published.Revision.CanonicalRevisionDigest,
+		ExpectedCheckpointVersion: published.Source.CheckpointVersion,
+		ExpectedCheckpointSHA256:  published.Source.CheckpointSHA256,
+	}
+	if mutation, err := assembly.repository.RequestSync(
+		t.Context(), syncCommand,
+	); !errors.Is(err, assetcatalog.ErrStateConflict) ||
+		!reflect.DeepEqual(mutation, assetcatalog.SourceRunMutation{}) {
+		t.Fatalf("RequestSync(SOURCE_GATE_UNAVAILABLE) = (%#v, %v)", mutation, err)
+	}
+	var discoveryRuns, syncAudits, syncOutbox int
+	if err := harness.db.QueryRow(t.Context(), `
+SELECT
+  (SELECT count(*) FROM asset_source_runs
+   WHERE source_id=$1::uuid AND run_kind='DISCOVERY'),
+  (SELECT count(*) FROM audit_records
+   WHERE workspace_id=$2::uuid AND request_id=$3),
+  (SELECT count(*) FROM outbox_events
+   WHERE aggregate_id=$1::uuid AND event_type='asset.source.sync.requested.v1')
+`, created.Source.ID, assembly.scope.WorkspaceID,
+		syncCommand.Context.IdempotencyKey()).Scan(
+		&discoveryRuns, &syncAudits, &syncOutbox,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if discoveryRuns != 0 || syncAudits != 0 || syncOutbox != 0 {
+		t.Fatalf("closed CMDB sync side effects = run:%d audit:%d outbox:%d",
+			discoveryRuns, syncAudits, syncOutbox)
+	}
+
+	manualCreated, err := assembly.repository.CreateSource(
+		t.Context(),
+		assetcatalog.CreateSourceCommand{
+			Context: sourceRevisionMutationContext(
+				t, assembly.scope, "manual-publish-available-create", "7",
+			),
+			Name:            "MANUAL publish available fixture",
+			SourceProfileID: assetcatalog.SourceProfileIDManualV1,
+			AuthorityEnvironmentIDs: []string{
+				assembly.environmentID,
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manualValidated, err := assembly.repository.RequestValidation(
+		t.Context(),
+		assetcatalog.ValidateSourceRevisionCommand{
+			Context: sourceRevisionMutationContext(
+				t, assembly.scope, "manual-publish-available-validate", "8",
+			),
+			SourceID: manualCreated.Source.ID, Revision: manualCreated.Revision.Revision,
+			ExpectedSourceVersion:   manualCreated.Source.Version,
+			ExpectedRevisionVersion: manualCreated.Revision.Version,
+			ExpectedRevisionDigest:  manualCreated.Revision.CanonicalRevisionDigest,
+		},
+	)
+	if err != nil || manualValidated.Revision.Status != assetcatalog.SourceRevisionValidated {
+		t.Fatalf("RequestValidation(MANUAL) = (%#v, %v)", manualValidated, err)
+	}
+	manualPublished, err := assembly.repository.Publish(
+		t.Context(),
+		assetcatalog.PublishSourceRevisionCommand{
+			Context: sourceRevisionMutationContext(
+				t, assembly.scope, "manual-publish-available", "9",
+			),
+			SourceID: manualValidated.Source.ID, Revision: manualValidated.Revision.Revision,
+			ReasonCode:               "VALIDATION_REVIEWED",
+			ExpectedSourceVersion:    manualValidated.Source.Version,
+			ExpectedRevisionVersion:  manualValidated.Revision.Version,
+			ExpectedRevisionDigest:   manualValidated.Revision.CanonicalRevisionDigest,
+			ExpectedValidationRunID:  manualValidated.Run.ID,
+			ExpectedValidationDigest: manualValidated.Revision.ValidationDigest,
+		},
+	)
+	if err != nil || manualPublished.Source.GateStatus != assetcatalog.SourceGateAvailable ||
+		manualPublished.Revision.Status != assetcatalog.SourceRevisionPublished {
+		t.Fatalf("Publish(MANUAL) = (%#v, %v)", manualPublished, err)
+	}
+}
 
 func TestSourceRevisionIntegrationInjectedCSVProfileCreatesClosedExactRevisions(t *testing.T) {
 	harness := newAssetCatalogHarness(t)
@@ -2188,6 +2585,212 @@ SELECT
 		t.Fatalf("concurrent RequestSync side effects = run:%d audit:%d/%d outbox:%d/%d",
 			runCount, auditResourceCount, auditCount, outboxAggregateCount, outboxCount)
 	}
+}
+
+type cmdbProfileIntegrationAssembly struct {
+	repository            *assetpostgres.Repository
+	registry              assetcatalog.SourceProfileRegistry
+	scope                 assetcatalog.SourceScope
+	environmentID         string
+	integrationID         string
+	clock                 func() time.Time
+	newID                 func() string
+	credentialReferenceID assetcatalog.CredentialReferenceID
+	trustReferenceID      assetcatalog.TrustReferenceID
+	validationAdmission   sourceprofile.SourceValidationRuntimeAdmission
+}
+
+func newCMDBProfileIntegrationAssembly(
+	t *testing.T,
+	harness *assetCatalogHarness,
+) cmdbProfileIntegrationAssembly {
+	t.Helper()
+	fixture := seedSourceCreationScope(t, harness.db)
+	integrationID := "40000000-0000-4000-8000-000000000211"
+	execAssetSQL(t, harness.db, `
+INSERT INTO integrations (
+  id,tenant_id,workspace_id,provider,name,secret_ref,config
+) VALUES (
+  $1::uuid,$2::uuid,$3::uuid,'cmdb_catalog_v1',
+  'CMDB Catalog v1 profile binding','opaque://cmdb-catalog-v1','{}'::jsonb
+)
+`, integrationID, fixture.tenantID, fixture.workspaceID)
+	descriptor := sourceprofile.ExternalCMDBV1()
+	credentialReferenceID := assetcatalog.CredentialReferenceID(
+		"50000000-0000-4000-8000-000000000211",
+	)
+	trustReferenceID := assetcatalog.TrustReferenceID(
+		"60000000-0000-4000-8000-000000000211",
+	)
+	registration, err := descriptor.Registration(sourceprofile.ExternalCMDBProfileReferences{
+		IntegrationID:            integrationID,
+		CredentialReferenceID:    credentialReferenceID,
+		TrustReferenceID:         trustReferenceID,
+		NetworkPolicyReferenceID: "70000000-0000-4000-8000-000000000211",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := assetcatalog.NewSourceProfileRegistry(registration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalManifest := []byte(
+		`{"schema_version":"discovery-worker-runtime-admission.v1","providers":[{"provider_kind":"CMDB_CATALOG_V1","profile_code":"CMDB_CATALOG_V1","canonical_descriptor_digest":"04a55074842e641d87ad67c42f1020b9b097ad15c3e781aaeffa3887837fdd08","runtime_recovery_capability_digest":"92f56dca945425f4129703183c71ba9c0aa08f47c3f8e8ec2ed6cdea2951f5aa"}]}`,
+	)
+	manifestDigest := sha256.Sum256(canonicalManifest)
+	admission, err := sourceprofile.NewSourceValidationRuntimeAdmission(
+		descriptor,
+		sourceprofile.SourceValidationRuntimeManifest{
+			CanonicalJSON: canonicalManifest,
+			DigestSHA256:  hex.EncodeToString(manifestDigest[:]),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := func() time.Time {
+		return time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	}
+	newID := deterministicAssetIDGenerator()
+	repository, err := assetpostgres.NewWithSourceProfileRegistry(
+		harness.application,
+		clock,
+		newID,
+		registry,
+		admission,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cmdbProfileIntegrationAssembly{
+		repository: repository,
+		registry:   registry,
+		scope: assetcatalog.SourceScope{
+			TenantID: fixture.tenantID, WorkspaceID: fixture.workspaceID,
+		},
+		environmentID:         fixture.environmentID,
+		integrationID:         integrationID,
+		clock:                 clock,
+		newID:                 newID,
+		credentialReferenceID: credentialReferenceID,
+		trustReferenceID:      trustReferenceID,
+		validationAdmission:   admission,
+	}
+}
+
+func createCMDBProfileSource(
+	t *testing.T,
+	repository *assetpostgres.Repository,
+	scope assetcatalog.SourceScope,
+	environmentID, idempotencyKey, name string,
+) assetcatalog.SourceRevisionMutation {
+	t.Helper()
+	created, err := repository.CreateSource(
+		t.Context(),
+		assetcatalog.CreateSourceCommand{
+			Context:         sourceRevisionMutationContext(t, scope, idempotencyKey, "c"),
+			Name:            name,
+			SourceProfileID: sourceprofile.ExternalCMDBProfileSelector,
+			AuthorityEnvironmentIDs: []string{
+				environmentID,
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("CreateSource(exact CMDB) error = %v", err)
+	}
+	if created.Source.Kind != assetcatalog.SourceKindExternalCMDB ||
+		created.Source.ProviderKind != "CMDB_CATALOG_V1" ||
+		created.Source.GateStatus != assetcatalog.SourceGateUnavailable ||
+		created.Revision.Status != assetcatalog.SourceRevisionDraft ||
+		created.Revision.ProfileCode != "CMDB_CATALOG_V1" {
+		t.Fatalf("CreateSource(exact CMDB) = %#v", created)
+	}
+	return created
+}
+
+func assertCMDBValidationZeroWrites(
+	t *testing.T,
+	database *pgxpool.Pool,
+	created assetcatalog.SourceRevisionMutation,
+	requestID string,
+) {
+	t.Helper()
+	var (
+		sourceVersion, revisionVersion               int64
+		gateStatus, revisionStatus                   string
+		revisionRunCleared, sourceRunCleared         bool
+		runCount, validationAudits, validationOutbox int
+	)
+	if err := database.QueryRow(t.Context(), `
+SELECT source.version,source.gate_status,source.validated_run_id IS NULL,
+       revision.version,revision.state,revision.validation_run_id IS NULL,
+       (SELECT count(*) FROM asset_source_runs
+        WHERE source_id=source.id AND run_kind='VALIDATION'),
+       (SELECT count(*) FROM audit_records
+        WHERE workspace_id=source.workspace_id AND request_id=$2),
+       (SELECT count(*) FROM outbox_events
+        WHERE workspace_id=source.workspace_id
+          AND event_type='asset.source.validation.requested.v1')
+FROM asset_sources AS source
+JOIN asset_source_revisions AS revision
+  ON revision.source_id=source.id AND revision.revision=$3
+WHERE source.id=$1::uuid
+`, created.Source.ID, requestID, created.Revision.Revision).Scan(
+		&sourceVersion, &gateStatus, &sourceRunCleared,
+		&revisionVersion, &revisionStatus, &revisionRunCleared,
+		&runCount, &validationAudits, &validationOutbox,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if sourceVersion != created.Source.Version ||
+		gateStatus != string(assetcatalog.SourceGateUnavailable) ||
+		!sourceRunCleared ||
+		revisionVersion != created.Revision.Version ||
+		revisionStatus != string(assetcatalog.SourceRevisionDraft) ||
+		!revisionRunCleared ||
+		runCount != 0 || validationAudits != 0 || validationOutbox != 0 {
+		t.Fatalf(
+			"closed CMDB validation mutated state: source=%d/%s/%t revision=%d/%s/%t side-effects=%d/%d/%d",
+			sourceVersion, gateStatus, sourceRunCleared,
+			revisionVersion, revisionStatus, revisionRunCleared,
+			runCount, validationAudits, validationOutbox,
+		)
+	}
+}
+
+func completeDeferredCMDBValidationFixture(
+	t *testing.T,
+	database *pgxpool.Pool,
+	assembly cmdbProfileIntegrationAssembly,
+	validating assetcatalog.SourceRunMutation,
+	proof string,
+) {
+	t.Helper()
+	// Task 19A deliberately does not own the Provider validation runtime. This
+	// fixture supplies only its already-terminal durable evidence; CreateSource,
+	// RequestValidation, Publish, replay, and RequestSync remain public calls.
+	execAssetSQL(t, database, `
+UPDATE asset_source_runs
+SET status='RUNNING',stage_code='VALIDATING',lease_owner='cmdb-validation-fixture',
+    lease_expires_at=statement_timestamp()+interval '10 minutes',
+    fence_epoch=1,fence_token_hash=repeat('6',64),
+    heartbeat_sequence=1,heartbeat_at=statement_timestamp(),version=version+1
+WHERE id=$1::uuid AND status='QUEUED'
+`, validating.Run.ID)
+	fixture := assetCatalogFixture{
+		tenantID:               assembly.scope.TenantID,
+		workspaceID:            assembly.scope.WorkspaceID,
+		environmentID:          assembly.environmentID,
+		integrationID:          assembly.integrationID,
+		sourceID:               validating.Source.ID,
+		revisionID:             validating.Revision.ID,
+		validationRunID:        validating.Run.ID,
+		revisionDigest:         validating.Revision.CanonicalRevisionDigest,
+		sourceDefinitionDigest: validating.Revision.SourceDefinitionDigest,
+	}
+	finishSourceRevisionExternalValidationOnly(t, database, fixture, proof)
 }
 
 type sourceCreationScopeFixture struct {

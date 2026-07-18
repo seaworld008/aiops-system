@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/puddle/v2"
 	"github.com/seaworld008/aiops-system/internal/assetcatalog"
+	"github.com/seaworld008/aiops-system/internal/sourceprofile"
 )
 
 const serializableAttempts = 3
@@ -37,10 +38,11 @@ func (database *assetCatalogPool) BeginTx(ctx context.Context, options pgx.TxOpt
 }
 
 type Repository struct {
-	pool     *assetCatalogPool
-	clock    func() time.Time
-	newID    func() string
-	profiles assetcatalog.SourceProfileRegistry
+	pool                *assetCatalogPool
+	clock               func() time.Time
+	newID               func() string
+	profiles            assetcatalog.SourceProfileRegistry
+	validationAdmission sourceprofile.SourceValidationRuntimeAdmission
 }
 
 func New(pool *pgxpool.Pool, clock func() time.Time, newID func() string) (*Repository, error) {
@@ -57,22 +59,58 @@ func NewWithSourceProfileRegistry(
 	clock func() time.Time,
 	newID func() string,
 	profiles assetcatalog.SourceProfileRegistry,
+	validationAdmissions ...sourceprofile.SourceValidationRuntimeAdmission,
 ) (*Repository, error) {
 	if pool == nil || newID == nil || nilSourceProfileRegistry(profiles) {
 		return nil, errors.New("asset catalog pool, id generator, and source profile registry are required")
 	}
+	if len(validationAdmissions) > 1 ||
+		len(validationAdmissions) == 1 &&
+			(!validationAdmissions[0].Valid() ||
+				!sourceProfileRegistryHasExactExternalCMDB(profiles)) {
+		return nil, errors.New("asset catalog validation runtime admission is invalid")
+	}
 	if clock == nil {
 		clock = time.Now
+	}
+	var validationAdmission sourceprofile.SourceValidationRuntimeAdmission
+	if len(validationAdmissions) == 1 {
+		validationAdmission = validationAdmissions[0]
 	}
 	return &Repository{
 		pool: &assetCatalogPool{
 			Pool:    pool,
 			beginTx: pool.BeginTx,
 		},
-		clock:    clock,
-		newID:    newID,
-		profiles: profiles,
+		clock:               clock,
+		newID:               newID,
+		profiles:            profiles,
+		validationAdmission: validationAdmission,
 	}, nil
+}
+
+func sourceProfileRegistryHasExactExternalCMDB(
+	profiles assetcatalog.SourceProfileRegistry,
+) bool {
+	if nilSourceProfileRegistry(profiles) {
+		return false
+	}
+	descriptor := sourceprofile.ExternalCMDBV1()
+	profile, err := profiles.Resolve(descriptor.Selector())
+	if err != nil {
+		return false
+	}
+	registration, err := descriptor.Registration(sourceprofile.ExternalCMDBProfileReferences{
+		IntegrationID:            profile.IntegrationID,
+		CredentialReferenceID:    profile.CredentialReferenceID,
+		TrustReferenceID:         profile.TrustReferenceID,
+		NetworkPolicyReferenceID: profile.NetworkPolicyReferenceID,
+	})
+	if err != nil || !reflect.DeepEqual(profile, registration.Profile) {
+		return false
+	}
+	admitted, err := profiles.ResolveProfileAdmission(context.Background(), descriptor.ProfileCode())
+	return err == nil && reflect.DeepEqual(profile, admitted)
 }
 
 func nilSourceProfileRegistry(registry assetcatalog.SourceProfileRegistry) bool {
