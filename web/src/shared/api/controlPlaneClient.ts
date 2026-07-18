@@ -107,6 +107,11 @@ type OperationDefinition = {
 const operationRegistry: Record<keyof operations, OperationDefinition> = {
   getBrowserConfig: { method: "GET", path: "/browser-config", successStatus: 200 },
   getSession: { method: "GET", path: "/session", successStatus: 200 },
+  getOverview: {
+    method: "GET",
+    path: "/workspaces/{workspace_id}/environments/{environment_id}/overview",
+    successStatus: 200,
+  },
   listAssets: {
     method: "GET",
     path: "/workspaces/{workspace_id}/environments/{environment_id}/assets",

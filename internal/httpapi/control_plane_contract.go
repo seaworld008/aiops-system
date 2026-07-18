@@ -29,7 +29,7 @@ var (
 	errControlPlaneBodyTooLarge         = errors.New("control plane body too large")
 )
 
-const controlPlaneContractDigest = "sha256:5f3d4bb6c3b7473f2655f4c7b4839e9d4cb3bf3b115a2ce2e2dd47b32e020082"
+const controlPlaneContractDigest = "sha256:79b697cfef1646ce9b54595dcd30dc42fbd03f8e79d3d9f731fd7c349017611d"
 
 type controlPlaneCursor struct {
 	Kind        string `json:"kind"`

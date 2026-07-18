@@ -14,6 +14,7 @@ import (
 	"github.com/seaworld008/aiops-system/internal/assetcatalog"
 	"github.com/seaworld008/aiops-system/internal/authn"
 	"github.com/seaworld008/aiops-system/internal/ids"
+	"github.com/seaworld008/aiops-system/internal/overview"
 	"github.com/seaworld008/aiops-system/internal/requestmeta"
 	"github.com/seaworld008/aiops-system/internal/signal"
 	"github.com/seaworld008/aiops-system/internal/store"
@@ -48,6 +49,7 @@ type Dependencies struct {
 	AssetSources          assetcatalog.SourceManager
 	AssetConflicts        assetcatalog.ConflictManager
 	ServiceAssetBindings  assetcatalog.BindingManager
+	Overview              overview.Manager
 	WebUI                 *WebUI
 }
 
@@ -88,6 +90,10 @@ func NewRouter(deps Dependencies) http.Handler {
 	router.Route("/api/v1", func(api chi.Router) {
 		api.Group(func(governed chi.Router) {
 			governed.Use(authenticationMiddleware(deps.Authenticator))
+			governed.Get(
+				"/workspaces/{workspaceID}/environments/{environmentID}/overview",
+				overviewHandler(deps.Overview),
+			)
 			governed.Get(
 				"/workspaces/{workspaceID}/environments/{environmentID}/assets",
 				listAssetsHandler(deps.Assets, deps.ControlPlaneCursor),

@@ -10,6 +10,7 @@ security:
   - oidc: []
 tags:
   - name: Browser
+  - name: Overview
   - name: Assets
   - name: AssetRelations
   - name: AssetSources
@@ -35,6 +36,28 @@ paths:
           $ref: "#/components/responses/SessionOK"
         "401":
           $ref: "#/components/responses/Problem401"
+        "503":
+          $ref: "#/components/responses/Problem503"
+  /api/v1/workspaces/{workspace_id}/environments/{environment_id}/overview:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+      - $ref: "#/components/parameters/EnvironmentID"
+    get:
+      tags: [Overview]
+      operationId: getOverview
+      responses:
+        "200":
+          $ref: "#/components/responses/OverviewOK"
+        "400":
+          $ref: "#/components/responses/Problem400"
+        "401":
+          $ref: "#/components/responses/Problem401"
+        "403":
+          $ref: "#/components/responses/Problem403"
+        "404":
+          $ref: "#/components/responses/Problem404"
+        "500":
+          $ref: "#/components/responses/Problem500"
         "503":
           $ref: "#/components/responses/Problem503"
   /api/v1/workspaces/{workspace_id}/environments/{environment_id}/assets:
@@ -1144,6 +1167,23 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Session"
+    OverviewOK:
+      description: Scope-safe governed operations readiness snapshot.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/CacheControl"
+        X-Content-Type-Options:
+          $ref: "#/components/headers/ContentTypeOptions"
+        Referrer-Policy:
+          $ref: "#/components/headers/ReferrerPolicy"
+        X-Trace-ID:
+          $ref: "#/components/headers/TraceID"
+        ETag:
+          $ref: "#/components/headers/ETag"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OverviewSnapshot"
     AssetPageOK:
       description: Scoped asset page.
       headers:
@@ -1857,6 +1897,232 @@ components:
         expires_at:
           type: string
           format: date-time
+    OverviewImplementationState:
+      type: string
+      enum: [NOT_STARTED, UNAVAILABLE, PARTIAL, AVAILABLE, DEGRADED, SUSPENDED]
+    OverviewSectionCode:
+      type: string
+      enum: [NOT_IMPLEMENTED, MODULE_UNAVAILABLE, AGGREGATE_PARTIAL, READY, STALE_EVIDENCE, SUSPENDED]
+    OverviewFeature:
+      type: string
+      enum: [ASSETS, SOURCES, CONNECTIONS, INVESTIGATIONS, ACTIONS, RELEASES]
+    OverviewEffectiveAction:
+      type: string
+      enum: [VIEW_ASSETS, VIEW_SOURCES, VIEW_CONNECTIONS, VIEW_INVESTIGATIONS, VIEW_ACTIONS, VIEW_RELEASES]
+    OverviewWorkQueueKey:
+      type: string
+      enum: [OPEN_CONFLICTS, STALE_ASSETS, UNAVAILABLE_SOURCES, DEGRADED_SOURCES]
+    OverviewScope:
+      type: object
+      additionalProperties: false
+      required: [workspace_id, environment_id]
+      properties:
+        workspace_id:
+          $ref: "#/components/schemas/UUID"
+        environment_id:
+          $ref: "#/components/schemas/UUID"
+    OverviewStateCount:
+      type: object
+      additionalProperties: false
+      required: [state, count]
+      properties:
+        state:
+          type: string
+          minLength: 1
+          maxLength: 32
+          pattern: "^[A-Z][A-Z0-9_]{0,31}$"
+        count:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9007199254740991
+    OverviewProviderGateSummary:
+      type: object
+      additionalProperties: false
+      required: [provider_kind, gate_status, source_count, evidence_at]
+      properties:
+        provider_kind:
+          type: string
+          pattern: "^[A-Z][A-Z0-9_]{0,63}$"
+        gate_status:
+          $ref: "#/components/schemas/SourceGateStatus"
+        source_count:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 9007199254740991
+        evidence_at:
+          $ref: "#/components/schemas/NullableDateTime"
+    OverviewAssetFacts:
+      type: object
+      additionalProperties: false
+      required: [total, lifecycles, mapping_statuses, stale_count, oldest_stale_at, open_conflict_count]
+      properties:
+        total:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9007199254740991
+        lifecycles:
+          type: array
+          minItems: 5
+          maxItems: 5
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/OverviewStateCount"
+        mapping_statuses:
+          type: array
+          minItems: 3
+          maxItems: 3
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/OverviewStateCount"
+        stale_count:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9007199254740991
+        oldest_stale_at:
+          $ref: "#/components/schemas/NullableDateTime"
+        open_conflict_count:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9007199254740991
+    OverviewSourceFacts:
+      type: object
+      additionalProperties: false
+      required:
+        - total
+        - statuses
+        - revision_statuses
+        - gate_statuses
+        - run_statuses
+        - backpressured_count
+        - provider_gates
+      properties:
+        total:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9007199254740991
+        statuses:
+          type: array
+          minItems: 4
+          maxItems: 4
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/OverviewStateCount"
+        revision_statuses:
+          type: array
+          minItems: 6
+          maxItems: 6
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/OverviewStateCount"
+        gate_statuses:
+          type: array
+          minItems: 5
+          maxItems: 5
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/OverviewStateCount"
+        run_statuses:
+          type: array
+          minItems: 8
+          maxItems: 8
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/OverviewStateCount"
+        backpressured_count:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 9007199254740991
+        provider_gates:
+          type: array
+          maxItems: 128
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/OverviewProviderGateSummary"
+    OverviewSection:
+      type: object
+      additionalProperties: false
+      required: [state, code, observed_at, asset_facts, source_facts]
+      properties:
+        state:
+          $ref: "#/components/schemas/OverviewImplementationState"
+        code:
+          $ref: "#/components/schemas/OverviewSectionCode"
+        observed_at:
+          type: string
+          format: date-time
+        asset_facts:
+          oneOf:
+            - $ref: "#/components/schemas/OverviewAssetFacts"
+            - type: "null"
+        source_facts:
+          oneOf:
+            - $ref: "#/components/schemas/OverviewSourceFacts"
+            - type: "null"
+    OverviewSections:
+      type: object
+      additionalProperties: false
+      required: [ASSETS, SOURCES, CONNECTIONS, INVESTIGATIONS, ACTIONS, RELEASES]
+      properties:
+        ASSETS:
+          $ref: "#/components/schemas/OverviewSection"
+        SOURCES:
+          $ref: "#/components/schemas/OverviewSection"
+        CONNECTIONS:
+          $ref: "#/components/schemas/OverviewSection"
+        INVESTIGATIONS:
+          $ref: "#/components/schemas/OverviewSection"
+        ACTIONS:
+          $ref: "#/components/schemas/OverviewSection"
+        RELEASES:
+          $ref: "#/components/schemas/OverviewSection"
+    OverviewWorkQueue:
+      type: object
+      additionalProperties: false
+      required: [key, section, state, count]
+      properties:
+        key:
+          $ref: "#/components/schemas/OverviewWorkQueueKey"
+        section:
+          $ref: "#/components/schemas/OverviewFeature"
+        state:
+          $ref: "#/components/schemas/OverviewImplementationState"
+        count:
+          type: [integer, "null"]
+          format: int64
+          minimum: 0
+          maximum: 9007199254740991
+    OverviewSnapshot:
+      type: object
+      additionalProperties: false
+      required: [scope, generated_at, sections, work_queues, effective_actions]
+      properties:
+        scope:
+          $ref: "#/components/schemas/OverviewScope"
+        generated_at:
+          type: string
+          format: date-time
+        sections:
+          $ref: "#/components/schemas/OverviewSections"
+        work_queues:
+          type: array
+          minItems: 4
+          maxItems: 4
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/OverviewWorkQueue"
+        effective_actions:
+          type: array
+          maxItems: 6
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/OverviewEffectiveAction"
     PageMeta:
       type: object
       additionalProperties: false
