@@ -2135,6 +2135,104 @@ func TestInventoryRevokeContextExpiryLeavesOneEventualFinalizer(t *testing.T) {
 	}
 }
 
+func TestInventoryCanceledBrokerRevokePermanentlyRejectsRolloverSuccessor(
+	t *testing.T,
+) {
+	fixture := newRolloverHandoffFixture(t)
+	handoff := fixture.begin(t)
+	fixture.predecessor.closeStarted = make(chan struct{})
+	fixture.predecessor.closeRelease = make(chan struct{})
+
+	type brokerRevokeResult struct {
+		proof discoveryqueue.CleanupProof
+		err   error
+	}
+	revokeContext, cancelRevoke := context.WithTimeout(
+		context.Background(),
+		50*time.Millisecond,
+	)
+	defer cancelRevoke()
+	revokeDone := make(chan brokerRevokeResult, 1)
+	go func() {
+		proof, err := fixture.broker.RevokeAttempt(
+			revokeContext,
+			fixture.openRequest.Attempt.AttemptID,
+		)
+		revokeDone <- brokerRevokeResult{proof: proof, err: err}
+	}()
+	select {
+	case <-fixture.predecessor.closeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Broker revoke did not reach predecessor cleanup")
+	}
+	select {
+	case <-revokeContext.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Broker revoke context did not expire")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		fixture.opener.attempt.state.mu.rawLock()
+		destroyStarted := fixture.opener.attempt.state.destroyed
+		fixture.opener.attempt.state.mu.rawUnlock()
+		if destroyStarted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Broker did not begin Destroy after canceled handle Revoke")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	completed, receiptErr := fixture.opener.attempt.state.rolloverRevocation.result()
+	close(fixture.predecessor.closeRelease)
+	if completed || !errors.Is(receiptErr, errInventoryRejected) {
+		t.Fatalf(
+			"rollover receipt before background cleanup = completed:%t err:%v, want sealed uncertainty",
+			completed,
+			receiptErr,
+		)
+	}
+
+	var revoked brokerRevokeResult
+	select {
+	case revoked = <-revokeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Broker revoke did not finish after predecessor cleanup")
+	}
+	defer revoked.proof.Destroy()
+	if revoked.err != nil {
+		t.Fatalf("RevokeAttempt() error = %v", revoked.err)
+	}
+	if revoked.proof.Status() != assetcatalog.CredentialCleanupUncertain {
+		t.Fatalf(
+			"canceled Broker cleanup status = %s, want UNCERTAIN",
+			revoked.proof.Status(),
+		)
+	}
+
+	material := inventoryRuntimeMaterial(
+		t,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+	)
+	successor, successorErr := handoff.NewSuccessor(
+		context.Background(),
+		fixture.queue,
+		fixture.fence,
+		&material,
+		fixture.partial.NextCheckpoint,
+	)
+	if successor != nil {
+		successor.Destroy()
+	}
+	if successor != nil || !errors.Is(successorErr, errInventoryContinuity) {
+		t.Fatalf(
+			"NewSuccessor(after UNCERTAIN Broker cleanup) = (%#v,%v), want permanent rejection",
+			successor,
+			successorErr,
+		)
+	}
+}
+
 func TestInventoryConcurrentDiscoverConsumesContinuationOnce(t *testing.T) {
 	t.Parallel()
 

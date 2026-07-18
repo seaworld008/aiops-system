@@ -489,8 +489,27 @@ func (attempt *FullInventoryAttempt) Revoke(ctx context.Context) error {
 	case <-done:
 		return private.revokeErr
 	case <-ctx.Done():
-		return ctx.Err()
+		contextErr := ctx.Err()
+		private.sealCanceledRolloverRevocation()
+		return contextErr
 	}
+}
+
+// sealCanceledRolloverRevocation makes a caller-visible cleanup timeout
+// permanently fail closed before CleanupBroker can call Destroy. The eventual
+// finalizer retains sole ownership of the raw client, but it cannot later
+// overwrite this safe receipt with a successful rollover prerequisite.
+func (private *fullInventoryAttemptState) sealCanceledRolloverRevocation() {
+	private.mu.rawLock()
+	revocation := private.rolloverRevocation
+	private.mu.rawUnlock()
+	if revocation == nil {
+		return
+	}
+	revocation.mu.Lock()
+	revocation.revoked = true
+	revocation.err = errInventoryRejected
+	revocation.mu.Unlock()
 }
 
 func (attempt *FullInventoryAttempt) revokeFromRuntimeClear() {
