@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -29,12 +30,20 @@ const (
 )
 
 var (
-	errInventoryContinuity      = errors.New("vsphere full inventory continuity unavailable")
-	errInventoryIdentityDrift   = errors.New("vsphere inventory identity drift")
-	errInventoryRejected        = errors.New("vsphere inventory rejected")
-	ignoredInventoryObjectTypes = []string{
+	errInventoryContinuity       = errors.New("vsphere full inventory continuity unavailable")
+	errInventoryIdentityDrift    = errors.New("vsphere inventory identity drift")
+	errInventoryRejected         = errors.New("vsphere inventory rejected")
+	errInventoryCleanupUncertain = errors.New("vsphere inventory cleanup uncertain")
+	ignoredInventoryObjectTypes  = []string{
+		"DistributedVirtualSwitch",
 		"DistributedVirtualPortgroup",
+		"VmwareDistributedVirtualSwitch",
 	}
+)
+
+const (
+	inventoryTopologyFolderChild      = "FOLDER_CHILD"
+	inventoryTopologyDatacenterVMRoot = "DATACENTER_VM_ROOT"
 )
 
 type inventoryPageClient interface {
@@ -55,8 +64,67 @@ type FullInventoryAttempt struct {
 	state *fullInventoryAttemptState
 }
 
+// fullInventoryStateBarrier preserves the Lock/Unlock contract consumed by
+// rollover_handoff.go while allowing terminal cleanup to cancel an in-flight
+// SOAP operation through the raw state lock. A normal locker keeps turnstile
+// ownership while waiting for operationDone, so a later Discover cannot
+// overtake an already waiting handoff.
+type fullInventoryStateBarrier struct {
+	turnstile     sync.Mutex
+	raw           sync.Mutex
+	operationDone chan struct{}
+}
+
+func (barrier *fullInventoryStateBarrier) Lock() {
+	barrier.turnstile.Lock()
+	for {
+		barrier.raw.Lock()
+		done := barrier.operationDone
+		if done == nil {
+			return
+		}
+		barrier.raw.Unlock()
+		<-done
+	}
+}
+
+func (barrier *fullInventoryStateBarrier) Unlock() {
+	barrier.raw.Unlock()
+	barrier.turnstile.Unlock()
+}
+
+func (barrier *fullInventoryStateBarrier) rawLock() {
+	barrier.raw.Lock()
+}
+
+func (barrier *fullInventoryStateBarrier) rawUnlock() {
+	barrier.raw.Unlock()
+}
+
+func (barrier *fullInventoryStateBarrier) beginOperationLocked(done chan struct{}) {
+	barrier.operationDone = done
+}
+
+func (barrier *fullInventoryStateBarrier) finishOperationLocked(done chan struct{}) {
+	if barrier.operationDone == done {
+		barrier.operationDone = nil
+		close(done)
+	}
+}
+
+type fullInventoryOperation struct {
+	generation uint64
+	context    context.Context
+	cancel     context.CancelFunc
+	done       chan struct{}
+	client     inventoryPageClient
+	root       types.ManagedObjectReference
+	token      string
+	rawMode    bool
+}
+
 type fullInventoryAttemptState struct {
-	mu sync.Mutex
+	mu fullInventoryStateBarrier
 
 	resolved           resolvedRuntime
 	authority          authoritySnapshot
@@ -80,18 +148,22 @@ type fullInventoryAttemptState struct {
 	client             inventoryPageClient
 	collector          types.ManagedObjectReference
 
-	sequence         int64
-	fullSnapshotID   string
-	successorID      string
-	pageToken        []byte
-	checkpointToken  []byte
-	soapContinuation bool
-	rootIndex        int
-	seenObjects      map[types.ManagedObjectReference]types.ManagedObjectReference
-	relationKeys     map[string]struct{}
-	pending          map[string]inventoryRelation
-	items            []inventoryObject
-	relations        []inventoryRelation
+	sequence          int64
+	fullSnapshotID    string
+	successorID       string
+	pageToken         []byte
+	checkpointToken   []byte
+	soapContinuation  bool
+	rootIndex         int
+	seenObjects       map[types.ManagedObjectReference]types.ManagedObjectReference
+	transparentNodes  map[types.ManagedObjectReference]types.ManagedObjectReference
+	topologyRelations map[string]inventoryRelation
+	relationKeys      map[string]struct{}
+	pending           map[string]inventoryRelation
+	items             []inventoryObject
+	relations         []inventoryRelation
+	operation         *fullInventoryOperation
+	generation        uint64
 
 	started       bool
 	completed     bool
@@ -412,30 +484,13 @@ func (attempt *FullInventoryAttempt) Revoke(ctx context.Context) error {
 		return errInventoryRejected
 	}
 	private := attempt.state
-	private.mu.Lock()
-	if private.revokeStart {
-		done := private.revokeDone
-		private.mu.Unlock()
-		select {
-		case <-done:
-			private.mu.Lock()
-			err := private.revokeErr
-			private.mu.Unlock()
-			return err
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	_, done := private.startRevoke(false)
+	select {
+	case <-done:
+		return private.revokeErr
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	private.revokeStart = true
-	client, runtime := private.detachForRevokeLocked()
-	private.mu.Unlock()
-
-	runtime.Clear()
-	var revokeErr error
-	if client != nil {
-		revokeErr = client.Close(ctx)
-	}
-	return private.finishRevoke(revokeErr)
 }
 
 func (attempt *FullInventoryAttempt) revokeFromRuntimeClear() {
@@ -443,22 +498,89 @@ func (attempt *FullInventoryAttempt) revokeFromRuntimeClear() {
 		return
 	}
 	private := attempt.state
-	private.mu.Lock()
-	if private.revokeStart {
-		private.mu.Unlock()
+	started, done := private.startRevoke(true)
+	if !started {
 		return
 	}
-	private.revokeStart = true
-	client, _ := private.detachForRevokeLocked()
-	private.mu.Unlock()
-
-	ctx, cancel := context.WithTimeout(context.Background(), sessionCleanupTimeout)
-	var revokeErr error
-	if client != nil {
-		revokeErr = client.Close(ctx)
+	timer := time.NewTimer(sessionCleanupTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
 	}
-	cancel()
-	_ = private.finishRevoke(revokeErr)
+}
+
+func (private *fullInventoryAttemptState) startRevoke(
+	fromRuntimeClear bool,
+) (bool, <-chan struct{}) {
+	private.mu.rawLock()
+	if private.revokeStart {
+		done := private.revokeDone
+		private.mu.rawUnlock()
+		return false, done
+	}
+	private.revokeStart = true
+	if private.operation != nil && private.operation.cancel != nil {
+		private.operation.cancel()
+	}
+	done := private.revokeDone
+	private.mu.rawUnlock()
+	go private.finalizeRevoke(fromRuntimeClear)
+	return true, done
+}
+
+func (private *fullInventoryAttemptState) finalizeRevoke(runtimeClearing bool) {
+	var (
+		revokeErr         error
+		timedOutOperation *fullInventoryOperation
+	)
+	defer func() {
+		if recover() != nil {
+			revokeErr = errInventoryCleanupUncertain
+		}
+		_ = private.finishRevoke(revokeErr, timedOutOperation)
+	}()
+
+	private.mu.rawLock()
+	operation := private.operation
+	var operationDone <-chan struct{}
+	if operation != nil {
+		operationDone = operation.done
+	}
+	private.mu.rawUnlock()
+	operationTimedOut := false
+	if operationDone != nil {
+		timer := time.NewTimer(sessionCleanupTimeout)
+		select {
+		case <-operationDone:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
+			operationTimedOut = true
+		}
+	}
+
+	private.mu.rawLock()
+	if operationTimedOut &&
+		private.operation == operation &&
+		private.mu.operationDone == operation.done {
+		private.seedCleanupUncertaintyLocked()
+		timedOutOperation = operation
+	}
+	client, runtime := private.detachForRevokeLocked()
+	private.mu.rawUnlock()
+	if !runtimeClearing {
+		if clearErr := clearInventoryRuntime(runtime); clearErr != nil {
+			revokeErr = clearErr
+		}
+	}
+	if closeErr := closeLocalInventoryClient(client); closeErr != nil {
+		revokeErr = closeErr
+	}
 }
 
 func (private *fullInventoryAttemptState) detachForRevokeLocked() (
@@ -477,6 +599,8 @@ func (private *fullInventoryAttemptState) detachForRevokeLocked() (
 	private.relations = nil
 	private.pending = nil
 	private.seenObjects = nil
+	private.transparentNodes = nil
+	private.topologyRelations = nil
 	private.relationKeys = nil
 	clear(private.rolloverObjects)
 	clear(private.rolloverRelations)
@@ -494,19 +618,53 @@ func (private *fullInventoryAttemptState) detachForRevokeLocked() (
 	return client, runtime
 }
 
-func (private *fullInventoryAttemptState) finishRevoke(revokeErr error) error {
+func (private *fullInventoryAttemptState) finishRevoke(
+	revokeErr error,
+	timedOutOperation *fullInventoryOperation,
+) error {
 	if revokeErr != nil {
 		revokeErr = errInventoryRejected
 	}
-	private.mu.Lock()
+	private.mu.rawLock()
+	select {
+	case <-private.revokeDone:
+		revokeErr = private.revokeErr
+		private.mu.rawUnlock()
+		return revokeErr
+	default:
+	}
+	if private.revokeErr != nil {
+		revokeErr = errInventoryRejected
+	}
 	private.revokeErr = revokeErr
 	revocation := private.rolloverRevocation
-	close(private.revokeDone)
-	private.mu.Unlock()
+	private.mu.rawUnlock()
+
 	if revocation != nil {
 		revocation.finish(revokeErr)
 	}
+
+	private.mu.rawLock()
+	if timedOutOperation != nil &&
+		private.operation == timedOutOperation {
+		private.mu.finishOperationLocked(timedOutOperation.done)
+	}
+	select {
+	case <-private.revokeDone:
+	default:
+		close(private.revokeDone)
+	}
+	private.mu.rawUnlock()
 	return revokeErr
+}
+
+func (private *fullInventoryAttemptState) seedCleanupUncertaintyLocked() {
+	select {
+	case <-private.revokeDone:
+		return
+	default:
+	}
+	private.revokeErr = errInventoryRejected
 }
 
 func (attempt *FullInventoryAttempt) Destroy() {
@@ -518,11 +676,14 @@ func (attempt *FullInventoryAttempt) destroyWithBarrier(afterRevoke func()) {
 		return
 	}
 	private := attempt.state
-	private.mu.Lock()
+	private.mu.rawLock()
 	private.destroyed = true
+	if private.operation != nil && private.operation.cancel != nil {
+		private.operation.cancel()
+	}
 	record := private.rolloverRecord
 	private.rolloverRecord = nil
-	private.mu.Unlock()
+	private.mu.rawUnlock()
 	if record != nil {
 		record.remove(attempt)
 	}
@@ -533,7 +694,7 @@ func (attempt *FullInventoryAttempt) destroyWithBarrier(afterRevoke func()) {
 	if afterRevoke != nil {
 		afterRevoke()
 	}
-	private.mu.Lock()
+	private.mu.rawLock()
 	clear(private.emittedObjects)
 	clear(private.emittedRelations)
 	private.emittedObjects = nil
@@ -545,7 +706,7 @@ func (attempt *FullInventoryAttempt) destroyWithBarrier(afterRevoke func()) {
 	private.replay.Clear()
 	private.successorID = ""
 	revocation := private.rolloverRevocation
-	private.mu.Unlock()
+	private.mu.rawUnlock()
 	if revocation != nil {
 		revocation.finishDestroy()
 	}
@@ -599,7 +760,7 @@ func (value *provider) discover(
 		request.SourceRevisionDigest != binding.SourceRevisionDigest {
 		return nil, errInventoryRejected
 	}
-	var outcome discoverysource.DiscoverOutcome
+	var attempt *FullInventoryAttempt
 	err := discoverysource.WithRuntime(
 		runtime,
 		binding,
@@ -607,11 +768,25 @@ func (value *provider) discover(
 			if view == nil || view.attempt == nil || view.binding != binding {
 				return errInventoryContinuity
 			}
-			var discoverErr error
-			outcome, discoverErr = view.attempt.discover(ctx, value.factory, request)
-			return discoverErr
+			attempt = view.attempt
+			return nil
 		},
 	)
+	if err == nil && attempt != nil {
+		var outcome discoverysource.DiscoverOutcome
+		outcome, err = attempt.discover(ctx, value.factory, request)
+		return normalizeInventoryDiscoverOutcome(outcome, err)
+	}
+	if err == nil {
+		err = errInventoryContinuity
+	}
+	return normalizeInventoryDiscoverOutcome(nil, err)
+}
+
+func normalizeInventoryDiscoverOutcome(
+	outcome discoverysource.DiscoverOutcome,
+	err error,
+) (discoverysource.DiscoverOutcome, error) {
 	if err != nil {
 		if errors.Is(err, errInventoryIdentityDrift) {
 			return nil, errInventoryIdentityDrift
@@ -628,6 +803,137 @@ func (value *provider) discover(
 	return outcome, nil
 }
 
+func (private *fullInventoryAttemptState) runOperationLocked(
+	invoke func() (any, error),
+	apply func(any, error) error,
+	discard func(any) error,
+) (operationErr error) {
+	operation := private.operation
+	if operation == nil || operation.context == nil ||
+		operation.done == nil || invoke == nil || apply == nil ||
+		private.mu.operationDone != operation.done {
+		return errInventoryContinuity
+	}
+	if operation.rawMode {
+		private.mu.rawUnlock()
+	} else {
+		operation.rawMode = true
+		private.mu.Unlock()
+	}
+
+	var (
+		result            any
+		callErr           error
+		panicValue        any
+		operationPanicked bool
+	)
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				panicValue = recovered
+				operationPanicked = true
+			}
+		}()
+		result, callErr = invoke()
+	}()
+
+	private.mu.rawLock()
+	if errors.Is(callErr, errInventoryCleanupUncertain) {
+		private.seedCleanupUncertaintyLocked()
+	}
+	current := private.operation == operation &&
+		private.generation == operation.generation
+	terminal := !current ||
+		private.destroyed ||
+		private.revokeStart ||
+		private.failed ||
+		private.handoffFrozen
+	if operationPanicked {
+		private.failed = true
+		terminal = true
+	}
+	if terminal && discard != nil {
+		cleanupErr := func() (cleanupErr error) {
+			private.mu.rawUnlock()
+			defer private.mu.rawLock()
+			defer func() {
+				if recover() != nil {
+					cleanupErr = errInventoryCleanupUncertain
+				}
+			}()
+			return discard(result)
+		}()
+		if cleanupErr != nil {
+			private.seedCleanupUncertaintyLocked()
+		}
+		current = private.operation == operation &&
+			private.generation == operation.generation
+	}
+	switch {
+	case !current:
+		operationErr = errInventoryContinuity
+	case terminal:
+		operationErr = errInventoryContinuity
+	default:
+		operationErr = apply(result, callErr)
+		if errors.Is(operationErr, errInventoryCleanupUncertain) {
+			private.seedCleanupUncertaintyLocked()
+		}
+	}
+	if operationPanicked {
+		panic(panicValue)
+	}
+	return operationErr
+}
+
+func (private *fullInventoryAttemptState) beginOperationLocked(
+	ctx context.Context,
+) error {
+	if ctx == nil || private.operation != nil || private.mu.operationDone != nil {
+		return errInventoryContinuity
+	}
+	operationContext, cancel := context.WithCancel(ctx)
+	private.generation++
+	operation := &fullInventoryOperation{
+		generation: private.generation,
+		context:    operationContext,
+		cancel:     cancel,
+		done:       make(chan struct{}),
+	}
+	private.operation = operation
+	private.mu.beginOperationLocked(operation.done)
+	return nil
+}
+
+func (private *fullInventoryAttemptState) finishOperationLocked(
+	operation *fullInventoryOperation,
+) {
+	if operation == nil || private.operation != operation {
+		return
+	}
+	if operation.cancel != nil {
+		operation.cancel()
+	}
+	operation.context = nil
+	operation.cancel = nil
+	operation.client = nil
+	operation.root = types.ManagedObjectReference{}
+	operation.token = ""
+	private.operation = nil
+	private.mu.finishOperationLocked(operation.done)
+}
+
+func (private *fullInventoryAttemptState) unlockAfterDiscover(
+	operation *fullInventoryOperation,
+) {
+	private.finishOperationLocked(operation)
+	if operation != nil && operation.rawMode {
+		private.mu.rawUnlock()
+		return
+	}
+	private.mu.Unlock()
+}
+
 func (attempt *FullInventoryAttempt) discover(
 	ctx context.Context,
 	factory ClientFactory,
@@ -638,7 +944,10 @@ func (attempt *FullInventoryAttempt) discover(
 	}
 	private := attempt.state
 	private.mu.Lock()
-	defer private.mu.Unlock()
+	var operation *fullInventoryOperation
+	defer func() {
+		private.unlockAfterDiscover(operation)
+	}()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -647,6 +956,10 @@ func (attempt *FullInventoryAttempt) discover(
 		private.binding != factory.binding {
 		return nil, errInventoryContinuity
 	}
+	if err := private.beginOperationLocked(ctx); err != nil {
+		return nil, err
+	}
+	operation = private.operation
 	opened, empty, err := openFullInventoryCheckpoint(request.Checkpoint)
 	if err != nil {
 		private.failed = true
@@ -676,9 +989,13 @@ func (attempt *FullInventoryAttempt) discover(
 		private.failed = true
 		return nil, errInventoryContinuity
 	}
-	if !validVCenterIdentity(private.client.Identity(), private.authority) ||
-		compareManagedObjectReference(private.client.CollectorReference(), private.collector) != 0 {
+	if !inventoryClientIdentityMatches(
+		private.client,
+		private.authority,
+		private.collector,
+	) {
 		private.failed = true
+		private.replay.Clear()
 		return nil, errInventoryIdentityDrift
 	}
 
@@ -747,11 +1064,11 @@ func (private *fullInventoryAttemptState) replayPage() (
 	if !private.authority.valid() ||
 		!sameAuthoritySnapshot(replay.authority, private.authority) ||
 		private.client == nil ||
-		!validVCenterIdentity(private.client.Identity(), private.authority) ||
-		compareManagedObjectReference(
-			private.client.CollectorReference(),
+		!inventoryClientIdentityMatches(
+			private.client,
+			private.authority,
 			private.collector,
-		) != 0 {
+		) {
 		return discoverysource.Page{}, errInventoryIdentityDrift
 	}
 	if !private.checkpointMatches(replay.output) {
@@ -815,34 +1132,89 @@ func (private *fullInventoryAttemptState) start(
 		private.rolloverAuthorized = false
 		private.rolloverBinding = discoverysource.RuntimeBinding{}
 	}
-	client, collector, err := private.openClient(ctx, factory)
-	if err != nil {
-		return err
-	}
-	private.client = client
-	private.collector = collector
-	private.fullSnapshotID = private.successorID
-	private.successorID = ""
-	if private.fullSnapshotID == "" {
-		private.fullSnapshotID = uuid.NewString()
-	}
-	private.rootIndex = 0
-	private.seenObjects = make(map[types.ManagedObjectReference]types.ManagedObjectReference)
-	private.relationKeys = make(map[string]struct{})
-	private.pending = make(map[string]inventoryRelation)
-	private.started = true
-	return nil
-}
-
-func (private *fullInventoryAttemptState) openClient(
-	ctx context.Context,
-	factory ClientFactory,
-) (inventoryPageClient, types.ManagedObjectReference, error) {
 	if !private.resolved.valid() || factory.binding != private.binding {
-		return nil, types.ManagedObjectReference{}, errInventoryContinuity
+		return errInventoryContinuity
 	}
 	resolved := cloneResolvedInventoryRuntime(private.resolved)
-	defer resolved.Clear()
+	authority := cloneAuthoritySnapshot(private.authority)
+	operationContext := private.operation.context
+	return private.runOperationLocked(
+		func() (any, error) {
+			defer resolved.Clear()
+			defer authority.Clear()
+			return openInventoryPageClient(
+				operationContext,
+				factory,
+				resolved,
+				authority,
+			)
+		},
+		func(result any, operationErr error) error {
+			opened, ok := result.(openedInventoryPageClient)
+			if operationErr != nil {
+				return operationErr
+			}
+			if !ok || opened.client == nil {
+				return errInventoryRejected
+			}
+			private.client = opened.client
+			private.collector = opened.collector
+			private.resolved.Clear()
+			private.fullSnapshotID = private.successorID
+			private.successorID = ""
+			if private.fullSnapshotID == "" {
+				private.fullSnapshotID = uuid.NewString()
+			}
+			private.rootIndex = 0
+			private.seenObjects = make(map[types.ManagedObjectReference]types.ManagedObjectReference)
+			private.transparentNodes = make(map[types.ManagedObjectReference]types.ManagedObjectReference)
+			private.topologyRelations = make(map[string]inventoryRelation)
+			private.relationKeys = make(map[string]struct{})
+			private.pending = make(map[string]inventoryRelation)
+			private.started = true
+			return nil
+		},
+		func(result any) error {
+			opened, ok := result.(openedInventoryPageClient)
+			if !ok || opened.client == nil {
+				return nil
+			}
+			return closeLocalInventoryClient(opened.client)
+		},
+	)
+}
+
+type openedInventoryPageClient struct {
+	client    inventoryPageClient
+	collector types.ManagedObjectReference
+}
+
+func openInventoryPageClient(
+	ctx context.Context,
+	factory ClientFactory,
+	resolved resolvedRuntime,
+	authority authoritySnapshot,
+) (
+	result openedInventoryPageClient,
+	resultErr error,
+) {
+	var owned validationClient
+	closeOwned := func() error {
+		client := owned
+		owned = nil
+		return closeLocalInventoryClient(client)
+	}
+	defer func() {
+		if recover() != nil {
+			result = openedInventoryPageClient{}
+			resultErr = errors.Join(
+				errInventoryRejected,
+				errInventoryCleanupUncertain,
+				closeOwned(),
+			)
+		}
+	}()
+
 	opener := factory.openClient
 	if opener == nil {
 		opener = func(
@@ -852,34 +1224,120 @@ func (private *fullInventoryAttemptState) openClient(
 			return openGovmomiValidationClient(ctx, runtime, factory.observeMethod)
 		}
 	}
-	opened, err := opener(ctx, resolved)
+	candidate, err := opener(ctx, resolved)
+	owned = candidate
 	if err != nil {
+		cleanupErr := closeOwned()
 		if contextErr := ctx.Err(); contextErr != nil {
-			return nil, types.ManagedObjectReference{}, contextErr
+			return openedInventoryPageClient{}, errors.Join(contextErr, cleanupErr)
 		}
-		return nil, types.ManagedObjectReference{}, errInventoryRejected
+		return openedInventoryPageClient{}, errors.Join(
+			errInventoryRejected,
+			cleanupErr,
+		)
 	}
 	if contextErr := ctx.Err(); contextErr != nil {
-		if opened != nil {
-			_ = opened.Close(context.WithoutCancel(ctx))
-		}
-		return nil, types.ManagedObjectReference{}, contextErr
+		return openedInventoryPageClient{}, errors.Join(
+			contextErr,
+			closeOwned(),
+		)
 	}
-	client, ok := opened.(inventoryPageClient)
+	client, ok := owned.(inventoryPageClient)
 	if !ok || client == nil {
-		if opened != nil {
-			_ = opened.Close(context.WithoutCancel(ctx))
+		return openedInventoryPageClient{}, errors.Join(
+			errInventoryRejected,
+			closeOwned(),
+		)
+	}
+	snapshot, captured := snapshotInventoryClientIdentity(client)
+	if !captured {
+		return openedInventoryPageClient{}, errors.Join(
+			errInventoryRejected,
+			errInventoryCleanupUncertain,
+			closeOwned(),
+		)
+	}
+	if !validVCenterIdentity(snapshot.identity, authority) ||
+		!validServiceReference(snapshot.collector, "PropertyCollector") {
+		return openedInventoryPageClient{}, errors.Join(
+			errInventoryIdentityDrift,
+			closeOwned(),
+		)
+	}
+	owned = nil
+	return openedInventoryPageClient{
+		client:    client,
+		collector: snapshot.collector,
+	}, nil
+}
+
+type inventoryClientIdentitySnapshot struct {
+	identity  vcenterIdentity
+	collector types.ManagedObjectReference
+}
+
+func snapshotInventoryClientIdentity(
+	client inventoryPageClient,
+) (
+	snapshot inventoryClientIdentitySnapshot,
+	captured bool,
+) {
+	if client == nil {
+		return inventoryClientIdentitySnapshot{}, false
+	}
+	defer func() {
+		if recover() != nil {
+			snapshot = inventoryClientIdentitySnapshot{}
+			captured = false
 		}
-		return nil, types.ManagedObjectReference{}, errInventoryRejected
+	}()
+	return inventoryClientIdentitySnapshot{
+		identity:  client.Identity(),
+		collector: client.CollectorReference(),
+	}, true
+}
+
+func inventoryClientIdentityMatches(
+	client inventoryPageClient,
+	authority authoritySnapshot,
+	collector types.ManagedObjectReference,
+) bool {
+	snapshot, captured := snapshotInventoryClientIdentity(client)
+	return captured &&
+		validVCenterIdentity(snapshot.identity, authority) &&
+		compareManagedObjectReference(snapshot.collector, collector) == 0
+}
+
+func closeLocalInventoryClient(client validationClient) (cleanupErr error) {
+	if client == nil {
+		return nil
 	}
-	collector := client.CollectorReference()
-	if !validVCenterIdentity(client.Identity(), private.authority) ||
-		!validServiceReference(collector, "PropertyCollector") {
-		_ = client.Close(context.WithoutCancel(ctx))
-		return nil, types.ManagedObjectReference{}, errInventoryIdentityDrift
+	closeContext, cancel := context.WithTimeout(
+		context.Background(),
+		sessionCleanupTimeout,
+	)
+	defer cancel()
+	defer func() {
+		if recover() != nil {
+			cleanupErr = errInventoryCleanupUncertain
+		}
+	}()
+	if err := client.Close(closeContext); err != nil {
+		return errInventoryCleanupUncertain
 	}
-	private.resolved.Clear()
-	return client, collector, nil
+	return nil
+}
+
+func clearInventoryRuntime(runtime discoverysource.BoundRuntime) (
+	cleanupErr error,
+) {
+	defer func() {
+		if recover() != nil {
+			cleanupErr = errInventoryCleanupUncertain
+		}
+	}()
+	runtime.Clear()
+	return nil
 }
 
 func cloneResolvedInventoryRuntime(value resolvedRuntime) resolvedRuntime {
@@ -940,14 +1398,10 @@ func (private *fullInventoryAttemptState) retrieve(
 		return errInventoryContinuity
 	}
 	root := private.authority.roots[private.rootIndex]
-	maxObjects := min(maxFullInventoryPageObjects, int32(limits.MaxPageItems))
+	maxObjects := int32(min(int64(maxFullInventoryPageObjects), limits.MaxPageItems))
 	if maxObjects <= 0 {
 		return errInventoryRejected
 	}
-	var (
-		result types.RetrieveResult
-		err    error
-	)
 	if private.soapContinuation != (len(private.pageToken) > 0) {
 		return errInventoryContinuity
 	}
@@ -955,53 +1409,84 @@ func (private *fullInventoryAttemptState) retrieve(
 	if private.soapContinuation {
 		token = string(private.pageToken)
 	}
+	continued := token != ""
 	clear(private.pageToken)
 	private.pageToken = nil
 	clear(private.checkpointToken)
 	private.checkpointToken = nil
 	private.soapContinuation = false
-	if token == "" {
-		result, err = private.client.RetrieveInventoryPage(ctx, root, maxObjects)
-	} else {
-		result, err = private.client.ContinueInventoryPage(ctx, token)
-		token = ""
-	}
-	if err != nil {
-		if contextErr := ctx.Err(); contextErr != nil {
-			return contextErr
-		}
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if !validInventoryPageToken(result.Token) {
-		return errInventoryRejected
-	}
-	objects, relations, err := decodeInventoryResult(root, result.Objects)
-	if err != nil {
-		return err
-	}
-	if err := private.acceptResult(root, objects, relations); err != nil {
-		return err
-	}
-	private.pageToken = append([]byte(nil), result.Token...)
-	if len(private.pageToken) > 0 {
-		private.checkpointToken = append([]byte(nil), private.pageToken...)
-		private.soapContinuation = true
-	} else {
-		private.checkpointToken = []byte(uuid.NewString())
-	}
-	result.Token = ""
-	if len(private.pageToken) == 0 {
-		if observedRoot, ok := private.seenObjects[root]; !ok ||
-			compareManagedObjectReference(observedRoot, root) != 0 ||
-			private.hasPendingForRoot(root) {
-			return errInventoryRejected
-		}
-		private.rootIndex++
-	}
-	return nil
+	operation := private.operation
+	operation.client = private.client
+	operation.root = root
+	operation.token = token
+	operationContext := operation.context
+	operationClient := operation.client
+	operationRoot := operation.root
+	operationToken := operation.token
+	return private.runOperationLocked(
+		func() (any, error) {
+			if operationToken == "" {
+				return operationClient.RetrieveInventoryPage(
+					operationContext,
+					operationRoot,
+					maxObjects,
+				)
+			}
+			return operationClient.ContinueInventoryPage(
+				operationContext,
+				operationToken,
+			)
+		},
+		func(value any, operationErr error) error {
+			if operationErr != nil {
+				if contextErr := ctx.Err(); contextErr != nil {
+					return contextErr
+				}
+				return operationErr
+			}
+			if contextErr := ctx.Err(); contextErr != nil {
+				return contextErr
+			}
+			result, ok := value.(types.RetrieveResult)
+			if !ok {
+				return errInventoryContinuity
+			}
+			if continued && len(result.Objects) == 0 && result.Token == "" {
+				return errInventoryContinuity
+			}
+			if !validInventoryPageToken(result.Token) {
+				return errInventoryRejected
+			}
+			objects, relations, decodeErr := decodeInventoryResult(root, result.Objects)
+			if decodeErr != nil {
+				return decodeErr
+			}
+			if acceptErr := private.acceptResult(root, objects, relations); acceptErr != nil {
+				return acceptErr
+			}
+			private.pageToken = append([]byte(nil), result.Token...)
+			if len(private.pageToken) > 0 {
+				private.checkpointToken = append([]byte(nil), private.pageToken...)
+				private.soapContinuation = true
+			} else {
+				private.checkpointToken = []byte(uuid.NewString())
+			}
+			result.Token = ""
+			if len(private.pageToken) == 0 {
+				if observedRoot, exists := private.seenObjects[root]; !exists ||
+					compareManagedObjectReference(observedRoot, root) != 0 ||
+					private.hasPendingForRoot(root) {
+					return errInventoryRejected
+				}
+				if topologyErr := private.finalizeTransparentTopology(root); topologyErr != nil {
+					return topologyErr
+				}
+				private.rootIndex++
+			}
+			return nil
+		},
+		nil,
+	)
 }
 
 func validInventoryPageToken(value string) bool {
@@ -1040,6 +1525,10 @@ func (private *fullInventoryAttemptState) acceptResult(
 	}
 	for _, object := range objects {
 		private.seenObjects[object.Reference] = root
+		if object.Reference.Type == "ComputeResource" {
+			private.transparentNodes[object.Reference] = root
+			continue
+		}
 		digest := inventoryObjectRolloverDigest(object)
 		if _, exists := private.rolloverObjects[digest]; exists {
 			delete(private.rolloverObjects, digest)
@@ -1065,6 +1554,12 @@ func (private *fullInventoryAttemptState) acceptResult(
 			compareManagedObjectReference(toRoot, relation.ToRoot) != 0 {
 			return errInventoryRejected
 		}
+		private.topologyRelations[key] = relation
+		if isTransparentInventoryObjectType(relation.FromReference.Type) ||
+			isTransparentInventoryObjectType(relation.ToReference.Type) {
+			delete(private.pending, key)
+			continue
+		}
 		digest := inventoryRelationRolloverDigest(relation)
 		if _, exists := private.rolloverRelations[digest]; exists {
 			delete(private.rolloverRelations, digest)
@@ -1072,6 +1567,340 @@ func (private *fullInventoryAttemptState) acceptResult(
 			private.relations = append(private.relations, relation)
 		}
 		delete(private.pending, key)
+	}
+	return nil
+}
+
+func (private *fullInventoryAttemptState) finalizeTransparentTopology(
+	root types.ManagedObjectReference,
+) error {
+	if err := private.validateContainmentTopology(root); err != nil {
+		return err
+	}
+
+	for node, nodeRoot := range private.transparentNodes {
+		if compareManagedObjectReference(nodeRoot, root) != 0 {
+			continue
+		}
+		var parent *types.ManagedObjectReference
+		children := make([]types.ManagedObjectReference, 0, 2)
+		for _, relation := range private.topologyRelations {
+			switch {
+			case compareManagedObjectReference(relation.ToReference, node) == 0:
+				if relation.Type != assetcatalog.RelationshipContains ||
+					relation.FromReference.Type != "Folder" ||
+					parent != nil {
+					return errInventoryRejected
+				}
+				value := relation.FromReference
+				parent = &value
+			case compareManagedObjectReference(relation.FromReference, node) == 0:
+				if relation.Type != assetcatalog.RelationshipContains ||
+					relation.ToReference.Type != "HostSystem" &&
+						relation.ToReference.Type != "ResourcePool" {
+					return errInventoryRejected
+				}
+				children = append(children, relation.ToReference)
+			}
+		}
+		if parent == nil || len(children) == 0 {
+			return errInventoryRejected
+		}
+		slices.SortFunc(children, compareManagedObjectReference)
+		for _, child := range children {
+			relation := inventoryRelation{
+				FromReference: *parent,
+				ToReference:   child,
+				FromRoot:      root,
+				ToRoot:        root,
+				Type:          assetcatalog.RelationshipContains,
+			}
+			key := inventoryRelationIdentity(relation)
+			if _, exists := private.relationKeys[key]; exists {
+				return errInventoryRejected
+			}
+			private.relationKeys[key] = struct{}{}
+			private.topologyRelations[key] = relation
+			digest := inventoryRelationRolloverDigest(relation)
+			if _, exists := private.rolloverRelations[digest]; exists {
+				delete(private.rolloverRelations, digest)
+			} else {
+				private.relations = append(private.relations, relation)
+			}
+		}
+	}
+	return private.finalizeDatacenterVMTopology(root)
+}
+
+func (private *fullInventoryAttemptState) validateContainmentTopology(
+	root types.ManagedObjectReference,
+) error {
+	folderOwners := make(
+		map[types.ManagedObjectReference]types.ManagedObjectReference,
+	)
+	computeOwners := make(
+		map[types.ManagedObjectReference]types.ManagedObjectReference,
+	)
+	resourcePoolOwners := make(
+		map[types.ManagedObjectReference]types.ManagedObjectReference,
+	)
+	folderGraph := make(
+		map[types.ManagedObjectReference][]types.ManagedObjectReference,
+	)
+	resourcePoolGraph := make(
+		map[types.ManagedObjectReference][]types.ManagedObjectReference,
+	)
+	for _, relation := range private.topologyRelations {
+		if compareManagedObjectReference(relation.FromRoot, root) != 0 ||
+			relation.Type != assetcatalog.RelationshipContains {
+			continue
+		}
+		from := relation.FromReference
+		to := relation.ToReference
+		if relation.TopologyPath == inventoryTopologyFolderChild &&
+			from.Type == "Folder" {
+			if !recordUniqueInventoryOwner(folderOwners, to, from) {
+				return errInventoryRejected
+			}
+			if to.Type == "Folder" {
+				folderGraph[from] = append(folderGraph[from], to)
+				if _, exists := folderGraph[to]; !exists {
+					folderGraph[to] = nil
+				}
+			}
+		}
+		if (from.Type == "ComputeResource" ||
+			from.Type == "ClusterComputeResource") &&
+			(to.Type == "HostSystem" || to.Type == "ResourcePool") {
+			if !recordUniqueInventoryOwner(computeOwners, to, from) {
+				return errInventoryRejected
+			}
+		}
+		if to.Type == "ResourcePool" &&
+			(from.Type == "ComputeResource" ||
+				from.Type == "ClusterComputeResource" ||
+				from.Type == "ResourcePool") {
+			if !recordUniqueInventoryOwner(resourcePoolOwners, to, from) {
+				return errInventoryRejected
+			}
+			if from.Type == "ResourcePool" {
+				resourcePoolGraph[from] = append(resourcePoolGraph[from], to)
+				if _, exists := resourcePoolGraph[to]; !exists {
+					resourcePoolGraph[to] = nil
+				}
+			}
+		}
+	}
+	for target := range folderOwners {
+		if _, computeOwned := computeOwners[target]; computeOwned &&
+			(target.Type == "HostSystem" || target.Type == "ResourcePool") {
+			return errInventoryRejected
+		}
+	}
+	if !inventoryDirectedGraphAcyclic(folderGraph) ||
+		!inventoryDirectedGraphAcyclic(resourcePoolGraph) {
+		return errInventoryRejected
+	}
+	return nil
+}
+
+func recordUniqueInventoryOwner(
+	owners map[types.ManagedObjectReference]types.ManagedObjectReference,
+	target types.ManagedObjectReference,
+	owner types.ManagedObjectReference,
+) bool {
+	existing, exists := owners[target]
+	if exists && compareManagedObjectReference(existing, owner) != 0 {
+		return false
+	}
+	owners[target] = owner
+	return true
+}
+
+func inventoryDirectedGraphAcyclic[Node comparable](
+	graph map[Node][]Node,
+) bool {
+	const (
+		inventoryGraphVisiting = uint8(1)
+		inventoryGraphVisited  = uint8(2)
+	)
+	type frame struct {
+		node Node
+		next int
+	}
+	colors := make(map[Node]uint8, len(graph))
+	for start := range graph {
+		if colors[start] != 0 {
+			continue
+		}
+		colors[start] = inventoryGraphVisiting
+		stack := []frame{{node: start}}
+		for len(stack) > 0 {
+			current := &stack[len(stack)-1]
+			children := graph[current.node]
+			if current.next == len(children) {
+				colors[current.node] = inventoryGraphVisited
+				stack = stack[:len(stack)-1]
+				continue
+			}
+			child := children[current.next]
+			current.next++
+			switch colors[child] {
+			case inventoryGraphVisiting:
+				return false
+			case inventoryGraphVisited:
+				continue
+			default:
+				colors[child] = inventoryGraphVisiting
+				stack = append(stack, frame{node: child})
+			}
+		}
+	}
+	return true
+}
+
+func (private *fullInventoryAttemptState) finalizeDatacenterVMTopology(
+	root types.ManagedObjectReference,
+) error {
+	type datacenterVMRoot struct {
+		datacenter types.ManagedObjectReference
+		folder     types.ManagedObjectReference
+	}
+	vmRoots := make([]datacenterVMRoot, 0)
+	vmRootOwners := make(map[types.ManagedObjectReference]types.ManagedObjectReference)
+	folderChildren := make(map[types.ManagedObjectReference][]types.ManagedObjectReference)
+	folderParents := make(map[types.ManagedObjectReference]types.ManagedObjectReference)
+	for _, relation := range private.topologyRelations {
+		if compareManagedObjectReference(relation.FromRoot, root) != 0 {
+			continue
+		}
+		switch relation.TopologyPath {
+		case inventoryTopologyDatacenterVMRoot:
+			if relation.FromReference.Type != "Datacenter" ||
+				relation.ToReference.Type != "Folder" {
+				return errInventoryRejected
+			}
+			if owner, exists := vmRootOwners[relation.ToReference]; exists &&
+				compareManagedObjectReference(owner, relation.FromReference) != 0 {
+				return errInventoryRejected
+			}
+			vmRootOwners[relation.ToReference] = relation.FromReference
+			vmRoots = append(vmRoots, datacenterVMRoot{
+				datacenter: relation.FromReference,
+				folder:     relation.ToReference,
+			})
+		case inventoryTopologyFolderChild:
+			if relation.FromReference.Type != "Folder" {
+				return errInventoryRejected
+			}
+			switch relation.ToReference.Type {
+			case "Folder":
+				folderParents[relation.ToReference] = relation.FromReference
+			}
+			folderChildren[relation.FromReference] = append(
+				folderChildren[relation.FromReference],
+				relation.ToReference,
+			)
+		}
+	}
+	slices.SortFunc(vmRoots, func(left, right datacenterVMRoot) int {
+		if comparison := compareManagedObjectReference(
+			left.datacenter,
+			right.datacenter,
+		); comparison != 0 {
+			return comparison
+		}
+		return compareManagedObjectReference(left.folder, right.folder)
+	})
+	for folder := range folderChildren {
+		slices.SortFunc(folderChildren[folder], compareManagedObjectReference)
+	}
+
+	folderMembership := make(map[types.ManagedObjectReference]types.ManagedObjectReference)
+	vmMembership := make(map[types.ManagedObjectReference]types.ManagedObjectReference)
+	visitState := make(map[types.ManagedObjectReference]uint8)
+	type folderFrame struct {
+		folder types.ManagedObjectReference
+		next   int
+	}
+	for _, vmRoot := range vmRoots {
+		if _, hasFolderParent := folderParents[vmRoot.folder]; hasFolderParent {
+			return errInventoryRejected
+		}
+		if owner, exists := folderMembership[vmRoot.folder]; exists &&
+			compareManagedObjectReference(owner, vmRoot.datacenter) != 0 {
+			return errInventoryRejected
+		}
+		if observedRoot, exists := private.seenObjects[vmRoot.folder]; !exists ||
+			compareManagedObjectReference(observedRoot, root) != 0 {
+			return errInventoryRejected
+		}
+		folderMembership[vmRoot.folder] = vmRoot.datacenter
+		if visitState[vmRoot.folder] == 2 {
+			continue
+		}
+		visitState[vmRoot.folder] = 1
+		stack := []folderFrame{{folder: vmRoot.folder}}
+		for len(stack) > 0 {
+			frame := &stack[len(stack)-1]
+			children := folderChildren[frame.folder]
+			if frame.next >= len(children) {
+				visitState[frame.folder] = 2
+				stack = stack[:len(stack)-1]
+				continue
+			}
+			child := children[frame.next]
+			frame.next++
+			if childRoot, exists := private.seenObjects[child]; !exists ||
+				compareManagedObjectReference(childRoot, root) != 0 {
+				return errInventoryRejected
+			}
+			switch child.Type {
+			case "Folder":
+				if owner, exists := folderMembership[child]; exists &&
+					compareManagedObjectReference(owner, vmRoot.datacenter) != 0 {
+					return errInventoryRejected
+				}
+				folderMembership[child] = vmRoot.datacenter
+				switch visitState[child] {
+				case 1:
+					return errInventoryRejected
+				case 2:
+					continue
+				}
+				visitState[child] = 1
+				stack = append(stack, folderFrame{folder: child})
+			case "VirtualMachine":
+				if owner, exists := vmMembership[child]; exists &&
+					compareManagedObjectReference(owner, vmRoot.datacenter) != 0 {
+					return errInventoryRejected
+				}
+				vmMembership[child] = vmRoot.datacenter
+			default:
+				return errInventoryRejected
+			}
+		}
+	}
+	for virtualMachine, datacenter := range vmMembership {
+		derived := inventoryRelation{
+			FromReference: datacenter,
+			ToReference:   virtualMachine,
+			FromRoot:      root,
+			ToRoot:        root,
+			Type:          assetcatalog.RelationshipContains,
+		}
+		key := inventoryRelationIdentity(derived)
+		if _, exists := private.relationKeys[key]; exists {
+			continue
+		}
+		private.relationKeys[key] = struct{}{}
+		private.topologyRelations[key] = derived
+		digest := inventoryRelationRolloverDigest(derived)
+		if _, exists := private.rolloverRelations[digest]; exists {
+			delete(private.rolloverRelations, digest)
+		} else {
+			private.relations = append(private.relations, derived)
+		}
 	}
 	return nil
 }
@@ -1358,7 +2187,7 @@ func decodeInventoryResult(
 	objects := make([]inventoryObject, 0, len(contents))
 	relations := make([]inventoryRelation, 0, len(contents)*2)
 	for _, content := range contents {
-		if slices.Contains(ignoredInventoryObjectTypes, content.Obj.Type) {
+		if isIgnoredInventoryObjectType(content.Obj.Type) {
 			if len(content.MissingSet) != 0 || !validManagedObjectReference(content.Obj) {
 				return nil, nil, errInventoryRejected
 			}
@@ -1380,7 +2209,8 @@ func decodeInventoryObject(
 ) (inventoryObject, []inventoryRelation, error) {
 	if len(content.MissingSet) != 0 ||
 		!validManagedObjectReference(content.Obj) ||
-		!slices.Contains(allowedObjectTypes, content.Obj.Type) {
+		!slices.Contains(allowedObjectTypes, content.Obj.Type) &&
+			!isTransparentInventoryObjectType(content.Obj.Type) {
 		return inventoryObject{}, nil, errInventoryRejected
 	}
 	properties := make(map[string]any, len(content.PropSet))
@@ -1391,15 +2221,21 @@ func decodeInventoryObject(
 		}
 		properties[property.Name] = property.Val
 	}
-	name, ok := inventoryString(properties["name"])
-	if !ok {
-		return inventoryObject{}, nil, errInventoryRejected
-	}
 	object := inventoryObject{
-		Reference: content.Obj, AuthorityRoot: root, Name: name,
+		Reference: content.Obj, AuthorityRoot: root,
+	}
+	if content.Obj.Type != "ComputeResource" {
+		name, ok := inventoryString(properties["name"])
+		if !ok {
+			return inventoryObject{}, nil, errInventoryRejected
+		}
+		object.Name = name
 	}
 	relations := make([]inventoryRelation, 0, 4)
-	addContains := func(from types.ManagedObjectReference, values any) error {
+	addContains := func(
+		from types.ManagedObjectReference,
+		values any,
+	) error {
 		references, valid := inventoryReferences(values)
 		if !valid {
 			return errInventoryRejected
@@ -1413,10 +2249,30 @@ func decodeInventoryObject(
 		return nil
 	}
 	switch content.Obj.Type {
-	case "Folder":
-		if value, exists := properties["childEntity"]; exists {
+	case "ComputeResource":
+		if value, exists := properties["host"]; exists {
 			if err := addContains(content.Obj, value); err != nil {
 				return inventoryObject{}, nil, err
+			}
+		}
+		if value, exists := properties["resourcePool"]; exists {
+			reference, valid := inventoryReference(value)
+			if !valid {
+				return inventoryObject{}, nil, errInventoryRejected
+			}
+			relations = append(relations, inventoryRelation{
+				FromReference: content.Obj, ToReference: reference,
+				FromRoot: root, ToRoot: root, Type: assetcatalog.RelationshipContains,
+			})
+		}
+	case "Folder":
+		if value, exists := properties["childEntity"]; exists {
+			firstRelation := len(relations)
+			if err := addContains(content.Obj, value); err != nil {
+				return inventoryObject{}, nil, err
+			}
+			for index := firstRelation; index < len(relations); index++ {
+				relations[index].TopologyPath = inventoryTopologyFolderChild
 			}
 		}
 	case "Datacenter":
@@ -1426,10 +2282,14 @@ func decodeInventoryObject(
 				if !valid {
 					return inventoryObject{}, nil, errInventoryRejected
 				}
-				relations = append(relations, inventoryRelation{
+				relation := inventoryRelation{
 					FromReference: content.Obj, ToReference: reference,
 					FromRoot: root, ToRoot: root, Type: assetcatalog.RelationshipContains,
-				})
+				}
+				if field == "vmFolder" {
+					relation.TopologyPath = inventoryTopologyDatacenterVMRoot
+				}
+				relations = append(relations, relation)
 			}
 		}
 	case "ClusterComputeResource":
@@ -1511,6 +2371,8 @@ func decodeInventoryObject(
 func inventoryPropertyAllowed(objectType string, name string) bool {
 	var allowed []string
 	switch objectType {
+	case "ComputeResource":
+		allowed = []string{"host", "resourcePool"}
 	case "Folder":
 		allowed = []string{"name", "childEntity"}
 	case "Datacenter":
@@ -1596,7 +2458,8 @@ func inventoryReference(value any) (types.ManagedObjectReference, bool) {
 		return types.ManagedObjectReference{}, false
 	}
 	return reference, validManagedObjectReference(reference) &&
-		slices.Contains(allowedObjectTypes, reference.Type)
+		(slices.Contains(allowedObjectTypes, reference.Type) ||
+			isTransparentInventoryObjectType(reference.Type))
 }
 
 func inventoryReferences(value any) ([]types.ManagedObjectReference, bool) {
@@ -1619,11 +2482,25 @@ func inventoryReferences(value any) ([]types.ManagedObjectReference, bool) {
 		if !validManagedObjectReference(reference) {
 			return nil, false
 		}
-		if slices.Contains(allowedObjectTypes, reference.Type) {
+		switch {
+		case slices.Contains(allowedObjectTypes, reference.Type),
+			isTransparentInventoryObjectType(reference.Type):
 			filtered = append(filtered, reference)
+		case isIgnoredInventoryObjectType(reference.Type):
+			continue
+		default:
+			return nil, false
 		}
 	}
 	return filtered, true
+}
+
+func isTransparentInventoryObjectType(objectType string) bool {
+	return objectType == "ComputeResource"
+}
+
+func isIgnoredInventoryObjectType(objectType string) bool {
+	return slices.Contains(ignoredInventoryObjectTypes, objectType)
 }
 
 func inventoryPropertyFilter(
@@ -1698,6 +2575,7 @@ func inventoryPropertyFilter(
 				"name", "vmFolder", "hostFolder", "datastoreFolder", "networkFolder",
 			}},
 			{Type: "ClusterComputeResource", PathSet: []string{"name", "host", "resourcePool"}},
+			{Type: "ComputeResource", PathSet: []string{"host", "resourcePool"}},
 			{Type: "ResourcePool", PathSet: []string{"name", "resourcePool", "vm"}},
 			{Type: "Datastore", PathSet: []string{"name"}},
 			{Type: "Network", PathSet: []string{"name"}},

@@ -2,6 +2,7 @@ package vsphere
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 
@@ -514,6 +515,56 @@ func TestNormalizeContainsUsesClosedHierarchy(t *testing.T) {
 		relation.Type = assetcatalog.RelationshipContains
 		if got, err := normalizeRelation(validNormalizationScope(t), relation, 12); err == nil {
 			t.Fatalf("invalid CONTAINS %#v normalized as %#v", relation, got)
+		}
+	}
+}
+
+func TestNormalizeTransparentComputeResourceBoundary(t *testing.T) {
+	t.Parallel()
+
+	scope := validNormalizationScope(t)
+	compute := types.ManagedObjectReference{Type: "ComputeResource", Value: "domain-s1"}
+	folder := types.ManagedObjectReference{Type: "Folder", Value: "group-h4"}
+	host := types.ManagedObjectReference{Type: "HostSystem", Value: "host-21"}
+	pool := types.ManagedObjectReference{Type: "ResourcePool", Value: "resgroup-8"}
+
+	if slices.Contains(allowedObjectTypes, compute.Type) {
+		t.Fatal("plain ComputeResource entered allowedObjectTypes")
+	}
+	if got, err := normalizeObject(scope, inventoryObject{
+		Reference: compute, AuthorityRoot: testAuthorityRoot, Name: "standalone",
+	}, 12); err == nil {
+		t.Fatalf("plain ComputeResource normalized as item %#v", got)
+	}
+	for _, relation := range []inventoryRelation{
+		{
+			FromReference: compute,
+			ToReference:   host,
+		},
+		{
+			FromReference: folder,
+			ToReference:   compute,
+		},
+	} {
+		relation.FromRoot = testAuthorityRoot
+		relation.ToRoot = testAuthorityRoot
+		relation.Type = assetcatalog.RelationshipContains
+		if got, err := normalizeRelation(scope, relation, 12); err == nil {
+			t.Fatalf("plain ComputeResource endpoint normalized as relation %#v", got)
+		}
+	}
+	for _, target := range []types.ManagedObjectReference{host, pool} {
+		relation := inventoryRelation{
+			FromReference: folder,
+			ToReference:   target,
+			FromRoot:      testAuthorityRoot,
+			ToRoot:        testAuthorityRoot,
+			Type:          assetcatalog.RelationshipContains,
+		}
+		if got, err := normalizeRelation(scope, relation, 12); err != nil {
+			t.Fatalf("folded Folder CONTAINS %s rejected: %v", target.Type, err)
+		} else if got.Type != assetcatalog.RelationshipContains {
+			t.Fatalf("folded relation = %#v", got)
 		}
 	}
 }

@@ -78,6 +78,7 @@ type inventoryRelation struct {
 	FromRoot      types.ManagedObjectReference
 	ToRoot        types.ManagedObjectReference
 	Type          assetcatalog.RelationshipType
+	TopologyPath  string
 }
 
 func normalizeObject(
@@ -434,7 +435,7 @@ func validRelationShape(relation inventoryRelation) bool {
 		switch relation.FromReference.Type {
 		case "Folder":
 			switch relation.ToReference.Type {
-			case "Folder", "Datacenter", "ClusterComputeResource", "Datastore", "Network", "VirtualMachine":
+			case "Folder", "Datacenter", "ClusterComputeResource", "Datastore", "HostSystem", "Network", "ResourcePool", "VirtualMachine":
 				return true
 			}
 		case "Datacenter":

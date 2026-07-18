@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/seaworld008/aiops-system/internal/assetcatalog"
+	"github.com/seaworld008/aiops-system/internal/assetdiscovery"
 	"github.com/seaworld008/aiops-system/internal/discoverycleanup"
 	"github.com/seaworld008/aiops-system/internal/discoveryqueue"
 	"github.com/seaworld008/aiops-system/internal/discoverysource"
@@ -180,6 +181,85 @@ func TestProtocolIntegrationCompleteSnapshotIsSingleEnvironment(t *testing.T) {
 		t.Fatalf("inventory policy = %#v", policy)
 	}
 	request.Checkpoint.Clear()
+}
+
+func TestProtocolIntegrationStandaloneComputeResourceAndDistributedNetworking(
+	t *testing.T,
+) {
+	model := simulator.VPX()
+	model.Machine = 1
+	provider, attempt, runtime, request := newTLSProtocolInventoryFixture(t, model)
+	t.Cleanup(attempt.Destroy)
+
+	var items []assetdiscovery.NormalizedItem
+	var relations []assetdiscovery.ObservedRelation
+	for {
+		outcome, err := provider.Discover(context.Background(), runtime, request)
+		if err != nil {
+			t.Fatalf("Discover() error = %v", err)
+		}
+		page, ok := outcome.(discoverysource.Page)
+		if !ok {
+			t.Fatalf("Discover() outcome = %T, want Page", outcome)
+		}
+		items = append(items, page.Items...)
+		relations = append(relations, page.Relations...)
+		request.Checkpoint.Clear()
+		request.Checkpoint = page.NextCheckpoint.Clone()
+		final := page.FinalPage
+		page.NextCheckpoint.Clear()
+		if final {
+			break
+		}
+	}
+	request.Checkpoint.Clear()
+
+	var (
+		clusterItem        bool
+		folderHost         bool
+		folderResourcePool bool
+		datacenterVM       bool
+	)
+	for _, item := range items {
+		if strings.Contains(item.ExternalID, ":ComputeResource:") &&
+			!strings.Contains(item.ExternalID, ":ClusterComputeResource:") {
+			t.Fatalf("plain ComputeResource projected as item %#v", item)
+		}
+		if strings.Contains(item.ExternalID, ":DistributedVirtual") {
+			t.Fatalf("distributed networking projected as item %#v", item)
+		}
+		clusterItem = clusterItem ||
+			strings.Contains(item.ExternalID, ":ClusterComputeResource:")
+	}
+	for _, relation := range relations {
+		for _, endpoint := range []string{relation.FromExternalID, relation.ToExternalID} {
+			if strings.Contains(endpoint, ":ComputeResource:") &&
+				!strings.Contains(endpoint, ":ClusterComputeResource:") {
+				t.Fatalf("plain ComputeResource persisted as relation endpoint %#v", relation)
+			}
+			if strings.Contains(endpoint, ":DistributedVirtual") {
+				t.Fatalf("distributed networking persisted as relation endpoint %#v", relation)
+			}
+		}
+		folderHost = folderHost ||
+			strings.Contains(relation.FromExternalID, ":Folder:") &&
+				strings.Contains(relation.ToExternalID, ":HostSystem:")
+		folderResourcePool = folderResourcePool ||
+			strings.Contains(relation.FromExternalID, ":Folder:") &&
+				strings.Contains(relation.ToExternalID, ":ResourcePool:")
+		datacenterVM = datacenterVM ||
+			strings.Contains(relation.FromExternalID, ":Datacenter:") &&
+				strings.Contains(relation.ToExternalID, ":VirtualMachine:")
+	}
+	if !clusterItem || !folderHost || !folderResourcePool || !datacenterVM {
+		t.Fatalf(
+			"simulator topology = cluster:%t folder-host:%t folder-pool:%t datacenter-vm:%t",
+			clusterItem,
+			folderHost,
+			folderResourcePool,
+			datacenterVM,
+		)
+	}
 }
 
 func TestProtocolIntegrationRolloverHandoffLogsOutAndStartsFreshRetrieve(t *testing.T) {
@@ -480,6 +560,88 @@ func TestProtocolIntegrationRolloverHandoffLogsOutAndStartsFreshRetrieve(t *test
 			gotMethods,
 		)
 	}
+}
+
+func newTLSProtocolInventoryFixture(
+	t *testing.T,
+	model *simulator.Model,
+) (
+	discoverysource.Provider,
+	*FullInventoryAttempt,
+	discoverysource.BoundRuntime,
+	discoverysource.DiscoverRequest,
+) {
+	t.Helper()
+	if err := model.Create(); err != nil {
+		t.Fatalf("create simulator model: %v", err)
+	}
+	t.Cleanup(model.Remove)
+	model.Service.TLS = &tls.Config{MinVersion: tls.VersionTLS13}
+	server := model.Service.NewServer()
+	t.Cleanup(server.Close)
+
+	endpointURL := *server.URL
+	user := endpointURL.User
+	endpointURL.User = nil
+	if user == nil {
+		t.Fatal("simulator URL has no credential")
+	}
+	password, ok := user.Password()
+	if !ok || password == "" {
+		t.Fatal("simulator URL has no password")
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(server.Certificate())
+	endpoint, err := NewEndpointHandle(endpointURL.String())
+	if err != nil {
+		t.Fatalf("NewEndpointHandle() error = %v", err)
+	}
+	credential, err := NewCredentialHandle(user.Username(), []byte(password))
+	if err != nil {
+		t.Fatalf("NewCredentialHandle() error = %v", err)
+	}
+	trust, err := NewTrustHandle(&tls.Config{
+		MinVersion: tls.VersionTLS13,
+		RootCAs:    roots,
+		ServerName: endpointURL.Hostname(),
+	}, TLSCompatibilityStrict)
+	if err != nil {
+		t.Fatalf("NewTrustHandle() error = %v", err)
+	}
+	authority, err := NewAuthorityHandle(
+		model.ServiceContent.About.InstanceUuid,
+		testEnvironmentID,
+		[]types.ManagedObjectReference{model.RootFolder.Reference()},
+	)
+	if err != nil {
+		t.Fatalf("NewAuthorityHandle() error = %v", err)
+	}
+	material, err := NewRuntimeMaterial(endpoint, credential, trust, authority)
+	if err != nil {
+		t.Fatalf("NewRuntimeMaterial() error = %v", err)
+	}
+	request := validInventoryRequest(t)
+	binding := publishedInventoryBinding(request)
+	attempt, err := NewFullInventoryAttempt(&material)
+	if err != nil {
+		t.Fatalf("NewFullInventoryAttempt() error = %v", err)
+	}
+	runtime, err := attempt.BindRuntime(context.Background(), binding)
+	if err != nil {
+		attempt.Destroy()
+		t.Fatalf("BindRuntime() error = %v", err)
+	}
+	factory, err := NewClientFactory(binding)
+	if err != nil {
+		attempt.Destroy()
+		t.Fatalf("NewClientFactory() error = %v", err)
+	}
+	provider, err := New(factory)
+	if err != nil {
+		attempt.Destroy()
+		t.Fatalf("New() error = %v", err)
+	}
+	return provider, attempt, runtime, request
 }
 
 func countProtocolMethod(methods []string, target string) int {
