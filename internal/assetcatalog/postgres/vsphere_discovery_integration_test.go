@@ -108,6 +108,105 @@ func TestVCenterDiscoveryIntegrationPartialPageNeverRunsMissingDetection(t *test
 	)
 }
 
+func TestVCenterDiscoveryIntegrationPersistsDirectDatacenterVMTopology(
+	t *testing.T,
+) {
+	scenario := newVCenterPageCommitScenario(
+		t,
+		"86a00000-0000-4000-8000-000000000023",
+		"vsphere-datacenter-vm-topology-run",
+	)
+	soap := newVCenterTopologySOAPFixture(t)
+	empty := emptyVCenterCheckpoint(t)
+	pages := soap.snapshotPages(
+		t,
+		vCenterRuntimeBinding(scenario),
+		scenario.fixture.environmentID,
+		empty,
+		500,
+	)
+	empty.Clear()
+	defer clearVCenterPages(pages)
+
+	itemIDs := vCenterItemIDs(pages)
+	var direct assetdiscovery.ObservedRelation
+	for _, page := range pages {
+		for _, relation := range page.Relations {
+			if strings.Contains(relation.FromExternalID, ":Datacenter:") &&
+				strings.Contains(relation.ToExternalID, ":VirtualMachine:") &&
+				relation.Type == assetcatalog.RelationshipContains {
+				direct = relation
+			}
+			for _, endpoint := range []string{
+				relation.FromExternalID,
+				relation.ToExternalID,
+			} {
+				if strings.Contains(endpoint, ":ComputeResource:") &&
+					!strings.Contains(endpoint, ":ClusterComputeResource:") {
+					t.Fatalf("plain ComputeResource emitted as relation endpoint %q", endpoint)
+				}
+			}
+		}
+	}
+	if direct == (assetdiscovery.ObservedRelation{}) {
+		t.Fatal("provider pages have no direct Datacenter CONTAINS VirtualMachine relation")
+	}
+	for _, endpoint := range []string{direct.FromExternalID, direct.ToExternalID} {
+		if _, ok := itemIDs[endpoint]; !ok {
+			t.Fatalf("direct relation endpoint %q has no projected item", endpoint)
+		}
+	}
+
+	reserveVCenterCleanupForPageTest(t, scenario)
+	results := applyVCenterPages(t, &scenario, pages)
+	if len(results) == 0 ||
+		!results[len(results)-1].FinalPage ||
+		!results[len(results)-1].CompleteSnapshot {
+		t.Fatalf("persisted topology did not close complete snapshot: %#v", results)
+	}
+	var persisted int
+	if err := scenario.harness.db.QueryRow(context.Background(), `
+SELECT count(*)
+FROM asset_relationships AS relationship
+JOIN assets AS source_asset
+  ON source_asset.id=relationship.source_asset_id
+ AND source_asset.external_id=relationship.from_external_id
+JOIN assets AS target_asset
+  ON target_asset.id=relationship.target_asset_id
+ AND target_asset.external_id=relationship.to_external_id
+WHERE relationship.source_id=$1::uuid
+  AND relationship.from_external_id=$2
+  AND relationship.to_external_id=$3
+  AND relationship.relationship_type='CONTAINS'
+  AND relationship.status='ACTIVE'
+`, scenario.fixture.sourceID, direct.FromExternalID, direct.ToExternalID).Scan(
+		&persisted,
+	); err != nil {
+		t.Fatalf("read persisted direct Datacenter VM topology: %v", err)
+	}
+	if persisted != 1 {
+		t.Fatalf("persisted direct Datacenter VM topology = %d, want 1", persisted)
+	}
+	var forbiddenEndpoints int
+	if err := scenario.harness.db.QueryRow(context.Background(), `
+SELECT count(*)
+FROM asset_relationships
+WHERE source_id=$1::uuid
+  AND (
+    (from_external_id LIKE '%:ComputeResource:%'
+      AND from_external_id NOT LIKE '%:ClusterComputeResource:%')
+    OR
+    (to_external_id LIKE '%:ComputeResource:%'
+      AND to_external_id NOT LIKE '%:ClusterComputeResource:%')
+  )
+`, scenario.fixture.sourceID).Scan(&forbiddenEndpoints); err != nil {
+		t.Fatalf("read transparent ComputeResource endpoints: %v", err)
+	}
+	if forbiddenEndpoints != 0 {
+		t.Fatalf("persisted plain ComputeResource endpoints = %d", forbiddenEndpoints)
+	}
+}
+
 func TestVCenterDiscoveryIntegrationProviderReplaySurvivesPreCommitResponseLoss(
 	t *testing.T,
 ) {
@@ -1606,6 +1705,22 @@ func newVCenterSOAPFixture(
 	model.Host = 0
 	model.Machine = machines
 	model.Datastore = datastores
+	return newVCenterSOAPFixtureForModel(t, model, instanceUUID)
+}
+
+func newVCenterTopologySOAPFixture(t *testing.T) vCenterSOAPFixture {
+	t.Helper()
+	model := simulator.VPX()
+	model.Machine = 1
+	return newVCenterSOAPFixtureForModel(t, model, "")
+}
+
+func newVCenterSOAPFixtureForModel(
+	t *testing.T,
+	model *simulator.Model,
+	instanceUUID string,
+) vCenterSOAPFixture {
+	t.Helper()
 	if err := model.Create(); err != nil {
 		t.Fatalf("create vSphere simulator model: %v", err)
 	}

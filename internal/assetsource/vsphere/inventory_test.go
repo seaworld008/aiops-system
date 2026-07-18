@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -94,6 +95,34 @@ func TestInventoryFullSnapshotPaginatesOverFiveHundredObjectsInOneAttempt(t *tes
 		t.Fatalf("inventory methods = %v", got)
 	}
 	final.NextCheckpoint.Clear()
+	request.Checkpoint.Clear()
+}
+
+func TestInventoryVeryLargePageLimitClampsBeforeInt32Narrowing(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeInventoryClient(testInstanceUUID)
+	client.initial[testAuthorityRoot] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent(testAuthorityRoot.Value, "authority-root"),
+		},
+	}
+	provider, attempt, runtime, request := newInventoryProviderFixture(
+		t,
+		client,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+	)
+	t.Cleanup(attempt.Destroy)
+	request.Limits.MaxPageItems = math.MaxInt64
+
+	page := discoverInventoryPage(t, provider, runtime, request)
+	defer page.NextCheckpoint.Clear()
+	if !page.FinalPage || !page.CompleteSnapshot {
+		t.Fatalf("page = %#v, want complete final snapshot", page)
+	}
+	if got := client.maxObjectsSnapshot(); !slices.Equal(got, []int32{500}) {
+		t.Fatalf("SOAP MaxObjects = %v, want [500]", got)
+	}
 	request.Checkpoint.Clear()
 }
 
@@ -205,6 +234,49 @@ func TestInventorySameInputCheckpointReplaysInitialNonFinalAndFinalPage(t *testi
 		"ContinueRetrievePropertiesEx",
 	}) {
 		t.Fatalf("final replay made SOAP calls: %v", got)
+	}
+	request.Checkpoint.Clear()
+}
+
+func TestInventoryEmptyContinuationPermanentlyFailsConsumedToken(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeInventoryClient(testInstanceUUID)
+	client.initial[testAuthorityRoot] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent(testAuthorityRoot.Value, "authority-root"),
+		},
+		Token: "empty-continuation-token-canary",
+	}
+	client.continuations["empty-continuation-token-canary"] = types.RetrieveResult{}
+	provider, attempt, runtime, request := newInventoryProviderFixture(
+		t,
+		client,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+	)
+	t.Cleanup(attempt.Destroy)
+
+	first := discoverInventoryPage(t, provider, runtime, request)
+	request.Checkpoint.Clear()
+	request.Checkpoint = first.NextCheckpoint.Clone()
+	first.NextCheckpoint.Clear()
+
+	for call := 1; call <= 2; call++ {
+		outcome, err := provider.Discover(context.Background(), runtime, request)
+		if outcome != nil || !errors.Is(err, errInventoryContinuity) {
+			t.Fatalf(
+				"Discover(empty continuation call %d) = (%#v,%v), want permanent continuity failure",
+				call,
+				outcome,
+				err,
+			)
+		}
+	}
+	if got := client.methodSnapshot(); !slices.Equal(got, []string{
+		"RetrievePropertiesEx",
+		"ContinueRetrievePropertiesEx",
+	}) {
+		t.Fatalf("empty continuation was retried or restored: %v", got)
 	}
 	request.Checkpoint.Clear()
 }
@@ -404,6 +476,328 @@ func TestInventoryMultipleRootsHaveDeterministicItemAndRelationOrdering(t *testi
 		t.Fatalf("root call order = %v, want canonical %v", got, []types.ManagedObjectReference{rootA, rootB})
 	}
 	request.Checkpoint.Clear()
+}
+
+func TestInventoryTransparentComputeResourceFoldsStandaloneHostTopology(t *testing.T) {
+	t.Parallel()
+
+	hostFolder := types.ManagedObjectReference{Type: "Folder", Value: "group-host"}
+	compute := types.ManagedObjectReference{Type: "ComputeResource", Value: "domain-s1"}
+	host := types.ManagedObjectReference{Type: "HostSystem", Value: "host-21"}
+	pool := types.ManagedObjectReference{Type: "ResourcePool", Value: "resgroup-8"}
+	client := newFakeInventoryClient(testInstanceUUID)
+	client.initial[testAuthorityRoot] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent(testAuthorityRoot.Value, "authority-root", hostFolder),
+			inventoryFolderContent(hostFolder.Value, "host-folder", compute),
+			inventoryComputeResourceContent(compute, host, pool),
+			inventoryHostContent(host, "standalone-esxi"),
+			inventoryResourcePoolContent(pool, "standalone-pool"),
+		},
+	}
+	provider, attempt, runtime, request := newInventoryProviderFixture(
+		t,
+		client,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+	)
+	t.Cleanup(attempt.Destroy)
+
+	var items []assetdiscovery.NormalizedItem
+	var relations []assetdiscovery.ObservedRelation
+	for {
+		page := discoverInventoryPage(t, provider, runtime, request)
+		items = append(items, page.Items...)
+		relations = append(relations, page.Relations...)
+		request.Checkpoint.Clear()
+		request.Checkpoint = page.NextCheckpoint.Clone()
+		final := page.FinalPage
+		page.NextCheckpoint.Clear()
+		if final {
+			break
+		}
+	}
+	if len(items) != 4 {
+		t.Fatalf("projected items = %d, want root/folder/host/pool only", len(items))
+	}
+	computeExternalID := "vsphere:" + testInstanceUUID + ":ComputeResource:" + compute.Value
+	for _, item := range items {
+		if item.ExternalID == computeExternalID {
+			t.Fatalf("plain ComputeResource projected as item %#v", item)
+		}
+	}
+	want := map[string]struct{}{
+		inventoryRelationKey(testAuthorityRoot, hostFolder): {},
+		inventoryRelationKey(hostFolder, host):              {},
+		inventoryRelationKey(hostFolder, pool):              {},
+	}
+	if len(relations) != len(want) {
+		t.Fatalf("projected relations = %#v, want %d folded relations", relations, len(want))
+	}
+	for _, relation := range relations {
+		if relation.FromExternalID == computeExternalID ||
+			relation.ToExternalID == computeExternalID {
+			t.Fatalf("plain ComputeResource persisted as relation endpoint %#v", relation)
+		}
+		key := relation.FromExternalID + "->" + relation.ToExternalID
+		if _, ok := want[key]; !ok {
+			t.Fatalf("unexpected folded relation %#v", relation)
+		}
+	}
+	request.Checkpoint.Clear()
+}
+
+func TestInventoryTransparentComputeResourceRejectsDistinctFolderOwningSameHost(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	directFolder := types.ManagedObjectReference{Type: "Folder", Value: "group-direct-host"}
+	computeFolder := types.ManagedObjectReference{Type: "Folder", Value: "group-compute-host"}
+	compute := types.ManagedObjectReference{Type: "ComputeResource", Value: "domain-s2"}
+	host := types.ManagedObjectReference{Type: "HostSystem", Value: "host-22"}
+	pool := types.ManagedObjectReference{Type: "ResourcePool", Value: "resgroup-9"}
+	client := newFakeInventoryClient(testInstanceUUID)
+	client.initial[testAuthorityRoot] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent(
+				testAuthorityRoot.Value,
+				"authority-root",
+				directFolder,
+				computeFolder,
+			),
+			inventoryFolderContent(directFolder.Value, "direct-host-folder", host),
+			inventoryFolderContent(computeFolder.Value, "compute-host-folder", compute),
+			inventoryComputeResourceContent(compute, host, pool),
+			inventoryHostContent(host, "shared-esxi"),
+			inventoryResourcePoolContent(pool, "standalone-pool"),
+		},
+	}
+	provider, attempt, runtime, request := newInventoryProviderFixture(
+		t,
+		client,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+	)
+	t.Cleanup(attempt.Destroy)
+
+	outcome, err := provider.Discover(context.Background(), runtime, request)
+	if outcome != nil || !errors.Is(err, errInventoryContinuity) {
+		t.Fatalf(
+			"Discover(distinct Folder/ComputeResource host owners) = (%#v,%v), want continuity failure",
+			outcome,
+			err,
+		)
+	}
+	request.Checkpoint.Clear()
+}
+
+func TestInventoryRejectsMalformedGlobalContainmentTopology(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		contents func() []types.ObjectContent
+	}{
+		{
+			name: "two folders own one cluster",
+			contents: func() []types.ObjectContent {
+				folderA := types.ManagedObjectReference{Type: "Folder", Value: "group-cluster-a"}
+				folderB := types.ManagedObjectReference{Type: "Folder", Value: "group-cluster-b"}
+				cluster := types.ManagedObjectReference{
+					Type: "ClusterComputeResource", Value: "domain-c7",
+				}
+				return []types.ObjectContent{
+					inventoryFolderContent(
+						testAuthorityRoot.Value,
+						"authority-root",
+						folderA,
+						folderB,
+					),
+					inventoryFolderContent(folderA.Value, "cluster-a", cluster),
+					inventoryFolderContent(folderB.Value, "cluster-b", cluster),
+					inventoryClusterContent(cluster, "shared-cluster"),
+				}
+			},
+		},
+		{
+			name: "folder cycle without datacenter",
+			contents: func() []types.ObjectContent {
+				folderA := types.ManagedObjectReference{Type: "Folder", Value: "group-cycle-a"}
+				folderB := types.ManagedObjectReference{Type: "Folder", Value: "group-cycle-b"}
+				return []types.ObjectContent{
+					inventoryFolderContent(testAuthorityRoot.Value, "authority-root"),
+					inventoryFolderContent(folderA.Value, "cycle-a", folderB),
+					inventoryFolderContent(folderB.Value, "cycle-b", folderA),
+				}
+			},
+		},
+		{
+			name: "resource pool cycle",
+			contents: func() []types.ObjectContent {
+				poolA := types.ManagedObjectReference{Type: "ResourcePool", Value: "resgroup-a"}
+				poolB := types.ManagedObjectReference{Type: "ResourcePool", Value: "resgroup-b"}
+				return []types.ObjectContent{
+					inventoryFolderContent(
+						testAuthorityRoot.Value,
+						"authority-root",
+						poolA,
+					),
+					inventoryResourcePoolContent(poolA, "pool-a", poolB),
+					inventoryResourcePoolContent(poolB, "pool-b", poolA),
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := newFakeInventoryClient(testInstanceUUID)
+			client.initial[testAuthorityRoot] = types.RetrieveResult{
+				Objects: test.contents(),
+			}
+			provider, attempt, runtime, request := newInventoryProviderFixture(
+				t,
+				client,
+				[]types.ManagedObjectReference{testAuthorityRoot},
+			)
+			t.Cleanup(attempt.Destroy)
+
+			outcome, err := provider.Discover(context.Background(), runtime, request)
+			if outcome != nil || !errors.Is(err, errInventoryContinuity) {
+				t.Fatalf(
+					"Discover(malformed global containment) = (%#v,%v), want continuity failure",
+					outcome,
+					err,
+				)
+			}
+			request.Checkpoint.Clear()
+		})
+	}
+}
+
+func TestInventoryDatacenterDirectlyContainsNestedVirtualMachine(t *testing.T) {
+	t.Parallel()
+
+	datacenter := types.ManagedObjectReference{Type: "Datacenter", Value: "datacenter-2"}
+	vmFolder := types.ManagedObjectReference{Type: "Folder", Value: "group-vm"}
+	nestedFolder := types.ManagedObjectReference{Type: "Folder", Value: "group-apps"}
+	virtualMachine := types.ManagedObjectReference{Type: "VirtualMachine", Value: "vm-42"}
+	client := newFakeInventoryClient(testInstanceUUID)
+	client.initial[testAuthorityRoot] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent(testAuthorityRoot.Value, "authority-root", datacenter),
+			inventoryDatacenterContent(datacenter, vmFolder),
+			inventoryFolderContent(vmFolder.Value, "vm-folder", nestedFolder),
+			inventoryFolderContent(nestedFolder.Value, "apps", virtualMachine),
+			inventoryVirtualMachineContent(virtualMachine, "payments-api"),
+		},
+	}
+	provider, attempt, runtime, request := newInventoryProviderFixture(
+		t,
+		client,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+	)
+	t.Cleanup(attempt.Destroy)
+
+	got := make(map[string]struct{})
+	for {
+		page := discoverInventoryPage(t, provider, runtime, request)
+		for _, relation := range page.Relations {
+			got[relation.FromExternalID+"->"+relation.ToExternalID] = struct{}{}
+		}
+		request.Checkpoint.Clear()
+		request.Checkpoint = page.NextCheckpoint.Clone()
+		final := page.FinalPage
+		page.NextCheckpoint.Clear()
+		if final {
+			break
+		}
+	}
+	for _, key := range []string{
+		inventoryRelationKey(vmFolder, nestedFolder),
+		inventoryRelationKey(nestedFolder, virtualMachine),
+		inventoryRelationKey(datacenter, virtualMachine),
+	} {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("missing verified VM containment relation %q; got %v", key, got)
+		}
+	}
+	request.Checkpoint.Clear()
+}
+
+func TestInventoryDatacenterVMTopologyRejectsSharedVMFolder(t *testing.T) {
+	t.Parallel()
+
+	datacenterA := types.ManagedObjectReference{Type: "Datacenter", Value: "datacenter-2"}
+	datacenterB := types.ManagedObjectReference{Type: "Datacenter", Value: "datacenter-3"}
+	sharedVMFolder := types.ManagedObjectReference{Type: "Folder", Value: "group-vm-shared"}
+	client := newFakeInventoryClient(testInstanceUUID)
+	client.initial[testAuthorityRoot] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent(
+				testAuthorityRoot.Value,
+				"authority-root",
+				datacenterA,
+				datacenterB,
+			),
+			inventoryDatacenterContent(datacenterA, sharedVMFolder),
+			inventoryDatacenterContent(datacenterB, sharedVMFolder),
+			inventoryFolderContent(sharedVMFolder.Value, "shared-vm-folder"),
+		},
+	}
+	provider, attempt, runtime, request := newInventoryProviderFixture(
+		t,
+		client,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+	)
+	t.Cleanup(attempt.Destroy)
+
+	outcome, err := provider.Discover(context.Background(), runtime, request)
+	if outcome != nil || !errors.Is(err, errInventoryContinuity) {
+		t.Fatalf(
+			"Discover(shared Datacenter vmFolder) = (%#v,%v), want continuity failure",
+			outcome,
+			err,
+		)
+	}
+	request.Checkpoint.Clear()
+}
+
+func TestInventoryKnownDistributedNetworkingObjectsAreIgnoredExactly(t *testing.T) {
+	t.Parallel()
+
+	known := []types.ManagedObjectReference{
+		{Type: "DistributedVirtualPortgroup", Value: "dvportgroup-1"},
+		{Type: "DistributedVirtualSwitch", Value: "dvs-1"},
+		{Type: "VmwareDistributedVirtualSwitch", Value: "dvs-2"},
+	}
+	contents := []types.ObjectContent{
+		inventoryFolderContent(testAuthorityRoot.Value, "authority-root", known...),
+	}
+	for _, reference := range known {
+		contents = append(contents, types.ObjectContent{Obj: reference})
+	}
+	objects, relations, err := decodeInventoryResult(testAuthorityRoot, contents)
+	if err != nil {
+		t.Fatalf("decodeInventoryResult(known distributed networking) error = %v", err)
+	}
+	if len(objects) != 1 || len(relations) != 0 {
+		t.Fatalf("known distributed networking projected as %d items/%d relations", len(objects), len(relations))
+	}
+	unknown := types.ObjectContent{
+		Obj: types.ManagedObjectReference{Type: "FutureDistributedSwitch", Value: "dvs-3"},
+	}
+	if gotObjects, gotRelations, err := decodeInventoryResult(
+		testAuthorityRoot,
+		[]types.ObjectContent{unknown},
+	); err == nil {
+		t.Fatalf(
+			"unknown inventory type decoded as objects=%#v relations=%#v",
+			gotObjects,
+			gotRelations,
+		)
+	}
 }
 
 func TestInventoryRelationsFollowCommittedEndpointItemsAcrossSmallPages(t *testing.T) {
@@ -861,6 +1255,1238 @@ func TestInventoryCallerCancellationWinsOverContinuityAndStopsSOAP(t *testing.T)
 	})
 }
 
+func TestInventoryRevokeCancelsInFlightContinuationWithoutWaitingForCaller(
+	t *testing.T,
+) {
+	client := newFakeInventoryClient(testInstanceUUID)
+	client.initial[testAuthorityRoot] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent("group-a", "folder-a"),
+		},
+		Token: "revoke-live-continuation-token-canary",
+	}
+	client.continuations["revoke-live-continuation-token-canary"] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent(testAuthorityRoot.Value, "authority-root"),
+		},
+	}
+	client.continueStarted = make(chan struct{})
+	client.continueRelease = make(chan struct{})
+	client.continueCancellationObserved = make(chan struct{})
+	provider, attempt, runtime, request := newInventoryProviderFixture(
+		t,
+		client,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+	)
+	t.Cleanup(attempt.Destroy)
+	first := discoverInventoryPage(t, provider, runtime, request)
+	request.Checkpoint.Clear()
+	request.Checkpoint = first.NextCheckpoint.Clone()
+	first.NextCheckpoint.Clear()
+
+	type discoverResult struct {
+		outcome discoverysource.DiscoverOutcome
+		err     error
+	}
+	discoverDone := make(chan discoverResult, 1)
+	go func() {
+		outcome, err := provider.Discover(context.Background(), runtime, request)
+		discoverDone <- discoverResult{outcome: outcome, err: err}
+	}()
+	select {
+	case <-client.continueStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("continuation did not start")
+	}
+
+	revokeContext, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	revokeDone := make(chan error, 1)
+	go func() {
+		revokeDone <- attempt.Revoke(revokeContext)
+	}()
+
+	select {
+	case <-client.continueCancellationObserved:
+	case <-time.After(2 * time.Second):
+		close(client.continueRelease)
+		<-revokeDone
+		t.Fatal("Revoke did not cancel the caller-owned SOAP operation")
+	}
+	var revokeErr error
+	select {
+	case revokeErr = <-revokeDone:
+	case <-time.After(2 * time.Second):
+		close(client.continueRelease)
+		revokeErr = <-revokeDone
+		t.Fatalf("Revoke waited for the caller-owned SOAP operation: %v", revokeErr)
+	}
+	if revokeErr != nil {
+		t.Fatalf("Revoke() error = %v", revokeErr)
+	}
+	result := <-discoverDone
+	if result.outcome != nil || !errors.Is(result.err, errInventoryContinuity) {
+		t.Fatalf("late continuation result = (%#v,%v), want discarded continuity failure", result.outcome, result.err)
+	}
+	if got := client.methodSnapshot(); !slices.Equal(got, []string{
+		"RetrievePropertiesEx",
+		"ContinueRetrievePropertiesEx",
+	}) {
+		t.Fatalf("revoked attempt resumed SOAP: %v", got)
+	}
+	client.mu.Lock()
+	closeCalls := client.closeCalls
+	client.mu.Unlock()
+	if closeCalls != 1 {
+		t.Fatalf("Revoke closed client %d times, want exactly once", closeCalls)
+	}
+	request.Checkpoint.Clear()
+}
+
+func TestInventoryRuntimeClearCancelsInFlightContinuationWithoutRevoke(
+	t *testing.T,
+) {
+	client := newFakeInventoryClient(testInstanceUUID)
+	client.initial[testAuthorityRoot] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent("group-a", "folder-a"),
+		},
+		Token: "runtime-clear-live-continuation-token-canary",
+	}
+	client.continuations["runtime-clear-live-continuation-token-canary"] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent(testAuthorityRoot.Value, "authority-root"),
+		},
+	}
+	client.continueStarted = make(chan struct{})
+	client.continueRelease = make(chan struct{})
+	client.continueCancellationObserved = make(chan struct{})
+	provider, attempt, runtime, request := newInventoryProviderFixture(
+		t,
+		client,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+	)
+	t.Cleanup(attempt.Destroy)
+	first := discoverInventoryPage(t, provider, runtime, request)
+	request.Checkpoint.Clear()
+	request.Checkpoint = first.NextCheckpoint.Clone()
+	first.NextCheckpoint.Clear()
+
+	type discoverResult struct {
+		outcome discoverysource.DiscoverOutcome
+		err     error
+	}
+	discoverDone := make(chan discoverResult, 1)
+	go func() {
+		outcome, err := provider.Discover(context.Background(), runtime, request)
+		discoverDone <- discoverResult{outcome: outcome, err: err}
+	}()
+	select {
+	case <-client.continueStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("continuation did not start")
+	}
+	clearDone := make(chan struct{})
+	go func() {
+		runtime.Clear()
+		close(clearDone)
+	}()
+	select {
+	case <-client.continueCancellationObserved:
+	case <-time.After(2 * time.Second):
+		close(client.continueRelease)
+		<-clearDone
+		t.Fatal("runtime clear did not cancel the caller-owned SOAP operation")
+	}
+	select {
+	case <-clearDone:
+	case <-time.After(2 * time.Second):
+		close(client.continueRelease)
+		<-clearDone
+		t.Fatal("runtime clear waited for the caller-owned SOAP operation")
+	}
+	result := <-discoverDone
+	if result.outcome != nil || !errors.Is(result.err, errInventoryContinuity) {
+		t.Fatalf("late continuation result = (%#v,%v), want discarded continuity failure", result.outcome, result.err)
+	}
+	client.mu.Lock()
+	closeCalls := client.closeCalls
+	client.mu.Unlock()
+	if closeCalls != 1 {
+		t.Fatalf("runtime clear closed client %d times, want exactly once", closeCalls)
+	}
+	request.Checkpoint.Clear()
+}
+
+func TestInventoryOpenFailureClosesReturnedClientOnce(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeInventoryClient(testInstanceUUID)
+	provider, attempt, runtime, request := newInventoryProviderWithOpenerFixture(
+		t,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+		func(context.Context, resolvedRuntime) (validationClient, error) {
+			return client, errors.New("open failed with local session")
+		},
+	)
+	t.Cleanup(attempt.Destroy)
+
+	outcome, discoverErr := provider.Discover(context.Background(), runtime, request)
+	if outcome != nil || discoverErr == nil {
+		t.Fatalf("Discover(open failure) = (%#v,%v)", outcome, discoverErr)
+	}
+	client.mu.Lock()
+	closeCalls := client.closeCalls
+	client.mu.Unlock()
+	if closeCalls != 1 {
+		t.Fatalf("open failure closed returned client %d times, want once", closeCalls)
+	}
+	request.Checkpoint.Clear()
+}
+
+func TestInventoryOpenIdentitySnapshotPanicClosesLocalClientAndPoisonsRevoke(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		configure func(*fakeInventoryClient)
+	}{
+		{
+			name: "Identity",
+			configure: func(client *fakeInventoryClient) {
+				client.identityPanic = "open Identity panic canary"
+			},
+		},
+		{
+			name: "CollectorReference",
+			configure: func(client *fakeInventoryClient) {
+				client.collectorPanic = "open CollectorReference panic canary"
+			},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := newFakeInventoryClient(testInstanceUUID)
+			test.configure(client)
+			provider, attempt, runtime, request := newInventoryProviderWithOpenerFixture(
+				t,
+				[]types.ManagedObjectReference{testAuthorityRoot},
+				func(context.Context, resolvedRuntime) (validationClient, error) {
+					return client, nil
+				},
+			)
+			t.Cleanup(attempt.Destroy)
+
+			outcome, discoverErr, panicValue := discoverInventoryRecover(
+				provider,
+				runtime,
+				request,
+			)
+			if panicValue != nil {
+				t.Errorf("Discover(open snapshot panic) propagated %#v", panicValue)
+			}
+			if outcome != nil || discoverErr == nil {
+				t.Errorf(
+					"Discover(open snapshot panic) = (%#v,%v), want safe rejection",
+					outcome,
+					discoverErr,
+				)
+			}
+			for call := 1; call <= 2; call++ {
+				if err := attempt.Revoke(context.Background()); !errors.Is(err, errInventoryRejected) {
+					t.Errorf(
+						"Revoke(open snapshot panic call %d) error = %v, want stable rejection",
+						call,
+						err,
+					)
+				}
+			}
+			client.mu.Lock()
+			closeCalls := client.closeCalls
+			closeHadDeadline := client.closeHadDeadline
+			client.mu.Unlock()
+			if closeCalls != 1 || !closeHadDeadline {
+				t.Errorf(
+					"open snapshot panic cleanup = calls:%d bounded:%t, want one bounded close",
+					closeCalls,
+					closeHadDeadline,
+				)
+			}
+			request.Checkpoint.Clear()
+		})
+	}
+}
+
+func TestInventoryOpenHandleErrorCloseFailurePoisonsRevoke(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeInventoryClient(testInstanceUUID)
+	client.closeErr = errors.New("local session close failed")
+	provider, attempt, runtime, request := newInventoryProviderWithOpenerFixture(
+		t,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+		func(context.Context, resolvedRuntime) (validationClient, error) {
+			return client, errors.New("open failed with local session")
+		},
+	)
+	t.Cleanup(attempt.Destroy)
+
+	outcome, discoverErr := provider.Discover(context.Background(), runtime, request)
+	if outcome != nil || discoverErr == nil {
+		t.Fatalf("Discover(handle+error close failure) = (%#v,%v)", outcome, discoverErr)
+	}
+	for call := 1; call <= 2; call++ {
+		if err := attempt.Revoke(context.Background()); !errors.Is(err, errInventoryRejected) {
+			t.Fatalf("Revoke(cleanup uncertainty call %d) error = %v, want stable rejection", call, err)
+		}
+	}
+	client.mu.Lock()
+	closeCalls := client.closeCalls
+	client.mu.Unlock()
+	if closeCalls != 1 {
+		t.Fatalf("handle+error cleanup closed client %d times, want once", closeCalls)
+	}
+	request.Checkpoint.Clear()
+}
+
+func TestInventoryAttachedIdentitySnapshotPanicPermanentlyRejectsCheckpoint(
+	t *testing.T,
+) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		continuation bool
+		configure    func(*fakeInventoryClient)
+		clear        func(*fakeInventoryClient)
+	}{
+		{
+			name:         "continuation Identity",
+			continuation: true,
+			configure: func(client *fakeInventoryClient) {
+				client.identityPanic = "attached Identity panic canary"
+			},
+			clear: func(client *fakeInventoryClient) {
+				client.identityPanic = nil
+			},
+		},
+		{
+			name: "replay CollectorReference",
+			configure: func(client *fakeInventoryClient) {
+				client.collectorPanic = "replay CollectorReference panic canary"
+			},
+			clear: func(client *fakeInventoryClient) {
+				client.collectorPanic = nil
+			},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := newFakeInventoryClient(testInstanceUUID)
+			client.initial[testAuthorityRoot] = types.RetrieveResult{
+				Objects: []types.ObjectContent{
+					inventoryFolderContent("group-a", "folder-a"),
+				},
+				Token: "attached-snapshot-panic-token-canary",
+			}
+			client.continuations["attached-snapshot-panic-token-canary"] = types.RetrieveResult{
+				Objects: []types.ObjectContent{
+					inventoryFolderContent(testAuthorityRoot.Value, "authority-root"),
+				},
+			}
+			provider, attempt, runtime, request := newInventoryProviderFixture(
+				t,
+				client,
+				[]types.ManagedObjectReference{testAuthorityRoot},
+			)
+			t.Cleanup(attempt.Destroy)
+			first := discoverInventoryPage(t, provider, runtime, request)
+			if test.continuation {
+				request.Checkpoint.Clear()
+				request.Checkpoint = first.NextCheckpoint.Clone()
+			}
+			first.NextCheckpoint.Clear()
+
+			test.configure(client)
+			outcome, discoverErr, panicValue := discoverInventoryRecover(
+				provider,
+				runtime,
+				request,
+			)
+			if panicValue != nil {
+				t.Errorf("Discover(attached snapshot panic) propagated %#v", panicValue)
+			}
+			if outcome != nil || discoverErr == nil {
+				t.Errorf(
+					"Discover(attached snapshot panic) = (%#v,%v), want rejection",
+					outcome,
+					discoverErr,
+				)
+			}
+			test.clear(client)
+
+			outcome, discoverErr = provider.Discover(
+				context.Background(),
+				runtime,
+				request,
+			)
+			if outcome != nil || !errors.Is(discoverErr, errInventoryContinuity) {
+				t.Errorf(
+					"Discover(after attached panic) = (%#v,%v), want permanent continuity failure",
+					outcome,
+					discoverErr,
+				)
+			}
+			if got := client.methodSnapshot(); !slices.Equal(got, []string{
+				"RetrievePropertiesEx",
+			}) {
+				t.Errorf("attached panic checkpoint resumed SOAP: %v", got)
+			}
+			if err := attempt.Revoke(context.Background()); err != nil {
+				t.Errorf("Revoke(attached snapshot panic) error = %v", err)
+			}
+			client.mu.Lock()
+			closeCalls := client.closeCalls
+			client.mu.Unlock()
+			if closeCalls != 1 {
+				t.Errorf("attached snapshot panic closed client %d times, want once", closeCalls)
+			}
+			request.Checkpoint.Clear()
+		})
+	}
+}
+
+func TestInventoryCanceledOpenClosesReturnedClientWithBoundedContext(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeInventoryClient(testInstanceUUID)
+	discoverContext, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	provider, attempt, runtime, request := newInventoryProviderWithOpenerFixture(
+		t,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+		func(context.Context, resolvedRuntime) (validationClient, error) {
+			cancel()
+			return client, nil
+		},
+	)
+	t.Cleanup(attempt.Destroy)
+
+	outcome, discoverErr := provider.Discover(
+		discoverContext,
+		runtime,
+		request,
+	)
+	if outcome != nil || !errors.Is(discoverErr, context.Canceled) {
+		t.Fatalf("Discover(canceled open) = (%#v,%v)", outcome, discoverErr)
+	}
+	client.mu.Lock()
+	closeCalls := client.closeCalls
+	closeHadDeadline := client.closeHadDeadline
+	client.mu.Unlock()
+	if closeCalls != 1 || !closeHadDeadline {
+		t.Fatalf(
+			"canceled open cleanup = calls:%d bounded:%t, want one bounded close",
+			closeCalls,
+			closeHadDeadline,
+		)
+	}
+	request.Checkpoint.Clear()
+}
+
+func TestInventoryRevokeCancelsInFlightOpenWithoutStateLock(t *testing.T) {
+	t.Parallel()
+
+	openStarted := make(chan struct{})
+	var openOnce sync.Once
+	provider, attempt, runtime, request := newInventoryProviderWithOpenerFixture(
+		t,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+		func(
+			ctx context.Context,
+			_ resolvedRuntime,
+		) (validationClient, error) {
+			openOnce.Do(func() { close(openStarted) })
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	)
+	t.Cleanup(attempt.Destroy)
+
+	type discoverResult struct {
+		outcome discoverysource.DiscoverOutcome
+		err     error
+	}
+	discoverDone := make(chan discoverResult, 1)
+	go func() {
+		outcome, discoverErr := provider.Discover(
+			context.Background(),
+			runtime,
+			request,
+		)
+		discoverDone <- discoverResult{outcome: outcome, err: discoverErr}
+	}()
+	select {
+	case <-openStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial open did not start")
+	}
+	revokeContext, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := attempt.Revoke(revokeContext); err != nil {
+		t.Fatalf("Revoke(in-flight open) error = %v", err)
+	}
+	result := <-discoverDone
+	if result.outcome != nil || !errors.Is(result.err, errInventoryContinuity) {
+		t.Fatalf("late open result = (%#v,%v), want discarded continuity failure", result.outcome, result.err)
+	}
+	request.Checkpoint.Clear()
+}
+
+func TestInventoryTimedOutOpenFinalizerReportsUncertainRevoke(t *testing.T) {
+	client := newFakeInventoryClient(testInstanceUUID)
+	openStarted := make(chan struct{})
+	openRelease := make(chan struct{})
+	releaseHandoff := make(chan struct{})
+	var openOnce sync.Once
+	var releaseOpenOnce sync.Once
+	var releaseHandoffOnce sync.Once
+	defer releaseHandoffOnce.Do(func() { close(releaseHandoff) })
+	defer releaseOpenOnce.Do(func() { close(openRelease) })
+	provider, attempt, runtime, request := newInventoryProviderWithOpenerFixture(
+		t,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+		func(context.Context, resolvedRuntime) (validationClient, error) {
+			openOnce.Do(func() { close(openStarted) })
+			<-openRelease
+			return client, nil
+		},
+	)
+	t.Cleanup(attempt.Destroy)
+
+	type discoverResult struct {
+		outcome discoverysource.DiscoverOutcome
+		err     error
+	}
+	discoverDone := make(chan discoverResult, 1)
+	go func() {
+		outcome, err := provider.Discover(context.Background(), runtime, request)
+		discoverDone <- discoverResult{outcome: outcome, err: err}
+	}()
+	select {
+	case <-openStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("uncertain open did not start")
+	}
+
+	handoffAcquired := make(chan struct{})
+	go func() {
+		attempt.state.mu.Lock()
+		close(handoffAcquired)
+		<-releaseHandoff
+		attempt.state.mu.Unlock()
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for attempt.state.mu.turnstile.TryLock() {
+		attempt.state.mu.turnstile.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("handoff waiter did not acquire the operation turnstile")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	revokeContext, cancel := context.WithTimeout(
+		context.Background(),
+		sessionCleanupTimeout+2*time.Second,
+	)
+	defer cancel()
+	firstRevokeErr := attempt.Revoke(revokeContext)
+	if !errors.Is(firstRevokeErr, errInventoryRejected) {
+		releaseHandoffOnce.Do(func() { close(releaseHandoff) })
+		releaseOpenOnce.Do(func() { close(openRelease) })
+		<-discoverDone
+		t.Fatalf("Revoke(timed-out open) error = %v, want safe rejection", firstRevokeErr)
+	}
+	select {
+	case <-handoffAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("timed-out operation did not wake the real barrier waiter")
+	}
+	releaseHandoffOnce.Do(func() { close(releaseHandoff) })
+	if err := attempt.Revoke(context.Background()); !errors.Is(err, errInventoryRejected) {
+		t.Fatalf("Revoke(timed-out open replay) error = %v, want stable rejection", err)
+	}
+
+	destroyDone := make(chan struct{})
+	go func() {
+		attempt.Destroy()
+		close(destroyDone)
+	}()
+	select {
+	case <-destroyDone:
+	case <-time.After(time.Second):
+		t.Fatal("Destroy waited for the already terminalized stuck operation")
+	}
+
+	releaseOpenOnce.Do(func() { close(openRelease) })
+	result := <-discoverDone
+	if result.outcome != nil || !errors.Is(result.err, errInventoryContinuity) {
+		t.Fatalf("late open result = (%#v,%v), want discarded continuity failure", result.outcome, result.err)
+	}
+	attempt.state.mu.rawLock()
+	retainedFacts := len(attempt.state.items) +
+		len(attempt.state.relations) +
+		len(attempt.state.pageToken) +
+		len(attempt.state.checkpointToken)
+	replayActive := attempt.state.replay.active
+	completed := attempt.state.completed
+	attempt.state.mu.rawUnlock()
+	if retainedFacts != 0 || replayActive || completed {
+		t.Fatalf(
+			"late open committed state: facts=%d replay=%t completed=%t",
+			retainedFacts,
+			replayActive,
+			completed,
+		)
+	}
+	client.mu.Lock()
+	closeCalls := client.closeCalls
+	closeHadDeadline := client.closeHadDeadline
+	client.mu.Unlock()
+	if closeCalls != 1 || !closeHadDeadline {
+		t.Fatalf(
+			"late open cleanup = calls:%d bounded:%t, want one bounded close",
+			closeCalls,
+			closeHadDeadline,
+		)
+	}
+	request.Checkpoint.Clear()
+}
+
+func TestInventoryLateDiscardClosePanicPoisonsRevoke(t *testing.T) {
+	client := newFakeInventoryClient(testInstanceUUID)
+	client.closePanic = "late discard close panic canary"
+	openStarted := make(chan struct{})
+	openRelease := make(chan struct{})
+	var openOnce sync.Once
+	provider, attempt, runtime, request := newInventoryProviderWithOpenerFixture(
+		t,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+		func(context.Context, resolvedRuntime) (validationClient, error) {
+			openOnce.Do(func() { close(openStarted) })
+			<-openRelease
+			return client, nil
+		},
+	)
+	t.Cleanup(attempt.Destroy)
+
+	type discoverResult struct {
+		outcome discoverysource.DiscoverOutcome
+		err     error
+	}
+	discoverDone := make(chan discoverResult, 1)
+	go func() {
+		outcome, err := provider.Discover(context.Background(), runtime, request)
+		discoverDone <- discoverResult{outcome: outcome, err: err}
+	}()
+	select {
+	case <-openStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("late-discard open did not start")
+	}
+
+	revokeDone := make(chan error, 1)
+	go func() {
+		revokeDone <- attempt.Revoke(context.Background())
+	}()
+	waitForInventoryTerminalIntent(t, attempt)
+	close(openRelease)
+
+	result := <-discoverDone
+	if result.outcome != nil || !errors.Is(result.err, errInventoryContinuity) {
+		t.Fatalf("late open result = (%#v,%v), want discarded continuity failure", result.outcome, result.err)
+	}
+	if err := <-revokeDone; !errors.Is(err, errInventoryRejected) {
+		t.Fatalf("Revoke(late discard Close panic) error = %v, want safe rejection", err)
+	}
+	if err := attempt.Revoke(context.Background()); !errors.Is(err, errInventoryRejected) {
+		t.Fatalf("Revoke(late discard Close panic replay) error = %v, want stable rejection", err)
+	}
+	client.mu.Lock()
+	closeCalls := client.closeCalls
+	client.mu.Unlock()
+	if closeCalls != 1 {
+		t.Fatalf("late discard panic closed client %d times, want once", closeCalls)
+	}
+	request.Checkpoint.Clear()
+}
+
+func TestInventoryRevokeOwnedClientClosePanicIsStableRejection(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeInventoryClient(testInstanceUUID)
+	client.initial[testAuthorityRoot] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent(testAuthorityRoot.Value, "authority-root"),
+		},
+	}
+	provider, attempt, runtime, request := newInventoryProviderFixture(
+		t,
+		client,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+	)
+	t.Cleanup(attempt.Destroy)
+	page := discoverInventoryPage(t, provider, runtime, request)
+	page.NextCheckpoint.Clear()
+	request.Checkpoint.Clear()
+	client.closePanic = "owned client close panic canary"
+
+	for call := 1; call <= 2; call++ {
+		if err := attempt.Revoke(context.Background()); !errors.Is(err, errInventoryRejected) {
+			t.Fatalf("Revoke(owned Close panic call %d) error = %v, want stable rejection", call, err)
+		}
+	}
+	select {
+	case <-attempt.state.revokeDone:
+	default:
+		t.Fatal("owned Close panic did not finalize revokeDone")
+	}
+	client.mu.Lock()
+	closeCalls := client.closeCalls
+	client.mu.Unlock()
+	if closeCalls != 1 {
+		t.Fatalf("owned Close panic closed client %d times, want once", closeCalls)
+	}
+}
+
+func TestInventoryRevokeRuntimeClearPanicStillClosesClient(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeInventoryClient(testInstanceUUID)
+	client.initial[testAuthorityRoot] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent(testAuthorityRoot.Value, "authority-root"),
+		},
+	}
+	provider, attempt, runtime, request := newInventoryProviderFixture(
+		t,
+		client,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+	)
+	t.Cleanup(attempt.Destroy)
+	t.Cleanup(runtime.Clear)
+	page := discoverInventoryPage(t, provider, runtime, request)
+	page.NextCheckpoint.Clear()
+	request.Checkpoint.Clear()
+
+	marker := struct{}{}
+	var clearOnce sync.Once
+	panicRuntime, err := discoverysource.BindRuntime(
+		publishedInventoryBinding(request),
+		&marker,
+		func(*struct{}) error { return nil },
+		func(*struct{}) {
+			clearOnce.Do(func() {
+				panic("runtime clear panic canary")
+			})
+		},
+	)
+	if err != nil {
+		t.Fatalf("BindRuntime(panic runtime) error = %v", err)
+	}
+	t.Cleanup(panicRuntime.Clear)
+	attempt.state.mu.rawLock()
+	attempt.state.runtime = panicRuntime
+	attempt.state.mu.rawUnlock()
+
+	if err := attempt.Revoke(context.Background()); !errors.Is(err, errInventoryRejected) {
+		t.Fatalf("Revoke(runtime Clear panic) error = %v, want safe rejection", err)
+	}
+	if err := attempt.Revoke(context.Background()); !errors.Is(err, errInventoryRejected) {
+		t.Fatalf("Revoke(runtime Clear panic replay) error = %v, want stable rejection", err)
+	}
+	client.mu.Lock()
+	closeCalls := client.closeCalls
+	client.mu.Unlock()
+	if closeCalls != 1 {
+		t.Fatalf("runtime Clear panic closed client %d times, want once", closeCalls)
+	}
+}
+
+func TestInventoryRevokePublishesRolloverReceiptBeforeReturning(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeInventoryClient(testInstanceUUID)
+	client.closeErr = errors.New("receipt ordering close failure")
+	revocation := &fullInventoryRolloverRevocation{}
+	revocation.mu.Lock()
+	revocationLocked := true
+	defer func() {
+		if revocationLocked {
+			revocation.mu.Unlock()
+		}
+	}()
+	private := &fullInventoryAttemptState{
+		client:             client,
+		revokeDone:         make(chan struct{}),
+		rolloverRevocation: revocation,
+	}
+	attempt := &FullInventoryAttempt{state: private}
+	revokeReturned := make(chan error, 1)
+	go func() {
+		revokeReturned <- attempt.Revoke(context.Background())
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		private.mu.rawLock()
+		sealed := private.revokeErr != nil
+		private.mu.rawUnlock()
+		if sealed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Revoke did not seal its terminal result")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-private.revokeDone:
+		t.Error("revokeDone closed before rollover receipt publication")
+	default:
+	}
+	earlyReturned := false
+	select {
+	case err := <-revokeReturned:
+		t.Errorf("Revoke returned before rollover receipt publication: %v", err)
+		earlyReturned = true
+	default:
+	}
+
+	revocation.mu.Unlock()
+	revocationLocked = false
+	if !earlyReturned {
+		select {
+		case err := <-revokeReturned:
+			if !errors.Is(err, errInventoryRejected) {
+				t.Fatalf("Revoke(receipt ordered) error = %v, want safe rejection", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Revoke did not return after rollover receipt publication")
+		}
+	}
+	revocation.mu.Lock()
+	revoked := revocation.revoked
+	receiptErr := revocation.err
+	revocation.mu.Unlock()
+	if !revoked || !errors.Is(receiptErr, errInventoryRejected) {
+		t.Fatalf("rollover receipt = revoked:%t err:%v", revoked, receiptErr)
+	}
+}
+
+func TestInventoryRevokeContextExpiryLeavesOneEventualFinalizer(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeInventoryClient(testInstanceUUID)
+	client.initial[testAuthorityRoot] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent(testAuthorityRoot.Value, "authority-root"),
+		},
+	}
+	provider, attempt, runtime, request := newInventoryProviderFixture(
+		t,
+		client,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+	)
+	t.Cleanup(attempt.Destroy)
+	page := discoverInventoryPage(t, provider, runtime, request)
+	page.NextCheckpoint.Clear()
+	request.Checkpoint.Clear()
+
+	client.closeStarted = make(chan struct{})
+	client.closeRelease = make(chan struct{})
+	revokeContext, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := attempt.Revoke(revokeContext); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Revoke(expired caller) error = %v, want deadline", err)
+	}
+	select {
+	case <-client.closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("eventual finalizer did not retain cleanup ownership")
+	}
+	close(client.closeRelease)
+	if err := attempt.Revoke(context.Background()); err != nil {
+		t.Fatalf("Revoke(eventual completion) error = %v", err)
+	}
+	client.mu.Lock()
+	closeCalls := client.closeCalls
+	client.mu.Unlock()
+	if closeCalls != 1 {
+		t.Fatalf("eventual finalizers = %d client closes, want one", closeCalls)
+	}
+}
+
+func TestInventoryCanceledBrokerRevokePermanentlyRejectsRolloverSuccessor(
+	t *testing.T,
+) {
+	fixture := newRolloverHandoffFixture(t)
+	handoff := fixture.begin(t)
+	fixture.predecessor.closeStarted = make(chan struct{})
+	fixture.predecessor.closeRelease = make(chan struct{})
+
+	type brokerRevokeResult struct {
+		proof discoveryqueue.CleanupProof
+		err   error
+	}
+	revokeContext, cancelRevoke := context.WithTimeout(
+		context.Background(),
+		50*time.Millisecond,
+	)
+	defer cancelRevoke()
+	revokeDone := make(chan brokerRevokeResult, 1)
+	go func() {
+		proof, err := fixture.broker.RevokeAttempt(
+			revokeContext,
+			fixture.openRequest.Attempt.AttemptID,
+		)
+		revokeDone <- brokerRevokeResult{proof: proof, err: err}
+	}()
+	select {
+	case <-fixture.predecessor.closeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Broker revoke did not reach predecessor cleanup")
+	}
+	select {
+	case <-revokeContext.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Broker revoke context did not expire")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		fixture.opener.attempt.state.mu.rawLock()
+		destroyStarted := fixture.opener.attempt.state.destroyed
+		fixture.opener.attempt.state.mu.rawUnlock()
+		if destroyStarted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Broker did not begin Destroy after canceled handle Revoke")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	completed, receiptErr := fixture.opener.attempt.state.rolloverRevocation.result()
+	close(fixture.predecessor.closeRelease)
+	if completed || !errors.Is(receiptErr, errInventoryRejected) {
+		t.Fatalf(
+			"rollover receipt before background cleanup = completed:%t err:%v, want sealed uncertainty",
+			completed,
+			receiptErr,
+		)
+	}
+
+	var revoked brokerRevokeResult
+	select {
+	case revoked = <-revokeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Broker revoke did not finish after predecessor cleanup")
+	}
+	defer revoked.proof.Destroy()
+	if revoked.err != nil {
+		t.Fatalf("RevokeAttempt() error = %v", revoked.err)
+	}
+	if revoked.proof.Status() != assetcatalog.CredentialCleanupUncertain {
+		t.Fatalf(
+			"canceled Broker cleanup status = %s, want UNCERTAIN",
+			revoked.proof.Status(),
+		)
+	}
+
+	material := inventoryRuntimeMaterial(
+		t,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+	)
+	successor, successorErr := handoff.NewSuccessor(
+		context.Background(),
+		fixture.queue,
+		fixture.fence,
+		&material,
+		fixture.partial.NextCheckpoint,
+	)
+	if successor != nil {
+		successor.Destroy()
+	}
+	if successor != nil || !errors.Is(successorErr, errInventoryContinuity) {
+		t.Fatalf(
+			"NewSuccessor(after UNCERTAIN Broker cleanup) = (%#v,%v), want permanent rejection",
+			successor,
+			successorErr,
+		)
+	}
+}
+
+func TestInventoryConcurrentDiscoverConsumesContinuationOnce(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeInventoryClient(testInstanceUUID)
+	client.initial[testAuthorityRoot] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent("group-a", "folder-a"),
+		},
+		Token: "serialized-continuation-token-canary",
+	}
+	client.continuations["serialized-continuation-token-canary"] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent(testAuthorityRoot.Value, "authority-root"),
+		},
+	}
+	client.continueStarted = make(chan struct{})
+	client.continueRelease = make(chan struct{})
+	provider, attempt, runtime, request := newInventoryProviderFixture(
+		t,
+		client,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+	)
+	t.Cleanup(attempt.Destroy)
+	first := discoverInventoryPage(t, provider, runtime, request)
+	request.Checkpoint.Clear()
+	request.Checkpoint = first.NextCheckpoint.Clone()
+	first.NextCheckpoint.Clear()
+
+	type discoverResult struct {
+		outcome discoverysource.DiscoverOutcome
+		err     error
+	}
+	done := make(chan discoverResult, 2)
+	for range 2 {
+		go func() {
+			outcome, err := provider.Discover(context.Background(), runtime, request)
+			done <- discoverResult{outcome: outcome, err: err}
+		}()
+	}
+	select {
+	case <-client.continueStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("continuation did not start")
+	}
+	close(client.continueRelease)
+	for call := 1; call <= 2; call++ {
+		result := <-done
+		page, ok := result.outcome.(discoverysource.Page)
+		if result.err != nil || !ok || !page.FinalPage || !page.CompleteSnapshot {
+			t.Fatalf("Discover(concurrent %d) = (%#v,%v)", call, result.outcome, result.err)
+		}
+		page.NextCheckpoint.Clear()
+	}
+	if got := client.methodSnapshot(); !slices.Equal(got, []string{
+		"RetrievePropertiesEx",
+		"ContinueRetrievePropertiesEx",
+	}) {
+		t.Fatalf("concurrent Discover consumed token more than once: %v", got)
+	}
+	request.Checkpoint.Clear()
+}
+
+func TestInventoryContinuationPanicTerminalizesAndUnlocksAttempt(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeInventoryClient(testInstanceUUID)
+	client.initial[testAuthorityRoot] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent("group-a", "folder-a"),
+		},
+		Token: "panic-continuation-token-canary",
+	}
+	client.continuations["panic-continuation-token-canary"] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent(testAuthorityRoot.Value, "authority-root"),
+		},
+	}
+	client.continuePanic = "continuation panic canary"
+	provider, attempt, runtime, request := newInventoryProviderFixture(
+		t,
+		client,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+	)
+	t.Cleanup(attempt.Destroy)
+	first := discoverInventoryPage(t, provider, runtime, request)
+	request.Checkpoint.Clear()
+	request.Checkpoint = first.NextCheckpoint.Clone()
+	first.NextCheckpoint.Clear()
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_, _ = provider.Discover(context.Background(), runtime, request)
+	}()
+	if recovered != "continuation panic canary" {
+		t.Fatalf("recovered panic = %#v", recovered)
+	}
+	if err := attempt.Revoke(context.Background()); err != nil {
+		t.Fatalf("Revoke(after panic) error = %v", err)
+	}
+	outcome, err := provider.Discover(context.Background(), runtime, request)
+	if outcome != nil || err == nil {
+		t.Fatalf("Discover(after panic) = (%#v,%v), want terminal attempt", outcome, err)
+	}
+	client.mu.Lock()
+	closeCalls := client.closeCalls
+	client.mu.Unlock()
+	if closeCalls != 1 {
+		t.Fatalf("panic cleanup closed client %d times, want once", closeCalls)
+	}
+	request.Checkpoint.Clear()
+}
+
+func TestInventoryLateContinuationSuccessAfterRevokeCannotCommitState(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeInventoryClient(testInstanceUUID)
+	client.initial[testAuthorityRoot] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent("group-a", "folder-a"),
+		},
+		Token: "late-success-continuation-token-canary",
+	}
+	client.continuations["late-success-continuation-token-canary"] = types.RetrieveResult{
+		Objects: []types.ObjectContent{
+			inventoryFolderContent(testAuthorityRoot.Value, "authority-root"),
+		},
+	}
+	client.continueStarted = make(chan struct{})
+	client.continueRelease = make(chan struct{})
+	client.continueIgnoreCancellation = true
+	provider, attempt, runtime, request := newInventoryProviderFixture(
+		t,
+		client,
+		[]types.ManagedObjectReference{testAuthorityRoot},
+	)
+	t.Cleanup(attempt.Destroy)
+	first := discoverInventoryPage(t, provider, runtime, request)
+	request.Checkpoint.Clear()
+	request.Checkpoint = first.NextCheckpoint.Clone()
+	first.NextCheckpoint.Clear()
+
+	type discoverResult struct {
+		outcome discoverysource.DiscoverOutcome
+		err     error
+	}
+	discoverDone := make(chan discoverResult, 1)
+	go func() {
+		outcome, err := provider.Discover(context.Background(), runtime, request)
+		discoverDone <- discoverResult{outcome: outcome, err: err}
+	}()
+	select {
+	case <-client.continueStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("late-success continuation did not start")
+	}
+
+	revokeContext, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := attempt.Revoke(revokeContext); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Revoke(late-success continuation) error = %v, want deadline", err)
+	}
+	close(client.continueRelease)
+	result := <-discoverDone
+	if result.outcome != nil || !errors.Is(result.err, errInventoryContinuity) {
+		t.Fatalf(
+			"late successful SOAP result = (%#v,%v), want discarded continuity failure",
+			result.outcome,
+			result.err,
+		)
+	}
+	if err := attempt.Revoke(context.Background()); err != nil {
+		t.Fatalf("Revoke(eventual late-success cleanup) error = %v", err)
+	}
+	attempt.state.mu.rawLock()
+	retainedFacts := len(attempt.state.items) +
+		len(attempt.state.relations) +
+		len(attempt.state.pageToken) +
+		len(attempt.state.checkpointToken)
+	replayActive := attempt.state.replay.active
+	completed := attempt.state.completed
+	attempt.state.mu.rawUnlock()
+	if retainedFacts != 0 || replayActive || completed {
+		t.Fatalf(
+			"late SOAP committed state: facts=%d replay=%t completed=%t",
+			retainedFacts,
+			replayActive,
+			completed,
+		)
+	}
+	client.mu.Lock()
+	closeCalls := client.closeCalls
+	client.mu.Unlock()
+	if closeCalls != 1 {
+		t.Fatalf("late-success cleanup closed client %d times, want once", closeCalls)
+	}
+	request.Checkpoint.Clear()
+}
+
+func TestFullInventoryStateBarrierWaitingHandoffCannotBeOvertaken(t *testing.T) {
+	t.Parallel()
+
+	var barrier fullInventoryStateBarrier
+	operationDone := make(chan struct{})
+	barrier.Lock()
+	barrier.beginOperationLocked(operationDone)
+	barrier.Unlock()
+
+	handoffAcquired := make(chan struct{})
+	releaseHandoff := make(chan struct{})
+	go func() {
+		barrier.Lock()
+		close(handoffAcquired)
+		<-releaseHandoff
+		barrier.Unlock()
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for barrier.turnstile.TryLock() {
+		barrier.turnstile.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("handoff waiter did not acquire the barrier turnstile")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	laterDiscoverAcquired := make(chan struct{})
+	go func() {
+		barrier.Lock()
+		close(laterDiscoverAcquired)
+		barrier.Unlock()
+	}()
+	barrier.rawLock()
+	barrier.finishOperationLocked(operationDone)
+	barrier.rawUnlock()
+	select {
+	case <-handoffAcquired:
+	case <-laterDiscoverAcquired:
+		t.Fatal("later Discover overtook the already waiting handoff")
+	case <-time.After(2 * time.Second):
+		t.Fatal("handoff waiter did not acquire the completed operation")
+	}
+	select {
+	case <-laterDiscoverAcquired:
+		t.Fatal("later Discover acquired before handoff released the turnstile")
+	default:
+	}
+	close(releaseHandoff)
+	select {
+	case <-laterDiscoverAcquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("later Discover did not proceed after handoff released the barrier")
+	}
+}
+
 func TestInventoryConcurrentRuntimeClearAndDestroyCannotResume(t *testing.T) {
 	client := newFakeInventoryClient(testInstanceUUID)
 	client.initial[testAuthorityRoot] = types.RetrieveResult{
@@ -926,7 +2552,7 @@ func TestInventoryConcurrentRuntimeClearAndDestroyCannotResume(t *testing.T) {
 		close(destroyDone)
 	}()
 	<-destroyStarted
-	time.Sleep(10 * time.Millisecond)
+	waitForInventoryTerminalIntent(t, attempt)
 	close(client.continueRelease)
 
 	var completed discoverResult
@@ -935,11 +2561,14 @@ func TestInventoryConcurrentRuntimeClearAndDestroyCannotResume(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Discover deadlocked with runtime clear/destroy")
 	}
-	page, ok := completed.outcome.(discoverysource.Page)
-	if completed.err != nil || !ok || !page.FinalPage || !page.CompleteSnapshot {
-		t.Fatalf("in-flight Discover() = (%#v,%v), want exact final page", completed.outcome, completed.err)
+	if completed.outcome != nil ||
+		!errors.Is(completed.err, errInventoryContinuity) {
+		t.Fatalf(
+			"in-flight Discover() = (%#v,%v), want terminally discarded result",
+			completed.outcome,
+			completed.err,
+		)
 	}
-	page.NextCheckpoint.Clear()
 	select {
 	case err := <-revokeDone:
 		if err != nil {
@@ -1505,10 +3134,46 @@ func discoverInventoryPage(
 	return page
 }
 
+func discoverInventoryRecover(
+	provider discoverysource.Provider,
+	runtime discoverysource.BoundRuntime,
+	request discoverysource.DiscoverRequest,
+) (
+	outcome discoverysource.DiscoverOutcome,
+	err error,
+	panicValue any,
+) {
+	defer func() {
+		panicValue = recover()
+	}()
+	outcome, err = provider.Discover(context.Background(), runtime, request)
+	return outcome, err, nil
+}
+
 func newInventoryProviderFixture(
 	t *testing.T,
 	client *fakeInventoryClient,
 	roots []types.ManagedObjectReference,
+) (
+	discoverysource.Provider,
+	*FullInventoryAttempt,
+	discoverysource.BoundRuntime,
+	discoverysource.DiscoverRequest,
+) {
+	t.Helper()
+	return newInventoryProviderWithOpenerFixture(
+		t,
+		roots,
+		func(context.Context, resolvedRuntime) (validationClient, error) {
+			return client, nil
+		},
+	)
+}
+
+func newInventoryProviderWithOpenerFixture(
+	t *testing.T,
+	roots []types.ManagedObjectReference,
+	opener func(context.Context, resolvedRuntime) (validationClient, error),
 ) (
 	discoverysource.Provider,
 	*FullInventoryAttempt,
@@ -1531,9 +3196,7 @@ func newInventoryProviderFixture(
 	if err != nil {
 		t.Fatalf("NewClientFactory() error = %v", err)
 	}
-	factory.openClient = func(context.Context, resolvedRuntime) (validationClient, error) {
-		return client, nil
-	}
+	factory.openClient = opener
 	provider, err := New(factory)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -1637,6 +3300,103 @@ func inventoryFolderContent(
 		Obj:     types.ManagedObjectReference{Type: "Folder", Value: value},
 		PropSet: properties,
 	}
+}
+
+func inventoryComputeResourceContent(
+	compute types.ManagedObjectReference,
+	host types.ManagedObjectReference,
+	pool types.ManagedObjectReference,
+) types.ObjectContent {
+	return types.ObjectContent{
+		Obj: compute,
+		PropSet: []types.DynamicProperty{
+			{Name: "host", Val: []types.ManagedObjectReference{host}},
+			{Name: "resourcePool", Val: pool},
+		},
+	}
+}
+
+func inventoryClusterContent(
+	cluster types.ManagedObjectReference,
+	name string,
+) types.ObjectContent {
+	return types.ObjectContent{
+		Obj: cluster,
+		PropSet: []types.DynamicProperty{
+			{Name: "name", Val: name},
+		},
+	}
+}
+
+func inventoryDatacenterContent(
+	datacenter types.ManagedObjectReference,
+	vmFolder types.ManagedObjectReference,
+) types.ObjectContent {
+	return types.ObjectContent{
+		Obj: datacenter,
+		PropSet: []types.DynamicProperty{
+			{Name: "name", Val: "DC0"},
+			{Name: "vmFolder", Val: vmFolder},
+		},
+	}
+}
+
+func inventoryHostContent(
+	host types.ManagedObjectReference,
+	name string,
+) types.ObjectContent {
+	return types.ObjectContent{
+		Obj: host,
+		PropSet: []types.DynamicProperty{
+			{Name: "name", Val: name},
+			{Name: "runtime.connectionState", Val: types.HostSystemConnectionStateConnected},
+			{Name: "summary.hardware.numCpuCores", Val: int64(16)},
+			{Name: "summary.hardware.memorySize", Val: int64(64 << 30)},
+		},
+	}
+}
+
+func inventoryVirtualMachineContent(
+	virtualMachine types.ManagedObjectReference,
+	name string,
+) types.ObjectContent {
+	return types.ObjectContent{
+		Obj: virtualMachine,
+		PropSet: []types.DynamicProperty{
+			{Name: "name", Val: name},
+			{Name: "config.guestId", Val: "ubuntu64Guest"},
+			{Name: "runtime.powerState", Val: types.VirtualMachinePowerStatePoweredOn},
+			{Name: "runtime.connectionState", Val: types.VirtualMachineConnectionStateConnected},
+			{Name: "config.hardware.numCPU", Val: int64(4)},
+			{Name: "config.hardware.memoryMB", Val: int64(8 << 10)},
+		},
+	}
+}
+
+func inventoryResourcePoolContent(
+	pool types.ManagedObjectReference,
+	name string,
+	children ...types.ManagedObjectReference,
+) types.ObjectContent {
+	properties := []types.DynamicProperty{{Name: "name", Val: name}}
+	if children != nil {
+		properties = append(properties, types.DynamicProperty{
+			Name: "resourcePool",
+			Val:  slices.Clone(children),
+		})
+	}
+	return types.ObjectContent{
+		Obj:     pool,
+		PropSet: properties,
+	}
+}
+
+func inventoryRelationKey(
+	from types.ManagedObjectReference,
+	to types.ManagedObjectReference,
+) string {
+	return "vsphere:" + testInstanceUUID + ":" + from.Type + ":" + from.Value +
+		"->vsphere:" + testInstanceUUID + ":" + to.Type + ":" + to.Value
 }
 
 type inventoryPageEvidence struct {
@@ -1780,20 +3540,32 @@ func assertCheckpointExcludes(
 }
 
 type fakeInventoryClient struct {
-	mu            sync.Mutex
-	identity      vcenterIdentity
-	collector     types.ManagedObjectReference
-	initial       map[types.ManagedObjectReference]types.RetrieveResult
-	continuations map[string]types.RetrieveResult
-	methods       []string
-	roots         []types.ManagedObjectReference
-	closed        bool
-	closeCalls    int
-	closeErr      error
+	mu               sync.Mutex
+	identity         vcenterIdentity
+	collector        types.ManagedObjectReference
+	initial          map[types.ManagedObjectReference]types.RetrieveResult
+	continuations    map[string]types.RetrieveResult
+	methods          []string
+	roots            []types.ManagedObjectReference
+	maxObjects       []int32
+	closed           bool
+	closeCalls       int
+	closeErr         error
+	closePanic       any
+	closeHadDeadline bool
+	identityPanic    any
+	collectorPanic   any
 
-	continueStarted chan struct{}
-	continueRelease chan struct{}
-	continueOnce    sync.Once
+	continueStarted              chan struct{}
+	continueRelease              chan struct{}
+	continueCancellationObserved chan struct{}
+	continueOnce                 sync.Once
+	continueCancellationOnce     sync.Once
+	continuePanic                any
+	continueIgnoreCancellation   bool
+	closeStarted                 chan struct{}
+	closeRelease                 chan struct{}
+	closeOnce                    sync.Once
 }
 
 func newFakeInventoryClient(instanceUUID string) *fakeInventoryClient {
@@ -1814,6 +3586,9 @@ func newFakeInventoryClient(instanceUUID string) *fakeInventoryClient {
 func (client *fakeInventoryClient) Identity() vcenterIdentity {
 	client.mu.Lock()
 	defer client.mu.Unlock()
+	if client.identityPanic != nil {
+		panic(client.identityPanic)
+	}
 	if client.closed {
 		return vcenterIdentity{}
 	}
@@ -1846,7 +3621,7 @@ func (*fakeInventoryClient) ProbeRoots(
 func (client *fakeInventoryClient) RetrieveInventoryPage(
 	_ context.Context,
 	root types.ManagedObjectReference,
-	_ int32,
+	maxObjects int32,
 ) (types.RetrieveResult, error) {
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -1855,6 +3630,7 @@ func (client *fakeInventoryClient) RetrieveInventoryPage(
 	}
 	client.methods = append(client.methods, "RetrievePropertiesEx")
 	client.roots = append(client.roots, root)
+	client.maxObjects = append(client.maxObjects, maxObjects)
 	result, ok := client.initial[root]
 	if !ok {
 		return types.RetrieveResult{}, errors.New("unknown root")
@@ -1880,16 +3656,31 @@ func (client *fakeInventoryClient) ContinueInventoryPage(
 	delete(client.continuations, token)
 	started := client.continueStarted
 	release := client.continueRelease
+	panicValue := client.continuePanic
+	ignoreCancellation := client.continueIgnoreCancellation
+	cancellationObserved := client.continueCancellationObserved
 	client.mu.Unlock()
 	if started != nil {
 		client.continueOnce.Do(func() { close(started) })
 	}
 	if release != nil {
-		select {
-		case <-release:
-		case <-ctx.Done():
-			return types.RetrieveResult{}, errInventoryContinuity
+		if ignoreCancellation {
+			<-release
+		} else {
+			select {
+			case <-release:
+			case <-ctx.Done():
+				if cancellationObserved != nil {
+					client.continueCancellationOnce.Do(func() {
+						close(cancellationObserved)
+					})
+				}
+				return types.RetrieveResult{}, errInventoryContinuity
+			}
 		}
+	}
+	if panicValue != nil {
+		panic(panicValue)
 	}
 	return result, nil
 }
@@ -1897,15 +3688,53 @@ func (client *fakeInventoryClient) ContinueInventoryPage(
 func (client *fakeInventoryClient) CollectorReference() types.ManagedObjectReference {
 	client.mu.Lock()
 	defer client.mu.Unlock()
+	if client.collectorPanic != nil {
+		panic(client.collectorPanic)
+	}
 	return client.collector
 }
 
-func (client *fakeInventoryClient) Close(context.Context) error {
+func (client *fakeInventoryClient) Close(ctx context.Context) error {
 	client.mu.Lock()
-	defer client.mu.Unlock()
 	client.closeCalls++
 	client.closed = true
-	return client.closeErr
+	_, client.closeHadDeadline = ctx.Deadline()
+	started := client.closeStarted
+	release := client.closeRelease
+	closeErr := client.closeErr
+	panicValue := client.closePanic
+	client.mu.Unlock()
+	if started != nil {
+		client.closeOnce.Do(func() { close(started) })
+	}
+	if release != nil {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if panicValue != nil {
+		panic(panicValue)
+	}
+	return closeErr
+}
+
+func waitForInventoryTerminalIntent(t *testing.T, attempt *FullInventoryAttempt) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		attempt.state.mu.rawLock()
+		terminal := attempt.state.destroyed || attempt.state.revokeStart
+		attempt.state.mu.rawUnlock()
+		if terminal {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("attempt did not publish destroy/revoke terminal intent")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (client *fakeInventoryClient) methodSnapshot() []string {
@@ -1918,6 +3747,12 @@ func (client *fakeInventoryClient) rootSnapshot() []types.ManagedObjectReference
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	return slices.Clone(client.roots)
+}
+
+func (client *fakeInventoryClient) maxObjectsSnapshot() []int32 {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return slices.Clone(client.maxObjects)
 }
 
 type inventoryWorkerAuthority struct {
