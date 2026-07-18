@@ -129,6 +129,7 @@ git commit -m "feat(assetdiscovery): add governed vsphere provider"
 - Task 20 `vsphere.New(ClientFactory)`、固定只读 SOAP validation/normalization。
 - Task 28A 同一 claim 中唯一的 `AttemptSession → ClaimRuntime → BoundRuntime` 和连续 `Discover` loop；完整 `RetrievePropertiesEx → ContinueRetrievePropertiesEx` 链必须在该同一 live session/同一 `PropertyCollector` 内结束。
 - 已合并 PageCommitter/Queue/CheckpointCodec/lease-fence/checkpoint-lineage rollover；Provider 不复制这些 ABI，也不把 Source revision 或 Catalog time 注入事实。
+- 已合并 `CleanupBroker` 的固定 `SessionHandle.Revoke → SessionHandle.Destroy` 终态生命周期。Task 21A rollover 不改变 Broker/Worker/Queue ABI，也不允许从已 Destroy 的 raw handle 恢复；它只通过 vSphere 私有 authority 在真实 `BeginCheckpointLineageRollover` exact admission 成功后拆出一次性 handoff。
 
 **Produces:**
 
@@ -137,12 +138,16 @@ git commit -m "feat(assetdiscovery): add governed vsphere provider"
 - 只有同一 vCenter instance、全部 configured roots、全部 object/relation pages 均无 transport/schema/DLP/root rejection 时，最后一页才产生 `(FinalPage=true,CompleteSnapshot=true)`。任何 partial/error/token/session/collector loss 都是 `CompleteSnapshot=false`、`missing=0`。
 - 每个 item 使用 `CHECKPOINT_SEQUENCE{OrderSequence=accepted next checkpoint version,ProviderVersionSHA256=SHA256(FramedTupleV1("vsphere-object-version.v1",instance_uuid,collector_version,object_moref))}`；每个 relation 使用 `CHECKPOINT_SEQUENCE{OrderSequence=accepted next checkpoint version,ProviderVersionSHA256=SHA256(FramedTupleV1("vsphere-relation-version.v1",instance_uuid,collector_version,source_moref,target_moref,relationship_type))}`，两者都使用 Pack 01 byte encoding。Adapter 永不供应 Source revision 或 Catalog time。
 - 旧 token/session 丢失只产生 safe closed evidence并停止；不得新登录后使用旧 token。后继只能由已冻结 `BeginCheckpointLineageRollover` 在 exact current Run/fence/evidence 下保持旧 checkpoint 并建立 successor full snapshot；Task 21A 不扩宽 Worker/Queue 公共 ABI。
+- Rollover handoff 固定为进程内、opaque、不可复制/序列化/重建且只能消费一次的 vSphere 私有 capability。它与 Broker-owned raw handle/runtime/session 完全分离，只保留 exact Source/revision/runtime binding、Scope/Run/attempt/epoch、canonical authority roots/digest、accepted checkpoint version/ciphertext digest 和预先绑定的 successor identity；不得携带 endpoint、credential、session、raw token、runtime 或已发现 facts。Broker Destroy 继续原子关闭旧 attempt 的 mint/Bind/Discover 入口并清除全部旧 runtime state。
+- `BeginHandoff` 必须在 `BeginCheckpointLineageRollover` 前及其成功/response-loss replay 后，以同一 process-local fence 调用幂等 `ReserveCleanupAttempt`，并精确回证注册 Broker attempt 的 `{RunID,AttemptID,AttemptEpoch}`；handoff 消费还必须在分配 successor 前用同一 Queue/fence/current attempt 再验证一次。任一 lease expiry/reclaim、foreign fence 或 attempt 漂移都一次性关闭 capability、清理新 material 且零新 SOAP。
+- 首次 exact `preparePending` 必须在第一次 `ReserveCleanupAttempt` preflight 前，按 `authority mutex → attempt mutex` 等待既有 Discover/SOAP 退出并不可逆冻结 predecessor 的 Bind/Discover/replay 入口；`pending.inFlight` 覆盖 preflight 与 `BeginCheckpointLineageRollover` 整段。Preflight error/context cancellation/reclaim/foreign fence/current-attempt drift 必须关闭 registration/pending 且同一或 changed retry 都不能复活；Queue response loss、post-admission failure、changed retry 或 handoff Destroy 也不得解冻。只有已通过 preflight 后同一 registration/pending/input/fence 的 Begin response-loss retry 可在 frozen 状态继续，final mint 也必须回证 predecessor 已 frozen；Broker 仍独占后续 `Revoke→Destroy` cleanup，successor 是默认未冻结的全新 attempt。
+- Raw `FullInventoryAttempt.NewRolloverSuccessor` 不是 rollover authority，必须永久 fail closed、清理传入 material 且不得创建 runtime、登录、发 SOAP 或提交 page；唯一合法 successor 是上述 Queue admission 后拆出的 handoff 一次性消费结果。
 
 **Classification:** C0 = token/session binding、fence/CAS/replay、identity drift、rollover、complete-only missing closure 与 sensitive serialization；C1 = full inventory/relation/complete snapshot；C2 = 固定 `RetrievePropertiesEx/ContinueRetrievePropertiesEx` SOAP wire。
 
 - [ ] **Step 1: Write real failing full-inventory/session-loss tests**
 
-RED 必须覆盖超过 500 objects 的分页 full closure、多个 root 的 deterministic object/relation ordering、continuation 只在同一 session/collector 成功、wrong session/collector 与 close 后 token 失败、partial root/DLP/schema rejection 时 `missing=0`、token/runtime/checkpoint serialization/log/DLP 负例、instance UUID drift、same-Run page replay 幂等、later-Run unchanged 仍追加 Observation、stale fence 零提交，以及 token/session 丢失只能走 governed rollover。测试不得用 fake 替代 production `discoverysource.Provider` 或 Task 28A loop。
+RED 必须覆盖超过 500 objects 的分页 full closure、多个 root 的 deterministic object/relation ordering、continuation 只在同一 session/collector 成功、wrong session/collector 与 close 后 token 失败、partial root/DLP/schema rejection 时 `missing=0`、token/runtime/checkpoint serialization/log/DLP 负例、instance UUID drift、same-Run page replay 幂等、later-Run unchanged 仍追加 Observation、stale fence 零提交，以及 token/session 丢失只能走 governed rollover。Rollover RED 还必须组合真实 `CleanupBroker` opener、真实 PageCommitter/PostgreSQL accepted partial page、真实 Queue admission、Broker `Revoke→Destroy` 与 handoff successor，证明旧 runtime 永久关闭且新 successor 从 `RetrievePropertiesEx` 开始；mint 前数据库 current attempt 与注册 Broker attempt 的 ID/epoch 漂移、mint 后 lease expiry/reclaim/foreign fence，以及 response-loss replay 的 attempt/fence 漂移都必须在新 SOAP 前关闭。测试还必须以 channel barrier 证明 BeginHandoff 等待在途 continuation，旧 attempt 若已推进 checkpoint 则 Queue Reserve/Begin=0；第一次 preflight 阻塞时旧 Bind/Discover 已冻结，preflight context cancellation/ErrUnavailable/reclaim/foreign fence/current-attempt drift 后同一或 changed retry也不能复活，数据库 checkpoint/page/missing/projection 不漂移且 Broker cleanup 仍正向；Queue Begin response loss 与 mint→revoke 窗口同样零新 SOAP/Page。普通 `NewFullInventoryAttempt → accepted non-final checkpoint → Revoke → NewRolloverSuccessor` 必须证明 raw successor 永久关闭、material 清理且零额外 SOAP/PageCommitter。direct predecessor `Revoke`、fake cleanup verifier、可序列化 marker 或 test-only successor bypass 都不能作为正向证据。测试不得用 fake 替代 production `discoverysource.Provider` 或 Task 28A loop。
 
 Run:
 
@@ -169,7 +174,7 @@ go test -race ./internal/assetcatalog/postgres \
   -run 'VCenterDiscoveryIntegration|PageCommitter|CheckpointLineageRollover|StaleFence' -count=1
 ~~~
 
-Expected: 同一 Task 28A attempt 内真实 paged full inventory/closure PASS；session/token loss、partial root、stale fence 和 rollover negatives PASS。该门不声称跨 Run delta、leave、HA takeover、真实 vCenter 或 Provider availability。
+Expected: 同一 Task 28A attempt 内真实 paged full inventory/closure PASS；session/token loss、partial root、stale fence 和 rollover negatives PASS。Rollover G2 必须由真实 TLS SOAP、真实 PostgreSQL PageCommitter/Queue 和真实 CleanupBroker 串成 `partial commit → BeginCheckpointLineageRollover → mint handoff → Revoke+Destroy → exact successor complete closure`，并覆盖 Queue response loss、foreign tuple/checkpoint/binding/authority/fence、handoff copy/replay/concurrent consume 与序列化/DLP负例。该门不声称跨 Run delta、leave、HA takeover、真实 vCenter 或 Provider availability。
 
 ### Task 21B0: vSphere PropertyCollector session-continuity authority (C0 prerequisite)
 

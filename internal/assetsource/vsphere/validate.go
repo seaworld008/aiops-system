@@ -165,12 +165,12 @@ func callerContextError(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func (*provider) Discover(
-	context.Context,
-	discoverysource.BoundRuntime,
-	discoverysource.DiscoverRequest,
+func (value *provider) Discover(
+	ctx context.Context,
+	runtime discoverysource.BoundRuntime,
+	request discoverysource.DiscoverRequest,
 ) (discoverysource.DiscoverOutcome, error) {
-	return nil, providerError("DISCOVERY_DEFERRED_CLOSED")
+	return value.discover(ctx, runtime, request)
 }
 
 func validationRequestMatchesBinding(
