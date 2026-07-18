@@ -305,8 +305,17 @@ func TestCreateAssetRollsBackWholeClosureWhenOutboxFailsIntegration(t *testing.T
 		DataClassification: assetcatalog.DataClassificationInternal,
 		Labels:             map[string]string{},
 	}
-	if _, err := repository.Create(context.Background(), command); !errors.Is(err, assetcatalog.ErrStateConflict) {
-		t.Fatalf("Create(outbox failure) error = %v, want ErrStateConflict", err)
+	_, createErr := repository.Create(context.Background(), command)
+	if createErr == nil || createErr.Error() != "asset catalog repository failure" {
+		t.Fatalf("Create(outbox failure) error = %v, want sanitized repository failure", createErr)
+	}
+	if errors.Is(createErr, assetcatalog.ErrStateConflict) ||
+		errors.Is(createErr, assetcatalog.ErrUnavailable) {
+		t.Fatalf("Create(outbox failure) error = %v, must not masquerade as state conflict or unavailable", createErr)
+	}
+	if strings.Contains(createErr.Error(), "test outbox rejection") ||
+		strings.Contains(createErr.Error(), "55000") {
+		t.Fatalf("Create(outbox failure) leaked injected PostgreSQL detail: %v", createErr)
 	}
 	assertManualCreateRolledBack(t, harness.db, fixture.sourceID, command.Context.IdempotencyKey())
 }
