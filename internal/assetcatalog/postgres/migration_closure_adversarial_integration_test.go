@@ -380,6 +380,7 @@ func TestAssetCatalogFutureSourceHookPersistentContractMatrix(t *testing.T) {
 
 	if !t.Run("new serializable transaction reaches VALIDATING only under true hook", func(t *testing.T) {
 		futureHookReplace(t, harness.migration, futureHookModeTrue)
+		futureHookAssertSyntheticFixtureOwnerRouting(t, harness.application, harness.db)
 		for _, definition := range liveTrue {
 			futureHookStartValidation(t, harness.application, definition)
 			futureHookAssertValidating(t, harness.application, definition)
@@ -387,7 +388,7 @@ func TestAssetCatalogFutureSourceHookPersistentContractMatrix(t *testing.T) {
 		for _, definitions := range [][]futureHookDefinition{cleanupBomb, cleanupFalse, cleanupNull} {
 			for _, definition := range definitions {
 				futureHookStartValidation(t, harness.application, definition)
-				futureHookOpenAvailable(t, harness.application, definition)
+				futureHookOpenAvailable(t, harness.application, harness.db, definition)
 			}
 		}
 	}) {
@@ -3931,26 +3932,45 @@ func finishClosureExternalValidation(
 	proof string,
 ) {
 	t.Helper()
+	finishClosureExternalValidationWithFixtureOwner(
+		t,
+		database,
+		database,
+		fixture,
+		revision,
+		proof,
+	)
+}
+
+func finishClosureExternalValidationWithFixtureOwner(
+	t *testing.T,
+	application *pgxpool.Pool,
+	fixtureOwner *pgxpool.Pool,
+	fixture assetCatalogFixture,
+	revision int64,
+	proof string,
+) {
+	t.Helper()
 	qualificationSchema, err := qualificationFixtureSchemaStateFor(
-		context.Background(), database,
+		context.Background(), application,
 	)
 	if err != nil {
 		t.Fatalf("inspect qualification fixture schema before validation closure: %v", err)
 	}
-	execAssetSQL(t, database, `
+	execAssetSQL(t, application, `
 		UPDATE asset_source_runs
 		SET stage_code='CLEANING_UP',cleanup_status='PENDING',cleanup_attempt_id=gen_random_uuid(),
 			cleanup_attempt_epoch=fence_epoch,version=version+1 WHERE id=$1
 	`, fixture.validationRunID)
-	execAssetSQL(t, database, `
+	execAssetSQL(t, application, `
 		UPDATE asset_source_runs
 		SET status='FINALIZING',work_result_kind='VALIDATION_PROOF',
 			work_result_status='SUCCEEDED',work_result_digest=$2,
 			work_result_recorded_at=statement_timestamp(),validation_outcome='SUCCEEDED',
 			validation_digest=$2,validation_proof_digest=$2,version=version+1 WHERE id=$1
 	`, fixture.validationRunID, proof)
-	revokeClosureAttempt(t, database, fixture, fixture.validationRunID, strings.Repeat("6", 64))
-	tx, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	revokeClosureAttempt(t, application, fixture, fixture.validationRunID, strings.Repeat("6", 64))
+	tx, err := application.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		t.Fatalf("begin external validation terminal closure: %v", err)
 	}
@@ -3969,11 +3989,11 @@ func finishClosureExternalValidation(
 	if err := tx.Commit(context.Background()); err != nil {
 		t.Fatalf("commit external validation terminal closure: %v", err)
 	}
-	execAssetSQL(t, database, `
+	execAssetSQL(t, application, `
 		UPDATE asset_source_revisions SET state='PUBLISHED',version=version+1 WHERE id=$1
 	`, fixture.revisionID)
 	var publicationClosed bool
-	if err := database.QueryRow(context.Background(), `
+	if err := application.QueryRow(context.Background(), `
 		SELECT source.published_revision=$3 AND
 			source.published_revision_digest=revision.canonical_revision_digest AND
 			revision.state='PUBLISHED' AND source.gate_status='UNAVAILABLE' AND
@@ -3994,10 +4014,17 @@ func finishClosureExternalValidation(
 	var qualificationReceipts qualificationFixtureReceipts
 	if qualificationSchema == qualificationFixtureSchemaFull {
 		qualificationReceipts = sealSyntheticQualificationFixtures(
-			t, database, fixture, revision,
+			t, fixtureOwner, fixture, revision,
 		)
 	}
-	available, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	availableDatabase := application
+	if qualificationSchema == qualificationFixtureSchemaFull {
+		availableDatabase = fixtureOwner
+	}
+	available, err := availableDatabase.BeginTx(
+		context.Background(),
+		pgx.TxOptions{IsoLevel: pgx.Serializable},
+	)
 	if err != nil {
 		t.Fatalf("begin external validation AVAILABLE gate: %v", err)
 	}
@@ -4038,7 +4065,7 @@ func finishClosureExternalValidation(
 	if qualificationSchema == qualificationFixtureSchemaFull {
 		qualificationFixtureRequireTerminalClosure(
 			t,
-			database,
+			application,
 			fixture,
 			qualificationReceipts.facts,
 			qualificationReceipts.ha,
@@ -4666,13 +4693,107 @@ func futureHookStartValidation(
 	}
 }
 
-func futureHookOpenAvailable(
+func futureHookAssertSyntheticFixtureOwnerRouting(
+	t *testing.T,
+	application *pgxpool.Pool,
+	fixtureOwner *pgxpool.Pool,
+) {
+	t.Helper()
+	oldDatabase, err := futureHookClosureDatabaseFor(
+		qualificationFixtureSchemaOld,
+		application,
+		fixtureOwner,
+	)
+	if err != nil {
+		t.Fatalf("select OLD future Source closure database: %v", err)
+	}
+	futureHookAssertApplicationCannotAssumeSchemaOwner(t, oldDatabase)
+
+	fullDatabase, err := futureHookClosureDatabaseFor(
+		qualificationFixtureSchemaFull,
+		application,
+		fixtureOwner,
+	)
+	if err != nil {
+		t.Fatalf("select FULL future Source closure database: %v", err)
+	}
+	futureHookAssertCanAssumeSchemaOwner(t, fullDatabase)
+
+	if _, err := futureHookClosureDatabaseFor("", application, fixtureOwner); err == nil {
+		t.Fatal("unknown future Source closure schema selected a database, want fail closed")
+	}
+}
+
+func futureHookClosureDatabaseFor(
+	state qualificationFixtureSchemaState,
+	application *pgxpool.Pool,
+	fixtureOwner *pgxpool.Pool,
+) (*pgxpool.Pool, error) {
+	switch state {
+	case qualificationFixtureSchemaOld:
+		return application, nil
+	case qualificationFixtureSchemaFull:
+		return fixtureOwner, nil
+	default:
+		return nil, fmt.Errorf("unsupported qualification fixture schema state %q", state)
+	}
+}
+
+func futureHookAssertApplicationCannotAssumeSchemaOwner(
 	t *testing.T,
 	database *pgxpool.Pool,
+) {
+	t.Helper()
+	tx, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatalf("begin future Source workload role boundary check: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	_, err = tx.Exec(context.Background(), `SET LOCAL ROLE aiops_schema_owner`)
+	var databaseError *pgconn.PgError
+	if !errors.As(err, &databaseError) || databaseError.Code != "42501" {
+		t.Fatalf("application SET LOCAL ROLE error=%v, want SQLSTATE 42501", err)
+	}
+}
+
+func futureHookAssertCanAssumeSchemaOwner(
+	t *testing.T,
+	database *pgxpool.Pool,
+) {
+	t.Helper()
+	tx, err := database.BeginTx(context.Background(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		t.Fatalf("begin future Source fixture-owner boundary check: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(context.Background(), `SET LOCAL ROLE aiops_schema_owner`); err != nil {
+		t.Fatalf("fixture-owner SET LOCAL ROLE aiops_schema_owner: %v", err)
+	}
+}
+
+func futureHookOpenAvailable(
+	t *testing.T,
+	application *pgxpool.Pool,
+	fixtureOwner *pgxpool.Pool,
 	definition futureHookDefinition,
 ) {
 	t.Helper()
-	execAssetSQL(t, database, `
+	qualificationSchema, err := qualificationFixtureSchemaStateFor(
+		context.Background(),
+		application,
+	)
+	if err != nil {
+		t.Fatalf("inspect qualification fixture schema before future Source closure: %v", err)
+	}
+	closureDatabase, err := futureHookClosureDatabaseFor(
+		qualificationSchema,
+		application,
+		fixtureOwner,
+	)
+	if err != nil {
+		t.Fatalf("select future Source closure database: %v", err)
+	}
+	execAssetSQL(t, application, `
 		UPDATE public.asset_source_runs
 		SET status='RUNNING',stage_code='VALIDATING',lease_owner='future-hook-worker',
 			lease_expires_at=statement_timestamp()+interval '10 minutes',fence_epoch=1,
@@ -4680,14 +4801,15 @@ func futureHookOpenAvailable(
 			heartbeat_at=statement_timestamp(),version=version+1
 		WHERE id=$1
 	`, definition.fixture.validationRunID)
-	finishClosureExternalValidation(
+	finishClosureExternalValidationWithFixtureOwner(
 		t,
-		database,
+		application,
+		closureDatabase,
 		definition.fixture,
 		1,
 		definition.validationProof,
 	)
-	futureHookAssertAvailable(t, database, definition)
+	futureHookAssertAvailable(t, application, definition)
 }
 
 func futureHookStartDiscoveryFailure(
