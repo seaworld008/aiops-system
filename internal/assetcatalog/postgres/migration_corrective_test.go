@@ -13,8 +13,10 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 const correctiveManualProfileManifestV1 = `{"backpressure_base_seconds":1,"backpressure_max_seconds":1,"compatibility_class":"MANUAL_V1","credential_purpose":"NONE","dlp_policy_code":"ASSET_SAFE_V1","environment_mapping_mode":"SINGLE_ENVIRONMENT","freshness_kind":"CATALOG_SEQUENCE","integration_mode":"NONE","max_document_bytes":65536,"max_page_bytes":65536,"max_page_items":1,"max_page_relations":0,"network_mode":"NONE","parser_code":"MANUAL_ASSET_V1","profile_code":"MANUAL_V1","provider_kind":"MANUAL_V1","rate_limit_requests":1,"rate_limit_window_seconds":1,"relationship_types":[],"schedule_mode":"NONE","source_kind":"MANUAL","sync_mode":"MANUAL","trust_mode":"NONE","trusted_path_codes":["MANUAL_V1_DISPLAY_NAME","MANUAL_V1_EXTERNAL_ID","MANUAL_V1_KIND"],"typed_extension_code":null,"version":"asset-source-profile-manifest.v1"}`
@@ -102,6 +104,19 @@ ALTER TABLE public.asset_sources ADD COLUMN gate_evidence_expires_at %s NULL;
 	dynamicDO := func(body string) string {
 		return "\nDO $$\nBEGIN\n" + body + "\nEND;\n$$;\n"
 	}
+	singleQuotedDO := func(body string) string {
+		return "\nDO '" + strings.ReplaceAll(body, "'", "''") + "' LANGUAGE plpgsql;\n"
+	}
+	escapeQuotedDO := func(body string) string {
+		escaped := strings.NewReplacer(
+			`\`, `\\`,
+			`'`, `\'`,
+			"\n", `\n`,
+			"\r", `\r`,
+			"\t", `\t`,
+		).Replace(body)
+		return "\nDO E'" + escaped + "' LANGUAGE plpgsql;\n"
+	}
 	successorColumns := columnList("uuid", "text", "timestamptz")
 	exactTrigger := `
 CREATE CONSTRAINT TRIGGER asset_sources_gate_evidence_closure_guard
@@ -113,6 +128,66 @@ FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state();
 	successorUp := correctiveSourceGateColumnsFixture(t, currentUp, successorColumns) + exactTrigger
 	dropAnchor := "DROP TRIGGER asset_sources_deferred_state_guard ON public.asset_sources;"
 	successorDown := strings.Replace(currentDown, dropAnchor, dropAnchor+exactDrop, 1)
+	assertRejectedDO := func(name, statement string) {
+		t.Helper()
+		t.Run("discriminator rejects "+name, func(t *testing.T) {
+			if required, err := correctiveSourceGateTriggerRequired(currentUp + statement); err == nil {
+				t.Fatalf("gate-column discriminator = %t, nil; want %s error", required, name)
+			}
+		})
+		t.Run("up rejects "+name, func(t *testing.T) {
+			if _, diagnostics := correctiveParsedTriggerIdentities(successorUp + statement); len(diagnostics) == 0 {
+				t.Fatalf("successor up manifest accepted %s", name)
+			}
+		})
+		t.Run("down rejects "+name, func(t *testing.T) {
+			got := correctiveDroppedTriggerIdentities(successorDown + statement)
+			want := correctiveExpectedDroppedTriggerIdentitiesForMigration(t, successorUp)
+			if correctiveSQLObjectSetsEqual(got, want) {
+				t.Fatalf("successor down manifest accepted %s", name)
+			}
+		})
+	}
+	assertSafeDO := func(name, statement string) {
+		t.Helper()
+		t.Run("safe "+name+" preserves manifests", func(t *testing.T) {
+			up := strings.Replace(successorUp, "RESET ROLE;", statement+"RESET ROLE;", 1)
+			required, err := correctiveSourceGateTriggerRequired(up)
+			if err != nil || !required {
+				t.Fatalf("safe %s discriminator = %t, %v; want true, nil", name, required, err)
+			}
+			gotUp, diagnostics := correctiveParsedTriggerIdentities(up)
+			if len(diagnostics) != 0 || !correctiveSQLObjectSetsEqual(gotUp, correctiveExpectedTriggerIdentitiesForMigration(t, up)) {
+				t.Fatalf("safe %s changed up manifest: diagnostics=%v", name, diagnostics)
+			}
+			down := strings.Replace(successorDown, dropAnchor, statement+dropAnchor, 1)
+			if got := correctiveDroppedTriggerIdentities(down); !correctiveSQLObjectSetsEqual(got, correctiveExpectedDroppedTriggerIdentitiesForMigration(t, up)) {
+				t.Fatalf("safe %s changed down manifest", name)
+			}
+		})
+	}
+	assertSafeDOPaths := func(name, statement string) {
+		t.Helper()
+		up := strings.Replace(successorUp, "RESET ROLE;", statement+"RESET ROLE;", 1)
+		t.Run("discriminator accepts safe "+name, func(t *testing.T) {
+			required, err := correctiveSourceGateTriggerRequired(up)
+			if err != nil || !required {
+				t.Fatalf("safe %s discriminator = %t, %v; want true, nil", name, required, err)
+			}
+		})
+		t.Run("up accepts safe "+name, func(t *testing.T) {
+			got, diagnostics := correctiveParsedTriggerIdentities(up)
+			if len(diagnostics) != 0 || !correctiveSQLObjectSetsEqual(got, correctiveExpectedTriggerIdentitiesForMigration(t, up)) {
+				t.Fatalf("safe %s changed up manifest: diagnostics=%v", name, diagnostics)
+			}
+		})
+		t.Run("down accepts safe "+name, func(t *testing.T) {
+			down := strings.Replace(successorDown, dropAnchor, statement+dropAnchor, 1)
+			if got := correctiveDroppedTriggerIdentities(down); !correctiveSQLObjectSetsEqual(got, correctiveExpectedDroppedTriggerIdentitiesForMigration(t, up)) {
+				t.Fatalf("safe %s changed down manifest", name)
+			}
+		})
+	}
 
 	typeVariants := []struct{ name, runID, digest, expires string }{
 		{"bare", "uuid", "text", "timestamptz"},
@@ -242,13 +317,414 @@ FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state('unrev
 			}
 		})
 	}
+	ordinaryBackslashDynamicSQL := []struct{ name, body string }{
+		{"octal add", `BEGIN \105XECUTE 'ALTER TABLE public.asset_sources ADD COLUMN gate_evidence_status text'; END;`},
+		{"hex drop", `BEGIN \x45XECUTE 'DROP TRIGGER asset_sources_gate_evidence_closure_guard ON public.asset_sources'; END;`},
+		{"unicode disable", `BEGIN \u0045XECUTE 'ALTER TABLE public.asset_sources DISABLE TRIGGER asset_sources_deferred_state_guard'; END;`},
+	}
+	for _, test := range ordinaryBackslashDynamicSQL {
+		assertRejectedDO("ordinary backslash "+test.name, singleQuotedDO(test.body))
+	}
+	nonCanonicalLanguageDOs := []struct{ name, statement string }{
+		{
+			"prefix non plpgsql do language",
+			"\nDO LANGUAGE plperl 'spi_exec_query(''ALTER TABLE public.asset_sources DISABLE TRIGGER asset_sources_deferred_state_guard'');';\n",
+		},
+		{
+			"tail non plpgsql do language",
+			strings.Replace(
+				singleQuotedDO(`spi_exec_query('ALTER TABLE public.asset_sources DISABLE TRIGGER asset_sources_deferred_state_guard');`),
+				"LANGUAGE plpgsql",
+				"LANGUAGE plperl",
+				1,
+			),
+		},
+		{
+			"quoted prefix do language alias",
+			"\nDO LANGUAGE \"plpgsql\" 'BEGIN PERFORM 1; END;';\n",
+		},
+		{
+			"quoted tail do language alias",
+			strings.Replace(singleQuotedDO("BEGIN PERFORM 1; END;"), "LANGUAGE plpgsql", `LANGUAGE "plpgsql"`, 1),
+		},
+		{
+			"duplicate prefix and tail do language",
+			"\nDO LANGUAGE plpgsql 'BEGIN PERFORM 1; END;' LANGUAGE plpgsql;\n",
+		},
+	}
+	for _, test := range nonCanonicalLanguageDOs {
+		assertRejectedDO(test.name, test.statement)
+	}
+	singleQuotedDynamicSQL := []struct{ name, body string }{
+		{"add", `BEGIN EXECUTE 'ALTER TABLE public.asset_sources ADD COLUMN gate_evidence_status text'; END;`},
+		{"create", `BEGIN EXECUTE 'CREATE TRIGGER dynamic_guard AFTER UPDATE ON public.asset_sources FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state()'; END;`},
+		{"drop", `BEGIN EXECUTE 'DROP TRIGGER asset_sources_gate_evidence_closure_guard ON public.asset_sources'; END;`},
+		{"alter", `BEGIN EXECUTE 'ALTER TRIGGER asset_sources_deferred_state_guard ON public.asset_sources RENAME TO dynamic_guard'; END;`},
+		{"enable", `BEGIN EXECUTE format('ALTER TABLE public.asset_sources ENABLE TRIGGER %I', 'asset_sources_deferred_state_guard'); END;`},
+		{"disable", `BEGIN EXECUTE 'ALTER TABLE public.asset_sources DISABLE ' || 'TRIGGER asset_sources_deferred_state_guard'; END;`},
+	}
+	singleQuotedDynamicForms := []struct {
+		name string
+		do   func(string) string
+	}{
+		{"single quoted", singleQuotedDO},
+		{"escape quoted", escapeQuotedDO},
+	}
+	for _, form := range singleQuotedDynamicForms {
+		for _, test := range singleQuotedDynamicSQL {
+			t.Run("discriminator rejects "+form.name+" dynamic "+test.name, func(t *testing.T) {
+				if required, err := correctiveSourceGateTriggerRequired(currentUp + form.do(test.body)); err == nil {
+					t.Fatalf("gate-column discriminator = %t, nil; want dynamic %s error", required, test.name)
+				}
+			})
+			t.Run("up rejects "+form.name+" dynamic "+test.name, func(t *testing.T) {
+				if _, diagnostics := correctiveParsedTriggerIdentities(successorUp + form.do(test.body)); len(diagnostics) == 0 {
+					t.Fatalf("successor up manifest accepted %s dynamic %s", form.name, test.name)
+				}
+			})
+			t.Run("down rejects "+form.name+" dynamic "+test.name, func(t *testing.T) {
+				got := correctiveDroppedTriggerIdentities(successorDown + form.do(test.body))
+				want := correctiveExpectedDroppedTriggerIdentitiesForMigration(t, successorUp)
+				if correctiveSQLObjectSetsEqual(got, want) {
+					t.Fatalf("successor down manifest accepted %s dynamic %s", form.name, test.name)
+				}
+			})
+		}
+	}
+	directSQLDOForms := []struct {
+		name string
+		do   func(string) string
+	}{
+		{"dollar quoted", dynamicDO},
+		{"single quoted", func(statement string) string {
+			return singleQuotedDO("BEGIN\n" + statement + "\nEND;")
+		}},
+		{"escape quoted", func(statement string) string {
+			return escapeQuotedDO("BEGIN\n" + statement + "\nEND;")
+		}},
+	}
+	directSQLStatements := []struct{ name, statement string }{
+		{"add", "ALTER TABLE public.asset_sources ADD COLUMN gate_evidence_status text;"},
+		{"create table", "CREATE TABLE public.asset_source_review_probe (id integer);"},
+		{"drop table", "DROP TABLE public.asset_source_review_probe;"},
+		{"create", "CREATE TRIGGER dynamic_guard AFTER UPDATE ON public.asset_sources FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state();"},
+		{"drop", "DROP TRIGGER asset_sources_gate_evidence_closure_guard ON public.asset_sources;"},
+		{"alter", "ALTER TRIGGER asset_sources_deferred_state_guard ON public.asset_sources RENAME TO dynamic_guard;"},
+		{"enable", "ALTER TABLE public.asset_sources ENABLE TRIGGER asset_sources_deferred_state_guard;"},
+		{"disable", "ALTER TABLE public.asset_sources DISABLE TRIGGER asset_sources_deferred_state_guard;"},
+		{"reviewer temp view", "CREATE TEMP VIEW codex_review_unknown_ddl_e7c AS SELECT 1;"},
+		{"index", "CREATE INDEX codex_review_unknown_ddl_index ON public.asset_sources (id);"},
+		{"type", "CREATE TYPE public.codex_review_unknown_ddl_type AS ENUM ('review');"},
+		{"sequence", "CREATE SEQUENCE public.codex_review_unknown_ddl_sequence;"},
+		{"function", "ALTER FUNCTION public.asset_catalog_text_valid(text, integer) STABLE;"},
+		{"grant", "GRANT SELECT ON public.asset_sources TO aiops_control_plane_runtime;"},
+		{"revoke", "REVOKE SELECT ON public.asset_sources FROM aiops_control_plane_runtime;"},
+		{"comment", "COMMENT ON TABLE public.asset_sources IS 'review';"},
+		{"lock", "LOCK TABLE public.asset_sources IN ACCESS SHARE MODE;"},
+		{"truncate", "TRUNCATE TABLE public.asset_sources;"},
+		{"set local", "SET LOCAL application_name = 'codex_review';"},
+	}
+	for _, form := range directSQLDOForms {
+		for _, sql := range directSQLStatements {
+			assertRejectedDO("direct "+form.name+" "+sql.name, form.do(sql.statement))
+		}
+	}
+	codeBodyDOForms := []struct {
+		name string
+		do   func(string) string
+	}{
+		{"dollar quoted", func(body string) string {
+			return "\nDO $$\n" + body + "\n$$ LANGUAGE plpgsql;\n"
+		}},
+		{"single quoted", singleQuotedDO},
+		{"escape quoted", escapeQuotedDO},
+	}
+	safeCodeBodies := []struct{ name, body string }{
+		{
+			"empty declare",
+			`DECLARE
+BEGIN
+    PERFORM 1;
+END;`,
+		},
+		{
+			"declare identifier",
+			`DECLARE
+    comment text := 'safe';
+BEGIN
+    RAISE NOTICE '%', comment;
+END;`,
+		},
+		{
+			"assignment identifier",
+			`DECLARE
+    comment text;
+BEGIN
+    comment := 'safe';
+    PERFORM length(comment);
+END;`,
+		},
+		{
+			"quoted assignment identifier",
+			`DECLARE
+    "target" text;
+    comment text := 'safe';
+BEGIN
+    "target" := comment;
+    PERFORM length("target");
+END;`,
+		},
+		{
+			"update set",
+			`BEGIN
+    UPDATE public.asset_sources
+    SET updated_at = updated_at
+    WHERE false;
+END;`,
+		},
+		{
+			"select alias",
+			`DECLARE
+    selected integer;
+BEGIN
+    SELECT 1 AS comment INTO selected;
+    PERFORM selected;
+END;`,
+		},
+		{
+			"select execute alias",
+			`DECLARE
+    selected integer;
+BEGIN
+    SELECT 1 AS execute INTO selected;
+    PERFORM selected;
+END;`,
+		},
+		{
+			"unicode identifier",
+			`DECLARE
+    λcomment integer := 0;
+BEGIN
+    λcomment := 1;
+END;`,
+		},
+		{
+			"high-bit identifier",
+			`DECLARE
+    😀comment integer := 0;
+BEGIN
+    😀comment := 1;
+END;`,
+		},
+		{
+			"option dump directive",
+			`#option dump BEGIN
+    PERFORM 1;
+END;`,
+		},
+		{
+			"same-line variable conflict directive",
+			`#variable_conflict use_variable BEGIN
+    PERFORM 1;
+END;`,
+		},
+		{
+			"same-line print strict params directive",
+			`#print_strict_params on BEGIN
+    PERFORM 1;
+END;`,
+		},
+		{
+			"quoted print strict params on directive",
+			`#print_strict_params "on" BEGIN
+    PERFORM 1;
+END;`,
+		},
+		{
+			"quoted print strict params off directive",
+			`#print_strict_params "off" BEGIN
+    PERFORM 1;
+END;`,
+		},
+		{
+			"adjacent quoted print strict params directive",
+			`#print_strict_params "on"BEGIN
+    PERFORM 1;
+END;`,
+		},
+	}
+	for _, form := range codeBodyDOForms {
+		for _, body := range safeCodeBodies {
+			assertSafeDOPaths(form.name+" "+body.name, form.do(body.body))
+		}
+	}
+	controlBoundaryDDL := []struct{ name, body string }{
+		{
+			"if then",
+			`BEGIN
+    IF true THEN
+        CREATE TEMP VIEW codex_review_if_ddl AS SELECT 1;
+    END IF;
+END;`,
+		},
+		{
+			"else",
+			`BEGIN
+    IF false THEN
+        NULL;
+    ELSE
+        GRANT SELECT ON public.asset_sources TO aiops_control_plane_runtime;
+    END IF;
+END;`,
+		},
+		{
+			"elseif",
+			`BEGIN
+    IF false THEN
+        NULL;
+    ELSEIF true THEN
+        CREATE TEMP VIEW codex_review_elseif_bypass AS SELECT 1;
+    END IF;
+END;`,
+		},
+		{
+			"high-bit then identifier",
+			`DECLARE
+    😀then integer := 1;
+BEGIN
+    IF 😀then = 1 THEN
+        CREATE TEMP VIEW codex_review_high_bit_then_bypass AS SELECT 1;
+    END IF;
+END;`,
+		},
+		{
+			"dollar tag inside identifier",
+			`BEGIN
+    PERFORM 1 AS safe$mask$alias;
+    CREATE TEMP VIEW codex_review_dollar_identifier_bypass AS SELECT 1;
+END;`,
+		},
+		{
+			"variable conflict directive",
+			`#variable_conflict use_variable
+BEGIN
+    CREATE TEMP VIEW codex_review_variable_conflict_bypass AS SELECT 1;
+END;`,
+		},
+		{
+			"print strict params directive",
+			`#print_strict_params on
+BEGIN
+    CREATE TEMP VIEW codex_review_print_strict_params_bypass AS SELECT 1;
+END;`,
+		},
+		{
+			"same-line option dump directive",
+			`#option dump BEGIN
+    CREATE TEMP VIEW codex_review_option_dump_bypass AS SELECT 1;
+END;`,
+		},
+		{
+			"quoted print strict params directive",
+			`#print_strict_params "on" BEGIN
+    CREATE TEMP VIEW codex_review_quoted_print_strict_params_bypass AS SELECT 1;
+END;`,
+		},
+		{
+			"adjacent quoted print strict params directive",
+			`#print_strict_params "on"BEGIN
+    CREATE TEMP VIEW codex_review_adjacent_quoted_print_strict_params_bypass AS SELECT 1;
+END;`,
+		},
+		{
+			"loop",
+			`BEGIN
+    LOOP
+        DROP VIEW codex_review_loop_ddl;
+        EXIT;
+    END LOOP;
+END;`,
+		},
+		{
+			"exception",
+			`BEGIN
+    BEGIN
+        PERFORM 1;
+    EXCEPTION WHEN OTHERS THEN
+        ALTER FUNCTION public.asset_catalog_text_valid(text, integer) STABLE;
+    END;
+END;`,
+		},
+		{
+			"empty declare",
+			`DECLARE
+BEGIN
+    CREATE TEMP VIEW codex_review_empty_declare_bypass AS SELECT 1;
+    BEGIN
+        PERFORM 1;
+    END;
+END;`,
+		},
+		{
+			"for dynamic execute",
+			`DECLARE
+    selected record;
+BEGIN
+    FOR selected IN EXECUTE 'SELECT 1' LOOP
+        EXIT;
+    END LOOP;
+END;`,
+		},
+	}
+	for _, form := range codeBodyDOForms {
+		for _, boundary := range controlBoundaryDDL {
+			assertRejectedDO("direct "+form.name+" control "+boundary.name, form.do(boundary.body))
+		}
+	}
+	escapeEncodedExecuteForms := []struct{ name, execute string }{
+		{"octal", `\105XECUTE`},
+		{"hex", `\x45XECUTE`},
+		{"short unicode", `\u0045XECUTE`},
+		{"long unicode", `\U00000045XECUTE`},
+		{"other character", `\EXECUTE`},
+	}
+	escapeEncodedDDL := []struct{ name, sql string }{
+		{"add", "ALTER TABLE public.asset_sources ADD COLUMN gate_evidence_status text"},
+		{"create", "CREATE TRIGGER dynamic_guard AFTER UPDATE ON public.asset_sources FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state()"},
+		{"drop", "DROP TRIGGER asset_sources_gate_evidence_closure_guard ON public.asset_sources"},
+		{"alter", "ALTER TRIGGER asset_sources_deferred_state_guard ON public.asset_sources RENAME TO dynamic_guard"},
+		{"enable", "ALTER TABLE public.asset_sources ENABLE TRIGGER asset_sources_deferred_state_guard"},
+		{"disable", "ALTER TABLE public.asset_sources DISABLE TRIGGER asset_sources_deferred_state_guard"},
+	}
+	for _, form := range escapeEncodedExecuteForms {
+		for _, ddl := range escapeEncodedDDL {
+			statement := "\nDO E'BEGIN " + form.execute + " \\'" + ddl.sql + "\\'; END;' LANGUAGE plpgsql;\n"
+			assertRejectedDO("escape "+form.name+" dynamic "+ddl.name, statement)
+		}
+	}
+	invalidEscapeDOs := []struct{ name, statement string }{
+		{"trailing escape backslash", "\nDO E'BEGIN PERFORM 1; END;\\"},
+		{"escape hex without digit", "\nDO E'BEGIN PERFORM \\x; END;' LANGUAGE plpgsql;\n"},
+		{"truncated short unicode escape", "\nDO E'BEGIN PERFORM \\u123; END;' LANGUAGE plpgsql;\n"},
+		{"truncated long unicode escape", "\nDO E'BEGIN PERFORM \\U0001234; END;' LANGUAGE plpgsql;\n"},
+		{"unicode escape above maximum", "\nDO E'BEGIN PERFORM \\U00110000; END;' LANGUAGE plpgsql;\n"},
+		{"unicode NUL escape", "\nDO E'BEGIN PERFORM \\u0000; END;' LANGUAGE plpgsql;\n"},
+		{"unpaired unicode surrogate escape", "\nDO E'BEGIN PERFORM \\uD800; END;' LANGUAGE plpgsql;\n"},
+		{"unpaired long unicode surrogate escape", "\nDO E'BEGIN PERFORM \\U0000DC00; END;' LANGUAGE plpgsql;\n"},
+		{"octal low byte NUL escape", "\nDO E'BEGIN PERFORM \\400; END;' LANGUAGE plpgsql;\n"},
+		{"invalid UTF-8 escape byte", "\nDO E'BEGIN PERFORM \\377; END;' LANGUAGE plpgsql;\n"},
+		{"invalid UTF-8 low escape byte", "\nDO E'BEGIN PERFORM \\777; END;' LANGUAGE plpgsql;\n"},
+	}
+	for _, test := range invalidEscapeDOs {
+		assertRejectedDO(test.name, test.statement)
+	}
 	safeDOBodies := []struct{ name, body string }{
 		{"ordinary", "    PERFORM 1;"},
-		{"single quote", "    RAISE NOTICE 'EXECUTE';"},
-		{"escape string", `    RAISE NOTICE E'EXECUTE';`},
-		{"line comment", "    -- EXECUTE dynamic SQL\n    PERFORM 1;"},
-		{"block comment", "    /* EXECUTE dynamic SQL */\n    PERFORM 1;"},
-		{"nested dollar quote", "    PERFORM $inner$EXECUTE$inner$;"},
+		{"single quote", "    RAISE NOTICE 'EXECUTE CREATE ALTER DROP GRANT REVOKE COMMENT LOCK SET';"},
+		{"escape string", `    RAISE NOTICE E'EXECUTE CREATE ALTER DROP GRANT REVOKE COMMENT LOCK SET';`},
+		{"line comment", "    -- EXECUTE CREATE ALTER DROP GRANT REVOKE COMMENT LOCK SET\n    PERFORM 1;"},
+		{"block comment", "    /* EXECUTE CREATE ALTER DROP GRANT REVOKE COMMENT LOCK SET */\n    PERFORM 1;"},
+		{"nested dollar quote", "    PERFORM $inner$EXECUTE CREATE ALTER DROP GRANT REVOKE COMMENT LOCK SET$inner$;"},
 	}
 	for _, test := range safeDOBodies {
 		t.Run("safe do "+test.name+" preserves manifests", func(t *testing.T) {
@@ -265,6 +741,104 @@ FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state('unrev
 			down := strings.Replace(successorDown, dropAnchor, safeDO+dropAnchor, 1)
 			if got := correctiveDroppedTriggerIdentities(down); !correctiveSQLObjectSetsEqual(got, correctiveExpectedDroppedTriggerIdentitiesForMigration(t, up)) {
 				t.Fatal("safe DO changed down manifest")
+			}
+		})
+	}
+	safeSingleQuotedDOs := []struct{ name, statement string }{
+		{"default language", "\nDO 'BEGIN PERFORM 1; END;';\n"},
+		{"prefix language", "\nDO LANGUAGE plpgsql 'BEGIN PERFORM 1; END;';\n"},
+		{"tail language", singleQuotedDO("BEGIN PERFORM 1; END;")},
+		{"doubled quote", singleQuotedDO("BEGIN RAISE NOTICE 'it''s EXECUTE CREATE ALTER DROP GRANT REVOKE COMMENT LOCK SET'; PERFORM 1; END;")},
+		{"escape string", escapeQuotedDO("BEGIN\nRAISE NOTICE E'EXECUTE CREATE ALTER DROP GRANT REVOKE COMMENT LOCK SET\\n';\nPERFORM 1;\nEND;")},
+		{"escape octal", `DO E'BEGIN PERFORM \061; END;' LANGUAGE plpgsql;`},
+		{"escape octal low byte", `DO E'BEGIN PERFORM \501; END;' LANGUAGE plpgsql;`},
+		{"escape hex", `DO E'BEGIN PERFORM \x31; END;' LANGUAGE plpgsql;`},
+		{"escape unicode", `DO E'BEGIN RAISE NOTICE \'\u03bb\'; PERFORM 1; END;' LANGUAGE plpgsql;`},
+		{"escape long unicode", `DO E'BEGIN RAISE NOTICE \'\U0001F642\'; PERFORM 1; END;' LANGUAGE plpgsql;`},
+		{"escape mixed long short surrogate", `DO E'BEGIN RAISE NOTICE \'\U0000D83D\uDE42\'; PERFORM 1; END;' LANGUAGE plpgsql;`},
+		{"escape mixed short long surrogate", `DO E'BEGIN RAISE NOTICE \'\uD83D\U0000DE42\'; PERFORM 1; END;' LANGUAGE plpgsql;`},
+		{"escape long surrogate pair", `DO E'BEGIN RAISE NOTICE \'\U0000D83D\U0000DE42\'; PERFORM 1; END;' LANGUAGE plpgsql;`},
+		{"escape outer line comment", escapeQuotedDO("BEGIN\n-- EXECUTE CREATE ALTER DROP GRANT REVOKE COMMENT LOCK SET\nPERFORM 1;\nEND;")},
+		{"escape outer block comment", escapeQuotedDO("BEGIN\n/* EXECUTE CREATE ALTER DROP GRANT REVOKE COMMENT LOCK SET */\nPERFORM 1;\nEND;")},
+		{"escape outer nested dollar quote", escapeQuotedDO("BEGIN PERFORM $inner$EXECUTE CREATE ALTER DROP GRANT REVOKE COMMENT LOCK SET$inner$; END;")},
+		{"line comment", singleQuotedDO("BEGIN\n-- EXECUTE CREATE ALTER DROP GRANT REVOKE COMMENT LOCK SET\nPERFORM 1;\nEND;")},
+		{"block comment", singleQuotedDO("BEGIN\n/* EXECUTE CREATE ALTER DROP GRANT REVOKE COMMENT LOCK SET */\nPERFORM 1;\nEND;")},
+		{"nested dollar quote", singleQuotedDO("BEGIN PERFORM $inner$EXECUTE CREATE ALTER DROP GRANT REVOKE COMMENT LOCK SET$inner$; END;")},
+	}
+	for _, test := range safeSingleQuotedDOs {
+		assertSafeDO("single quoted do "+test.name, test.statement)
+	}
+	assertSafeDO("procedural statements", `
+DO $$
+DECLARE
+    safe_counter integer := 0;
+BEGIN
+    safe_counter := safe_counter + 1;
+    IF safe_counter = 1 THEN
+        PERFORM 1;
+    ELSE
+        NULL;
+    END IF;
+    FOR safe_counter IN 1..2 LOOP
+        CONTINUE WHEN safe_counter = 1;
+        EXIT WHEN safe_counter = 2;
+    END LOOP;
+    ASSERT safe_counter = 2;
+END;
+$$ LANGUAGE plpgsql;
+`)
+	validEscapeStrings := []struct {
+		name, input, want string
+	}{
+		{"controls quote and backslash", `E'\b\f\n\r\t\'\\'`, "\b\f\n\r\t'\\"},
+		{"one to three digit octal", `E'\1\12\101'`, "\x01\nA"},
+		{"three digit octal low byte", `E'\501'`, "A"},
+		{"three digit octal low byte UTF-8", `E'\703\651'`, "é"},
+		{"octal maximum width boundary", `E'\1234'`, "S4"},
+		{"one to two digit hex", `E'\x4\x41'`, "\x04A"},
+		{"hex maximum width boundary", `E'\x414'`, "A4"},
+		{"octal UTF-8 bytes", `E'\303\251'`, "é"},
+		{"hex UTF-8 bytes", `E'\xC3\xA9'`, "é"},
+		{"four digit unicode", `E'\u03bb'`, "λ"},
+		{"eight digit unicode", `E'\U0001F642'`, "🙂"},
+		{"unicode surrogate pair", `E'\uD83D\uDE42'`, "🙂"},
+		{"long short unicode surrogate pair", `E'\U0000D83D\uDE42'`, "🙂"},
+		{"short long unicode surrogate pair", `E'\uD83D\U0000DE42'`, "🙂"},
+		{"long unicode surrogate pair", `E'\U0000D83D\U0000DE42'`, "🙂"},
+		{"other escaped character", `E'\q'`, "q"},
+		{"newline continuation", "E'one\\\ntwo'", "onetwo"},
+		{"CRLF continuation", "E'one\\\r\ntwo'", "onetwo"},
+	}
+	for _, test := range validEscapeStrings {
+		t.Run("escape string decoder accepts "+test.name, func(t *testing.T) {
+			got, end, ok := correctiveSingleQuotedSQLLiteral(test.input, 1)
+			if !ok || end != len(test.input) || got != test.want {
+				t.Fatalf("correctiveSingleQuotedSQLLiteral(%q) = %q, %d, %t; want %q, %d, true",
+					test.input, got, end, ok, test.want, len(test.input))
+			}
+		})
+	}
+	invalidEscapeStrings := []struct{ name, input string }{
+		{"trailing backslash", `E'abc\`},
+		{"hex without digit", `E'\x'`},
+		{"truncated short unicode", `E'\u123'`},
+		{"truncated long unicode", `E'\U0001234'`},
+		{"unicode above maximum", `E'\U00110000'`},
+		{"unicode NUL", `E'\u0000'`},
+		{"unpaired high surrogate", `E'\uD800'`},
+		{"unpaired low surrogate", `E'\uDC00'`},
+		{"unpaired long high surrogate", `E'\U0000D800'`},
+		{"unpaired long low surrogate", `E'\U0000DC00'`},
+		{"invalid surrogate pair", `E'\uD800\u0041'`},
+		{"octal low byte NUL", `E'\400'`},
+		{"octal NUL", `E'\000'`},
+		{"invalid UTF-8 byte", `E'\377'`},
+		{"invalid UTF-8 low byte", `E'\777'`},
+	}
+	for _, test := range invalidEscapeStrings {
+		t.Run("escape string decoder rejects "+test.name, func(t *testing.T) {
+			if got, end, ok := correctiveSingleQuotedSQLLiteral(test.input, 1); ok {
+				t.Fatalf("correctiveSingleQuotedSQLLiteral(%q) = %q, %d, true; want rejection", test.input, got, end)
 			}
 		})
 	}
@@ -1041,6 +1615,8 @@ type correctiveFunction struct {
 }
 
 const correctiveSQLIdentifierPattern = `(?:"(?:""|[^"])+"|[a-z_][a-z0-9_$]*)`
+const correctivePLpgSQLUnquotedIdentifierPattern = `(?:[A-Za-z_]|[^\x00-\x7F])(?:[A-Za-z0-9_$]|[^\x00-\x7F])*`
+const correctivePLpgSQLIdentifierPattern = `(?:"(?:""|[^"])+"|` + correctivePLpgSQLUnquotedIdentifierPattern + `)`
 const correctiveTriggerLifecycleStatementPattern = `(?is)^\s*(?:create\s+(?:or\s+replace\s+)?(?:constraint\s+)?trigger\b|` +
 	`drop\s+trigger\b|alter\s+trigger\b|alter\s+table\b.+?\b(?:enable|disable)\s+(?:(?:always|replica)\s+)?trigger\b)`
 
@@ -1173,7 +1749,7 @@ func correctiveTopLevelSQLStatements(sql string) []string {
 			inDoubleQuote = true
 			statement.WriteByte(character)
 		case character == '$':
-			tag := correctiveDollarQuoteTag(sql[index:])
+			tag := correctiveDollarQuoteAt(sql, index)
 			if tag == "" {
 				statement.WriteByte(character)
 				continue
@@ -1198,26 +1774,401 @@ func correctiveTopLevelSQLStatements(sql string) []string {
 }
 
 func correctiveDOExecutesDynamicSQL(statement string) bool {
-	if !regexp.MustCompile(`(?is)^\s*do\b`).MatchString(statement) {
+	doPrefix := regexp.MustCompile(`(?is)^\s*do\b`).FindStringIndex(statement)
+	if doPrefix == nil {
 		return false
 	}
-	for index := 0; index < len(statement); index++ {
-		if statement[index] != '$' {
-			continue
-		}
-		tag := correctiveDollarQuoteTag(statement[index:])
-		if tag == "" {
-			continue
-		}
-		bodyStart := index + len(tag)
-		bodyEndRelative := strings.Index(statement[bodyStart:], tag)
-		if bodyEndRelative < 0 {
+	body, ok := correctiveDOCodeBody(statement[doPrefix[1]:])
+	if !ok {
+		return true
+	}
+	code := correctiveMaskNonCodePLpgSQL(body)
+	declaration := false
+	for _, sql := range correctiveTopLevelSQLStatements(code) {
+		if correctiveDOStatementExecutesUnreviewedSQL(sql, &declaration) {
 			return true
 		}
-		body := correctiveMaskNonCodeSQL(statement[bodyStart : bodyStart+bodyEndRelative])
-		return regexp.MustCompile(`(?i)\bexecute\b`).MatchString(body)
+	}
+	return declaration
+}
+
+func correctiveDOStatementExecutesUnreviewedSQL(statement string, declaration *bool) bool {
+	statement = correctiveTrimPLpgSQLLabels(statement)
+	for len(statement) > 0 {
+		if strings.HasPrefix(statement, "#") {
+			var ok bool
+			statement, ok = correctiveTrimPLpgSQLDirective(statement)
+			if !ok {
+				return true
+			}
+			statement = correctiveTrimPLpgSQLLabels(statement)
+			continue
+		}
+		words := correctivePLpgSQLWords(statement)
+		if len(words) == 0 {
+			return false
+		}
+		lead := strings.ToLower(statement[words[0][0]:words[0][1]])
+		if *declaration {
+			if lead != "begin" {
+				return false
+			}
+			*declaration = false
+			statement = correctiveTrimPLpgSQLLabels(statement[words[0][1]:])
+			continue
+		}
+		if regexp.MustCompile(
+			`(?is)^` + correctivePLpgSQLIdentifierPattern +
+				`(?:\s*(?:\.\s*` + correctivePLpgSQLIdentifierPattern + `|\[[^\]]+\]))*\s*(?::=|=)`,
+		).MatchString(statement) {
+			return false
+		}
+		switch lead {
+		case "declare":
+			*declaration = true
+			statement = correctiveTrimPLpgSQLLabels(statement[words[0][1]:])
+			continue
+		case "begin", "else", "loop":
+			statement = correctiveTrimPLpgSQLLabels(statement[words[0][1]:])
+			continue
+		case "if", "elsif", "elseif", "case", "when", "exception":
+			var ok bool
+			statement, ok = correctivePLpgSQLControlRemainder(statement, "then")
+			if !ok {
+				return true
+			}
+			statement = correctiveTrimPLpgSQLLabels(statement)
+			continue
+		case "while", "for", "foreach":
+			if lead == "for" && correctiveDOHasWordSequence(statement, words, "in", "execute") {
+				return true
+			}
+			var ok bool
+			statement, ok = correctivePLpgSQLControlRemainder(statement, "loop")
+			if !ok {
+				return true
+			}
+			statement = correctiveTrimPLpgSQLLabels(statement)
+			continue
+		case "end":
+			return false
+		case "open":
+			return correctiveDOHasWordSequence(statement, words, "for", "execute")
+		case "return":
+			return correctiveDOHasWordSequence(statement, words, "query", "execute")
+		default:
+			return correctiveUnsafeDOCommandLead(statement, words)
+		}
+	}
+	return false
+}
+
+func correctiveTrimPLpgSQLDirective(statement string) (string, bool) {
+	if len(statement) == 0 || statement[0] != '#' {
+		return "", false
+	}
+	words := correctivePLpgSQLWords(statement)
+	if len(words) < 2 ||
+		!correctivePLpgSQLDirectiveWhitespace(statement[1:words[0][0]]) ||
+		words[1][0] == words[0][1] ||
+		!correctivePLpgSQLDirectiveWhitespace(statement[words[0][1]:words[1][0]]) {
+		return "", false
+	}
+	option, quotedOption := correctivePLpgSQLIdentifierValue(statement[words[0][0]:words[0][1]])
+	value, quotedValue := correctivePLpgSQLIdentifierValue(statement[words[1][0]:words[1][1]])
+	valid := !quotedOption && !quotedValue && option == "option" && value == "dump" ||
+		!quotedOption && !quotedValue && option == "variable_conflict" &&
+			(value == "error" || value == "use_variable" || value == "use_column") ||
+		!quotedOption && option == "print_strict_params" && (value == "on" || value == "off")
+	if !valid || !quotedValue && words[1][1] < len(statement) &&
+		!correctivePLpgSQLDirectiveWhitespace(statement[words[1][1]:words[1][1]+1]) {
+		return "", false
+	}
+	return strings.TrimSpace(statement[words[1][1]:]), true
+}
+
+func correctivePLpgSQLIdentifierValue(value string) (string, bool) {
+	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+		return strings.ReplaceAll(value[1:len(value)-1], `""`, `"`), true
+	}
+	return strings.ToLower(value), false
+}
+
+func correctivePLpgSQLDirectiveWhitespace(value string) bool {
+	for index := 0; index < len(value); index++ {
+		switch value[index] {
+		case ' ', '\t', '\n', '\r', '\f', '\v':
+		default:
+			return false
+		}
 	}
 	return true
+}
+
+func correctiveTrimPLpgSQLLabels(statement string) string {
+	statement = strings.TrimSpace(statement)
+	for strings.HasPrefix(statement, "<<") {
+		end := strings.Index(statement[2:], ">>")
+		if end < 0 {
+			return statement
+		}
+		statement = strings.TrimSpace(statement[end+4:])
+	}
+	return statement
+}
+
+func correctivePLpgSQLControlRemainder(statement, boundary string) (string, bool) {
+	words := correctivePLpgSQLWords(statement)
+	caseDepth := 0
+	for index := 1; index < len(words); index++ {
+		word := strings.ToLower(statement[words[index][0]:words[index][1]])
+		if word == "case" {
+			caseDepth++
+			continue
+		}
+		if word == "end" && caseDepth > 0 {
+			caseDepth--
+			continue
+		}
+		if word == boundary && caseDepth == 0 {
+			return statement[words[index][1]:], true
+		}
+	}
+	return "", false
+}
+
+func correctivePLpgSQLWords(statement string) [][]int {
+	return regexp.MustCompile(correctivePLpgSQLIdentifierPattern).FindAllStringIndex(statement, -1)
+}
+
+func correctiveUnsafeDOCommandLead(statement string, words [][]int) bool {
+	lead := strings.ToLower(statement[words[0][0]:words[0][1]])
+	switch lead {
+	case "security":
+		return len(words) > 1 && strings.EqualFold(statement[words[1][0]:words[1][1]], "label")
+	case "start":
+		return len(words) > 1 && strings.EqualFold(statement[words[1][0]:words[1][1]], "transaction")
+	case "abort", "alter", "analyze", "call", "checkpoint", "cluster", "comment", "commit", "copy",
+		"create", "deallocate", "discard", "do", "drop", "execute", "explain", "grant", "import", "listen",
+		"load", "lock", "notify", "prepare", "reassign", "refresh", "reindex", "release", "reset",
+		"revoke", "rollback", "savepoint", "set", "show", "truncate", "unlisten", "vacuum":
+		return true
+	default:
+		return false
+	}
+}
+
+func correctiveDOHasWordSequence(statement string, words [][]int, first, second string) bool {
+	for index := 0; index+1 < len(words); index++ {
+		if strings.EqualFold(statement[words[index][0]:words[index][1]], first) &&
+			strings.EqualFold(statement[words[index+1][0]:words[index+1][1]], second) {
+			return true
+		}
+	}
+	return false
+}
+
+func correctiveDOCodeBody(suffix string) (string, bool) {
+	suffix = strings.TrimSpace(suffix)
+	prefixLanguage := false
+	languagePrefix := regexp.MustCompile(`(?is)^language\s+(` + correctiveSQLIdentifierPattern + `)\s+`)
+	if match := languagePrefix.FindStringSubmatchIndex(suffix); match != nil {
+		if !correctiveCanonicalDOLanguage(suffix[match[2]:match[3]]) {
+			return "", false
+		}
+		prefixLanguage = true
+		suffix = strings.TrimSpace(suffix[match[1]:])
+	}
+	if len(suffix) == 0 {
+		return "", false
+	}
+
+	bodyEnd := 0
+	body := ""
+	switch {
+	case suffix[0] == '$':
+		tag := correctiveDollarQuoteTag(suffix)
+		if tag == "" {
+			return "", false
+		}
+		bodyStart := len(tag)
+		bodyEndRelative := strings.Index(suffix[bodyStart:], tag)
+		if bodyEndRelative < 0 {
+			return "", false
+		}
+		bodyEnd = bodyStart + bodyEndRelative + len(tag)
+		body = suffix[bodyStart : bodyStart+bodyEndRelative]
+	case suffix[0] == '\'':
+		var ok bool
+		body, bodyEnd, ok = correctiveSingleQuotedSQLLiteral(suffix, 0)
+		if !ok {
+			return "", false
+		}
+	case len(suffix) >= 2 && (suffix[0] == 'e' || suffix[0] == 'E') && suffix[1] == '\'':
+		var ok bool
+		body, bodyEnd, ok = correctiveSingleQuotedSQLLiteral(suffix, 1)
+		if !ok {
+			return "", false
+		}
+	default:
+		return "", false
+	}
+
+	tail := strings.TrimSpace(suffix[bodyEnd:])
+	if tail == ";" {
+		return body, true
+	}
+	languageTail := regexp.MustCompile(`(?is)^language\s+(` + correctiveSQLIdentifierPattern + `)\s*;\s*$`)
+	match := languageTail.FindStringSubmatch(tail)
+	if prefixLanguage || match == nil || !correctiveCanonicalDOLanguage(match[1]) {
+		return "", false
+	}
+	return body, true
+}
+
+func correctiveCanonicalDOLanguage(value string) bool {
+	return len(value) > 0 && value[0] != '"' && strings.EqualFold(value, "plpgsql")
+}
+
+func correctiveSingleQuotedSQLLiteral(value string, quote int) (string, int, bool) {
+	if quote < 0 || quote >= len(value) || value[quote] != '\'' {
+		return "", 0, false
+	}
+	backslashEscapes := correctiveEscapeStringPrefix(value, quote)
+	var body strings.Builder
+	for index := quote + 1; index < len(value); index++ {
+		character := value[index]
+		switch {
+		case character == '\'' && index+1 < len(value) && value[index+1] == '\'':
+			body.WriteByte('\'')
+			index++
+		case character == '\'':
+			decoded := body.String()
+			if strings.IndexByte(decoded, 0) >= 0 || !utf8.ValidString(decoded) {
+				return "", 0, false
+			}
+			return decoded, index + 1, true
+		case character == '\\' && !backslashEscapes:
+			return "", 0, false
+		case backslashEscapes && character == '\\':
+			decoded, next, ok := correctiveDecodeEscapeString(value, index)
+			if !ok {
+				return "", 0, false
+			}
+			body.WriteString(decoded)
+			index = next - 1
+		default:
+			body.WriteByte(character)
+		}
+	}
+	return "", 0, false
+}
+
+func correctiveDecodeEscapeString(value string, backslash int) (string, int, bool) {
+	if backslash < 0 || backslash+1 >= len(value) || value[backslash] != '\\' {
+		return "", 0, false
+	}
+	escaped := value[backslash+1]
+	switch escaped {
+	case '\n':
+		return "", backslash + 2, true
+	case '\r':
+		next := backslash + 2
+		if next < len(value) && value[next] == '\n' {
+			next++
+		}
+		return "", next, true
+	case 'b':
+		return "\b", backslash + 2, true
+	case 'f':
+		return "\f", backslash + 2, true
+	case 'n':
+		return "\n", backslash + 2, true
+	case 'r':
+		return "\r", backslash + 2, true
+	case 't':
+		return "\t", backslash + 2, true
+	case '\\', '\'':
+		return string(escaped), backslash + 2, true
+	case 'x':
+		start := backslash + 2
+		end := start
+		for end < len(value) && end < start+2 && correctiveHexDigit(value[end]) {
+			end++
+		}
+		if end == start {
+			return "", 0, false
+		}
+		decoded, err := strconv.ParseUint(value[start:end], 16, 8)
+		if err != nil || decoded == 0 {
+			return "", 0, false
+		}
+		return string([]byte{byte(decoded)}), end, true
+	case 'u', 'U':
+		digits := 4
+		if escaped == 'U' {
+			digits = 8
+		}
+		codePoint, next, ok := correctiveUnicodeEscape(value, backslash+2, digits)
+		if !ok || codePoint == 0 || codePoint > utf8.MaxRune {
+			return "", 0, false
+		}
+		if codePoint >= 0xdc00 && codePoint <= 0xdfff {
+			return "", 0, false
+		}
+		if codePoint >= 0xd800 && codePoint <= 0xdbff {
+			if next+2 > len(value) || value[next] != '\\' || (value[next+1] != 'u' && value[next+1] != 'U') {
+				return "", 0, false
+			}
+			lowDigits := 4
+			if value[next+1] == 'U' {
+				lowDigits = 8
+			}
+			low, lowNext, lowOK := correctiveUnicodeEscape(value, next+2, lowDigits)
+			if !lowOK || low < 0xdc00 || low > 0xdfff {
+				return "", 0, false
+			}
+			codePoint = 0x10000 + ((codePoint - 0xd800) << 10) + (low - 0xdc00)
+			next = lowNext
+		}
+		return string(rune(codePoint)), next, true
+	}
+	if escaped >= '0' && escaped <= '7' {
+		end := backslash + 1
+		for end < len(value) && end < backslash+4 && value[end] >= '0' && value[end] <= '7' {
+			end++
+		}
+		decoded, err := strconv.ParseUint(value[backslash+1:end], 8, 16)
+		decodedByte := byte(decoded)
+		if err != nil || decodedByte == 0 {
+			return "", 0, false
+		}
+		return string([]byte{decodedByte}), end, true
+	}
+	return string(escaped), backslash + 2, true
+}
+
+func correctiveUnicodeEscape(value string, start, digits int) (uint64, int, bool) {
+	end := start + digits
+	if start < 0 || digits < 1 || end > len(value) {
+		return 0, 0, false
+	}
+	for index := start; index < end; index++ {
+		if !correctiveHexDigit(value[index]) {
+			return 0, 0, false
+		}
+	}
+	decoded, err := strconv.ParseUint(value[start:end], 16, 32)
+	if err != nil {
+		return 0, 0, false
+	}
+	return decoded, end, true
+}
+
+func correctiveHexDigit(value byte) bool {
+	return value >= '0' && value <= '9' ||
+		value >= 'a' && value <= 'f' ||
+		value >= 'A' && value <= 'F'
 }
 
 func correctiveDollarQuoteTag(value string) string {
@@ -1697,6 +2648,14 @@ func correctiveDigestInputs(body string) []string {
 }
 
 func correctiveMaskNonCodeSQL(value string) string {
+	return correctiveMaskNonCodeSQLMode(value, false)
+}
+
+func correctiveMaskNonCodePLpgSQL(value string) string {
+	return correctiveMaskNonCodeSQLMode(value, true)
+}
+
+func correctiveMaskNonCodeSQLMode(value string, preserveQuotedIdentifiers bool) string {
 	masked := []byte(value)
 	lineComment := false
 	blockCommentDepth := 0
@@ -1752,9 +2711,13 @@ func correctiveMaskNonCodeSQL(value string) string {
 			continue
 		}
 		if inDoubleQuote {
-			masked[index] = ' '
+			if !preserveQuotedIdentifiers {
+				masked[index] = ' '
+			}
 			if character == '"' && index+1 < len(value) && value[index+1] == '"' {
-				masked[index+1] = ' '
+				if !preserveQuotedIdentifiers {
+					masked[index+1] = ' '
+				}
 				index++
 			} else if character == '"' {
 				inDoubleQuote = false
@@ -1775,10 +2738,12 @@ func correctiveMaskNonCodeSQL(value string) string {
 			inSingleQuote = true
 			singleQuoteBackslashEscapes = correctiveEscapeStringPrefix(value, index)
 		case character == '"':
-			masked[index] = ' '
+			if !preserveQuotedIdentifiers {
+				masked[index] = ' '
+			}
 			inDoubleQuote = true
 		case character == '$':
-			tag := correctiveDollarQuoteTag(value[index:])
+			tag := correctiveDollarQuoteAt(value, index)
 			if tag != "" {
 				for offset := 0; offset < len(tag); offset++ {
 					masked[index+offset] = ' '
@@ -1789,6 +2754,24 @@ func correctiveMaskNonCodeSQL(value string) string {
 		}
 	}
 	return string(masked)
+}
+
+func correctiveDollarQuoteAt(value string, index int) string {
+	if index < 0 || index >= len(value) || value[index] != '$' {
+		return ""
+	}
+	if index > 0 && correctiveUnquotedIdentifierContinuation(value[index-1]) {
+		return ""
+	}
+	return correctiveDollarQuoteTag(value[index:])
+}
+
+func correctiveUnquotedIdentifierContinuation(character byte) bool {
+	return character >= 0x80 ||
+		(character >= 'A' && character <= 'Z') ||
+		(character >= 'a' && character <= 'z') ||
+		(character >= '0' && character <= '9') ||
+		character == '_' || character == '$'
 }
 
 func correctiveResolveFrameSequence(expression string, assignments map[string]string, depth int) ([]string, bool) {
