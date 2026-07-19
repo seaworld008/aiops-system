@@ -21,11 +21,15 @@ The workstation deployment operator must persist `max_connections = 100` (or a l
 
 ## Identity and DSN boundaries
 
+The first three rows below describe the current wrapper. The two Source Gate rows are the exact target after the sequential capability-identity harness merges；until then their variables/files are absent and must not be reported as available。
+
 | Purpose | Exact login identity | In-memory variable | Allowed use |
 |---|---|---|---|
 | Test control/admin | `aiops` | `AIOPS_TEST_POSTGRES_DSN` | Local fixture bootstrap plus create/drop of confirmed randomized test databases only; never application runtime |
 | Migration | `aiops_migrator` | `AIOPS_TEST_POSTGRES_MIGRATION_DSN` | Migration identity admission, then the reviewed SET-only edge to `aiops_schema_owner`; never runtime queries |
 | Application | `aiops_control_plane_workload` | `AIOPS_TEST_POSTGRES_APPLICATION_DSN` | Application admission and runtime integration checks; never migration or role switching |
+| Source Gate seal | `aiops_source_gate_sealer` | `AIOPS_TEST_POSTGRES_SOURCE_GATE_SEAL_DSN` | Receipt-seal primitive and exact identity/ACL negatives only |
+| Source Gate admit | `aiops_source_gate_admitter` | `AIOPS_TEST_POSTGRES_SOURCE_GATE_ADMIT_DSN` | Gate-admit primitive and exact identity/ACL negatives only |
 
 The two non-login roles are `aiops_schema_owner` and `aiops_control_plane_runtime`. The exact base graph is:
 
@@ -36,35 +40,41 @@ The two non-login roles are `aiops_schema_owner` and `aiops_control_plane_runtim
 
 All four roles are `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`. The local `aiops` role is an external test-control administrator and is not part of the production four-role ABI.
 
-`DatabaseRoleAdmission.Check` is the application probe and requires `session_user=current_user='aiops_control_plane_workload'`. Migration identity and role-switch admission run separately before `BEGIN`; callers must not select an admission mode.
+Source Gate A2a additionally consumes two production capability identities：`aiops_source_gate_sealer` and `aiops_source_gate_admitter` are both `LOGIN NOINHERIT` with the same five dangerous flags disabled、no membership、mutually distinct credentials/DSNs，and no base runtime or extension-owner rights。Their application database/schema ACL is absent at exact-36；only exact-38 postflight/grant gives direct database `CONNECT`、schema `USAGE` and their own single function `EXECUTE`，and down/unknown/partial revokes it。They have no relation/sequence ACL and cannot call one another's routine。
+
+The current exact-36 `DatabaseRoleAdmission.Check` remains the four-base-role application probe and requires `session_user=current_user='aiops_control_plane_workload'`；the capability harness exact8 does not modify it，and instead uses control/admin fixtures to prove the two capability identities、ACL absence、pairwise-distinct credentials/DSNs and application-connection rejection。Formal A2a alone extends the application probe to version-matched six-role/exact-36-or-38 ACL admission and adds fixed exact-38-only capability probes requiring exact sealer/admitter session identity while rejecting role switching、cross-function privilege or any relation ACL。Migration identity and role-switch admission run separately before `BEGIN`；callers must not select an admission mode。
 
 ## External Secret and trust layout
 
-With `root=$AIOPS_LOCAL_POSTGRES_ROOT`, the default external layout is:
+With `root=$AIOPS_LOCAL_POSTGRES_ROOT`, the first three identities below are current；the Source Gate rows are the target layout that the capability-identity harness must provision before A2a:
 
 | Identity/material | Root-relative file | Required mode |
 |---|---|---:|
 | Test-admin password | `secrets/postgres-password` | `0600` |
 | Migration password | `secrets/migrator-password` | `0600` |
 | Application password | `secrets/workload-password` | `0600` |
+| Source Gate sealer password | `secrets/source-gate-sealer-password` | `0600` |
+| Source Gate admitter password | `secrets/source-gate-admitter-password` | `0600` |
 | Development CA | `certs/ca.crt` | readable |
 | Test-admin certificate/key | `certs/client.crt`, `secrets/client.key` | key `0600` |
 | Migration certificate/key | `certs/migrator-client.crt`, `secrets/migrator-client.key` | key `0600`; certificate CN `aiops_migrator` |
 | Application certificate/key | `certs/workload-client.crt`, `secrets/workload-client.key` | key `0600`; certificate CN `aiops_control_plane_workload` |
+| Source Gate sealer certificate/key | `certs/source-gate-sealer-client.crt`, `secrets/source-gate-sealer-client.key` | key `0600`; certificate CN `aiops_source_gate_sealer` |
+| Source Gate admitter certificate/key | `certs/source-gate-admitter-client.crt`, `secrets/source-gate-admitter-client.key` | key `0600`; certificate CN `aiops_source_gate_admitter` |
 
-Every path may be overridden through the safe path variables in `.env.example`. Those variables identify files only; Secret values and complete DSNs must never appear in `.env`, shell history, documentation, logs, issue reports, snapshots, or commits.
+After the capability-identity harness merges, every path is overridden through the safe path variables in `.env.example`. That same change must reserve empty `AIOPS_SOURCE_GATE_ADMIT_DATABASE_URL` and `AIOPS_DISCOVERY_SOURCE_GATE_SEAL_DSN_FILE` production slots without wiring either pool；A2c alone consumes them。Those variables identify files or intentionally empty configuration slots only; Secret values and complete DSNs must never appear in `.env`, shell history, documentation, logs, issue reports, snapshots, or commits.
 
 ## Wrapper behavior
 
-`scripts/with-local-postgres.sh` fails closed unless it can prove all of the following before running a command:
+The current `scripts/with-local-postgres.sh` continues to prove only control/migration/application identities. The capability-identity harness must extend it so that, after that Batch merges, it fails closed unless it can prove all of the following before running a command:
 
 - an explicit external root and loopback-only endpoint;
-- the exact control database and three exact LOGIN role names;
+- the exact control database and five exact LOGIN role names;
 - the expected running/healthy digest-pinned container;
 - PostgreSQL `18.4`, SSL enabled, TLS minimum `TLSv1.3`, and `max_connections >= 100`;
 - readable CA/certificates, `0600` private keys, and nonempty `0600` passwords of at least 32 characters.
 
-It reads each password only into process memory, URL-encodes all URI components through standard input, exports the three DSNs above, unsets the plaintext shell variables, and then `exec`s the requested command. It never prints or writes a DSN. Tests must use the identity-specific variable; `AIOPS_TEST_POSTGRES_DSN` is retained solely as the control/admin harness variable while legacy fixtures are migrated.
+After the harness merges, it reads each password only into process memory, URL-encodes all URI components through standard input, exports the five DSNs above, proves all credentials are pairwise distinct, unsets the plaintext shell variables, and then `exec`s the requested command. It never prints or writes a DSN. Tests must use the identity-specific variable; `AIOPS_TEST_POSTGRES_DSN` is retained solely as the control/admin harness variable while legacy fixtures are migrated. The pre-A2a helper may create roles/credentials and control-database login evidence, but its application-database ACL reconciliation is exact and bidirectional：only exact-38 schema postflight enters the capability `CONNECT|USAGE` grant branch and then requires full role/capability admission；exact-36、successful A2a down、unknown or partial state enters revoke-and-prove-absent，with unknown/partial returning closed after revocation。A2a initial/up/down/up/partial tests must exercise every outcome so predecessor ACL cannot retain a capability grant。
 
 ## Stable commands
 
@@ -98,4 +108,4 @@ The external deployment's own launcher may set `AIOPS_LOCAL_POSTGRES_ROOT` and `
 
 If a password or identity file is missing, empty, expired, or suspected of exposure, stop the test gate. Generate a new cryptographically random password (at least 256 bits), update the external Secret file and matching database role as one operator-controlled rotation, issue a replacement client certificate with the exact role CN, keep private files at `0600`, and rerun both identity login checks plus `make postgres-local-check`.
 
-Changing only the file or only the database role intentionally breaks authentication. Never recover by weakening `pg_hba.conf`, client-certificate verification, TLS, role flags, memberships, database/schema ACL, or the separation between control, migration, and application DSNs.
+Changing only the file or only the database role intentionally breaks authentication. Never recover by weakening `pg_hba.conf`, client-certificate verification, TLS, role flags, memberships, database/schema ACL, or the separation between control、migration、application、sealer and admitter DSNs.
