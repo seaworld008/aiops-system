@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -72,6 +74,655 @@ func TestQualificationFixtureExactPersistentABI(t *testing.T) {
 		strings.Join(wantRunTypes, "\n"); got != want {
 		t.Fatalf("qualification Run column types:\n%s\nwant exact:\n%s", got, want)
 	}
+}
+
+func TestQualificationFixtureSyntheticSignatureIsStructuralShapeOnly(t *testing.T) {
+	receiptDigest := strings.Repeat("a5", sha256.Size)
+	signature := qualificationFixtureStructuralSignature(t, receiptDigest)
+	decoded, err := base64.RawURLEncoding.DecodeString(signature)
+	if err != nil {
+		t.Fatalf("decode structural qualification signature fixture: %v", err)
+	}
+	want := append(
+		assetCatalogCorrectiveDecodeDigest(t, receiptDigest),
+		assetCatalogCorrectiveDecodeDigest(t, receiptDigest)...,
+	)
+	if !strings.EqualFold(hex.EncodeToString(decoded), hex.EncodeToString(want)) {
+		t.Fatalf("structural qualification signature fixture=%x, want digest duplicated=%x", decoded, want)
+	}
+}
+
+func TestQualificationFixtureRoutineCallsUseNonNullSafeParameters(t *testing.T) {
+	for _, contract := range qualificationFixtureSourceGateRoutineContracts() {
+		for _, call := range []struct {
+			label     string
+			arguments []any
+		}{
+			{label: "own", arguments: contract.ownArguments},
+			{label: "cross", arguments: contract.crossArguments},
+		} {
+			for index, argument := range call.arguments {
+				if argument == nil {
+					t.Errorf(
+						"%s %s argument %d is NULL; STRICT would bypass the session guard",
+						contract.identity,
+						call.label,
+						index+1,
+					)
+				}
+			}
+		}
+	}
+}
+
+func TestQualificationFixtureOwnRoutineSessionRejectsBodyError(t *testing.T) {
+	err := qualificationFixtureOwnRoutineSessionVerdict(
+		"aiops_source_gate_sealer",
+		&pgconn.PgError{
+			Code:    "P0001",
+			Message: "synthetic primitive body failure",
+		},
+	)
+	if err == nil {
+		t.Fatal("own routine session verdict accepted a non-authorization body error")
+	}
+}
+
+func TestAssetCatalogQualificationRoutineACLAndColumnBoundary(t *testing.T) {
+	t.Run("version matched", func(t *testing.T) {
+		harness := newAssetCatalogHarness(t)
+		harness.applyThroughAssetCatalog(t)
+		state, err := qualificationFixtureSchemaStateFor(context.Background(), harness.application)
+		if err != nil {
+			t.Fatalf("inspect version-matched qualification schema: %v", err)
+		}
+		qualificationFixtureAssertVersionMatchedCapabilityBoundary(t, harness, state)
+	})
+
+	t.Run("partial revokes before closing", func(t *testing.T) {
+		harness := newAssetCatalogHarness(t)
+		harness.applyThroughAssetCatalog(t)
+		state, err := qualificationFixtureSchemaStateFor(
+			context.Background(),
+			harness.db,
+		)
+		if err != nil {
+			t.Fatalf("inspect qualification schema before partial mutation: %v", err)
+		}
+		execAssetSQL(t, harness.db, `
+			ALTER TABLE public.asset_sources
+			ADD COLUMN gate_evidence_unreviewed text
+		`)
+		harness.grantSourceGateCapabilityACLForTest(t)
+		err = harness.reconcileSourceGateCapabilityACL(
+			context.Background(),
+			sourceGateCapabilityAdmissionCallbacksForCurrentBinary(),
+		)
+		if !errors.Is(err, errSourceGateCapabilityUnavailable) {
+			t.Fatalf("partial capability reconciliation error=%v, want %v", err, errSourceGateCapabilityUnavailable)
+		}
+		harness.assertSourceGateCapabilityACLAbsent(t)
+		harness.assertSourceGateCapabilityConnectionsRejected(t)
+		qualificationFixtureAssertPartialCapabilityBoundary(
+			t,
+			harness,
+			state == qualificationFixtureSchemaFull,
+		)
+	})
+
+	t.Run("synthetic exact-38 partial keeps only dormant canonical routine ACL", func(t *testing.T) {
+		harness := newAssetCatalogHarness(t)
+		harness.applyThroughAssetCatalog(t)
+		state, err := qualificationFixtureSchemaStateFor(
+			context.Background(),
+			harness.db,
+		)
+		if err != nil {
+			t.Fatalf("inspect qualification schema before synthetic exact-38 partial: %v", err)
+		}
+		synthetic := state == qualificationFixtureSchemaOld
+		if synthetic {
+			qualificationFixtureInstallSyntheticSourceGateRoutines(t, harness)
+			qualificationFixtureConfigureSyntheticExact38RoutineACL(t, harness)
+			t.Cleanup(func() {
+				qualificationFixtureResetSyntheticExact38RoutineACL(t, harness)
+				qualificationFixtureDropSyntheticSourceGateRoutines(t, harness)
+			})
+		}
+		execAssetSQL(t, harness.db, `
+			ALTER TABLE public.asset_sources
+			ADD COLUMN gate_evidence_partial_unknown text
+		`)
+		harness.grantSourceGateCapabilityACLForTest(t)
+		err = harness.reconcileSourceGateCapabilityACL(
+			context.Background(),
+			sourceGateCapabilityAdmissionCallbacksForCurrentBinary(),
+		)
+		if !errors.Is(err, errSourceGateCapabilityUnavailable) {
+			t.Fatalf(
+				"synthetic exact-38 partial reconciliation error=%v, want %v",
+				err,
+				errSourceGateCapabilityUnavailable,
+			)
+		}
+		harness.assertSourceGateCapabilityACLAbsent(t)
+		harness.assertSourceGateCapabilityConnectionsRejected(t)
+		qualificationFixtureAssertPartialCapabilityBoundary(t, harness, true)
+	})
+
+	t.Run("synthetic exact-38 routine sessions require error-free own calls", func(t *testing.T) {
+		harness := newAssetCatalogHarness(t)
+		harness.applyThroughAssetCatalog(t)
+		state, err := qualificationFixtureSchemaStateFor(
+			context.Background(),
+			harness.db,
+		)
+		if err != nil {
+			t.Fatalf("inspect qualification schema before synthetic routine session probe: %v", err)
+		}
+		if state == qualificationFixtureSchemaFull {
+			qualificationFixtureAssertExact38RoutineCatalog(t, harness)
+			return
+		}
+		qualificationFixtureInstallSyntheticSourceGateRoutines(t, harness)
+		qualificationFixtureConfigureSyntheticExact38RoutineACL(t, harness)
+		t.Cleanup(func() {
+			qualificationFixtureResetSyntheticExact38RoutineACL(t, harness)
+			qualificationFixtureDropSyntheticSourceGateRoutines(t, harness)
+		})
+		harness.grantSourceGateCapabilityACLForTest(t)
+		t.Cleanup(func() {
+			if err := harness.closeSourceGateCapabilityBounded(); err != nil {
+				t.Errorf("close synthetic routine session capability ACL: %v", err)
+			}
+		})
+
+		contracts := qualificationFixtureSourceGateRoutineContracts()
+		sealer, err := harness.openSourceGateCapabilityPool(
+			context.Background(),
+			harness.sourceGateSealConfig,
+		)
+		if err != nil {
+			t.Fatalf("open synthetic exact-38 sealer session: %v", err)
+		}
+		defer sealer.Close()
+		admitter, err := harness.openSourceGateCapabilityPool(
+			context.Background(),
+			harness.sourceGateAdmitConfig,
+		)
+		if err != nil {
+			t.Fatalf("open synthetic exact-38 admitter session: %v", err)
+		}
+		defer admitter.Close()
+
+		for index, pool := range []*pgxpool.Pool{sealer, admitter} {
+			qualificationFixtureAssertOwnRoutineSessionAccepted(
+				t,
+				pool,
+				contracts[index].identity,
+				contracts[index].ownQuery,
+				contracts[index].ownArguments,
+			)
+			qualificationFixtureExpectSerializableSQLState(
+				t,
+				pool,
+				"42501",
+				contracts[index].crossQuery,
+				contracts[index].crossArguments,
+			)
+		}
+		for _, contract := range contracts {
+			qualificationFixtureExpectSerializableSQLState(
+				t,
+				harness.application,
+				"42501",
+				contract.ownQuery,
+				contract.ownArguments,
+			)
+		}
+	})
+
+	t.Run("synthetic exact-38 Runs ACL rejects broad legacy columns", func(t *testing.T) {
+		harness := newAssetCatalogHarness(t)
+		harness.applyThroughAssetCatalog(t)
+		state, err := qualificationFixtureSchemaStateFor(
+			context.Background(),
+			harness.db,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		synthetic := state == qualificationFixtureSchemaOld
+		qualificationFixtureConfigureBroadRunColumnACL(t, harness, synthetic)
+		t.Cleanup(func() {
+			qualificationFixtureRevokeRunMutationACL(t, harness)
+			qualificationFixtureAssertRunMutationACLAbsent(t, harness.db)
+			if synthetic {
+				qualificationFixtureDropSyntheticRunQueueColumns(t, harness)
+			}
+		})
+
+		if err := qualificationFixtureExact38RunColumnACLError(
+			context.Background(),
+			harness.db,
+		); err == nil {
+			t.Fatal("exact Run column ACL accepted broad created_at INSERT and UPDATE")
+		}
+		qualificationFixtureRevokeRunMutationACL(t, harness)
+		qualificationFixtureAssertRunMutationACLAbsent(t, harness.db)
+		qualificationFixtureConfigureExactRunColumnACL(t, harness)
+		if err := qualificationFixtureExact38RunColumnACLError(
+			context.Background(),
+			harness.db,
+		); err != nil {
+			t.Fatalf("exact Run column ACL did not recover after broad grant removal: %v", err)
+		}
+		qualificationFixtureAssertExact7QueueBindingACL(t, harness.db)
+		qualificationFixtureAssertRunDMLBoundary(t, harness)
+
+		t.Run("PUBLIC cannot expand UPDATE", func(t *testing.T) {
+			t.Cleanup(func() {
+				qualificationFixtureSetRunColumnPrivilege(
+					t,
+					harness,
+					"UPDATE",
+					"created_at",
+					"PUBLIC",
+					false,
+				)
+			})
+			qualificationFixtureSetRunColumnPrivilege(
+				t,
+				harness,
+				"UPDATE",
+				"created_at",
+				"PUBLIC",
+				true,
+			)
+			qualificationFixtureAssertWorkloadColumnPrivilege(
+				t,
+				harness.db,
+				"created_at",
+				"UPDATE",
+				true,
+			)
+			if err := qualificationFixtureExact38RunColumnACLError(
+				context.Background(),
+				harness.db,
+			); err == nil {
+				t.Fatal("exact Run ACL accepted PUBLIC UPDATE(created_at)")
+			}
+			qualificationFixtureSetRunColumnPrivilege(
+				t,
+				harness,
+				"UPDATE",
+				"created_at",
+				"PUBLIC",
+				false,
+			)
+			qualificationFixtureAssertExactRunColumnACLRecovered(t, harness.db)
+		})
+
+		t.Run("inherited runtime cannot expand workload UPDATE", func(t *testing.T) {
+			t.Cleanup(func() {
+				qualificationFixtureSetRunColumnPrivilege(
+					t,
+					harness,
+					"UPDATE",
+					"created_at",
+					"aiops_control_plane_runtime",
+					false,
+				)
+			})
+			qualificationFixtureSetRunColumnPrivilege(
+				t,
+				harness,
+				"UPDATE",
+				"created_at",
+				"aiops_control_plane_runtime",
+				true,
+			)
+			qualificationFixtureAssertWorkloadColumnPrivilege(
+				t,
+				harness.db,
+				"created_at",
+				"UPDATE",
+				true,
+			)
+			if err := qualificationFixtureExact38RunColumnACLError(
+				context.Background(),
+				harness.db,
+			); err == nil {
+				t.Fatal("exact Run ACL accepted inherited runtime UPDATE(created_at)")
+			}
+			qualificationFixtureSetRunColumnPrivilege(
+				t,
+				harness,
+				"UPDATE",
+				"created_at",
+				"aiops_control_plane_runtime",
+				false,
+			)
+			qualificationFixtureAssertExactRunColumnACLRecovered(t, harness.db)
+		})
+
+		t.Run("wrong grantor cannot replace canonical UPDATE", func(t *testing.T) {
+			t.Cleanup(func() {
+				qualificationFixtureRemoveWrongGrantorRunColumnACL(t, harness)
+				qualificationFixtureSetRunColumnPrivilege(
+					t,
+					harness,
+					"UPDATE",
+					"status",
+					"aiops_control_plane_runtime",
+					true,
+				)
+			})
+			qualificationFixtureSetRunColumnPrivilege(
+				t,
+				harness,
+				"UPDATE",
+				"status",
+				"aiops_control_plane_runtime",
+				false,
+			)
+			qualificationFixtureInstallWrongGrantorRunColumnACL(t, harness)
+			if grantor := qualificationFixtureRunColumnGrantor(
+				t,
+				harness.db,
+				"status",
+				"UPDATE",
+				"aiops_control_plane_runtime",
+			); grantor == "aiops_schema_owner" {
+				t.Fatal("wrong-grantor fixture unexpectedly retained canonical schema-owner grantor")
+			}
+			if err := qualificationFixtureExact38RunColumnACLError(
+				context.Background(),
+				harness.db,
+			); err == nil {
+				t.Fatal("exact Run ACL accepted wrong UPDATE(status) grantor")
+			}
+			qualificationFixtureRemoveWrongGrantorRunColumnACL(t, harness)
+			qualificationFixtureSetRunColumnPrivilege(
+				t,
+				harness,
+				"UPDATE",
+				"status",
+				"aiops_control_plane_runtime",
+				true,
+			)
+			qualificationFixtureAssertExactRunColumnACLRecovered(t, harness.db)
+		})
+	})
+
+	t.Run("down revokes before predecessor exposure", func(t *testing.T) {
+		harness := newAssetCatalogHarness(t)
+		harness.applyThroughAssetCatalog(t)
+		harness.applyMigration(t, "000015_assets_catalog.down.sql")
+		harness.reconcileSourceGateCapabilityAfterSuccessfulDownForTest(t)
+		qualificationFixtureAssertCapabilityObjectACLAbsent(t, harness.db)
+	})
+
+	for _, publicGrant := range []struct {
+		name       string
+		createSQL  string
+		grantSQL   string
+		cleanupSQL string
+	}{
+		{
+			name:       "PUBLIC table SELECT fails closed",
+			createSQL:  `CREATE TABLE public.source_gate_public_acl_probe(id integer)`,
+			grantSQL:   `GRANT SELECT ON TABLE public.source_gate_public_acl_probe TO PUBLIC`,
+			cleanupSQL: `DROP TABLE IF EXISTS public.source_gate_public_acl_probe`,
+		},
+		{
+			name:       "PUBLIC sequence USAGE fails closed",
+			createSQL:  `CREATE SEQUENCE public.source_gate_public_sequence_probe`,
+			grantSQL:   `GRANT USAGE ON SEQUENCE public.source_gate_public_sequence_probe TO PUBLIC`,
+			cleanupSQL: `DROP SEQUENCE IF EXISTS public.source_gate_public_sequence_probe`,
+		},
+	} {
+		t.Run(publicGrant.name, func(t *testing.T) {
+			harness := newAssetCatalogHarness(t)
+			harness.applyThroughAssetCatalog(t)
+			t.Cleanup(func() {
+				if _, err := harness.db.Exec(context.Background(), publicGrant.cleanupSQL); err != nil {
+					t.Errorf("clean PUBLIC ACL probe: %v", err)
+				}
+			})
+			execAssetSQL(t, harness.db, publicGrant.createSQL)
+			execAssetSQL(t, harness.db, publicGrant.grantSQL)
+			if err := qualificationFixtureCapabilityRelationACLAbsent(
+				context.Background(),
+				harness.db,
+			); err == nil {
+				t.Fatal("Source Gate capability relation/sequence gate accepted PUBLIC privilege")
+			}
+		})
+	}
+
+	for _, routine := range qualificationFixtureSourceGateRoutineContracts() {
+		t.Run("PUBLIC EXECUTE "+routine.name+" fails closed", func(t *testing.T) {
+			harness := newAssetCatalogHarness(t)
+			harness.applyThroughAssetCatalog(t)
+			state, err := qualificationFixtureSchemaStateFor(
+				context.Background(),
+				harness.db,
+			)
+			if err != nil {
+				t.Fatalf("inspect qualification schema before PUBLIC routine ACL probe: %v", err)
+			}
+			synthetic := state == qualificationFixtureSchemaOld
+			if synthetic {
+				qualificationFixtureInstallSyntheticSourceGateRoutines(t, harness)
+			}
+			t.Cleanup(func() {
+				qualificationFixtureSetRoutinePublicExecute(
+					t,
+					harness,
+					routine,
+					false,
+				)
+				qualificationFixtureAssertRoutinePublicExecuteAbsent(t, harness.db)
+				if synthetic {
+					qualificationFixtureDropSyntheticSourceGateRoutines(t, harness)
+				}
+			})
+
+			qualificationFixtureSetRoutinePublicExecute(t, harness, routine, true)
+			if err := qualificationFixtureRoutineACLContract(
+				context.Background(),
+				harness.db,
+				state,
+			); err == nil {
+				t.Fatalf(
+					"Source Gate capability object gate accepted PUBLIC EXECUTE on %s",
+					routine.name,
+				)
+			}
+			qualificationFixtureSetRoutinePublicExecute(t, harness, routine, false)
+			if err := qualificationFixtureRoutineACLContract(
+				context.Background(),
+				harness.db,
+				state,
+			); err != nil {
+				t.Fatalf("Source Gate routine ACL did not recover after PUBLIC revoke: %v", err)
+			}
+		})
+	}
+
+	t.Run("synthetic exact-38 routine effective ACL matrix", func(t *testing.T) {
+		harness := newAssetCatalogHarness(t)
+		harness.applyThroughAssetCatalog(t)
+		state, err := qualificationFixtureSchemaStateFor(
+			context.Background(),
+			harness.db,
+		)
+		if err != nil {
+			t.Fatalf("inspect qualification schema before exact-38 routine ACL probe: %v", err)
+		}
+		synthetic := state == qualificationFixtureSchemaOld
+		if synthetic {
+			qualificationFixtureInstallSyntheticSourceGateRoutines(t, harness)
+			qualificationFixtureConfigureSyntheticExact38RoutineACL(t, harness)
+		}
+		t.Cleanup(func() {
+			for _, routine := range qualificationFixtureSourceGateRoutineContracts() {
+				qualificationFixtureSetRoutinePublicExecute(t, harness, routine, false)
+			}
+			qualificationFixtureAssertRoutinePublicExecuteAbsent(t, harness.db)
+			if synthetic {
+				qualificationFixtureResetSyntheticExact38RoutineACL(t, harness)
+				if err := qualificationFixtureCapabilityObjectACLAbsent(
+					context.Background(),
+					harness.db,
+				); err != nil {
+					t.Errorf("synthetic exact-38 routine ACL cleanup did not close: %v", err)
+				}
+				qualificationFixtureDropSyntheticSourceGateRoutines(t, harness)
+			}
+		})
+
+		if err := qualificationFixtureExact38RoutineACLContract(
+			context.Background(),
+			harness.db,
+		); err != nil {
+			t.Fatalf("exact-38 routine ACL positive matrix: %v", err)
+		}
+		for _, routine := range qualificationFixtureSourceGateRoutineContracts() {
+			t.Run("PUBLIC EXECUTE "+routine.name, func(t *testing.T) {
+				qualificationFixtureSetRoutinePublicExecute(t, harness, routine, true)
+				if err := qualificationFixtureExact38RoutineACLContract(
+					context.Background(),
+					harness.db,
+				); err == nil {
+					t.Fatalf("exact-38 routine ACL accepted PUBLIC EXECUTE on %s", routine.name)
+				}
+				qualificationFixtureSetRoutinePublicExecute(t, harness, routine, false)
+				if err := qualificationFixtureExact38RoutineACLContract(
+					context.Background(),
+					harness.db,
+				); err != nil {
+					t.Fatalf(
+						"exact-38 routine ACL did not recover after revoking PUBLIC from %s: %v",
+						routine.name,
+						err,
+					)
+				}
+			})
+		}
+		for _, extra := range []struct {
+			identity string
+			routine  qualificationFixtureRoutineContract
+		}{
+			{
+				identity: "aiops_source_gate_sealer",
+				routine: qualificationFixtureRoutineContract{
+					name:      "asset_catalog_sha256_valid",
+					arguments: "text",
+				},
+			},
+			{
+				identity: "aiops_source_gate_admitter",
+				routine: qualificationFixtureRoutineContract{
+					name:      "asset_catalog_code_valid",
+					arguments: "text, integer",
+				},
+			},
+		} {
+			t.Run("extra EXECUTE "+extra.identity, func(t *testing.T) {
+				t.Cleanup(func() {
+					qualificationFixtureSetRoutineIdentityExecute(
+						t,
+						harness,
+						extra.routine,
+						extra.identity,
+						false,
+					)
+				})
+				qualificationFixtureSetRoutineIdentityExecute(
+					t,
+					harness,
+					extra.routine,
+					extra.identity,
+					true,
+				)
+				if err := qualificationFixtureExact38RoutineACLContract(
+					context.Background(),
+					harness.db,
+				); err == nil {
+					t.Fatalf(
+						"exact-38 routine ACL accepted extra edge %s -> %s",
+						extra.identity,
+						extra.routine.name,
+					)
+				}
+				qualificationFixtureSetRoutineIdentityExecute(
+					t,
+					harness,
+					extra.routine,
+					extra.identity,
+					false,
+				)
+				if err := qualificationFixtureExact38RoutineACLContract(
+					context.Background(),
+					harness.db,
+				); err != nil {
+					t.Fatalf(
+						"exact-38 routine ACL did not recover after revoking extra edge %s -> %s: %v",
+						extra.identity,
+						extra.routine.name,
+						err,
+					)
+				}
+			})
+		}
+
+		publicRoutine := qualificationFixtureRoutineContract{
+			name:      "asset_catalog_text_valid",
+			arguments: "text, integer",
+		}
+		t.Run("non-primitive PUBLIC EXECUTE", func(t *testing.T) {
+			t.Cleanup(func() {
+				qualificationFixtureSetRoutinePublicExecute(
+					t,
+					harness,
+					publicRoutine,
+					false,
+				)
+			})
+			qualificationFixtureSetRoutinePublicExecute(
+				t,
+				harness,
+				publicRoutine,
+				true,
+			)
+			if err := qualificationFixtureExact38RoutineACLContract(
+				context.Background(),
+				harness.db,
+			); err == nil {
+				t.Fatalf(
+					"exact-38 routine ACL accepted PUBLIC EXECUTE on non-primitive %s",
+					publicRoutine.name,
+				)
+			}
+			qualificationFixtureSetRoutinePublicExecute(
+				t,
+				harness,
+				publicRoutine,
+				false,
+			)
+			if err := qualificationFixtureExact38RoutineACLContract(
+				context.Background(),
+				harness.db,
+			); err != nil {
+				t.Fatalf(
+					"exact-38 routine ACL did not recover after revoking non-primitive PUBLIC EXECUTE: %v",
+					err,
+				)
+			}
+		})
+	})
 }
 
 func TestAssetCatalogQualificationFixtureSchemaContract(t *testing.T) {
@@ -1740,6 +2391,89 @@ var qualificationFixtureRunColumns = []string{
 	"ha_fact_chain_digest",
 }
 
+// Pack 06 freezes the legacy initial INSERT surface consumed by the merged
+// manual_run.go and source_revisions.go Run constructors, plus the seven
+// immutable qualification queue-binding columns.
+var qualificationFixtureRunInsertColumns = []string{
+	"id",
+	"tenant_id",
+	"workspace_id",
+	"source_id",
+	"source_revision",
+	"source_revision_digest",
+	"run_kind",
+	"trigger_type",
+	"gate_revision",
+	"idempotency_key",
+	"request_hash",
+	"cursor_before_sha256",
+	"checkpoint_version",
+	"trace_id",
+	"qualification_evidence_kind",
+	"qualification_scope_digest",
+	"qualification_binding_digest",
+	"qualification_profile_descriptor_digest",
+	"qualification_runtime_manifest_digest",
+	"qualification_lab_binding_digest",
+	"qualification_prior_receipts_digest",
+}
+
+// Pack 06's legacy lifecycle UPDATE surface is the exact union of the merged
+// manual_run.go, source_revisions.go, page_committer.go, and
+// discoveryqueue/postgres/repository.go Run assignments. Identity, scope,
+// revision, request, initial cursor, not-before, and DB-derived timestamps are
+// intentionally absent.
+var qualificationFixtureRunUpdateColumns = []string{
+	"status",
+	"stage_code",
+	"cursor_after_sha256",
+	"page_sequence",
+	"page_digest",
+	"relation_page_sequence",
+	"relation_page_digest",
+	"final_page",
+	"complete_snapshot",
+	"effective_complete_snapshot",
+	"checkpoint_version",
+	"lease_owner",
+	"lease_expires_at",
+	"fence_epoch",
+	"fence_token_hash",
+	"heartbeat_sequence",
+	"pending_transition",
+	"pending_transition_reason",
+	"pending_transition_not_before",
+	"pending_transition_digest",
+	"observed_count",
+	"created_count",
+	"changed_count",
+	"unchanged_count",
+	"conflict_count",
+	"missing_count",
+	"stale_count",
+	"restored_count",
+	"tombstoned_count",
+	"rejected_count",
+	"work_result_kind",
+	"work_result_status",
+	"work_result_digest",
+	"work_result_recorded_at",
+	"validation_outcome",
+	"validation_digest",
+	"validation_proof_digest",
+	"lineage_rollover_reason",
+	"lineage_rollover_evidence_digest",
+	"cleanup_attempt_id",
+	"cleanup_attempt_epoch",
+	"cleanup_status",
+	"cleanup_digest",
+	"terminal_failure_override",
+	"terminal_failure_override_digest",
+	"terminal_command_sha256",
+	"failure_code",
+	"version",
+}
+
 var qualificationFixtureSourceColumnTypes = []string{
 	"uuid",
 	"text",
@@ -1784,6 +2518,1569 @@ var qualificationFixtureGateForeignKeyReferences = []string{
 	"workspace_id",
 	"source_id",
 	"id",
+}
+
+func qualificationFixtureAssertVersionMatchedCapabilityBoundary(
+	t *testing.T,
+	harness *assetCatalogHarness,
+	state qualificationFixtureSchemaState,
+) {
+	t.Helper()
+	switch state {
+	case qualificationFixtureSchemaOld:
+		qualificationFixtureAssertCapabilityObjectACLAbsent(t, harness.db)
+		qualificationFixtureAssertPredecessorRelationACL(t, harness.db)
+	case qualificationFixtureSchemaFull:
+		qualificationFixtureAssertExact38RoutineCatalog(t, harness)
+		qualificationFixtureAssertCapabilityRelationACLAbsent(t, harness.db)
+		qualificationFixtureAssertExact38ColumnACL(t, harness.db)
+		qualificationFixtureAssertProtectedColumnDMLDenied(t, harness.application)
+	default:
+		t.Fatalf("unsupported version-matched qualification schema state %q", state)
+	}
+}
+
+func qualificationFixtureAssertCapabilityRelationACLAbsent(
+	t *testing.T,
+	database *pgxpool.Pool,
+) {
+	t.Helper()
+	if err := qualificationFixtureCapabilityRelationACLAbsent(
+		context.Background(),
+		database,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func qualificationFixtureCapabilityRelationACLAbsent(
+	ctx context.Context,
+	database *pgxpool.Pool,
+) error {
+	var directRelationACL int
+	if err := database.QueryRow(ctx, `
+		WITH capability_roles(role_name) AS (
+			VALUES ('aiops_source_gate_sealer'), ('aiops_source_gate_admitter')
+		),
+		relation_acl AS (
+			SELECT 1
+			FROM pg_class AS relation
+			JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+			CROSS JOIN LATERAL aclexplode(relation.relacl) AS acl
+			LEFT JOIN pg_roles AS grantee ON grantee.oid=acl.grantee
+			WHERE namespace.nspname='public' AND (
+				acl.grantee=0 OR
+				grantee.rolname IN (
+					'aiops_source_gate_sealer',
+					'aiops_source_gate_admitter'
+				)
+			)
+		),
+		column_acl AS (
+			SELECT 1
+			FROM pg_attribute AS attribute
+			JOIN pg_class AS relation ON relation.oid=attribute.attrelid
+			JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+			CROSS JOIN LATERAL aclexplode(attribute.attacl) AS acl
+			LEFT JOIN pg_roles AS grantee ON grantee.oid=acl.grantee
+			WHERE namespace.nspname='public' AND
+				attribute.attnum>0 AND NOT attribute.attisdropped AND (
+					acl.grantee=0 OR
+					grantee.rolname IN (
+						'aiops_source_gate_sealer',
+						'aiops_source_gate_admitter'
+					)
+				)
+		),
+		effective_relation_acl AS (
+			SELECT 1
+			FROM pg_class AS relation
+			JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+			CROSS JOIN capability_roles
+			CROSS JOIN (
+				VALUES
+					('SELECT'),('INSERT'),('UPDATE'),('DELETE'),
+					('TRUNCATE'),('REFERENCES'),('TRIGGER')
+			) AS privilege(privilege_name)
+			WHERE namespace.nspname='public' AND
+				relation.relkind IN ('r','p','v','m','f') AND
+				has_table_privilege(
+					capability_roles.role_name,
+					relation.oid,
+					privilege.privilege_name
+				)
+		),
+		effective_column_acl AS (
+			SELECT 1
+			FROM pg_class AS relation
+			JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+			CROSS JOIN capability_roles
+			CROSS JOIN (
+				VALUES ('SELECT'),('INSERT'),('UPDATE'),('REFERENCES')
+			) AS privilege(privilege_name)
+			WHERE namespace.nspname='public' AND
+				relation.relkind IN ('r','p','v','m','f') AND
+				has_any_column_privilege(
+					capability_roles.role_name,
+					relation.oid,
+					privilege.privilege_name
+				)
+		),
+		effective_sequence_acl AS (
+			SELECT 1
+			FROM pg_class AS relation
+			JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+			CROSS JOIN capability_roles
+			CROSS JOIN (
+				VALUES ('USAGE'),('SELECT'),('UPDATE')
+			) AS privilege(privilege_name)
+			WHERE namespace.nspname='public' AND relation.relkind='S' AND
+				has_sequence_privilege(
+					capability_roles.role_name,
+					relation.oid,
+					privilege.privilege_name
+				)
+		)
+		SELECT
+			(SELECT count(*) FROM relation_acl)+
+			(SELECT count(*) FROM column_acl)+
+			(SELECT count(*) FROM effective_relation_acl)+
+			(SELECT count(*) FROM effective_column_acl)+
+			(SELECT count(*) FROM effective_sequence_acl)
+	`).Scan(&directRelationACL); err != nil {
+		return fmt.Errorf("inspect Source Gate capability relation/sequence ACL: %w", err)
+	}
+	if directRelationACL != 0 {
+		return fmt.Errorf(
+			"Source Gate capability direct/PUBLIC/effective relation/sequence ACL rows=%d, want 0",
+			directRelationACL,
+		)
+	}
+	return nil
+}
+
+func qualificationFixtureAssertCapabilityObjectACLAbsent(
+	t *testing.T,
+	database *pgxpool.Pool,
+) {
+	t.Helper()
+	if err := qualificationFixtureCapabilityObjectACLAbsent(
+		context.Background(),
+		database,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func qualificationFixtureCapabilityObjectACLAbsent(
+	ctx context.Context,
+	database *pgxpool.Pool,
+) error {
+	if err := qualificationFixtureCapabilityRelationACLAbsent(ctx, database); err != nil {
+		return err
+	}
+	var directObjectACL int
+	if err := database.QueryRow(ctx, `
+		WITH capability_roles(role_name) AS (
+			VALUES ('aiops_source_gate_sealer'), ('aiops_source_gate_admitter')
+		),
+		routine_acl AS (
+			SELECT 1
+			FROM pg_proc AS routine
+			JOIN pg_namespace AS namespace ON namespace.oid=routine.pronamespace
+			CROSS JOIN LATERAL aclexplode(
+				COALESCE(routine.proacl,acldefault('f',routine.proowner))
+			) AS acl
+			LEFT JOIN pg_roles AS grantee ON grantee.oid=acl.grantee
+			WHERE namespace.nspname='public' AND (
+				(
+					acl.grantee=0 AND
+					routine.proname IN (
+						'asset_catalog_seal_qualification_receipt',
+						'asset_catalog_admit_source_gate'
+					)
+				) OR
+				grantee.rolname IN (
+					'aiops_source_gate_sealer',
+					'aiops_source_gate_admitter'
+				)
+			)
+		),
+		effective_routine_acl AS (
+			SELECT 1
+			FROM pg_proc AS routine
+			JOIN pg_namespace AS namespace ON namespace.oid=routine.pronamespace
+			CROSS JOIN capability_roles
+			WHERE namespace.nspname='public' AND
+				has_schema_privilege(
+					capability_roles.role_name,
+					namespace.oid,
+					'USAGE'
+				) AND
+				has_function_privilege(
+					capability_roles.role_name,
+					routine.oid,
+					'EXECUTE'
+				)
+		)
+		SELECT
+			(SELECT count(*) FROM routine_acl)+
+			(SELECT count(*) FROM effective_routine_acl)
+	`).Scan(&directObjectACL); err != nil {
+		return fmt.Errorf("inspect closed Source Gate capability object ACL: %w", err)
+	}
+	if directObjectACL != 0 {
+		return fmt.Errorf(
+			"closed Source Gate capability direct/PUBLIC/effective object ACL rows=%d, want 0",
+			directObjectACL,
+		)
+	}
+	return nil
+}
+
+func qualificationFixtureRoutineACLContract(
+	ctx context.Context,
+	database *pgxpool.Pool,
+	state qualificationFixtureSchemaState,
+) error {
+	switch state {
+	case qualificationFixtureSchemaOld:
+		return qualificationFixtureCapabilityObjectACLAbsent(ctx, database)
+	case qualificationFixtureSchemaFull:
+		return qualificationFixtureExact38RoutineACLContract(ctx, database)
+	default:
+		return fmt.Errorf("unsupported Source Gate routine ACL schema state %q", state)
+	}
+}
+
+func qualificationFixtureAssertPredecessorRelationACL(
+	t *testing.T,
+	database *pgxpool.Pool,
+) {
+	t.Helper()
+	for _, relation := range []string{"asset_sources", "asset_source_runs"} {
+		var privileges []string
+		if err := database.QueryRow(context.Background(), `
+			SELECT ARRAY(
+				SELECT upper(acl.privilege_type)
+				FROM pg_class AS relation
+				JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+				CROSS JOIN LATERAL aclexplode(
+					COALESCE(relation.relacl,acldefault('r',relation.relowner))
+				) AS acl
+				JOIN pg_roles AS grantee ON grantee.oid=acl.grantee
+				WHERE namespace.nspname='public' AND relation.relname=$1
+				  AND grantee.rolname='aiops_control_plane_runtime'
+				  AND upper(acl.privilege_type) IN ('INSERT','UPDATE')
+				ORDER BY upper(acl.privilege_type) COLLATE "C"
+			)
+		`, relation).Scan(&privileges); err != nil {
+			t.Fatalf("inspect predecessor relation ACL for %s: %v", relation, err)
+		}
+		if got := strings.Join(privileges, ","); got != "INSERT,UPDATE" {
+			t.Fatalf("predecessor relation ACL for %s=%q, want INSERT,UPDATE", relation, got)
+		}
+	}
+}
+
+func qualificationFixtureAssertExact38RoutineCatalog(
+	t *testing.T,
+	harness *assetCatalogHarness,
+) {
+	t.Helper()
+	contracts := qualificationFixtureSourceGateRoutineContracts()
+	for _, contract := range contracts {
+		var (
+			owner           string
+			language        string
+			volatility      string
+			strict          bool
+			securityDefiner bool
+			parallel        string
+			returnType      string
+			configuration   []string
+			definition      string
+		)
+		if err := harness.db.QueryRow(context.Background(), `
+			SELECT pg_get_userbyid(routine.proowner),language.lanname,
+				routine.provolatile,routine.proisstrict,routine.prosecdef,routine.proparallel,
+				pg_get_function_result(routine.oid),
+				COALESCE(routine.proconfig,'{}'::text[]),
+				pg_get_functiondef(routine.oid)
+			FROM pg_proc AS routine
+			JOIN pg_namespace AS namespace ON namespace.oid=routine.pronamespace
+			JOIN pg_language AS language ON language.oid=routine.prolang
+			WHERE namespace.nspname='public' AND routine.proname=$1
+			  AND pg_get_function_identity_arguments(routine.oid)=$2
+		`, contract.name, contract.arguments).Scan(
+			&owner,
+			&language,
+			&volatility,
+			&strict,
+			&securityDefiner,
+			&parallel,
+			&returnType,
+			&configuration,
+			&definition,
+		); err != nil {
+			t.Fatalf("inspect exact-38 routine %s: %v", contract.name, err)
+		}
+		if owner != "aiops_schema_owner" || language != "plpgsql" || volatility != "v" ||
+			!strict || !securityDefiner || parallel != "u" || returnType != "boolean" ||
+			strings.Join(configuration, ",") != "search_path=pg_catalog, public, pg_temp" ||
+			!strings.Contains(definition, "'"+contract.identity+"'") ||
+			strings.Contains(definition, "'"+contract.otherIdentity+"'") {
+			t.Fatalf(
+				"exact-38 routine %s catalog drift: owner=%q language=%q volatility=%q strict=%t security=%t parallel=%q return=%q config=%v",
+				contract.name,
+				owner,
+				language,
+				volatility,
+				strict,
+				securityDefiner,
+				parallel,
+				returnType,
+				configuration,
+			)
+		}
+		if err := correctiveSourceGateSessionGuardError(definition, contract.identity); err != nil {
+			t.Fatalf("exact-38 routine %s session guard drift: %v", contract.name, err)
+		}
+	}
+	if err := qualificationFixtureExact38RoutineACLContract(
+		context.Background(),
+		harness.db,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	sealer, err := harness.openSourceGateCapabilityPool(
+		context.Background(),
+		harness.sourceGateSealConfig,
+	)
+	if err != nil {
+		t.Fatalf("open exact-38 sealer boundary pool: %v", err)
+	}
+	defer sealer.Close()
+	admitter, err := harness.openSourceGateCapabilityPool(
+		context.Background(),
+		harness.sourceGateAdmitConfig,
+	)
+	if err != nil {
+		t.Fatalf("open exact-38 admitter boundary pool: %v", err)
+	}
+	defer admitter.Close()
+	for index, pool := range []*pgxpool.Pool{sealer, admitter} {
+		qualificationFixtureAssertOwnRoutineSessionAccepted(
+			t,
+			pool,
+			contracts[index].identity,
+			contracts[index].ownQuery,
+			contracts[index].ownArguments,
+		)
+		qualificationFixtureExpectSerializableSQLState(
+			t,
+			pool,
+			"42501",
+			contracts[index].crossQuery,
+			contracts[index].crossArguments,
+		)
+	}
+	qualificationFixtureExpectSerializableSQLState(
+		t,
+		harness.application,
+		"42501",
+		contracts[0].ownQuery,
+		contracts[0].ownArguments,
+	)
+	qualificationFixtureExpectSerializableSQLState(
+		t,
+		harness.application,
+		"42501",
+		contracts[1].ownQuery,
+		contracts[1].ownArguments,
+	)
+}
+
+type qualificationFixtureRoutineContract struct {
+	name           string
+	arguments      string
+	identity       string
+	otherIdentity  string
+	ownQuery       string
+	ownArguments   []any
+	crossQuery     string
+	crossArguments []any
+}
+
+func qualificationFixtureExact38RoutineACLContract(
+	ctx context.Context,
+	database *pgxpool.Pool,
+) error {
+	return qualificationFixtureCanonicalRoutineACLContract(ctx, database, true)
+}
+
+func qualificationFixtureCanonicalRoutineACLContract(
+	ctx context.Context,
+	database *pgxpool.Pool,
+	active bool,
+) error {
+	contracts := qualificationFixtureSourceGateRoutineContracts()
+	var (
+		effectiveEdges        []string
+		directCapabilityEdges []string
+		publicExecuteRoutine  []string
+	)
+	if err := database.QueryRow(ctx, `
+		WITH capability_roles(role_name) AS (
+			VALUES ('aiops_source_gate_sealer'), ('aiops_source_gate_admitter')
+		),
+		public_routines AS (
+			SELECT routine.oid,routine.proacl,routine.proowner,
+				namespace.oid AS namespace_oid,
+				namespace.nspname || '.' || routine.proname || '(' ||
+					pg_get_function_identity_arguments(routine.oid) || ')' AS identity
+			FROM pg_proc AS routine
+			JOIN pg_namespace AS namespace ON namespace.oid=routine.pronamespace
+			WHERE namespace.nspname='public'
+		)
+		SELECT ARRAY(
+				SELECT capability_roles.role_name || '->' || routine.identity
+				FROM public_routines AS routine
+				CROSS JOIN capability_roles
+				WHERE has_schema_privilege(
+						capability_roles.role_name,
+						routine.namespace_oid,
+						'USAGE'
+					) AND
+					has_function_privilege(
+						capability_roles.role_name,
+						routine.oid,
+						'EXECUTE'
+					)
+				ORDER BY capability_roles.role_name COLLATE "C",
+					routine.identity COLLATE "C"
+			),
+			ARRAY(
+				SELECT routine.identity
+				FROM public_routines AS routine
+				CROSS JOIN LATERAL aclexplode(
+					COALESCE(routine.proacl,acldefault('f',routine.proowner))
+				) AS acl
+				WHERE acl.grantee=0 AND upper(acl.privilege_type)='EXECUTE'
+				ORDER BY routine.identity COLLATE "C"
+			),
+			ARRAY(
+				SELECT grantee.rolname || '->' || routine.identity || ':' ||
+					upper(acl.privilege_type) || ':' ||
+					acl.is_grantable::text || ':' || grantor.rolname
+				FROM public_routines AS routine
+				CROSS JOIN LATERAL aclexplode(
+					COALESCE(routine.proacl,acldefault('f',routine.proowner))
+				) AS acl
+				JOIN pg_roles AS grantee ON grantee.oid=acl.grantee
+				JOIN capability_roles
+					ON capability_roles.role_name=grantee.rolname
+				JOIN pg_roles AS grantor ON grantor.oid=acl.grantor
+				WHERE upper(acl.privilege_type)='EXECUTE'
+				ORDER BY grantee.rolname COLLATE "C",
+					routine.identity COLLATE "C"
+			)
+	`).Scan(
+		&effectiveEdges,
+		&publicExecuteRoutine,
+		&directCapabilityEdges,
+	); err != nil {
+		return fmt.Errorf("inspect exact-38 global routine ACL allowlist: %w", err)
+	}
+	wantEdges := make([]string, 0, len(contracts))
+	wantDirectEdges := make([]string, 0, len(contracts))
+	for _, contract := range contracts {
+		edge := contract.identity + "->public." + contract.name +
+			"(" + contract.arguments + ")"
+		wantEdges = append(wantEdges, edge)
+		wantDirectEdges = append(
+			wantDirectEdges,
+			edge+":EXECUTE:false:aiops_schema_owner",
+		)
+	}
+	sort.Strings(wantEdges)
+	sort.Strings(wantDirectEdges)
+	wantEffectiveEdges := wantEdges
+	if !active {
+		wantEffectiveEdges = []string{}
+	}
+	if !reflect.DeepEqual(effectiveEdges, wantEffectiveEdges) ||
+		!reflect.DeepEqual(directCapabilityEdges, wantDirectEdges) ||
+		len(publicExecuteRoutine) != 0 {
+		return fmt.Errorf(
+			"exact-38 global routine ACL effective=%v direct=%v PUBLIC=%v, want effective=%v direct=%v and no PUBLIC EXECUTE",
+			effectiveEdges,
+			directCapabilityEdges,
+			publicExecuteRoutine,
+			wantEffectiveEdges,
+			wantDirectEdges,
+		)
+	}
+
+	for _, contract := range contracts {
+		var (
+			acl                  []string
+			ownEffective         bool
+			crossEffective       bool
+			applicationEffective bool
+		)
+		if err := database.QueryRow(ctx, `
+			SELECT ARRAY(
+					SELECT COALESCE(grantee.rolname,'PUBLIC') || ':' ||
+						upper(acl.privilege_type) || ':' ||
+						acl.is_grantable::text || ':' || grantor.rolname
+					FROM aclexplode(
+						COALESCE(routine.proacl,acldefault('f',routine.proowner))
+					) AS acl
+					LEFT JOIN pg_roles AS grantee ON grantee.oid=acl.grantee
+					JOIN pg_roles AS grantor ON grantor.oid=acl.grantor
+					WHERE acl.grantee<>routine.proowner
+					ORDER BY COALESCE(grantee.rolname,'PUBLIC') COLLATE "C",
+						upper(acl.privilege_type) COLLATE "C"
+				),
+				has_schema_privilege($3,namespace.oid,'USAGE') AND
+					has_function_privilege($3,routine.oid,'EXECUTE'),
+				has_schema_privilege($4,namespace.oid,'USAGE') AND
+					has_function_privilege($4,routine.oid,'EXECUTE'),
+				has_schema_privilege(
+					'aiops_control_plane_workload',
+					namespace.oid,
+					'USAGE'
+				) AND has_function_privilege(
+					'aiops_control_plane_workload',routine.oid,'EXECUTE'
+				)
+			FROM pg_proc AS routine
+			JOIN pg_namespace AS namespace ON namespace.oid=routine.pronamespace
+			WHERE namespace.nspname='public' AND routine.proname=$1
+			  AND pg_get_function_identity_arguments(routine.oid)=$2
+		`,
+			contract.name,
+			contract.arguments,
+			contract.identity,
+			contract.otherIdentity,
+		).Scan(
+			&acl,
+			&ownEffective,
+			&crossEffective,
+			&applicationEffective,
+		); err != nil {
+			return fmt.Errorf("inspect exact-38 routine %s ACL: %w", contract.name, err)
+		}
+		wantACL := contract.identity + ":EXECUTE:false:aiops_schema_owner"
+		if strings.Join(acl, ",") != wantACL ||
+			ownEffective != active || crossEffective || applicationEffective {
+			return fmt.Errorf(
+				"exact-38 routine %s ACL=%v effective=(own:%t cross:%t application:%t), want ACL %q and (%t,false,false)",
+				contract.name,
+				acl,
+				ownEffective,
+				crossEffective,
+				applicationEffective,
+				wantACL,
+				active,
+			)
+		}
+	}
+	return nil
+}
+
+func qualificationFixtureAssertPartialCapabilityBoundary(
+	t *testing.T,
+	harness *assetCatalogHarness,
+	canonicalRoutineACL bool,
+) {
+	t.Helper()
+	harness.assertSourceGateCapabilityACLAbsent(t)
+	harness.assertSourceGateCapabilityConnectionsRejected(t)
+	if !canonicalRoutineACL {
+		qualificationFixtureAssertCapabilityObjectACLAbsent(t, harness.db)
+		return
+	}
+	qualificationFixtureAssertCapabilityRelationACLAbsent(t, harness.db)
+	if err := qualificationFixtureCanonicalRoutineACLContract(
+		context.Background(),
+		harness.db,
+		false,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func qualificationFixtureInstallSyntheticSourceGateRoutines(
+	t *testing.T,
+	harness *assetCatalogHarness,
+) {
+	t.Helper()
+	qualificationFixtureExecAsSchemaOwner(
+		t,
+		harness,
+		correctiveSourceGateSuccessorRoutineFixture(),
+	)
+	for _, routine := range qualificationFixtureSourceGateRoutineContracts() {
+		qualificationFixtureSetRoutinePublicExecute(t, harness, routine, false)
+	}
+}
+
+func qualificationFixtureDropSyntheticSourceGateRoutines(
+	t *testing.T,
+	harness *assetCatalogHarness,
+) {
+	t.Helper()
+	qualificationFixtureExecAsSchemaOwner(t, harness, `
+		DROP FUNCTION IF EXISTS public.asset_catalog_seal_qualification_receipt(
+			uuid,uuid,uuid,uuid,bigint,bigint,text,
+			timestamp with time zone,timestamp with time zone,text
+		);
+		DROP FUNCTION IF EXISTS public.asset_catalog_admit_source_gate(
+			uuid,uuid,uuid,uuid,bigint,bigint
+		);
+	`)
+}
+
+func qualificationFixtureConfigureSyntheticExact38RoutineACL(
+	t *testing.T,
+	harness *assetCatalogHarness,
+) {
+	t.Helper()
+	qualificationFixtureExecAsSchemaOwner(t, harness, `
+		REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
+		GRANT USAGE ON SCHEMA public
+			TO aiops_source_gate_sealer,aiops_source_gate_admitter;
+		GRANT EXECUTE ON FUNCTION public.asset_catalog_seal_qualification_receipt(
+			uuid,uuid,uuid,uuid,bigint,bigint,text,
+			timestamp with time zone,timestamp with time zone,text
+		) TO aiops_source_gate_sealer;
+		GRANT EXECUTE ON FUNCTION public.asset_catalog_admit_source_gate(
+			uuid,uuid,uuid,uuid,bigint,bigint
+		) TO aiops_source_gate_admitter;
+	`)
+}
+
+func qualificationFixtureResetSyntheticExact38RoutineACL(
+	t *testing.T,
+	harness *assetCatalogHarness,
+) {
+	t.Helper()
+	qualificationFixtureExecAsSchemaOwner(t, harness, `
+		REVOKE ALL ON FUNCTION public.asset_catalog_seal_qualification_receipt(
+			uuid,uuid,uuid,uuid,bigint,bigint,text,
+			timestamp with time zone,timestamp with time zone,text
+		) FROM aiops_source_gate_sealer,aiops_source_gate_admitter;
+		REVOKE ALL ON FUNCTION public.asset_catalog_admit_source_gate(
+			uuid,uuid,uuid,uuid,bigint,bigint
+		) FROM aiops_source_gate_sealer,aiops_source_gate_admitter;
+		REVOKE USAGE ON SCHEMA public
+			FROM aiops_source_gate_sealer,aiops_source_gate_admitter;
+	`)
+}
+
+func qualificationFixtureSetRoutinePublicExecute(
+	t *testing.T,
+	harness *assetCatalogHarness,
+	routine qualificationFixtureRoutineContract,
+	grant bool,
+) {
+	t.Helper()
+	action := "REVOKE"
+	direction := "FROM"
+	if grant {
+		action = "GRANT"
+		direction = "TO"
+	}
+	qualificationFixtureExecAsSchemaOwner(
+		t,
+		harness,
+		fmt.Sprintf(
+			"%s EXECUTE ON FUNCTION public.%s(%s) %s PUBLIC",
+			action,
+			routine.name,
+			routine.arguments,
+			direction,
+		),
+	)
+}
+
+func qualificationFixtureSetRoutineIdentityExecute(
+	t *testing.T,
+	harness *assetCatalogHarness,
+	routine qualificationFixtureRoutineContract,
+	identity string,
+	grant bool,
+) {
+	t.Helper()
+	action := "REVOKE"
+	direction := "FROM"
+	if grant {
+		action = "GRANT"
+		direction = "TO"
+	}
+	qualificationFixtureExecAsSchemaOwner(
+		t,
+		harness,
+		fmt.Sprintf(
+			"%s EXECUTE ON FUNCTION public.%s(%s) %s %s",
+			action,
+			routine.name,
+			routine.arguments,
+			direction,
+			pgx.Identifier{identity}.Sanitize(),
+		),
+	)
+}
+
+func qualificationFixtureExecAsSchemaOwner(
+	t *testing.T,
+	harness *assetCatalogHarness,
+	statement string,
+) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := harness.migration.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		t.Fatalf("begin Source Gate routine ACL fixture transaction: %v", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE aiops_schema_owner`); err != nil {
+		t.Fatalf("enter Source Gate routine ACL fixture owner context: %v", err)
+	}
+	if _, err := tx.Exec(ctx, statement); err != nil {
+		t.Fatalf("mutate Source Gate routine ACL fixture: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit Source Gate routine ACL fixture: %v", err)
+	}
+}
+
+func qualificationFixtureAssertRoutinePublicExecuteAbsent(
+	t *testing.T,
+	database *pgxpool.Pool,
+) {
+	t.Helper()
+	var count int
+	if err := database.QueryRow(context.Background(), `
+		SELECT count(*)::integer
+		FROM pg_proc AS routine
+		JOIN pg_namespace AS namespace ON namespace.oid=routine.pronamespace
+		CROSS JOIN LATERAL aclexplode(
+			COALESCE(routine.proacl,acldefault('f',routine.proowner))
+		) AS acl
+		WHERE namespace.nspname='public' AND
+			routine.proname IN (
+				'asset_catalog_seal_qualification_receipt',
+				'asset_catalog_admit_source_gate'
+			) AND
+			acl.grantee=0 AND upper(acl.privilege_type)='EXECUTE'
+	`).Scan(&count); err != nil {
+		t.Fatalf("inspect Source Gate routine PUBLIC cleanup: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("Source Gate routine PUBLIC EXECUTE rows after cleanup=%d, want 0", count)
+	}
+}
+
+func qualificationFixtureSourceGateRoutineContracts() []qualificationFixtureRoutineContract {
+	issuedAt := time.Date(2026, time.July, 21, 1, 0, 0, 0, time.UTC)
+	sealArguments := []any{
+		"00000000-0000-4000-8000-000000000101",
+		"00000000-0000-4000-8000-000000000102",
+		"00000000-0000-4000-8000-000000000103",
+		"00000000-0000-4000-8000-000000000104",
+		int64(1),
+		int64(1),
+		strings.Repeat("a5", sha256.Size),
+		issuedAt,
+		issuedAt.Add(5 * time.Minute),
+		strings.Repeat("A", 86),
+	}
+	admitArguments := append([]any(nil), sealArguments[:6]...)
+	return []qualificationFixtureRoutineContract{
+		{
+			name:          "asset_catalog_seal_qualification_receipt",
+			arguments:     "uuid, uuid, uuid, uuid, bigint, bigint, text, timestamp with time zone, timestamp with time zone, text",
+			identity:      "aiops_source_gate_sealer",
+			otherIdentity: "aiops_source_gate_admitter",
+			ownQuery: `SELECT public.asset_catalog_seal_qualification_receipt(
+				$1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::bigint,$6::bigint,
+				$7::text,$8::timestamptz,$9::timestamptz,$10::text
+			)`,
+			ownArguments: sealArguments,
+			crossQuery: `SELECT public.asset_catalog_admit_source_gate(
+				$1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::bigint,$6::bigint
+			)`,
+			crossArguments: admitArguments,
+		},
+		{
+			name:          "asset_catalog_admit_source_gate",
+			arguments:     "uuid, uuid, uuid, uuid, bigint, bigint",
+			identity:      "aiops_source_gate_admitter",
+			otherIdentity: "aiops_source_gate_sealer",
+			ownQuery: `SELECT public.asset_catalog_admit_source_gate(
+				$1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::bigint,$6::bigint
+			)`,
+			ownArguments: admitArguments,
+			crossQuery: `SELECT public.asset_catalog_seal_qualification_receipt(
+				$1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::bigint,$6::bigint,
+				$7::text,$8::timestamptz,$9::timestamptz,$10::text
+			)`,
+			crossArguments: sealArguments,
+		},
+	}
+}
+
+func qualificationFixtureAssertOwnRoutineSessionAccepted(
+	t *testing.T,
+	database *pgxpool.Pool,
+	identity, query string,
+	arguments []any,
+) {
+	t.Helper()
+	err := qualificationFixtureExecSerializableRoutine(database, query, arguments)
+	if err := qualificationFixtureOwnRoutineSessionVerdict(identity, err); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func qualificationFixtureOwnRoutineSessionVerdict(identity string, err error) error {
+	if err != nil {
+		return fmt.Errorf(
+			"%s own non-NULL routine call must complete without error: %w",
+			identity,
+			err,
+		)
+	}
+	return nil
+}
+
+func qualificationFixtureExpectSerializableSQLState(
+	t *testing.T,
+	database *pgxpool.Pool,
+	state, query string,
+	arguments []any,
+) {
+	t.Helper()
+	err := qualificationFixtureExecSerializableRoutine(database, query, arguments)
+	if got := assetCatalogSQLState(err); got != state {
+		t.Fatalf("serializable routine call error=%v SQLSTATE=%q, want %s", err, got, state)
+	}
+}
+
+func qualificationFixtureExecSerializableRoutine(
+	database *pgxpool.Pool,
+	query string,
+	arguments []any,
+) error {
+	ctx := context.Background()
+	tx, err := database.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.Serializable,
+		AccessMode: pgx.ReadWrite,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+	var isolation, readOnly string
+	if err := tx.QueryRow(ctx, `
+		SELECT current_setting('transaction_isolation'),
+			current_setting('transaction_read_only')
+	`).Scan(&isolation, &readOnly); err != nil {
+		return err
+	}
+	if isolation != "serializable" || readOnly != "off" {
+		return fmt.Errorf(
+			"routine probe transaction mode=(%s,%s), want (serializable,off)",
+			isolation,
+			readOnly,
+		)
+	}
+	_, err = tx.Exec(ctx, query, arguments...)
+	return err
+}
+
+func qualificationFixtureAssertExact38ColumnACL(
+	t *testing.T,
+	database *pgxpool.Pool,
+) {
+	t.Helper()
+	if err := qualificationFixtureExact38ColumnACLError(
+		context.Background(),
+		database,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func qualificationFixtureConfigureBroadRunColumnACL(
+	t *testing.T,
+	harness *assetCatalogHarness,
+	addSyntheticColumns bool,
+) {
+	t.Helper()
+	if addSyntheticColumns {
+		additions := make([]string, 0, 7)
+		for index, column := range qualificationFixtureRunColumns[:7] {
+			additions = append(
+				additions,
+				"ADD COLUMN "+pgx.Identifier{column}.Sanitize()+" "+
+					qualificationFixtureRunColumnTypes[index],
+			)
+		}
+		qualificationFixtureExecAsSchemaOwner(
+			t,
+			harness,
+			"ALTER TABLE public.asset_source_runs "+strings.Join(additions, ","),
+		)
+	}
+	runColumns := qualificationFixtureRelationColumns(
+		t,
+		harness.db,
+		"asset_source_runs",
+	)
+	broadInsertColumns := qualificationFixtureWithoutColumns(
+		runColumns,
+		qualificationFixtureRunColumns[7:],
+	)
+	broadUpdateColumns := qualificationFixtureWithoutColumns(
+		runColumns,
+		qualificationFixtureRunColumns,
+	)
+	qualificationFixtureExecAsSchemaOwner(
+		t,
+		harness,
+		fmt.Sprintf(`
+			REVOKE INSERT,UPDATE ON TABLE public.asset_source_runs
+				FROM aiops_control_plane_runtime;
+			GRANT INSERT (%s) ON TABLE public.asset_source_runs
+				TO aiops_control_plane_runtime;
+			GRANT UPDATE (%s) ON TABLE public.asset_source_runs
+				TO aiops_control_plane_runtime;
+		`,
+			qualificationFixtureSQLColumnList(broadInsertColumns),
+			qualificationFixtureSQLColumnList(broadUpdateColumns),
+		),
+	)
+}
+
+func qualificationFixtureDropSyntheticRunQueueColumns(
+	t *testing.T,
+	harness *assetCatalogHarness,
+) {
+	t.Helper()
+	drops := make([]string, 0, 7)
+	for _, column := range qualificationFixtureRunColumns[:7] {
+		drops = append(
+			drops,
+			"DROP COLUMN "+pgx.Identifier{column}.Sanitize(),
+		)
+	}
+	qualificationFixtureExecAsSchemaOwner(
+		t,
+		harness,
+		"ALTER TABLE public.asset_source_runs "+strings.Join(drops, ","),
+	)
+}
+
+func qualificationFixtureConfigureExactRunColumnACL(
+	t *testing.T,
+	harness *assetCatalogHarness,
+) {
+	t.Helper()
+	qualificationFixtureExecAsSchemaOwner(
+		t,
+		harness,
+		fmt.Sprintf(`
+			GRANT INSERT (%s) ON TABLE public.asset_source_runs
+				TO aiops_control_plane_runtime;
+			GRANT UPDATE (%s) ON TABLE public.asset_source_runs
+				TO aiops_control_plane_runtime;
+		`,
+			qualificationFixtureSQLColumnList(qualificationFixtureRunInsertColumns),
+			qualificationFixtureSQLColumnList(qualificationFixtureRunUpdateColumns),
+		),
+	)
+}
+
+func qualificationFixtureSetRunColumnPrivilege(
+	t *testing.T,
+	harness *assetCatalogHarness,
+	privilege, column, grantee string,
+	grant bool,
+) {
+	t.Helper()
+	granteeSQL := "PUBLIC"
+	if grantee != "PUBLIC" {
+		granteeSQL = pgx.Identifier{grantee}.Sanitize()
+	}
+	action := "REVOKE"
+	direction := "FROM"
+	if grant {
+		action = "GRANT"
+		direction = "TO"
+	}
+	qualificationFixtureExecAsSchemaOwner(
+		t,
+		harness,
+		fmt.Sprintf(
+			"%s %s (%s) ON TABLE public.asset_source_runs %s %s",
+			action,
+			privilege,
+			pgx.Identifier{column}.Sanitize(),
+			direction,
+			granteeSQL,
+		),
+	)
+}
+
+func qualificationFixtureInstallWrongGrantorRunColumnACL(
+	t *testing.T,
+	harness *assetCatalogHarness,
+) {
+	t.Helper()
+	qualificationFixtureExecAsSchemaOwner(t, harness, `
+		GRANT USAGE ON SCHEMA public TO aiops_migrator;
+		GRANT UPDATE (status) ON TABLE public.asset_source_runs
+			TO aiops_migrator WITH GRANT OPTION
+	`)
+	if _, err := harness.migration.Exec(context.Background(), `
+		GRANT UPDATE (status) ON TABLE public.asset_source_runs
+			TO aiops_control_plane_runtime
+	`); err != nil {
+		t.Fatalf("install wrong-grantor Run column ACL fixture: %v", err)
+	}
+}
+
+func qualificationFixtureRemoveWrongGrantorRunColumnACL(
+	t *testing.T,
+	harness *assetCatalogHarness,
+) {
+	t.Helper()
+	qualificationFixtureExecAsSchemaOwner(t, harness, `
+		REVOKE UPDATE (status) ON TABLE public.asset_source_runs
+			FROM aiops_migrator CASCADE;
+		REVOKE USAGE ON SCHEMA public FROM aiops_migrator
+	`)
+}
+
+func qualificationFixtureRunColumnGrantor(
+	t *testing.T,
+	database *pgxpool.Pool,
+	column, privilege, grantee string,
+) string {
+	t.Helper()
+	var grantor string
+	if err := database.QueryRow(context.Background(), `
+		SELECT grantor.rolname
+		FROM pg_attribute AS attribute
+		JOIN pg_class AS relation ON relation.oid=attribute.attrelid
+		JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+		CROSS JOIN LATERAL aclexplode(attribute.attacl) AS acl
+		JOIN pg_roles AS acl_grantee ON acl_grantee.oid=acl.grantee
+		JOIN pg_roles AS grantor ON grantor.oid=acl.grantor
+		WHERE namespace.nspname='public' AND
+			relation.relname='asset_source_runs' AND
+			attribute.attname=$1 AND upper(acl.privilege_type)=$2 AND
+			acl_grantee.rolname=$3
+	`, column, privilege, grantee).Scan(&grantor); err != nil {
+		t.Fatalf("inspect Run column ACL grantor: %v", err)
+	}
+	return grantor
+}
+
+func qualificationFixtureAssertWorkloadColumnPrivilege(
+	t *testing.T,
+	database *pgxpool.Pool,
+	column, privilege string,
+	want bool,
+) {
+	t.Helper()
+	var got bool
+	if err := database.QueryRow(context.Background(), `
+		SELECT has_column_privilege(
+			'aiops_control_plane_workload',
+			'public.asset_source_runs',
+			$1,
+			$2
+		)
+	`, column, privilege).Scan(&got); err != nil {
+		t.Fatalf("inspect workload effective Run column privilege: %v", err)
+	}
+	if got != want {
+		t.Fatalf(
+			"workload effective %s(%s)=%t, want %t",
+			privilege,
+			column,
+			got,
+			want,
+		)
+	}
+}
+
+func qualificationFixtureAssertExactRunColumnACLRecovered(
+	t *testing.T,
+	database *pgxpool.Pool,
+) {
+	t.Helper()
+	if err := qualificationFixtureExact38RunColumnACLError(
+		context.Background(),
+		database,
+	); err != nil {
+		t.Fatalf("exact Run column ACL did not recover: %v", err)
+	}
+}
+
+func qualificationFixtureRevokeRunMutationACL(
+	t *testing.T,
+	harness *assetCatalogHarness,
+) {
+	t.Helper()
+	runColumns := qualificationFixtureRelationColumns(
+		t,
+		harness.db,
+		"asset_source_runs",
+	)
+	columns := qualificationFixtureSQLColumnList(runColumns)
+	qualificationFixtureExecAsSchemaOwner(
+		t,
+		harness,
+		fmt.Sprintf(`
+			REVOKE INSERT (%s) ON TABLE public.asset_source_runs
+				FROM aiops_control_plane_runtime;
+			REVOKE UPDATE (%s) ON TABLE public.asset_source_runs
+				FROM aiops_control_plane_runtime;
+			REVOKE INSERT,UPDATE ON TABLE public.asset_source_runs
+				FROM aiops_control_plane_runtime;
+		`, columns, columns),
+	)
+}
+
+func qualificationFixtureAssertRunMutationACLAbsent(
+	t *testing.T,
+	database *pgxpool.Pool,
+) {
+	t.Helper()
+	var count int
+	if err := database.QueryRow(context.Background(), `
+		WITH relation_acl AS (
+			SELECT 1
+			FROM pg_class AS relation
+			JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+			CROSS JOIN LATERAL aclexplode(relation.relacl) AS acl
+			JOIN pg_roles AS grantee ON grantee.oid=acl.grantee
+			WHERE namespace.nspname='public' AND
+				relation.relname='asset_source_runs' AND
+				grantee.rolname='aiops_control_plane_runtime' AND
+				upper(acl.privilege_type) IN ('INSERT','UPDATE')
+		),
+		column_acl AS (
+			SELECT 1
+			FROM pg_attribute AS attribute
+			JOIN pg_class AS relation ON relation.oid=attribute.attrelid
+			JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+			CROSS JOIN LATERAL aclexplode(attribute.attacl) AS acl
+			JOIN pg_roles AS grantee ON grantee.oid=acl.grantee
+			WHERE namespace.nspname='public' AND
+				relation.relname='asset_source_runs' AND
+				grantee.rolname='aiops_control_plane_runtime' AND
+				upper(acl.privilege_type) IN ('INSERT','UPDATE')
+		)
+		SELECT
+			(SELECT count(*) FROM relation_acl)+
+			(SELECT count(*) FROM column_acl)
+	`).Scan(&count); err != nil {
+		t.Fatalf("inspect synthetic Run mutation ACL cleanup: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("synthetic Run mutation ACL rows after cleanup=%d, want 0", count)
+	}
+}
+
+func qualificationFixtureExact38RunColumnACLError(
+	ctx context.Context,
+	database *pgxpool.Pool,
+) error {
+	for _, contract := range []struct {
+		privilege string
+		want      []string
+	}{
+		{privilege: "INSERT", want: qualificationFixtureRunInsertColumns},
+		{privilege: "UPDATE", want: qualificationFixtureRunUpdateColumns},
+	} {
+		if err := qualificationFixtureColumnACLError(
+			ctx,
+			database,
+			"asset_source_runs",
+			contract.privilege,
+			contract.want,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func qualificationFixtureAssertExact7QueueBindingACL(
+	t *testing.T,
+	database *pgxpool.Pool,
+) {
+	t.Helper()
+	var columns []string
+	if err := database.QueryRow(context.Background(), `
+		SELECT ARRAY(
+			SELECT attribute.attname
+			FROM pg_attribute AS attribute
+			JOIN pg_class AS relation ON relation.oid=attribute.attrelid
+			JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+			WHERE namespace.nspname='public' AND
+				relation.relname='asset_source_runs' AND
+				attribute.attname=ANY($1::text[]) AND
+				has_column_privilege(
+					'aiops_control_plane_workload',
+					relation.oid,
+					attribute.attnum,
+					'INSERT'
+				)
+			ORDER BY attribute.attnum
+		)
+	`, qualificationFixtureRunColumns[:7]).Scan(&columns); err != nil {
+		t.Fatalf("inspect exact seven queue-binding INSERT privileges: %v", err)
+	}
+	if !reflect.DeepEqual(columns, qualificationFixtureRunColumns[:7]) {
+		t.Fatalf(
+			"queue-binding INSERT columns=%v, want exact seven %v",
+			columns,
+			qualificationFixtureRunColumns[:7],
+		)
+	}
+}
+
+func qualificationFixtureAssertRunDMLBoundary(
+	t *testing.T,
+	harness *assetCatalogHarness,
+) {
+	t.Helper()
+	runColumns := qualificationFixtureRelationColumns(
+		t,
+		harness.db,
+		"asset_source_runs",
+	)
+	insertAllowed := make(map[string]struct{}, len(qualificationFixtureRunInsertColumns))
+	for _, column := range qualificationFixtureRunInsertColumns {
+		insertAllowed[column] = struct{}{}
+	}
+	updateAllowed := make(map[string]struct{}, len(qualificationFixtureRunUpdateColumns))
+	for _, column := range qualificationFixtureRunUpdateColumns {
+		updateAllowed[column] = struct{}{}
+	}
+	for _, column := range runColumns {
+		identifier := pgx.Identifier{column}.Sanitize()
+		if _, allowed := insertAllowed[column]; !allowed {
+			expectAssetSQLState(
+				t,
+				harness.application,
+				"42501",
+				"INSERT INTO public.asset_source_runs ("+identifier+") VALUES (DEFAULT)",
+			)
+		}
+		if _, allowed := updateAllowed[column]; !allowed {
+			expectAssetSQLState(
+				t,
+				harness.application,
+				"42501",
+				"UPDATE public.asset_source_runs SET "+identifier+"="+
+					identifier+" WHERE false",
+			)
+		}
+	}
+}
+
+func qualificationFixtureSQLColumnList(columns []string) string {
+	identifiers := make([]string, 0, len(columns))
+	for _, column := range columns {
+		identifiers = append(identifiers, pgx.Identifier{column}.Sanitize())
+	}
+	return strings.Join(identifiers, ",")
+}
+
+func qualificationFixtureExact38ColumnACLError(
+	ctx context.Context,
+	database *pgxpool.Pool,
+) error {
+	sourceColumns, err := qualificationFixtureRelationColumnsFor(
+		ctx,
+		database,
+		"asset_sources",
+	)
+	if err != nil {
+		return err
+	}
+	for _, contract := range []struct {
+		relation  string
+		privilege string
+		want      []string
+	}{
+		{
+			relation: "asset_sources", privilege: "INSERT",
+			want: qualificationFixtureWithoutColumns(
+				sourceColumns,
+				qualificationFixtureSourceColumns,
+			),
+		},
+		{
+			relation: "asset_sources", privilege: "UPDATE",
+			want: qualificationFixtureWithoutColumns(
+				sourceColumns,
+				qualificationFixtureSourceColumns,
+			),
+		},
+		{
+			relation: "asset_source_runs", privilege: "INSERT",
+			want: qualificationFixtureRunInsertColumns,
+		},
+		{
+			relation: "asset_source_runs", privilege: "UPDATE",
+			want: qualificationFixtureRunUpdateColumns,
+		},
+	} {
+		if err := qualificationFixtureColumnACLError(
+			ctx,
+			database,
+			contract.relation,
+			contract.privilege,
+			contract.want,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func qualificationFixtureRelationColumns(
+	t *testing.T,
+	database *pgxpool.Pool,
+	relation string,
+) []string {
+	t.Helper()
+	columns, err := qualificationFixtureRelationColumnsFor(
+		context.Background(),
+		database,
+		relation,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return columns
+}
+
+func qualificationFixtureRelationColumnsFor(
+	ctx context.Context,
+	database *pgxpool.Pool,
+	relation string,
+) ([]string, error) {
+	var columns []string
+	if err := database.QueryRow(ctx, `
+		SELECT ARRAY(
+			SELECT attribute.attname
+			FROM pg_attribute AS attribute
+			JOIN pg_class AS relation ON relation.oid=attribute.attrelid
+			JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+			WHERE namespace.nspname='public' AND relation.relname=$1
+			  AND attribute.attnum>0 AND NOT attribute.attisdropped
+			ORDER BY attribute.attnum
+		)
+	`, relation).Scan(&columns); err != nil {
+		return nil, fmt.Errorf("read %s columns for ACL boundary: %w", relation, err)
+	}
+	return columns, nil
+}
+
+func qualificationFixtureWithoutColumns(columns, excluded []string) []string {
+	excludedSet := make(map[string]struct{}, len(excluded))
+	for _, column := range excluded {
+		excludedSet[column] = struct{}{}
+	}
+	result := make([]string, 0, len(columns))
+	for _, column := range columns {
+		if _, found := excludedSet[column]; !found {
+			result = append(result, column)
+		}
+	}
+	return result
+}
+
+func qualificationFixtureAssertColumnACL(
+	t *testing.T,
+	database *pgxpool.Pool,
+	relation string,
+	privilege string,
+	want []string,
+) {
+	t.Helper()
+	if err := qualificationFixtureColumnACLError(
+		context.Background(),
+		database,
+		relation,
+		privilege,
+		want,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func qualificationFixtureColumnACLError(
+	ctx context.Context,
+	database *pgxpool.Pool,
+	relation string,
+	privilege string,
+	want []string,
+) error {
+	var (
+		relationACL         []string
+		directColumns       []string
+		runtimeEffective    []string
+		workloadEffective   []string
+		capabilityEffective []string
+	)
+	if err := database.QueryRow(ctx, `
+		WITH target AS (
+			SELECT relation.oid,relation.relacl,relation.relowner
+			FROM pg_class AS relation
+			JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+			WHERE namespace.nspname='public' AND relation.relname=$1
+		),
+		attributes AS (
+			SELECT attribute.attnum,attribute.attname
+			FROM pg_attribute AS attribute
+			JOIN target ON target.oid=attribute.attrelid
+			WHERE attribute.attnum>0 AND NOT attribute.attisdropped
+		),
+		capability_roles(role_name) AS (
+			VALUES ('aiops_source_gate_sealer'),('aiops_source_gate_admitter')
+		)
+		SELECT ARRAY(
+				SELECT COALESCE(grantee.rolname,'PUBLIC') || ':' ||
+					upper(acl.privilege_type) || ':' ||
+					acl.is_grantable::text || ':' || grantor.rolname
+				FROM target
+				CROSS JOIN LATERAL aclexplode(
+					COALESCE(target.relacl,acldefault('r',target.relowner))
+				) AS acl
+				LEFT JOIN pg_roles AS grantee ON grantee.oid=acl.grantee
+				JOIN pg_roles AS grantor ON grantor.oid=acl.grantor
+				WHERE acl.grantee<>target.relowner AND
+					upper(acl.privilege_type)=$2
+				ORDER BY COALESCE(grantee.rolname,'PUBLIC') COLLATE "C"
+			),
+			ARRAY(
+				SELECT attribute.attname || ':' ||
+					COALESCE(grantee.rolname,'PUBLIC') || ':' ||
+					acl.is_grantable::text || ':' || grantor.rolname
+				FROM pg_attribute AS attribute
+				JOIN target ON target.oid=attribute.attrelid
+				CROSS JOIN LATERAL aclexplode(attribute.attacl) AS acl
+				LEFT JOIN pg_roles AS grantee ON grantee.oid=acl.grantee
+				JOIN pg_roles AS grantor ON grantor.oid=acl.grantor
+				WHERE attribute.attnum>0 AND NOT attribute.attisdropped AND
+					upper(acl.privilege_type)=$2
+				ORDER BY attribute.attnum
+			),
+			ARRAY(
+				SELECT attribute.attname
+				FROM attributes AS attribute
+				CROSS JOIN target
+				WHERE has_column_privilege(
+					'aiops_control_plane_runtime',
+					target.oid,
+					attribute.attnum,
+					$2
+				)
+				ORDER BY attribute.attnum
+			),
+			ARRAY(
+				SELECT attribute.attname
+				FROM attributes AS attribute
+				CROSS JOIN target
+				WHERE has_column_privilege(
+					'aiops_control_plane_workload',
+					target.oid,
+					attribute.attnum,
+					$2
+				)
+				ORDER BY attribute.attnum
+			),
+			ARRAY(
+				SELECT capability_roles.role_name || '->' || attribute.attname
+				FROM attributes AS attribute
+				CROSS JOIN target
+				CROSS JOIN capability_roles
+				WHERE has_column_privilege(
+					capability_roles.role_name,
+					target.oid,
+					attribute.attnum,
+					$2
+				)
+				ORDER BY capability_roles.role_name COLLATE "C",
+					attribute.attnum
+			)
+	`, relation, privilege).Scan(
+		&relationACL,
+		&directColumns,
+		&runtimeEffective,
+		&workloadEffective,
+		&capabilityEffective,
+	); err != nil {
+		return fmt.Errorf("inspect exact-38 %s %s ACL: %w", relation, privilege, err)
+	}
+	wantDirect := make([]string, 0, len(want))
+	for _, column := range want {
+		wantDirect = append(
+			wantDirect,
+			column+":aiops_control_plane_runtime:false:aiops_schema_owner",
+		)
+	}
+	if len(relationACL) != 0 ||
+		!reflect.DeepEqual(directColumns, wantDirect) ||
+		!reflect.DeepEqual(runtimeEffective, want) ||
+		!reflect.DeepEqual(workloadEffective, want) ||
+		len(capabilityEffective) != 0 {
+		return fmt.Errorf(
+			"exact-38 %s %s relation=%v direct=%v runtime=%v workload=%v capability=%v, want direct=%v and effective=%v",
+			relation,
+			privilege,
+			relationACL,
+			directColumns,
+			runtimeEffective,
+			workloadEffective,
+			capabilityEffective,
+			wantDirect,
+			want,
+		)
+	}
+	return nil
+}
+
+func qualificationFixtureAssertProtectedColumnDMLDenied(
+	t *testing.T,
+	application *pgxpool.Pool,
+) {
+	t.Helper()
+	for _, query := range []string{
+		`INSERT INTO public.asset_sources (gate_evidence_run_id) VALUES (NULL)`,
+		`UPDATE public.asset_sources SET gate_evidence_digest=gate_evidence_digest WHERE false`,
+		`INSERT INTO public.asset_source_runs (qualification_result_digest) VALUES (NULL)`,
+		`UPDATE public.asset_source_runs
+		 SET ha_fact_chain_digest=ha_fact_chain_digest WHERE false`,
+	} {
+		expectAssetSQLState(t, application, "42501", query)
+	}
 }
 
 func qualificationFixtureSchemaStateFor(
@@ -3408,7 +5705,7 @@ func closeSyntheticQualificationReceipt(
 			facts.receiptExpiresAt, issuedAt)
 	}
 
-	signingKeyID := "synthetic-test-only-signing-key-v1"
+	signingKeyID := "synthetic-structural-shape-only-signing-key-v1"
 	receiptDigest := assetCatalogCorrectiveFramedDigest(
 		[]byte("asset-source-qualification-receipt.v1"),
 		[]byte(fixture.tenantID),
@@ -3426,10 +5723,6 @@ func closeSyntheticQualificationReceipt(
 		[]byte(qualificationFixtureTimestamp(facts.receiptExpiresAt)),
 		[]byte(signingKeyID),
 	)
-	signatureMaterial := append(
-		assetCatalogCorrectiveDecodeDigest(t, receiptDigest),
-		assetCatalogCorrectiveDecodeDigest(t, receiptDigest)...,
-	)
 	seal := qualificationFixtureSeal{
 		evidenceKind:            evidenceKind,
 		scopeDigest:             facts.scopeDigest,
@@ -3442,7 +5735,7 @@ func closeSyntheticQualificationReceipt(
 		issuedAt:                issuedAt,
 		expiresAt:               facts.receiptExpiresAt,
 		signingKeyID:            signingKeyID,
-		signature:               base64.RawURLEncoding.EncodeToString(signatureMaterial),
+		signature:               qualificationFixtureStructuralSignature(t, receiptDigest),
 		receiptDigest:           receiptDigest,
 		haOwnerWorker:           qualificationFixtureOptionalDigest(haFacts.ownerWorker),
 		haTakeoverWorker:        qualificationFixtureOptionalDigest(haFacts.takeoverWorker),
@@ -3548,6 +5841,16 @@ func closeSyntheticQualificationReceipt(
 		t.Fatalf("commit synthetic-test-only qualification final closure: %v", err)
 	}
 	return seal
+}
+
+// qualificationFixtureStructuralSignature deliberately constructs only a
+// canonical unpadded-base64url shape for disposable migration-owner fixtures.
+// It is not a cryptographic signature or Task 19A2a/19A2b/G2/G4 evidence.
+func qualificationFixtureStructuralSignature(t *testing.T, receiptDigest string) string {
+	t.Helper()
+	digest := assetCatalogCorrectiveDecodeDigest(t, receiptDigest)
+	structuralShape := append(append([]byte(nil), digest...), digest...)
+	return base64.RawURLEncoding.EncodeToString(structuralShape)
 }
 
 type qualificationFixtureHASeal struct {
