@@ -115,6 +115,19 @@ func TestQualificationFixtureRoutineCallsUseNonNullSafeParameters(t *testing.T) 
 	}
 }
 
+func TestQualificationFixtureOwnRoutineSessionRejectsBodyError(t *testing.T) {
+	err := qualificationFixtureOwnRoutineSessionVerdict(
+		"aiops_source_gate_sealer",
+		&pgconn.PgError{
+			Code:    "P0001",
+			Message: "synthetic primitive body failure",
+		},
+	)
+	if err == nil {
+		t.Fatal("own routine session verdict accepted a non-authorization body error")
+	}
+}
+
 func TestAssetCatalogQualificationRoutineACLAndColumnBoundary(t *testing.T) {
 	t.Run("version matched", func(t *testing.T) {
 		harness := newAssetCatalogHarness(t)
@@ -195,6 +208,78 @@ func TestAssetCatalogQualificationRoutineACLAndColumnBoundary(t *testing.T) {
 		harness.assertSourceGateCapabilityACLAbsent(t)
 		harness.assertSourceGateCapabilityConnectionsRejected(t)
 		qualificationFixtureAssertPartialCapabilityBoundary(t, harness, true)
+	})
+
+	t.Run("synthetic exact-38 routine sessions require error-free own calls", func(t *testing.T) {
+		harness := newAssetCatalogHarness(t)
+		harness.applyThroughAssetCatalog(t)
+		state, err := qualificationFixtureSchemaStateFor(
+			context.Background(),
+			harness.db,
+		)
+		if err != nil {
+			t.Fatalf("inspect qualification schema before synthetic routine session probe: %v", err)
+		}
+		if state == qualificationFixtureSchemaFull {
+			qualificationFixtureAssertExact38RoutineCatalog(t, harness)
+			return
+		}
+		qualificationFixtureInstallSyntheticSourceGateRoutines(t, harness)
+		qualificationFixtureConfigureSyntheticExact38RoutineACL(t, harness)
+		t.Cleanup(func() {
+			qualificationFixtureResetSyntheticExact38RoutineACL(t, harness)
+			qualificationFixtureDropSyntheticSourceGateRoutines(t, harness)
+		})
+		harness.grantSourceGateCapabilityACLForTest(t)
+		t.Cleanup(func() {
+			if err := harness.closeSourceGateCapabilityBounded(); err != nil {
+				t.Errorf("close synthetic routine session capability ACL: %v", err)
+			}
+		})
+
+		contracts := qualificationFixtureSourceGateRoutineContracts()
+		sealer, err := harness.openSourceGateCapabilityPool(
+			context.Background(),
+			harness.sourceGateSealConfig,
+		)
+		if err != nil {
+			t.Fatalf("open synthetic exact-38 sealer session: %v", err)
+		}
+		defer sealer.Close()
+		admitter, err := harness.openSourceGateCapabilityPool(
+			context.Background(),
+			harness.sourceGateAdmitConfig,
+		)
+		if err != nil {
+			t.Fatalf("open synthetic exact-38 admitter session: %v", err)
+		}
+		defer admitter.Close()
+
+		for index, pool := range []*pgxpool.Pool{sealer, admitter} {
+			qualificationFixtureAssertOwnRoutineSessionAccepted(
+				t,
+				pool,
+				contracts[index].identity,
+				contracts[index].ownQuery,
+				contracts[index].ownArguments,
+			)
+			qualificationFixtureExpectSerializableSQLState(
+				t,
+				pool,
+				"42501",
+				contracts[index].crossQuery,
+				contracts[index].crossArguments,
+			)
+		}
+		for _, contract := range contracts {
+			qualificationFixtureExpectSerializableSQLState(
+				t,
+				harness.application,
+				"42501",
+				contract.ownQuery,
+				contract.ownArguments,
+			)
+		}
 	})
 
 	t.Run("synthetic exact-38 Runs ACL rejects broad legacy columns", func(t *testing.T) {
@@ -3258,13 +3343,20 @@ func qualificationFixtureAssertOwnRoutineSessionAccepted(
 ) {
 	t.Helper()
 	err := qualificationFixtureExecSerializableRoutine(database, query, arguments)
-	state := assetCatalogSQLState(err)
-	if state == "42501" {
-		t.Fatalf("%s own non-NULL routine call returned SQLSTATE 42501", identity)
+	if err := qualificationFixtureOwnRoutineSessionVerdict(identity, err); err != nil {
+		t.Fatal(err)
 	}
-	if err != nil && state == "" {
-		t.Fatalf("%s own non-NULL routine probe failed before a database verdict: %v", identity, err)
+}
+
+func qualificationFixtureOwnRoutineSessionVerdict(identity string, err error) error {
+	if err != nil {
+		return fmt.Errorf(
+			"%s own non-NULL routine call must complete without error: %w",
+			identity,
+			err,
+		)
 	}
+	return nil
 }
 
 func qualificationFixtureExpectSerializableSQLState(
