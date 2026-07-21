@@ -2,13 +2,20 @@ package postgres_test
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -25,11 +32,13 @@ import (
 )
 
 type assetCatalogHarness struct {
-	admin       *pgxpool.Pool
-	db          *pgxpool.Pool
-	migration   *pgxpool.Pool
-	application *pgxpool.Pool
-	name        string
+	admin                 *pgxpool.Pool
+	db                    *pgxpool.Pool
+	migration             *pgxpool.Pool
+	application           *pgxpool.Pool
+	sourceGateSealConfig  *pgxpool.Config
+	sourceGateAdmitConfig *pgxpool.Config
+	name                  string
 }
 
 var safeAssetCatalogControlDatabase = regexp.MustCompile(`^aiops_test(_[a-z0-9]+)*$`)
@@ -42,11 +51,11 @@ func newAssetCatalogHarness(t *testing.T) *assetCatalogHarness {
 	}
 	migrationDSN := strings.TrimSpace(os.Getenv("AIOPS_TEST_POSTGRES_MIGRATION_DSN"))
 	applicationDSN := strings.TrimSpace(os.Getenv("AIOPS_TEST_POSTGRES_APPLICATION_DSN"))
-	if migrationDSN == "" || applicationDSN == "" {
-		t.Fatal("AIOPS_TEST_POSTGRES_MIGRATION_DSN and AIOPS_TEST_POSTGRES_APPLICATION_DSN are required when the real PostgreSQL harness is enabled")
-	}
-	if adminDSN == migrationDSN || adminDSN == applicationDSN || migrationDSN == applicationDSN {
-		t.Fatal("test-control, migration, and application PostgreSQL DSNs must be distinct")
+	sourceGateSealDSN := strings.TrimSpace(os.Getenv("AIOPS_TEST_POSTGRES_SOURCE_GATE_SEAL_DSN"))
+	sourceGateAdmitDSN := strings.TrimSpace(os.Getenv("AIOPS_TEST_POSTGRES_SOURCE_GATE_ADMIT_DSN"))
+	if migrationDSN == "" || applicationDSN == "" ||
+		sourceGateSealDSN == "" || sourceGateAdmitDSN == "" {
+		t.Fatal("migration, application, source-gate sealer, and source-gate admitter PostgreSQL DSNs are required when the real PostgreSQL harness is enabled")
 	}
 	ctx := context.Background()
 	adminConfig, err := pgxpool.ParseConfig(adminDSN)
@@ -54,7 +63,8 @@ func newAssetCatalogHarness(t *testing.T) *assetCatalogHarness {
 		t.Fatal("parse PostgreSQL test-control DSN: invalid configuration")
 	}
 	controlName := adminConfig.ConnConfig.Database
-	if !assetCatalogControlDatabaseNameSafe(controlName) {
+	if !assetCatalogControlDatabaseNameSafe(controlName) ||
+		adminConfig.ConnConfig.User != "aiops" || adminConfig.ConnConfig.Password == "" {
 		t.Fatalf("AIOPS_TEST_POSTGRES_DSN must name a dedicated safe test control database, got %q", controlName)
 	}
 	migrationConfig, err := assetCatalogRolePoolConfig(migrationDSN, controlName, "aiops_migrator")
@@ -65,20 +75,43 @@ func newAssetCatalogHarness(t *testing.T) *assetCatalogHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sourceGateSealConfig, err := assetCatalogRolePoolConfig(
+		sourceGateSealDSN, controlName, "aiops_source_gate_sealer",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceGateAdmitConfig, err := assetCatalogRolePoolConfig(
+		sourceGateAdmitDSN, controlName, "aiops_source_gate_admitter",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := assetCatalogIdentityConfigsDistinct(
+		[]string{adminDSN, migrationDSN, applicationDSN, sourceGateSealDSN, sourceGateAdmitDSN},
+		[]*pgxpool.Config{
+			adminConfig, migrationConfig, applicationConfig, sourceGateSealConfig, sourceGateAdmitConfig,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
 	adminConfig.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 	admin, err := pgxpool.NewWithConfig(ctx, adminConfig)
 	if err != nil {
 		t.Fatalf("connect PostgreSQL test control database: %v", err)
 	}
+	t.Cleanup(admin.Close)
 	var serverVersion int
 	if err := admin.QueryRow(ctx, `SELECT current_setting('server_version_num')::integer`).Scan(&serverVersion); err != nil {
-		admin.Close()
 		t.Fatalf("read PostgreSQL server version: %v", err)
 	}
 	if serverVersion < 180004 || serverVersion >= 190000 {
-		admin.Close()
 		t.Fatalf("integration harness requires PostgreSQL 18.4 or newer 18.x, got %d", serverVersion)
 	}
+	assertAssetCatalogPoolIdentity(t, admin, "aiops")
+	assertAssetCatalogConfigIdentity(t, sourceGateSealConfig, "aiops_source_gate_sealer")
+	assertAssetCatalogConfigIdentity(t, sourceGateAdmitConfig, "aiops_source_gate_admitter")
+	assertSourceGateCapabilityRoleContracts(t, admin)
 
 	databaseName := "aiops_assets_test_" + randomAssetHex(t, 16)
 	identifier := pgx.Identifier{databaseName}.Sanitize()
@@ -99,7 +132,6 @@ func newAssetCatalogHarness(t *testing.T) *assetCatalogHarness {
 				t.Errorf("drop isolated physical PostgreSQL database %s: %v", databaseName, err)
 			}
 		}
-		admin.Close()
 	})
 	if _, err := admin.Exec(ctx, "CREATE DATABASE "+identifier+" WITH TEMPLATE template0 OWNER aiops_schema_owner"); err != nil {
 		t.Fatalf("create isolated physical PostgreSQL test database %s; ownership unconfirmed, refusing destructive cleanup: %v", databaseName, err)
@@ -108,6 +140,8 @@ func newAssetCatalogHarness(t *testing.T) *assetCatalogHarness {
 	if _, err := admin.Exec(ctx, `SET ROLE aiops_schema_owner;
 REVOKE ALL ON DATABASE `+identifier+` FROM PUBLIC;
 REVOKE ALL ON DATABASE `+identifier+` FROM aiops_control_plane_runtime;
+REVOKE ALL ON DATABASE `+identifier+` FROM aiops_source_gate_sealer;
+REVOKE ALL ON DATABASE `+identifier+` FROM aiops_source_gate_admitter;
 GRANT CONNECT ON DATABASE `+identifier+` TO aiops_migrator;
 GRANT CONNECT ON DATABASE `+identifier+` TO aiops_control_plane_workload;
 RESET ROLE;`); err != nil {
@@ -139,6 +173,8 @@ SET ROLE aiops_schema_owner;
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 REVOKE ALL ON SCHEMA public FROM aiops_migrator;
 REVOKE ALL ON SCHEMA public FROM aiops_control_plane_workload;
+REVOKE ALL ON SCHEMA public FROM aiops_source_gate_sealer;
+REVOKE ALL ON SCHEMA public FROM aiops_source_gate_admitter;
 GRANT CREATE, USAGE ON SCHEMA public TO aiops_schema_owner;
 GRANT USAGE ON SCHEMA public TO aiops_control_plane_runtime;
 RESET ROLE;`); err != nil {
@@ -164,8 +200,16 @@ RESET ROLE;`); err != nil {
 	assertAssetCatalogPoolIdentity(t, migration, "aiops_migrator")
 	assertAssetCatalogPoolIdentity(t, application, "aiops_control_plane_workload")
 	harness := &assetCatalogHarness{
-		admin: admin, db: database, migration: migration, application: application, name: databaseName,
+		admin:                 admin,
+		db:                    database,
+		migration:             migration,
+		application:           application,
+		sourceGateSealConfig:  sourceGateSealConfig,
+		sourceGateAdmitConfig: sourceGateAdmitConfig,
+		name:                  databaseName,
 	}
+	harness.assertSourceGateCapabilityACLAbsent(t)
+	harness.assertSourceGateCapabilityConnectionsRejected(t)
 	return harness
 }
 
@@ -180,6 +224,9 @@ func assetCatalogRolePoolConfig(dsn, controlName, expectedUser string) (*pgxpool
 	if config.ConnConfig.User != expectedUser {
 		return nil, fmt.Errorf("PostgreSQL DSN identity must be %s", expectedUser)
 	}
+	if config.ConnConfig.Password == "" {
+		return nil, fmt.Errorf("%s PostgreSQL DSN must use an identity-specific credential", expectedUser)
+	}
 	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 	if config.ConnConfig.RuntimeParams == nil {
 		config.ConnConfig.RuntimeParams = make(map[string]string)
@@ -189,6 +236,24 @@ func assetCatalogRolePoolConfig(dsn, controlName, expectedUser string) (*pgxpool
 		config.MaxConns = 12
 	}
 	return config, nil
+}
+
+func assetCatalogIdentityConfigsDistinct(
+	rawDSNs []string,
+	configs []*pgxpool.Config,
+) error {
+	if len(rawDSNs) != 5 || len(configs) != 5 {
+		return errors.New("asset-catalog integration harness requires exactly five PostgreSQL identities")
+	}
+	for left := range rawDSNs {
+		for right := left + 1; right < len(rawDSNs); right++ {
+			if rawDSNs[left] == rawDSNs[right] ||
+				configs[left].ConnConfig.Password == configs[right].ConnConfig.Password {
+				return errors.New("PostgreSQL test identities must use pairwise-distinct DSNs and credentials")
+			}
+		}
+	}
+	return nil
 }
 
 func assertAssetCatalogPoolIdentity(t *testing.T, pool *pgxpool.Pool, expected string) {
@@ -202,9 +267,1091 @@ func assertAssetCatalogPoolIdentity(t *testing.T, pool *pgxpool.Pool, expected s
 	}
 }
 
+func assertAssetCatalogConfigIdentity(
+	t *testing.T,
+	config *pgxpool.Config,
+	expected string,
+) {
+	t.Helper()
+	pool, err := pgxpool.NewWithConfig(context.Background(), config.Copy())
+	if err != nil {
+		t.Fatalf("connect PostgreSQL control identity %s: unavailable", expected)
+	}
+	defer pool.Close()
+	if err := pool.Ping(context.Background()); err != nil {
+		t.Fatalf("ping PostgreSQL control identity %s: unavailable", expected)
+	}
+	assertAssetCatalogPoolIdentity(t, pool, expected)
+}
+
+func assertSourceGateCapabilityRoleContracts(t *testing.T, admin *pgxpool.Pool) {
+	t.Helper()
+	const expectedRoleCount = 2
+	rows, err := admin.Query(context.Background(), `
+		SELECT rolname,rolcanlogin,rolinherit,rolsuper,rolcreatedb,rolcreaterole,
+		       rolreplication,rolbypassrls
+		FROM pg_roles
+		WHERE rolname=ANY($1::text[])
+		ORDER BY rolname
+	`, []string{"aiops_source_gate_admitter", "aiops_source_gate_sealer"})
+	if err != nil {
+		t.Fatalf("inspect Source Gate capability roles: %v", err)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var (
+			role                               string
+			login, inherit, super, createDB    bool
+			createRole, replication, bypassRLS bool
+		)
+		if err := rows.Scan(
+			&role, &login, &inherit, &super, &createDB, &createRole, &replication, &bypassRLS,
+		); err != nil {
+			t.Fatalf("scan Source Gate capability role contract: %v", err)
+		}
+		if !login || inherit || super || createDB || createRole || replication || bypassRLS {
+			t.Fatalf("Source Gate capability role %s flags drifted", role)
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate Source Gate capability roles: %v", err)
+	}
+	if count != expectedRoleCount {
+		t.Fatalf("Source Gate capability role count=%d, want %d", count, expectedRoleCount)
+	}
+	var memberships int
+	if err := admin.QueryRow(context.Background(), `
+		SELECT count(*)
+		FROM pg_auth_members AS membership
+		JOIN pg_roles AS granted_role ON granted_role.oid=membership.roleid
+		JOIN pg_roles AS member_role ON member_role.oid=membership.member
+		WHERE granted_role.rolname=ANY($1::text[])
+		   OR member_role.rolname=ANY($1::text[])
+	`, []string{"aiops_source_gate_admitter", "aiops_source_gate_sealer"}).Scan(&memberships); err != nil {
+		t.Fatalf("inspect Source Gate capability memberships: %v", err)
+	}
+	if memberships != 0 {
+		t.Fatalf("Source Gate capability role memberships=%d, want 0", memberships)
+	}
+}
+
+func TestSourceGateCapabilityIdentityHarnessArtifacts(t *testing.T) {
+	t.Parallel()
+	artifacts := map[string][]string{
+		".env.example": {
+			"AIOPS_TEST_POSTGRES_SOURCE_GATE_SEAL_DSN=",
+			"AIOPS_TEST_POSTGRES_SOURCE_GATE_ADMIT_DSN=",
+			"AIOPS_SOURCE_GATE_ADMIT_DATABASE_URL=",
+			"AIOPS_DISCOVERY_SOURCE_GATE_SEAL_DSN_FILE=",
+			"AIOPS_LOCAL_POSTGRES_SOURCE_GATE_SEAL_USER=aiops_source_gate_sealer",
+			"AIOPS_LOCAL_POSTGRES_SOURCE_GATE_ADMIT_USER=aiops_source_gate_admitter",
+			"AIOPS_LOCAL_POSTGRES_SOURCE_GATE_SEAL_PASSWORD_FILE=",
+			"AIOPS_LOCAL_POSTGRES_SOURCE_GATE_ADMIT_PASSWORD_FILE=",
+			"AIOPS_LOCAL_POSTGRES_SOURCE_GATE_SEAL_CERT_FILE=",
+			"AIOPS_LOCAL_POSTGRES_SOURCE_GATE_ADMIT_CERT_FILE=",
+			"AIOPS_LOCAL_POSTGRES_SOURCE_GATE_SEAL_KEY_FILE=",
+			"AIOPS_LOCAL_POSTGRES_SOURCE_GATE_ADMIT_KEY_FILE=",
+		},
+		"scripts/with-local-postgres.sh": {
+			"aiops_source_gate_sealer",
+			"aiops_source_gate_admitter",
+			"AIOPS_TEST_POSTGRES_SOURCE_GATE_SEAL_DSN",
+			"AIOPS_TEST_POSTGRES_SOURCE_GATE_ADMIT_DSN",
+			"AIOPS_LOCAL_POSTGRES_SOURCE_GATE_SEAL_PASSWORD_FILE",
+			"AIOPS_LOCAL_POSTGRES_SOURCE_GATE_ADMIT_PASSWORD_FILE",
+			"AIOPS_LOCAL_POSTGRES_SOURCE_GATE_SEAL_CERT_FILE",
+			"AIOPS_LOCAL_POSTGRES_SOURCE_GATE_ADMIT_CERT_FILE",
+			"AIOPS_LOCAL_POSTGRES_SOURCE_GATE_SEAL_KEY_FILE",
+			"AIOPS_LOCAL_POSTGRES_SOURCE_GATE_ADMIT_KEY_FILE",
+			"OpenSSL::X509::Certificate",
+			"common_names == [expected]",
+			"pg_catalog.pg_stat_ssl",
+			"client_serial::text",
+			"AIOPS_POSTGRES_PROBE_EXPECTED_SERIAL",
+			"PGREQUIREAUTH=scram-sha-256",
+			"PGPASSFILE=$empty_passfile",
+			"unset PGSSLCERT PGSSLKEY",
+			"--no-password",
+			"/run/aiops-postgres/wrong-client.crt",
+			"/run/aiops-postgres/wrong-client.key",
+		},
+		".github/workflows/ci.yml": {
+			"aiops_source_gate_sealer",
+			"aiops_source_gate_admitter",
+			"AIOPS_TEST_POSTGRES_SOURCE_GATE_SEAL_DSN",
+			"AIOPS_TEST_POSTGRES_SOURCE_GATE_ADMIT_DSN",
+		},
+		"docs/operations/local-postgresql-development.md": {
+			"All five rows below describe the current test harness",
+			"AIOPS_TEST_POSTGRES_SOURCE_GATE_SEAL_DSN",
+			"AIOPS_TEST_POSTGRES_SOURCE_GATE_ADMIT_DSN",
+			"AIOPS_SOURCE_GATE_ADMIT_DATABASE_URL",
+			"AIOPS_DISCOVERY_SOURCE_GATE_SEAL_DSN_FILE",
+		},
+	}
+	for relative, required := range artifacts {
+		contents := assetCatalogRepositoryArtifact(t, relative)
+		for _, token := range required {
+			if !strings.Contains(contents, token) {
+				t.Errorf("%s missing capability-harness token %q", relative, token)
+			}
+		}
+	}
+	envExample := assetCatalogRepositoryArtifact(t, ".env.example")
+	for _, key := range []string{
+		"AIOPS_SOURCE_GATE_ADMIT_DATABASE_URL",
+		"AIOPS_DISCOVERY_SOURCE_GATE_SEAL_DSN_FILE",
+	} {
+		count := 0
+		for _, line := range strings.Split(envExample, "\n") {
+			if strings.HasPrefix(line, key+"=") {
+				count++
+				if line != key+"=" {
+					t.Errorf("%s production slot is not empty", key)
+				}
+			}
+		}
+		if count != 1 {
+			t.Errorf("%s production slot count=%d, want 1", key, count)
+		}
+	}
+}
+
+func TestLocalPostgreSQLIdentityProbeArtifactsRequireTLSClientCertificateAndPassword(t *testing.T) {
+	t.Parallel()
+	script := assetCatalogRepositoryArtifact(t, "scripts/with-local-postgres.sh")
+	requiredInOrder := []string{
+		"probe_result=$(docker",
+		"client_serial::text",
+		"pg_catalog.pg_stat_ssl",
+		"AIOPS_POSTGRES_PROBE_EXPECTED_SERIAL",
+		"unset PGSSLCERT PGSSLKEY",
+		"--no-password",
+		"/run/aiops-postgres/wrong-client.crt",
+	}
+	offset := 0
+	for _, token := range requiredInOrder {
+		index := strings.Index(script[offset:], token)
+		if index < 0 {
+			t.Fatalf("local PostgreSQL identity probe missing ordered dual-factor token %q", token)
+		}
+		offset += index + len(token)
+	}
+	for _, token := range []string{
+		`[ "$probe_result" = "$expected_probe_result" ]`,
+		`if psql --no-password -X -v ON_ERROR_STOP=1 -Atc "SELECT 1" >/dev/null 2>&1; then`,
+		`export PGREQUIREAUTH=scram-sha-256`,
+		`chmod 600 "$empty_passfile"`,
+	} {
+		if !strings.Contains(script, token) {
+			t.Errorf("local PostgreSQL identity probe missing fail-closed behavior %q", token)
+		}
+	}
+}
+
+func TestLocalPostgreSQLIdentityProbeBehaviorFailsClosed(t *testing.T) {
+	t.Parallel()
+	script := localPostgreSQLIdentityProbeScript(t)
+	const (
+		expectedUser     = "aiops_source_gate_sealer"
+		expectedPassword = "behavior-test-password-not-a-secret"
+		expectedSerial   = "12345678901234567890"
+		negativeCanary   = "AIOPS_FAKE_NEGATIVE_CANARY"
+	)
+	expectedResult := strings.Join(
+		[]string{expectedUser, expectedUser, "t", "TLSv1.3", expectedSerial},
+		"|",
+	)
+	for _, test := range []struct {
+		name    string
+		mode    string
+		wantErr bool
+	}{
+		{name: "exact dual factor", mode: "strict"},
+		{name: "TLS downgrade", mode: "tls12", wantErr: true},
+		{name: "certificate serial drift", mode: "wrong-serial", wantErr: true},
+		{name: "certificate omission accepted", mode: "no-cert-success", wantErr: true},
+		{name: "password omission accepted", mode: "no-password-success", wantErr: true},
+		{name: "swapped certificate accepted", mode: "wrong-cert-success", wantErr: true},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			output, state, passfileMode, err := runLocalPostgreSQLIdentityProbeFixture(
+				t,
+				script,
+				test.mode,
+				expectedUser,
+				expectedPassword,
+				expectedSerial,
+			)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("probe mode %q did not fail closed", test.mode)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("exact dual-factor probe failed: %v output=%q", err, output)
+				}
+				if output != expectedResult {
+					t.Fatalf("exact dual-factor probe output=%q, want %q", output, expectedResult)
+				}
+				if state != "4" {
+					t.Fatalf("exact dual-factor probe executed %q validated phases, want 4", state)
+				}
+				if passfileMode != 0o600 {
+					t.Fatalf("empty PostgreSQL passfile mode=%04o, want 0600", passfileMode)
+				}
+			}
+			if strings.Contains(output, negativeCanary) {
+				t.Fatalf("negative probe stderr canary leaked in mode %q", test.mode)
+			}
+			if strings.Contains(output, expectedPassword) {
+				t.Fatalf("probe password leaked in mode %q", test.mode)
+			}
+		})
+	}
+}
+
+func localPostgreSQLIdentityProbeScript(t *testing.T) string {
+	t.Helper()
+	script := assetCatalogRepositoryArtifact(t, "scripts/with-local-postgres.sh")
+	const (
+		startMarker = "        -euc '\n"
+		endMarker   = "\n        ' 2>/dev/null) || fail \"control-database identity probe failed"
+	)
+	start := strings.Index(script, startMarker)
+	if start < 0 {
+		t.Fatal("local PostgreSQL wrapper identity probe shell is not extractable")
+	}
+	start += len(startMarker)
+	end := strings.Index(script[start:], endMarker)
+	if end < 0 {
+		t.Fatal("local PostgreSQL wrapper identity probe shell has no stable end marker")
+	}
+	return script[start : start+end]
+}
+
+func runLocalPostgreSQLIdentityProbeFixture(
+	t *testing.T,
+	script string,
+	mode string,
+	user string,
+	password string,
+	serial string,
+) (string, string, os.FileMode, error) {
+	t.Helper()
+	root := t.TempDir()
+	statePath := filepath.Join(root, "probe-state")
+	fakePSQLPath := filepath.Join(root, "psql")
+	const fakePSQL = `#!/bin/sh
+set -eu
+
+state=0
+if [ -f "$AIOPS_FAKE_PSQL_STATE_FILE" ]; then
+    state=$(cat "$AIOPS_FAKE_PSQL_STATE_FILE")
+fi
+phase=$((state + 1))
+
+[ "${PGREQUIREAUTH:-}" = "scram-sha-256" ] || exit 80
+[ "${PGSSLMODE:-}" = "verify-full" ] || exit 81
+[ "${PGSSLROOTCERT:-}" = "/run/aiops-postgres/ca.crt" ] || exit 82
+[ -f "${PGPASSFILE:-}" ] || exit 83
+
+case "$phase" in
+    1)
+        case "$*" in
+            *pg_catalog.pg_stat_ssl*) ;;
+            *) exit 84 ;;
+        esac
+        [ "${PGSSLCERT:-}" = "/run/aiops-postgres/client.crt" ] || exit 85
+        [ "${PGSSLKEY:-}" = "/run/aiops-postgres/client.key" ] || exit 86
+        [ "${PGPASSWORD:-}" = "$AIOPS_POSTGRES_PROBE_PASSWORD" ] || exit 87
+        printf '%s' "$phase" > "$AIOPS_FAKE_PSQL_STATE_FILE"
+        tls=TLSv1.3
+        certificate_serial=$AIOPS_POSTGRES_PROBE_EXPECTED_SERIAL
+        [ "$AIOPS_FAKE_PSQL_MODE" != "tls12" ] || tls=TLSv1.2
+        [ "$AIOPS_FAKE_PSQL_MODE" != "wrong-serial" ] || certificate_serial=999
+        printf '%s|%s|t|%s|%s\n' \
+            "$AIOPS_POSTGRES_PROBE_USER" \
+            "$AIOPS_POSTGRES_PROBE_USER" \
+            "$tls" \
+            "$certificate_serial"
+        ;;
+    2)
+        [ "${PGSSLCERT+x}" != "x" ] || exit 88
+        [ "${PGSSLKEY+x}" != "x" ] || exit 89
+        [ "${PGPASSWORD:-}" = "$AIOPS_POSTGRES_PROBE_PASSWORD" ] || exit 90
+        printf '%s' "$phase" > "$AIOPS_FAKE_PSQL_STATE_FILE"
+        printf '%s\n' "AIOPS_FAKE_NEGATIVE_CANARY" >&2
+        [ "$AIOPS_FAKE_PSQL_MODE" != "no-cert-success" ] || exit 0
+        exit 1
+        ;;
+    3)
+        [ "${PGSSLCERT:-}" = "/run/aiops-postgres/client.crt" ] || exit 91
+        [ "${PGSSLKEY:-}" = "/run/aiops-postgres/client.key" ] || exit 92
+        [ "${PGPASSWORD+x}" != "x" ] || exit 93
+        no_password=false
+        for argument in "$@"; do
+            [ "$argument" != "--no-password" ] || no_password=true
+        done
+        [ "$no_password" = "true" ] || exit 94
+        printf '%s' "$phase" > "$AIOPS_FAKE_PSQL_STATE_FILE"
+        printf '%s\n' "AIOPS_FAKE_NEGATIVE_CANARY" >&2
+        [ "$AIOPS_FAKE_PSQL_MODE" != "no-password-success" ] || exit 0
+        exit 1
+        ;;
+    4)
+        [ "${PGSSLCERT:-}" = "/run/aiops-postgres/wrong-client.crt" ] || exit 95
+        [ "${PGSSLKEY:-}" = "/run/aiops-postgres/wrong-client.key" ] || exit 96
+        [ "${PGPASSWORD:-}" = "$AIOPS_POSTGRES_PROBE_PASSWORD" ] || exit 97
+        printf '%s' "$phase" > "$AIOPS_FAKE_PSQL_STATE_FILE"
+        printf '%s\n' "AIOPS_FAKE_NEGATIVE_CANARY" >&2
+        [ "$AIOPS_FAKE_PSQL_MODE" != "wrong-cert-success" ] || exit 0
+        exit 1
+        ;;
+    *)
+        exit 98
+        ;;
+esac
+`
+	if err := os.WriteFile(fakePSQLPath, []byte(fakePSQL), 0o700); err != nil {
+		t.Fatalf("write fake psql: %v", err)
+	}
+	command := exec.Command("sh", "-euc", script)
+	command.Env = []string{
+		"PATH=" + root + ":" + os.Getenv("PATH"),
+		"TMPDIR=" + root,
+		"AIOPS_FAKE_PSQL_MODE=" + mode,
+		"AIOPS_FAKE_PSQL_STATE_FILE=" + statePath,
+		"AIOPS_POSTGRES_PROBE_HOST=localhost",
+		"AIOPS_POSTGRES_PROBE_PORT=55432",
+		"AIOPS_POSTGRES_PROBE_DATABASE=aiops_test",
+		"AIOPS_POSTGRES_PROBE_USER=" + user,
+		"AIOPS_POSTGRES_PROBE_PASSWORD=" + password,
+		"AIOPS_POSTGRES_PROBE_EXPECTED_SERIAL=" + serial,
+	}
+	combined, err := command.CombinedOutput()
+	state, _ := os.ReadFile(statePath)
+	passfiles, globErr := filepath.Glob(filepath.Join(root, "aiops-postgres-empty-home-*", ".pgpass"))
+	if globErr != nil {
+		t.Fatalf("find empty PostgreSQL passfile: %v", globErr)
+	}
+	var passfileMode os.FileMode
+	if len(passfiles) == 1 {
+		info, statErr := os.Stat(passfiles[0])
+		if statErr != nil {
+			t.Fatalf("stat empty PostgreSQL passfile: %v", statErr)
+		}
+		passfileMode = info.Mode().Perm()
+	}
+	return strings.TrimSpace(string(combined)), string(state), passfileMode, err
+}
+
+func TestLocalPostgreSQLCertificateIdentityParserRejectsAmbiguousCN(t *testing.T) {
+	t.Parallel()
+	script := assetCatalogRepositoryArtifact(t, "scripts/with-local-postgres.sh")
+	const (
+		startMarker = "ruby -ropenssl -e '\n"
+		endMarker   = "\n    ' \"$cert_file\" \"$expected_cn\""
+		expectedCN  = "aiops_source_gate_sealer"
+	)
+	start := strings.Index(script, startMarker)
+	if start < 0 {
+		t.Fatal("local PostgreSQL wrapper has no embedded certificate identity parser")
+	}
+	start += len(startMarker)
+	end := strings.Index(script[start:], endMarker)
+	if end < 0 {
+		t.Fatal("local PostgreSQL wrapper certificate identity parser is not extractable")
+	}
+	parser := script[start : start+end]
+
+	valid := writeCertificateIdentityFixture(t, pkix.Name{CommonName: expectedCN}, nil)
+	if output, err := exec.Command("ruby", "-ropenssl", "-e", parser, valid, expectedCN).CombinedOutput(); err != nil {
+		t.Fatalf("exact certificate CN rejected: %v output=%q", err, strings.TrimSpace(string(output)))
+	}
+	const (
+		serialStartMarker = "certificate_serial_decimal() {\n    ruby -ropenssl -e '\n"
+		serialEndMarker   = "\n    ' \"$1\" 2>/dev/null\n}"
+	)
+	serialStart := strings.Index(script, serialStartMarker)
+	if serialStart < 0 {
+		t.Fatal("local PostgreSQL wrapper certificate serial parser is not extractable")
+	}
+	serialStart += len(serialStartMarker)
+	serialEnd := strings.Index(script[serialStart:], serialEndMarker)
+	if serialEnd < 0 {
+		t.Fatal("local PostgreSQL wrapper certificate serial parser has no stable end marker")
+	}
+	certificatePEM, err := os.ReadFile(valid)
+	if err != nil {
+		t.Fatalf("read certificate serial fixture: %v", err)
+	}
+	block, _ := pem.Decode(certificatePEM)
+	if block == nil {
+		t.Fatal("decode certificate serial fixture")
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse certificate serial fixture: %v", err)
+	}
+	serialOutput, err := exec.Command(
+		"ruby",
+		"-ropenssl",
+		"-e",
+		script[serialStart:serialStart+serialEnd],
+		valid,
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("extract certificate serial: %v output=%q", err, strings.TrimSpace(string(serialOutput)))
+	}
+	if got, want := string(serialOutput), certificate.SerialNumber.String(); got != want {
+		t.Fatalf("certificate serial output=%q, want exact decimal %q", got, want)
+	}
+	escapedCN := writeCertificateIdentityFixture(t, pkix.Name{
+		CommonName:         "wrong",
+		OrganizationalUnit: []string{"x,CN=" + expectedCN},
+	}, nil)
+	if err := exec.Command("ruby", "-ropenssl", "-e", parser, escapedCN, expectedCN).Run(); err == nil {
+		t.Fatal("certificate with escaped CN text in a non-CN attribute was accepted")
+	}
+	rawMultipleCN, err := asn1.Marshal(pkix.RDNSequence{
+		{{Type: asn1.ObjectIdentifier{2, 5, 4, 3}, Value: expectedCN}},
+		{{Type: asn1.ObjectIdentifier{2, 5, 4, 3}, Value: "second"}},
+	})
+	if err != nil {
+		t.Fatalf("marshal multiple-CN certificate subject: %v", err)
+	}
+	multipleCN := writeCertificateIdentityFixture(t, pkix.Name{}, rawMultipleCN)
+	if err := exec.Command("ruby", "-ropenssl", "-e", parser, multipleCN, expectedCN).Run(); err == nil {
+		t.Fatal("certificate with multiple CN attributes was accepted")
+	}
+}
+
+func writeCertificateIdentityFixture(
+	t *testing.T,
+	subject pkix.Name,
+	rawSubject []byte,
+) string {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate certificate identity fixture key: %v", err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               subject,
+		RawSubject:            rawSubject,
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+	if err != nil {
+		t.Fatalf("create certificate identity fixture: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "client.crt")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("write certificate identity fixture: %v", err)
+	}
+	return path
+}
+
+func TestSourceGateCapabilityACLPlanFailsClosed(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name          string
+		state         qualificationFixtureSchemaState
+		inspectionErr error
+		grant         bool
+		closed        bool
+	}{
+		{name: "exact 36", state: qualificationFixtureSchemaOld},
+		{name: "exact 38", state: qualificationFixtureSchemaFull, grant: true},
+		{name: "unknown", inspectionErr: errors.New("unknown schema"), closed: true},
+		{name: "partial", state: qualificationFixtureSchemaState("PARTIAL"), closed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			plan := sourceGateCapabilityACLPlanFor(test.state, test.inspectionErr)
+			if plan.grant != test.grant || plan.closed != test.closed {
+				t.Errorf("plan=%+v, want grant=%t closed=%t", plan, test.grant, test.closed)
+			}
+		})
+	}
+}
+
+func TestSourceGateCapabilityIdentityHarnessReconcilesVersionMatchedAndPartial(t *testing.T) {
+	t.Run("version matched", func(t *testing.T) {
+		harness := newAssetCatalogHarness(t)
+		harness.applyThroughAssetCatalog(t)
+		state, err := qualificationFixtureSchemaStateFor(context.Background(), harness.application)
+		if err != nil {
+			t.Fatalf("inspect capability schema state: %v", err)
+		}
+		harness.assertSourceGateCapabilityACLForSchemaState(t, state)
+		harness.grantSourceGateCapabilityACLForTest(t)
+		if err := harness.reconcileSourceGateCapabilityACL(
+			context.Background(),
+			sourceGateCapabilityAdmissionCallbacksForCurrentBinary(),
+		); err != nil {
+			t.Fatalf("reconcile version-matched capability ACL: %v", err)
+		}
+		harness.assertSourceGateCapabilityACLForSchemaState(t, state)
+	})
+
+	t.Run("partial", func(t *testing.T) {
+		harness := newAssetCatalogHarness(t)
+		harness.applyThroughAssetCatalog(t)
+		execAssetSQL(t, harness.db, `
+			ALTER TABLE public.asset_sources
+			ADD COLUMN gate_evidence_unreviewed text
+		`)
+		harness.grantSourceGateCapabilityACLForTest(t)
+		err := harness.reconcileSourceGateCapabilityACL(
+			context.Background(),
+			sourceGateCapabilityAdmissionCallbacksForCurrentBinary(),
+		)
+		if !errors.Is(err, errSourceGateCapabilityUnavailable) {
+			t.Fatalf("partial capability reconciliation error=%v, want %v", err, errSourceGateCapabilityUnavailable)
+		}
+		harness.assertSourceGateCapabilityACLAbsent(t)
+		harness.assertSourceGateCapabilityConnectionsRejected(t)
+	})
+
+	t.Run("successful down with cancelled caller", func(t *testing.T) {
+		harness := newAssetCatalogHarness(t)
+		harness.grantSourceGateCapabilityACLForTest(t)
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := harness.reconcileSourceGateCapabilityAfterSuccessfulDown(cancelled); err != nil {
+			t.Fatalf("reconcile successful down capability ACL: %v", err)
+		}
+		harness.assertSourceGateCapabilityACLAbsent(t)
+		harness.assertSourceGateCapabilityConnectionsRejected(t)
+	})
+}
+
+func assetCatalogRepositoryArtifact(t *testing.T, relative string) string {
+	t.Helper()
+	path := filepath.Join(filepath.Dir(migrationDirectory(t)), relative)
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read repository artifact %s: %v", relative, err)
+	}
+	return string(contents)
+}
+
+var errSourceGateCapabilityUnavailable = errors.New("source gate capability unavailable")
+
+type sourceGateCapabilityACLPlan struct {
+	grant  bool
+	closed bool
+}
+
+type sourceGateCapabilityAdmissionCallbacks struct {
+	postflight  func(context.Context, *pgxpool.Pool) error
+	application func(context.Context, *pgxpool.Pool) error
+	sealer      func(context.Context, *pgxpool.Pool) error
+	admitter    func(context.Context, *pgxpool.Pool) error
+}
+
+var installedSourceGateCapabilityAdmissionCallbacks *sourceGateCapabilityAdmissionCallbacks
+
+// installSourceGateCapabilityAdmissionCallbacksForTests is the stable handoff
+// for the successor-owned exact-38 integration file. It must be called from
+// that file's init function so every existing migration harness observes one
+// immutable, version-matched callback set before tests begin.
+func installSourceGateCapabilityAdmissionCallbacksForTests(
+	callbacks sourceGateCapabilityAdmissionCallbacks,
+) {
+	if installedSourceGateCapabilityAdmissionCallbacks != nil {
+		panic("Source Gate capability admission callbacks already installed")
+	}
+	if callbacks.postflight == nil || callbacks.application == nil ||
+		callbacks.sealer == nil || callbacks.admitter == nil {
+		panic("Source Gate capability admission callbacks are incomplete")
+	}
+	copy := callbacks
+	installedSourceGateCapabilityAdmissionCallbacks = &copy
+}
+
+func sourceGateCapabilityAdmissionCallbacksForCurrentBinary() *sourceGateCapabilityAdmissionCallbacks {
+	if installedSourceGateCapabilityAdmissionCallbacks == nil {
+		return nil
+	}
+	copy := *installedSourceGateCapabilityAdmissionCallbacks
+	return &copy
+}
+
+func sourceGateCapabilityACLPlanFor(
+	state qualificationFixtureSchemaState,
+	inspectionErr error,
+) sourceGateCapabilityACLPlan {
+	if inspectionErr != nil {
+		return sourceGateCapabilityACLPlan{closed: true}
+	}
+	switch state {
+	case qualificationFixtureSchemaOld:
+		return sourceGateCapabilityACLPlan{}
+	case qualificationFixtureSchemaFull:
+		return sourceGateCapabilityACLPlan{grant: true}
+	default:
+		return sourceGateCapabilityACLPlan{closed: true}
+	}
+}
+
+func (h *assetCatalogHarness) grantSourceGateCapabilityACLForTest(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := h.migration.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		t.Fatalf("begin Source Gate capability ACL leak fixture: %v", err)
+	}
+	defer rollbackSourceGateCapabilityACLTransaction(tx)
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE aiops_schema_owner`); err != nil {
+		t.Fatalf("enter Source Gate capability ACL leak owner context: %v", err)
+	}
+	database := pgx.Identifier{h.name}.Sanitize()
+	for _, statement := range []string{
+		"GRANT CONNECT, CREATE, TEMPORARY ON DATABASE " + database +
+			" TO aiops_source_gate_sealer, aiops_source_gate_admitter",
+		"GRANT USAGE, CREATE ON SCHEMA public TO aiops_source_gate_sealer, aiops_source_gate_admitter",
+	} {
+		if _, err := tx.Exec(ctx, statement); err != nil {
+			t.Fatalf("inject Source Gate capability ACL leak: %v", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit Source Gate capability ACL leak fixture: %v", err)
+	}
+}
+
+func (h *assetCatalogHarness) reconcileSourceGateCapabilityACL(
+	ctx context.Context,
+	callbacks *sourceGateCapabilityAdmissionCallbacks,
+) error {
+	if err := h.closeSourceGateCapabilityBounded(); err != nil {
+		return fmt.Errorf("%w: initial closed-state reconciliation failed", errSourceGateCapabilityUnavailable)
+	}
+	state, inspectionErr := qualificationFixtureSchemaStateFor(ctx, h.application)
+	plan := sourceGateCapabilityACLPlanFor(state, inspectionErr)
+	if plan.closed {
+		return fmt.Errorf("%w: schema state is not exact", errSourceGateCapabilityUnavailable)
+	}
+	if !plan.grant {
+		if err := assetpostgres.NewSchemaAdmission(h.application, "public").Check(ctx); err != nil {
+			return fmt.Errorf("%w: schema admission failed", errSourceGateCapabilityUnavailable)
+		}
+		if err := storepostgres.NewDatabaseRoleAdmission(h.application, "public").Check(ctx); err != nil {
+			return fmt.Errorf("%w: database-role admission failed", errSourceGateCapabilityUnavailable)
+		}
+		return nil
+	}
+	if callbacks == nil || callbacks.postflight == nil || callbacks.application == nil ||
+		callbacks.sealer == nil || callbacks.admitter == nil {
+		return fmt.Errorf("%w: exact-38 probes are not installed", errSourceGateCapabilityUnavailable)
+	}
+	if err := callbacks.postflight(ctx, h.application); err != nil {
+		return fmt.Errorf("%w: exact-38 schema/routine postflight failed", errSourceGateCapabilityUnavailable)
+	}
+	if err := h.setSourceGateCapabilityACL(ctx, true); err != nil {
+		if closeErr := h.closeSourceGateCapabilityBounded(); closeErr != nil {
+			return fmt.Errorf("%w: conditional grant outcome unknown and bounded cleanup failed", errSourceGateCapabilityUnavailable)
+		}
+		return fmt.Errorf("%w: conditional grant failed", errSourceGateCapabilityUnavailable)
+	}
+	if err := h.runSourceGateCapabilityAdmissionCallbacks(ctx, callbacks); err != nil {
+		if closeErr := h.closeSourceGateCapabilityBounded(); closeErr != nil {
+			return fmt.Errorf("%w: exact-38 probe and bounded cleanup failed", errSourceGateCapabilityUnavailable)
+		}
+		return fmt.Errorf("%w: exact-38 probe failed", errSourceGateCapabilityUnavailable)
+	}
+	if ctx.Err() != nil {
+		if closeErr := h.closeSourceGateCapabilityBounded(); closeErr != nil {
+			return fmt.Errorf("%w: caller cancellation and bounded cleanup failed", errSourceGateCapabilityUnavailable)
+		}
+		return fmt.Errorf("%w: caller canceled exact-38 admission", errSourceGateCapabilityUnavailable)
+	}
+	return nil
+}
+
+func (h *assetCatalogHarness) reconcileSourceGateCapabilityAfterSuccessfulDown(
+	ctx context.Context,
+) error {
+	// A completed down migration must close the capability even when the
+	// caller's lifecycle context was canceled during shutdown.
+	_ = ctx
+	if err := h.closeSourceGateCapabilityBounded(); err != nil {
+		return fmt.Errorf("%w: down bounded cleanup failed", errSourceGateCapabilityUnavailable)
+	}
+	return nil
+}
+
+func (h *assetCatalogHarness) runSourceGateCapabilityAdmissionCallbacks(
+	ctx context.Context,
+	callbacks *sourceGateCapabilityAdmissionCallbacks,
+) error {
+	sealer, err := h.openSourceGateCapabilityPool(ctx, h.sourceGateSealConfig)
+	if err != nil {
+		return err
+	}
+	defer sealer.Close()
+	admitter, err := h.openSourceGateCapabilityPool(ctx, h.sourceGateAdmitConfig)
+	if err != nil {
+		return err
+	}
+	defer admitter.Close()
+	if err := callbacks.application(ctx, h.application); err != nil {
+		return err
+	}
+	if err := callbacks.sealer(ctx, sealer); err != nil {
+		return err
+	}
+	return callbacks.admitter(ctx, admitter)
+}
+
+func (h *assetCatalogHarness) openSourceGateCapabilityPool(
+	ctx context.Context,
+	controlConfig *pgxpool.Config,
+) (*pgxpool.Pool, error) {
+	if controlConfig == nil {
+		return nil, errors.New("missing Source Gate capability configuration")
+	}
+	config := controlConfig.Copy()
+	config.ConnConfig.Database = h.name
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		return nil, errors.New("open Source Gate capability pool")
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, errors.New("ping Source Gate capability pool")
+	}
+	return pool, nil
+}
+
+func (h *assetCatalogHarness) setSourceGateCapabilityACL(
+	ctx context.Context,
+	grant bool,
+) error {
+	tx, err := h.migration.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin Source Gate capability ACL transaction: %w", err)
+	}
+	defer rollbackSourceGateCapabilityACLTransaction(tx)
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE aiops_schema_owner`); err != nil {
+		return fmt.Errorf("enter Source Gate capability ACL owner context: %w", err)
+	}
+	database := pgx.Identifier{h.name}.Sanitize()
+	statements := []string{
+		"REVOKE ALL PRIVILEGES ON SCHEMA public FROM aiops_source_gate_sealer, aiops_source_gate_admitter",
+		"REVOKE ALL PRIVILEGES ON DATABASE " + database + " FROM aiops_source_gate_sealer, aiops_source_gate_admitter",
+	}
+	if grant {
+		statements = []string{
+			"GRANT CONNECT ON DATABASE " + database + " TO aiops_source_gate_sealer, aiops_source_gate_admitter",
+			"GRANT USAGE ON SCHEMA public TO aiops_source_gate_sealer, aiops_source_gate_admitter",
+		}
+	}
+	for _, statement := range statements {
+		if _, err := tx.Exec(ctx, statement); err != nil {
+			return fmt.Errorf("apply Source Gate capability ACL transition: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit Source Gate capability ACL transition: %w", err)
+	}
+	return nil
+}
+
+func rollbackSourceGateCapabilityACLTransaction(tx pgx.Tx) {
+	rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = tx.Rollback(rollbackCtx)
+}
+
+func (h *assetCatalogHarness) closeSourceGateCapabilityBounded() error {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := h.setSourceGateCapabilityACL(cleanupCtx, false); err != nil {
+		return err
+	}
+	return h.proveSourceGateCapabilityClosed(cleanupCtx)
+}
+
+func (h *assetCatalogHarness) proveSourceGateCapabilityClosed(ctx context.Context) error {
+	if err := h.sourceGateCapabilityACLAbsent(ctx); err != nil {
+		return err
+	}
+	return h.sourceGateCapabilityConnectionsRejected(ctx)
+}
+
+func (h *assetCatalogHarness) assertSourceGateCapabilityACLAbsent(t *testing.T) {
+	t.Helper()
+	if err := h.sourceGateCapabilityACLAbsent(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (h *assetCatalogHarness) assertSourceGateCapabilityACLForSchemaState(
+	t *testing.T,
+	state qualificationFixtureSchemaState,
+) {
+	t.Helper()
+	switch state {
+	case qualificationFixtureSchemaOld:
+		h.assertSourceGateCapabilityACLAbsent(t)
+		h.assertSourceGateCapabilityConnectionsRejected(t)
+	case qualificationFixtureSchemaFull:
+		h.assertSourceGateCapabilityExact38ACL(t)
+		h.assertSourceGateCapabilityConnectionsAccepted(t)
+	default:
+		t.Fatalf("unsupported Source Gate capability schema state %q", state)
+	}
+}
+
+func (h *assetCatalogHarness) assertSourceGateCapabilityExact38ACL(t *testing.T) {
+	t.Helper()
+	for _, role := range []string{"aiops_source_gate_sealer", "aiops_source_gate_admitter"} {
+		var (
+			databaseConnect   bool
+			databaseCreate    bool
+			databaseTemporary bool
+			schemaUsage       bool
+			schemaCreate      bool
+			databaseACL       []string
+			schemaACL         []string
+		)
+		if err := h.db.QueryRow(context.Background(), `
+			SELECT
+				has_database_privilege($1,current_database(),'CONNECT'),
+				has_database_privilege($1,current_database(),'CREATE'),
+				has_database_privilege($1,current_database(),'TEMPORARY'),
+				has_schema_privilege($1,'public','USAGE'),
+				has_schema_privilege($1,'public','CREATE'),
+				ARRAY (
+					SELECT upper(acl.privilege_type)
+					FROM pg_database AS database_record
+					CROSS JOIN LATERAL aclexplode(
+						COALESCE(database_record.datacl,acldefault('d',database_record.datdba))
+					) AS acl
+					JOIN pg_roles AS grantee ON grantee.oid=acl.grantee
+					WHERE database_record.datname=current_database()
+					  AND grantee.rolname=$1
+					ORDER BY upper(acl.privilege_type) COLLATE "C"
+				),
+				ARRAY (
+					SELECT upper(acl.privilege_type)
+					FROM pg_namespace AS namespace_record
+					CROSS JOIN LATERAL aclexplode(
+						COALESCE(namespace_record.nspacl,acldefault('n',namespace_record.nspowner))
+					) AS acl
+					JOIN pg_roles AS grantee ON grantee.oid=acl.grantee
+					WHERE namespace_record.nspname='public'
+					  AND grantee.rolname=$1
+					ORDER BY upper(acl.privilege_type) COLLATE "C"
+				)
+		`, role).Scan(
+			&databaseConnect,
+			&databaseCreate,
+			&databaseTemporary,
+			&schemaUsage,
+			&schemaCreate,
+			&databaseACL,
+			&schemaACL,
+		); err != nil {
+			t.Fatalf("inspect exact-38 Source Gate capability ACL for %s: %v", role, err)
+		}
+		if !databaseConnect || databaseCreate || databaseTemporary ||
+			!schemaUsage || schemaCreate ||
+			strings.Join(databaseACL, ",") != "CONNECT" ||
+			strings.Join(schemaACL, ",") != "USAGE" {
+			t.Fatalf(
+				"exact-38 Source Gate ACL for %s drifted: db=%t/%t/%t direct=%v schema=%t/%t direct=%v",
+				role,
+				databaseConnect,
+				databaseCreate,
+				databaseTemporary,
+				databaseACL,
+				schemaUsage,
+				schemaCreate,
+				schemaACL,
+			)
+		}
+	}
+}
+
+func (h *assetCatalogHarness) sourceGateCapabilityACLAbsent(ctx context.Context) error {
+	for _, role := range []string{"aiops_source_gate_sealer", "aiops_source_gate_admitter"} {
+		var (
+			databaseConnect   bool
+			databaseCreate    bool
+			databaseTemporary bool
+			schemaUsage       bool
+			schemaCreate      bool
+			directDatabaseACL bool
+			directSchemaACL   bool
+		)
+		if err := h.db.QueryRow(ctx, `
+			SELECT
+				has_database_privilege($1,current_database(),'CONNECT'),
+				has_database_privilege($1,current_database(),'CREATE'),
+				has_database_privilege($1,current_database(),'TEMPORARY'),
+				has_schema_privilege($1,'public','USAGE'),
+				has_schema_privilege($1,'public','CREATE'),
+				EXISTS (
+					SELECT 1
+					FROM pg_database AS database_record
+					CROSS JOIN LATERAL aclexplode(
+						COALESCE(database_record.datacl,acldefault('d',database_record.datdba))
+					) AS acl
+					JOIN pg_roles AS grantee ON grantee.oid=acl.grantee
+					WHERE database_record.datname=current_database()
+					  AND grantee.rolname=$1
+				),
+				EXISTS (
+					SELECT 1
+					FROM pg_namespace AS namespace_record
+					CROSS JOIN LATERAL aclexplode(
+						COALESCE(namespace_record.nspacl,acldefault('n',namespace_record.nspowner))
+					) AS acl
+					JOIN pg_roles AS grantee ON grantee.oid=acl.grantee
+					WHERE namespace_record.nspname='public'
+					  AND grantee.rolname=$1
+				)
+		`, role).Scan(
+			&databaseConnect,
+			&databaseCreate,
+			&databaseTemporary,
+			&schemaUsage,
+			&schemaCreate,
+			&directDatabaseACL,
+			&directSchemaACL,
+		); err != nil {
+			return fmt.Errorf("inspect Source Gate capability ACL for %s: %w", role, err)
+		}
+		if databaseConnect || databaseCreate || databaseTemporary ||
+			schemaUsage || schemaCreate || directDatabaseACL || directSchemaACL {
+			return fmt.Errorf(
+				"Source Gate capability ACL for %s is open: db=%t/%t/%t schema=%t/%t direct=%t/%t",
+				role,
+				databaseConnect,
+				databaseCreate,
+				databaseTemporary,
+				schemaUsage,
+				schemaCreate,
+				directDatabaseACL,
+				directSchemaACL,
+			)
+		}
+	}
+	return nil
+}
+
+func (h *assetCatalogHarness) assertSourceGateCapabilityConnectionsAccepted(t *testing.T) {
+	t.Helper()
+	for _, identity := range []struct {
+		role   string
+		config *pgxpool.Config
+	}{
+		{role: "aiops_source_gate_sealer", config: h.sourceGateSealConfig},
+		{role: "aiops_source_gate_admitter", config: h.sourceGateAdmitConfig},
+	} {
+		pool, err := h.openSourceGateCapabilityPool(context.Background(), identity.config)
+		if err != nil {
+			t.Fatalf("open exact-38 Source Gate capability identity %s: %v", identity.role, err)
+		}
+		assertAssetCatalogPoolIdentity(t, pool, identity.role)
+		pool.Close()
+	}
+}
+
+func (h *assetCatalogHarness) assertSourceGateCapabilityConnectionsRejected(t *testing.T) {
+	t.Helper()
+	if err := h.sourceGateCapabilityConnectionsRejected(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (h *assetCatalogHarness) sourceGateCapabilityConnectionsRejected(ctx context.Context) error {
+	for _, identity := range []struct {
+		role   string
+		config *pgxpool.Config
+	}{
+		{role: "aiops_source_gate_sealer", config: h.sourceGateSealConfig},
+		{role: "aiops_source_gate_admitter", config: h.sourceGateAdmitConfig},
+	} {
+		if identity.config == nil {
+			return fmt.Errorf("missing Source Gate capability config for %s", identity.role)
+		}
+		config := identity.config.Copy()
+		config.ConnConfig.Database = h.name
+		pool, err := pgxpool.NewWithConfig(ctx, config)
+		if err == nil {
+			err = pool.Ping(ctx)
+			pool.Close()
+		}
+		var databaseError *pgconn.PgError
+		if !errors.As(err, &databaseError) || databaseError.Code != "42501" {
+			return fmt.Errorf(
+				"Source Gate capability %s application connection SQLSTATE=%q, want 42501",
+				identity.role, assetCatalogSQLState(err),
+			)
+		}
+	}
+	return nil
+}
+
+func assetCatalogSQLState(err error) string {
+	var databaseError *pgconn.PgError
+	if errors.As(err, &databaseError) {
+		return databaseError.Code
+	}
+	return ""
+}
+
 func (h *assetCatalogHarness) applyThroughAssetCatalog(t *testing.T) {
 	t.Helper()
 	h.applyUpThrough(t, "000015_assets_catalog.up.sql")
+	h.reconcileSourceGateCapabilityAfterSuccessfulUp(t)
+}
+
+func (h *assetCatalogHarness) reconcileSourceGateCapabilityAfterSuccessfulUp(
+	t *testing.T,
+) qualificationFixtureSchemaState {
+	t.Helper()
+	if err := h.reconcileSourceGateCapabilityACL(
+		context.Background(),
+		sourceGateCapabilityAdmissionCallbacksForCurrentBinary(),
+	); err != nil {
+		t.Fatalf("reconcile version-matched Source Gate capability harness: %v", err)
+	}
+	return h.assertSourceGateCapabilityForCurrentSchema(t)
+}
+
+func (h *assetCatalogHarness) assertSourceGateCapabilityForCurrentSchema(
+	t *testing.T,
+) qualificationFixtureSchemaState {
+	t.Helper()
+	state, err := qualificationFixtureSchemaStateFor(context.Background(), h.application)
+	if err != nil {
+		t.Fatalf("inspect current Source Gate capability schema: %v", err)
+	}
+	h.assertSourceGateCapabilityACLForSchemaState(t, state)
+	return state
+}
+
+func (h *assetCatalogHarness) reconcileSourceGateCapabilityAfterSuccessfulDownForTest(t *testing.T) {
+	t.Helper()
+	if err := h.reconcileSourceGateCapabilityAfterSuccessfulDown(context.Background()); err != nil {
+		t.Fatalf("reconcile Source Gate capability after successful down: %v", err)
+	}
+	h.assertSourceGateCapabilityACLAbsent(t)
+	h.assertSourceGateCapabilityConnectionsRejected(t)
 }
 
 func (h *assetCatalogHarness) applyUpThrough(t *testing.T, cutoff string) {
@@ -821,9 +1968,12 @@ func TestAssetCatalogMigration(t *testing.T) {
 			qualificationSchema,
 		)
 	}
-	roleAdmission := storepostgres.NewDatabaseRoleAdmission(harness.application, "public")
-	if err := roleAdmission.Check(context.Background()); err != nil {
-		t.Fatalf("application database-role admission: %v", err)
+	harness.assertSourceGateCapabilityACLForSchemaState(t, qualificationSchema)
+	if qualificationSchema == qualificationFixtureSchemaOld {
+		roleAdmission := storepostgres.NewDatabaseRoleAdmission(harness.application, "public")
+		if err := roleAdmission.Check(context.Background()); err != nil {
+			t.Fatalf("application exact-36 database-role admission: %v", err)
+		}
 	}
 }
 
@@ -984,11 +2134,14 @@ func TestAssetCatalogMigrationEnvironmentMappingModeParity(t *testing.T) {
 	admission := assetpostgres.NewSchemaAdmission(harness.application, "public")
 
 	harness.applyMigration(t, "000015_assets_catalog.up.sql")
+	harness.reconcileSourceGateCapabilityAfterSuccessfulUp(t)
 	if err := admission.Check(context.Background()); err != nil {
 		t.Fatalf("schema admission after first 000015 up: %v", err)
 	}
 	harness.applyMigration(t, "000015_assets_catalog.down.sql")
+	harness.reconcileSourceGateCapabilityAfterSuccessfulDownForTest(t)
 	harness.applyMigration(t, "000015_assets_catalog.up.sql")
+	harness.reconcileSourceGateCapabilityAfterSuccessfulUp(t)
 	if err := admission.Check(context.Background()); err != nil {
 		t.Fatalf("schema admission after 000015 up/down/up: %v", err)
 	}
@@ -2013,6 +3166,7 @@ func TestAssetCatalogMigrationCompatibility(t *testing.T) {
 		t.Fatalf("pre-000015 admission error=%v", err)
 	}
 	harness.applyMigration(t, "000015_assets_catalog.up.sql")
+	harness.reconcileSourceGateCapabilityAfterSuccessfulUp(t)
 	if err := admission.Check(context.Background()); err != nil {
 		t.Fatalf("post-000015 admission: %v", err)
 	}
@@ -2022,6 +3176,7 @@ func TestAssetCatalogMigrationEmptyRollback(t *testing.T) {
 	harness := newAssetCatalogHarness(t)
 	harness.applyThroughAssetCatalog(t)
 	harness.applyMigration(t, "000015_assets_catalog.down.sql")
+	harness.reconcileSourceGateCapabilityAfterSuccessfulDownForTest(t)
 }
 
 func TestAssetCatalogMigrationEmptyRollbackRestoresPredecessorCatalog(t *testing.T) {
@@ -2029,7 +3184,9 @@ func TestAssetCatalogMigrationEmptyRollbackRestoresPredecessorCatalog(t *testing
 	harness.applyUpThrough(t, "000014_read_evidence_clock_skew.up.sql")
 	before := assetCatalogPredecessorFingerprint(t, harness.db)
 	harness.applyMigration(t, "000015_assets_catalog.up.sql")
+	harness.reconcileSourceGateCapabilityAfterSuccessfulUp(t)
 	harness.applyMigration(t, "000015_assets_catalog.down.sql")
+	harness.reconcileSourceGateCapabilityAfterSuccessfulDownForTest(t)
 	after := assetCatalogPredecessorFingerprint(t, harness.db)
 	if after != before {
 		t.Fatalf("000015 empty rollback predecessor fingerprint=%s, want %s", after, before)
@@ -2275,6 +3432,7 @@ func TestAssetCatalogMigrationDownNowaitConflictRollsBack(t *testing.T) {
 				t.Fatalf("conflicting one-shot down error=%v, want SQLSTATE 55P03", downErr)
 			}
 			assertAssetCatalogOwnedTableCount(t, harness.db, 12)
+			harness.assertSourceGateCapabilityForCurrentSchema(t)
 			if err := assetpostgres.NewSchemaAdmission(harness.application, "public").Check(context.Background()); err != nil {
 				t.Fatalf("schema admission after conflicting down rollback: %v", err)
 			}
@@ -2283,8 +3441,10 @@ func TestAssetCatalogMigrationDownNowaitConflictRollsBack(t *testing.T) {
 				t.Fatalf("release down conflict holder: %v", err)
 			}
 			harness.applyMigration(t, "000015_assets_catalog.down.sql")
+			harness.reconcileSourceGateCapabilityAfterSuccessfulDownForTest(t)
 			assertAssetCatalogOwnedTableCount(t, harness.db, 0)
 			harness.applyMigration(t, "000015_assets_catalog.up.sql")
+			harness.reconcileSourceGateCapabilityAfterSuccessfulUp(t)
 			if err := assetpostgres.NewSchemaAdmission(harness.application, "public").Check(context.Background()); err != nil {
 				t.Fatalf("schema admission after released-lock retry: %v", err)
 			}
@@ -2432,6 +3592,7 @@ func TestAssetCatalogMigrationDownHoldsCompleteLockSetBeforeCleanup(t *testing.T
 		t.Fatal("observed down migration did not complete after advisory release")
 	}
 
+	harness.reconcileSourceGateCapabilityAfterSuccessfulDownForTest(t)
 	execAssetSQL(t, harness.db, `
 		DROP EVENT TRIGGER asset_catalog_test_pause_down;
 		DROP FUNCTION asset_catalog_test_hooks.pause_down_after_lock();
