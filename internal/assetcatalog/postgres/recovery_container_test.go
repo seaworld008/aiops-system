@@ -27,14 +27,16 @@ type recoveryDocker struct {
 }
 
 type recoveryPostgreSQLContainer struct {
-	docker              recoveryDocker
-	name                string
-	username            string
-	password            string
-	migrationPassword   string
-	applicationPassword string
-	databaseName        string
-	hostPort            uint16
+	docker                  recoveryDocker
+	name                    string
+	username                string
+	password                string
+	migrationPassword       string
+	applicationPassword     string
+	sourceGateSealPassword  string
+	sourceGateAdmitPassword string
+	databaseName            string
+	hostPort                uint16
 }
 
 type recoveryPostgreSQLPair struct {
@@ -53,6 +55,68 @@ var recoveryBaseRoleNames = []string{
 	"aiops_schema_owner",
 	"aiops_control_plane_runtime",
 	"aiops_control_plane_workload",
+	"aiops_source_gate_sealer",
+	"aiops_source_gate_admitter",
+}
+
+func TestRecoverySourceGateCapabilityIdentityContract(t *testing.T) {
+	t.Parallel()
+	container := &recoveryPostgreSQLContainer{
+		username:                "aiops_test_admin",
+		password:                "admin-secret",
+		migrationPassword:       "migration-secret",
+		applicationPassword:     "application-secret",
+		sourceGateSealPassword:  "seal-secret",
+		sourceGateAdmitPassword: "admit-secret",
+	}
+	if !recoveryLoginCredentialsDistinct(container) {
+		t.Fatal("five recovery LOGIN credentials should be pairwise distinct")
+	}
+	sanitized := container.sanitizeToolOutput([]byte(strings.Join([]string{
+		container.password,
+		container.migrationPassword,
+		container.applicationPassword,
+		container.sourceGateSealPassword,
+		container.sourceGateAdmitPassword,
+	}, " ")))
+	for _, secret := range []string{
+		container.password,
+		container.migrationPassword,
+		container.applicationPassword,
+		container.sourceGateSealPassword,
+		container.sourceGateAdmitPassword,
+	} {
+		if strings.Contains(sanitized, secret) {
+			t.Fatal("recovery diagnostic output retained a LOGIN credential")
+		}
+	}
+	for _, marker := range []string{
+		"<redacted-password>",
+		"<redacted-migration-password>",
+		"<redacted-application-password>",
+		"<redacted-source-gate-seal-password>",
+		"<redacted-source-gate-admit-password>",
+	} {
+		if !strings.Contains(sanitized, marker) {
+			t.Fatalf("recovery diagnostic output omitted redaction marker %q", marker)
+		}
+	}
+	container.sourceGateAdmitPassword = container.sourceGateSealPassword
+	if recoveryLoginCredentialsDistinct(container) {
+		t.Fatal("duplicate recovery capability credentials were accepted")
+	}
+
+	wantRoles := []string{
+		"aiops_migrator",
+		"aiops_schema_owner",
+		"aiops_control_plane_runtime",
+		"aiops_control_plane_workload",
+		"aiops_source_gate_sealer",
+		"aiops_source_gate_admitter",
+	}
+	if strings.Join(recoveryBaseRoleNames, "\n") != strings.Join(wantRoles, "\n") {
+		t.Fatalf("recovery role manifest=%v, want %v", recoveryBaseRoleNames, wantRoles)
+	}
 }
 
 func prepareRecoveryPostgreSQLPair(t *testing.T) *recoveryPostgreSQLPair {
@@ -137,6 +201,14 @@ func newRecoveryAssetCatalogHarness(
 	bootstrapRecoveryRoleGraph(t, container, admin)
 	bootstrapRecoveryDatabaseACL(t, container, admin)
 
+	sourceGateSealConfig := recoveryControlRoleConfig(
+		t, container, "aiops_source_gate_sealer", container.sourceGateSealPassword,
+	)
+	sourceGateAdmitConfig := recoveryControlRoleConfig(
+		t, container, "aiops_source_gate_admitter", container.sourceGateAdmitPassword,
+	)
+	assertRecoveryControlRoleIdentity(t, sourceGateSealConfig, "aiops_source_gate_sealer")
+	assertRecoveryControlRoleIdentity(t, sourceGateAdmitConfig, "aiops_source_gate_admitter")
 	migration := openRecoveryRolePool(t, container, "aiops_migrator", container.migrationPassword, "")
 	owner := openRecoveryRolePool(t, container, "aiops_migrator", container.migrationPassword, "aiops_schema_owner")
 	application := openRecoveryRolePool(t, container, "aiops_control_plane_workload", container.applicationPassword, "")
@@ -150,11 +222,13 @@ func newRecoveryAssetCatalogHarness(
 	assertRecoveryBootstrapContract(t, admin, container.databaseName)
 
 	return &assetCatalogHarness{
-		admin:       admin,
-		db:          owner,
-		migration:   migration,
-		application: application,
-		name:        container.databaseName,
+		admin:                 admin,
+		db:                    owner,
+		migration:             migration,
+		application:           application,
+		sourceGateSealConfig:  sourceGateSealConfig,
+		sourceGateAdmitConfig: sourceGateAdmitConfig,
+		name:                  container.databaseName,
 	}, recoveryRoleOIDs(t, admin)
 }
 
@@ -176,12 +250,23 @@ CREATE ROLE aiops_control_plane_runtime
 CREATE ROLE aiops_control_plane_workload
   LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
   PASSWORD '%s';
+CREATE ROLE aiops_source_gate_sealer
+  LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+  PASSWORD '%s';
+CREATE ROLE aiops_source_gate_admitter
+  LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+  PASSWORD '%s';
 GRANT aiops_schema_owner TO aiops_migrator
   WITH ADMIN FALSE, INHERIT FALSE, SET TRUE;
 GRANT aiops_control_plane_runtime TO aiops_control_plane_workload
   WITH ADMIN FALSE, INHERIT TRUE, SET FALSE;
 COMMIT;
-`, container.migrationPassword, container.applicationPassword)
+`,
+		container.migrationPassword,
+		container.applicationPassword,
+		container.sourceGateSealPassword,
+		container.sourceGateAdmitPassword,
+	)
 	if _, err := admin.Exec(context.Background(), roles); err != nil {
 		t.Fatalf("bootstrap exact recovery database role graph: %v", err)
 	}
@@ -207,11 +292,11 @@ func bootstrapRecoveryDatabaseACL(
 		t.Fatalf("enter recovery schema-owner bootstrap context: %v", err)
 	}
 	for _, statement := range []string{
-		"REVOKE ALL ON DATABASE " + database + " FROM PUBLIC, aiops_migrator, aiops_schema_owner, aiops_control_plane_runtime, aiops_control_plane_workload, " + bootstrapAdmin,
+		"REVOKE ALL ON DATABASE " + database + " FROM PUBLIC, aiops_migrator, aiops_schema_owner, aiops_control_plane_runtime, aiops_control_plane_workload, aiops_source_gate_sealer, aiops_source_gate_admitter, " + bootstrapAdmin,
 		"GRANT CONNECT, CREATE, TEMPORARY ON DATABASE " + database + " TO aiops_schema_owner",
 		"GRANT CONNECT ON DATABASE " + database + " TO aiops_migrator, aiops_control_plane_workload",
 		`ALTER SCHEMA public OWNER TO aiops_schema_owner`,
-		"REVOKE ALL ON SCHEMA public FROM PUBLIC, aiops_migrator, aiops_schema_owner, aiops_control_plane_runtime, aiops_control_plane_workload, " + bootstrapAdmin,
+		"REVOKE ALL ON SCHEMA public FROM PUBLIC, aiops_migrator, aiops_schema_owner, aiops_control_plane_runtime, aiops_control_plane_workload, aiops_source_gate_sealer, aiops_source_gate_admitter, " + bootstrapAdmin,
 		`GRANT CREATE, USAGE ON SCHEMA public TO aiops_schema_owner`,
 		`GRANT USAGE ON SCHEMA public TO aiops_control_plane_runtime`,
 	} {
@@ -297,6 +382,49 @@ func recoveryPoolConfig(
 	return config, nil
 }
 
+func recoveryControlRoleConfig(
+	t *testing.T,
+	container *recoveryPostgreSQLContainer,
+	username string,
+	password string,
+) *pgxpool.Config {
+	t.Helper()
+	config, err := recoveryPoolConfig(container, username, password)
+	if err != nil {
+		t.Fatalf("construct isolated PostgreSQL %s control-database configuration", username)
+	}
+	config.ConnConfig.Database = "postgres"
+	return config
+}
+
+func assertRecoveryControlRoleIdentity(
+	t *testing.T,
+	config *pgxpool.Config,
+	expectedUser string,
+) {
+	t.Helper()
+	pool, err := pgxpool.NewWithConfig(context.Background(), config.Copy())
+	if err != nil {
+		t.Fatalf("connect isolated PostgreSQL %s control-database identity: unavailable", expectedUser)
+	}
+	defer pool.Close()
+	if err := pool.Ping(context.Background()); err != nil {
+		t.Fatalf("ping isolated PostgreSQL %s control-database identity: unavailable", expectedUser)
+	}
+	var sessionUser, currentUser, databaseName string
+	if err := pool.QueryRow(context.Background(), `
+SELECT session_user, current_user, current_database()
+`).Scan(&sessionUser, &currentUser, &databaseName); err != nil {
+		t.Fatalf("read recovery PostgreSQL %s control-database identity: %v", expectedUser, err)
+	}
+	if sessionUser != expectedUser || currentUser != expectedUser || databaseName != "postgres" {
+		t.Fatalf(
+			"recovery PostgreSQL control identity=session:%q current:%q database:%q, want %q on postgres",
+			sessionUser, currentUser, databaseName, expectedUser,
+		)
+	}
+}
+
 func assertRecoveryPoolIdentity(
 	t *testing.T,
 	pool *pgxpool.Pool,
@@ -318,13 +446,15 @@ func assertRecoveryBootstrapContract(t *testing.T, admin *pgxpool.Pool, database
 	t.Helper()
 	var rolesExact, membershipsExact, capabilitiesExact bool
 	if err := admin.QueryRow(context.Background(), `
-SELECT count(*)=4 AND bool_and(
+SELECT count(*)=6 AND bool_and(
   NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls AND
   CASE rolname
     WHEN 'aiops_migrator' THEN rolcanlogin AND NOT rolinherit
     WHEN 'aiops_schema_owner' THEN NOT rolcanlogin AND NOT rolinherit
     WHEN 'aiops_control_plane_runtime' THEN NOT rolcanlogin AND NOT rolinherit
     WHEN 'aiops_control_plane_workload' THEN rolcanlogin AND rolinherit
+    WHEN 'aiops_source_gate_sealer' THEN rolcanlogin AND NOT rolinherit
+    WHEN 'aiops_source_gate_admitter' THEN rolcanlogin AND NOT rolinherit
     ELSE false
   END
 )
@@ -751,13 +881,18 @@ func startRecoveryPostgreSQLContainer(
 	t.Helper()
 	suffix := randomAssetHex(t, 8)
 	container := &recoveryPostgreSQLContainer{
-		docker:              docker,
-		name:                "aiops-assets-recovery-" + role + "-" + suffix,
-		username:            "aiops_" + randomAssetHex(t, 6),
-		password:            randomAssetHex(t, 24),
-		migrationPassword:   randomAssetHex(t, 24),
-		applicationPassword: randomAssetHex(t, 24),
-		databaseName:        "assets_" + randomAssetHex(t, 6),
+		docker:                  docker,
+		name:                    "aiops-assets-recovery-" + role + "-" + suffix,
+		username:                "aiops_" + randomAssetHex(t, 6),
+		password:                randomAssetHex(t, 24),
+		migrationPassword:       randomAssetHex(t, 24),
+		applicationPassword:     randomAssetHex(t, 24),
+		sourceGateSealPassword:  randomAssetHex(t, 24),
+		sourceGateAdmitPassword: randomAssetHex(t, 24),
+		databaseName:            "assets_" + randomAssetHex(t, 6),
+	}
+	if !recoveryLoginCredentialsDistinct(container) {
+		return nil, errors.New("recovery LOGIN credentials are empty or not pairwise distinct")
 	}
 	envFile := filepath.Join(t.TempDir(), role+".env")
 	envContent := strings.Join([]string{
@@ -780,6 +915,7 @@ func startRecoveryPostgreSQLContainer(
 		"--name", container.name,
 		"--label", "aiops.test=asset-catalog-recovery",
 		"--env-file", envFile,
+		"--tmpfs", "/var/lib/postgresql:rw,noexec,nosuid,nodev,size=256m",
 		"--publish", "127.0.0.1::5432",
 		recoveryPostgreSQLImage,
 	).CombinedOutput()
@@ -873,7 +1009,7 @@ func (container *recoveryPostgreSQLContainer) remove(t *testing.T) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	output, err := container.docker.command(ctx, "rm", "--force", container.name).CombinedOutput()
+	output, err := container.docker.command(ctx, "rm", "--force", "--volumes", container.name).CombinedOutput()
 	if err != nil && !strings.Contains(strings.ToLower(string(output)), "no such container") {
 		t.Errorf("remove isolated PostgreSQL recovery container: %v: %s", err, sanitizeToolOutput(output))
 	}
@@ -1133,8 +1269,31 @@ func (container *recoveryPostgreSQLContainer) sanitizeToolOutput(output []byte) 
 		container.password, "<redacted-password>",
 		container.migrationPassword, "<redacted-migration-password>",
 		container.applicationPassword, "<redacted-application-password>",
+		container.sourceGateSealPassword, "<redacted-source-gate-seal-password>",
+		container.sourceGateAdmitPassword, "<redacted-source-gate-admit-password>",
 		container.databaseName, "<redacted-database>",
 	).Replace(sanitizeToolOutput(output))
+}
+
+func recoveryLoginCredentialsDistinct(container *recoveryPostgreSQLContainer) bool {
+	passwords := []string{
+		container.password,
+		container.migrationPassword,
+		container.applicationPassword,
+		container.sourceGateSealPassword,
+		container.sourceGateAdmitPassword,
+	}
+	seen := make(map[string]struct{}, len(passwords))
+	for _, password := range passwords {
+		if password == "" {
+			return false
+		}
+		if _, duplicate := seen[password]; duplicate {
+			return false
+		}
+		seen[password] = struct{}{}
+	}
+	return true
 }
 
 func sanitizeToolOutput(output []byte) string {

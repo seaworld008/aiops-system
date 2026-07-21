@@ -21,8 +21,31 @@ type recoveredTableProof struct {
 
 func TestAssetCatalogRecovery(t *testing.T) {
 	pair := prepareRecoveryPostgreSQLPair(t)
+	assertRecoverySourceGateCapabilityClosed(t, pair.sourceHarness)
+	assertRecoverySourceGateCapabilityClosed(t, pair.targetHarness)
+	pair.sourceHarness.grantSourceGateCapabilityACLForTest(t)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := pair.sourceHarness.reconcileSourceGateCapabilityAfterSuccessfulDown(cancelled); err != nil {
+		t.Fatalf("recovery pre-migration capability down reconciliation: %v", err)
+	}
+	assertRecoverySourceGateCapabilityClosed(t, pair.sourceHarness)
 	source := pair.sourcePool
 	pair.sourceHarness.applyThroughAssetCatalog(t)
+	sourceCapabilitySchema, err := qualificationFixtureSchemaStateFor(
+		context.Background(), pair.sourceHarness.application,
+	)
+	if err != nil {
+		t.Fatalf("inspect recovery source capability schema: %v", err)
+	}
+	pair.sourceHarness.grantSourceGateCapabilityACLForTest(t)
+	if err := pair.sourceHarness.reconcileSourceGateCapabilityACL(
+		context.Background(),
+		sourceGateCapabilityAdmissionCallbacksForCurrentBinary(),
+	); err != nil {
+		t.Fatalf("recovery source capability reconciliation: %v", err)
+	}
+	pair.sourceHarness.assertSourceGateCapabilityACLForSchemaState(t, sourceCapabilitySchema)
 	fixture := seedRepresentativeAssetCatalog(t, source)
 	seedRecoveryProjection(t, source, fixture)
 	authoritativeSeed := fixture
@@ -43,6 +66,7 @@ func TestAssetCatalogRecovery(t *testing.T) {
 	verifyAssetCatalogClosure(t, source, fixture, sourceQualificationSchema)
 	verifyAuthoritativeCompletePointer(t, source, authoritativeFixture)
 	assertRecoveryCatalogOwners(t, pair.sourceHarness.admin)
+	pair.sourceHarness.assertSourceGateCapabilityACLForSchemaState(t, sourceQualificationSchema)
 
 	backup := logicalDumpDatabase(t, pair.source)
 	if len(backup) < 1024 || !strings.HasPrefix(string(backup[:5]), "PGDMP") {
@@ -50,13 +74,22 @@ func TestAssetCatalogRecovery(t *testing.T) {
 	}
 	backupSHA256 := sha256.Sum256(backup)
 	t.Logf("logical recovery archive SHA-256=%x", backupSHA256)
+	pair.sourceHarness.assertSourceGateCapabilityACLForSchemaState(t, sourceQualificationSchema)
+	assertRecoverySourceGateCapabilityClosed(t, pair.targetHarness)
 	assertRecoveryPoolIdentity(t, pair.targetHarness.migration, "aiops_migrator", "aiops_migrator")
 	restoreLogicalDump(t, pair.target, backup)
+	if err := pair.targetHarness.reconcileSourceGateCapabilityACL(
+		context.Background(),
+		sourceGateCapabilityAdmissionCallbacksForCurrentBinary(),
+	); err != nil {
+		t.Fatalf("recovery target capability reconciliation: %v", err)
+	}
 	target := pair.targetPool
 	assertRecoveryAdmissions(t, pair.targetHarness)
 	targetQualificationSchema := verifyQualificationRecoveryReadiness(
 		t, target, authoritativeFixture,
 	)
+	pair.targetHarness.assertSourceGateCapabilityACLForSchemaState(t, targetQualificationSchema)
 	targetProof := collectAssetCatalogProof(t, target)
 	if len(sourceProof) != len(targetProof) {
 		t.Fatalf("restored proof table count=%d, want %d", len(targetProof), len(sourceProof))
@@ -78,6 +111,21 @@ func TestAssetCatalogRecovery(t *testing.T) {
 		t.Fatalf("schema admission after restored exact-FK removal error=%v, want %v",
 			err, assetpostgres.ErrAssetCatalogUnavailable)
 	}
+	pair.targetHarness.grantSourceGateCapabilityACLForTest(t)
+	if err := pair.targetHarness.reconcileSourceGateCapabilityACL(
+		context.Background(),
+		sourceGateCapabilityAdmissionCallbacksForCurrentBinary(),
+	); !errors.Is(err, errSourceGateCapabilityUnavailable) {
+		t.Fatalf("partial restored capability reconciliation error=%v, want %v",
+			err, errSourceGateCapabilityUnavailable)
+	}
+	assertRecoverySourceGateCapabilityClosed(t, pair.targetHarness)
+}
+
+func assertRecoverySourceGateCapabilityClosed(t *testing.T, harness *assetCatalogHarness) {
+	t.Helper()
+	harness.assertSourceGateCapabilityACLAbsent(t)
+	harness.assertSourceGateCapabilityConnectionsRejected(t)
 }
 
 func assertRecoveryAdmissions(t *testing.T, harness *assetCatalogHarness) {

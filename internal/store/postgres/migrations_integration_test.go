@@ -43,8 +43,18 @@ import (
 var safeMigrationControlDatabase = regexp.MustCompile(`^aiops_test(_[a-z0-9]+)*$`)
 
 type migrationIntegrationDatabase struct {
-	db        *pgxpool.Pool
-	migration *pgxpool.Pool
+	db                    *pgxpool.Pool
+	migration             *pgxpool.Pool
+	sourceGateSealConfig  *pgxpool.Config
+	sourceGateAdmitConfig *pgxpool.Config
+	name                  string
+}
+
+type migrationIntegrationRoleConfigs struct {
+	migration       *pgxpool.Config
+	application     *pgxpool.Config
+	sourceGateSeal  *pgxpool.Config
+	sourceGateAdmit *pgxpool.Config
 }
 
 func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
@@ -265,6 +275,7 @@ func TestMigrationsEnforceScopeAndConfirmedRootCause(t *testing.T) {
 	applyMigrationFile(t, ctx, database, filepath.Join(migrationDirectory, "000014_read_evidence_clock_skew.up.sql"))
 	applyMigrationFile(t, ctx, harness.migration, filepath.Join(migrationDirectory, "000015_assets_catalog.up.sql"))
 	applyMigrations(t, ctx, database, harness.migration, migrationDirectory, ".down.sql", true)
+	harness.assertSourceGateCapabilityClosed(t)
 	var relationName *string
 	if err := database.QueryRow(ctx, `SELECT to_regclass('public.tenants')::text`).Scan(&relationName); err != nil {
 		t.Fatalf("check down migration: %v", err)
@@ -301,6 +312,130 @@ func TestMigrationIntegrationDatabaseNameGuard(t *testing.T) {
 	}
 }
 
+func TestMigrationIntegrationCapabilityIdentityConfigsFailClosed(t *testing.T) {
+	const (
+		controlName = "aiops_test"
+		adminDSN    = "postgres://aiops:admin-password-000000000000000000000000@localhost/aiops_test?sslmode=disable"
+	)
+	base := map[string]string{
+		"AIOPS_TEST_POSTGRES_MIGRATION_DSN":         "postgres://aiops_migrator:migration-password-00000000000000000000@localhost/aiops_test?sslmode=disable",
+		"AIOPS_TEST_POSTGRES_APPLICATION_DSN":       "postgres://aiops_control_plane_workload:application-password-000000000000000000@localhost/aiops_test?sslmode=disable",
+		"AIOPS_TEST_POSTGRES_SOURCE_GATE_SEAL_DSN":  "postgres://aiops_source_gate_sealer:seal-password-00000000000000000000000000@localhost/aiops_test?sslmode=disable",
+		"AIOPS_TEST_POSTGRES_SOURCE_GATE_ADMIT_DSN": "postgres://aiops_source_gate_admitter:admit-password-0000000000000000000000000@localhost/aiops_test?sslmode=disable",
+	}
+	setBase := func(t *testing.T) {
+		t.Helper()
+		for key, value := range base {
+			t.Setenv(key, value)
+		}
+	}
+
+	t.Run("exact five identities", func(t *testing.T) {
+		setBase(t)
+		configs, err := loadMigrationIntegrationRoleConfigs(controlName, adminDSN)
+		if err != nil {
+			t.Fatalf("load exact-five migration identities: %v", err)
+		}
+		if configs.migration.ConnConfig.User != "aiops_migrator" ||
+			configs.application.ConnConfig.User != "aiops_control_plane_workload" ||
+			configs.sourceGateSeal.ConnConfig.User != "aiops_source_gate_sealer" ||
+			configs.sourceGateAdmit.ConnConfig.User != "aiops_source_gate_admitter" {
+			t.Fatal("loaded migration identities drifted")
+		}
+	})
+
+	for _, test := range []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{
+			name: "missing capability DSN",
+			key:  "AIOPS_TEST_POSTGRES_SOURCE_GATE_SEAL_DSN",
+		},
+		{
+			name:  "wrong capability identity",
+			key:   "AIOPS_TEST_POSTGRES_SOURCE_GATE_ADMIT_DSN",
+			value: "postgres://aiops_control_plane_workload:other-password-0000000000000000000000000@localhost/aiops_test?sslmode=disable",
+		},
+		{
+			name:  "wrong control database",
+			key:   "AIOPS_TEST_POSTGRES_SOURCE_GATE_SEAL_DSN",
+			value: "postgres://aiops_source_gate_sealer:other-password-00000000000000000000000000@localhost/other?sslmode=disable",
+		},
+		{
+			name:  "duplicate credential",
+			key:   "AIOPS_TEST_POSTGRES_SOURCE_GATE_ADMIT_DSN",
+			value: "postgres://aiops_source_gate_admitter:seal-password-00000000000000000000000000@localhost/aiops_test?sslmode=disable",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			setBase(t)
+			t.Setenv(test.key, test.value)
+			if _, err := loadMigrationIntegrationRoleConfigs(controlName, adminDSN); err == nil {
+				t.Fatal("load migration identity configs error=nil, want fail closed")
+			}
+		})
+	}
+}
+
+func loadMigrationIntegrationRoleConfigs(
+	controlName string,
+	adminDSN string,
+) (migrationIntegrationRoleConfigs, error) {
+	type roleDSN struct {
+		environment string
+		user        string
+	}
+	roles := []roleDSN{
+		{environment: "AIOPS_TEST_POSTGRES_MIGRATION_DSN", user: "aiops_migrator"},
+		{environment: "AIOPS_TEST_POSTGRES_APPLICATION_DSN", user: "aiops_control_plane_workload"},
+		{environment: "AIOPS_TEST_POSTGRES_SOURCE_GATE_SEAL_DSN", user: "aiops_source_gate_sealer"},
+		{environment: "AIOPS_TEST_POSTGRES_SOURCE_GATE_ADMIT_DSN", user: "aiops_source_gate_admitter"},
+	}
+	adminConfig, err := pgxpool.ParseConfig(adminDSN)
+	if err != nil || adminConfig.ConnConfig.Database != controlName ||
+		adminConfig.ConnConfig.User != "aiops" || adminConfig.ConnConfig.Password == "" {
+		return migrationIntegrationRoleConfigs{}, errors.New("invalid PostgreSQL test-control identity configuration")
+	}
+
+	rawDSNs := []string{adminDSN}
+	passwords := []string{adminConfig.ConnConfig.Password}
+	configs := make([]*pgxpool.Config, 0, len(roles))
+	for _, role := range roles {
+		raw := strings.TrimSpace(os.Getenv(role.environment))
+		if raw == "" {
+			return migrationIntegrationRoleConfigs{}, fmt.Errorf("%s is required", role.environment)
+		}
+		config, err := pgxpool.ParseConfig(raw)
+		if err != nil || config.ConnConfig.Database != controlName ||
+			config.ConnConfig.User != role.user || config.ConnConfig.Password == "" {
+			return migrationIntegrationRoleConfigs{}, fmt.Errorf("invalid %s identity configuration", role.user)
+		}
+		config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+		if config.ConnConfig.RuntimeParams == nil {
+			config.ConnConfig.RuntimeParams = make(map[string]string)
+		}
+		config.ConnConfig.RuntimeParams["search_path"] = "pg_catalog,public,pg_temp"
+		rawDSNs = append(rawDSNs, raw)
+		passwords = append(passwords, config.ConnConfig.Password)
+		configs = append(configs, config)
+	}
+	for left := range rawDSNs {
+		for right := left + 1; right < len(rawDSNs); right++ {
+			if rawDSNs[left] == rawDSNs[right] || passwords[left] == passwords[right] {
+				return migrationIntegrationRoleConfigs{}, errors.New("PostgreSQL test identities must use pairwise-distinct DSNs and credentials")
+			}
+		}
+	}
+	return migrationIntegrationRoleConfigs{
+		migration:       configs[0],
+		application:     configs[1],
+		sourceGateSeal:  configs[2],
+		sourceGateAdmit: configs[3],
+	}, nil
+}
+
 func newMigrationIntegrationDatabase(t *testing.T, dsn string) *migrationIntegrationDatabase {
 	t.Helper()
 	ctx := context.Background()
@@ -317,28 +452,29 @@ func newMigrationIntegrationDatabase(t *testing.T, dsn string) *migrationIntegra
 	if err != nil {
 		t.Fatalf("connect PostgreSQL migration control database: %v", err)
 	}
+	t.Cleanup(admin.Close)
 	var serverVersion int
 	if err := admin.QueryRow(ctx, `SELECT current_setting('server_version_num')::integer`).Scan(&serverVersion); err != nil {
-		admin.Close()
 		t.Fatalf("read PostgreSQL server version: %v", err)
 	}
 	if serverVersion < 180004 || serverVersion >= 190000 {
-		admin.Close()
 		t.Fatalf("integration harness requires PostgreSQL 18.4 or newer 18.x, got server_version_num=%d", serverVersion)
 	}
-	migrationDSN := strings.TrimSpace(os.Getenv("AIOPS_TEST_POSTGRES_MIGRATION_DSN"))
-	if migrationDSN == "" {
-		admin.Close()
-		t.Fatal("AIOPS_TEST_POSTGRES_MIGRATION_DSN is required when the full migration harness is enabled")
-	}
-	migrationConfig, err := pgxpool.ParseConfig(migrationDSN)
+	roleConfigs, err := loadMigrationIntegrationRoleConfigs(controlName, dsn)
 	if err != nil {
-		admin.Close()
-		t.Fatal("parse PostgreSQL migration identity DSN: invalid configuration")
+		t.Fatalf("load exact-five PostgreSQL migration identities: %v", err)
 	}
-	if migrationConfig.ConnConfig.Database != controlName || migrationConfig.ConnConfig.User != "aiops_migrator" {
-		admin.Close()
-		t.Fatal("PostgreSQL migration identity DSN must name the same safe control database as aiops_migrator")
+	migrationConfig := roleConfigs.migration
+	for _, identity := range []struct {
+		config *pgxpool.Config
+		user   string
+	}{
+		{config: roleConfigs.migration, user: "aiops_migrator"},
+		{config: roleConfigs.application, user: "aiops_control_plane_workload"},
+		{config: roleConfigs.sourceGateSeal, user: "aiops_source_gate_sealer"},
+		{config: roleConfigs.sourceGateAdmit, user: "aiops_source_gate_admitter"},
+	} {
+		assertMigrationIntegrationConfigIdentity(t, identity.config, identity.user)
 	}
 
 	databaseName := "aiops_migrations_test_" + randomMigrationHex(t, 16)
@@ -357,7 +493,6 @@ func newMigrationIntegrationDatabase(t *testing.T, dsn string) *migrationIntegra
 				t.Errorf("drop isolated PostgreSQL migration database %s: %v", databaseName, err)
 			}
 		}
-		admin.Close()
 	})
 	if _, err := admin.Exec(ctx, "CREATE DATABASE "+identifier+" WITH TEMPLATE template0 OWNER aiops_schema_owner"); err != nil {
 		t.Fatalf("create isolated PostgreSQL migration database %s; ownership unconfirmed, refusing destructive cleanup: %v", databaseName, err)
@@ -366,6 +501,8 @@ func newMigrationIntegrationDatabase(t *testing.T, dsn string) *migrationIntegra
 	if _, err := admin.Exec(ctx, `SET ROLE aiops_schema_owner;
 REVOKE ALL ON DATABASE `+identifier+` FROM PUBLIC;
 REVOKE ALL ON DATABASE `+identifier+` FROM aiops_control_plane_runtime;
+REVOKE ALL ON DATABASE `+identifier+` FROM aiops_source_gate_sealer;
+REVOKE ALL ON DATABASE `+identifier+` FROM aiops_source_gate_admitter;
 GRANT CONNECT ON DATABASE `+identifier+` TO aiops_migrator;
 GRANT CONNECT ON DATABASE `+identifier+` TO aiops_control_plane_workload;
 RESET ROLE;`); err != nil {
@@ -417,11 +554,122 @@ RESET ROLE;`); err != nil {
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 REVOKE ALL ON SCHEMA public FROM aiops_migrator;
 REVOKE ALL ON SCHEMA public FROM aiops_control_plane_workload;
+REVOKE ALL ON SCHEMA public FROM aiops_source_gate_sealer;
+REVOKE ALL ON SCHEMA public FROM aiops_source_gate_admitter;
 GRANT CREATE, USAGE ON SCHEMA public TO aiops_schema_owner;
 GRANT USAGE ON SCHEMA public TO aiops_control_plane_runtime;`); err != nil {
 		t.Fatalf("preprovision isolated PostgreSQL migration schema ACL: %v", err)
 	}
-	return &migrationIntegrationDatabase{db: database, migration: migration}
+	harness := &migrationIntegrationDatabase{
+		db:                    database,
+		migration:             migration,
+		sourceGateSealConfig:  roleConfigs.sourceGateSeal,
+		sourceGateAdmitConfig: roleConfigs.sourceGateAdmit,
+		name:                  databaseName,
+	}
+	harness.assertSourceGateCapabilityClosed(t)
+	return harness
+}
+
+func assertMigrationIntegrationConfigIdentity(
+	t *testing.T,
+	config *pgxpool.Config,
+	expected string,
+) {
+	t.Helper()
+	pool, err := pgxpool.NewWithConfig(context.Background(), config.Copy())
+	if err != nil {
+		t.Fatalf("connect PostgreSQL control identity %s: unavailable", expected)
+	}
+	defer pool.Close()
+	if err := pool.Ping(context.Background()); err != nil {
+		t.Fatalf("ping PostgreSQL control identity %s: unavailable", expected)
+	}
+	assertMigrationIntegrationIdentity(t, pool, expected, expected)
+}
+
+func (h *migrationIntegrationDatabase) assertSourceGateCapabilityClosed(t *testing.T) {
+	t.Helper()
+	for _, identity := range []struct {
+		role   string
+		config *pgxpool.Config
+	}{
+		{role: "aiops_source_gate_sealer", config: h.sourceGateSealConfig},
+		{role: "aiops_source_gate_admitter", config: h.sourceGateAdmitConfig},
+	} {
+		var (
+			databaseConnect   bool
+			databaseCreate    bool
+			databaseTemporary bool
+			schemaUsage       bool
+			schemaCreate      bool
+			directDatabaseACL bool
+			directSchemaACL   bool
+		)
+		if err := h.db.QueryRow(context.Background(), `
+			SELECT
+				has_database_privilege($1,current_database(),'CONNECT'),
+				has_database_privilege($1,current_database(),'CREATE'),
+				has_database_privilege($1,current_database(),'TEMPORARY'),
+				has_schema_privilege($1,'public','USAGE'),
+				has_schema_privilege($1,'public','CREATE'),
+				EXISTS (
+					SELECT 1
+					FROM pg_database AS database_record
+					CROSS JOIN LATERAL aclexplode(
+						COALESCE(database_record.datacl,acldefault('d',database_record.datdba))
+					) AS acl
+					JOIN pg_roles AS grantee ON grantee.oid=acl.grantee
+					WHERE database_record.datname=current_database()
+					  AND grantee.rolname=$1
+				),
+				EXISTS (
+					SELECT 1
+					FROM pg_namespace AS namespace_record
+					CROSS JOIN LATERAL aclexplode(
+						COALESCE(namespace_record.nspacl,acldefault('n',namespace_record.nspowner))
+					) AS acl
+					JOIN pg_roles AS grantee ON grantee.oid=acl.grantee
+					WHERE namespace_record.nspname='public'
+					  AND grantee.rolname=$1
+				)
+		`, identity.role).Scan(
+			&databaseConnect,
+			&databaseCreate,
+			&databaseTemporary,
+			&schemaUsage,
+			&schemaCreate,
+			&directDatabaseACL,
+			&directSchemaACL,
+		); err != nil {
+			t.Fatalf("inspect full-migration capability ACL for %s: %v", identity.role, err)
+		}
+		if databaseConnect || databaseCreate || databaseTemporary ||
+			schemaUsage || schemaCreate || directDatabaseACL || directSchemaACL {
+			t.Fatalf("full-migration capability ACL for %s is open", identity.role)
+		}
+
+		config := identity.config.Copy()
+		config.ConnConfig.Database = h.name
+		pool, err := pgxpool.NewWithConfig(context.Background(), config)
+		if err == nil {
+			err = pool.Ping(context.Background())
+			pool.Close()
+		}
+		var databaseError *pgconn.PgError
+		if !errors.As(err, &databaseError) || databaseError.Code != "42501" {
+			t.Fatalf("full-migration capability %s application connection SQLSTATE=%q, want 42501",
+				identity.role, migrationIntegrationSQLState(err))
+		}
+	}
+}
+
+func migrationIntegrationSQLState(err error) string {
+	var databaseError *pgconn.PgError
+	if errors.As(err, &databaseError) {
+		return databaseError.Code
+	}
+	return ""
 }
 
 func assertMigrationIntegrationIdentity(
