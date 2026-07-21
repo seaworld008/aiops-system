@@ -937,7 +937,7 @@ PRODUCTION_RELEASE_DECIDE
 
 #### 应用平台与部署契约
 
-- 唯一前端工程为 `web/`，运行时依赖固定为 React 19、TypeScript 7、Vite 8、TanStack Router/Query/Table、React Hook Form、Zod、Radix、lucide-react 与 CSS Modules。应用模块按 `app → features → shared` 单向依赖：`app` 负责 bootstrap/provider/router/AppShell/auth/scope/config，`features` 只实现纵向领域切片，`shared` 只包含 API、UI 和纯工具；feature 之间不得直接导入页面或组件，只能通过 typed route、稳定 ID 和共享契约协作。
+- 唯一前端工程为 `web/`，运行时依赖固定为 React 19、TypeScript 5.9.3、Vite 8、TanStack Router/Query/Table、React Hook Form、Zod、Radix、lucide-react 与 CSS Modules。应用模块按 `app → features → shared` 单向依赖：`app` 负责 bootstrap/provider/router/AppShell/auth/scope/config，`features` 只实现纵向领域切片，`shared` 只包含 API、UI 和纯工具；feature 之间不得直接导入页面或组件，只能通过 typed route、稳定 ID 和共享契约协作。
 - 所有 HTTP/SSE 访问只能由 `web/src/shared/api/` 发起；低层 transport 保持私有，feature adapter 必须使用唯一 `api/openapi/control-plane-v1.yaml` 生成的 `paths/operations` 类型，禁止直接 `fetch`、字符串路径泛型请求和手写重复 DTO。RFC 9457 Problem、稳定 `code`/`trace_id`、Scope-aware query key 和公共 Operation 投影在 Phase 1 建立，后续页面只能复用或扩展。
 - URL 保存非敏感的 Workspace/Environment、筛选、排序、Cursor、Tab、选中对象、时间窗和 Operation ID；TanStack Query 只保存服务端状态且每个 key 必须含 Scope，切换 Scope 时取消并清除旧查询且不持久化缓存；React Hook Form + Zod 保存临时表单状态；抽屉、焦点和展开等短生命周期状态留在组件本地。Context 只承载 auth、scope 和 theme，不引入 Redux、Zustand 或第二套客户端事实源。
 - 共享 UI 基线必须提供 `DataTable`、`ProblemPanel`、`OperationTimeline`、`EffectiveActionGate`、`ETagConflictReview` 和 `ReauthBoundary`。权限只来自资源 DTO 的 `effective_actions`；治理 mutation 只接受服务端确认，不做 optimistic update，不自动重试或重放副作用，并以 `Idempotency-Key`、`ETag/If-Match`、最近认证和持久 Operation 处理并发与恢复。
