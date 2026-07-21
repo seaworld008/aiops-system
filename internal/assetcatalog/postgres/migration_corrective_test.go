@@ -25,11 +25,16 @@ const correctiveManualProviderSchemaV1 = `{"additionalProperties":false,"propert
 
 const correctiveCanonicalEmptyRelationPageSHA256 = "b89ad607e709ef2ea85f7fc6eb0f80e32ae3ecf234220907a0fe718825f7c151"
 
-func TestAssetCatalogCorrectiveOwnsExact36RoutineSignaturesAndRuntimeLock(t *testing.T) {
+func TestAssetCatalogCorrectiveOwnsVersionMatchedRoutineSignaturesAndRuntimeLock(t *testing.T) {
 	up := readMigration(t, "000015_assets_catalog.up.sql")
 	correctiveAssertTopLevelParserSemantics(t)
 
-	assertExactSQLObjectSet(t, "000015 owned routines", correctiveRoutineIdentities(up), correctiveExpectedRoutineIdentities())
+	assertExactSQLObjectSet(
+		t,
+		"000015 owned routines",
+		correctiveRoutineIdentities(up),
+		correctiveExpectedRoutineIdentitiesForMigration(t, up),
+	)
 	assertExactSQLObjectSet(t, "000015 reviewed trigger manifest",
 		correctiveTriggerIdentities(t, up),
 		correctiveExpectedTriggerIdentitiesForMigration(t, up),
@@ -77,6 +82,130 @@ func TestAssetCatalogCorrectiveOwnsExact36RoutineSignaturesAndRuntimeLock(t *tes
 		"from public.service_bindings",
 		"for share",
 	})
+}
+
+func TestAssetCatalogCorrectiveSourceGateSuccessorRoutineManifest(t *testing.T) {
+	currentUp := readMigration(t, "000015_assets_catalog.up.sql")
+	currentDown := readMigration(t, "000015_assets_catalog.down.sql")
+	successorUp, successorDown, err := correctiveSourceGateSuccessorRoutineBoundary(
+		currentUp,
+		currentDown,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := correctiveExpectedSourceGateSuccessorRoutineIdentities()
+
+	assertExactSQLObjectSet(
+		t,
+		"Source Gate successor routines",
+		correctiveRoutineIdentities(successorUp),
+		want,
+	)
+	assertExactSQLObjectSet(
+		t,
+		"Source Gate successor down routines",
+		correctiveDroppedRoutineIdentities(successorDown),
+		want,
+	)
+
+	for _, contract := range []struct {
+		name        string
+		sessionUser string
+		otherUser   string
+	}{
+		{
+			name:        "public.asset_catalog_seal_qualification_receipt",
+			sessionUser: "aiops_source_gate_sealer",
+			otherUser:   "aiops_source_gate_admitter",
+		},
+		{
+			name:        "public.asset_catalog_admit_source_gate",
+			sessionUser: "aiops_source_gate_admitter",
+			otherUser:   "aiops_source_gate_sealer",
+		},
+	} {
+		function := correctiveRequireFunction(t, successorUp, contract.name)
+		attributes := correctiveNormalizeSQL(function.attributes)
+		correctiveRequireTokens(t, contract.name+" attributes", attributes,
+			"language plpgsql",
+			"volatile",
+			"strict",
+			"parallel unsafe",
+			"security definer",
+			"set search_path = pg_catalog, public, pg_temp",
+		)
+		correctiveRequireTokens(t, contract.name+" result",
+			correctiveNormalizeSQL(function.full), ") returns boolean as")
+		body := correctiveNormalizeSQL(function.body)
+		correctiveAssertSourceGateSessionGuard(t, contract.name, body, contract.sessionUser)
+		if strings.Contains(body, contract.otherUser) {
+			t.Errorf("%s body accepts or names cross-capability identity %s", contract.name, contract.otherUser)
+		}
+	}
+}
+
+func TestAssetCatalogCorrectiveSourceGateSuccessorRoutineDualStateBoundary(t *testing.T) {
+	currentUp := readMigration(t, "000015_assets_catalog.up.sql")
+	currentDown := readMigration(t, "000015_assets_catalog.down.sql")
+	currentState, err := correctiveSourceGateRoutineManifestState(currentUp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exact36Up := currentUp
+	exact36Down := currentDown
+	exact38Up := currentUp
+	exact38Down := currentDown
+	if currentState == "exact-36" {
+		exact38Up += correctiveSourceGateSuccessorRoutineFixture()
+		exact38Down = correctiveSourceGateSuccessorRoutineDownFixture() + exact38Down
+	} else {
+		exact36Up = correctiveWithoutSourceGateSuccessorRoutineStatements(exact36Up, false)
+		exact36Down = correctiveWithoutSourceGateSuccessorRoutineStatements(exact36Down, true)
+	}
+
+	overload := `
+CREATE FUNCTION public.asset_catalog_admit_source_gate(uuid)
+RETURNS boolean LANGUAGE sql AS 'SELECT false';
+`
+	for _, test := range []struct {
+		name      string
+		up        string
+		down      string
+		wantError bool
+	}{
+		{name: "exact-36 attaches successor fixture", up: exact36Up, down: exact36Down},
+		{name: "synthetic exact-38 validates migration itself", up: exact38Up, down: exact38Down},
+		{name: "duplicate successor routines fail closed", up: exact38Up + correctiveSourceGateSuccessorRoutineFixture(), down: exact38Down, wantError: true},
+		{name: "successor overload fails closed", up: exact38Up + overload, down: exact38Down, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			up, down, err := correctiveSourceGateSuccessorRoutineBoundary(test.up, test.down)
+			if test.wantError {
+				if err == nil {
+					t.Fatal("routine boundary accepted duplicate or overload manifest")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertExactSQLObjectSet(t, "dual-state successor routines", correctiveRoutineIdentities(up), correctiveExpectedSourceGateSuccessorRoutineIdentities())
+			assertExactSQLObjectSet(t, "dual-state successor down routines", correctiveDroppedRoutineIdentities(down), correctiveExpectedSourceGateSuccessorRoutineIdentities())
+		})
+	}
+}
+
+func TestAssetCatalogCorrectiveSourceGateSessionGuardDirection(t *testing.T) {
+	fixture := correctiveSourceGateSuccessorRoutineFixture()
+	sealer := correctiveRequireFunction(t, fixture, "public.asset_catalog_seal_qualification_receipt")
+	if err := correctiveSourceGateSessionGuardError(sealer.body, "aiops_source_gate_sealer"); err != nil {
+		t.Fatalf("correct sealer session guard rejected: %v", err)
+	}
+	reversed := strings.Replace(sealer.body, "<>", "=", 1)
+	if err := correctiveSourceGateSessionGuardError(reversed, "aiops_source_gate_sealer"); err == nil {
+		t.Fatal("reversed sealer session guard accepted; only the wrong session identity may enter 42501")
+	}
 }
 
 func TestAssetCatalogCorrectiveSourceGateSuccessorTriggerManifest(t *testing.T) {
@@ -218,7 +347,7 @@ FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state();
 				t.Fatalf("gate-column discriminator = %t, %v; want true, nil before trigger creation", required, err)
 			}
 			up := test.up + exactTrigger
-			assertExactSQLObjectSet(t, "successor routine manifest", correctiveRoutineIdentities(up), correctiveExpectedRoutineIdentities())
+			assertExactSQLObjectSet(t, "successor routine manifest", correctiveRoutineIdentities(up), correctiveExpectedRoutineIdentitiesForMigration(t, currentUp))
 			assertExactSQLObjectSet(t, "successor trigger manifest", correctiveTriggerIdentities(t, up), correctiveExpectedTriggerIdentitiesForMigration(t, up))
 			assertExactSQLObjectSet(t, "successor down trigger manifest", correctiveDroppedTriggerIdentities(successorDown), correctiveExpectedDroppedTriggerIdentitiesForMigration(t, up))
 		})
@@ -1248,7 +1377,12 @@ func TestAssetCatalogCorrectiveDownUsesOneShotNowaitAndDropsEveryDependency(t *t
 		correctiveDroppedTriggerIdentities(downRaw),
 		correctiveExpectedDroppedTriggerIdentitiesForMigration(t, up),
 	)
-	assertExactSQLObjectSet(t, "down dropped routine manifest", correctiveDroppedRoutineIdentities(downRaw), correctiveExpectedRoutineIdentities())
+	assertExactSQLObjectSet(
+		t,
+		"down dropped routine manifest",
+		correctiveDroppedRoutineIdentities(downRaw),
+		correctiveExpectedRoutineIdentitiesForMigration(t, up),
+	)
 	correctiveAssertOrdered(t, "cycle-breaking foreign keys", down, []string{
 		"drop constraint asset_source_limit_buckets_last_receipt_fk",
 		"drop constraint asset_sources_published_revision_fk",
@@ -2278,6 +2412,49 @@ func correctiveFunctionDefinition(sql, qualifiedName string) (correctiveFunction
 	return correctiveFunction{}, false
 }
 
+func correctiveSourceGateSuccessorRoutineFixture() string {
+	return `
+CREATE FUNCTION public.asset_catalog_seal_qualification_receipt(
+    uuid, uuid, uuid, uuid, bigint, bigint,
+    text, timestamp with time zone, timestamp with time zone, text
+)
+RETURNS boolean AS $$
+BEGIN
+    IF session_user <> 'aiops_source_gate_sealer' THEN
+        RAISE EXCEPTION 'source gate sealer identity required' USING ERRCODE = '42501';
+    END IF;
+    RETURN false;
+END;
+$$ LANGUAGE plpgsql VOLATILE STRICT PARALLEL UNSAFE SECURITY DEFINER
+SET search_path = pg_catalog, public, pg_temp;
+
+CREATE FUNCTION public.asset_catalog_admit_source_gate(
+    uuid, uuid, uuid, uuid, bigint, bigint
+)
+RETURNS boolean AS $$
+BEGIN
+    IF session_user <> 'aiops_source_gate_admitter' THEN
+        RAISE EXCEPTION 'source gate admitter identity required' USING ERRCODE = '42501';
+    END IF;
+    RETURN false;
+END;
+$$ LANGUAGE plpgsql VOLATILE STRICT PARALLEL UNSAFE SECURITY DEFINER
+SET search_path = pg_catalog, public, pg_temp;
+`
+}
+
+func correctiveSourceGateSuccessorRoutineDownFixture() string {
+	return `
+DROP FUNCTION public.asset_catalog_seal_qualification_receipt(
+    uuid, uuid, uuid, uuid, bigint, bigint,
+    text, timestamp with time zone, timestamp with time zone, text
+);
+DROP FUNCTION public.asset_catalog_admit_source_gate(
+    uuid, uuid, uuid, uuid, bigint, bigint
+);
+`
+}
+
 func correctiveAssertFunctionAttributes(t *testing.T, label string, function correctiveFunction, required ...string) {
 	t.Helper()
 	attributes := correctiveNormalizeSQL(function.attributes)
@@ -2363,6 +2540,111 @@ func correctiveExpectedRoutineIdentities() []string {
 		"public.enforce_asset_observation_admission()",
 		"public.validate_asset_observation_page_closure()",
 	}
+}
+
+func correctiveExpectedSourceGateSuccessorRoutineIdentities() []string {
+	identities := append([]string(nil), correctiveExpectedRoutineIdentities()...)
+	return append(
+		identities,
+		"public.asset_catalog_seal_qualification_receipt(uuid,uuid,uuid,uuid,bigint,bigint,text,timestamp with time zone,timestamp with time zone,text)",
+		"public.asset_catalog_admit_source_gate(uuid,uuid,uuid,uuid,bigint,bigint)",
+	)
+}
+
+func correctiveSourceGateRoutineManifestState(up string) (string, error) {
+	got := correctiveRoutineIdentities(up)
+	switch {
+	case correctiveSQLObjectSetsEqual(got, correctiveExpectedRoutineIdentities()):
+		return "exact-36", nil
+	case correctiveSQLObjectSetsEqual(got, correctiveExpectedSourceGateSuccessorRoutineIdentities()):
+		return "exact-38", nil
+	default:
+		sorted := append([]string(nil), got...)
+		sort.Strings(sorted)
+		return "", fmt.Errorf(
+			"000015 routine manifest is neither current exact-36 nor future exact-38: %v",
+			sorted,
+		)
+	}
+}
+
+func correctiveExpectedRoutineIdentitiesForMigration(t *testing.T, up string) []string {
+	t.Helper()
+	state, err := correctiveSourceGateRoutineManifestState(up)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state == "exact-38" {
+		return correctiveExpectedSourceGateSuccessorRoutineIdentities()
+	}
+	return correctiveExpectedRoutineIdentities()
+}
+
+func correctiveSourceGateSuccessorRoutineBoundary(up, down string) (string, string, error) {
+	state, err := correctiveSourceGateRoutineManifestState(up)
+	if err != nil {
+		return "", "", err
+	}
+	if state == "exact-36" {
+		return up + correctiveSourceGateSuccessorRoutineFixture(),
+			correctiveSourceGateSuccessorRoutineDownFixture() + down,
+			nil
+	}
+	return up, down, nil
+}
+
+func correctiveWithoutSourceGateSuccessorRoutineStatements(sql string, dropped bool) string {
+	successors := correctiveExpectedSourceGateSuccessorRoutineIdentities()
+	successorIdentities := map[string]struct{}{
+		successors[len(successors)-2]: {},
+		successors[len(successors)-1]: {},
+	}
+	statements := correctiveTopLevelSQLStatements(sql)
+	filtered := make([]string, 0, len(statements))
+	for _, statement := range statements {
+		identities := correctiveRoutineIdentities(statement)
+		if dropped {
+			identities = correctiveDroppedRoutineIdentities(statement)
+		}
+		if len(identities) == 1 {
+			if _, remove := successorIdentities[identities[0]]; remove {
+				continue
+			}
+		}
+		filtered = append(filtered, statement)
+	}
+	return strings.Join(filtered, "\n")
+}
+
+func correctiveAssertSourceGateSessionGuard(
+	t *testing.T,
+	label, body, identity string,
+) {
+	t.Helper()
+	if err := correctiveSourceGateSessionGuardError(body, identity); err != nil {
+		t.Errorf("%s session identity guard: %v", label, err)
+	}
+}
+
+func correctiveSourceGateSessionGuardError(body, identity string) error {
+	normalized := correctiveNormalizeSQL(body)
+	if strings.Count(normalized, "session_user") != 1 {
+		return fmt.Errorf(
+			"normalized body names session_user %d times, want exactly once",
+			strings.Count(normalized, "session_user"),
+		)
+	}
+	guard := regexp.MustCompile(
+		`\bif session_user <> '` + regexp.QuoteMeta(identity) +
+			`' then raise exception [^;]+ using errcode = '42501'; end if;`,
+	)
+	if matches := guard.FindAllStringIndex(normalized, -1); len(matches) != 1 {
+		return fmt.Errorf(
+			"normalized body must contain exactly one wrong-identity 42501 branch for %q",
+			identity,
+		)
+	}
+	return nil
 }
 
 func correctiveCanonicalArgumentType(argument string) string {
