@@ -209,8 +209,40 @@ func TestAssetCatalogCorrectiveSourceGateSessionGuardDirection(t *testing.T) {
 }
 
 func TestAssetCatalogCorrectiveSourceGateSuccessorTriggerManifest(t *testing.T) {
+	correctiveAssertSourceGateSuccessorTriggerManifest(
+		t,
+		readMigration(t, "000015_assets_catalog.up.sql"),
+		readMigration(t, "000015_assets_catalog.down.sql"),
+	)
+}
+
+func TestAssetCatalogCorrectiveSourceGateSuccessorTriggerManifestAcceptsFormalInputAcrossAuxiliaryMatrix(t *testing.T) {
 	currentUp := readMigration(t, "000015_assets_catalog.up.sql")
 	currentDown := readMigration(t, "000015_assets_catalog.down.sql")
+	columns := `
+    gate_evidence_run_id uuid,
+    gate_evidence_digest text,
+    gate_evidence_expires_at timestamptz`
+	trigger := `
+CREATE CONSTRAINT TRIGGER asset_sources_gate_evidence_closure_guard
+AFTER INSERT OR UPDATE ON public.asset_sources
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state();
+	`
+	dropAnchor := "DROP TRIGGER asset_sources_deferred_state_guard ON public.asset_sources;"
+	drop := "\nDROP TRIGGER asset_sources_gate_evidence_closure_guard ON public.asset_sources;\n"
+	formalUp, formalDown, err := correctiveSourceGateSuccessorTriggerFixture(
+		t, currentUp, currentDown, columns, trigger, dropAnchor, drop,
+	)
+	if err != nil {
+		t.Fatalf("construct synthetic formal source-gate fixture: %v", err)
+	}
+
+	correctiveAssertSourceGateSuccessorTriggerManifest(t, formalUp, formalDown)
+}
+
+func correctiveAssertSourceGateSuccessorTriggerManifest(t *testing.T, inputUp, inputDown string) {
+	t.Helper()
 	columnList := func(runID, digest, expires string) string {
 		return fmt.Sprintf(`
     gate_evidence_run_id %s,
@@ -254,13 +286,17 @@ DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state();
 	`
 	exactDrop := "\nDROP TRIGGER asset_sources_gate_evidence_closure_guard ON public.asset_sources;\n"
-	successorUp := correctiveSourceGateColumnsFixture(t, currentUp, successorColumns) + exactTrigger
 	dropAnchor := "DROP TRIGGER asset_sources_deferred_state_guard ON public.asset_sources;"
-	successorDown := strings.Replace(currentDown, dropAnchor, dropAnchor+exactDrop, 1)
+	baselineUp, baselineDown, successorUp, successorDown, err := correctiveSourceGateSuccessorTriggerFixturePair(
+		t, inputUp, inputDown, successorColumns, exactTrigger, dropAnchor, exactDrop,
+	)
+	if err != nil {
+		t.Fatalf("construct baseline/formal source-gate fixture pair: %v", err)
+	}
 	assertRejectedDO := func(name, statement string) {
 		t.Helper()
 		t.Run("discriminator rejects "+name, func(t *testing.T) {
-			if required, err := correctiveSourceGateTriggerRequired(currentUp + statement); err == nil {
+			if required, err := correctiveSourceGateTriggerRequired(baselineUp + statement); err == nil {
 				t.Fatalf("gate-column discriminator = %t, nil; want %s error", required, name)
 			}
 		})
@@ -331,11 +367,11 @@ FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state();
 	successors := make([]struct{ name, up string }, 0, len(typeVariants)*3)
 	for _, types := range typeVariants {
 		columns := columnList(types.runID, types.digest, types.expires)
-		mixed := correctiveSourceGateColumnsFixture(t, currentUp, "gate_evidence_run_id "+types.runID) +
+		mixed := correctiveSourceGateColumnsFixture(t, baselineUp, "gate_evidence_run_id "+types.runID) +
 			mixedAlterList(types.digest, types.expires)
 		successors = append(successors,
-			struct{ name, up string }{types.name + " inline", correctiveSourceGateColumnsFixture(t, currentUp, columns)},
-			struct{ name, up string }{types.name + " all alter", currentUp + alterList(types.runID, types.digest, types.expires)},
+			struct{ name, up string }{types.name + " inline", correctiveSourceGateColumnsFixture(t, baselineUp, columns)},
+			struct{ name, up string }{types.name + " all alter", baselineUp + alterList(types.runID, types.digest, types.expires)},
 			struct{ name, up string }{types.name + " mixed", mixed},
 		)
 	}
@@ -347,7 +383,7 @@ FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state();
 				t.Fatalf("gate-column discriminator = %t, %v; want true, nil before trigger creation", required, err)
 			}
 			up := test.up + exactTrigger
-			assertExactSQLObjectSet(t, "successor routine manifest", correctiveRoutineIdentities(up), correctiveExpectedRoutineIdentitiesForMigration(t, currentUp))
+			assertExactSQLObjectSet(t, "successor routine manifest", correctiveRoutineIdentities(up), correctiveExpectedRoutineIdentitiesForMigration(t, baselineUp))
 			assertExactSQLObjectSet(t, "successor trigger manifest", correctiveTriggerIdentities(t, up), correctiveExpectedTriggerIdentitiesForMigration(t, up))
 			assertExactSQLObjectSet(t, "successor down trigger manifest", correctiveDroppedTriggerIdentities(successorDown), correctiveExpectedDroppedTriggerIdentitiesForMigration(t, up))
 		})
@@ -389,7 +425,7 @@ FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state('unrev
 	}
 	for _, test := range upNegatives {
 		t.Run("up rejects "+test.name, func(t *testing.T) {
-			fixture := correctiveSourceGateColumnsFixture(t, currentUp, successorColumns) + test.trigger
+			fixture := correctiveSourceGateColumnsFixture(t, baselineUp, successorColumns) + test.trigger
 			got, diagnostics := correctiveParsedTriggerIdentities(fixture)
 			want := correctiveExpectedTriggerIdentitiesForMigration(t, fixture)
 			if len(diagnostics) == 0 && correctiveSQLObjectSetsEqual(got, want) {
@@ -399,12 +435,12 @@ FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state('unrev
 	}
 
 	downNegatives := []struct{ name, down string }{
-		{"missing drop", currentDown},
-		{"wrong relation", currentDown + strings.Replace(exactDrop, "ON public.asset_sources", "ON public.asset_source_runs", 1)},
+		{"missing drop", baselineDown},
+		{"wrong relation", baselineDown + strings.Replace(exactDrop, "ON public.asset_sources", "ON public.asset_source_runs", 1)},
 		{"extra drop", successorDown + "\nDROP TRIGGER asset_sources_gate_evidence_extra_guard ON public.asset_sources;\n"},
 		{"extra drop with if exists", successorDown + "\nDROP TRIGGER IF EXISTS asset_sources_gate_evidence_extra_guard ON public.asset_sources;\n"},
-		{"postposed drop", currentDown + exactDrop},
-		{"drop after first table", strings.Replace(currentDown, "DROP TABLE public.service_asset_bindings;", "DROP TABLE public.service_asset_bindings;"+exactDrop, 1)},
+		{"postposed drop", baselineDown + exactDrop},
+		{"drop after first table", strings.Replace(baselineDown, "DROP TABLE public.service_asset_bindings;", "DROP TABLE public.service_asset_bindings;"+exactDrop, 1)},
 		{"duplicate successor drop", strings.Replace(successorDown, strings.TrimSpace(exactDrop), strings.TrimSpace(exactDrop)+exactDrop, 1)},
 		{"create after drops", successorDown + exactTrigger},
 		{"create with arguments after drops", successorDown + `
@@ -502,7 +538,7 @@ FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state('unrev
 	for _, form := range singleQuotedDynamicForms {
 		for _, test := range singleQuotedDynamicSQL {
 			t.Run("discriminator rejects "+form.name+" dynamic "+test.name, func(t *testing.T) {
-				if required, err := correctiveSourceGateTriggerRequired(currentUp + form.do(test.body)); err == nil {
+				if required, err := correctiveSourceGateTriggerRequired(baselineUp + form.do(test.body)); err == nil {
 					t.Fatalf("gate-column discriminator = %t, nil; want dynamic %s error", required, test.name)
 				}
 			})
@@ -973,7 +1009,7 @@ $$ LANGUAGE plpgsql;
 	}
 	if correctiveSQLObjectSetsEqual(
 		correctiveDroppedTriggerIdentities(successorDown),
-		correctiveExpectedDroppedTriggerIdentitiesForMigration(t, currentUp),
+		correctiveExpectedDroppedTriggerIdentitiesForMigration(t, baselineUp),
 	) {
 		t.Fatal("baseline down manifest accepted premature successor trigger drop")
 	}
@@ -997,7 +1033,7 @@ $$ LANGUAGE plpgsql;
 	}
 	for _, test := range invalidColumns {
 		t.Run("discriminator rejects "+test.name, func(t *testing.T) {
-			fixture := correctiveSourceGateColumnsFixture(t, currentUp, test.columns)
+			fixture := correctiveSourceGateColumnsFixture(t, baselineUp, test.columns)
 			if required, err := correctiveSourceGateTriggerRequired(fixture); err == nil {
 				t.Fatalf("gate-column discriminator = %t, nil; want invalid %s error", required, test.name)
 			}
@@ -1005,12 +1041,12 @@ $$ LANGUAGE plpgsql;
 	}
 
 	invalidAlters := []struct{ name, up string }{
-		{"partial alter", currentUp + "\nALTER TABLE public.asset_sources ADD COLUMN gate_evidence_run_id uuid;\n"},
-		{"wrong alter type", currentUp + strings.Replace(alterColumns, "run_id uuid", "run_id text", 1)},
-		{"duplicate mixed column", correctiveSourceGateColumnsFixture(t, currentUp, successorColumns) + "\nALTER TABLE public.asset_sources ADD COLUMN gate_evidence_run_id uuid;\n"},
-		{"unknown alter column", currentUp + alterColumns + "\nALTER TABLE public.asset_sources ADD COLUMN gate_evidence_status text;\n"},
-		{"unreviewed alter column", correctiveSourceGateColumnsFixture(t, currentUp, successorColumns) + "\nALTER TABLE public.asset_sources ALTER COLUMN gate_evidence_run_id TYPE text;\n"},
-		{"dynamic exact3 alter", currentUp + dynamicDO(`
+		{"partial alter", baselineUp + "\nALTER TABLE public.asset_sources ADD COLUMN gate_evidence_run_id uuid;\n"},
+		{"wrong alter type", baselineUp + strings.Replace(alterColumns, "run_id uuid", "run_id text", 1)},
+		{"duplicate mixed column", correctiveSourceGateColumnsFixture(t, baselineUp, successorColumns) + "\nALTER TABLE public.asset_sources ADD COLUMN gate_evidence_run_id uuid;\n"},
+		{"unknown alter column", baselineUp + alterColumns + "\nALTER TABLE public.asset_sources ADD COLUMN gate_evidence_status text;\n"},
+		{"unreviewed alter column", correctiveSourceGateColumnsFixture(t, baselineUp, successorColumns) + "\nALTER TABLE public.asset_sources ALTER COLUMN gate_evidence_run_id TYPE text;\n"},
+		{"dynamic exact3 alter", baselineUp + dynamicDO(`
     EXECUTE 'ALTER TABLE public.asset_sources ADD COLUMN gate_evidence_run_id uuid';
     EXECUTE format('ALTER TABLE public.asset_sources ADD COLUMN %I text', 'gate_evidence_digest');
     EXECUTE 'ALTER TABLE public.asset_sources ADD COLUMN gate_evidence_' || 'expires_at timestamptz';`)},
@@ -1019,6 +1055,95 @@ $$ LANGUAGE plpgsql;
 		t.Run("discriminator rejects "+test.name, func(t *testing.T) {
 			if required, err := correctiveSourceGateTriggerRequired(test.up); err == nil {
 				t.Fatalf("gate-column discriminator = %t, nil; want invalid %s error", required, test.name)
+			}
+		})
+	}
+}
+
+func TestAssetCatalogCorrectiveSourceGateSuccessorFixtureReusesFormalState(t *testing.T) {
+	currentUp := readMigration(t, "000015_assets_catalog.up.sql")
+	currentDown := readMigration(t, "000015_assets_catalog.down.sql")
+	columns := `
+    gate_evidence_run_id uuid,
+    gate_evidence_digest text,
+    gate_evidence_expires_at timestamptz`
+	trigger := `
+CREATE CONSTRAINT TRIGGER asset_sources_gate_evidence_closure_guard
+AFTER INSERT OR UPDATE ON public.asset_sources
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state();
+	`
+	dropAnchor := "DROP TRIGGER asset_sources_deferred_state_guard ON public.asset_sources;"
+	drop := "\nDROP TRIGGER asset_sources_gate_evidence_closure_guard ON public.asset_sources;\n"
+
+	formalUp, formalDown, err := correctiveSourceGateSuccessorTriggerFixture(
+		t, currentUp, currentDown, columns, trigger, dropAnchor, drop,
+	)
+	if err != nil {
+		t.Fatalf("construct formal successor fixture from baseline: %v", err)
+	}
+	gotUp, gotDown, err := correctiveSourceGateSuccessorTriggerFixture(
+		t, formalUp, formalDown, columns, trigger, dropAnchor, drop,
+	)
+	if err != nil {
+		t.Fatalf("reuse formal successor fixture: %v", err)
+	}
+	if gotUp != formalUp || gotDown != formalDown {
+		t.Fatalf(
+			"formal successor fixture was reconstructed: run-id=%d digest=%d expires=%d trigger=%d drop=%d; want byte-for-byte reuse",
+			strings.Count(gotUp, "gate_evidence_run_id"),
+			strings.Count(gotUp, "gate_evidence_digest"),
+			strings.Count(gotUp, "gate_evidence_expires_at"),
+			strings.Count(gotUp, "CREATE CONSTRAINT TRIGGER asset_sources_gate_evidence_closure_guard"),
+			strings.Count(gotDown, "DROP TRIGGER asset_sources_gate_evidence_closure_guard"),
+		)
+	}
+
+	partialUp := correctiveSourceGateColumnsFixture(t, currentUp, "gate_evidence_run_id uuid")
+	duplicateColumnsUp := correctiveSourceGateColumnsFixture(t, formalUp, columns)
+	extraTrigger := `
+CREATE TRIGGER asset_sources_gate_evidence_extra_guard
+AFTER UPDATE ON public.asset_sources
+FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state();
+`
+	dynamicTrigger := `
+DO $$
+BEGIN
+    EXECUTE 'CREATE TRIGGER dynamic_guard AFTER UPDATE ON public.asset_sources FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state()';
+END;
+$$;
+`
+	replaceFormalTrigger := func(old, replacement string) string {
+		return strings.Replace(formalUp, trigger, strings.Replace(trigger, old, replacement, 1), 1)
+	}
+	rejected := []struct {
+		name string
+		up   string
+		down string
+	}{
+		{"partial columns", partialUp, currentDown},
+		{"duplicate columns", duplicateColumnsUp, formalDown},
+		{"aliased column", strings.Replace(formalUp, "gate_evidence_run_id uuid", "gate_evidence_run_alias uuid", 1), formalDown},
+		{"wrong column type", strings.Replace(formalUp, "gate_evidence_run_id uuid", "gate_evidence_run_id text", 1), formalDown},
+		{"renamed trigger", strings.Replace(formalUp, "asset_sources_gate_evidence_closure_guard", "asset_sources_gate_evidence_closure_guard_wrong", 1), formalDown},
+		{"wrong trigger relation", replaceFormalTrigger("ON public.asset_sources", "ON public.asset_source_runs"), formalDown},
+		{"wrong trigger caller", replaceFormalTrigger("public.validate_asset_source_deferred_state()", "public.validate_asset_source_revision_deferred_state()"), formalDown},
+		{"wrong trigger lifecycle", replaceFormalTrigger("DEFERRABLE INITIALLY DEFERRED", "NOT DEFERRABLE INITIALLY IMMEDIATE"), formalDown},
+		{"duplicate trigger", formalUp + trigger, formalDown},
+		{"extra trigger object", formalUp + extraTrigger, formalDown},
+		{"dynamic trigger DDL", formalUp + dynamicTrigger, formalDown},
+		{"formal up with baseline down", formalUp, currentDown},
+		{"baseline up with formal down", currentUp, formalDown},
+		{"wrong down relation", formalUp, strings.Replace(formalDown, drop, strings.Replace(drop, "ON public.asset_sources", "ON public.asset_source_runs", 1), 1)},
+		{"duplicate down drop", formalUp, strings.Replace(formalDown, dropAnchor, dropAnchor+drop, 1)},
+		{"dynamic down DDL", formalUp, formalDown + dynamicTrigger},
+	}
+	for _, test := range rejected {
+		t.Run("rejects "+test.name, func(t *testing.T) {
+			if _, _, _, _, err := correctiveSourceGateSuccessorTriggerFixturePair(
+				t, test.up, test.down, columns, trigger, dropAnchor, drop,
+			); err == nil {
+				t.Fatalf("successor fixture construction accepted %s state", test.name)
 			}
 		})
 	}
@@ -3567,6 +3692,235 @@ func correctiveSourceGateColumnsFixture(t *testing.T, up, columns string) string
 	}
 	successorTable := strings.TrimSuffix(table, ")") + ",\n    " + strings.TrimSpace(columns) + "\n)"
 	return strings.Replace(up, table, successorTable, 1)
+}
+
+func correctiveSourceGateSuccessorTriggerFixture(
+	t *testing.T,
+	up, down, columns, trigger, dropAnchor, drop string,
+) (string, string, error) {
+	t.Helper()
+	formal, err := correctiveSourceGateSuccessorTriggerFixtureState(up, down)
+	if err != nil {
+		return "", "", err
+	}
+	if formal {
+		return up, down, nil
+	}
+
+	table, err := correctiveTableDefinition(up, "public.asset_sources")
+	if err != nil {
+		return "", "", err
+	}
+	if occurrences := strings.Count(up, table); occurrences != 1 {
+		return "", "", fmt.Errorf("public.asset_sources fixture definition occurs %d times, want exact one", occurrences)
+	}
+	if occurrences := strings.Count(down, dropAnchor); occurrences != 1 {
+		return "", "", fmt.Errorf("successor trigger drop anchor occurs %d times, want exact one", occurrences)
+	}
+	successorTable := strings.TrimSuffix(table, ")") + ",\n    " + strings.TrimSpace(columns) + "\n)"
+	successorUp := strings.Replace(up, table, successorTable, 1) + trigger
+	successorDown := strings.Replace(down, dropAnchor, dropAnchor+drop, 1)
+	formal, err = correctiveSourceGateSuccessorTriggerFixtureState(successorUp, successorDown)
+	if err != nil {
+		return "", "", fmt.Errorf("constructed successor source-gate fixture: %w", err)
+	}
+	if !formal {
+		return "", "", fmt.Errorf("constructed successor source-gate fixture remains baseline")
+	}
+	return successorUp, successorDown, nil
+}
+
+func correctiveSourceGateSuccessorTriggerFixturePair(
+	t *testing.T,
+	up, down, columns, trigger, dropAnchor, drop string,
+) (string, string, string, string, error) {
+	t.Helper()
+	formal, err := correctiveSourceGateSuccessorTriggerFixtureState(up, down)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	if !formal {
+		formalUp, formalDown, err := correctiveSourceGateSuccessorTriggerFixture(
+			t, up, down, columns, trigger, dropAnchor, drop,
+		)
+		return up, down, formalUp, formalDown, err
+	}
+
+	baselineUp, err := correctiveWithoutSourceGateEvidenceColumns(up)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("decompose formal source-gate columns: %w", err)
+	}
+	baselineUp, err = correctiveWithoutSourceGateClosureTriggerStatement(baselineUp, false)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("decompose formal source-gate trigger: %w", err)
+	}
+	baselineDown, err := correctiveWithoutSourceGateClosureTriggerStatement(down, true)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("decompose formal source-gate trigger drop: %w", err)
+	}
+	baseline, err := correctiveSourceGateSuccessorTriggerFixtureState(baselineUp, baselineDown)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("decomposed baseline source-gate fixture: %w", err)
+	}
+	if baseline {
+		return "", "", "", "", fmt.Errorf("decomposed source-gate fixture remains formal")
+	}
+	if _, _, err := correctiveSourceGateSuccessorTriggerFixture(
+		t, baselineUp, baselineDown, columns, trigger, dropAnchor, drop,
+	); err != nil {
+		return "", "", "", "", fmt.Errorf("reconstruct decomposed formal source-gate fixture: %w", err)
+	}
+	return baselineUp, baselineDown, up, down, nil
+}
+
+func correctiveWithoutSourceGateEvidenceColumns(up string) (string, error) {
+	addColumn := regexp.MustCompile(`(?is)^\s*alter\s+table\s+(` + correctiveQualifiedSQLIdentifierPattern() +
+		`)\s+add\s+(?:column\s+)?(` + correctiveSQLIdentifierPattern + `)\s+(.+?)\s*;\s*$`)
+	statements := correctiveTopLevelSQLStatements(up)
+	filtered := make([]string, 0, len(statements))
+	manifest := make([]string, 0, 3)
+	tableSeen := false
+	for _, statement := range statements {
+		table, found, err := correctiveTableDefinitionInStatement(statement, "public.asset_sources")
+		if err != nil {
+			return "", err
+		}
+		if found {
+			if tableSeen {
+				return "", fmt.Errorf("duplicate public.asset_sources definition")
+			}
+			tableSeen = true
+			open := strings.Index(table, "(")
+			if open < 0 {
+				return "", fmt.Errorf("public.asset_sources definition has no column list")
+			}
+			retained := make([]string, 0)
+			for _, element := range correctiveSplitSQLArguments(table[open+1 : len(table)-1]) {
+				name, definition, column := correctiveColumnDefinition(element)
+				if column && correctiveGateEvidenceColumnLike(name) {
+					manifest = append(manifest, correctiveGateEvidenceColumnIdentity(name, definition))
+					continue
+				}
+				if strings.Contains(strings.ToLower(correctiveStripSQLComments(element)), "gate_evidence_") {
+					return "", fmt.Errorf("unreviewed gate-evidence table element: %s", correctiveNormalizeSQL(element))
+				}
+				retained = append(retained, element)
+			}
+			baselineTable := table[:open+1] + strings.Join(retained, ",") + ")"
+			filtered = append(filtered, strings.Replace(statement, table, baselineTable, 1))
+			continue
+		}
+
+		match := addColumn.FindStringSubmatch(statement)
+		if match != nil &&
+			correctiveCanonicalSQLIdentifier(match[1]) == "public.asset_sources" &&
+			correctiveGateEvidenceColumnLike(correctiveCanonicalSQLIdentifier(match[2])) {
+			manifest = append(manifest, correctiveGateEvidenceColumnIdentity(
+				correctiveCanonicalSQLIdentifier(match[2]),
+				match[3],
+			))
+			continue
+		}
+		filtered = append(filtered, statement)
+	}
+	if !tableSeen {
+		return "", fmt.Errorf("migration does not define table public.asset_sources with an explicit schema")
+	}
+	sort.Strings(manifest)
+	expected := []string{
+		"gate_evidence_digest text",
+		"gate_evidence_expires_at timestamp with time zone",
+		"gate_evidence_run_id uuid",
+	}
+	if !reflect.DeepEqual(manifest, expected) {
+		return "", fmt.Errorf("removed gate-evidence column manifest = %v, want exact %v", manifest, expected)
+	}
+	return strings.Join(filtered, "\n"), nil
+}
+
+func correctiveWithoutSourceGateClosureTriggerStatement(sql string, dropped bool) (string, error) {
+	expected := correctiveTriggerIdentity(
+		"public.asset_sources",
+		"asset_sources_gate_evidence_closure_guard",
+		true,
+		"after",
+		[]string{"insert", "update"},
+		"row",
+		true,
+		"public.validate_asset_source_deferred_state",
+	)
+	if dropped {
+		expected = "public.asset_sources/asset_sources_gate_evidence_closure_guard"
+	}
+
+	statements := correctiveTopLevelSQLStatements(sql)
+	filtered := make([]string, 0, len(statements))
+	removed := 0
+	for _, statement := range statements {
+		var identities []string
+		if dropped {
+			identities = correctiveDroppedTriggerIdentities(statement)
+		} else {
+			var diagnostics []string
+			identities, diagnostics = correctiveParsedTriggerIdentities(statement)
+			if len(diagnostics) != 0 {
+				return "", fmt.Errorf("trigger statement diagnostics: %v", diagnostics)
+			}
+		}
+		if len(identities) == 1 && identities[0] == expected {
+			removed++
+			continue
+		}
+		filtered = append(filtered, statement)
+	}
+	if removed != 1 {
+		return "", fmt.Errorf("source-gate closure trigger statement count = %d, want exact one", removed)
+	}
+	return strings.Join(filtered, "\n"), nil
+}
+
+func correctiveSourceGateSuccessorTriggerFixtureState(up, down string) (bool, error) {
+	required, err := correctiveSourceGateTriggerRequired(up)
+	if err != nil {
+		return false, fmt.Errorf("source-gate columns: %w", err)
+	}
+
+	expectedUp := correctiveExpectedTriggerIdentities()
+	if required {
+		expectedUp = append(expectedUp, correctiveTriggerIdentity(
+			"public.asset_sources",
+			"asset_sources_gate_evidence_closure_guard",
+			true,
+			"after",
+			[]string{"insert", "update"},
+			"row",
+			true,
+			"public.validate_asset_source_deferred_state",
+		))
+	}
+	gotUp, diagnostics := correctiveParsedTriggerIdentities(up)
+	if len(diagnostics) != 0 {
+		return false, fmt.Errorf("source-gate up trigger manifest diagnostics: %v", diagnostics)
+	}
+	if !correctiveSQLObjectSetsEqual(gotUp, expectedUp) {
+		return false, fmt.Errorf("source-gate up trigger manifest does not match %s state", correctiveSourceGateFixtureStateName(required))
+	}
+
+	expectedDown := make([]string, 0, len(expectedUp))
+	for _, identity := range expectedUp {
+		expectedDown = append(expectedDown, strings.SplitN(identity, "|", 2)[0])
+	}
+	if gotDown := correctiveDroppedTriggerIdentities(down); !correctiveSQLObjectSetsEqual(gotDown, expectedDown) {
+		return false, fmt.Errorf("source-gate down trigger manifest does not match %s state", correctiveSourceGateFixtureStateName(required))
+	}
+	return required, nil
+}
+
+func correctiveSourceGateFixtureStateName(formal bool) string {
+	if formal {
+		return "formal"
+	}
+	return "baseline"
 }
 
 func correctiveDroppedTriggerIdentities(sql string) []string {
