@@ -132,7 +132,7 @@ git commit -m "feat(assetdiscovery): add fixed external cmdb provider"
 | External CMDB qualification canary、gate evaluator/decision + operating proof | 本包 Task 19B | 消费 Task 19A2a/19A2b/19A2c + Task 29A 已合并 receipts；唯一调用 CMDB `AdmitGate` |
 | Signed final Provider matrix + final E2E/CI | [Pack 09 Task 29B](./09-discovery-worker-ha-e2e.md#task-29b-signed-provider-matrix-and-final-e2e-ci) | 只聚合完成的 per-source gate/canary/HA receipts，不重建它们 |
 
-这只是所有权纠偏，不回写完成度 checkbox。已合并 Task 28C/19A 后，Source Gate successor contract 的当前唯一无环顺序冻结为 `reachability docs corrective → manager exact-3 contract sync → source-gate capability-identity harness C0 → pre-A2a exact-2 routine/test-boundary corrective → manager exact-3 evidence sync → fresh Task 19A2a → post-A2a exact-2 validation corrective → Task 19A2b → Task 19A2c → Task 29A → Task 19B → Task 29B`。reachability docs 合并后，主管理窗口必须先从最新 `main` 创建第一次 exact-3 manager-only PR，只修改 `docs/status/current.md`、`coverage-matrix.md` 与 `09-discovery-worker-ha-e2e.md`，把唯一当前入口改为 capability harness；随后依次完成 exact-8 harness 与 pre-A2a exact-2，再以相同 exact-3 文件边界做第二次 evidence sync，记录 merged evidence并发布 formal A2a。两次 manager sync 都不改 ABI、业务完成度或 checkbox。每一实现 Batch 都由最新 `main` 的 fresh window 独立真实 G2/PR/merge；fixture、旧 dirty worktree 或未合并实现不能反向成为 ABI 事实源。不得把 19A2b/19A2c/29A/19B/29B 提前；Task 18A merged code 仍只是稳定 `Produces`，旧 Task 18 继续等待 G3。所有 Source Gate 后继、真实 CMDB canary 和 G4 均 deferred，`EXTERNAL_CMDB/CMDB_CATALOG_V1` 始终保持 `NOT_STARTED/UNAVAILABLE/CLOSED`。
+这只是所有权纠偏，不回写完成度 checkbox。已合并 Task 28C/19A 后，Source Gate successor contract 的当前唯一无环顺序冻结为 `reachability docs corrective → manager exact-3 contract sync → source-gate capability-identity harness C0 → pre-A2a exact-2 routine/test-boundary corrective → manager exact-3 evidence sync → global routine ACL exact-11 contract + status sync → fresh Task 19A2a exact-12 → post-A2a exact-2 validation corrective → Task 19A2b → Task 19A2c → Task 29A → Task 19B → Task 29B`。global routine ACL corrective把原exact8 docs与`docs/status/current.md`、coverage、Pack09组成同一exact11原子提交；它进入`main`时合同与当前入口同时生效，不存在后继manager sync窗口，也不改ABI、业务完成度、checkbox或能力状态。上一fresh A2a因predecessor72默认PUBLIC `EXECUTE`为两个capability identity产生合计144条额外effective edge而`STOPPED/NOT PASS`；该未提交worktree不得续用或复制，本exact11不实现A2a/G2。pre-A2a exact-2 global helper保持安全真值且不得收窄；exact11合并后的唯一入口是从届时最新`origin/main`新建fresh Task19A2a exact12，消费本Pack唯一exact72 identity manifest与production digest。每一实现Batch只消费最新`main`；不得提前19A2b/19A2c/29A/19B/29B。所有Source Gate后继、真实CMDB canary和G4均deferred，`EXTERNAL_CMDB/CMDB_CATALOG_V1`与全部Source/Provider/Worker始终保持`NOT_STARTED/UNAVAILABLE/CLOSED`。
 
 ### Task 18A: merged CMDB paging/checkpoint protocol foundation
 
@@ -302,25 +302,26 @@ reachability docs corrective
 → source-gate capability-identity harness C0
 → pre-A2a exact-2 routine/test-boundary corrective
 → manager exact-3 evidence sync
-→ fresh Task 19A2a
+→ global routine ACL exact-11 contract + status sync
+→ fresh Task 19A2a exact-12
 → post-A2a exact-2 validation corrective
 → Task 19A2b → Task 19A2c → Task 29A → Task 19B → Task 29B
 ```
 
-第一次 manager exact-3 contract sync 必须先把 `docs/status/current.md` 的唯一下一入口从 stale formal A2a 改为本链，并让 `coverage-matrix.md`/Pack 09 逐字消费本节；它不等待实现证据。随后 capability-identity harness C0 才可从最新 `main` 独立修改且只修改 `.github/workflows/ci.yml`、`.env.example`、`scripts/with-local-postgres.sh`、`docs/operations/local-postgresql-development.md`、`internal/assetcatalog/postgres/migration_integration_test.go`、`internal/assetcatalog/postgres/recovery_container_test.go`、`internal/assetcatalog/postgres/migration_recovery_integration_test.go` 与 `internal/store/postgres/migrations_integration_test.go`。它只预置互异的 `aiops_source_gate_sealer`/`aiops_source_gate_admitter` LOGIN、短期 credential/DSN/certificate、future-gated application-DB ACL helper 与 CI/local/recovery identity harness；`.env.example` 同时预留空的 `AIOPS_SOURCE_GATE_ADMIT_DATABASE_URL`、`AIOPS_DISCOVERY_SOURCE_GATE_SEAL_DSN_FILE`、两个测试 DSN和安全文件路径。helper必须双向 reconcile：只有 A2a exact-38 schema postflight 才进入 capability `CONNECT|USAGE` grant分支并随后要求 full role/capability admission；exact-36、成功 down、unknown或partial一律先 revoke并证明 absent，unknown/partial再 fail closed。initial/up/down/up/partial 必须证明 predecessor ACL无残留。该 Batch 不修改 migration、授予函数、打开 pool 或改变能力状态；targeted identity tests、fresh G1、独立 P0/P1 review 与单独 PR/merge 后才允许 pre-A2a exact-2。
+第一次 manager exact-3 contract sync 先把 status 入口改为 capability harness；后续 harness只预置身份/DSN/certificate与双向ACL helper，不修改migration或授予函数。该helper只有在future owned exact38/global exact110 postflight都通过时才授予capability`CONNECT|USAGE`；predecessor72/owned36、down、unknown或partial均revoke并证明absent。pre-A2a exact-2合并后manager evidence sync记录其证据；本global routine ACL exact11 corrective在同一原子提交中冻结72↔110/rollback/recovery合同并同步current/coverage/Pack09入口，进入`main`后直接发布fresh A2a exact12，不再等待另一manager sync。上一fresh A2a因PUBLIC72形成144条额外capability edge而`STOPPED/NOT PASS`，其未提交worktree不得续用或复制；本corrective不实现A2a/G2。
 
 pre-A2a exact-2 的完整且唯一文件为：
 
 - Modify: `internal/assetcatalog/postgres/migration_corrective_test.go`
 - Modify: `internal/assetcatalog/postgres/migration_closure_adversarial_integration_test.go`
 
-**Consumes（全部已合并）:** 本八文档 reachability contract、第一次 manager exact-3 contract sync、capability-identity harness C0、Task 19A 的 closed publication admission，以及现有 exact-36/fixture-owner test boundary；不得读取未提交 formal A2a。
+**Consumes（全部已合并）:** 前序八文档 reachability contract、第一次 manager exact-3 contract sync、capability-identity harness C0、Task 19A 的 closed publication admission，以及现有 exact-36/fixture-owner test boundary；不得读取未提交 formal A2a。
 
-**Produces:** 只把 successor routine manifest 从 existing exact 36 冻结为 exact 38、锁定两条新 routine 的 canonical signature/owner/language/volatility/strict/security/search-path/session-user/ACL/down lifecycle、冻结 Sources/Runs 列级 INSERT/UPDATE 边界，并把 fixture synthetic signature 明确限制为 canonical structural shape。它要求 ordinary runtime/workload 两条都不可执行、sealer 只能 seal、admitter只能 admit、交叉调用与任一 relation privilege均失败。它不修改 migration、schema/role admission、domain、Repository、Worker、API、status 或能力状态；targeted fail-first tests、fresh G1、独立 P0/P1 review 与单独 PR/merge 后，主管理窗口以相同 exact-3 文件边界执行第二次 evidence sync，记录 harness/pre-A2a merged 证据并把 formal A2a 发布为唯一下一入口。五项前置全部合并前 formal A2a 禁止重启。
+**Produces:** 只把 successor routine manifest 从 existing exact 36 冻结为 exact 38、锁定两条新 routine 的 canonical signature/owner/language/volatility/strict/security/search-path/session-user/ACL/down lifecycle、冻结 Sources/Runs 列级 INSERT/UPDATE 边界，并把 fixture synthetic signature 明确限制为 canonical structural shape。它要求 ordinary runtime/workload 两条都不可执行、sealer 只能 seal、admitter只能 admit、交叉调用与任一 relation privilege均失败。该已合并pre-A2a exact-2不修改 migration、schema/role admission、domain、Repository、Worker、API、status 或能力状态；其targeted fail-first tests、fresh G1、独立 P0/P1 review 与单独 PR/merge 后，manager evidence sync已记录harness/pre-A2a merged证据。当前global routine ACL exact11 corrective再原子同步合同与status/coverage/Pack09；其提交进入`main`前 formal A2a 禁止重启。
 
 ### Task 19A2a: Source Gate schema, domain, and admission contract
 
-**Batch:** C0，1–2 日；上述 reachability docs、第一次 manager contract sync、capability-identity harness C0、pre-A2a exact-2 test boundary 与第二次 manager evidence sync 必须先依次合并。随后从届时最新 `main` 创建新的 fresh worktree，从 RED 重新实现并重证，不能读取、复制、cherry-pick 或继承任何旧 dirty A2a worktree。独立真实 G2/PR/merge只消费已合并 Task 19A 与规范 ABI；fixture/test boundary不得反向定义字段、closure或生产证据。Task 19A2a 完整合并后必须先完成独立 post-A2a exact-2 validation corrective，Task 19A2b 才可开始。不得与 Task 19A2b/19A2c 共享文件或要求一次整体合并。
+**Batch:** C0，1–2 日；上述前置与global routine ACL exact-11 contract + status sync必须先依次合并。随后从包含该exact11提交的最新`origin/main`创建新的fresh worktree，从RED重新实现并重证，逐项消费本Pack唯一exact72 identity manifest与production digest、global110/runtime72、up/down、五身份和required双实例restore；不能读取、复制、cherry-pick或继承任何旧dirty A2a worktree/WIP/snapshot。上一fresh A2a因PUBLIC72产生144条额外capability edge而`STOPPED/NOT PASS`；本exact11不实现A2a/G2，只有其进入`main`后才允许重启fresh Task19A2a exact12。独立真实G2/PR/merge只消费已合并Task19A与规范ABI；fixture/test boundary不得反向定义字段、closure或生产证据。Task19A2a完整合并后必须先完成独立post-A2a exact-2 validation corrective，Task19A2b才可开始。不得与Task19A2b/19A2c共享文件或要求一次整体合并。
 
 **Exact future files:**
 
@@ -350,7 +351,88 @@ pre-A2a exact-2 的完整且唯一文件为：
 
 - Schema/domain enums `RunKind=QUALIFICATION`、`WorkResultKind=QUALIFICATION_PROOF`、closed evidence kind `TWO_WORKER_HA|PROVIDER_CANARY`，以及 safe `GateEvidenceSet/GateEvaluator/GateDecision`、`SourceGateRepository`、`QualificationFactSnapshot`、`EvidenceVerifier` 与 `QualificationOutcomeSink` pure contracts；process-local `QualificationOutcome` 的 exact safe fields 只有 Run locator、evidence kind 与 sealed `LeaseFence`，不得用 caller-supplied `FenceEpoch` 替代，且整个 outcome 拒绝 JSON/Text/Binary/log serialization。上述接口本身不产生 registry、sink instance 或 signer。
 - Existing twelve-table schema extension、named checks/deferred closure、least-privilege ACL、schema/role admission and dump/restore manifest。Task 19A2b 只能消费这些已合并 columns/contracts 实现 persistence，不得重定义字段、digest 或 evidence kind。
-- Existing 36-routine manifest exactly 新增 `public.asset_catalog_seal_qualification_receipt(uuid,uuid,uuid,uuid,bigint,bigint,text,timestamp with time zone,timestamp with time zone,text)` 与 `public.asset_catalog_admit_source_gate(uuid,uuid,uuid,uuid,bigint,bigint)` 两条 non-overloaded primitives，总数 exact 38。二者均 `RETURNS boolean LANGUAGE plpgsql VOLATILE STRICT PARALLEL UNSAFE SECURITY DEFINER`、owner=`aiops_schema_owner`、fixed `search_path=pg_catalog, public, pg_temp`。PUBLIC/runtime/workload 均无 EXECUTE；sealer only seal、admitter only admit，routine 内另验 exact `session_user`，两 capability roles 无 membership/relation/sequence ACL。两者强制 serializable read-write，固定 target Run→immutable receipt order/UUID C-order prior Runs→Source→published Revision，Audit/Outbox append last；seal CAS=Run version/fence，admit CAS=Source version/gate revision。前者不接 result/HA/receipt digest/status/cleanup/Audit payload；后者不接 decision/status/reason/pointer/Audit/Outbox payload。它们是 typed internal capabilities，不是通用写代理。
+- Existing36新增两条non-overloaded primitives后`000015` owned exact38；application-schema global exact110=fixed predecessor72+Asset38。Predecessor authority为78 definitions/6 replacements/final72（68 trigger+4 helper），pre-up无direct grant而是normalized PUBLIC72；unknown73rd、missing、overload或ACL/owner/grantor/grantability drift在DDL前整笔回滚。唯一固定 identity list、serialization与production digest见本包 [Canonical predecessor exact72 runtime EXECUTE manifest](#canonical-predecessor-exact72-runtime-execute-manifest)；up的显式revoke/grant、application admission与exact-12 test必须逐项等于该列表并使用其production expected digest，禁止从运行时catalog或migration文本动态生成一个新清单后自行接受。up后PUBLIC0、runtime direct/effective90、workload direct0/effective90、capability edges仅seal/admit；down先revoke新增runtime72 edges，再删除owned38并恢复PUBLIC72，最终catalog/ACL等于pre-up；禁止schema-wide grant/revoke或恢复未知对象。两条新routine既有properties/session/lock/CAS边界不变。
+
+#### Canonical predecessor exact72 runtime EXECUTE manifest
+
+本节是 predecessor exact72 identity list 与 production expected digest 的唯一事实源；规范、Task1、README与runbook只能链接本节，不得复制或派生平行列表。下列 schema-qualified canonical signatures 是从已审 `000001..000014` 的78次定义、6次同identity replacement得到的72个最终identity，按UTF-8 bytes `COLLATE "C"`严格递增，无重复、无overload：
+
+```text
+public.bind_investigation_task_attempt_runtime()
+public.bump_runner_scope_revision()
+public.capture_credential_revocation_system_recovery()
+public.enforce_action_queue_credential_cleanup()
+public.enforce_credential_revocation_heartbeat_sequence()
+public.enforce_credential_revocation_transition()
+public.enforce_hypothesis_runtime_mutation()
+public.enforce_incident_runtime_mutation()
+public.enforce_investigation_runtime_transition()
+public.enforce_investigation_task_attempt_lifecycle()
+public.enforce_runner_certificate_lifecycle()
+public.enforce_runner_result_receipt_insert()
+public.enforce_tool_invocation_runtime_mutation()
+public.guard_credential_revocation_system_receipt_insert()
+public.investigation_json_object_document_valid(bytea, integer)
+public.investigation_runtime_hypothesis_set_valid(uuid, uuid, uuid)
+public.investigation_runtime_incident_signal_set_valid(uuid, uuid, uuid)
+public.investigation_text_array_bounded(text[], integer, integer)
+public.reject_action_queue_removal()
+public.reject_action_queue_submission_identity_mutation()
+public.reject_action_queue_terminal_mutation()
+public.reject_audit_mutation()
+public.reject_correlated_signal_mutation()
+public.reject_credential_confirmation_mutation()
+public.reject_credential_revocation_receipt_mutation()
+public.reject_credential_revocation_removal()
+public.reject_credential_revocation_reparenting()
+public.reject_credential_revocation_system_receipt_mutation()
+public.reject_evidence_runtime_mutation()
+public.reject_feedback_runtime_mutation()
+public.reject_hypothesis_evidence_runtime_mutation()
+public.reject_investigation_idempotency_mutation()
+public.reject_investigation_plan_binding_mutation()
+public.reject_investigation_reparenting()
+public.reject_investigation_runtime_identity_mutation()
+public.reject_investigation_signal_correlation_mutation()
+public.reject_investigation_task_attempt_removal()
+public.reject_investigation_task_attempt_runtime_binding_mutation()
+public.reject_legacy_execution_lease_activation()
+public.reject_runner_certificate_removal()
+public.reject_runner_evidence_receipt_mutation()
+public.reject_runner_result_receipt_mutation()
+public.reject_runner_scope_binding_update()
+public.reject_tool_invocation_runtime_binding_mutation()
+public.reject_tool_invocation_runtime_removal()
+public.require_new_investigation_create_ledger_v2()
+public.require_new_investigation_plan_binding()
+public.require_new_tool_invocation_runtime_binding()
+public.validate_action_queue_finalizing_receipt()
+public.validate_credential_confirmation_parent_shape()
+public.validate_credential_confirmation_shape()
+public.validate_credential_revocation_action_marker()
+public.validate_credential_revocation_completion_receipt()
+public.validate_credential_revocation_confirmation()
+public.validate_credential_revocation_receipt_claim()
+public.validate_credential_revocation_receipt_final_shape()
+public.validate_credential_revocation_system_receipt_final_shape()
+public.validate_investigation_runtime_hypothesis_set()
+public.validate_investigation_runtime_terminal_tasks()
+public.validate_investigation_signal_correlation_insert()
+public.validate_investigation_task_attempt_completion()
+public.validate_investigation_task_attempt_insert()
+public.validate_runner_evidence_receipt_insert()
+public.validate_runtime_evidence_insert()
+public.validate_runtime_evidence_task_projection()
+public.validate_runtime_feedback_projection()
+public.validate_runtime_hypothesis_evidence()
+public.validate_runtime_hypothesis_evidence_insert()
+public.validate_runtime_hypothesis_feedback()
+public.validate_runtime_hypothesis_parent_set()
+public.validate_runtime_incident_signal_projection()
+public.validate_tool_invocation_runtime_parent_lifecycle()
+```
+
+每项的runtime direct edge payload exactly是six-element JSON array，顺序 `[grantee, canonical_signature, privilege_type, is_grantable, grantor, owner]`；例如 `["aiops_control_plane_runtime","public.reject_audit_mutation()","EXECUTE",false,"aiops_schema_owner","aiops_schema_owner"]`。Signature在PostgreSQL18.4、`quote_all_identifiers=off`、`search_path=pg_catalog,pg_temp`下由显式schema/OID的namespace、`proname`、`pg_get_function_identity_arguments`拼成。Canonical encoder固定UTF-8无BOM/空白/换行，`false`为literal；只将引号转义为`\"`、反斜杠为`\\`、U+0000..U+001F为lowercase `\u00xx`，其余有效scalar直接UTF-8，非法输入拒绝；SQL/Go不得使用`jsonb::text`或通用encoder默认格式。Domain逐字为`source-gate-predecessor-runtime-execute-manifest.v1`；按上列signature C-order，production framing为`int4send(51)||domain||int8send(72)||Σ(int4send(payload byte length)||payload)`，完整frame为10,617 bytes，对其全部bytes取lowercase SHA-256，唯一production expected digest逐字为 `088e21a85ed39b3be463f80a09a5ca3b35aa244143e3f07e9a940013c2b049d0`。One-entry `public.reject_audit_mutation()` encoding vector仍是189-byte frame与SHA-256 `4c58b76019db0f92871b972c7dabbd677ac01d97ac85ae3bbb6fe9f3822d8cc3`，只证明encoder/framing；它不得替代production digest。Migration SQL与Go admission/test必须分别硬编码并复算同一个production常量，显式枚举必须逐项等于上列72项；任何运行时快照、缺失、额外、重排、签名别名或“生成后接受”都fail closed。
 
 **Exact twelve-table extension and safe receipt:**
 
@@ -437,7 +519,7 @@ runtime 不得拥有 Sources/Runs relation-level `INSERT|UPDATE`。Source 使用
 - [ ] RED：固定 15-frame canonical vectors、minimal-decimal revision、raw32 digests、UTC microsecond DB-issued time、unpadded-base64url signature 与 raw32 receipt-digest signature coverage；帧增删/换序、padded signature、uppercase/non-64 hex、timestamp alias、future/backdated issued、unknown kind、`expiry > issued+24h` 或 canary expiry 晚于 prior HA expiry全拒绝。
 - [ ] RED：named deferred closure 接受 structurally exact current canary 和保留该 current pointer 的完整同 binding rollover receipt chain；partial/cross-Scope/wrong-kind/nonterminal/expired/mismatch/错误 binding/revision/缺 HA/非零 projection、epoch 回退/跳跃或 chain 缺口全部 commit fail；rollover 执行期 `DEGRADED` 与成功 terminal `AVAILABLE` 保留 pointer，`SUSPENDED` 原子清 pointer，`MANUAL_V1` direct `AVAILABLE` 保持 pointer 全 NULL。
 - [ ] RED：Source 三列 direct INSERT/UPDATE、Run 23 列 direct UPDATE 与非 queue-binding 16 列 direct INSERT 返回 `42501`；exact 7 queue-binding INSERT 可达且任何 receipt/HA 预填被权限或 closure拒绝。migration-owner synthetic final `AVAILABLE` 只允许 disposable `_test.go` closure/recovery fixture，pointer + status 必须同一最终 serializable transaction，且测试明确禁止把它计作验签、A2a/A2b/G2/G4/availability evidence。
-- [ ] RED：exact 38-routine manifest只接受两条 fixed mutation primitive；PUBLIC/runtime/workload EXECUTE、sealer/admitter交叉 EXECUTE、overload、错误 owner/language/volatility/strict/security/search path/session-user、非 serializable/read-only、result/HA/receipt-digest/decision/pointer/Audit payload参数或缺 down drop 全拒绝。receipt-seal只从 durable facts + exact signer inputs派生 receipt/HA/terminal/Audit并拒绝 cleanup/Source/Outbox mutation；gate-admit从 canary派生 pointer/open Audit/Outbox。错误 target→prior→Source→Revision锁序、Audit append非最后或错误 CAS列必须 RED。
+- [ ] RED：owned exact38只接受两条fixed primitive；global manifest严格验证pre-up72、runtime exact72 direct edge count/hash、up110 direct/effective/PUBLIC/owner/grantor/grantability、unexpected111、wrong predecessor ACL、down72 restored与up/down/up。The application identity must exercise predecessor key DML across the action-queue、credential-revocation and investigation/runtime/evidence surfaces after up、down and re-up，thereby firing the predecessor trigger graph and all four helper paths；after up and re-up it also exercises Asset/Audit/Outbox ordinary behavior。Permission success alone cannot replace behavior assertions。任一PUBLIC EXECUTE、capability交叉edge、runtime edge缺失/额外、workload direct edge、overload、错误owner/grantor/grantability/properties/session-user、schema-wide revoke/grant或缺失显式down revoke/restore均RED。receipt-seal/gate-admit的durable-fact派生、lock/CAS和payload拒绝边界保持不变。
 - [ ] RED：`QualificationOutcome` exact field/method reflection只允许 locator/evidence kind/sealed `LeaseFence`，拒绝 public token/hash accessor、caller epoch或任一序列化/日志面；A2b 后续必须能在不修改 A2a domain files 的前提下消费 raw fence完成 `Matches`。
 - [ ] GREEN：只实现 schema/domain/admission contract和上述两条 typed SQL primitive；不新增 PostgreSQL gate Repository、named qualification predicate、handler、Worker mode、production config、registry 或 signer。
 
@@ -456,7 +538,7 @@ go vet ./internal/assetcatalog/... ./internal/store/postgres
 git diff --check
 ~~~
 
-G2 必须使用 PostgreSQL 18.4 TLS、真实 migration/application/sealer/admitter 四种 LOGIN identities、up/down/up、schema/role/capability admission、3+23 catalog manifest、four-column FK/deferred trigger、exact-38 routine/column/session-user ACL、15-frame vectors、lifecycle、HA tuple/direct-SQL negatives 与 pure domain tests；缺任一 DSN、共享 credential、Skip 或 identity mismatch 不得 PASS。migration-owner fixture/synthetic signature只证明 structural closure/recovery，不得列入验签或 A2a 行为 PASS。Task 19A2a 以自己的单一精确 commit/PR 合并后只产生 schema/domain/typed-mutation-ABI `BUILT_CLOSED`，不产生 Repository、真实 qualification Run、Provider HA/canary receipt或 `AVAILABLE`。
+G2 必须使用 PostgreSQL 18.4 TLS、五身份、up/down/up、schema/role/capability admission、3+23、owned exact38/global exact110 ACL、runtime exact72 edge count/hash与SQL/Go known-vector parity、15-frame/lifecycle/HA/direct-SQL negatives。Predecessor关键DML、68 trigger与4 helper必须在up/down/re-up验证；`000015` Asset/Audit/Outbox ordinary behavior只在up/re-up验证。exact-12新integration test还覆盖unexpected111、wrong predecessor ACL、五身份与上述ACL维度；merged pre-A2a global helper不得修改或收窄。由于ACL/恢复语义变化，双实例dump/restore recovery在本A2a为required G2，必须证明restore后的global110/runtime exact72 direct manifest与down恢复72且撤销新增edges；缺DSN、共享credential、Skip、identity mismatch或未执行recovery不得PASS。future`000016..000022`新增/替换public routine必须更新content-addressed global manifest、显式PUBLIC revoke与rollback contract，否则admission fail closed。Task19A2a仍只产生`BUILT_CLOSED`，不产生真实qualification或availability。
 
 **Deferred G3/G4:** Task 19A2b persistence、Task 19A2c lane/assembly、Task 29A two-worker HA、Task 19B External CMDB canary/gate、Task 29B final matrix 与所有真实资格执行继续 deferred。此任务不勾任何 Provider/Worker checkbox，全部保持 `NOT_STARTED/UNAVAILABLE/CLOSED`。
 
