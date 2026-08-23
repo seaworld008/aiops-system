@@ -7,29 +7,28 @@ toolchain go1.26.5
 require (
 	github.com/coreos/go-oidc/v3 v3.20.0
 	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467
-	github.com/go-chi/chi/v5 v5.3.1
+	github.com/go-chi/chi/v5 v5.3.2
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/google/cel-go v0.29.2
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/jackc/puddle/v2 v2.2.2
-	github.com/luthermonson/go-proxmox v0.8.0
+	github.com/luthermonson/go-proxmox v0.8.1
 	github.com/pashagolub/pgxmock/v4 v4.9.0
-	github.com/stretchr/testify v1.11.1
+	github.com/stretchr/testify v1.12.1
 	github.com/vmware/govmomi v0.55.1
-	go.temporal.io/api v1.63.0
-	go.temporal.io/sdk v1.46.0
-	go.yaml.in/yaml/v3 v3.0.4
-	golang.org/x/sys v0.45.0
-	google.golang.org/grpc v1.79.3
-	google.golang.org/protobuf v1.36.11
+	go.temporal.io/api v1.63.5
+	go.temporal.io/sdk v1.48.0
+	go.yaml.in/yaml/v3 v3.0.5
+	golang.org/x/sys v0.47.0
+	google.golang.org/grpc v1.82.1
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
 	cel.dev/expr v0.25.1 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
 	github.com/buger/goterm v1.0.4 // indirect
-	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/diskfs/go-diskfs v1.9.3 // indirect
 	github.com/djherbis/times v1.6.0 // indirect
 	github.com/facebookgo/clock v0.0.0-20150410010913-600d898af40a // indirect
@@ -43,17 +42,15 @@ require (
 	github.com/jinzhu/copier v0.3.4 // indirect
 	github.com/magefile/mage v1.14.0 // indirect
 	github.com/nexus-rpc/nexus-proto-annotations v0.1.0 // indirect
-	github.com/nexus-rpc/sdk-go v0.6.0 // indirect
-	github.com/pmezard/go-difflib v1.0.0 // indirect
+	github.com/nexus-rpc/sdk-go v0.7.0 // indirect
 	github.com/robfig/cron v1.2.0 // indirect
-	github.com/stretchr/objx v0.5.2 // indirect
+	github.com/stretchr/objx v0.5.3 // indirect
 	golang.org/x/exp v0.0.0-20240823005443-9b4947da3948 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/text v0.38.0 // indirect
 	golang.org/x/time v0.3.0 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20260120221211-b8f7ae30c516 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260120221211-b8f7ae30c516 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
 )
