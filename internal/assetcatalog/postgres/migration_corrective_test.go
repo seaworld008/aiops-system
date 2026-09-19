@@ -1149,6 +1149,194 @@ $$;
 	}
 }
 
+func TestAssetCatalogCorrectiveIdentityForeignKeyFixtureSupportsInlineAndTopLevelForms(t *testing.T) {
+	currentUp := readMigration(t, "000015_assets_catalog.up.sql")
+	currentDown := readMigration(t, "000015_assets_catalog.down.sql")
+	columns := `
+    gate_evidence_run_id uuid,
+    gate_evidence_digest text,
+    gate_evidence_expires_at timestamptz`
+	trigger := `
+CREATE CONSTRAINT TRIGGER asset_sources_gate_evidence_closure_guard
+AFTER INSERT OR UPDATE ON public.asset_sources
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state();
+	`
+	dropAnchor := "DROP TRIGGER asset_sources_deferred_state_guard ON public.asset_sources;"
+	drop := "\nDROP TRIGGER asset_sources_gate_evidence_closure_guard ON public.asset_sources;\n"
+	inlineFK := `
+    CONSTRAINT asset_sources_gate_evidence_run_fk
+        FOREIGN KEY (tenant_id, workspace_id, id, gate_evidence_run_id)
+        REFERENCES asset_source_runs (tenant_id, workspace_id, source_id, id)
+        DEFERRABLE INITIALLY DEFERRED`
+	topLevelFK := `
+ALTER TABLE public.asset_sources
+    ADD CONSTRAINT asset_sources_gate_evidence_run_fk
+        FOREIGN KEY (tenant_id, workspace_id, id, gate_evidence_run_id)
+        REFERENCES asset_source_runs (tenant_id, workspace_id, source_id, id)
+        DEFERRABLE INITIALLY DEFERRED;
+`
+
+	for _, test := range []struct {
+		name string
+		up   func(string) string
+		down func(string) string
+	}{{
+		name: "inline named constraint",
+		up: func(up string) string {
+			table := correctiveRequireTable(t, up, "public.asset_sources")
+			return strings.Replace(up, table, strings.TrimSuffix(table, ")")+",\n"+strings.TrimSpace(inlineFK)+"\n)", 1) + trigger
+		},
+		down: func(down string) string {
+			fkDrop := "ALTER TABLE public.asset_sources DROP CONSTRAINT asset_sources_gate_evidence_run_fk;\n"
+			down = strings.Replace(down, dropAnchor, dropAnchor+drop, 1)
+			return strings.Replace(down, "DROP TABLE public.service_asset_bindings;", fkDrop+"DROP TABLE public.service_asset_bindings;", 1)
+		},
+	}, {
+		name: "unique top-level alter",
+		up:   func(up string) string { return up + trigger + topLevelFK },
+		down: func(down string) string {
+			fkDrop := "ALTER TABLE public.asset_sources DROP CONSTRAINT asset_sources_gate_evidence_run_fk;\n"
+			down = strings.Replace(down, dropAnchor, dropAnchor+drop, 1)
+			return strings.Replace(down, "DROP TABLE public.service_asset_bindings;", fkDrop+"DROP TABLE public.service_asset_bindings;", 1)
+		},
+	}} {
+		t.Run(test.name, func(t *testing.T) {
+			formalUp := correctiveSourceGateColumnsFixture(t, currentUp, columns)
+			formalUp = test.up(formalUp)
+			formalDown := test.down(currentDown)
+			baselineUp, baselineDown, roundTripUp, roundTripDown, err := correctiveSourceGateSuccessorTriggerFixturePair(
+				t, formalUp, formalDown, columns, trigger, dropAnchor, drop,
+			)
+			if err != nil {
+				t.Fatalf("identity-FK formal fixture rejected: %v", err)
+			}
+			if formal, err := correctiveSourceGateIdentityForeignKeyState(baselineUp); err != nil || formal {
+				t.Fatalf("formal-to-baseline extraction retained identity FK: formal=%t err=%v", formal, err)
+			}
+			if formal, err := correctiveSourceGateIdentityForeignKeyState(roundTripUp); err != nil || !formal {
+				t.Fatalf("baseline-to-formal reconstruction lost identity FK: formal=%t err=%v", formal, err)
+			}
+			if _, err := correctiveSourceGateIdentityForeignKeyDownState(baselineDown); err != nil {
+				t.Fatalf("baseline down state invalid after extraction: %v", err)
+			}
+			if _, err := correctiveSourceGateIdentityForeignKeyDownState(roundTripDown); err != nil {
+				t.Fatalf("formal down state invalid after reconstruction: %v", err)
+			}
+		})
+	}
+}
+
+func TestAssetCatalogCorrectiveIdentityForeignKeyFixtureRejectsDriftAndLifecycle(t *testing.T) {
+	currentUp := readMigration(t, "000015_assets_catalog.up.sql")
+	currentDown := readMigration(t, "000015_assets_catalog.down.sql")
+	columns := "gate_evidence_run_id uuid, gate_evidence_digest text, gate_evidence_expires_at timestamptz"
+	trigger := `
+CREATE CONSTRAINT TRIGGER asset_sources_gate_evidence_closure_guard
+AFTER INSERT OR UPDATE ON public.asset_sources
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION public.validate_asset_source_deferred_state();
+`
+	dropAnchor := "DROP TRIGGER asset_sources_deferred_state_guard ON public.asset_sources;"
+	dropTrigger := "\nDROP TRIGGER asset_sources_gate_evidence_closure_guard ON public.asset_sources;\n"
+	formalUp, formalDown, err := correctiveSourceGateSuccessorTriggerFixture(
+		t, currentUp, currentDown, columns, trigger, dropAnchor, dropTrigger,
+	)
+	if err != nil {
+		t.Fatalf("construct canonical inline fixture: %v", err)
+	}
+	assertReject := func(name, up, down string) {
+		t.Helper()
+		t.Run(name, func(t *testing.T) {
+			if _, err := correctiveSourceGateSuccessorTriggerFixtureState(up, down); err == nil {
+				t.Fatal("identity-FK drift or lifecycle was accepted")
+			}
+		})
+	}
+
+	inline := correctiveSourceGateIdentityForeignKeyInlineSQL()
+	mutations := []struct {
+		name string
+		up   func(string) string
+		down func(string) string
+	}{
+		{"missing FK", func(up string) string { return strings.Replace(up, ",\n    "+inline, "", 1) }, func(down string) string {
+			return strings.Replace(down, correctiveSourceGateIdentityForeignKeyDropSQL()+"\n", "", 1)
+		}},
+		{"duplicate FK", func(up string) string { return strings.Replace(up, inline, inline+",\n    "+inline, 1) }, func(down string) string { return down }},
+		{"wrong name", func(up string) string {
+			return strings.Replace(up, correctiveSourceGateIdentityForeignKeyName, "asset_sources_gate_evidence_run_wrong_fk", 1)
+		}, func(down string) string { return down }},
+		{"quoted name", func(up string) string {
+			return strings.Replace(up, correctiveSourceGateIdentityForeignKeyName, `"asset_sources_gate_evidence_run_fk"`, 1)
+		}, func(down string) string { return down }},
+		{"uppercase name", func(up string) string {
+			return strings.Replace(up, correctiveSourceGateIdentityForeignKeyName, "ASSET_SOURCES_GATE_EVIDENCE_RUN_FK", 1)
+		}, func(down string) string { return down }},
+		{"wrong source columns", func(up string) string {
+			return strings.Replace(up, "tenant_id, workspace_id, id, gate_evidence_run_id", "workspace_id, tenant_id, id, gate_evidence_run_id", 1)
+		}, func(down string) string { return down }},
+		{"wrong reference columns", func(up string) string {
+			return strings.Replace(up, "tenant_id, workspace_id, source_id, id", "tenant_id, workspace_id, id, source_id", 1)
+		}, func(down string) string { return down }},
+		{"six-column identity", func(up string) string {
+			return strings.Replace(up, "id, gate_evidence_run_id)", "id, gate_evidence_run_id, gate_evidence_digest)", 1)
+		}, func(down string) string { return down }},
+		{"digest identity", func(up string) string {
+			return strings.Replace(up, "gate_evidence_run_id)", "gate_evidence_digest)", 1)
+		}, func(down string) string { return down }},
+		{"wrong reference schema", func(up string) string {
+			return strings.Replace(up, "references asset_source_runs", "references public.asset_source_runs", 1)
+		}, func(down string) string { return down }},
+		{"wrong reference table", func(up string) string {
+			return strings.Replace(up, "references asset_source_runs", "references asset_source_runs_wrong", 1)
+		}, func(down string) string { return down }},
+		{"not deferred", func(up string) string {
+			return strings.Replace(up, "deferrable initially deferred", "not deferrable initially immediate", 1)
+		}, func(down string) string { return down }},
+		{"extra alter", func(up string) string {
+			return up + "\nALTER TABLE public.asset_sources ADD COLUMN gate_evidence_extra text;\n"
+		}, func(down string) string { return down }},
+		{"extra gate constraint alter", func(up string) string {
+			return up + "\nALTER TABLE public.asset_sources ADD CONSTRAINT asset_sources_gate_evidence_extra_fk FOREIGN KEY (tenant_id, workspace_id, id, gate_evidence_run_id) REFERENCES asset_source_runs (tenant_id, workspace_id, source_id, id) DEFERRABLE INITIALLY DEFERRED;\n"
+		}, func(down string) string { return down }},
+		{"dynamic DDL", func(up string) string {
+			return up + "\nDO $$ BEGIN EXECUTE 'ALTER TABLE public.asset_sources ADD CONSTRAINT asset_sources_gate_evidence_run_fk FOREIGN KEY (tenant_id, workspace_id, id, gate_evidence_run_id) REFERENCES asset_source_runs (tenant_id, workspace_id, source_id, id) DEFERRABLE INITIALLY DEFERRED'; END $$;\n"
+		}, func(down string) string { return down }},
+		{"drop lifecycle", func(up string) string {
+			return up + "\nALTER TABLE public.asset_sources DROP CONSTRAINT asset_sources_gate_evidence_run_fk;\n"
+		}, func(down string) string { return down }},
+		{"wrong down name", func(up string) string { return up }, func(down string) string {
+			return strings.Replace(down, correctiveSourceGateIdentityForeignKeyName, "asset_sources_gate_evidence_run_wrong_fk", 1)
+		}},
+		{"duplicate down drop", func(up string) string { return up }, func(down string) string {
+			return strings.Replace(down, correctiveSourceGateIdentityForeignKeyDropSQL(), correctiveSourceGateIdentityForeignKeyDropSQL()+"\n"+correctiveSourceGateIdentityForeignKeyDropSQL(), 1)
+		}},
+		{"missing down drop", func(up string) string { return up }, func(down string) string {
+			return strings.Replace(down, correctiveSourceGateIdentityForeignKeyDropSQL()+"\n", "", 1)
+		}},
+		{"validate down lifecycle", func(up string) string { return up }, func(down string) string {
+			return down + "\nALTER TABLE public.asset_sources VALIDATE CONSTRAINT asset_sources_gate_evidence_run_fk;\n"
+		}},
+		{"rename down lifecycle", func(up string) string { return up }, func(down string) string {
+			return down + "\nALTER TABLE public.asset_sources RENAME CONSTRAINT asset_sources_gate_evidence_run_fk TO asset_sources_gate_evidence_run_new_fk;\n"
+		}},
+		{"disable down lifecycle", func(up string) string { return up }, func(down string) string {
+			return down + "\nALTER TABLE public.asset_sources DISABLE TRIGGER asset_sources_gate_evidence_run_fk;\n"
+		}},
+		{"if exists down drop", func(up string) string { return up }, func(down string) string {
+			return strings.Replace(down, "drop constraint asset_sources_gate_evidence_run_fk;", "drop constraint if exists asset_sources_gate_evidence_run_fk;", 1)
+		}},
+		{"drop after table", func(up string) string { return up }, func(down string) string {
+			down = strings.Replace(down, correctiveSourceGateIdentityForeignKeyDropSQL()+"\n", "", 1)
+			return down + "\n" + correctiveSourceGateIdentityForeignKeyDropSQL() + "\n"
+		}},
+	}
+	for _, mutation := range mutations {
+		assertReject(mutation.name, mutation.up(formalUp), mutation.down(formalDown))
+	}
+}
+
 func TestAssetCatalogCorrectiveOwnsNormalizedLimiterBucketAndPermitTruth(t *testing.T) {
 	up := readMigration(t, "000015_assets_catalog.up.sql")
 	buckets := correctiveNormalizeSQL(correctiveRequireTable(t, up, "public.asset_source_limit_buckets"))
@@ -3558,7 +3746,121 @@ func correctiveExpectedTriggerIdentitiesForMigration(t *testing.T, up string) []
 	))
 }
 
+const correctiveSourceGateIdentityForeignKeyName = "asset_sources_gate_evidence_run_fk"
+
+func correctiveSourceGateIdentityForeignKeyInlineSQL() string {
+	return "constraint " + correctiveSourceGateIdentityForeignKeyName +
+		" foreign key (tenant_id, workspace_id, id, gate_evidence_run_id)" +
+		" references asset_source_runs (tenant_id, workspace_id, source_id, id)" +
+		" deferrable initially deferred"
+}
+
+func correctiveSourceGateIdentityForeignKeyTopLevelSQL() string {
+	return "alter table public.asset_sources add " + correctiveSourceGateIdentityForeignKeyInlineSQL() + ";"
+}
+
+func correctiveSourceGateIdentityForeignKeyDropSQL() string {
+	return "alter table public.asset_sources drop constraint " + correctiveSourceGateIdentityForeignKeyName + ";"
+}
+
+func correctiveSourceGateIdentityForeignKeyElement(element string) (bool, error) {
+	compact := correctiveCompactSQL(element)
+	lower := strings.ToLower(compact)
+	if !strings.Contains(lower, "foreign key") && !strings.HasPrefix(lower, "constraint ") {
+		return false, nil
+	}
+	if !strings.Contains(lower, "gate_evidence") && !strings.Contains(lower, correctiveSourceGateIdentityForeignKeyName) {
+		return false, nil
+	}
+	if !regexp.MustCompile(`^(?i:constraint)\s+asset_sources_gate_evidence_run_fk\s+(?i:foreign)\s+(?i:key)\s+\(tenant_id, workspace_id, id, gate_evidence_run_id\)\s+(?i:references)\s+asset_source_runs\s+\(tenant_id, workspace_id, source_id, id\)\s+(?i:deferrable)\s+(?i:initially)\s+(?i:deferred)$`).MatchString(compact) {
+		return false, fmt.Errorf("unreviewed gate-evidence foreign-key table element: %s", lower)
+	}
+	return true, nil
+}
+
+func correctiveSourceGateIdentityForeignKeyTopLevelStatement(statement string) bool {
+	return regexp.MustCompile(`^(?i:alter)\s+(?i:table)\s+public\.asset_sources\s+(?i:add)\s+(?i:constraint)\s+asset_sources_gate_evidence_run_fk\s+(?i:foreign)\s+(?i:key)\s+\(tenant_id, workspace_id, id, gate_evidence_run_id\)\s+(?i:references)\s+asset_source_runs\s+\(tenant_id, workspace_id, source_id, id\)\s+(?i:deferrable)\s+(?i:initially)\s+(?i:deferred);$`).MatchString(correctiveCompactSQL(statement))
+}
+
+func correctiveSourceGateIdentityForeignKeyDropStatement(statement string) bool {
+	return regexp.MustCompile(`^(?i:alter)\s+(?i:table)\s+public\.asset_sources\s+(?i:drop)\s+(?i:constraint)\s+asset_sources_gate_evidence_run_fk;$`).MatchString(correctiveCompactSQL(statement))
+}
+
+func correctiveSourceGateIdentityForeignKeyState(up string) (bool, error) {
+	inlineCount, topLevelCount := 0, 0
+	for _, statement := range correctiveTopLevelSQLStatements(up) {
+		if correctiveDOExecutesDynamicSQL(statement) {
+			return false, fmt.Errorf("unreviewed dynamic SQL in DO statement")
+		}
+		if table, found, err := correctiveTableDefinitionInStatement(statement, "public.asset_sources"); err != nil {
+			return false, err
+		} else if found {
+			open := strings.Index(table, "(")
+			if open < 0 {
+				return false, fmt.Errorf("public.asset_sources definition has no column list")
+			}
+			for _, element := range correctiveSplitSQLArguments(table[open+1 : len(table)-1]) {
+				valid, err := correctiveSourceGateIdentityForeignKeyElement(element)
+				if err != nil {
+					return false, err
+				}
+				if valid {
+					inlineCount++
+				}
+			}
+			continue
+		}
+
+		compact := correctiveCompactSQL(statement)
+		lower := strings.ToLower(compact)
+		if strings.Contains(lower, correctiveSourceGateIdentityForeignKeyName) ||
+			(strings.Contains(lower, "gate_evidence") && strings.Contains(lower, "foreign key")) {
+			if !correctiveSourceGateIdentityForeignKeyTopLevelStatement(statement) {
+				return false, fmt.Errorf("unreviewed gate-evidence foreign-key statement: %s", lower)
+			}
+			topLevelCount++
+		}
+	}
+	if inlineCount > 1 || topLevelCount > 1 || inlineCount+topLevelCount > 1 {
+		return false, fmt.Errorf("identity foreign key count = %d, want at most one", inlineCount+topLevelCount)
+	}
+	return inlineCount+topLevelCount == 1, nil
+}
+
+func correctiveSourceGateIdentityForeignKeyDownState(down string) (bool, error) {
+	count := 0
+	tableDropSeen := false
+	dropTable := regexp.MustCompile(`(?is)^\s*drop\s+table\b`)
+	for _, statement := range correctiveTopLevelSQLStatements(down) {
+		if correctiveDOExecutesDynamicSQL(statement) {
+			return false, fmt.Errorf("unreviewed dynamic SQL in DO statement")
+		}
+		compact := correctiveCompactSQL(statement)
+		lower := strings.ToLower(compact)
+		if dropTable.MatchString(correctiveMaskNonCodeSQL(statement)) {
+			tableDropSeen = true
+		}
+		if strings.Contains(lower, correctiveSourceGateIdentityForeignKeyName) ||
+			(strings.Contains(lower, "gate_evidence") && strings.Contains(lower, "foreign key")) {
+			if !correctiveSourceGateIdentityForeignKeyDropStatement(statement) {
+				return false, fmt.Errorf("unreviewed gate-evidence foreign-key down statement: %s", lower)
+			}
+			if tableDropSeen {
+				return false, fmt.Errorf("identity foreign-key drop follows table drop")
+			}
+			count++
+		}
+	}
+	if count > 1 {
+		return false, fmt.Errorf("identity foreign-key down drop count = %d, want at most one", count)
+	}
+	return count == 1, nil
+}
+
 func correctiveSourceGateTriggerRequired(up string) (bool, error) {
+	if _, err := correctiveSourceGateIdentityForeignKeyState(up); err != nil {
+		return false, err
+	}
 	alterTable := regexp.MustCompile(`(?is)^\s*alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?(` +
 		correctiveQualifiedSQLIdentifierPattern() + `)\s+`)
 	addColumn := regexp.MustCompile(`(?is)^\s*alter\s+table\s+(` + correctiveQualifiedSQLIdentifierPattern() +
@@ -3584,6 +3886,11 @@ func correctiveSourceGateTriggerRequired(up string) (bool, error) {
 				return false, fmt.Errorf("public.asset_sources definition has no column list")
 			}
 			for _, element := range correctiveSplitSQLArguments(table[open+1 : len(table)-1]) {
+				if valid, err := correctiveSourceGateIdentityForeignKeyElement(element); err != nil {
+					return false, err
+				} else if valid {
+					continue
+				}
 				name, definition, ok := correctiveColumnDefinition(element)
 				if ok && correctiveGateEvidenceColumnLike(name) {
 					manifest = append(manifest, correctiveGateEvidenceColumnIdentity(name, definition))
@@ -3602,6 +3909,9 @@ func correctiveSourceGateTriggerRequired(up string) (bool, error) {
 		}
 		if !tableSeen {
 			return false, fmt.Errorf("gate-evidence ALTER precedes public.asset_sources definition")
+		}
+		if correctiveSourceGateIdentityForeignKeyTopLevelStatement(statement) {
+			continue
 		}
 		addMatch := addColumn.FindStringSubmatch(statement)
 		if addMatch == nil || correctiveCanonicalSQLIdentifier(addMatch[1]) != "public.asset_sources" {
@@ -3717,9 +4027,15 @@ func correctiveSourceGateSuccessorTriggerFixture(
 	if occurrences := strings.Count(down, dropAnchor); occurrences != 1 {
 		return "", "", fmt.Errorf("successor trigger drop anchor occurs %d times, want exact one", occurrences)
 	}
-	successorTable := strings.TrimSuffix(table, ")") + ",\n    " + strings.TrimSpace(columns) + "\n)"
+	successorTable := strings.TrimSuffix(table, ")") + ",\n    " + strings.TrimSpace(columns) + ",\n    " + correctiveSourceGateIdentityForeignKeyInlineSQL() + "\n)"
 	successorUp := strings.Replace(up, table, successorTable, 1) + trigger
 	successorDown := strings.Replace(down, dropAnchor, dropAnchor+drop, 1)
+	successorDown = strings.Replace(
+		successorDown,
+		"DROP TABLE public.service_asset_bindings;",
+		correctiveSourceGateIdentityForeignKeyDropSQL()+"\nDROP TABLE public.service_asset_bindings;",
+		1,
+	)
 	formal, err = correctiveSourceGateSuccessorTriggerFixtureState(successorUp, successorDown)
 	if err != nil {
 		return "", "", fmt.Errorf("constructed successor source-gate fixture: %w", err)
@@ -3758,6 +4074,10 @@ func correctiveSourceGateSuccessorTriggerFixturePair(
 	if err != nil {
 		return "", "", "", "", fmt.Errorf("decompose formal source-gate trigger drop: %w", err)
 	}
+	baselineDown, err = correctiveWithoutSourceGateIdentityForeignKeyDropStatement(baselineDown)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("decompose formal source-gate identity foreign-key drop: %w", err)
+	}
 	baseline, err := correctiveSourceGateSuccessorTriggerFixtureState(baselineUp, baselineDown)
 	if err != nil {
 		return "", "", "", "", fmt.Errorf("decomposed baseline source-gate fixture: %w", err)
@@ -3773,13 +4093,41 @@ func correctiveSourceGateSuccessorTriggerFixturePair(
 	return baselineUp, baselineDown, up, down, nil
 }
 
+func correctiveWithoutSourceGateIdentityForeignKeyDropStatement(down string) (string, error) {
+	formal, err := correctiveSourceGateIdentityForeignKeyDownState(down)
+	if err != nil {
+		return "", err
+	}
+	if !formal {
+		return down, nil
+	}
+	filtered := make([]string, 0, len(correctiveTopLevelSQLStatements(down)))
+	removed := 0
+	for _, statement := range correctiveTopLevelSQLStatements(down) {
+		if correctiveSourceGateIdentityForeignKeyDropStatement(statement) {
+			removed++
+			continue
+		}
+		filtered = append(filtered, statement)
+	}
+	if removed != 1 {
+		return "", fmt.Errorf("source-gate identity foreign-key drop count = %d, want exact one", removed)
+	}
+	return strings.Join(filtered, "\n"), nil
+}
+
 func correctiveWithoutSourceGateEvidenceColumns(up string) (string, error) {
+	formalFK, err := correctiveSourceGateIdentityForeignKeyState(up)
+	if err != nil {
+		return "", err
+	}
 	addColumn := regexp.MustCompile(`(?is)^\s*alter\s+table\s+(` + correctiveQualifiedSQLIdentifierPattern() +
 		`)\s+add\s+(?:column\s+)?(` + correctiveSQLIdentifierPattern + `)\s+(.+?)\s*;\s*$`)
 	statements := correctiveTopLevelSQLStatements(up)
 	filtered := make([]string, 0, len(statements))
 	manifest := make([]string, 0, 3)
 	tableSeen := false
+	removedFK := 0
 	for _, statement := range statements {
 		table, found, err := correctiveTableDefinitionInStatement(statement, "public.asset_sources")
 		if err != nil {
@@ -3796,6 +4144,12 @@ func correctiveWithoutSourceGateEvidenceColumns(up string) (string, error) {
 			}
 			retained := make([]string, 0)
 			for _, element := range correctiveSplitSQLArguments(table[open+1 : len(table)-1]) {
+				if valid, err := correctiveSourceGateIdentityForeignKeyElement(element); err != nil {
+					return "", err
+				} else if valid {
+					removedFK++
+					continue
+				}
 				name, definition, column := correctiveColumnDefinition(element)
 				if column && correctiveGateEvidenceColumnLike(name) {
 					manifest = append(manifest, correctiveGateEvidenceColumnIdentity(name, definition))
@@ -3808,6 +4162,11 @@ func correctiveWithoutSourceGateEvidenceColumns(up string) (string, error) {
 			}
 			baselineTable := table[:open+1] + strings.Join(retained, ",") + ")"
 			filtered = append(filtered, strings.Replace(statement, table, baselineTable, 1))
+			continue
+		}
+
+		if correctiveSourceGateIdentityForeignKeyTopLevelStatement(statement) {
+			removedFK++
 			continue
 		}
 
@@ -3834,6 +4193,12 @@ func correctiveWithoutSourceGateEvidenceColumns(up string) (string, error) {
 	}
 	if !reflect.DeepEqual(manifest, expected) {
 		return "", fmt.Errorf("removed gate-evidence column manifest = %v, want exact %v", manifest, expected)
+	}
+	if formalFK && removedFK != 1 {
+		return "", fmt.Errorf("removed identity foreign-key count = %d, want exact one", removedFK)
+	}
+	if !formalFK && removedFK != 0 {
+		return "", fmt.Errorf("removed identity foreign-key from baseline fixture")
 	}
 	return strings.Join(filtered, "\n"), nil
 }
@@ -3883,6 +4248,20 @@ func correctiveSourceGateSuccessorTriggerFixtureState(up, down string) (bool, er
 	required, err := correctiveSourceGateTriggerRequired(up)
 	if err != nil {
 		return false, fmt.Errorf("source-gate columns: %w", err)
+	}
+	identityFK, err := correctiveSourceGateIdentityForeignKeyState(up)
+	if err != nil {
+		return false, fmt.Errorf("source-gate identity foreign key: %w", err)
+	}
+	downIdentityFK, err := correctiveSourceGateIdentityForeignKeyDownState(down)
+	if err != nil {
+		return false, fmt.Errorf("source-gate identity foreign key down: %w", err)
+	}
+	if identityFK != downIdentityFK {
+		return false, fmt.Errorf("source-gate identity foreign-key up/down mismatch: up=%t down=%t", identityFK, downIdentityFK)
+	}
+	if required != identityFK {
+		return false, fmt.Errorf("source-gate formal state requires exact identity foreign key: columns=%t fk=%t", required, identityFK)
 	}
 
 	expectedUp := correctiveExpectedTriggerIdentities()
@@ -4209,6 +4588,10 @@ func correctiveRequireTokens(t *testing.T, label, text string, required ...strin
 
 func correctiveNormalizeSQL(value string) string {
 	return strings.Join(strings.Fields(strings.ToLower(correctiveStripSQLComments(value))), " ")
+}
+
+func correctiveCompactSQL(value string) string {
+	return strings.Join(strings.Fields(correctiveStripSQLComments(value)), " ")
 }
 
 func correctiveNormalizeSource(value string) string {
