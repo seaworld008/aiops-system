@@ -86,7 +86,7 @@ Requirements:
 - PostgreSQL 18.4 or newer 18.x for persistence and migration tests
 - Temporal, Keycloak, Vault, and S3-compatible storage for the intended production architecture
 
-Run the development control plane with its in-memory repository:
+Run the development control plane with local configuration; PostgreSQL is required by the current assembly:
 
 ```bash
 make test
@@ -103,7 +103,7 @@ GET http://localhost:8080/readyz
 GET http://localhost:8080/api/v1/session
 ```
 
-The in-memory mode is for local development only. Production mode fails closed unless PostgreSQL, scoped webhook secrets, and Keycloak OIDC are configured. Copy [.env.example](.env.example) as a reference; never commit real credentials.
+The current repository has no in-memory repository fallback. The control plane remains unavailable and fails readiness unless PostgreSQL, scoped webhook secrets, and Keycloak OIDC are configured. Copy [.env.example](.env.example) as a reference; never commit real credentials.
 
 To run real PostgreSQL migration and repository tests:
 
