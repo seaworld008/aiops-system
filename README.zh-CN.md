@@ -86,7 +86,7 @@ flowchart LR
 - PostgreSQL 18.4 或更新的 18.x（持久化与真实迁移测试）
 - 目标生产架构还需要 Temporal、Keycloak、Vault 和 S3 兼容对象存储
 
-使用内存仓储启动开发控制面：
+使用本地配置启动开发控制面（PostgreSQL 是当前装配的必需依赖）：
 
 ```bash
 make test
@@ -103,7 +103,7 @@ GET http://localhost:8080/readyz
 GET http://localhost:8080/api/v1/session
 ```
 
-内存模式仅用于本地开发。生产模式未配置 PostgreSQL、作用域 Webhook 密钥和 Keycloak OIDC 时会拒绝启动。可参考 [.env.example](.env.example)，请勿提交真实凭据。
+控制面未配置 PostgreSQL、作用域 Webhook 密钥和 Keycloak OIDC 时会保持不可用并拒绝就绪。当前仓库不再提供 memory repository fallback。可参考 [.env.example](.env.example)，请勿提交真实凭据。
 
 运行真实 PostgreSQL 迁移与仓储测试：
 

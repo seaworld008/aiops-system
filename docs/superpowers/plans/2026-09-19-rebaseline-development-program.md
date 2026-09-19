@@ -4,7 +4,7 @@
 > 审计基线：`origin/main@90c19b7bbeb17381a72e3cd21dd85b10e01767d4`
 > 活动 Batch：`NONE`
 
-这是暂停检查点之后的唯一恢复计划。它重新声明远端基线、文档入口、Agent 协作和后继 Batch 顺序；它不实现业务代码、不开放 Provider/Capability/Action，也不把旧分支或未合并 worktree 重新纳入事实。
+这是暂停检查点之后的唯一恢复计划。它重新声明远端基线、文档入口、Agent 协作和后继 Batch 顺序；它不开放 Provider/Capability/Action，也不把旧分支或未合并 worktree 重新纳入事实。本次经用户明确授权的 rebaseline maintenance Batch（入口、CI、装配和安全边界修复）不等于恢复 Source Gate 或任何产品运行能力。
 
 ## 入口与不变量
 
@@ -34,7 +34,7 @@ G1 覆盖文档/静态/受影响定向测试；G2 覆盖 Batch 关键行为、�
 
 ## 暂停边界
 
-暂停期间只允许审计、文档治理和恢复准备。禁止开始 fixture corrective、Task 19A2a 或任何 Provider/Worker/Capability/Action 实现；禁止把 `BUILT_CLOSED` 解释为 `AVAILABLE`。恢复需要明确的人工恢复信号，并重新确认最新远端 SHA、分支、worktree 和未解决审计项。
+暂停期间只允许审计、文档治理、恢复准备和经明确授权的 rebaseline maintenance；禁止开始 fixture corrective、Task 19A2a 或任何 Provider/Worker/Capability/Action 实现；禁止把 `BUILT_CLOSED` 解释为 `AVAILABLE`。恢复需要明确的人工恢复信号，并重新确认最新远端 SHA、分支、worktree 和未解决审计项。
 
 ## 交付物
 
