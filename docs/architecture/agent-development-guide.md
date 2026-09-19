@@ -1,6 +1,6 @@
 # Agent 开发指南
 
-> 当前治理基线：`origin/main@90c19b7bbeb17381a72e3cd21dd85b10e01767d4`（2026-09-19 审计）。
+> 本 PR 起始治理基线：`origin/main@90c19b7bbeb17381a72e3cd21dd85b10e01767d4`（2026-09-19 审计）；合并后以后继工作开始时重新读取最新 `origin/main` exact SHA。
 > 当前状态：`SPEC_APPROVED / DEVELOPMENT_PAUSED / RUNTIME_CLOSED`；活动 Batch 为 `NONE`。
 
 本指南把一次 Agent 工作限定在可审计的隔离 worktree、稳定接口和分层验证内。它不授权修改业务范围，也不把模型、分支或测试假设当作事实源。

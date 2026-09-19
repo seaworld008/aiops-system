@@ -1,7 +1,7 @@
 # 2026-09-19 重新基线开发计划
 
 > 状态：`SPEC_APPROVED / DEVELOPMENT_PAUSED / RUNTIME_CLOSED`
-> 审计基线：`origin/main@90c19b7bbeb17381a72e3cd21dd85b10e01767d4`
+> PR 起始审计基线：`origin/main@90c19b7bbeb17381a72e3cd21dd85b10e01767d4`；后继 Batch 以合并后最新 `origin/main` exact SHA 为准。
 > 活动 Batch：`NONE`
 
 这是暂停检查点之后的唯一恢复计划。它重新声明远端基线、文档入口、Agent 协作和后继 Batch 顺序；它不开放 Provider/Capability/Action，也不把旧分支或未合并 worktree 重新纳入事实。本次经用户明确授权的 rebaseline maintenance Batch（入口、CI、装配和安全边界修复）不等于恢复 Source Gate 或任何产品运行能力。

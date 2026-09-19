@@ -4,7 +4,7 @@
 
 ## 当前重新基线边界（2026-09-19）
 
-- 本仓库文档审计与后继开发的远端基线固定为 `origin/main@90c19b7bbeb17381a72e3cd21dd85b10e01767d4`。旧的 `ad50d9f` 只可作为历史设计证据，不能作为当前执行基线。
+- 本 PR 的起始审计基线为 `origin/main@90c19b7bbeb17381a72e3cd21dd85b10e01767d4`；合并后后继工作必须重新读取届时最新 `origin/main` exact SHA。旧的 `ad50d9f` 只可作为历史设计证据，不能作为当前执行基线。
 - 当前事实为 `SPEC_APPROVED / DEVELOPMENT_PAUSED / RUNTIME_CLOSED`，活动 Batch=`NONE`。暂停期间只允许审计、文档治理和恢复准备；不得启动业务实现或开放任何 Provider、Capability、Action、Worker、G2/G3/G4 运行门。
 - Agent 之间按 Batch 协作：每个 Agent 只修改已分配文件，文件所有权不得重叠；后继 Batch 只消费已合并的稳定 `Produces`，不得读取其他 worktree 的未提交实现、WIP、snapshot 或 review 作为契约事实。
 - G1 是快速门，G2 是 Batch 门，G3 是纵向 Milestone 门，G4 是真实资格/发布门。低层门通过不等于生产可用；未通过 G4 的能力保持 `BUILT_CLOSED`、`UNAVAILABLE` 或 `CLOSED`。

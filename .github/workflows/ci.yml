@@ -39,12 +39,8 @@ jobs:
             packages+=("${package}")
           done < <(
             git diff --name-only "${BASE_SHA}...HEAD" -- '*.go' |
-              while IFS= read -r file; do
+            while IFS= read -r file; do
                 directory="$(dirname "${file}")"
-                if find "${directory}" -maxdepth 1 -type f -name '*_integration_test.go' -print -quit | grep -q .; then
-                  echo "Skipping integration-only package ./$(printf '%s' "${directory}" | sed 's#^./##')" >&2
-                  continue
-                fi
                 go list "./${directory}" 2>/dev/null || true
               done | sort -u
           )
@@ -52,8 +48,25 @@ jobs:
             echo 'No affected non-integration Go packages.'
             exit 0
           fi
-          printf 'Testing affected packages:\n%s\n' "${packages[*]}"
-          go test -count=1 "${packages[@]}"
+          for package in "${packages[@]}"; do
+            directory="${package#./}"
+            names=()
+            while IFS= read -r name; do
+              [[ -n "${name}" ]] && names+=("${name}")
+            done < <(
+              rg --no-filename '^func Test[A-Za-z0-9_]+\(' "${directory}" \
+                -g '*_test.go' -g '!**/*_integration_test.go' |
+                sed -E 's/^func (Test[A-Za-z0-9_]+)\(.*/\1/' |
+                sort -u
+            )
+            if ((${#names[@]} == 0)); then
+              echo "No deterministic unit tests for ${package}; deferred integration tests remain in full-go."
+              continue
+            fi
+            pattern="^($(IFS='|'; echo "${names[*]}"))$"
+            printf 'Testing affected unit tests in %s with %s\n' "${package}" "${pattern}"
+            go test -count=1 -run "${pattern}" "${package}"
+          done
 
   web:
     runs-on: ubuntu-latest
