@@ -1,6 +1,8 @@
 # 05 Host 与 PostgreSQL 只读诊断阶段索引
 
-> 状态：规划完成，尚未执行。实现基线固定为 `main@ad50d9f`。
+> 历史阶段规划（非当前执行入口）。当前执行基线由 [重新基线开发计划](../../2026-09-19-rebaseline-development-program.md) 和 `docs/status/current.md` 共同约束；暂停期间不得执行本阶段任务。
+
+> 状态：规划完成，尚未执行。旧实现基线仅作历史证据；执行时从届时最新 `origin/main` 创建 fresh worktree。
 
 本目录把三种 Connection Provider 的验证/发布、AWX Inventory 增量发现、主机固定探针、AWX 预发布只读模板、PostgreSQL 命名诊断查询、独立 READ 凭据生命周期、公共 API、企业级前端与生产验收拆成八个可独立审查的任务包。执行者必须按固定顺序完成，保留每个 Task 的红灯、最小实现、绿灯与 commit 边界。
 

@@ -1,6 +1,8 @@
 # 04 Proactive Grants 阶段索引
 
-> 状态：规划完成，尚未执行。实现基线固定为 `main@ad50d9f`。
+> 历史阶段规划（非当前执行入口）。当前执行基线由 [重新基线开发计划](../../2026-09-19-rebaseline-development-program.md) 和 `docs/status/current.md` 共同约束；暂停期间不得执行本阶段任务。
+
+> 状态：规划完成，尚未执行。旧实现基线仅作历史证据；执行时从届时最新 `origin/main` 创建 fresh worktree。
 
 本目录把 Asset Snapshot、InvestigationGrant、主动策略、Gateway 四边界、Evidence-backed ActionProposal、跨 Incident Investigation、Policy Hub 和高保真前端拆成七个可独立审查、固定顺序执行的任务包。每个包都保留 Superpowers writing-plans 的 Header、Global Constraints、Files、Interfaces、Red→Green→Refactor 检查框、验证命令和逐任务 commit；任何执行者不得跳包或把多个包压回单一巨型计划。
 

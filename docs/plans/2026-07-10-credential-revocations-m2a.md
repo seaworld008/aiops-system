@@ -1,5 +1,7 @@
 # Credential Revocations M2A Implementation Plan
 
+> 历史计划（非当前执行入口）。当前状态、远端基线和恢复顺序以 [`docs/status/current.md`](../status/current.md) 与 [重新基线开发计划](../superpowers/plans/2026-09-19-rebaseline-development-program.md) 为准。
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add the durable, secret-safe credential revocation lifecycle, migration, reference protector, and memory/PostgreSQL repositories without wiring it into execution yet.

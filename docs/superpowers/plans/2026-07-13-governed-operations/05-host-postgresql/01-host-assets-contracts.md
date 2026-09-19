@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - 每个 Task 严格采用 Red → Green → Refactor：先运行并保存预期失败，再做最小生产实现，复跑指定测试后才允许重构和提交。
-- 实现基线固定为 `main@ad50d9f`；执行前创建独立 worktree，不删除或修改用户已有 worktree。
+- 历史实现基线不再固定；执行前从届时最新 `origin/main` 创建独立 worktree，不删除或修改用户已有 worktree。
 - 迁移名和文件名必须精确为 `000019_host_postgresql_read_diagnostics`；只创建 README 指定的八张新表。允许且必须做本阶段所需的 additive 兼容变更（Provider allowlist、Runtime artifact kind/size、AWX Connection projection、Validation Run/Check private proof fields、Environment candidate key、Audit Environment projection），但不得改变 Phase 1–4 领域语义或绕过其状态机。AWX enrollment 使用本迁移专属 Operation/Attempt，不复用 Investigation lease、Phase 1 SourceRun 或 Connection Validation Run。
 - `000019` 是 `public.asset_catalog_future_source_gate_admitted(candidate public.asset_sources) RETURNS boolean` 的 Phase 5 successor owner；只能 `CREATE OR REPLACE` 同一签名 body，逐字保留 `000017` 的 Kubernetes Operator branch，并增加 exact `AWX_INVENTORY / AWX_API / AWX_READ_V1 / available runtime closure / validation proof` branch。函数替换不创建额外或第九张表，也不得形成 overload 或第二套 admission。
 - 所有行都绑定 Tenant/Workspace/Environment；跨 Scope 外键、读取、列表、发布和 cleanup 必须 fail closed。

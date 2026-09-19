@@ -2,11 +2,15 @@
 
 This roadmap is deliberately gate-driven. Calendar progress never enables production writes by itself.
 
+> Current state: `SPEC_APPROVED / DEVELOPMENT_PAUSED / RUNTIME_CLOSED`.
+> Audit baseline: `origin/main@90c19b7bbeb17381a72e3cd21dd85b10e01767d4`.
+> No Batch is active. Resume only through the fresh identity-FK fixture corrective and the ordered successor chain in the [rebaseline development program](superpowers/plans/2026-09-19-rebaseline-development-program.md).
+
 ## Delivery status
 
 | Workstream | Current state | Next exit condition |
 | --- | --- | --- |
-| Repository and domain foundation | Implemented | Keep migrations and domain contracts backward compatible |
+| Repository and domain foundation | Implemented, development paused | Keep migrations and domain contracts backward compatible; do not infer availability from this foundation |
 | Scoped signal ingestion | Implemented foundation | Validate against real Alertmanager and Nightingale endpoints |
 | Read-only connectors | Implemented foundation | Run contract and failure tests against pilot environments |
 | Investigation and model routing | Persistent runtime, authenticated READ Task Gateway, atomic runtime Bundle, independent READ-only client, fixed READ HTTP executor, recovery-first Temporal v2, READ Runner Activity, immutable Snapshot, role-isolated Temporal control boundary, fail-closed subprocess containment, deterministic late-FATAL containment, a static process-escape gate, fixed-root sealed public-source capability, and a post-`SECRET_READY` contained production secret-loader implemented. The loader reads only an independent fixed tmpfs root and writes three role-bound frames on its FD3–FD5, which map to the control child's FD5–FD7, without exposing secret bytes to the parent. Live clients, Outbox and Runner remain unassembled, and sealed Admission blocks both new claims and legacy lease progression | Assemble the real supervised child clients/runtime while retaining zero claims, then connect Runner/Gateway/Outbox and local E2E in M5C2-4c; finally pass external identity/network gates and build a replay set of at least 100 historical incidents |
@@ -14,7 +18,7 @@ This roadmap is deliberately gate-driven. Calendar progress never enables produc
 | Fenced action execution | Secure queue, durable revocation, mTLS Gateway, split Runner images, and killable Executor foundation implemented | Add only fixed non-production adapters after external sandbox/network gates |
 | Temporal orchestration | Digest/Bundle-bound READ runtime v2, DB-only result recovery, strict payload/failure History allowlist, server-attested separate Starter/Control mTLS capabilities, fixed Control Worker, monitored TERM/FATAL and deterministic kill/reap, a sealed pre-assembly child lifecycle arbiter, static process-escape gates, a kill-bounded public-source loader, and an independently contained secret-loader are implemented. After `SECRET_READY`, the latter uses fixed self-reexec, PIDFD/PGID/Pdeathsig, an independent tmpfs root, and exact FD3–FD5 output mapping; cancellation, deadline, abnormal exit, and surviving descendants fail closed and are reaped. No Dial is performed and the hidden control child deliberately exits before READY | Put the real Control Worker and clients inside the contained child, require cluster-exclusive reconnect identity and cgroup/PID-namespace evidence, then complete supervised Outbox/Runner/Gateway assembly and prove separate Temporal credentials/RBAC |
 | Web console and Feishu | Planned | Investigation, approval, execution, and audit user journeys |
-| Production pilot | Blocked by gates | Non-production drills plus formal Go/No-Go review |
+| Production pilot | Closed while paused | Resume only after G1/G2, then G3/G4 real qualification and formal Go/No-Go review |
 
 M4 does not enable action claims: the control plane still has no write `StartAuthorizer`, the
 WRITE Runner only performs a Linux capability probe in `non-production`, and the Executor rejects

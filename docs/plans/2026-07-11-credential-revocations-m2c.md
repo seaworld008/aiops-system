@@ -1,5 +1,7 @@
 # Credential Revocations M2C Recovery, Worker, and Finalization
 
+> 历史计划（非当前执行入口）。当前状态、远端基线和恢复顺序以 [`docs/status/current.md`](../status/current.md) 与 [重新基线开发计划](../superpowers/plans/2026-09-19-rebaseline-development-program.md) 为准。
+
 **Goal:** Make credential cleanup recoverable across process loss and make it
 impossible for a WRITE target lock to be released before the credential for the
 same action lease epoch is durably `REVOKED` or `NO_CREDENTIAL`.

@@ -1,9 +1,11 @@
 # AI Native Operations Intelligence & Safe Automation Platform
 
+> 历史架构蓝图（V3）：保留用于决策与实现证据追溯，不是当前执行入口。当前入口为 [`docs/architecture/README.md`](README.md)、[`docs/status/current.md`](../status/current.md) 和 [2026-09-19 重新基线开发计划](../superpowers/plans/2026-09-19-rebaseline-development-program.md)。其中任何旧实现基线、分支或能力描述都必须以当前状态源重新核对。
+
 版本：2026 V3  
 更新日期：2026-07-10  
-状态：当前权威架构蓝图
-替代关系：历史输入已归档至 [`docs/archive/`](../archive/README.md)，本文件作为后续实现依据。
+状态：历史设计证据（非当前执行入口）
+替代关系：当前规范、状态和后继开发顺序以架构入口与重新基线计划为准；历史输入仍归档至 [`docs/archive/`](../archive/README.md)。
 
 ---
 

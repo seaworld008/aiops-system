@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - 每个 Task 严格采用 Red → Green → Refactor：先运行并保存预期失败，再做最小生产实现，复跑指定测试后才允许重构和提交。
-- Baseline is `main@ad50d9f`; execute after Phase 7 acceptance from an isolated worktree without a nested `.worktrees` directory.
+- Execute only after Phase 7 acceptance from an isolated worktree based on the latest `origin/main`, without a nested `.worktrees` directory. Older baseline references are historical evidence.
 - Release acceptance never grants a capability. It can only promote already accepted, explicitly listed Asset/Capability/Action revisions.
 - The server derives canonical digests and gate status. Browser and model input cannot set `PROMOTED`, bypass soak time, replace evidence, or widen eligibility.
 - Evidence and decisions are append-only. Correction creates a new record and preserves the original.

@@ -1,5 +1,7 @@
 # Phase 8: Production Rollout and Sustained Operations
 
+> 历史阶段规划（非当前执行入口）。当前执行基线由 [重新基线开发计划](../../2026-09-19-rebaseline-development-program.md) 和 `docs/status/current.md` 共同约束；暂停期间不得执行本阶段任务。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把已通过只读生产门与逐 Action 类型写入门的系统，落成可容量规划、可灰度、可回退、可灾备、可审计、有人值守的生产服务，并以持久化的 `PRODUCTION_CLOSED_LOOP_ACCEPTED` 或安全的 HOLD/ROLL_BACK 决策收口。
@@ -10,7 +12,7 @@
 
 ## Global Constraints
 
-- 状态为规划完成、尚未执行；实现基线固定为 `main@ad50d9f`，执行时先验收 Phase 1–7 的实际产物与证据。
+- 状态为规划完成、尚未执行；旧实现基线仅作历史证据，执行时必须从届时最新 `origin/main` 开始并先验收 Phase 1–7 的实际产物与证据。
 - migration 固定为 `000022_production_release_governance`；不得改写 `000020_production_platform` 或 `000021_governed_actions`。
 - 所有 release/wave/evidence/decision 主键、唯一键和外键携带 `tenant_id/workspace_id/environment_id`；不能以单一 synthetic Scope ID 替代。
 - ADR 0009 继续拥有生产 READ 平台决策；ADR 0012 只拥有 release governance 与持续运维，不能重写 0009 或 Phase 7 的 ADR 0010/0011。

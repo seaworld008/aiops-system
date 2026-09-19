@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - 每个 Task 严格采用 Red → Green → Refactor：先运行并保存预期失败，再做最小生产实现，复跑指定测试后才允许重构和提交。
-- 实现基线固定为 main@ad50d9f；开始执行时先创建独立 worktree，且该模块根下不能包含嵌套 .worktrees。当前共享主目录会被既有架构唯一调用链测试扫描到用户 worktree，因此不得宣称其 go test ./... 基线全绿，也不得删除用户 worktree。
+- 历史实现基线不再固定；开始执行时必须从届时最新 `origin/main` 创建独立 worktree，且该模块根下不能包含嵌套 `.worktrees`。当前共享主目录会被既有架构唯一调用链测试扫描到用户 worktree，因此不得宣称其 go test ./... 基线全绿，也不得删除用户 worktree。
 - 继续使用 Go 模块化单体；本阶段不新建微服务。
 - PostgreSQL 是领域事实源，Temporal 只保存编排 ID、摘要和小型脱敏结果。
 - 模型不是授权 Principal，不属于可信计算基，不能签发、扩大、复用或转换 Grant。

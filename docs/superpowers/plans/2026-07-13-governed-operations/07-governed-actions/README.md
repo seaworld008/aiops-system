@@ -1,5 +1,7 @@
 # 07 — Governed Production Actions 阶段索引
 
+> 历史阶段规划（非当前执行入口）。当前执行基线由 [重新基线开发计划](../../2026-09-19-rebaseline-development-program.md) 和 `docs/status/current.md` 共同约束；暂停期间不得执行本阶段任务。
+
 本阶段在 Phase 1–6 的生产只读验收之后，逐 Action 类型打开受治理生产变更。它不是通用写代理，也不是模型、聊天界面或浏览器获得目标系统权限；唯一生产路径固定为：
 
 ```text

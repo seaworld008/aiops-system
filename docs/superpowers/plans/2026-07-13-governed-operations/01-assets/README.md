@@ -1,5 +1,7 @@
 # 01 — 资产目录、真实发现来源与 Control Plane
 
+> 历史阶段规划（非当前执行入口）。当前执行基线由 [重新基线开发计划](../../2026-09-19-rebaseline-development-program.md) 和 `docs/status/current.md` 共同约束；暂停期间不得执行本阶段任务。
+
 本目录把 Phase 1 拆成 11 个生产任务包。它是[受治理运维能力总计划](../../2026-07-13-governed-operations-program.md)的第一阶段，产品、安全和前端语义以[已确认设计规范](../../../specs/2026-07-13-operational-assets-controlled-access-design.md)为准；快速构建的 Batch、并发和验证时机由[快速开发与真实验收计划](../../2026-07-15-fast-development-validation-program.md)统一覆盖。
 
 本阶段的终点不是枚举、假 Provider、静态页面或 Demo：它建立十二表 PostgreSQL 事实（含不可变 Source Revision 权限 Environment 子表，以及独立 Limiter bucket 与 permit/receipt truth）、不可变 Source Revision、真实 CSV/API/CMDB/vSphere/Proxmox/OpenStack/AWS/Azure/GCP 协议适配、独立 Discovery Worker、HA lease/fence、加密 checkpoint、持久背压、逐 Provider gate，以及真实 OIDC/OpenAPI、Go 同源 SPA、类型化应用平台和 Overview。它仍不开放目标系统写操作；项目最终通过 Phase 7/8 的不可变 ActionPlan、策略、重新认证、人工审批、短凭据、类型化执行、独立验证、对账/回滚/升级与审计形成生产闭环。
@@ -28,7 +30,7 @@ vSphere 的独立 closed DAG 固定为：[Task 28A](./09-discovery-worker-ha-e2e
 
 ## Consumes
 
-- `main@ad50d9f` 的 Go/Control Plane/Worker/READ-WRITE Runner/调查执行安全基线。
+- 旧 Go/Control Plane/Worker/READ-WRITE Runner/调查执行安全基线仅作历史证据；执行时必须从届时最新 `origin/main` 重新核对。
 - 已确认规范的 Scope、资产生命周期、字段所有权、来源类型、公共 API、权限、前端视觉/交互和安全不变量。
 - 既有 `services`、`service_bindings`、`integrations`、`audit_records`、`outbox_events` 与 OIDC/Scope 契约；不解释未知 JSONB 为运行能力。
 - 已有 `workerbootstrap`、`securemanifest`、PostgreSQL Outbox/lease 安全模式；新 Worker 复用原则但不复用 WRITE 授权。

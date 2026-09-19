@@ -1,5 +1,7 @@
 # M5 Investigation Runtime 信任边界与后续依赖
 
+> 历史计划（非当前执行入口）。当前状态、远端基线和恢复顺序以 [`docs/status/current.md`](../status/current.md) 与 [重新基线开发计划](../superpowers/plans/2026-09-19-rebaseline-development-program.md) 为准。
+
 日期：2026-07-11
 范围：M5A1 领域契约与 Memory fixture、M5A2a PostgreSQL 运行时迁移、M5A2b 事务型 PostgreSQL Repository、M5B1 READ Runner 持久 attempt/fence 底座、M5B2 独立 READ Task Gateway 协议、M5B3 精确环境 TaskSpec scope 与 immutable typed connector registry、M5C1A exact event-type Outbox 路由底座、M5C1B immutable investigation preparation、M5C2-1 持久 Plan/Task/Attempt/Receipt runtime binding、M5C2-2 无完成响应体的确定性结果恢复、M5C2-3a 内容寻址 target manifest/真实 runtime Binder、M5C2-3b 内容寻址 egress policy 与固定 READ HTTP executor、M5C2-4a 关闭态 Admission/atomic runtime Bundle/独立 READ client、M5C2-4b recovery-first Temporal v2/READ Runner Activity、M5C2-4c1a/c1b 原子 Snapshot 与角色隔离 Temporal 控制边界，以及 M5C2-4c2a/b0/b1a/b1b0/b1b1/b1b2a/b1b2b 父进程 containment、预装配进程逃逸门禁、固定 FD4 public-source、同 envelope 语义 Snapshot、`SECRET_READY`、固定 FD5–FD7 密钥绑定与独立固定根 secret-loader
 

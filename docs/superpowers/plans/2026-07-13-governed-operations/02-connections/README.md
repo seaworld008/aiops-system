@@ -1,5 +1,7 @@
 # 02 — Connections / Runtime Publication 阶段索引
 
+> 历史阶段规划（非当前执行入口）。当前执行基线由 [重新基线开发计划](../../2026-09-19-rebaseline-development-program.md) 和 `docs/status/current.md` 共同约束；暂停期间不得执行本阶段任务。
+
 本目录是 Governed Operations 路线的第二阶段实施计划。目标不是做一个 demo 或只读 pilot，而是交付真实生产级 Connection 发布闭环：
 
 ```text

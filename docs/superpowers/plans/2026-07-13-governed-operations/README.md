@@ -1,5 +1,7 @@
 # Governed Operations Production Program
 
+> 规划基线（历史入口）：本目录保留八阶段范围与 Produces/Consumes 契约；当前执行基线为届时最新 `origin/main`，当前状态为 `DEVELOPMENT_PAUSED / RUNTIME_CLOSED`。请先读 [重新基线开发计划](../2026-09-19-rebaseline-development-program.md)。
+
 This directory is the executable plan set for turning the approved governed-operations design into a complete production closed loop. It is intentionally split into a short program index, phase indexes, and bounded task packs so future workers can load only the context required for the current task.
 
 The current set contains 8 ordered phases, 59 bounded task packs, and 189 checkbox-driven implementation tasks. Planning completion does not change runtime capability state; every new Provider, page, migration, read capability, governed Action, and release gate remains unimplemented until its named evidence passes.

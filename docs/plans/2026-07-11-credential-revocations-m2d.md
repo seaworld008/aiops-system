@@ -1,5 +1,7 @@
 # M2D OIDC credential-revocation administration
 
+> 历史计划（非当前执行入口）。当前状态、远端基线和恢复顺序以 [`docs/status/current.md`](../status/current.md) 与 [重新基线开发计划](../superpowers/plans/2026-09-19-rebaseline-development-program.md) 为准。
+
 ## Objective
 
 Expose the existing durable `MANUAL_REQUIRED` recovery transitions through an

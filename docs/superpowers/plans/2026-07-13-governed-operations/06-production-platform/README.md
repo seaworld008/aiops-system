@@ -1,5 +1,7 @@
 # Production Platform and Read Path Implementation Plan
 
+> 历史阶段规划（非当前执行入口）。当前执行基线由 [重新基线开发计划](../../2026-09-19-rebaseline-development-program.md) 和 `docs/status/current.md` 共同约束；暂停期间不得执行本阶段任务。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 把 Phase 1–5 已验收的资产、连接、Runtime、Grant、主动策略、VictoriaMetrics、Host 与 PostgreSQL 固定只读能力装配为真实高可用生产平台，经过 Preview、非生产 READ_ONLY、生产 SHADOW、受监督生产 READ_ONLY 的不可跳级验证，形成唯一生产只读 Go/No-Go 决策。

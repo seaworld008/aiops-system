@@ -1,5 +1,7 @@
 # Credential Revocation M2B Durable Broker and Vault Client
 
+> 历史计划（非当前执行入口）。当前状态、远端基线和恢复顺序以 [`docs/status/current.md`](../status/current.md) 与 [重新基线开发计划](../superpowers/plans/2026-09-19-rebaseline-development-program.md) 为准。
+
 **Goal:** Add the non-runtime `DurableBroker`, a database-time child-creation authorization, and a strict Vault 2.0.3 profile client. This slice must prove the absolute-expiry and effective-policy invariants required by M2A, but must not yet wire credentials into `execution.Service` or a write runner.
 
 **Architecture:** Policy and a server-owned issuer profile are resolved before persistence. `PrepareResult.Created=true` elects the only creator. Immediately before Vault, the PostgreSQL repository locks the current Runner registration, action, and revocation in that order; it proves an enabled WRITE Runner, matching scope revision, exact workspace/environment binding, RUNNING state, and no cancellation intent before returning a bounded DB-time authorization. The Broker creates one non-orphan service child, anchors its accessor before any dynamic secret call, inspects the child through the manager identity, issues exactly one leased secret, destroys the child token, and returns the secret only after ACTIVE is durably acknowledged. Any post-anchor failure destroys local material and persists revocation intent.
