@@ -132,7 +132,7 @@ git commit -m "feat(assetdiscovery): add fixed external cmdb provider"
 | External CMDB qualification canary、gate evaluator/decision + operating proof | 本包 Task 19B | 消费 Task 19A2a/19A2b/19A2c + Task 29A 已合并 receipts；唯一调用 CMDB `AdmitGate` |
 | Signed final Provider matrix + final E2E/CI | [Pack 09 Task 29B](./09-discovery-worker-ha-e2e.md#task-29b-signed-provider-matrix-and-final-e2e-ci) | 只聚合完成的 per-source gate/canary/HA receipts，不重建它们 |
 
-这只是所有权纠偏，不回写完成度 checkbox。已合并 Task 28C/19A 后，Source Gate successor contract 的当前唯一无环顺序冻结为 `reachability docs corrective → manager exact-3 contract sync → source-gate capability-identity harness C0 → pre-A2a exact-2 routine/test-boundary corrective → manager exact-3 evidence sync → global routine ACL exact-11 contract + status sync → pre-A2a formal-fixture compatibility exact-9 corrective → pre-A2a identity-FK fixture compatibility exact-9B docs-only contract checkpoint → [DEVELOPMENT_PAUSED] → resumed fresh test-only identity-FK fixture corrective → fresh Task 19A2a exact-12 → post-A2a exact-2 validation corrective → Task 19A2b → Task 19A2c → Task 29A → Task 19B → Task 29B`。global routine ACL exact11已由PR #152合并，formal-fixture exact9已由PR #153合并为`main@c0b620e6fff9de0b746504f5fb7231fcb4a213c4`、tree`0af13374448f1386593291631e10a07add41440b`。PR #153后的fresh formal A2a暴露独立identity-FK fixture冲突：合法top-level`ALTER TABLE ... ADD CONSTRAINT`与inline named constraint分别被merged discriminator/extractor拒绝。截止2026-07-23，本轮只冻结下述exact9B exact8 docs合同并暂停开发；原Phase B test-only实现`NOT_STARTED`且不是本交付，docs-only exact9B不解阻A2a。全部partial A2a均为`STOPPED/NOT PASS`，停止的`cb00`及其他dirty/stopped A2a worktree/WIP/snapshot永不作为输入，任何未完成实现不提交、不合并。恢复后的唯一入口是从届时最新`origin/main`创建fresh、独立test-only identity-FK fixture corrective并完成RED→GREEN、完整验证、独立复核、PR/merge；之后才允许fresh Task19A2a exact12。pre-A2a exact-2 global helper与PR #153 auxiliary matrix保持安全真值且不得收窄；fresh A2a仍消费本Pack唯一exact72 identity manifest与production digest。每一实现Batch只消费最新`main`；不得提前19A2b/19A2c/29A/19B/29B。所有Source Gate后继、真实CMDB canary和G4均deferred，`EXTERNAL_CMDB/CMDB_CATALOG_V1`与全部Source/Provider/Worker始终保持`NOT_STARTED/UNAVAILABLE/CLOSED`。
+这只是所有权纠偏，不回写完成度 checkbox。已合并 Task 28C/19A 后，Source Gate successor contract 的当前唯一无环顺序冻结为 `reachability docs corrective → manager exact-3 contract sync → source-gate capability-identity harness C0 → pre-A2a exact-2 routine/test-boundary corrective → manager exact-3 evidence sync → global routine ACL exact-11 contract + status sync → pre-A2a formal-fixture compatibility exact-9 corrective → pre-A2a identity-FK fixture corrective (PR #169 merged) → fresh Task 19A2a exact-12 → post-A2a exact-2 validation corrective → Task 19A2b → Task 19A2c → Task 29A → Task 19B → Task 29B`。global routine ACL exact11已由PR #152合并，formal-fixture exact9已由PR #153合并为`main@c0b620e6fff9de0b746504f5fb7231fcb4a213c4`、tree`0af13374448f1386593291631e10a07add41440b`。PR #153后的fresh formal A2a暴露独立identity-FK fixture冲突：合法top-level`ALTER TABLE ... ADD CONSTRAINT`与inline named constraint分别被merged discriminator/extractor拒绝。截止2026-07-23，本轮只冻结下述exact9B exact8 docs合同并暂停开发；PR #169 已合并 Phase B test-only corrective；它解除了 fixture parser blocker，但不实现 A2a/G2。全部partial A2a均为`STOPPED/NOT PASS`，停止的`cb00`及其他dirty/stopped A2a worktree/WIP/snapshot永不作为输入，任何未完成实现不提交、不合并。恢复后的唯一入口是从届时最新`origin/main`创建fresh、独立test-only identity-FK fixture corrective并完成RED→GREEN、完整验证、独立复核、PR/merge；之后才允许fresh Task19A2a exact12。pre-A2a exact-2 global helper与PR #153 auxiliary matrix保持安全真值且不得收窄；fresh A2a仍消费本Pack唯一exact72 identity manifest与production digest。每一实现Batch只消费最新`main`；不得提前19A2b/19A2c/29A/19B/29B。所有Source Gate后继、真实CMDB canary和G4均deferred，`EXTERNAL_CMDB/CMDB_CATALOG_V1`与全部Source/Provider/Worker始终保持`NOT_STARTED/UNAVAILABLE/CLOSED`。
 
 ### Task 18A: merged CMDB paging/checkpoint protocol foundation
 
@@ -304,15 +304,13 @@ reachability docs corrective
 → manager exact-3 evidence sync
 → global routine ACL exact-11 contract + status sync
 → pre-A2a formal-fixture compatibility exact-9 corrective
-→ pre-A2a identity-FK fixture compatibility exact-9B docs-only contract checkpoint
-→ [DEVELOPMENT_PAUSED]
-→ resumed fresh test-only identity-FK fixture corrective
+→ pre-A2a identity-FK fixture corrective (PR #169 merged)
 → fresh Task 19A2a exact-12
 → post-A2a exact-2 validation corrective
 → Task 19A2b → Task 19A2c → Task 29A → Task 19B → Task 29B
 ```
 
-第一次 manager exact-3 contract sync 先把 status 入口改为 capability harness；后续 harness只预置身份/DSN/certificate与双向ACL helper，不修改migration或授予函数。该helper只有在future owned exact38/global exact110 postflight都通过时才授予capability`CONNECT|USAGE`；predecessor72/owned36、down、unknown或partial均revoke并证明absent。pre-A2a exact-2合并后manager evidence sync记录其证据；global routine ACL exact11 corrective已由 PR #152 以同一原子提交冻结72↔110/rollback/recovery合同并同步current/coverage/Pack09入口。PR #152后的fresh A2a确认exact3/trigger/drop fixture blocker，PR #153 exact9已将其关闭并合并为`main@c0b620e6fff9de0b746504f5fb7231fcb4a213c4`、tree`0af13374448f1386593291631e10a07add41440b`。其后fresh formal A2a又确认identity FK无论以合法top-level ADD CONSTRAINT或inline named constraint表达都必然被merged fixture拒绝。截至2026-07-23只冻结exact9B docs-only合同并暂停开发，test-only实现保持`NOT_STARTED`；恢复后须新建fresh独立corrective并完成RED→GREEN/复核/PR/merge。全部partial A2a均为`STOPPED/NOT PASS`，停止的`cb00`和其他dirty/stopped A2a worktree/WIP/snapshot不得续用或复制，任何未完成实现不提交、不合并；docs-only exact9B不实现A2a/G2。
+第一次 manager exact-3 contract sync 先把 status 入口改为 capability harness；后续 harness只预置身份/DSN/certificate与双向ACL helper，不修改migration或授予函数。该helper只有在future owned exact38/global exact110 postflight都通过时才授予capability`CONNECT|USAGE`；predecessor72/owned36、down、unknown或partial均revoke并证明absent。pre-A2a exact-2合并后manager evidence sync记录其证据；global routine ACL exact11 corrective已由 PR #152 以同一原子提交冻结72↔110/rollback/recovery合同并同步current/coverage/Pack09入口。PR #152后的fresh A2a确认exact3/trigger/drop fixture blocker，PR #153 exact9已将其关闭并合并为`main@c0b620e6fff9de0b746504f5fb7231fcb4a213c4`、tree`0af13374448f1386593291631e10a07add41440b`。其后fresh formal A2a又确认identity FK无论以合法top-level ADD CONSTRAINT或inline named constraint表达都必然被merged fixture拒绝。PR #169 已合并 fresh test-only corrective；它已完成 strict parser/state/extraction 与负例验证，仍不实现 A2a/G2。全部partial A2a均为`STOPPED/NOT PASS`，停止的`cb00`和其他dirty/stopped A2a worktree/WIP/snapshot不得续用或复制，任何未完成实现不提交、不合并；docs-only exact9B不实现A2a/G2。
 
 pre-A2a exact-2 的完整且唯一文件为：
 
@@ -347,11 +345,11 @@ partial、duplicate、renamed、wrong type、wrong trigger、wrong relation、wr
 
 ### Pre-Task 19A2a: identity-FK fixture compatibility exact-9B corrective
 
-**Pause state (2026-07-23):** `DOCS_CONTRACT_FROZEN / DEVELOPMENT_PAUSED / IMPLEMENTATION_NOT_STARTED`。
+**Current state (PR #169 merged):** `TEST_ONLY_CORRECTIVE_BUILT_CLOSED / DEVELOPMENT_PAUSED / RUNTIME_CLOSED`。
 
-**Batch:** 本轮 exact9B 只消费已合并PR #153的`main@c0b620e6fff9de0b746504f5fb7231fcb4a213c4`、tree`0af13374448f1386593291631e10a07add41440b`，并只把下列exact8权威文档收口为docs-only暂停检查点。用户已决定暂停开发，原计划Phase B test-only实现永久停止于本轮并保持`NOT_STARTED`，不是本检查点或其后文档PR的交付；当前没有可提交或合并的实现。docs-only exact9B不等于corrective完整完成，也不允许formal A2a启动。
+**Batch:** exact9B docs-only checkpoint 已由 PR #169 的 fresh test-only corrective 继承完成，合并 commit 为 `fb6ff23f4170a07c87c3bd6fac233b909d5ff781`。该 Batch 只拥有 `migration_corrective_test.go` 的 strict FK parser/state/extraction 与负例；不修改 migration、A2a、G2 或运行能力。下一入口为 fresh Task 19A2a exact-12，且仍必须从最新 `origin/main` 创建独立 worktree。
 
-**Exact files:** 本暂停检查点只有上节同一exact8文档；不得修改`internal/assetcatalog/postgres/migration_corrective_test.go`、migration、Task19A2a exact12文件、OpenAPI/generated types、production code、CI/scripts/env、operations或任何其他文件。恢复开发后另从届时最新`origin/main`创建fresh、独立test-only identity-FK fixture corrective，由它单独拥有该测试fixture；该未来所有权不是本轮交付。
+**Exact files:** PR #169 只修改 `internal/assetcatalog/postgres/migration_corrective_test.go`；migration、Task19A2a exact12文件、OpenAPI/generated types、production code、CI/scripts/env、operations均未修改。
 
 **Observed merged conflict:** Pack06要求唯一identity constraint为：
 
@@ -368,7 +366,7 @@ DEFERRABLE INITIALLY DEFERRED
 
 **Fail-closed matrix:** missing、partial或duplicate FK；wrong name、quoted alias或大小写别名；wrong source/reference columns、order、mapping、table或schema；6-column FK；digest/expiry进入identity；`NOT DEFERRABLE`、`INITIALLY IMMEDIATE`或缺失任一deferred属性；dynamic DDL；除上述唯一精确top-level创建语句外的任何ALTER；后续任何DROP/VALIDATE/rename/disable lifecycle；额外gate constraint；up/down mismatch。实现不得使用宽松contains、简单删除first match、隐藏/转义标识符或跳过既有matrix。PR #153 exact3/trigger/drop auxiliary matrix、既有adversarial cases、global exact72/110、owned exact38、ACL/owner/grantor/grantability、C-order、down manifest、trigger-before-table-drop与显式revoke/restore全部保持原强度。
 
-**Resumed implementation gate (`NOT_STARTED`):** 恢复开发后的唯一入口是从届时最新`origin/main`创建fresh、独立test-only identity-FK fixture corrective。其synthetic formal fixture必须包含exact3+exact named FK+trigger+down，并使当前完整successor/auxiliary matrix因FK未审而真实失败；inline named constraint与上述唯一精确top-level创建语句两种合法表达分别覆盖。GREEN只实现严格FK parser/state-aware fixture与可逆baseline extraction，并新增上述完整负例；随后运行targeted normal/race、全部`TestAssetCatalogCorrective*` normal/race、可审计nonintegration suite、vet、diff-check与fresh G1，取得独立复核并经单独PR合并。真实PostgreSQL G2不属于该test-only corrective且不得冒充formal A2a；docs-only exact9B与未来实现均不提升completion、Provider/Worker/Capability、G2/G4或checkbox，所有相关状态保持`NOT_STARTED/UNAVAILABLE/CLOSED`。只有该后继实现合并后才允许fresh formal A2a。
+**Completed implementation gate:** PR #169 已完成 strict FK parser/state-aware fixture、可逆 baseline extraction、inline/top-level 合法表达和主要负例矩阵，并通过 targeted normal/race、corrective normal/race、`go vet`、`git diff --check` 与 fresh G1。该 test-only corrective 不提升 Provider/Worker/Capability、G2/G4 或运行能力；只有它合并后才允许 fresh formal A2a exact-12。
 
 ### Task 19A2a: Source Gate schema, domain, and admission contract
 

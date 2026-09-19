@@ -17,8 +17,8 @@
 
 | 顺序 | Batch | 责任与出口 |
 | ---: | --- | --- |
-| 1 | fresh identity-FK fixture corrective | 仅修复已冻结 fixture 合同，真实 RED→GREEN、G1/G2、独立 review、PR/merge。 |
-| 2 | Task 19A2a exact-12 | 消费已合并 fixture，完成 Source Gate formal migration/test contract；未通过前不启动。 |
+| 1 | fresh identity-FK fixture corrective | 已由 PR #169 合并为 `BUILT_CLOSED`；仅修复 test-only fixture 合同，不开放 A2a 或运行能力。 |
+| 2 | Task 19A2a exact-12 | 下一入口；消费 PR #169 已合并 fixture，从最新 `origin/main` fresh worktree 开始。 |
 | 3 | post-A2a exact-2 | 只拥有 validation corrective，不能扩展到 Provider runtime。 |
 | 4 | Task 19A2b | durable current-trust rechecks；依赖 exact-12 已合并。 |
 | 5 | Task 19A2c | 隔离 sealer/admitter connector 与 Task 28A seam；缺 authority/issuer 仍关闭。 |
