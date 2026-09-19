@@ -9,7 +9,7 @@ Evidence-first operations intelligence with policy-governed automation.
 **English** · [简体中文](README.zh-CN.md)
 
 > [!IMPORTANT]
-> AIOps System is in active pre-alpha development. Read-only investigation foundations are usable for development and evaluation. Production write automation has no configurable enablement path and remains disabled until every safety and quality gate in the pilot plan has passed.
+> AIOps System is currently `SPEC_APPROVED / DEVELOPMENT_PAUSED / RUNTIME_CLOSED`. Existing foundations remain available for development and evaluation, while production writes and every unqualified Provider/Capability/Action remain closed. The current rebaseline and the only restart order are recorded in [the Agent development guide](docs/architecture/agent-development-guide.md) and [the rebaseline development program](docs/superpowers/plans/2026-09-19-rebaseline-development-program.md).
 
 ## Why this project exists
 
@@ -86,7 +86,7 @@ Requirements:
 - PostgreSQL 18.4 or newer 18.x for persistence and migration tests
 - Temporal, Keycloak, Vault, and S3-compatible storage for the intended production architecture
 
-Run the development control plane with its in-memory repository:
+Run the development control plane with local configuration; PostgreSQL is required by the current assembly:
 
 ```bash
 make test
@@ -103,7 +103,7 @@ GET http://localhost:8080/readyz
 GET http://localhost:8080/api/v1/session
 ```
 
-The in-memory mode is for local development only. Production mode fails closed unless PostgreSQL, scoped webhook secrets, and Keycloak OIDC are configured. Copy [.env.example](.env.example) as a reference; never commit real credentials.
+The current repository has no in-memory repository fallback. The control plane remains unavailable and fails readiness unless PostgreSQL, scoped webhook secrets, and Keycloak OIDC are configured. Copy [.env.example](.env.example) as a reference; never commit real credentials.
 
 To run real PostgreSQL migration and repository tests:
 
@@ -126,13 +126,17 @@ The WRITE image defaults to `disabled`; M4 only performs a Linux isolation capab
 
 - [Documentation index](docs/README.md)
 - [Architecture overview](docs/architecture/overview.md)
-- [2026 V3 implementation blueprint](docs/architecture/implementation-blueprint-v3.md)
+- [Architecture documentation entry](docs/architecture/README.md)
+- [Agent development guide](docs/architecture/agent-development-guide.md)
+- [2026 V3 implementation blueprint (historical)](docs/architecture/implementation-blueprint-v3.md)
 - [SME internal pilot plan](docs/plans/2026-07-10-sme-internal-aiops-pilot.md)
 - [M4 isolated executor design](docs/plans/2026-07-11-isolated-executor-m4.md)
 - [Isolated Runner image and Linux runtime gates](docs/operations/isolated-runner-runtime.md)
 - [READ runtime Bundle and closed Admission](docs/operations/read-runtime-bundle.md)
 - [Roadmap and release gates](docs/roadmap.md)
 - [Historical designs](docs/archive/README.md)
+
+The V3 blueprint and the 2026-07-10/11 plans are retained as historical evidence. They are not current execution entry points; start from `docs/status/current.md` and the rebaseline program.
 
 ## Repository layout
 

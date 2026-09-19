@@ -106,7 +106,12 @@ func TestProviderIdentityRemainsClosedAndUnregistered(t *testing.T) {
 		} else if statErr != nil {
 			t.Fatalf("stat %s: %v", path, statErr)
 		}
-		command := exec.Command("rg", "-n", `PROXMOX_VE_V1|proxmox`, target)
+		// Test fixtures in other packages may mention the closed provider so
+		// they can prove rejection. The registration boundary is production
+		// source only; scanning test data made this guard reject its own
+		// adversarial fixtures.
+		command := exec.Command("rg", "-n", `PROXMOX_VE_V1|proxmox`, target,
+			"-g", "*.go", "-g", "!**/*_test.go")
 		output, commandErr := command.CombinedOutput()
 		if commandErr == nil {
 			t.Fatalf("Task23 must remain unregistered; %s contains:\n%s", path, output)

@@ -11,7 +11,19 @@ readonly TERMINATION_GRACE_SECONDS="10"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 readonly TOOL_ROOT="${REPO_ROOT}/tools/code-map"
-readonly REPO_ALIAS="$(basename "${REPO_ROOT}")"
+repo_path_digest() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | awk '{print substr($1, 1, 12)}'
+    return
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | awk '{print substr($1, 1, 12)}'
+    return
+  fi
+  printf '%s\n' 'code-map: shasum or sha256sum is required to derive a worktree alias' >&2
+  exit 1
+}
+readonly REPO_ALIAS="$(basename "${REPO_ROOT}")-$(repo_path_digest "${REPO_ROOT}")"
 readonly OS_OPERATION_LOCK="${REPO_ROOT}/.gitnexus-operation.lock"
 readonly REFRESH_LOCK="${REPO_ROOT}/.gitnexus-refresh.lock"
 REFRESH_LOCK_NONCE=""
@@ -467,6 +479,16 @@ index_storage_is_safe() {
 assert_index_storage_safe() {
   index_storage_is_safe ||
     die ".gitnexus must contain only owner-only real directories and owner-only single-link regular files"
+}
+
+normalize_index_storage_permissions() {
+  [[ -d .gitnexus && ! -L .gitnexus ]] || return 0
+  while IFS= read -r -d '' path; do
+    chmod go-rwx "${path}"
+  done < <(find .gitnexus -type d -print0)
+  while IFS= read -r -d '' path; do
+    chmod go-rwx "${path}"
+  done < <(find .gitnexus -type f -print0)
 }
 
 lock_path_is_safe() {
@@ -934,6 +956,7 @@ refresh_index_locked() {
   input_before="$(worktree_fingerprint)"
 
   run_gitnexus "${args[@]}" || run_status=$?
+  normalize_index_storage_permissions
   input_after="$(worktree_fingerprint)"
   after="$(protected_context_fingerprint)"
   [[ "${before}" == "${after}" && "${input_before}" == "${input_after}" ]] ||
@@ -947,6 +970,7 @@ refresh_index_locked() {
     printf '%s\n' 'code-map: incremental refresh failed; retrying one fail-closed full rebuild' >&2
     run_status=0
     run_gitnexus "${args[@]}" --force --drop-embeddings || run_status=$?
+    normalize_index_storage_permissions
     input_after="$(worktree_fingerprint)"
     after="$(protected_context_fingerprint)"
     [[ "${before}" == "${after}" && "${input_before}" == "${input_after}" ]] ||

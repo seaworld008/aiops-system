@@ -1,5 +1,7 @@
 # Runner Gateway M3：mTLS 身份与分段执行协议
 
+> 历史计划（非当前执行入口）。当前状态、远端基线和恢复顺序以 [`docs/status/current.md`](../status/current.md) 与 [重新基线开发计划](../superpowers/plans/2026-09-19-rebaseline-development-program.md) 为准。
+
 ## 目标
 
 在公共 API 之外提供独立的 TLS 1.3 Runner Gateway，把每次 Runner

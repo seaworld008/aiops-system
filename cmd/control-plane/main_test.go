@@ -129,6 +129,26 @@ func TestNewAssetCatalogAssemblyRejectsUnavailableSchemaAdmission(t *testing.T) 
 	}
 }
 
+func TestNewOverviewAssemblyWiresPostgreSQLRepositoryWhenDependenciesExist(t *testing.T) {
+	t.Parallel()
+	authorizer, err := authz.NewAuthorizer(5*time.Minute, time.Now)
+	if err != nil {
+		t.Fatalf("NewAuthorizer() error = %v", err)
+	}
+	manager, err := newOverviewAssembly(&pgxpool.Pool{}, authorizer)
+	if err != nil || manager == nil {
+		t.Fatalf("newOverviewAssembly(available dependencies) = (%#v, %v), want manager", manager, err)
+	}
+	for name, pool := range map[string]*pgxpool.Pool{"pool": nil} {
+		if manager, err := newOverviewAssembly(pool, authorizer); err == nil || manager != nil {
+			t.Fatalf("newOverviewAssembly(%s missing) = (%#v, %v), want closed", name, manager, err)
+		}
+	}
+	if manager, err := newOverviewAssembly(&pgxpool.Pool{}, nil); err == nil || manager != nil {
+		t.Fatalf("newOverviewAssembly(authorizer missing) = (%#v, %v), want closed", manager, err)
+	}
+}
+
 func TestControlPlaneCMDBProfileAssemblyConsumesNeutralExactAdmission(t *testing.T) {
 	closed, err := newSourceProfileAssembly(nil)
 	if err != nil {

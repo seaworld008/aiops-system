@@ -1,5 +1,7 @@
 # SME Internal AIOps Pilot Implementation Plan
 
+> 历史计划（非当前执行入口）。当前状态、远端基线和恢复顺序以 [`docs/status/current.md`](../status/current.md) 与 [重新基线开发计划](../superpowers/plans/2026-09-19-rebaseline-development-program.md) 为准。
+
 > 本文是分阶段交付计划，不是当前完成度声明；最新状态与生产开放门槛见[路线图](../roadmap.md)。每项逻辑遵循测试先行，完成后进行规格审查和代码质量审查。
 
 **Goal:** 交付一个可本地运行、可测试、可对接真实企业端点的调查与受控执行平台核心，并保留生产灰度所需的不可绕过安全边界。

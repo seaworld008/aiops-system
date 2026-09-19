@@ -23,6 +23,8 @@ import (
 	"github.com/seaworld008/aiops-system/internal/credentialadmin"
 	"github.com/seaworld008/aiops-system/internal/httpapi"
 	"github.com/seaworld008/aiops-system/internal/ids"
+	"github.com/seaworld008/aiops-system/internal/overview"
+	overviewpostgres "github.com/seaworld008/aiops-system/internal/overview/postgres"
 	signalservice "github.com/seaworld008/aiops-system/internal/signal"
 	"github.com/seaworld008/aiops-system/internal/sourceprofile"
 	postgresstore "github.com/seaworld008/aiops-system/internal/store/postgres"
@@ -165,6 +167,11 @@ func run() error {
 		dependencyFailure = errors.Join(dependencyFailure, errors.New("asset catalog is unavailable"))
 	}
 
+	overviewManager, overviewErr := newOverviewAssembly(databasePool, authorizer)
+	if overviewErr != nil {
+		dependencyFailure = errors.Join(dependencyFailure, errors.New("overview dependencies are unavailable"))
+	}
+
 	dependencyReady := func() error {
 		if dependencyFailure != nil || databasePool == nil || assetAssembly.Admission == nil {
 			return errors.New("control plane dependencies are unavailable")
@@ -201,6 +208,7 @@ func run() error {
 			AssetSources:          assetAssembly.AssetSources,
 			AssetConflicts:        assetAssembly.AssetConflicts,
 			ServiceAssetBindings:  assetAssembly.ServiceAssetBindings,
+			Overview:              overviewManager,
 			WebUI:                 webUI,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -273,6 +281,24 @@ func run() error {
 		shutdownFailure = errors.Join(shutdownFailure, <-shutdownErrors)
 	}
 	return errors.Join(serveFailure, shutdownFailure)
+}
+
+func newOverviewAssembly(
+	databasePool *pgxpool.Pool,
+	authorizer *authz.Authorizer,
+) (overview.Manager, error) {
+	if databasePool == nil || authorizer == nil {
+		return nil, errors.New("overview dependencies are unavailable")
+	}
+	overviewRepository, err := overviewpostgres.New(databasePool)
+	if err != nil {
+		return nil, errors.New("overview repository is unavailable")
+	}
+	manager, err := overview.NewService(overviewRepository, overviewRepository, authorizer, overview.Options{})
+	if err != nil {
+		return nil, errors.New("overview service is unavailable")
+	}
+	return manager, nil
 }
 
 func combineReadiness(checks ...func() error) func() error {

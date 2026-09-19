@@ -110,6 +110,14 @@ func fileHasAccessExpandingMetadata(file *os.File) bool {
 	return false
 }
 
+// FileHasAccessExpandingMetadata reports whether an already-open file carries
+// metadata that can broaden access beyond the owner/mode checks. Callers use
+// this on the same descriptor they will read so path replacement cannot evade
+// the metadata boundary.
+func FileHasAccessExpandingMetadata(file *os.File) bool {
+	return fileHasAccessExpandingMetadata(file)
+}
+
 func allowedExtendedAttribute(goos, name string) bool {
 	switch goos {
 	case "darwin":

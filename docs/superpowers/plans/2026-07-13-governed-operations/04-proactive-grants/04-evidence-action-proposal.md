@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - 每个 Task 严格采用 Red → Green → Refactor：先运行并保存预期失败，再做最小生产实现，复跑指定测试后才允许重构和提交。
-- 实现基线固定为 main@ad50d9f；开始执行时先创建独立 worktree，且该模块根下不能包含嵌套 .worktrees。
+- 历史实现基线不再固定；开始执行时必须从届时最新 `origin/main` 创建独立 worktree，且该模块根下不能包含嵌套 `.worktrees`。
 - 000018 migration 的唯一文件仍是 `migrations/000018_investigation_grants_proactive_policies.*.sql`，七表完整 DDL 由 `01-domain-schema.md` Task 2 一次创建；本包不得创建 000018b 或平行迁移。
 - 模型不是 Principal，也不是 Scope、Catalog、Actor attribution、授权、审批或队列事实源。
 - 模型可输出的业务内容仅为服务端目录内的 `action_type` 与该类型极窄 typed intent；Evidence IDs 与 Evidence digest 完全由服务端固定，模型不得输出或选择。

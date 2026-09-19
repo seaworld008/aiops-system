@@ -9,7 +9,7 @@
 [English](README.md) · **简体中文**
 
 > [!IMPORTANT]
-> 项目目前处于积极开发的 pre-alpha 阶段。只读调查基础可用于开发和评估；生产写不存在可配置启用路径，在试点计划的全部安全、质量门槛通过前始终保持关闭。
+> 项目当前处于 `SPEC_APPROVED / DEVELOPMENT_PAUSED / RUNTIME_CLOSED`。已有基础仍可用于开发和评估，但生产写入以及任何未完成真实资格的 Provider/Capability/Action 均保持关闭。当前重新基线与唯一恢复顺序见[Agent 开发指南](docs/architecture/agent-development-guide.md)和[重新基线开发计划](docs/superpowers/plans/2026-09-19-rebaseline-development-program.md)。
 
 ## 为什么需要这个项目
 
@@ -86,7 +86,7 @@ flowchart LR
 - PostgreSQL 18.4 或更新的 18.x（持久化与真实迁移测试）
 - 目标生产架构还需要 Temporal、Keycloak、Vault 和 S3 兼容对象存储
 
-使用内存仓储启动开发控制面：
+使用本地配置启动开发控制面（PostgreSQL 是当前装配的必需依赖）：
 
 ```bash
 make test
@@ -103,7 +103,7 @@ GET http://localhost:8080/readyz
 GET http://localhost:8080/api/v1/session
 ```
 
-内存模式仅用于本地开发。生产模式未配置 PostgreSQL、作用域 Webhook 密钥和 Keycloak OIDC 时会拒绝启动。可参考 [.env.example](.env.example)，请勿提交真实凭据。
+控制面未配置 PostgreSQL、作用域 Webhook 密钥和 Keycloak OIDC 时会保持不可用并拒绝就绪。当前仓库不再提供 memory repository fallback。可参考 [.env.example](.env.example)，请勿提交真实凭据。
 
 运行真实 PostgreSQL 迁移与仓储测试：
 
@@ -126,13 +126,17 @@ WRITE 镜像默认是 `disabled`；M4 的 `non-production` 只执行 Linux 隔�
 
 - [文档索引](docs/README.md)
 - [架构概览](docs/architecture/overview.md)
-- [2026 V3 实施蓝图](docs/architecture/implementation-blueprint-v3.md)
+- [架构文档入口](docs/architecture/README.md)
+- [Agent 开发指南](docs/architecture/agent-development-guide.md)
+- [2026 V3 实施蓝图（历史证据）](docs/architecture/implementation-blueprint-v3.md)
 - [中小企业内部试点计划](docs/plans/2026-07-10-sme-internal-aiops-pilot.md)
 - [M4 隔离执行器设计](docs/plans/2026-07-11-isolated-executor-m4.md)
 - [隔离 Runner 镜像与 Linux 运行门禁](docs/operations/isolated-runner-runtime.md)
 - [READ Runtime Bundle 与关闭态 Admission](docs/operations/read-runtime-bundle.md)
 - [路线图与发布门禁](docs/roadmap.md)
 - [历史设计归档](docs/archive/README.md)
+
+V3 蓝图和 2026-07-10/11 计划作为历史证据保留，不是当前执行入口；请从 `docs/status/current.md` 和重新基线计划开始。
 
 ## 参与贡献与安全报告
 

@@ -24,7 +24,7 @@ vet:
 	go vet ./...
 
 build:
-	go build ./cmd/control-plane ./cmd/worker ./cmd/read-runner ./cmd/write-runner ./cmd/executor
+	go build ./cmd/control-plane ./cmd/discovery-worker ./cmd/worker ./cmd/read-runner ./cmd/write-runner ./cmd/executor
 
 runner-images:
 	docker build --build-arg GO_BUILD_IMAGE="$(GO_BUILD_IMAGE)" --file build/package/read-runner/Dockerfile --tag "$(READ_RUNNER_IMAGE)" .

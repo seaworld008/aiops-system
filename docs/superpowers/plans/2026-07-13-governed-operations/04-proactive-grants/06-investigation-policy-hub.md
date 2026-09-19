@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - 每个 Task 严格采用 Red → Green → Refactor：先运行并保存预期失败，再做最小生产实现，复跑指定测试后才允许重构和提交。
-- 实现基线固定为 main@ad50d9f；开始执行时先创建独立 worktree，且该模块根下不能包含嵌套 .worktrees。
+- 历史实现基线不再固定；开始执行时必须从届时最新 `origin/main` 创建独立 worktree，且该模块根下不能包含嵌套 `.worktrees`。
 - 公共 API 唯一源为 `api/openapi/control-plane-v1.yaml`；前端唯一生成类型为 `web/src/shared/api/schema.d.ts`，不得手写重复 DTO。
 - 真实登录固定为 Keycloak Server 26.6.3 与浏览器 keycloak-js 26.2.4，使用 Authorization Code + PKCE、`login-required`、内存 Token、请求前刷新；不得使用 localStorage/sessionStorage/cookie 保存 bearer token。
 - Workspace/Environment 是每个 API 与页面的显式 Scope；跨 Scope 对象返回安全 403/404，不泄露存在性。

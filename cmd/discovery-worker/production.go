@@ -8,7 +8,6 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,12 +17,10 @@ import (
 	"net/http"
 	"os"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -1065,97 +1062,7 @@ func validProductionFileInfo(
 }
 
 func productionFileHasAccessExpandingMetadata(file *os.File) bool {
-	if file == nil || runtime.GOOS == "darwin" && productionDarwinFileHasACL(file) {
-		return true
-	}
-	size, err := unix.Flistxattr(int(file.Fd()), nil)
-	if err != nil || size > 1<<20 {
-		return true
-	}
-	if size == 0 {
-		return false
-	}
-	names := make([]byte, size)
-	read, err := unix.Flistxattr(int(file.Fd()), names)
-	if err != nil || read != size {
-		return true
-	}
-	for len(names) > 0 {
-		end := bytes.IndexByte(names, 0)
-		if end <= 0 || !allowedProductionExtendedAttribute(
-			runtime.GOOS,
-			string(names[:end]),
-		) {
-			return true
-		}
-		names = names[end+1:]
-	}
-	return false
-}
-
-func allowedProductionExtendedAttribute(goos, name string) bool {
-	switch goos {
-	case "darwin":
-		return name == "com.apple.provenance"
-	case "linux":
-		return name == "security.selinux" || name == "security.ima" ||
-			name == "security.evm"
-	default:
-		return false
-	}
-}
-
-func productionDarwinFileHasACL(file *os.File) bool {
-	const (
-		fgetattrlistSyscall  = 228
-		attrBitMapCount      = 5
-		extendedSecurityAttr = 0x00400000
-		noACLEntryCount      = uint32(0xffffffff)
-	)
-	type attrList struct {
-		bitmapCount uint16
-		reserved    uint16
-		commonAttr  uint32
-		volumeAttr  uint32
-		directory   uint32
-		fileAttr    uint32
-		forkAttr    uint32
-	}
-	attributes := attrList{
-		bitmapCount: attrBitMapCount,
-		commonAttr:  extendedSecurityAttr,
-	}
-	buffer := make([]byte, 4096)
-	_, _, errno := syscall.Syscall6(
-		fgetattrlistSyscall,
-		file.Fd(),
-		uintptr(unsafe.Pointer(&attributes)),
-		uintptr(unsafe.Pointer(&buffer[0])),
-		uintptr(len(buffer)),
-		0,
-		0,
-	)
-	if errno != 0 {
-		return true
-	}
-	total := int(binary.LittleEndian.Uint32(buffer[:4]))
-	if total < 12 || total > len(buffer) {
-		return true
-	}
-	referenceOffset := int(int32(binary.LittleEndian.Uint32(buffer[4:8])))
-	referenceLength := int(binary.LittleEndian.Uint32(buffer[8:12]))
-	dataStart := 4 + referenceOffset
-	if referenceLength == 0 {
-		return false
-	}
-	if dataStart < 12 || referenceLength < 44 ||
-		dataStart > total-referenceLength {
-		return true
-	}
-	entryCount := binary.LittleEndian.Uint32(
-		buffer[dataStart+36 : dataStart+40],
-	)
-	return entryCount != noACLEntryCount
+	return securemanifest.FileHasAccessExpandingMetadata(file)
 }
 
 func validKeyID(value string) bool {

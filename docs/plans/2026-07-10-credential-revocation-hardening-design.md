@@ -1,5 +1,7 @@
 # Credential Revocation M2A Hardening Design
 
+> 历史计划（非当前执行入口）。当前状态、远端基线和恢复顺序以 [`docs/status/current.md`](../status/current.md) 与 [重新基线开发计划](../superpowers/plans/2026-09-19-rebaseline-development-program.md) 为准。
+
 ## Scope
 
 This amendment hardens only the M2A credential repository and migration contract. It does not wire Broker, Vault, execution Service, HTTP, runtime assembly, or a production write switch.

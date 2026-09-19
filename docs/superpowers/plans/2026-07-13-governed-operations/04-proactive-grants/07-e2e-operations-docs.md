@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - 每个 Task 严格采用 Red → Green → Refactor：先运行并保存预期失败，再做最小生产实现，复跑指定测试后才允许重构和提交。
-- 实现基线固定为 main@ad50d9f；开始执行时先创建独立 worktree，且该模块根下不能包含嵌套 .worktrees。当前共享主目录会被既有架构唯一调用链测试扫描到用户 worktree，因此不得宣称其 go test ./... 基线全绿，也不得删除用户 worktree。
+- 历史实现基线不再固定；开始执行时必须从届时最新 `origin/main` 创建独立 worktree，且该模块根下不能包含嵌套 `.worktrees`。当前共享主目录会被既有架构唯一调用链测试扫描到用户 worktree，因此不得宣称其 go test ./... 基线全绿，也不得删除用户 worktree。
 - 继续使用 Go 模块化单体；本阶段不新建微服务。
 - PostgreSQL 是领域事实源，Temporal 只保存编排 ID、摘要和小型脱敏结果。
 - 模型不是授权 Principal，不属于可信计算基，不能签发、扩大、复用或转换 Grant。
@@ -414,10 +414,10 @@ Expected: 无 trailing whitespace、冲突标记或 malformed patch。
 
 - [ ] **Step 7: 执行独立 worktree 全量验证并保存事实**
 
-必须在 commit `ad50d9f`（当时的 `main` 基线）创建、且模块根下不含嵌套 `.worktrees` 的独立 worktree 执行。当前共享主目录的用户 worktree 会被架构测试扫描，不能在那里声称全绿，更不能删除它们。
+必须在届时最新 `origin/main` 创建、且模块根下不含嵌套 `.worktrees` 的独立 worktree 执行。当前共享主目录的用户 worktree 会被架构测试扫描，不能在那里声称全绿，更不能删除它们。
 
 ~~~bash
-git diff --name-only --diff-filter=ACM -z ad50d9f -- '*.go' | xargs -0 gofmt -w
+git diff --name-only --diff-filter=ACM origin/main -- '*.go' | xargs -0 gofmt -w
 go test -race -shuffle=on -count=1 ./...
 go vet ./...
 go build ./cmd/control-plane ./cmd/worker ./cmd/read-runner ./cmd/write-runner ./cmd/executor
@@ -443,7 +443,7 @@ Run: go test ./internal/proactivepolicy ./internal/investigationgrant/... ./inte
 
 Expected: PASS。
 
-Run: git status --short && git diff --stat ad50d9f
+Run: git status --short && git diff --stat origin/main
 
 Expected: 只有本计划列出的实现、测试、生成类型、截图与文档；无 Secret、临时文件、数据库 dump、Playwright trace/video 或未声明二进制。
 

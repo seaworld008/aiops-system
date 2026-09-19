@@ -1,5 +1,7 @@
 # VictoriaMetrics Ecosystem Production Closure Implementation Plan
 
+> 历史阶段规划（非当前执行入口）。当前执行基线由 [重新基线开发计划](../../2026-09-19-rebaseline-development-program.md) 和 `docs/status/current.md` 共同约束；暂停期间不得执行本阶段任务。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 在 `000015` Operational Asset Catalog 与 `000016` Connection Publication 基础上，完成 VictoriaMetrics Operator、VictoriaMetrics、VictoriaLogs、VictoriaTraces 的生产级资产发现、版本兼容、类型化只读调查、证据治理、前端体验与运维闭环。
@@ -21,7 +23,7 @@
 - Target schema、Connector schema、Evidence schema、Executor profile 必须形成精确版本闭包；未知版本只保留资产可见性，能力状态为 `UNSUPPORTED`。
 - 输出在进入控制平面前必须通过严格 JSON schema、深度/数量/字节预算、稳定排序、JCS/SHA-256 和 DLP；不接受 partial response。
 - 所有新增行为严格 TDD：先写失败测试并运行确认，再做最小实现，再运行通过；每个 Task 独立提交。
-- 实现时先确认基线为 `main@ad50d9f`；若前序包已推进，必须以已合入接口为准做适配并记录差异，不可回退用户或其他任务的修改。
+- 实现时必须先确认基线为届时最新 `origin/main`；若前序包已推进，必须以已合入接口为准做适配并记录差异，不可回退用户或其他任务的修改。
 
 ---
 

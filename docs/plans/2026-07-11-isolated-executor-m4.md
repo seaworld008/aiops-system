@@ -1,5 +1,7 @@
 # 可终止隔离执行器 M4：固定代码、READY/GO 与不确定性收敛
 
+> 历史计划（非当前执行入口）。当前状态、远端基线和恢复顺序以 [`docs/status/current.md`](../status/current.md) 与 [重新基线开发计划](../superpowers/plans/2026-09-19-rebaseline-development-program.md) 为准。
+
 ## 目标与状态
 
 M4 建立 WRITE Runner 与单作业 Executor 之间可强制终止、可审计且默认关闭的进程边界，
