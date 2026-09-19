@@ -27,7 +27,57 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - run: git diff --check
       - run: go vet ./...
-      - run: go build ./cmd/control-plane ./cmd/worker ./cmd/read-runner ./cmd/write-runner ./cmd/executor
+      - run: go build ./cmd/control-plane ./cmd/discovery-worker ./cmd/worker ./cmd/read-runner ./cmd/write-runner ./cmd/executor
+      - name: Run affected Go unit tests
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          packages=()
+          while IFS= read -r package; do
+            packages+=("${package}")
+          done < <(
+            git diff --name-only "${BASE_SHA}...HEAD" -- '*.go' |
+              while IFS= read -r file; do
+                directory="$(dirname "${file}")"
+                if find "${directory}" -maxdepth 1 -type f -name '*_integration_test.go' -print -quit | grep -q .; then
+                  echo "Skipping integration-only package ./$(printf '%s' "${directory}" | sed 's#^./##')" >&2
+                  continue
+                fi
+                go list "./${directory}" 2>/dev/null || true
+              done | sort -u
+          )
+          if ((${#packages[@]} == 0)); then
+            echo 'No affected non-integration Go packages.'
+            exit 0
+          fi
+          printf 'Testing affected packages:\n%s\n' "${packages[*]}"
+          go test -count=1 "${packages[@]}"
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Activate pinned pnpm
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@10.34.0 --activate
+          test "$(pnpm --version)" = "10.34.0"
+      - name: Install web dependencies
+        run: pnpm --dir web install --frozen-lockfile
+      - name: Check OpenAPI generated types
+        run: pnpm --dir web generate:api:check
+      - name: Run web checks
+        run: pnpm --dir web check
 
   full-go:
     if: github.event_name == 'workflow_dispatch'
@@ -50,7 +100,7 @@ jobs:
           --health-timeout 5s
           --health-retries 12
       vault:
-        image: hashicorp/vault:2.0.3
+        image: hashicorp/vault:2.0.3@sha256:db6a5f78749204d0a8d002be1cc6e9a2a6de53dffce41a894c4a06d309dca360
         env:
           VAULT_ADDR: http://127.0.0.1:8200
           VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
@@ -267,7 +317,7 @@ jobs:
       - run: git diff --check
       - run: go test -race -shuffle=on -count=1 ./...
       - run: go vet ./...
-      - run: go build ./cmd/control-plane ./cmd/worker ./cmd/read-runner ./cmd/write-runner ./cmd/executor
+      - run: go build ./cmd/control-plane ./cmd/discovery-worker ./cmd/worker ./cmd/read-runner ./cmd/write-runner ./cmd/executor
 
   vulnerability-scan:
     if: github.event_name == 'workflow_dispatch'
