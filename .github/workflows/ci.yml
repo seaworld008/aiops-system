@@ -41,7 +41,7 @@ jobs:
             git diff --name-only "${BASE_SHA}...HEAD" -- '*.go' |
             while IFS= read -r file; do
                 directory="$(dirname "${file}")"
-                go list "./${directory}" 2>/dev/null || true
+                printf './%s\n' "${directory}"
               done | sort -u
           )
           if ((${#packages[@]} == 0)); then
